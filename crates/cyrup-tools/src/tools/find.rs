@@ -284,10 +284,14 @@ impl Tool for FindTool {
         // `num_results`, so on the 1000th entry the buffer holds exactly 1000 — not more — and the
         // cap fires while still buffering. Under pi's own default, fd's output is sorted.
         //
-        // The 100 ms deadline has no analogue here: cyrup's walk is single-threaded with no
-        // streaming mode, so the length condition is the whole test. On a tree slow enough that
-        // fd's deadline beats the cap, fd streams in arrival order where this sorts — timing
-        // dependent, unreproducible in-process, and the one genuine residual.
+        // The 100 ms deadline has no analogue here: this walk has no streaming mode, so the
+        // length condition is the whole test. The residual it leaves now has two symmetric
+        // halves, and PERF-003 gave it the second. BELOW `FD_MAX_BUFFER_LENGTH`: on a tree slow
+        // enough that fd's deadline beats the cap, fd streams in arrival order where this sorts.
+        // ABOVE it: cyrup emits in arrival order too, and that arrival order is no longer
+        // deterministic, because `LocalFs::walk` is now `ignore::WalkParallel` — which is exactly
+        // what fd's own walk has always been, so the two diverge no further than before. Both
+        // halves are timing dependent and unreproducible in-process.
         //
         // `Path::cmp`, not `str::cmp`: fd orders by `self.path().cmp(other.path())`
         // (`dir_entry.rs:132-136`), which compares COMPONENTS. Byte comparison inverts the two

@@ -76,6 +76,46 @@ pub(crate) fn windows_access_result(
 /// (`lib.rs:322-359`) unchanged except for the io leaf, so `Loop` (which carries no
 /// `WithPath` — `lib.rs:286-295`) keeps ripgrep's un-prefixed
 /// `"File system loop found: … points to an ancestor …"`.
+/// One walked entry, converted for the stream — shared VERBATIM by the serial and the parallel
+/// branch of [`LocalFs::walk`] so the two cannot drift in what they yield.
+///
+/// A per-entry `Err` is a NON-FATAL event on this stream and the walk CONTINUES past it:
+/// `ignore::Walk::next` leaves its iterator intact after yielding one (ignore 0.4.26
+/// `src/walk.rs:1124-1126`), and on the parallel branch the visitor returns `WalkState::Continue`
+/// for it just as it does for an `Ok`. Consumers must never read one as end-of-stream.
+///
+/// The message is [`walk_error_message`]'s rendering of the `ignore::Error`, i.e. ripgrep's own
+/// `{path}: {io error}` with the path stated once, e.g.
+/// `/srv/locked: Permission denied (os error 13)`. It is NOT `e.to_string()`: at ignore 0.4.26 +
+/// walkdir 2.5.0 `Display` states the path TWICE — see [`walk_error_message`]. No prefix is added
+/// here because the two consumers of this seam want different things from the same value: `find`
+/// emulates fd, which discards it (fd 10.5.0 `src/walk.rs:227-231`, `:500-505`), and `grep`
+/// emulates ripgrep, which reports it as `rg: {path}: {io error}` on stderr. A `walk: ` prefix
+/// matched neither.
+fn to_walk_item(result: Result<ignore::DirEntry, ignore::Error>) -> Result<WalkItem, ToolError> {
+    match result {
+        Ok(entry) => {
+            let path = entry.path().to_path_buf();
+            // One `file_type()` read feeds both flags. `ignore` 0.4.26 derives a traversed entry's
+            // type from `std::fs::DirEntry::file_type` (`walk.rs:322-333`, `:353-367`), which is
+            // `lstat` semantics: a symlink reports itself as a symlink, so it is neither a dir nor
+            // a file and both flags are false — exactly the entry ripgrep declines to search.
+            // `None` occurs only for the synthetic stdin entry (`walk.rs:67-78`), which a
+            // path-rooted walker never yields, so `unwrap_or(false)` mirrors ripgrep's own
+            // `file_type().map_or(false, |ft| ft.is_file())`: unknown type is not a regular file.
+            let ty = entry.file_type();
+            let is_dir = ty.map(|t| t.is_dir()).unwrap_or(false);
+            let is_file = ty.map(|t| t.is_file()).unwrap_or(false);
+            Ok(WalkItem {
+                path,
+                is_dir,
+                is_file,
+            })
+        }
+        Err(e) => Err(ToolError::new(walk_error_message(&e))),
+    }
+}
+
 pub(crate) fn walk_error_message(err: &ignore::Error) -> String {
     match err {
         // The one variant carrying a path. Recurse, so the tail is the PEELED io text
@@ -146,6 +186,38 @@ impl FsOps for LocalFs {
             .map_err(|e| error::invalid(format!("read_stream: {e}")))?
             .map_err(|e| error::io(&error::show(path), &e))?;
         Ok(Box::new(file))
+    }
+
+    /// One `spawn_blocking` for the whole batch instead of one per path — see
+    /// [`FsOps::read_streams`] for why this override exists and what it is worth.
+    ///
+    /// `open(2)` itself is cheap (~1.5µs here); it is entering the blocking pool that is not. The
+    /// opens run back-to-back on a single pool thread, so the batch costs one round-trip in total.
+    async fn read_streams(
+        &self,
+        paths: &[std::path::PathBuf],
+    ) -> Vec<Result<Box<dyn std::io::Read + Send>, ToolError>> {
+        let owned: Vec<std::path::PathBuf> = paths.to_vec();
+        let opened = tokio::task::spawn_blocking(move || {
+            owned
+                .into_iter()
+                .map(|path| {
+                    std::fs::File::open(&path)
+                        .map(|f| Box::new(f) as Box<dyn std::io::Read + Send>)
+                        .map_err(|e| error::io(&error::show(&path), &e))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        match opened {
+            Ok(v) => v,
+            // The pool itself failed, so nothing was opened. Every path reports it, keeping the
+            // one-result-per-path contract the caller indexes against.
+            Err(e) => paths
+                .iter()
+                .map(|_| Err(error::invalid(format!("read_streams: {e}"))))
+                .collect(),
+        }
     }
 
     /// 1:1 with Pi's `fsWriteFile(path, content, "utf-8")` (write.ts:39 / edit.ts:107):
@@ -434,49 +506,74 @@ impl FsOps for LocalFs {
                 drop(builder.add_ignore(path));
             }
 
-            let walker = builder.build();
-            // A per-entry `Err` is a NON-FATAL event on this stream and the walk CONTINUES past
-            // it: `ignore::Walk::next` leaves its iterator intact after yielding one (ignore
-            // 0.4.26 `src/walk.rs:1124-1126`), so valid entries arrive both before and after.
-            // Consumers must never read one as end-of-stream.
-            //
-            // The message is `walk_error_message`'s rendering of the `ignore::Error`, i.e.
-            // ripgrep's own `{path}: {io error}` with the path stated once, e.g.
-            // `/srv/locked: Permission denied (os error 13)`. It is NOT `e.to_string()`:
-            // at ignore 0.4.26 + walkdir 2.5.0 `Display` states the path TWICE — see
-            // `walk_error_message`. No prefix is added here because the two consumers of
-            // this seam want different things from the same value: `find` emulates fd,
-            // which discards it (fd 10.5.0 `src/walk.rs:227-231`, `:500-505`), and `grep`
-            // emulates ripgrep, which reports it as `rg: {path}: {io error}` on stderr.
-            // A `walk: ` prefix matched neither.
-            for result in walker {
-                let item = match result {
-                    Ok(entry) => {
-                        let path = entry.path().to_path_buf();
-                        // One `file_type()` read feeds both flags. `ignore` 0.4.26 derives a
-                        // traversed entry's type from `std::fs::DirEntry::file_type`
-                        // (`walk.rs:322-333`, `:353-367`), which is `lstat` semantics: a symlink
-                        // reports itself as a symlink, so it is neither a dir nor a file and both
-                        // flags are false — exactly the entry ripgrep declines to search. `None`
-                        // occurs only for the synthetic stdin entry (`walk.rs:67-78`), which a
-                        // path-rooted walker never yields, so `unwrap_or(false)` mirrors ripgrep's
-                        // own `file_type().map_or(false, |ft| ft.is_file())`: unknown type is not a
-                        // regular file.
-                        let ty = entry.file_type();
-                        let is_dir = ty.map(|t| t.is_dir()).unwrap_or(false);
-                        let is_file = ty.map(|t| t.is_file()).unwrap_or(false);
-                        Ok(WalkItem {
-                            path,
-                            is_dir,
-                            is_file,
-                        })
+            // The caller's directory prune. `filter_entry` is the ONLY skip handle `ignore`
+            // exposes, and it is honoured identically by `Walk` and `WalkParallel` (ignore 0.4.26
+            // `walk.rs:973-979`, cloned into both at `walk.rs:616,640,1423`), which is what lets
+            // the serial and parallel branches below share one prune and never drift in which
+            // paths they visit. The predicate must be total: it is consulted for FILES too, and a
+            // `false` there would drop the file.
+            if let Some(prune) = opts.prune.clone() {
+                builder.filter_entry(move |e| {
+                    // Depth 0 is the search root and is never prunable. `Walk::skip_entry`
+                    // short-circuits it (`walk.rs:1057-1059`) and `WalkParallel` pushes roots
+                    // before any filter runs (`walk.rs:1355-1400`), so this guard is
+                    // belt-and-braces on both — and load-bearing for any future walker that is
+                    // neither.
+                    if e.depth() == 0 {
+                        return true;
                     }
-                    Err(e) => Err(ToolError::new(walk_error_message(&e))),
-                };
-                if tx.blocking_send(item).is_err() {
-                    break;
-                }
+                    // `DirEntry::is_dir` is `pub(crate)` (`walk.rs:102`), so the type is read
+                    // through `file_type()` exactly as `to_walk_item` does.
+                    if e.file_type().is_some_and(|t| t.is_dir()) {
+                        return !prune.prunes(e.path());
+                    }
+                    true
+                });
             }
+
+            // `--sort=path` / `--sortr=path` force the SERIAL walk. `WalkBuilder::sort_by_file_path`
+            // "is not used in the parallel iterator" (ignore 0.4.26 `walk.rs:899`) and
+            // `WalkParallel` has no sort field at all (`walk.rs:1314-1325`), so a parallel walk
+            // would silently drop the ordering — and with a match cap in force the ordering
+            // decides WHICH matches the caller gets (`ops/mod.rs` `PathSort`). ripgrep resolves it
+            // the same way: "sorting results currently always forces ripgrep to abandon
+            // parallelism and run in a single thread" (`rg --help`, rg 15.1.0).
+            //
+            // Both branches share every setting above, including the `filter_entry` prune, which
+            // `Walk` and `WalkParallel` honour identically — so the two differ in ORDER and
+            // THREADS only, never in which paths they visit.
+            if opts.sort_by_path.is_some() {
+                for result in builder.build() {
+                    if tx.blocking_send(to_walk_item(result)).is_err() {
+                        break;
+                    }
+                }
+                return;
+            }
+
+            // Threads default to `available_parallelism().min(12)` (`walk.rs:1434-1440`) — the
+            // same heuristic ripgrep uses — so `.threads()` is deliberately not called.
+            // `visit()` joins every worker under `std::thread::scope` before returning
+            // (`walk.rs:1406-1430`): no thread outlives this `spawn_blocking` task.
+            builder.build_parallel().run(|| {
+                let tx = tx.clone();
+                Box::new(move |result| {
+                    // `blocking_send` — these are `std::thread::scope` threads with no tokio
+                    // runtime context, so the bounded channel keeps applying back-pressure
+                    // instead of panicking. A closed receiver means the consumer hit its cap or
+                    // was cancelled, so `Quit` (not `Continue`) stops every remaining thread at
+                    // once; a dropped receiver also makes an already-parked `blocking_send`
+                    // return `Err` rather than hang.
+                    //
+                    // Nothing in here can panic: no `unwrap`, no indexing. `WalkParallel::visit`
+                    // joins with `handle.join().unwrap()`, so a panicking visitor would surface
+                    // as a panic in this blocking task.
+                    match tx.blocking_send(to_walk_item(result)) {
+                        Ok(()) => ignore::WalkState::Continue,
+                        Err(_) => ignore::WalkState::Quit,
+                    }
+                })
+            });
         });
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }

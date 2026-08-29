@@ -106,6 +106,42 @@ impl FsOps for TraversalFs {
         self.inner.read_stream(&p).await
     }
 
+    /// The batch form of the method above, and it carries the same obligation: EVERY path is
+    /// confined here, before anything is opened. A path that fails confinement takes its own slot
+    /// in the result and does not stop the rest — the caller already treats a per-path `Err` as
+    /// "skip this file".
+    ///
+    /// Overriding is not optional for correctness (the trait default routes through
+    /// `self.read_stream`, so it would confine anyway) — it is what keeps the batch to one hop.
+    async fn read_streams(
+        &self,
+        paths: &[std::path::PathBuf],
+    ) -> Vec<Result<Box<dyn std::io::Read + Send>, ToolError>> {
+        let mut confined = Vec::with_capacity(paths.len());
+        let mut verdicts = Vec::with_capacity(paths.len());
+        for path in paths {
+            match self.confine(path) {
+                Ok(p) => {
+                    verdicts.push(Ok(confined.len()));
+                    confined.push(p);
+                }
+                Err(e) => verdicts.push(Err(e)),
+            }
+        }
+        let mut opened = self.inner.read_streams(&confined).await.into_iter();
+        // `opened` is indexed by position among the CONFINED paths, so it is walked in step with
+        // the verdicts rather than by the caller's index.
+        verdicts
+            .into_iter()
+            .map(|v| match v {
+                Ok(_) => opened
+                    .next()
+                    .unwrap_or_else(|| Err(crate::error::invalid("read_streams: short result"))),
+                Err(e) => Err(e),
+            })
+            .collect()
+    }
+
     async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
         let p = self.confine(path)?;
         self.inner.write_in_place(&p, bytes).await

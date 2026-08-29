@@ -181,6 +181,18 @@ impl FsOps for ProtectedFs {
         self.inner.read_stream(path).await
     }
 
+    /// Batch form, forwarded for the same reason and with the same (absent) guard as
+    /// [`Self::read_stream`]: `ProtectedFs` restricts MUTATION only. Named explicitly rather than
+    /// left to the trait default because the default would re-enter `self.read_stream` per path
+    /// and give back the per-file hop this method exists to remove — the silent-delegation hazard
+    /// described above, in its performance form.
+    async fn read_streams(
+        &self,
+        paths: &[std::path::PathBuf],
+    ) -> Vec<Result<Box<dyn std::io::Read + Send>, ToolError>> {
+        self.inner.read_streams(paths).await
+    }
+
     async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
         self.deny_if_protected(path)?;
         self.inner.write_in_place(path, bytes).await

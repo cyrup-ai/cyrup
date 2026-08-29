@@ -4,13 +4,14 @@
 
 use crate::config::GrepOpts;
 use crate::ops::cancel_read::{CancelReader, Cancelled};
-use crate::ops::{FsOps, WalkFlavor, WalkOpts};
+use crate::ops::{FsOps, PathSort, WalkFlavor, WalkOpts};
 use crate::tools::globmatch::{RgGlob, to_posix};
 use crate::tools::rgconfig::{self, CaseMode, RgFlags};
 use crate::truncate::{GREP_MAX_LINE_LENGTH, TruncOpts, format_size, truncate_head, truncate_line};
 use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Encoding, Searcher, SearcherBuilder, Sink, SinkMatch};
 use std::path::PathBuf;
@@ -211,56 +212,68 @@ impl GrepTool {
     /// Pi gathers raw matches first (no context in the searcher), then formats each match as an
     /// independent re-read block; mirror that so overlapping windows duplicate shared context
     /// lines exactly as Pi does (`formatBlock`, grep.ts:255-273).
+    /// Search a BATCH of candidates: one seam call to open them all, one `spawn_blocking`, one
+    /// `Searcher` reused across every file in the batch.
+    ///
+    /// Batching is the point of this function, and it is a measured one. Per file the old shape
+    /// paid TWO `spawn_blocking` round-trips — [`FsOps::read_stream`] does one just to reach
+    /// `File::open`, then the search did its own — strictly ordered, because the open has to
+    /// finish before the search starts. On a 1,885-entry tree that is ~3,770 round-trips at ~31µs,
+    /// ~30ms of scheduler time against ~2.9ms of real `open(2)` work and ~21ms of real searching.
+    /// Running several of those per-file futures at once does not remove the round-trips; only
+    /// batching does. Measured end to end on `crates/`: ~75ms → ~18ms.
+    ///
+    /// The `Searcher` is built ONCE here rather than per file. It is `!Sync` (three `RefCell`s,
+    /// grep-searcher 0.1.16 `searcher/mod.rs:597-624`) so it can never be shared across threads,
+    /// but it is perfectly reusable within one blocking task, and `search_reader` takes `&mut
+    /// self`. That is worth ~3ms per full-tree scan on its own.
+    ///
+    /// Every candidate in a batch shares one `binary` mode, which is what makes one searcher
+    /// legal: the caller batches walk-discovered files, and those are all implicit. The explicit
+    /// path arrives as a batch of one.
     #[allow(clippy::too_many_arguments)]
-    async fn search_one(
+    async fn search_batch(
         &self,
-        file: &std::path::Path,
-        rel: &str,
+        // Owned `(path, rel)`, not borrowed. This future is pushed into a `FuturesUnordered` and
+        // outlives the loop iteration that built the batch, so it cannot hold a `&` to that
+        // iteration's `WalkItem`. Everything else it borrows (`self`, `matcher`, `cancel`, `rg`,
+        // `encoding`) is declared ABOVE the loop and outlives every future, so those stay borrows
+        // and no `Arc` is needed.
+        files: Vec<(PathBuf, String)>,
         matcher: &grep_regex::RegexMatcher,
-        // Observed at BOTH `await` points below and, via `CancelReader` and `MatchSink`, inside
-        // the blocking search itself. `Err(error::aborted())` here propagates through the `?` at
-        // each call site and out of `execute`, matching Pi's `Operation aborted` rejection.
+        // Observed at every `await` below and, via `CancelReader` and `MatchSink`, inside the
+        // blocking search itself — and now also BETWEEN files of a batch, which is the one new
+        // abort edge batching introduces.
         cancel: &CancelToken,
-        // ripgrep chooses binary detection PER HAYSTACK, not per invocation: a path the user named
-        // gets one mode, a path found by traversal gets another (`hiargs.rs:1124-1157`, handed to
-        // the worker as `binary_detection_explicit` / `binary_detection_implicit` at
-        // `hiargs.rs:696-697`). The caller classifies the candidate; this function just uses what
-        // it was given.
+        // ripgrep chooses binary detection PER HAYSTACK, not per invocation (`hiargs.rs:1124-1157`).
+        // The caller classifies the candidates; a batch is uniform by construction.
         binary: BinaryDetection,
-        // Config-derived searcher settings (`$RIPGREP_CONFIG_PATH`). `-v/--invert-match` and
-        // `-m/--max-count` are read off `rg`; `-E/--encoding` arrives pre-parsed because
-        // `Encoding::new` is fallible and must not be re-run per candidate.
         rg: &RgFlags,
         encoding: Option<&Encoding>,
         context: usize,
+        // The GLOBAL match cap, applied per file. With searches in flight concurrently there is no
+        // exact remaining budget at dispatch time, so each file is capped at the most any single
+        // file could contribute and the excess is trimmed deterministically at render.
+        // `-m/--max-count` stays on the searcher and stays independent — see `max_matches` below.
         limit: usize,
-        count: &mut usize,
-        out: &mut Vec<String>,
-        any_line_truncated: &mut bool,
-    ) -> Result<(), ToolError> {
-        // Pi never materializes the candidate in the agent process: the search runs in a separate
-        // ripgrep child (`spawn(rgPath, args, …)`, grep.ts:226) with rg's own bounded read buffer,
-        // so file size is decoupled from the agent's heap. cyrup's search is in-process (the
-        // declared `ignore`/`grep-searcher` delta, module doc above), so the same property comes
-        // from [`FsOps::read_stream`] + `search_reader`. A full `FsOps::read` here allocated the
-        // whole file BEFORE binary detection could reject it — one multi-GB log, database dump or
-        // vendored tarball in the tree was an RSS spike or an OOM kill of the session, on a file
-        // that need not match at all. A read failure is skipped, exactly as before: rg simply
-        // emits no match events for a file it cannot open.
+    ) -> Result<Vec<(PathBuf, Vec<MatchBlock>)>, ToolError> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Pi never materializes a candidate in the agent process: the search runs in a separate
+        // ripgrep child (grep.ts:226) with rg's own bounded read buffer, so file size is decoupled
+        // from the agent's heap. cyrup's search is in-process, so the same property comes from
+        // [`FsOps::read_streams`] + `search_reader`. A full `FsOps::read` here allocated the whole
+        // file BEFORE binary detection could reject it — one multi-GB log or vendored tarball in
+        // the tree was an RSS spike or an OOM kill, on a file that need not match at all.
         //
-        // A cancel landing while the open is in flight must not wait for the open to finish — a
-        // remote/RPC `FsOps` can park here for a long time. `run_until_cancelled` returns `None`
-        // immediately when the token is ALREADY cancelled (tokio-util 0.7.18
-        // `sync/cancellation_token.rs:280-293`), so this doubles as the entry guard, and otherwise
-        // drops the open future the moment the token fires.
-        //
-        // `None` is an abort; a `Some(Err(_))` is still the pre-existing skip: rg simply emits no
-        // match events for a file it cannot open.
-        let Some(opened) = cancel.run_until_cancelled(self.fs.read_stream(file)).await else {
+        // A cancel landing while the opens are in flight must not wait for them — a remote/RPC
+        // `FsOps` can park here. `run_until_cancelled` returns `None` immediately when the token is
+        // ALREADY cancelled (tokio-util 0.7.18 `sync/cancellation_token.rs:280-293`), so this
+        // doubles as the entry guard.
+        let paths: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+        let Some(opened) = cancel.run_until_cancelled(self.fs.read_streams(&paths)).await else {
             return Err(error::aborted());
-        };
-        let Ok(reader) = opened else {
-            return Ok(());
         };
 
         // Binary detection is the caller's choice (the `binary` parameter above); this note is only
@@ -275,26 +288,17 @@ impl GrepTool {
         // memory-maps exactly this case (one path, `is_file()` — `hiargs.rs:233-244`), and
         // `convert` is documented as having NO EFFECT under a memory map
         // (grep-searcher-0.1.16 `searcher/mod.rs:88-94`): the bytes reach the sink untouched and
-        // line numbers stay the file's raw `\n` numbering. cyrup always uses `search_reader`
-        // (`FsOps::read_stream` above), the branch where `convert` DOES fire and rewrites every
-        // NUL to the line terminator (`line_buffer.rs:448-460`) — which shifts every line number
-        // after the first NUL. `none()` is the reader-side mode that reproduces what Pi observes,
-        // byte for byte, and it keeps the searcher's numbering in agreement with the raw
-        // `\n`-split re-read that the context / non-UTF-8 blocks below are cut from.
+        // line numbers stay the file's raw `\n` numbering. cyrup always uses `search_reader`, the
+        // branch where `convert` DOES fire and rewrites every NUL to the line terminator
+        // (`line_buffer.rs:448-460`) — which shifts every line number after the first NUL.
+        // `none()` is the reader-side mode that reproduces what Pi observes, byte for byte, and it
+        // keeps the searcher's numbering in agreement with the raw `\n`-split re-read that the
+        // context / non-UTF-8 blocks below are cut from.
         //
         // `grep-searcher`'s own default is also `none()`, but it must not be relied on implicitly:
         // it would apply to the walk too, dumping raw bytes of every PNG/wasm/font/sqlite hit in
         // the tree into the model-facing result.
-        //
-        // The searcher is built per file rather than hoisted because `search_reader` is a
-        // BLOCKING API driven from `spawn_blocking` (see [`FsOps::read_stream`]), so it and the
-        // reader must be owned by the blocking task.
         let matcher_owned = matcher.clone();
-        // `MatchSink` counts against the REMAINING budget; the caller's global `count` is advanced
-        // by however many this file contributed. Pi's cap is global too — its line handler ignores
-        // every event once `matchCount >= effectiveLimit` (grep.ts:278) — so a file can only ever
-        // fill the gap.
-        let remaining = limit.saturating_sub(*count);
         // The token is moved INTO the blocking task rather than polled from outside it: a
         // `spawn_blocking` task owns an OS thread and cannot be aborted by dropping its
         // `JoinHandle`, so the only way out of `search_reader` is for the work itself to fail.
@@ -304,7 +308,7 @@ impl GrepTool {
         let invert = rg.invert_match;
         let max_count = rg.max_count;
         let encoding = encoding.cloned();
-        let searched: Result<Vec<(u64, Vec<u8>)>, Aborted> =
+        let searched: Result<Vec<FileMatches>, Aborted> =
             tokio::task::spawn_blocking(move || {
                 let mut searcher: Searcher = SearcherBuilder::new()
                     .line_number(true)
@@ -313,144 +317,239 @@ impl GrepTool {
                     // `-m/--max-count` is ripgrep's PER-FILE cap, a different axis from pi's
                     // GLOBAL `limit`: rg stops reading each haystack after N matches and moves on
                     // to the next file, whereas `limit` ends the whole search. So it belongs on
-                    // the searcher and not folded into `remaining` above — the sink keeps
-                    // enforcing the global budget, and both caps apply independently.
+                    // the searcher and not folded into the sink's budget — both caps apply
+                    // independently, and reusing one searcher across the batch does not change
+                    // that: `max_matches` is re-applied per `search_reader` call.
                     .max_matches(max_count)
                     // `None` is grep-searcher's "sniff the BOM, else assume UTF-8" default, so an
                     // absent `-E` leaves the existing behaviour exactly as it was.
                     .encoding(encoding)
                     .build();
-                let mut matches: Vec<(u64, Vec<u8>)> = Vec::new();
-                let mut local = 0usize;
-                let outcome = {
-                    let sink = MatchSink {
-                        matches: &mut matches,
-                        count: &mut local,
-                        limit: remaining,
-                        cancel: cancel_task.clone(),
+                let mut per_file: Vec<FileMatches> = Vec::with_capacity(opened.len());
+                for reader in opened {
+                    // The abort edge batching adds. Within a file `CancelReader` and `MatchSink`
+                    // still observe the token; without this check a cancelled search would keep
+                    // grinding through the REST of the batch before anything noticed.
+                    if cancel_task.is_cancelled() {
+                        return Err(Aborted);
+                    }
+                    // A file that could not be opened contributes nothing and does not stop the
+                    // batch: rg emits no match events for a file it cannot read. Its slot is kept
+                    // so `per_file` stays index-aligned with `files`.
+                    let Ok(reader) = reader else {
+                        per_file.push(Vec::new());
+                        continue;
                     };
-                    searcher.search_reader(
-                        &matcher_owned,
-                        CancelReader::new(reader, cancel_task),
-                        sink,
-                    )
-                };
-                match outcome {
-                    // The searcher's error is no longer thrown away wholesale: a cancel marker is an
-                    // abort, and EVERY other `io::Error` keeps the previous `let _ = …` semantics —
-                    // whatever was collected before the failure stands and the walk moves on, because
-                    // rg emits no match events for a file it cannot read.
-                    Err(e) if Cancelled::is(&e) => Err(Aborted),
-                    _ => Ok(matches),
+                    let mut matches: FileMatches = Vec::new();
+                    let mut local = 0usize;
+                    let outcome = {
+                        let sink = MatchSink {
+                            matches: &mut matches,
+                            count: &mut local,
+                            limit,
+                            cancel: cancel_task.clone(),
+                        };
+                        searcher.search_reader(
+                            &matcher_owned,
+                            CancelReader::new(reader, cancel_task.clone()),
+                            sink,
+                        )
+                    };
+                    // A cancel marker is an abort for the whole batch; EVERY other `io::Error`
+                    // keeps the previous per-file semantics — whatever was collected before the
+                    // failure stands and the walk moves on.
+                    if let Err(e) = &outcome
+                        && Cancelled::is(e)
+                    {
+                        return Err(Aborted);
+                    }
+                    per_file.push(matches);
                 }
+                Ok(per_file)
             })
             .await
             .map_err(|e| error::invalid(format!("grep: {e}")))?;
 
-        let Ok(matches) = searched else {
+        let Ok(per_file) = searched else {
             return Err(error::aborted());
         };
 
-        if matches.is_empty() {
-            return Ok(());
-        }
-        *count += matches.len();
-
-        // Which matches take Pi's `formatBlock` path (grep.ts:333-335) rather than the direct
-        // `match.lineText` path (grep.ts:323-331)? Pi's condition is
-        // `contextValue === 0 && match.lineText !== undefined`, and `lineText` is
-        // `event.data.lines.text` — ABSENT whenever ripgrep could not encode the line as UTF-8
-        // (it serialises `lines.bytes` instead). So: context>0, or a non-UTF-8 matched line.
-        let takes_block = |raw: &[u8]| context > 0 || std::str::from_utf8(raw).is_err();
-        // `formatBlock` reads through `getFileLines`, a **second, independent** read of the file
-        // (grep.ts:206-218) — ripgrep's own read was a different process against the real
-        // filesystem — cached for the rest of the invocation by `fileCache`. Do it at most once
-        // per file, and ONLY if some match actually needs it, so that at context==0 the file is
-        // never re-read (Pi does not) yet the read-your-latest-writes semantics and the failure
-        // path below stay reachable exactly where Pi has them. Pi's own `fileCache` is moot here:
-        // each candidate is now visited exactly once.
-        //
-        // `None` is Pi's `catch { lines = [] }` (grep.ts:212-214). A successfully-read EMPTY
-        // file is NOT that case — `"".split("\n")` is `[""]`, length 1. This one IS a whole-file
-        // read on both sides, and pi pays it too — but only for a file that ACTUALLY MATCHED and
-        // only on the `contextValue > 0` / non-UTF-8 path.
-        let src_lines: Option<Vec<String>> = if matches.iter().any(|(_, r)| takes_block(r)) {
+        let mut out: Vec<(PathBuf, Vec<MatchBlock>)> = Vec::new();
+        for ((path, rel), matches) in files.into_iter().zip(per_file) {
+            // A file that matched nothing contributes no rows and cannot affect the order of the
+            // ones that did, so it is dropped HERE rather than carried to the caller's sort. On a
+            // search whose pattern is rare or absent — the case this task targets — that is very
+            // nearly every file in the tree.
+            if matches.is_empty() {
+                continue;
+            }
+            // Which matches take Pi's `formatBlock` path (grep.ts:333-335) rather than the direct
+            // `match.lineText` path (grep.ts:323-331)? Pi's condition is
+            // `contextValue === 0 && match.lineText !== undefined`, and `lineText` is
+            // `event.data.lines.text` — ABSENT whenever ripgrep could not encode the line as UTF-8
+            // (it serialises `lines.bytes` instead). So: context>0, or a non-UTF-8 matched line.
+            let takes_block = |raw: &[u8]| context > 0 || std::str::from_utf8(raw).is_err();
+            // `formatBlock` reads through `getFileLines`, a **second, independent** read of the
+            // file (grep.ts:206-218), cached for the rest of the invocation by `fileCache`. Do it
+            // at most once per file, and ONLY if some match actually needs it, so that at
+            // context==0 the file is never re-read (Pi does not) yet the read-your-latest-writes
+            // semantics and the failure path below stay reachable exactly where Pi has them. Pi's
+            // own `fileCache` is moot here: each candidate is visited exactly once.
+            //
             // This is a WHOLE-FILE read of a file that already matched — on a multi-hundred-MB
             // candidate it is the second place a cancel could be stranded, so it is raced too.
             // `Err(_)` stays Pi's `catch { lines = [] }` (grep.ts:212-214); only a `None` — the
             // token firing — aborts.
-            let Some(read) = cancel.run_until_cancelled(self.fs.read(file)).await else {
-                return Err(error::aborted());
-            };
-            match read {
-                // Pi `getFileLines` folds `\r\n`→`\n` AND lone `\r`→`\n` BEFORE splitting
-                // (grep.ts:211). The matcher numbered lines on raw `\n`, so a file using
-                // lone-`\r` separators yields context blocks that key off these folded segments
-                // — matching Pi even where that diverges from the matcher's numbering.
-                Ok(b) => {
-                    let content = String::from_utf8_lossy(&b);
-                    let folded = content.replace("\r\n", "\n").replace('\r', "\n");
-                    Some(folded.split('\n').map(str::to_owned).collect())
+            let src_lines: Option<Vec<String>> = if matches.iter().any(|(_, r)| takes_block(r)) {
+                let Some(read) = cancel.run_until_cancelled(self.fs.read(&path)).await else {
+                    return Err(error::aborted());
+                };
+                match read {
+                    // Pi `getFileLines` folds `\r\n`→`\n` AND lone `\r`→`\n` BEFORE splitting
+                    // (grep.ts:211). The matcher numbered lines on raw `\n`, so a file using
+                    // lone-`\r` separators yields context blocks that key off these folded
+                    // segments — matching Pi even where that diverges from the matcher's numbering.
+                    Ok(b) => {
+                        let content = String::from_utf8_lossy(&b);
+                        let folded = content.replace("\r\n", "\n").replace('\r', "\n");
+                        Some(folded.split('\n').map(str::to_owned).collect())
+                    }
+                    Err(_) => None,
                 }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-        for (ln, raw) in &matches {
-            let l = *ln as usize;
-            if !takes_block(raw) {
-                // Pi grep.ts:325-331: format straight from the captured line text —
-                // `\r\n`→`\n`, then DROP every remaining `\r` (not fold it to `\n`, which is
-                // what `getFileLines` does), then strip ONE trailing `\n`.
-                let stripped = String::from_utf8_lossy(raw)
-                    .replace("\r\n", "\n")
-                    .replace('\r', "");
-                let text = stripped.strip_suffix('\n').unwrap_or(&stripped);
-                let (capped, tr) = truncate_line(text, GREP_MAX_LINE_LENGTH);
-                if tr {
-                    *any_line_truncated = true;
-                }
-                out.push(format!("{rel}:{l}: {capped}"));
-                continue;
-            }
-            // Pi `formatBlock`: an unreadable file collapses the whole block to ONE marker row
-            // per match (grep.ts:258). The rows still count as output, so they participate in
-            // byte truncation like any other line.
-            let Some(src_lines) = src_lines.as_ref() else {
-                out.push(format!("{rel}:{l}: (unable to read file)"));
-                continue;
-            };
-            // Pi: `start = max(1, n - context)`, `end = min(lines.length, n + context)` when
-            // context > 0, else just the single match line (grep.ts:260-261).
-            let (start, end) = if context > 0 {
-                (
-                    l.saturating_sub(context).max(1),
-                    (l + context).min(src_lines.len()),
-                )
             } else {
-                (l, l)
+                None
             };
-            for current in start..=end {
-                let raw = src_lines
-                    .get(current.saturating_sub(1))
-                    .map_or("", String::as_str);
-                // Pi's per-line `replace(/\r/g,"")` (grep.ts:264).
-                let text = raw.replace('\r', "");
-                let (capped, tr) = truncate_line(&text, GREP_MAX_LINE_LENGTH);
-                if tr {
-                    *any_line_truncated = true;
-                }
-                if current == l {
-                    out.push(format!("{rel}:{current}: {capped}"));
-                } else {
-                    out.push(format!("{rel}-{current}- {capped}"));
-                }
-            }
+            out.push((path, render_blocks(&rel, &matches, src_lines.as_ref(), context)));
         }
-        Ok(())
+        Ok(out)
     }
 }
+
+/// Turn one file's raw matches into one [`MatchBlock`] per match.
+///
+/// Split out of the search so the batch loop above reads as open → search → render, and so the
+/// per-match formatting stays one thing rather than being interleaved with I/O.
+///
+/// **One block per match, always** — including the one-row `(unable to read file)` marker, which
+/// pi counts as an emitted match — so `blocks.len()` IS the file's match count and the caller's
+/// cap keeps counting the axis pi counts on.
+fn render_blocks(
+    rel: &str,
+    matches: &[(u64, Vec<u8>)],
+    src_lines: Option<&Vec<String>>,
+    context: usize,
+) -> Vec<MatchBlock> {
+    let takes_block = |raw: &[u8]| context > 0 || std::str::from_utf8(raw).is_err();
+    let mut blocks: Vec<MatchBlock> = Vec::with_capacity(matches.len());
+    for (ln, raw) in matches {
+        let l = *ln as usize;
+        // `rows` is what this match renders to — one row at `context == 0`, or pi's
+        // `2·context+1`-line window — and `line_truncated` describes only these rows, so a block
+        // the cap later drops cannot raise the notice.
+        let mut rows: Vec<String> = Vec::new();
+        let mut line_truncated = false;
+        if !takes_block(raw) {
+            // Pi grep.ts:325-331: format straight from the captured line text — `\r\n`→`\n`, then
+            // DROP every remaining `\r` (not fold it to `\n`, which is what `getFileLines` does),
+            // then strip ONE trailing `\n`.
+            let stripped = String::from_utf8_lossy(raw)
+                .replace("\r\n", "\n")
+                .replace('\r', "");
+            let text = stripped.strip_suffix('\n').unwrap_or(&stripped);
+            let (capped, tr) = truncate_line(text, GREP_MAX_LINE_LENGTH);
+            if tr {
+                line_truncated = true;
+            }
+            rows.push(format!("{rel}:{l}: {capped}"));
+            blocks.push(MatchBlock {
+                rows,
+                line_truncated,
+            });
+            continue;
+        }
+        // Pi `formatBlock`: an unreadable file collapses the whole block to ONE marker row per
+        // match (grep.ts:258). The rows still count as output, so they participate in byte
+        // truncation like any other line.
+        let Some(src_lines) = src_lines else {
+            rows.push(format!("{rel}:{l}: (unable to read file)"));
+            blocks.push(MatchBlock {
+                rows,
+                line_truncated,
+            });
+            continue;
+        };
+        // Pi: `start = max(1, n - context)`, `end = min(lines.length, n + context)` when
+        // context > 0, else just the single match line (grep.ts:260-261).
+        let (start, end) = if context > 0 {
+            (
+                l.saturating_sub(context).max(1),
+                (l + context).min(src_lines.len()),
+            )
+        } else {
+            (l, l)
+        };
+        for current in start..=end {
+            let raw = src_lines
+                .get(current.saturating_sub(1))
+                .map_or("", String::as_str);
+            // Pi's per-line `replace(/\r/g,"")` (grep.ts:264).
+            let text = raw.replace('\r', "");
+            let (capped, tr) = truncate_line(&text, GREP_MAX_LINE_LENGTH);
+            if tr {
+                line_truncated = true;
+            }
+            if current == l {
+                rows.push(format!("{rel}:{current}: {capped}"));
+            } else {
+                rows.push(format!("{rel}-{current}- {capped}"));
+            }
+        }
+        blocks.push(MatchBlock {
+            rows,
+            line_truncated,
+        });
+    }
+    blocks
+}
+
+/// The rows one MATCH renders to: exactly one at `context == 0`, or the `2·context+1`-line block
+/// pi's `formatBlock` emits (grep.ts:250-268).
+///
+/// Grouped per match rather than flattened because the global cap counts MATCHES, so a file that
+/// overshoots must be trimmed at a match boundary — and with searches running concurrently a file
+/// CAN overshoot: each is capped at the global `limit` because no exact remaining budget exists at
+/// dispatch time.
+struct MatchBlock {
+    rows: Vec<String>,
+    /// Whether any row in this block hit `GREP_MAX_LINE_LENGTH`. Per-block so the
+    /// `Some lines truncated` notice describes only rows that were actually EMITTED — a block
+    /// dropped by the cap must not raise it.
+    line_truncated: bool,
+}
+
+/// Appends blocks until the GLOBAL match cap is reached, counting MATCHES (not rows) — the axis
+/// pi counts on (grep.ts:278-292), and the axis `count >= limit` is tested on at every consumer.
+fn take_into(
+    out: &mut Vec<String>,
+    count: &mut usize,
+    any_line_truncated: &mut bool,
+    limit: usize,
+    blocks: Vec<MatchBlock>,
+) {
+    for b in blocks {
+        if *count >= limit {
+            return;
+        }
+        *count += 1;
+        *any_line_truncated |= b.line_truncated;
+        out.extend(b.rows);
+    }
+}
+
+/// One file's raw matches: the 1-based line number and the raw bytes of each matching line, in
+/// the order the searcher produced them. Named because a batch carries one of these per file and
+/// the nested shape is otherwise unreadable at the call site.
+type FileMatches = Vec<(u64, Vec<u8>)>;
 
 /// The blocking search stopped because the token fired, not because the file ended.
 struct Aborted;
@@ -698,6 +797,38 @@ impl Tool for GrepTool {
         let cfg_override = rgconfig::build_override(&self.cwd, &rg);
         let cfg_types = rgconfig::build_types(&rg);
 
+        // `RgGlob` is not `Clone`, and both the prune predicate below and the per-file filter in
+        // the walk loop need it, so it is shared by `Arc` rather than duplicated.
+        let glob = glob.map(Arc::new);
+        let cfg_override = cfg_override.map(Arc::new);
+
+        // The walker-side replacement for the old `pruned: Vec<PathBuf>` post-hoc filter. That
+        // filter was sound only because `ignore::Walk` is pre-order — a directory always arrived
+        // before its contents — which a parallel walk does not guarantee. Registered through
+        // `WalkBuilder::filter_entry` it is order-independent, and it is what ripgrep does.
+        //
+        // ripgrep evaluates the override for directories too (ignore `dir.rs:416-425`) and an
+        // Ignore verdict takes the whole subtree; a plain (non-`!`) glob that merely MISSES does
+        // not prune, because `Override::matched` guards its whitelist-miss fallback with `!is_dir`
+        // (`overrides.rs:106`). `--type`/`--type-not` never prune: `Types::matched` returns `None`
+        // for a directory, so a `-t rust` config must still descend into directories that do not
+        // look like Rust to reach the `.rs` files inside them.
+        let prune = (glob.is_some() || cfg_override.is_some()).then(|| {
+            let glob = glob.clone();
+            let cfg_override = cfg_override.clone();
+            let cwd = self.cwd.clone();
+            crate::ops::PruneDirs::new(move |dir: &std::path::Path| {
+                // Same relativisation as the file filter below: the glob is anchored at the
+                // OVERRIDE ROOT — ripgrep's own cwd — not at the search root, because pi spawns
+                // `rg` with no `cwd` option and passes `searchPath` positionally (grep.ts:224).
+                let rel = dir.strip_prefix(&cwd).map_or_else(|_| to_posix(dir), to_posix);
+                glob.as_ref().is_some_and(|g| g.prunes_dir(&rel))
+                    || cfg_override
+                        .as_ref()
+                        .is_some_and(|o| o.matched(&rel, true).is_ignore())
+            })
+        });
+
         // ripgrep's two detection modes, one per candidate class (`hiargs.rs:1141-1157` with Pi's
         // flag set). The explicit one is `none()` and NOT `convert(b'\x00')` on purpose — see the
         // note in `search_one`.
@@ -726,21 +857,27 @@ impl Tool for GrepTool {
             // `meta.is_file` IS ripgrep's explicit rule: `Haystack::is_explicit()` is "depth 0 and
             // not a directory", i.e. a path handed to `rg` on the command line — which is what
             // Pi's `path` argument becomes (grep.ts:224). ripgrep never filters such a file out.
-            self.search_one(
-                &search_root,
-                &rel,
-                &matcher,
-                &cancel,
-                binary_explicit,
-                &rg,
-                encoding.as_ref(),
-                context,
-                limit,
-                &mut count,
-                &mut out,
-                &mut any_line_truncated,
-            )
-            .await?;
+            let searched = self
+                .search_batch(
+                    vec![(search_root.clone(), rel)],
+                    &matcher,
+                    &cancel,
+                    binary_explicit,
+                    &rg,
+                    encoding.as_ref(),
+                    context,
+                    limit,
+                )
+                .await?;
+            for (_, blocks) in searched {
+                take_into(
+                    &mut out,
+                    &mut count,
+                    &mut any_line_truncated,
+                    limit,
+                    blocks,
+                );
+            }
         } else {
             // Pi runs plain `rg --hidden` with NO `--no-require-git` flag (grep.ts:215-219): search
             // dotfiles/dot-dirs, but honor `.gitignore` only *inside* a git repo — ripgrep's default,
@@ -755,16 +892,11 @@ impl Tool for GrepTool {
             // `killedDueToLimit` (grep.ts:240-245, :291-295) and that flag short-circuits the
             // guard. So the error is REMEMBERED here and decided after the loop; returning at the
             // first one would stop the walk and make the limit unreachable, failing calls pi
-            // answers successfully. First error only — pi reports rg's whole stderr, but rg's
-            // parallel walk does not order it against ours, so the first is the only stable
-            // choice.
-            let mut walk_error: Option<ToolError> = None;
-            // Directory roots the override PRUNED. `ignore::Walk` prunes internally with
-            // `skip_current_dir()` on a private iterator and exposes no skip handle to a consumer
-            // (walk.rs:1131-1145), so the prune is reproduced here: the walk is pre-order, so a
-            // directory always arrives before its contents, and every later item beneath a pruned
-            // root is dropped. Same paths searched, same paths excluded, same match cap.
-            let mut pruned: Vec<PathBuf> = Vec::new();
+            // answers successfully. Which one is reported used to be "the first", on the ground
+            // that rg's parallel walk does not order its stderr against ours — but OUR walk is
+            // parallel now too, so arrival order is no longer stable on either side. They are
+            // collected and the lexicographically smallest is taken; the message is
+            // `{path}: {os error}`, so that is path order, and it is the same on every run.
             let mut walk = self.fs.walk(
                 &search_root,
                 WalkOpts {
@@ -818,32 +950,162 @@ impl Tool for GrepTool {
                         })
                         .collect(),
                     sort_by_path: rg.sort_path,
+                    prune,
                 },
             );
+            // ripgrep's own default and `WalkParallel`'s (ignore `walk.rs:1434-1440`): keep walk
+            // and search at the same width so neither starves the other.
+            // ripgrep's own default and `WalkParallel`'s (ignore `walk.rs:1434-1440`): keep walk
+            // and search at the same width so neither starves the other.
+            let concurrency = std::thread::available_parallelism().map_or(1, |n| n.get()).min(12);
+            // Candidates waiting to be dispatched as one batch. Batching is what removes the
+            // per-file `spawn_blocking` round-trips — see [`Self::search_batch`].
+            let mut pending: Vec<(PathBuf, String)> = Vec::new();
+            // Batch size is derived from the OBSERVED match density, not ramped on a fixed
+            // schedule, and that is a correctness property of the common case rather than a tuning
+            // nicety. Over-dispatching costs real work: every file in a batch is opened and
+            // searched even if the cap was already reachable without it. A `grep` for a frequent
+            // pattern at the default `limit: 100` finishes inside the first file or two, so a
+            // fixed ramp to 32 turned a ~1.6ms search into ~2.7ms — a regression on the single
+            // most common call this tool gets.
+            //
+            // So: once anything has matched, estimate how many files are still needed to fill the
+            // remaining budget (`remaining ÷ matches-per-file`), spread that across the in-flight
+            // width, and batch that much. A dense pattern computes 1 and behaves exactly like the
+            // unbatched shape; a sparse one computes thousands and clamps to `MAX_BATCH`, which is
+            // where the hop amortisation lives. Before anything has matched there is no density to
+            // measure and no budget being spent, so go straight to the maximum.
+            const MAX_BATCH: usize = 32;
+            let mut batch_size = 1usize;
+            // Candidates handed to `search_batch`, the denominator of that density. Counted at
+            // DISPATCH rather than completion, so it includes files still in flight; that
+            // understates density slightly and errs toward larger batches, which is the safe
+            // direction — the estimate only has to be right to an order of magnitude.
+            let mut dispatched = 0usize;
+            let mut inflight = FuturesUnordered::new();
+            // Keyed by path so the render order is decided by the path comparator below, never by
+            // completion order. `PathBuf` and not the rendered `rel`: `Path::cmp` compares
+            // COMPONENTS, which is the only ordering stable across runs and platforms.
+            let mut collected: Vec<(PathBuf, Vec<MatchBlock>)> = Vec::new();
+            // EVERY walk error, not the first. `grep` used to keep the first on the ground that
+            // "rg's parallel walk does not order it against ours, so the first is the only stable
+            // choice" — but now OUR walk is parallel too, so "first" is no longer stable either.
+            // The smallest is taken after the loop; the message is `{path}: {os error}`, so that
+            // is path order. Small — one per unreadable directory.
+            let mut walk_errors: Vec<String> = Vec::new();
+            // Matches from COMPLETED batches only. No atomic and no lock: the dispatch loop is a
+            // single async task and `FuturesUnordered` is polled from it, so this is plain
+            // single-threaded state even though the searches themselves are not.
+            let mut found = 0usize;
+            let mut walk_done = false;
+
             loop {
-                // The walk and the search are FUSED, and both stop at the limit. Pi's line handler
-                // sets `matchLimitReached` and calls `stopChild(true)` (grep.ts:292-295, defined at
-                // `:240-245`) the instant `matchCount >= effectiveLimit`, which kills the rg child
-                // — so upstream neither finishes the traversal nor reads another file. Staging the
-                // whole walk into a `Vec`, sorting it, and only then searching cost a complete
-                // tree walk on EVERY call regardless of `limit`, and took the 100-match window
-                // from the alphabetically-first files rather than from the first matches
-                // discovered — a systematic `a*`-biased sample with nothing in the output to
-                // distinguish it. `grep -n sort grep.ts` is empty at v0.84.1, so the sort is
-                // dropped rather than moved.
-                if count >= limit {
+                // Dispatch when a batch is full, or when the walk has ended and a tail remains.
+                let batch_ready =
+                    pending.len() >= batch_size || (walk_done && !pending.is_empty());
+                if batch_ready && found < limit && inflight.len() < concurrency {
+                    let batch = std::mem::take(&mut pending);
+                    dispatched += batch.len();
+                    inflight.push(self.search_batch(
+                        batch,
+                        &matcher,
+                        &cancel,
+                        binary_implicit.clone(),
+                        &rg,
+                        encoding.as_ref(),
+                        context,
+                        limit,
+                    ));
+                    continue;
+                }
+                // TERMINATION, and it is load-bearing in a way the old `if count >= limit { break }`
+                // was not. The cancel arm below is ALWAYS enabled, so a turn with nothing left to
+                // do does NOT hit `select!`'s "all branches disabled" panic — it would park
+                // forever on a token that may never fire. This condition is the only thing that
+                // ends the loop, and it must be tested BEFORE the `select!`. Reaching the cap ends
+                // it even with candidates still pending: those are exactly the files the cap says
+                // we no longer need.
+                if inflight.is_empty() && (found >= limit || (walk_done && pending.is_empty())) {
                     break;
                 }
-                // The `select!` below observes a cancel while parked on `walk.next()`; one that
-                // lands mid-candidate is observed INSIDE `search_one`, which threads the token
-                // through `CancelReader` and `MatchSink` into the blocking searcher. This check is
-                // the cheap fast path: it skips opening the next candidate at all.
+                // The cheap fast path, kept from the fused loop: skip opening the next candidate
+                // at all. A cancel that lands mid-search is observed INSIDE `search_batch`, which
+                // threads the token through `CancelReader`, `MatchSink`, and the between-files
+                // check in the blocking task.
                 if cancel.is_cancelled() {
                     return Err(error::aborted());
                 }
+                // The walk and the search are still FUSED to the cap, exactly as pi is: its line
+                // handler sets `matchLimitReached` and calls `stopChild(true)` (grep.ts:292-295,
+                // defined at `:240-245`) the instant `matchCount >= effectiveLimit`, killing the
+                // rg child so upstream neither finishes the traversal nor reads another file.
+                let can_pull = !walk_done
+                    && found < limit
+                    && pending.len() < batch_size
+                    && inflight.len() < concurrency;
+
                 tokio::select! {
+                    // `biased;` — without it `select!` polls in RANDOM order, so with the token
+                    // already cancelled AND a walk item already buffered the walk arm would win
+                    // half the time and the tool would keep consuming entries after Esc: bounded
+                    // in expectation, unbounded in the worst case. `find.rs` has carried this
+                    // since its own loop was written; grep's did not, and this is where it lands.
+                    biased;
                     _ = cancel.cancelled() => return Err(error::aborted()),
-                    item = walk.next() => {
+
+                    // Completions are drained ahead of new dispatch, which is what bounds
+                    // `collected`'s growth rather than letting the walk run ahead of the searches.
+                    //
+                    // `Some(done)` is a PATTERN, and it is load-bearing: an EMPTY
+                    // `FuturesUnordered` returns `Poll::Ready(None)` immediately, and `select!`
+                    // DISABLES a branch whose pattern does not match, letting the walk arm park
+                    // normally. Written as a bare `done = inflight.next()` this arm would instead
+                    // complete instantly on every turn whenever nothing is in flight and spin the
+                    // loop hot against the walker.
+                    Some(done) = inflight.next() => {
+                        // `?` still propagates `error::aborted()` out of `execute`. Dropping
+                        // `inflight` on that path is enough: each `spawn_blocking` task owns its
+                        // own `CancelToken` clone and stops itself through `CancelReader` /
+                        // `MatchSink`.
+                        let batch: Vec<(PathBuf, Vec<MatchBlock>)> = done?;
+                        // `search_batch` already dropped every file that matched nothing, so each
+                        // entry here contributes at least one row.
+                        for (path, blocks) in batch {
+                            found += blocks.len();
+                            collected.push((path, blocks));
+                        }
+                        // Re-derive the batch size from what the search has actually seen. All
+                        // integer: `need` is "files still required at the density observed so
+                        // far", divided across the in-flight width. `found == 0` means nothing has
+                        // matched yet, so no budget is being spent and there is nothing to
+                        // over-dispatch against.
+                        let estimate = if found == 0 {
+                            MAX_BATCH
+                        } else {
+                            let remaining = limit.saturating_sub(found);
+                            let need = remaining.saturating_mul(dispatched) / found;
+                            (need / concurrency).clamp(1, MAX_BATCH)
+                        };
+                        // Bounded by a DOUBLING, never jumped to. The estimate is derived from a
+                        // handful of files and is wildly noisy early: one sparse file among the
+                        // first few predicts thousands still needed and sends the batch straight
+                        // to `MAX_BATCH`, putting `concurrency × 32` files in flight for a cap
+                        // that four more files would have filled. Measured, that cost the common
+                        // capped search 1.9ms → 3.0ms.
+                        //
+                        // The two errors are not symmetric: over-dispatching opens and searches
+                        // files whose results are then discarded, while under-dispatching only
+                        // costs one more turn of a loop that is already running. So growth is
+                        // geometric and the estimate acts purely as a CEILING on it — a dense
+                        // pattern holds the batch at 1 and behaves exactly like the unbatched
+                        // shape, a sparse one reaches `MAX_BATCH` within five completions, which
+                        // on any tree worth batching is immediately.
+                        batch_size = estimate.min(batch_size.saturating_mul(2)).max(1);
+                    }
+
+                    // Guarded, so a full pipeline stops consuming the walker and the bounded
+                    // channel back-pressures into `WalkParallel`'s `blocking_send`.
+                    item = walk.next(), if can_pull => {
                         match item {
                             Some(Ok(w)) => {
                                 // ripgrep's subject filter. A traversal-discovered entry is
@@ -855,11 +1117,11 @@ impl Tool for GrepTool {
                                 // `read_stream`'s `File::open`, which has no `O_NOFOLLOW` and DOES
                                 // follow, searching the target's bytes under the link's name.
                                 //
-                                // Directories are deliberately NOT filtered out here any more:
-                                // the override is evaluated for them below, and that is what
-                                // prunes a subtree. Everything that is neither a regular file nor
-                                // a directory is dropped up front, since it is neither a search
-                                // subject nor a prunable root.
+                                // Directories are dropped here again, as they were before the
+                                // consumer-side prune existed: the override prune now runs INSIDE
+                                // the walker ([`WalkOpts::prune`]), so a pruned subtree never
+                                // reaches this loop and a directory is neither a search subject
+                                // nor a prunable root on this side any more.
                                 //
                                 // This filter is for WALK-discovered candidates only. A `path`
                                 // argument that is a symlink to a file never reaches this loop:
@@ -868,23 +1130,10 @@ impl Tool for GrepTool {
                                 // file is searched directly — which is what ripgrep does for a
                                 // depth-0 explicit subject (`Subject::is_file` short-circuits on
                                 // `dent.depth() == 0`).
-                                if !w.is_file && !w.is_dir {
-                                    continue;
-                                }
-                                // A directory filter is in force when the caller passed a glob OR
-                                // the user's config carries one. Without either, a directory is
-                                // simply not a search subject and is dropped as before.
-                                if glob.is_none() && cfg_override.is_none() && w.is_dir {
+                                if !w.is_file {
                                     continue;
                                 }
                                 {
-                                    // Anything under a directory the override already pruned is
-                                    // gone — files AND nested directories — before any further
-                                    // test. This is `skip_current_dir()`'s effect, applied on the
-                                    // consumer side (walk.rs:1131-1145).
-                                    if pruned.iter().any(|p| w.path.starts_with(p)) {
-                                        continue;
-                                    }
                                     // The glob is matched against the path relative to the OVERRIDE
                                     // ROOT, which for ripgrep is its own cwd — Pi spawns `rg` with
                                     // no `cwd` option and passes `searchPath` positionally, so a
@@ -896,31 +1145,6 @@ impl Tool for GrepTool {
                                         .path
                                         .strip_prefix(&self.cwd)
                                         .map_or_else(|_| to_posix(&w.path), to_posix);
-                                    if w.is_dir {
-                                        // ripgrep evaluates the override for directories too
-                                        // (dir.rs:416-425), and an Ignore verdict takes the whole
-                                        // subtree. A plain (non-`!`) glob that simply misses does
-                                        // NOT prune — overrides.rs:106 guards that fallback with
-                                        // `!is_dir` — so `prunes_dir` is the only test here, and
-                                        // `Override::matched` applies the same rule internally.
-                                        //
-                                        // walk.rs:1057-1060: `skip_entry` returns false at depth 0,
-                                        // so the search root itself is never prunable.
-                                        //
-                                        // `--type`/`--type-not` deliberately do NOT prune: ripgrep
-                                        // matches types against files only (`Types::matched`
-                                        // returns `None` for a directory), so a `-t rust` config
-                                        // must still descend into directories that do not look
-                                        // like Rust to reach the `.rs` files inside them.
-                                        let prunes = glob.as_ref().is_some_and(|g| g.prunes_dir(&glob_rel))
-                                            || cfg_override
-                                                .as_ref()
-                                                .is_some_and(|o| o.matched(&glob_rel, true).is_ignore());
-                                        if w.path != search_root && prunes {
-                                            pruned.push(w.path.clone());
-                                        }
-                                        continue;
-                                    }
                                     if let Some(g) = &glob
                                         && !g.keeps_file(&glob_rel)
                                     {
@@ -939,45 +1163,80 @@ impl Tool for GrepTool {
                                 }
                                 let rel_path = w.path.strip_prefix(&search_root).unwrap_or(&w.path);
                                 let rel = to_posix(rel_path);
-                                // Traversal-discovered, so implicit: binary files are still cut
-                                // off at the first NUL, exactly as before this change.
-                                self.search_one(
-                                    &w.path,
-                                    &rel,
-                                    &matcher,
-                                    &cancel,
-                                    binary_implicit.clone(),
-                                    &rg,
-                                    encoding.as_ref(),
-                                    context,
-                                    limit,
-                                    &mut count,
-                                    &mut out,
-                                    &mut any_line_truncated,
-                                )
-                                .await?;
+                                // Queued, not awaited, and not yet dispatched: the batch goes out
+                                // when it is full. Traversal-discovered, so implicit binary
+                                // detection — unchanged.
+                                pending.push((w.path.clone(), rel));
                             }
-                            Some(Err(e)) => {
-                                if walk_error.is_none() {
-                                    // pi surfaces rg's stderr verbatim (`stderr.trim()`,
-                                    // grep.ts:310) and rg writes `rg: {path}: {os error}`.
-                                    // `LocalFs::walk` yields the bare `{path}: {os error}` because
-                                    // `find` must carry no prefix at all, so the `rg: ` half is
-                                    // added here, at the one consumer that emulates ripgrep.
-                                    walk_error =
-                                        Some(ToolError::new(format!("rg: {}", e.message)));
-                                }
-                            }
-                            None => break,
+                            // pi surfaces rg's stderr verbatim (`stderr.trim()`, grep.ts:310) and
+                            // rg writes `rg: {path}: {os error}`. `LocalFs::walk` yields the bare
+                            // `{path}: {os error}` because `find` must carry no prefix at all, so
+                            // the `rg: ` half is added below, at the one consumer that emulates
+                            // ripgrep.
+                            Some(Err(e)) => walk_errors.push(e.message),
+                            // NOT a `break`: batches are still in flight and a tail may still be
+                            // pending. The termination test at the top of the loop ends it.
+                            None => walk_done = true,
                         }
                     }
                 }
             }
+            // Dropping `walk` here is what makes every remaining walker thread observe a closed
+            // receiver and return `WalkState::Quit` — the parallel-walk equivalent of pi's
+            // `stopChild(true)`. On the `found >= limit` exit the walk is mid-tree, so this is the
+            // path that stops it; letting `walk` live to the end of the scope would leave up to 12
+            // threads walking a tree whose results are already discarded.
+            drop(walk);
+
+            // Rows are emitted in path order, never in completion order. pi cannot be copied here
+            // — pi IS rg's parallel walk, so pi's own row order varies run to run — and a tool
+            // result the model reads must not. `find` already resolves this the same way: bound
+            // the walk at the cap, then sort the bounded set. fd does exactly that too
+            // (`ReceiverBuffer` sorts while buffering, fd 10.5.0 `walk.rs:281-285`), and fd's walk
+            // is parallel — so sorting a capped set is the upstream behaviour, not a divergence.
+            //
+            // This is NOT the full-tree `sort()`+`truncate()` that TOOL-033 removed. That version
+            // drained the whole walk on EVERY call and then took the 100-match window from the
+            // alphabetically-first files — a systematic `a*`-biased sample. Here the walk still
+            // stops at the cap, so the SET is what discovery produced and only its ORDER moves.
+            //
+            // Determinism, precisely: the ORDER is always deterministic. The SET is deterministic
+            // whenever the cap is not reached, which is every search returning fewer than `limit`
+            // matches. When the cap IS reached the set depends on which files finished first —
+            // which is exactly pi's behaviour, since `stopChild(true)` kills rg mid-parallel-walk.
+            // The comparator follows the WALK's ordering contract, it is not unconditionally
+            // ascending. `--sortr=path` shares no comparator with `--sort=path`, and with a match
+            // cap in force the direction decides WHICH matches come back, not merely their order
+            // — which is why that walk stays serial at all (`fs.rs`, the `sort_by_path` branch).
+            // Re-sorting its output ascending here would throw away the very thing that branch
+            // exists to preserve. Pinned by `sortr_reverses_which_match_the_cap_returns`.
+            //
+            // Trimming after this sort is still correct for a sorted walk: dispatch happens in
+            // walk order and only stops once `found >= limit`, so every file ahead of the cutoff
+            // in sort order was already dispatched.
+            match rg.sort_path {
+                Some(PathSort::Descending) => collected.sort_by(|(a, _), (b, _)| b.cmp(a)),
+                Some(PathSort::Ascending) | None => collected.sort_by(|(a, _), (b, _)| a.cmp(b)),
+            }
+            for (_, blocks) in collected {
+                take_into(
+                    &mut out,
+                    &mut count,
+                    &mut any_line_truncated,
+                    limit,
+                    blocks,
+                );
+            }
 
             // pi: `if (!killedDueToLimit && code !== 0 && code !== 1) { reject(stderr.trim()); }`
-            // (grep.ts:309-313). `count >= limit` IS `killedDueToLimit`: it is the condition that
-            // breaks the loop above, exactly as it kills the rg child upstream. `limit` is
-            // `.max(1)` (grep.ts:189), so this cannot be vacuously true on entry.
+            // (grep.ts:309-313). `count >= limit` IS `killedDueToLimit`, but note it is no longer
+            // what BREAKS the loop: the pipeline stops dispatching on `found >= limit` (matches
+            // from completed batches) and `count` is derived afterwards, by `take_into`, while
+            // trimming the sorted blocks. The two agree exactly where it matters — the collected
+            // blocks are a superset of the completed ones, so `found >= limit` guarantees
+            // `count == limit` — which is why testing `count` here still means "the cap fired",
+            // exactly as `stopChild(true)` kills the rg child upstream. `limit` is `.max(1)`
+            // (grep.ts:189), so this cannot be vacuously true on entry.
             //
             // This check precedes the `out.is_empty()` reply below because pi's does — the
             // exit-code guard is at grep.ts:309 and the `matchCount === 0` reply at `:314` — so an
@@ -985,9 +1244,9 @@ impl Tool for GrepTool {
             // It also precedes the successful formatting path, because rg exiting 2 makes pi
             // reject even when matches were found.
             if count < limit
-                && let Some(e) = walk_error
+                && let Some(message) = walk_errors.into_iter().min()
             {
-                return Err(e);
+                return Err(ToolError::new(format!("rg: {message}")));
             }
         }
 

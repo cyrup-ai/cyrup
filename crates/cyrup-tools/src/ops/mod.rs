@@ -311,6 +311,36 @@ pub enum PathSort {
     Descending,
 }
 
+/// A caller-supplied directory prune, applied INSIDE the walker.
+///
+/// Takes `&Path` and not `ignore::DirEntry` on purpose: [`WalkOpts`] is the backend-agnostic seam
+/// ([`FsOps::walk`]), and a non-`ignore` backend must be able to honour a prune without depending
+/// on ripgrep's walker types.
+///
+/// A newtype rather than a bare `Option<Arc<dyn Fn…>>` so [`WalkOpts`] keeps its `Debug` derive: a
+/// trait object is not `Debug`, and hand-writing `Debug` for the whole struct would drift the next
+/// time a knob is added.
+#[derive(Clone)]
+pub struct PruneDirs(Arc<dyn Fn(&Path) -> bool + Send + Sync>);
+
+impl PruneDirs {
+    /// Wraps `f`, which must be TOTAL: the walker consults it for files as well as directories.
+    pub fn new(f: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// `true` ⇒ do not descend into this directory, and do not yield it.
+    pub fn prunes(&self, dir: &Path) -> bool {
+        (self.0)(dir)
+    }
+}
+
+impl std::fmt::Debug for PruneDirs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PruneDirs(<predicate>)")
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct WalkOpts {
     pub include_hidden: bool,
@@ -346,6 +376,20 @@ pub struct WalkOpts {
     /// sorting costs a full directory read before the first entry can be yielded, and `grep` is
     /// fused to its match cap precisely so it does not pay for entries it will never search.
     pub sort_by_path: Option<PathSort>,
+    /// Directory subtrees the caller's ignore override excludes. Applied INSIDE the walker via
+    /// `WalkBuilder::filter_entry` (ignore 0.4.26 `walk.rs:973-979`), which BOTH walkers honour:
+    /// the serial one turns a `false` verdict on a directory into `skip_current_dir()`
+    /// (`walk.rs:1131-1145`) and the parallel one never enqueues the subtree at all
+    /// (`walk.rs:1791-1797`).
+    ///
+    /// It used to be a post-hoc `Vec<PathBuf>` filter in `grep.rs`, sound only because
+    /// `ignore::Walk` is pre-order — a directory always arrived before its contents. A parallel
+    /// walk gives no such ordering, so that filter would drop a different set of files depending
+    /// on thread interleaving. Expressed as a walker-side prune it is order-independent, and it is
+    /// what ripgrep itself does.
+    ///
+    /// Never applied at depth 0: the search root is not prunable (`walk.rs:1057-1059`).
+    pub prune: Option<PruneDirs>,
 }
 
 /// A single walked path.
@@ -455,6 +499,34 @@ pub trait FsOps: Send + Sync {
     /// it keeps every decorator in `isolation/` forwarding unchanged.
     async fn read_stream(&self, path: &Path) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
         Ok(Box::new(std::io::Cursor::new(self.read(path).await?)))
+    }
+
+    /// Open MANY paths in one go, one result per path, in the order given.
+    ///
+    /// This exists for one reason, and it is a measured one: [`Self::read_stream`] costs a
+    /// `spawn_blocking` round-trip per file on the local backend, and `grep` opens every candidate
+    /// in the tree. On a 1,885-entry tree that is ~1,900 round-trips at ~31µs each — ~30ms of pure
+    /// scheduler overhead against ~2.9ms of actual `open(2)` work, and it dominated the search.
+    /// Opening a batch behind ONE hop removes it.
+    ///
+    /// A per-path `Err` is NOT fatal to the batch: it is that path's result and the rest still
+    /// open. `grep` skips a file it cannot read, exactly as ripgrep does.
+    ///
+    /// **The default implementation is the SAFE one, deliberately.** It loops `self.read_stream`,
+    /// which on a decorator is that decorator's OWN method — so an isolation wrapper that never
+    /// overrides this still confines every path it opens. That matters because the failure mode of
+    /// a forgotten delegation on this seam is silent (see [`crate::isolation`]): overriding buys
+    /// speed, and forgetting to override costs speed and nothing else. An override MUST apply the
+    /// same guard its `read_stream` applies, to every path, before delegating.
+    async fn read_streams(
+        &self,
+        paths: &[PathBuf],
+    ) -> Vec<Result<Box<dyn std::io::Read + Send>, ToolError>> {
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            out.push(self.read_stream(path).await);
+        }
+        out
     }
 
     /// Write `bytes` to `path` **through the existing inode**, creating the file if it is absent —
