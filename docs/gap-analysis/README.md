@@ -15,6 +15,8 @@ medium in one table**, and shows the shape of the remaining distance.
 [`00-residual-ledger.md`](00-residual-ledger.md) ranks and suggests an order. The numbered files hold
 the evidence.
 
+> **UPDATE 2026-08-29 — `SEAM-112` is CLOSED, so the above-medium set is 1 `critical` + 3 `high`.** The dated editions below are left as written; they are records of what was true when each was measured, not current counts. `SEAM-112` (`/resume` produces a broken session: nothing renders, bash calls repeat endlessly) is closed in both halves — the render half at `879eb4e` (2026-08-18), the repetition at the port divergence described in area 08's row: pi guards the overflow-latch clear with `stopReason !== "error" && stopReason !== "length"` and the port kept only the shared arm, so every `Length` message cleared the latch immediately before the compaction check read it and the compact-and-retry cycle had no termination condition. `TUI-092` also closed (2026-08-20) after the fifth edition was written.
+>
 > **RECONCILED 2026-08-19 (fifth edition) against cyrup HEAD `4fb5e40`.** This edition corrects two
 > things and deliberately recounts nothing. **(1) The above-medium set turned over completely.** All
 > five rows the fourth edition named — `SESS-040`, `PROV-047`, `PROV-054`, `PROV-055`, `PROV-056` —
