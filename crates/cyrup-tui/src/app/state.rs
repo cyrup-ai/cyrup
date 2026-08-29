@@ -383,6 +383,15 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Apply `hideThinkingBlock` to every surface that shows it: the transcript (which freezes the
+    /// choice into each committed [`crate::transcript::Entry::Thinking`]) and the footer's right
+    /// cluster. One writer, because the two desync silently — the transcript would suppress the
+    /// body while the footer still advertised a live reasoning level.
+    pub(crate) fn set_hide_thinking(&mut self, hide: bool) {
+        self.transcript.set_hide_thinking_block(hide);
+        self.status.set_thinking_hidden(hide);
+    }
+
     /// Fresh state with the given theme.
     pub fn new(theme: UiTheme) -> Self {
         // `if (areExperimentalFeaturesEnabled()) statsParts.push(… "xp" …)` (`footer.ts:162-164`).

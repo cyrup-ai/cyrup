@@ -55,9 +55,7 @@ impl App<InlineBackend<Stdout>> {
         // Same for `hideThinkingBlock` (Pi seeds `this.hideThinkingBlock = getHideThinkingBlock()`
         // before constructing any `AssistantMessageComponent`): the very first reasoning block must
         // already honour the persisted setting.
-        self.state
-            .transcript
-            .set_hide_thinking_block(session.services().settings.effective().hide_thinking_block());
+        self.state.set_hide_thinking(session.services().settings.effective().hide_thinking_block());
         // `terminal.showImages` / `terminal.imageWidthCells` govern how a tool result's `image`
         // content blocks render (TUI-007) — seed both before the first frame.
         let eff = session.services().settings.effective();
@@ -235,9 +233,8 @@ impl App<InlineBackend<Stdout>> {
         self.state
             .transcript
             .set_output_pad(ctx.session.services().settings.effective().output_pad().max(0) as usize);
-        self.state.transcript.set_hide_thinking_block(
-            ctx.session.services().settings.effective().hide_thinking_block(),
-        );
+        self.state
+            .set_hide_thinking(ctx.session.services().settings.effective().hide_thinking_block());
         let eff = ctx.session.services().settings.effective();
         self.state.show_images = eff.show_images();
         self.state.transcript.set_show_images(self.state.show_images);

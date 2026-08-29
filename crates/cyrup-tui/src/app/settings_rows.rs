@@ -22,6 +22,18 @@ pub(crate) fn model_thinking_summary_for_count(count: usize) -> String {
     }
 }
 
+/// The `/settings` "Thinking level" row's displayed value.
+///
+/// **[CYRUP-DELTA]** — `hideThinkingBlock` and `Thinking level` are siblings in one list and
+/// nothing upstream connects them, because upstream does not need to: `setHideThinkingBlock`
+/// re-renders the prior messages (`assistant-message.ts:57-62`), so the suppression is self-
+/// evident on screen. Under ADR-0001 it is not, so the level alone would read as "reasoning is on
+/// and visible" while the body is replaced by the static label. Shared with the submenu
+/// write-back in `app/selectors.rs` so a confirmed pick cannot silently drop the marker.
+pub(crate) fn thinking_row_value(level: &str, hidden: bool) -> String {
+    if hidden { format!("{level} (hidden)") } else { level.to_string() }
+}
+
 pub(crate) fn settings_rows(
     eff: &cyrup_session_svc::EffectiveSettings,
     current_theme: &str,
@@ -247,7 +259,12 @@ pub(crate) fn settings_rows(
         // `SelectorKind::Thinking` with a live confirm arm — and no way in: `open_selector` had
         // exactly one call site and it only ever constructed `SelectorKind::Theme`. Shift+Tab
         // cycled blindly with no list of the levels.
-        SettingRow::submenu("thinking", "Thinking level", thinking_level.to_string(), "thinking")
+        SettingRow::submenu(
+            "thinking",
+            "Thinking level",
+            thinking_row_value(thinking_level, eff.hide_thinking_block()),
+            "thinking",
+        )
             .with_description("Reasoning depth for thinking-capable models"),
         // GAP 3 — `id: "model-thinking"` (`settings-selector.ts:574-577`). `currentValue` is
         // `modelThinkingOverridesSummary`: `"none"` at zero, else `"{n} configured"` (`:184-188`).

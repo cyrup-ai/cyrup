@@ -660,7 +660,19 @@ impl<B: Backend> App<B> {
                 // messages; cyrup's committed rows have left the render tree for native scrollback
                 // (`flush_committed` → `insert_before`), so history keeps the form it committed with.
                 if id == "hideThinkingBlock" {
-                    self.state.transcript.set_hide_thinking_block(value == "true");
+                    let hide = value == "true";
+                    self.state.set_hide_thinking(hide);
+                    // The `/settings` slot stays open on a cycle and its rows are built ONCE from
+                    // the effective settings (`app/execute.rs`'s `C::OpenSelector` arm), so the
+                    // sibling `Thinking level` row would keep the marker state it was born with —
+                    // reading as "reasoning is visible" one line under the switch that just
+                    // suppressed it, and keeping a stale `(hidden)` when the switch goes back off.
+                    // Written through exactly as `model-thinking` is above, which is pi's own
+                    // `item.currentValue = …` before `onChange` (`tui/src/components/
+                    // settings-list.ts:222-225` for a submenu return, `:236-238` for a cycle).
+                    // A no-op when no settings list is open, which is the bare `Ctrl+T` case.
+                    let shown = thinking_row_value(&self.state.thinking_level, hide);
+                    self.set_settings_row_value("thinking", &shown);
                 }
                 // `markdown.mermaid` is live upstream by construction: `onMermaidRenderingModeChange`
                 // persists (`settings-selector.ts:856-857`) and the transformer's
