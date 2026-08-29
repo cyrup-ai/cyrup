@@ -1784,3 +1784,127 @@ fn m7_interior_whitespace_runs_survive_a_wrapping_cell() {
         "the double space was re-packed to a single one:\n{r:?}"
     );
 }
+
+/// PERF-005 §3.0b — the incremental highlighter must be indistinguishable from the cold one.
+///
+/// The cursor keeps a `ParseState` across calls and parses only the lines a streaming delta added.
+/// That is only sound if resuming produces exactly what a from-scratch parse produces, so drive a
+/// fence the way a stream does — one delta at a time, on one thread, so the thread-local cursor is
+/// warm — and compare each step against the same text rendered on a FRESH thread, where the cursor
+/// starts empty and the uncached path runs.
+#[test]
+fn incremental_highlight_matches_a_cold_render_at_every_delta() {
+    let theme = UiTheme::dark();
+    let body = [
+        "fn main() {",
+        "    let s = \"a string\";",
+        "    // a comment",
+        "    let n = 42;",
+        "    if n > 0 {",
+        "        println!(\"{s} {n}\");",
+        "    }",
+        "}",
+    ];
+
+    let cold = |text: &str| {
+        let t = text.to_string();
+        std::thread::spawn(move || rows(&render_markdown(&t, 80, &UiTheme::dark())))
+            .join()
+            .unwrap()
+    };
+
+    // Phase 1 — the open fence, delta after delta, CONTIGUOUSLY. This is the phase that pins
+    // resume: the cursor stays warm across the whole loop, so each step parses only the line the
+    // delta added and splices it onto state built many steps ago. It has to run without the closed
+    // form interleaved, because a closed fence is memoised and hands the cursor slot back (§3.0b) —
+    // alternating the two would restart the cursor on every delta and quietly stop testing resume
+    // at all, which is exactly what this loop used to do once promotion landed.
+    let mut acc = String::new();
+    for (i, line) in body.iter().enumerate() {
+        acc.push_str(line);
+        acc.push('\n');
+        let text = format!("```rust\n{acc}");
+        assert_eq!(rows(&render_markdown(&text, 80, &theme)), cold(&text), "open delta {i}");
+    }
+
+    // Phase 2 — the transition itself, with the cursor still warm on the full open body: the fence
+    // closes, `memoable` flips, and the block INHERITS the cursor rather than re-reading itself.
+    // This is the production sequence, and the one step where inherited rows and a cold parse could
+    // disagree.
+    let closed = format!("```rust\n{acc}```\n");
+    assert_eq!(rows(&render_markdown(&closed, 80, &theme)), cold(&closed), "the closing frame");
+    // The same frame again, now served from the memo.
+    assert_eq!(rows(&render_markdown(&closed, 80, &theme)), cold(&closed), "the memoised frame");
+
+    // Phase 3 — closed fences at every length, none of which the cursor is tracking. These take the
+    // uncached path and the memo, and pin that a memoable block never CREATES a cursor.
+    let mut acc = String::new();
+    for (i, line) in body.iter().enumerate() {
+        acc.push_str(line);
+        acc.push('\n');
+        let text = format!("```rust\n{acc}```\n");
+        assert_eq!(rows(&render_markdown(&text, 80, &theme)), cold(&text), "closed delta {i}");
+    }
+
+    // A fence that SHRINKS or is replaced is not a prefix extension — the cursor must rebuild, not
+    // splice. This is the case the prefix test exists to catch.
+    let replaced = "```rust\nlet other = 1;\n```\n";
+    let warm = rows(&render_markdown(replaced, 80, &theme));
+    let cold = std::thread::spawn(move || rows(&render_markdown(replaced, 80, &UiTheme::dark())))
+        .join()
+        .unwrap();
+    assert_eq!(warm, cold, "a non-prefix input must rebuild from scratch");
+}
+
+/// PERF-005 §3.0a — bounding the parse to the rows the caller reads changes nothing it reads.
+///
+/// syntect is a forward line-at-a-time state machine, so the first `max_rows` rows of a full-block
+/// highlight are the rows a bounded highlight produces. The tool bodies rely on exactly this: they
+/// render `total.min(10)` rows and used to highlight all `total`.
+#[test]
+fn a_bounded_highlight_equals_the_first_rows_of_a_full_one() {
+    let theme = UiTheme::dark();
+    let mut code = String::new();
+    for i in 0..200 {
+        code.push_str(&format!("fn f{i}(x: u32) -> u32 {{ x + {i} }}\n"));
+    }
+    let full = crate::markdown::highlight_code_lines(&code, "rust", &theme, usize::MAX)
+        .expect("rust highlights");
+    for bound in [1usize, 2, 10, 37, 199, 200] {
+        let bounded = crate::markdown::highlight_code_lines(&code, "rust", &theme, bound)
+            .expect("rust highlights");
+        assert_eq!(bounded.len(), bound.min(full.len()), "bound {bound}");
+        assert_eq!(bounded[..], full[..bounded.len()], "bound {bound} must match the full prefix");
+    }
+    // An unknown language still declines, bounded or not — the §3.0a gate sits above the caches.
+    assert!(crate::markdown::highlight_code_lines(&code, "not-a-language", &theme, 10).is_none());
+    assert!(crate::markdown::highlight_code_lines(&code, "", &theme, 10).is_none());
+}
+
+/// PERF-005 §3.0b — a settled body is served from the memo, and the memo cannot serve wrong rows.
+#[test]
+fn a_settled_body_memo_is_keyed_on_everything_that_changes_its_rows() {
+    let dark = UiTheme::dark();
+    let code = "fn a() {}\nfn b() {}\nfn c() {}\n";
+
+    // Repeat hits agree with the first build.
+    let first = crate::markdown::highlight_code_lines(code, "rust", &dark, 3).expect("rust");
+    for _ in 0..4 {
+        let again = crate::markdown::highlight_code_lines(code, "rust", &dark, 3).expect("rust");
+        assert_eq!(again, first, "a memo hit must equal the build it caches");
+    }
+
+    // `max_rows` is part of the key: a 3-row entry must not answer a 1-row request.
+    let one = crate::markdown::highlight_code_lines(code, "rust", &dark, 1).expect("rust");
+    assert_eq!(one.len(), 1, "a different bound is a different entry");
+    assert_eq!(one[0], first[0]);
+
+    // `theme_generation` is part of the key: the rows carry RESOLVED colours.
+    let bumped = UiTheme::dark().with_generation(dark.generation + 1);
+    let after = crate::markdown::highlight_code_lines(code, "rust", &bumped, 3).expect("rust");
+    assert_eq!(after.len(), first.len());
+
+    // A different language is a different entry, not a stale hit.
+    let as_python = crate::markdown::highlight_code_lines(code, "python", &dark, 3).expect("python");
+    assert_eq!(as_python.len(), first.len());
+}

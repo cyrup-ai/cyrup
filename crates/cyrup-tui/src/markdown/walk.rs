@@ -20,6 +20,7 @@ impl<'t> MdRenderer<'t> {
             link_text: String::new(),
             code_lang: None,
             code_buf: String::new(),
+            code_closed: false,
             html_buf: None,
             table: None,
             default_text: None,
@@ -493,6 +494,12 @@ impl<'t> MdRenderer<'t> {
                     pulldown_cmark::CodeBlockKind::Fenced(info) => info.trim().to_string(),
                     pulldown_cmark::CodeBlockKind::Indented => String::new(),
                 });
+                // The fence's CLOSED-ness, read off its own source while that source is in hand:
+                // `raw` is this event's range, and a `Start` tag's range spans the whole element
+                // (the same property `Tag::Table` below relies on for its `token.raw` fallback), so
+                // it runs from the opening delimiter through the closing one. A closed fence's body
+                // can never change again, which is what makes it memoisable (PERF-005 §3.0b).
+                self.code_closed = fence_is_closed(raw);
                 self.code_buf.clear();
             }
             Tag::Emphasis => self.italic = self.italic.saturating_add(1),
@@ -599,10 +606,11 @@ impl<'t> MdRenderer<'t> {
             TagEnd::CodeBlock => {
                 let lang = self.code_lang.take().unwrap_or_default();
                 let code = std::mem::take(&mut self.code_buf);
+                let closed = std::mem::take(&mut self.code_closed);
                 if self.mermaid_applies(&lang) {
-                    self.emit_mermaid_block(&lang, &code);
+                    self.emit_mermaid_block(&lang, &code, closed);
                 } else {
-                    self.emit_code_block(&lang, &code);
+                    self.emit_code_block(&lang, &code, closed);
                 }
             }
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
@@ -736,7 +744,7 @@ impl<'t> MdRenderer<'t> {
     /// classes, one [`Span`] per run. The classes are not reported by the engine — they are
     /// inferred from the rendered geometry by the private `mermaid::classify`, whose module doc
     /// names the cases where that inference is wrong.
-    fn emit_mermaid_block(&mut self, lang: &str, code: &str) {
+    fn emit_mermaid_block(&mut self, lang: &str, code: &str, closed: bool) {
         match mermaid::render_diagram(code, self.width, self.mermaid.is_streaming) {
             DiagramOutcome::Diagram(rows) => {
                 for row in rows {
@@ -749,11 +757,11 @@ impl<'t> MdRenderer<'t> {
                 self.blank();
             }
             // `return token.raw` — the fence exactly as it would have rendered untransformed.
-            DiagramOutcome::Raw => self.emit_code_block(lang, code),
+            DiagramOutcome::Raw => self.emit_code_block(lang, code, closed),
             // `` `${token.raw}\n${codeSpan(styledWarning)}  \n` `` (`:81`): the untouched fence,
             // then the warning line with no blank between them — hence the `emit_fence_rows` split.
             DiagramOutcome::Warned(msg) => {
-                self.emit_fence_rows(lang, code);
+                self.emit_fence_rows(lang, code, closed);
                 self.emit_prefixed(Line::styled(msg, self.theme.warning_style()));
                 self.blank();
             }
@@ -781,14 +789,14 @@ impl<'t> MdRenderer<'t> {
 
     /// Emit a fenced code block: top fence line, highlighted (or flat) body, bottom fence line, and
     /// the separating blank that follows any block.
-    fn emit_code_block(&mut self, lang: &str, code: &str) {
-        self.emit_fence_rows(lang, code);
+    fn emit_code_block(&mut self, lang: &str, code: &str, closed: bool) {
+        self.emit_fence_rows(lang, code, closed);
         self.blank();
     }
 
     /// [`Self::emit_code_block`] without the trailing blank — the fence rows alone, which is what
     /// pi's `token.raw` is when the warning line has to follow it immediately (`mermaid.ts:81`).
-    fn emit_fence_rows(&mut self, lang: &str, code: &str) {
+    fn emit_fence_rows(&mut self, lang: &str, code: &str, closed: bool) {
         // marked's `fences` tokenizer is
         // `/^ {0,3}(`{3,}(?=[^`\n]*\n)|~{3,})([^\n]*)(?:\n|$)(?:|([\s\S]*?)(?:\n|$))(?: {0,3}\1[~`]* *(?=\n|$)|$)/`
         // — the body is capture 3 and the `(?:\n|$)` that follows it consumes the newline BEFORE the
@@ -812,7 +820,10 @@ impl<'t> MdRenderer<'t> {
         // which is what makes a wrapped code row lose it upstream: `wrapSingleLine` never starts a
         // produced row with whitespace (`utils.ts:912-915`).
         self.emit_prefixed(Line::styled(format!("```{lang}"), border));
-        for line in highlight_lines(code, lang, self.theme) {
+        // `closed` is this block's memo-eligibility: a fence that carries its closing
+        // delimiter is frozen, so it belongs in the highlighter's memo, and only the still-growing
+        // tail may claim the single resumable cursor (PERF-005 §3.0b rule (b)).
+        for line in highlight_lines(code, lang, self.theme, closed) {
             self.emit_prefixed(line);
         }
         self.emit_prefixed(Line::styled("```".to_string(), border));

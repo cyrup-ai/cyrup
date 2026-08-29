@@ -216,6 +216,19 @@ impl App<InlineBackend<Stdout>> {
         };
         'run: loop {
             self.drain_over_budget_arm();
+            // THE production frame site (PERF-005 §3.1). At the top of the body, so it batches
+            // every arm that fired on the previous iteration regardless of which — pi's
+            // `scheduleRender` callback, in the one place cyrup has to put it.
+            //
+            // Deliberately NOT an arm of the `select!` below: under `biased;` a draw in an arm is
+            // starvable by any hotter arm above it, which is the exact failure this removes.
+            if self.frames.due() {
+                let _frame = ArmGuard::enter("frame");
+                if self.frames.taken() {
+                    let _ = self.terminal.clear();
+                }
+                self.draw_synchronized()?;
+            }
             let theme_changed = async {
                 match theme_rx.as_mut() {
                     Some(rx) => rx.changed().await.is_ok(),
@@ -273,6 +286,16 @@ impl App<InlineBackend<Stdout>> {
                     None => std::future::pending().await,
                 }
             };
+            // Wakes the loop for a frame that is pending but not yet due. Never resolves when
+            // nothing is requested, so an idle session costs no wakeups — the same shape as the
+            // `alt_timer` arm above it.
+            let frame_due_in = self.frames.due_in();
+            let frame_due = async move {
+                match frame_due_in {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 // REQUIRED, not a micro-optimisation — the same statement `KeyedAcquire::wait`
                 // (`cyrup-core/src/keyed_lock.rs`) makes for its own cancel race, and the shape
@@ -291,28 +314,43 @@ impl App<InlineBackend<Stdout>> {
                 // the next poll. `src/tests/run_loop_cancel_bias.rs` pins this.
                 //
                 // THE ORDERING RULE IS NOW STRONGER THAN "cancel first" — it is **cancel, then
-                // input, then everything else**, and the second half is as load-bearing as the
-                // first (TUI-092 §2.5). `biased;` takes the FIRST ready arm, so any arm above
-                // `input.next()` that is ready on every poll starves it *permanently*. The spinner
-                // ticker is exactly that: armed for the whole of a streaming turn and re-ready
-                // every 80 ms (`SPINNER_INTERVAL`, `status_indicator.rs:48`), so as soon as one
-                // `draw_synchronized` costs more than a tick — which is what growing transcripts
-                // do — the input arm is never reached again and the keyboard dies while the screen
-                // keeps animating. Do NOT "tidy" the input arm back down among the tickers.
+                // input, then everything else** (TUI-092 §2.5). `biased;` takes the FIRST ready
+                // arm, so any arm above `input.next()` that is ready on every poll starves it.
+                //
+                // [PERF-005 §3.1] Arm order is NO LONGER what protects the keyboard — the frame
+                // cap is. No arm draws any more: they set a flag, and the single site at the top
+                // of this loop's body paints at most once per `MIN_RENDER_INTERVAL`, so a slow
+                // frame can no longer make a ticker arm perpetually ready ahead of the input arm.
+                // The input arm additionally requests IMMEDIATELY, preempting the cap, so a
+                // keystroke is never delayed by it.
+                //
+                // The ordering still matters for the two arms whose semantics depend on winning a
+                // tie — cancel, and the session swap — and `run_loop_input_priority.rs` still pins
+                // input above the tickers. Do NOT "tidy" the input arm back down among them.
+                //
+                // The order below is therefore **cancel, input, rebind, frame wake, tickers**, and
+                // `run_loop_input_priority.rs` asserts the first two are adjacent: nothing but
+                // comments may sit between them. A hand-kept list of ticker names cannot catch an
+                // arm that did not exist when the list was written, which is exactly how the frame
+                // wake first shipped at position #2.
                 biased;
                 _ = cancel.cancelled() => break,
                 // Input outranks every ticker (TUI-092 §2.5/§5c). `biased;` takes the FIRST
                 // ready arm, and the spinner re-arms every `SPINNER_INTERVAL` (80 ms,
-                // `status_indicator.rs:48`) for the whole of a streaming turn — so the moment one
-                // `draw_synchronized` costs more than a tick, a spinner arm placed ABOVE this one
-                // is always ready when the loop comes round and this arm is never polled again.
-                // The loop keeps drawing; the keyboard is dead, progressively, exactly as reported.
-                // No `.await` has to hang for that to happen.
+                // `status_indicator.rs:48`) for the whole of a streaming turn.
+                //
+                // [PERF-005 §3.1] The starvation this defended against is gone at its source: the
+                // tickers no longer draw, so a slow frame cannot keep one of them ready ahead of
+                // this arm. The order is kept because it is still the cheaper guarantee — a key
+                // that arrives in the same poll as a tick, or as the frame wake below, is serviced
+                // first either way. Nothing may be inserted between this arm and the cancel arm
+                // above it.
                 //
                 // Nothing is lost by demoting the tickers: they are `if`-guarded and idempotent,
                 // `MissedTickBehavior::Skip` re-arms a skipped tick, and this arm ends in
-                // `draw_synchronized()` anyway — so servicing a key repaints the frame the spinner
-                // would have drawn.
+                // `frames.request_immediate()` — pi's `requestImmediateRender()` — so servicing a
+                // key still produces the frame the spinner would have drawn, and produces it
+                // without waiting out the cap.
                 maybe_in = input.next() => match self.on_input_event(&mut ctx, maybe_in, &mut input, &mut events).await? {
                     RunFlow::Break => break 'run,
                     RunFlow::ReturnOk => return Ok(()),
@@ -333,6 +371,15 @@ impl App<InlineBackend<Stdout>> {
                         self.on_session_swapped(&mut ctx, &mut events).await?;
                     }
                 }
+                // Wake only; the draw is at the top of the body. A body here would be starvable.
+                //
+                // [PERF-005 §3.1] LAST of the four arms whose order is stated, exactly as §3.1's
+                // wiring sketch puts it — below cancel, input and the rebind. Position is not what
+                // makes this arm correct: it resolves only while a frame is pending-but-not-due, it
+                // carries no body, and whichever arm wakes the loop, the top-of-body site paints.
+                // It sits here because it must not win a tie against a ready keystroke, which is
+                // the whole of the rule three arms above.
+                () = frame_due => {}
                 // The guard is the tick's ARMING condition, so every animation driven from
                 // `on_spinner_tick` has to appear in it. `state.loader` is the third: a mounted
                 // `BorderedLoader` (`/share`) arms no indicator and runs no bash block, so without
@@ -405,6 +452,14 @@ impl App<InlineBackend<Stdout>> {
                 break;
             }
         }
+        // A state change made just before the quit would otherwise never be drawn: `break` leaves
+        // the loop without passing the top-of-body frame site again (PERF-005 §3.1).
+        if self.frames.pending() {
+            if self.frames.taken() {
+                let _ = self.terminal.clear();
+            }
+            let _ = self.draw_synchronized();
+        }
         // ADR-0005 §B-14 — leave the alternate screen BEFORE the terminal is restored, and before
         // the drain below. pi's `shutdown()` runs `this.ui.stop()` on whichever renderer is live
         // (`interactive-mode.ts:3591`); here the alternate screen would otherwise stand until `App`
@@ -450,7 +505,7 @@ impl App<InlineBackend<Stdout>> {
             None => false,
         };
         if stale {
-            self.draw_synchronized()?;
+            self.frames.request();
         }
         Ok(())
     }

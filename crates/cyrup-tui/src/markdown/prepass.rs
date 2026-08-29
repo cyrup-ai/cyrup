@@ -255,3 +255,81 @@ fn is_pure_fence(line: &str) -> bool {
         _ => false,
     }
 }
+
+/// Whether a fenced block's source carries its CLOSING delimiter.
+///
+/// The text in front of a closing fence can never change in a later delta — the delimiter is what
+/// puts it out of reach of an append — so "closed" is exactly "immutable", which is exactly the
+/// memo-eligibility `super::highlight` routes on (PERF-005 §3.0b rule (b)). A fence that is still
+/// growing is the one block a frame may not memoise, and it is also the only block that may claim
+/// the single resumable cursor.
+///
+/// `raw` is `Start(Tag::CodeBlock)`'s source range — the opening delimiter through the closing one.
+/// `MdRenderer::start` already relies on that range being the whole element for
+/// `Start(Table)`; this is the same property read for the fence.
+///
+/// A *partial* closing fence cannot reach here to be mistaken for a complete one:
+/// [`trim_partial_closing_fence`] only ever strips a short trailing run from a live buffer, and
+/// never appends a balancing delimiter, so a fence caught mid-delimiter arrives open.
+///
+/// An indented code block has no delimiter and answers `false` — correct, and moot besides: its
+/// language token is empty, so it never reaches a highlighter cache at all.
+pub(super) fn fence_is_closed(raw: &str) -> bool {
+    let mut lines = raw.trim_end_matches(['\n', '\r']).lines();
+    // The opener, and the fence char + run length a closer has to match.
+    let Some((ch, open_len)) = lines.next().map(str::trim).and_then(leading_fence) else {
+        return false;
+    };
+    // `next_back` on what REMAINS after the opener: a block that is only its opening fence has no
+    // remainder, so it is correctly still open rather than closed by its own first line.
+    lines.next_back().map(str::trim).is_some_and(|last| {
+        is_pure_fence(last) && last.starts_with(ch) && last.chars().count() >= open_len
+    })
+}
+
+#[cfg(test)]
+mod fence_closure {
+    use super::fence_is_closed;
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+
+    /// The predicate itself, over the cases that decide a fence's memo-eligibility.
+    #[test]
+    fn a_fence_is_closed_only_when_it_carries_its_own_delimiter() {
+        assert!(fence_is_closed("```rust\nfn a() {}\n```"), "a plainly closed fence");
+        assert!(fence_is_closed("```rust\n```"), "empty, but closed");
+        assert!(fence_is_closed("```rust\nfn a() {}\n```\n"), "a trailing newline is not content");
+        assert!(fence_is_closed("````\n```\n````"), "a 4-char opener; the interior ``` is body");
+        assert!(fence_is_closed("~~~\n```\n~~~"), "a ~ fence is not closed by a ` run");
+
+        assert!(!fence_is_closed("```rust\nfn a() {"), "the growing tail of a stream");
+        assert!(!fence_is_closed("```rust"), "the opener alone does not close itself");
+        assert!(!fence_is_closed("````\nfn a() {}\n```"), "a closer must be at least as long");
+        assert!(!fence_is_closed("    indented code"), "an indented block has no delimiter");
+    }
+
+    /// The property the predicate is USELESS without, and whose failure would be silent.
+    ///
+    /// `fence_is_closed` reads `Start(Tag::CodeBlock)`'s source range. If that range did not span
+    /// the closing delimiter, every fence would answer `false`, every fence would take the single
+    /// resumable cursor, and two fences in a turn would evict each other on every frame — which is
+    /// precisely the pre-PERF-005 cost, reached with no failing test and no visible symptom. So the
+    /// range property is pinned here rather than assumed.
+    #[test]
+    fn the_code_block_start_range_spans_the_closing_delimiter() {
+        // One settled fence, then prose, then the fence still streaming in.
+        let doc = "text\n\n```rust\nfn a() {}\n```\n\nmore\n\n```rust\nfn b() {\n";
+        let opts =
+            Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+        let verdicts: Vec<bool> = Parser::new_ext(doc, opts)
+            .into_offset_iter()
+            .filter(|(ev, _)| matches!(ev, Event::Start(Tag::CodeBlock(_))))
+            .map(|(_, range)| fence_is_closed(doc.get(range).unwrap_or("")))
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![true, false],
+            "the settled fence must be memo-eligible and only the growing tail may claim the \
+             cursor (PERF-005 §3.0b rule (b)) — got {verdicts:?}",
+        );
+    }
+}

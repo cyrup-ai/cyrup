@@ -54,11 +54,15 @@ pub(super) fn render_read_result(
     };
     // `highlightCode(replaceTabs(output), lang)` — the tabs are replaced BEFORE the highlighter runs
     // on this side of the ternary (`read.ts:185`), so a leading tab is three highlighted spaces.
-    let highlighted =
-        lang.and_then(|l| crate::markdown::highlight_code_lines(&replace_tabs(&output), l, theme));
+    // `shown` BEFORE the highlight, not after it: the highlighter parsed all `total` lines and
+    // then rendered at most ten of them — 356 ms/frame at a 2,000-line file, 99.5% discarded
+    // (PERF-005 §3.0a).
     let all = trim_trailing_empty(output.split('\n').collect());
     let total = all.len();
     let shown = if expanded { total } else { total.min(10) };
+    let highlighted = lang.and_then(|l| {
+        crate::markdown::highlight_code_lines(&replace_tabs(&output), l, theme, shown)
+    });
     out.push(Line::default());
     for (i, l) in all.iter().take(shown).enumerate() {
         out.push(body_line(l, highlighted.as_ref(), i, theme));
@@ -105,12 +109,13 @@ pub(super) fn render_write_call(
             } else {
                 crate::theme::language_from_path(&raw_path)
             };
-            let highlighted = lang.and_then(|l| {
-                crate::markdown::highlight_code_lines(&replace_tabs(&display), l, theme)
-            });
+            // `shown` BEFORE the highlight (PERF-005 §3.0a) — see the `read` body above.
             let all = trim_trailing_empty(display.split('\n').collect());
             let total = all.len();
             let shown = if expanded { total } else { total.min(10) };
+            let highlighted = lang.and_then(|l| {
+                crate::markdown::highlight_code_lines(&replace_tabs(&display), l, theme, shown)
+            });
             out.push(Line::default());
             for (i, l) in all.iter().take(shown).enumerate() {
                 out.push(body_line(l, highlighted.as_ref(), i, theme));

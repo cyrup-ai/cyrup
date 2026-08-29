@@ -16,6 +16,16 @@
 //! first. This test pins it so a future "tidy" cannot move the input arm back down among the
 //! tickers.
 //!
+//! # Why a list of ticker names is not enough (PERF-005 §3.1)
+//!
+//! The first cut of this guard asserted `input_pos < ticker_pos` for five tickers named
+//! individually. That catches a ticker climbing over the input arm, but it is blind to any arm
+//! that is not on the list — and `() = frame_due => {}` shipped at position #2, above input,
+//! through this file passing green. The check below is therefore an allow-list of nothing:
+//! between cancel and input there may be comments and blank lines, and no arm at all. The named
+//! ticker sweep is kept alongside it, because it pins the complementary direction — that no
+//! ticker drifts up past input from below.
+//!
 //! # Why this test reads the source
 //!
 //! The property is *ordering inside a macro*, and the loop it lives in owns a terminal, a session
@@ -59,6 +69,24 @@ fn the_input_arm_outranks_every_ticker() {
             "the cancel arm keeps position #1 (run_loop_cancel_bias.rs pins why); \
              found input before cancel in the select! at byte {offset} of app.rs",
         );
+        // Stronger than the ticker sweep below, and the reason this guard now catches what it
+        // once missed: between the cancel arm and the input arm there may be NOTHING but comments
+        // and blank lines. A hand-kept enumeration of ticker names cannot see an arm that did not
+        // exist when the list was written — PERF-005's `() = frame_due => {}` slid into position #2
+        // exactly that way, past a green run of this very file. An allow-list of nothing has no
+        // such blind spot.
+        //
+        // `.skip(1)` drops the cancel arm's own line; the trailing partial line is the indentation
+        // in front of `maybe_in`, which trims to empty.
+        for line in block[cancel_pos..input_pos].lines().skip(1) {
+            let t = line.trim();
+            assert!(
+                t.is_empty() || t.starts_with("//"),
+                "the input arm must be the FIRST arm after cancel (TUI-092 §2.5, PERF-005 §3.1) — \
+                 an arm polled between them wins a tie against a ready keystroke; found `{t}` \
+                 between them in the select! at byte {offset} of app.rs",
+            );
+        }
         for ticker in [
             "_ = ctx.spinner.tick()",
             "_ = dialog_countdown.tick()",
