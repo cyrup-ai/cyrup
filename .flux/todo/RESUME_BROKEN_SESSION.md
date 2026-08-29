@@ -1,7 +1,7 @@
 ---
 stage: aug
 status: done
-updated: 2026-08-29 01:47
+updated: 2026-08-29 01:59
 ---
 
 # SEAM-112: /resume Produces A Broken Session
@@ -9,183 +9,180 @@ updated: 2026-08-29 01:47
 ## Objective
 
 `/resume` produces a broken session: **nothing renders, and bash tool calls repeat
-endlessly.** Filed 2026-08-15 from live use, rated `critical`.
+endlessly.** Filed 2026-08-15 from live use, `critical`.
 
-The render half is closed. **The open question is narrowly this: why do the bash calls
-repeat?** Everything below exists to stop the next implementer spending the session
-re-deriving what is already settled.
+The render half is closed. **The open question is narrowly: why do the bash calls repeat?**
 
 ---
 
 ## Audit results — settled, do not re-investigate
 
-### The ledger's three candidates: two are dead, one is narrowed
+### The ledger's three candidates: two dead, one narrowed to nothing
 
-The row lists three candidates. Two are now disproved by reading the code at HEAD.
+**Candidate (2) — the generation bump racing the install. FALSE, structurally impossible.**
+[`runtime.rs`](../../crates/cyrup-session-svc/src/runtime.rs) `install_inner` assigns the
+session and the generation under the **same write lock** (`:445`, `:446`) and only then sends
+the watch notify (`:449`). No window exists.
 
-**Candidate (2) — "the generation bump fires before the new session is fully installed, so
-the TUI subscribes to a stream that is then replaced." FALSE, structurally impossible.**
-In [`runtime.rs`](../../crates/cyrup-session-svc/src/runtime.rs) `install_inner`, the
-session and the generation are assigned under the **same write lock** (`:445` `g.session =
-next.clone()`, `:446` `g.generation = new_gen`), and the watch notify (`:449`
-`gen_tx.send(new_gen)`) happens only after that lock is dropped. A watcher cannot observe a
-bumped generation before the session behind it is installed. There is no window.
+**Candidate (3) — nothing drives the new subscription. FALSE.** `on_session_swapped`
+([`run_arms.rs:143-315`](../../crates/cyrup-tui/src/app/run_arms.rs)) re-subscribes (`:163`),
+repoints the loop's handle (`:164`), and replays the conversation (`:285`, `:290`), plus ui
+sinks, read-backs, shortcuts, auth, context usage and the title. This is why "nothing renders"
+is closed.
 
-**Candidate (3) — "`rebind_session` resets the transcript but nothing drives the new
-subscription." FALSE.** `on_session_swapped`
-([`run_arms.rs`](../../crates/cyrup-tui/src/app/run_arms.rs) `:143-315`) is thorough: it
-re-subscribes (`:163` `*events = new_session.subscribe()`), repoints the loop's session
-handle (`:164` `ctx.session = new_session`), and re-seeds the view from the resumed
-conversation (`:285` `let restored = ctx.session.replay_items().await`, `:290`
-`replay_items_with_extensions`). It also re-installs the ui sinks, the overlay sink, the
-extension read-backs, the fault listener, the shortcut set, the auth snapshot, the context
-usage and the terminal title. This is why "nothing renders" is closed at HEAD.
+**Candidate (1) — "the rebuilt session's tool-result path is not re-wired." DEAD in both
+halves.** The previous augmentation narrowed this to the live path and proposed that a tool
+result present in agent state but not yet persisted is erased by a wholesale re-seed. **That
+hypothesis is now disproved.** Two independent proofs:
 
-**Candidate (1) — "the rebuilt session's tool-result path is not re-wired." NARROWED: the
-resume SEED is fine; only the LIVE path remains.** The seed is
-[`builder.rs`](../../crates/cyrup-session-svc/src/builder.rs) step 7 (`:1499`), which maps
-`existing_raw` through `raw_message_to_agent`
-([`event.rs:418`](../../crates/cyrup-session-svc/src/event.rs)). That function's `Raw::Core`
-arm delegates to `core_message_to_agent`, which carries an explicit
-`Message::ToolResult → AgentMessage::ToolResult` arm preserving `tool_call_id`,
-`tool_name`, `content` and `is_error`. Every pi role is pinned by
-`agent_transcript_raw_seed.rs:454`. **Tool results survive the resume seed.** Do not spend
-time there.
+1. **Agent state gets it synchronously.** [`state.rs:173`](../../crates/cyrup-agent/src/state.rs)
+   — `reduce` pushes every message into `st.messages` on `MessageEnd`, and its own doc states
+   it is "called while the state lock is held, BEFORE subscribers are awaited."
+2. **The session file gets it in the same awaited call.** All three tool-result sites emit
+   `MessageStart` then `MessageEnd` with `.await?` —
+   [`exec.rs:249-250`](../../crates/cyrup-agent/src/agent/run/tools/exec.rs), `exec.rs:361-362`,
+   [`mod.rs:110-111`](../../crates/cyrup-agent/src/agent/run/tools/mod.rs) — and the subscriber
+   appends the finalized message to the session tree on `MessageEnd`
+   ([`subscriber.rs:171`](../../crates/cyrup-session-svc/src/subscriber.rs)).
 
-### The row's own citations have drifted — navigate by symbol, not line
+There is no window. **Stop looking for a lost tool result.**
 
-The row says *"Wiring verified at HEAD — do not begin by re-deriving it"* and then gives line
-numbers. The modules have been split since it was filed, so several no longer resolve. An
-implementer trusting them lands on comment lines or missing files:
+The resume seed is likewise fine: [`builder.rs:1499`](../../crates/cyrup-session-svc/src/builder.rs)
+seeds through `raw_message_to_agent`
+([`event.rs:418`](../../crates/cyrup-session-svc/src/event.rs)), whose `Core` arm carries an
+explicit `Message::ToolResult → AgentMessage::ToolResult` arm preserving `tool_call_id`.
+
+### The row's citations have drifted — navigate by symbol
 
 | Row cites | Reality at HEAD |
 | --- | --- |
-| `run.rs:344` (`Some(ev) = events.next()`) | **`:397`** — `:344` is a `bash_running()` guard |
-| `run.rs:293` (swap arm hoisted) | **`:331`** — `swapped = session_swapped` |
+| `run.rs:344` (`Some(ev) = events.next()`) | **`:397`** |
+| `run.rs:293` (swap arm) | **`:331`** (`swapped = session_swapped`) |
 | `run_arms.rs:158` (re-subscribe) | **`:163`/`:164`** |
-| `agent.rs:1985-2026` (`continue_run`) | **file no longer exists** — split into [`agent/lifecycle.rs:209`](../../crates/cyrup-agent/src/agent/lifecycle.rs) and [`loop_fn.rs:200`,`:280`](../../crates/cyrup-agent/src/loop_fn.rs) |
-| `session.rs:5550-5562` (`record_bash_result`) | **file no longer exists** at that path |
-| `subscriber.rs:89-93` (`Fanout::invalidate`) | correct |
-| `runtime.rs:513` (`switch_session_with`) | correct |
-| `session_bind.rs:4` (`rebind_session`) | correct |
+| `agent.rs:1985-2026` (`continue_run`) | **file split** — [`agent/lifecycle.rs:209`](../../crates/cyrup-agent/src/agent/lifecycle.rs), [`loop_fn.rs:200`,`:280`](../../crates/cyrup-agent/src/loop_fn.rs) |
+| `session.rs:5550-5562` | **no such file** |
+| `subscriber.rs:89-93`, `runtime.rs:513`, `session_bind.rs:4` | correct |
 
-The four named test files all exist:
-[`runtime_swap.rs`](../../crates/cyrup-tui/src/tests/runtime_swap.rs) (161),
-[`extension_ui_reset_on_swap.rs`](../../crates/cyrup-tui/src/tests/extension_ui_reset_on_swap.rs) (74),
-[`session_start_lifecycle.rs`](../../crates/cyrup-session-svc/src/tests/session_start_lifecycle.rs) (176),
-[`run_loop_swap_arm_reachable.rs`](../../crates/cyrup-tui/src/tests/run_loop_swap_arm_reachable.rs) (124).
+---
 
-### Where the in-source SEAM-112 markers actually are
+## The leading hypothesis — the overflow latch is not one-shot
 
-This is the finding that reframes the row. The markers are **not** on the swap path. Every
-one is on **compaction / re-seed / retry**:
+Every in-source `SEAM-112` marker sits on compaction / re-seed / retry, not on the swap path.
+[`round8_postrun.rs:177`](../../crates/cyrup-session-svc/src/tests/round8_postrun.rs) states it
+outright: *"after a successful OVERFLOW compaction the interrupted turn must actually be
+RETRIED."*
 
-| Marker | Says |
-| --- | --- |
-| [`auto_compaction.rs:307`](../../crates/cyrup-session-svc/src/session/auto_compaction.rs) | the re-seed is on the SUCCESS PATH ONLY |
-| `auto_compaction.rs:375` | after a compaction that will retry, re-drop the retriable trailing assistant |
-| [`compaction.rs:216`](../../crates/cyrup-session-svc/src/session/compaction.rs) | same success-path-only ordering |
-| [`round8_postrun.rs:177`](../../crates/cyrup-session-svc/src/tests/round8_postrun.rs) | **"after a successful OVERFLOW compaction the interrupted turn must actually be RETRIED"** |
-| [`compact_refusals.rs:469`](../../crates/cyrup-session-svc/src/tests/compact_refusals.rs) | a FAILED compaction must leave `agent.state.messages` exactly as it found it |
-| `builder.rs:824`, `:1499` | the raw projection and the resume seed |
+The overflow guard is `overflow_recovery_attempted`
+([`session/mod.rs:242`](../../crates/cyrup-session-svc/src/session/mod.rs)). It is read and set
+in [`auto_compaction.rs:85`,`:100`](../../crates/cyrup-session-svc/src/session/auto_compaction.rs)
+to make overflow recovery one-shot. It is **cleared in two places**
+([`run.rs:247`,`:278`](../../crates/cyrup-session-svc/src/session/run.rs)) — and the second is
+the problem:
 
-### The mechanism this suggests — the hypothesis to test first
+```rust
+// run.rs:273 — on_assistant_message_end
+if assistant.stop_reason == cyrup_core::StopReason::Error {
+    return;
+}
+*Self::lock(&self.overflow_recovery_attempted) = false;
+```
 
-Every re-seed site replaces `agent.state.messages` **wholesale from the persisted
-projection** (`self.agent.set_messages(compacted_messages)`, `auto_compaction.rs` ~`:341`).
-The live tool-result path appends to agent state at
-[`agent/run/turn.rs:76-77`](../../crates/cyrup-agent/src/agent/run/turn.rs) — into **both**
-`self.messages` and `self.new_messages` — with the tool sites at
-[`tools/exec.rs:248`,`:361`](../../crates/cyrup-agent/src/agent/run/tools/exec.rs) and
-[`tools/mod.rs:109`](../../crates/cyrup-agent/src/agent/run/tools/mod.rs).
+The early return covers **only** `StopReason::Error`. A normal tool-calling turn ends with
+`StopReason::ToolUse`, falls through, and **clears the latch**. So in a tool-calling loop the
+"one-shot" guard is re-armed on every single turn.
 
-**So: a tool result that is in agent state but not yet persisted as a session entry is
-erased by any wholesale re-seed.** The model then sees its own `tool_use` unanswered and
-re-issues the identical call. If the condition that triggered the re-seed still holds, the
-cycle repeats — endlessly, with the same command, which is exactly the reported symptom.
+Combine that with the retry tail (`auto_compaction.rs:375`, `will_retry` → `continue_run`
+re-driving the interrupted turn) and the cycle is:
 
-A resumed session is the natural way to enter that state: it starts at or near the context
-limit, so the first turn can overflow immediately and drive compaction on every attempt.
+```
+overflow -> latch was false -> compact -> will_retry -> continue_run
+   -> turn re-runs the SAME bash call -> assistant message_end (ToolUse) -> latch CLEARED
+   -> overflow -> compact -> ... unbounded
+```
 
-**This is a hypothesis with a specific check, not a conclusion. It is unproven and must not
-be treated as the cause until the live run below confirms it.** It is recorded because it
-explains BOTH symptoms from one cause and the ledger's three candidates do not.
+Each pass re-executes the identical bash command. **This is the reported symptom exactly.**
+
+A resumed session is the natural way to enter it: it starts at or near the context limit, so
+the very first turn can overflow.
+
+**The cycle terminates only if compaction actually shrinks the context.** The same file
+documents a prior bug of precisely that shape — compaction "reported success while the very
+next turn still shipped the ENTIRE pre-compaction history to the provider: zero token
+reduction, full cost" (`auto_compaction.rs:327`). If any resumed-session path leaves the
+re-seed ineffective, the loop never exits.
+
+**This is a hypothesis with a specific numeric check, not a conclusion.** It is unproven until
+the live run below confirms it. It is recorded because it explains an *endless* repeat — which
+none of the row's three candidates does, and which the previous augmentation's hypothesis
+cannot, now that both halves of candidate (1) are dead.
 
 ---
 
 ## The work
 
-### 1. Reproduce ONCE, with instrumentation — before changing anything
+### 1. Instrument, reproduce ONCE, read
 
-The ledger is explicit and it is right: **do not characterise this by re-running it.** One
-observation, read the log.
+Log at exactly these points, then run **one** `/resume` on a session large enough to overflow,
+let the bash call repeat two or three times, and stop. Do not characterise by re-running.
 
-Add temporary `tracing` at exactly these four points:
-
-- **tool result appended** — [`agent/run/turn.rs:76`](../../crates/cyrup-agent/src/agent/run/turn.rs):
-  log `tool_call_id`, `tool_name`, and `self.messages.len()` after the push.
-- **agent state re-seeded** — `auto_compaction.rs` at the `set_messages` call (~`:341`) and
-  every other `set_messages` site: log the incoming length and whether the last message is
-  an `Assistant` with an unanswered `ToolUse`.
-- **TUI re-subscribe / rebind** — [`run_arms.rs:163-164`](../../crates/cyrup-tui/src/app/run_arms.rs):
-  log the generation being bound and `restored.len()` at `:285`.
-- **run continuation refused** — [`agent/lifecycle.rs:209`](../../crates/cyrup-agent/src/agent/lifecycle.rs)
-  and [`loop_fn.rs:200`,`:280`](../../crates/cyrup-agent/src/loop_fn.rs): log each
-  `ContinueFromAssistant`.
-
-Then run **one** `/resume` on a session large enough to overflow, let the bash call repeat
-two or three times, and stop.
+- **latch cleared** — `run.rs:277`: log `assistant.stop_reason` on every clear. This is the
+  load-bearing line; a `ToolUse` here is the hypothesis firing.
+- **latch read / set** — `auto_compaction.rs:85` and `:100`.
+- **compaction effectiveness** — `auto_compaction.rs:340`: log `estimated_tokens_after`
+  alongside the model's context window, and the seeded message count.
+- **retry decision** — `auto_compaction.rs:375`: log `will_retry`.
+- **tool result** — `turn.rs:76`: log `tool_call_id` and `tool_name`, to correlate the repeats.
 
 ### 2. Read the log against this decision tree
 
-- **A tool result is appended, then a re-seed drops the list back to a length that excludes
-  it** → the hypothesis above is confirmed. Fix at the re-seed: the re-seed must not discard
-  agent-state messages that have no persisted entry yet. Follow the ordering already
-  established at `auto_compaction.rs:307` (success path only) and `:375` (re-drop the
-  retriable tail) rather than inventing a new sequencing.
-- **No tool result is ever appended** → the failure is upstream in the tool execution path
-  (`tools/exec.rs:248`/`:361`); the result never reaches `turn.rs:76`.
-- **The result is appended and survives, but the model still repeats** → the request
-  projection is dropping it at the LLM boundary; look at `convertToLlm`
-  ([`hooks.rs:185`](../../crates/cyrup-agent/src/hooks.rs)), where `AgentMessage::ToolResult`
-  maps back to `Message::ToolResult`, and check `tool_call_id` correlation.
-- **`ContinueFromAssistant` fires each cycle** → the interrupted-turn retry is the driver;
-  the `will_retry` branch at `auto_compaction.rs:375` is the site.
+- **`ToolUse` appears on a latch clear, and compaction repeats** → the hypothesis is
+  confirmed. Fix at `run.rs:277`: the clear must not re-arm overflow recovery for a turn that
+  merely ended in a tool call. Restrict it to a genuinely completed response — pi's own
+  intent at `agent-session.ts:562-577` is a *non-error response*, and a `ToolUse` turn is not
+  a completed response. Widen the early return to cover `ToolUse` (and any stop reason that
+  implies the turn is still in flight) rather than removing the clear, which would break the
+  legitimate reset after a real answer.
+- **`estimated_tokens_after` does not drop, or drops but stays above the window** → the
+  compaction is ineffective on this path; the latch is then a symptom and the fix is at the
+  re-seed. Follow the ordering already established at `auto_compaction.rs:307` (success path
+  only) and `:375` (re-drop the retriable tail).
+- **The latch stays set and the loop still repeats** → the driver is not overflow recovery;
+  fall back to logging at `agent/lifecycle.rs:209` and `loop_fn.rs:200`/`:280` to see what is
+  re-entering the run.
+- **No compaction at all in the log** → the repeat is not compaction-driven; the remaining
+  surface is the request projection, where `AgentMessage::ToolResult` maps back at
+  [`hooks.rs:185`](../../crates/cyrup-agent/src/hooks.rs) — check `tool_call_id` correlation.
 
 ### 3. Fix at the root cause
 
-Apply the fix at whichever of the four the log names. Do not fix the symptom — suppressing a
-repeated call without explaining the erased result leaves the session silently lossy.
+Do not suppress the repeat. A guard that merely caps the loop leaves a session that silently
+burns the context window.
 
 ### 4. Correct the row's stale citations
 
-While in the file, repoint the drifted line references in the SEAM-112 rows
+Repoint the drifted references in the `SEAM-112` rows
 ([`08-cyrup-session-svc-and-modes.md:410`](../../docs/gap-analysis/08-cyrup-session-svc-and-modes.md),
-[`00-residual-ledger.md:24`](../../docs/gap-analysis/00-residual-ledger.md)) to the symbols
-in the drift table above. The row's value is that it tells the next reader not to
-re-derive; broken citations destroy exactly that value.
+[`00-residual-ledger.md:24`](../../docs/gap-analysis/00-residual-ledger.md)) to the symbols in
+the drift table, and strike candidates (1)–(3), all now disproved.
 
 ---
 
 ## Out of scope
 
-- The swap path itself (`on_session_swapped`, `install_inner`, `Fanout::invalidate`). Two of
-  three ledger candidates were disproved there; it is correct at HEAD.
-- The resume seed's role/tool-result fidelity — verified, and pinned by
-  `agent_transcript_raw_seed.rs:454`.
+- The swap path (`on_session_swapped`, `install_inner`, `Fanout::invalidate`) — correct at HEAD.
+- The resume seed's tool-result fidelity — proved intact.
 - The "nothing renders" half, closed by `879eb4e`.
-- Any change that makes the repeat *quieter* rather than explaining the erased result.
+- Persisting or de-duplicating tool results — they are already persisted synchronously.
 
 ---
 
 ## Definition of done
 
-1. One instrumented `/resume` captured, and the log names which of the four decision-tree
-   branches fired.
-2. The mechanism by which a tool result fails to reach the model is stated in one sentence,
-   grounded in that log — not inferred from reading.
-3. The fix is applied at that mechanism, and a second `/resume` under the same conditions no
-   longer repeats the call.
-4. The temporary instrumentation is removed.
-5. `cargo check --workspace --all-targets` is clean.
-6. The SEAM-112 rows carry the corrected citations.
+1. One instrumented `/resume` captured, and the log names which decision-tree branch fired.
+2. The reason the model re-issues the identical call is stated in one sentence grounded in
+   that log.
+3. The fix is applied at that branch; if it is the latch, the clear no longer re-arms overflow
+   recovery on a turn that ended in a tool call, while still resetting after a real response.
+4. A second `/resume` under the same conditions no longer repeats the call.
+5. Temporary instrumentation removed; `cargo check --workspace --all-targets` clean.
+6. The `SEAM-112` rows carry corrected citations and the three disproved candidates struck.
