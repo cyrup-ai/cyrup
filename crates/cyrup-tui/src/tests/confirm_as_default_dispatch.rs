@@ -104,3 +104,65 @@ async fn thinking_kind_reaches_its_arm_and_reports() {
         "`ConfirmSelectionAsDefault{{Thinking}}` produced no status:\n{out}"
     );
 }
+
+/// The `/settings` list is built ONCE (`app/execute.rs`'s `C::OpenSelector` arm) and a row cycle
+/// keeps the slot open, so a sibling row whose display depends on another row goes stale. Flipping
+/// `hideThinkingBlock` must refresh the `Thinking level` row IN PLACE, in both directions.
+///
+/// This drives `execute_command` for the same reason the tests above do: the marker is applied in
+/// the `C::ApplySetting` arm, and a formatter-level assertion passes whether or not that arm ever
+/// writes the row through — which is exactly how the staleness shipped.
+#[tokio::test]
+async fn hide_thinking_refreshes_the_thinking_level_row_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = session(dir.path()).await;
+    let mut app = App::new(TestBackend::new(100, 40), UiTheme::dark()).unwrap();
+
+    app.execute_command(AppCommand::OpenSelector(SelectorKind::Settings), &session, None).await;
+    // The list windows 10 of 29 rows and `Thinking level` is not in the first page, so filter to
+    // it through the real search box. `filtered` holds INDICES into `rows` (`apply_filter`), so a
+    // row written through while a filter is active still shows — which is the property under test.
+    for c in "thinking level".chars() {
+        app.handle_input(&crate::InputEvent::Key(
+            crate::crossterm::event::KeyEvent::new(
+                crate::crossterm::event::KeyCode::Char(c),
+                crate::crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+    }
+    app.draw().unwrap();
+    let before = screen(&app);
+    assert!(before.contains("Thinking level"), "the row is not on screen at all:\n{before}");
+    assert!(!before.contains("(hidden)"), "clean before the flip:\n{before}");
+
+    // The command BOTH writers dispatch: the row cycle via the `Apply` payload, and `Ctrl+T`.
+    app.execute_command(
+        AppCommand::ApplySetting {
+            id: "hideThinkingBlock".to_string(),
+            value: "true".to_string(),
+        },
+        &session,
+        None,
+    )
+    .await;
+    app.draw().unwrap();
+    let hidden = screen(&app);
+    assert!(
+        hidden.contains("(hidden)"),
+        "the sibling row did not refresh while the slot stayed open:\n{hidden}"
+    );
+
+    // ...and back off, leaving no stale marker for the rest of the dialog.
+    app.execute_command(
+        AppCommand::ApplySetting {
+            id: "hideThinkingBlock".to_string(),
+            value: "false".to_string(),
+        },
+        &session,
+        None,
+    )
+    .await;
+    app.draw().unwrap();
+    let visible = screen(&app);
+    assert!(!visible.contains("(hidden)"), "a stale marker survived the flip back:\n{visible}");
+}

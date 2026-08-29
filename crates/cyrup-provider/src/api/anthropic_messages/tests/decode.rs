@@ -130,7 +130,7 @@ async fn content_block_start_text_payload_is_kept() {
         .content
         .iter()
         .find_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .expect("text block on the start partial");
@@ -145,7 +145,7 @@ async fn content_block_start_text_payload_is_kept() {
         .content
         .iter()
         .find_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .expect("text block");
@@ -287,7 +287,7 @@ async fn missing_message_stop_is_error() {
     let m = model();
     let events = collect(raw.as_bytes().to_vec(), &m).await;
     let err = events.iter().find_map(|e| match e {
-        StreamEvent::Error { error, .. } => Some(error.clone()),
+        StreamEvent::Error { error, .. } => Some((**error).clone()),
         _ => None,
     });
     let msg = err.expect("error terminal");
@@ -304,7 +304,7 @@ async fn sse_error_event_is_error_terminal() {
     let m = model();
     let events = collect(raw.as_bytes().to_vec(), &m).await;
     let err = events.iter().find_map(|e| match e {
-        StreamEvent::Error { error, .. } => Some(error.clone()),
+        StreamEvent::Error { error, .. } => Some((**error).clone()),
         _ => None,
     });
     assert!(err.is_some());

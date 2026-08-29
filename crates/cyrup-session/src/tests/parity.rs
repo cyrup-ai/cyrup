@@ -32,7 +32,7 @@ fn text_of(m: &Message) -> String {
     blocks
         .iter()
         .find_map(|b| match b {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .unwrap_or_default()
@@ -369,13 +369,13 @@ fn gap17_serialize_separators_json_args_and_skips_empty() {
             Content::ToolCall(ToolCall {
                 id: "t1".into(),
                 name: "read".into(),
-                arguments: json!({ "path": "a.rs" }).as_object().cloned().unwrap(),
+                arguments: json!({ "path": "a.rs" }).as_object().cloned().unwrap().into(),
                 thought_signature: None,
             }),
             Content::ToolCall(ToolCall {
                 id: "t2".into(),
                 name: "write".into(),
-                arguments: json!({ "path": "b.rs" }).as_object().cloned().unwrap(),
+                arguments: json!({ "path": "b.rs" }).as_object().cloned().unwrap().into(),
                 thought_signature: None,
             }),
         ],
@@ -818,7 +818,7 @@ fn asst_toolcall(name: &str, key: &str, path: &str) -> Message {
         content: vec![Content::ToolCall(ToolCall {
             id: "tc".into(),
             name: name.into(),
-            arguments: json!({ key: path }).as_object().cloned().unwrap(),
+            arguments: json!({ key: path }).as_object().cloned().unwrap().into(),
             thought_signature: None,
         })],
         provider: "faux".into(),

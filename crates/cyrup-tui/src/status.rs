@@ -107,6 +107,14 @@ pub struct StatusLine {
     pub auto_compact: bool,
     /// Current reasoning level (`off`…`xhigh`/`max`). Rendered only when [`reasoning`](Self::reasoning) is set.
     pub thinking_level: String,
+    /// **[CYRUP-DELTA]** `hideThinkingBlock` — upstream's footer has no counterpart, because
+    /// upstream never leaves the flag unattributed: `setHideThinkingBlock` re-renders every prior
+    /// assistant message (`assistant-message.ts:57-62`), so a user watching the screen sees the
+    /// bodies collapse the instant it flips. cyrup's committed rows have left the render tree for
+    /// native scrollback (ADR-0001; `TUI-N06` owns that residual), so nothing already on screen
+    /// changes and the flag becomes invisible — a global, cross-session setting silently
+    /// suppressing reasoning the user is paying for. The footer carries it so it can always be seen.
+    thinking_hidden: bool,
     /// Whether the active model supports reasoning (`state.model?.reasoning`, `footer.ts:185`). When
     /// set, the right cluster appends ` • thinking off` / ` • {level}`.
     pub reasoning: bool,
@@ -228,6 +236,11 @@ impl StatusLine {
     /// Set the reasoning level shown in the right cluster (`footer.ts:186-188`).
     pub fn set_thinking_level(&mut self, level: impl Into<String>) {
         self.thinking_level = level.into();
+    }
+    /// Whether `hideThinkingBlock` is suppressing the reasoning body, which the right cluster
+    /// marks so the state stays legible outside the pickers.
+    pub fn set_thinking_hidden(&mut self, hidden: bool) {
+        self.thinking_hidden = hidden;
     }
     /// Set whether the active model supports reasoning (gates the ` • thinking …` suffix).
     pub fn set_reasoning(&mut self, reasoning: bool) {
@@ -395,6 +408,10 @@ impl StatusLine {
             let level = if self.thinking_level.is_empty() { "off" } else { self.thinking_level.as_str() };
             if level == "off" {
                 format!("{model} • thinking off")
+            } else if self.thinking_hidden {
+                // The level alone reads as "reasoning is on and visible", which it is not: the
+                // body is replaced by the static `Thinking...` label.
+                format!("{model} • {level} (hidden)")
             } else {
                 format!("{model} • {level}")
             }

@@ -1,6 +1,7 @@
 //! The turn driver (Pi `runLoop`): steering/follow-up injection, the assistant turn, the tool
 //! batch, and the two post-turn hooks whose overrides are folded back into the run baseline.
 
+use std::sync::Arc;
 use super::{RunCtx, RunFailure};
 use crate::agent::message::tool_calls;
 use crate::event::{AgentEvent, AgentMessage};
@@ -40,12 +41,12 @@ impl RunCtx {
                 // Pi's `streamAssistantResponse` leaves the final assistant message in the loop's
                 // working copy (`currentContext.messages`, agent-loop.ts:346/348/361/363); mirror that
                 // before tool execution / the post-turn hooks read the context.
-                self.messages.push(AgentMessage::Assistant(asst.clone()));
-                self.new_messages.push(AgentMessage::Assistant(asst.clone()));
+                self.messages.push(AgentMessage::Assistant(Arc::new(asst.clone())));
+                self.new_messages.push(AgentMessage::Assistant(Arc::new(asst.clone())));
 
                 if matches!(asst.stop_reason, StopReason::Error | StopReason::Aborted) {
                     self.emit(AgentEvent::TurnEnd {
-                        message: AgentMessage::Assistant(asst),
+                        message: AgentMessage::Assistant(Arc::new(asst)),
                         tool_results: Vec::new(),
                     })
                     .await?;
@@ -79,7 +80,7 @@ impl RunCtx {
                 }
 
                 self.emit(AgentEvent::TurnEnd {
-                    message: AgentMessage::Assistant(asst.clone()),
+                    message: AgentMessage::Assistant(Arc::new(asst.clone())),
                     tool_results: tool_results.clone(),
                 })
                 .await?;

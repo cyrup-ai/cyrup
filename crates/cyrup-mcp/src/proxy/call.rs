@@ -750,7 +750,7 @@ async fn invoke(
         return match ctx.env.read_resource(server_name, uri, recovery, owned).await {
             Ok(content) => {
                 let content = if content.is_empty() {
-                    vec![Content::Text { text: "(empty resource)".to_string(), text_signature: None }]
+                    vec![Content::Text { text: "(empty resource)".into(), text_signature: None }]
                 } else {
                     content
                 };
@@ -776,7 +776,7 @@ async fn invoke(
         // Path 2 — the server returned `isError: true`.
         Ok(result) if result.is_error => {
             let content = if result.content.is_empty() {
-                vec![Content::Text { text: "(empty result)".to_string(), text_signature: None }]
+                vec![Content::Text { text: "(empty result)".into(), text_signature: None }]
             } else {
                 result.content
             };
@@ -804,7 +804,7 @@ async fn invoke(
         // Path 3 — success. `callIdentity` is spread AFTER the guard keys here.
         Ok(result) => {
             let content = if result.content.is_empty() {
-                vec![Content::Text { text: "(empty result)".to_string(), text_signature: None }]
+                vec![Content::Text { text: "(empty result)".into(), text_signature: None }]
             } else {
                 result.content
             };
@@ -875,7 +875,7 @@ async fn catch_arm(
             let guarded = ctx
                 .env
                 .guard_mcp_output(
-                    vec![Content::Text { text: message.clone(), text_signature: None }],
+                    vec![Content::Text { text: message.clone().into(), text_signature: None }],
                     OutputGuardOptions {
                         prefix: "Failed to call tool: ".to_string(),
                         suffix: schema_suffix.to_string(),

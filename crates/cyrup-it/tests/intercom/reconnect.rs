@@ -210,7 +210,7 @@ async fn a_tool_call_after_a_refused_broker_retries_and_succeeds() {
         .content
         .iter()
         .map(|c| match c {
-            cyrup_core::Content::Text { text, .. } => text.clone(),
+            cyrup_core::Content::Text { text, .. } => text.to_string(),
             _ => String::new(),
         })
         .collect::<String>();

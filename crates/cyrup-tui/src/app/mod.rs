@@ -110,7 +110,7 @@ pub use outcome::{
 pub(crate) use settings_rows::PROJECT_UNTRUSTED_WARNING;
 pub(crate) use settings_rows::{
     format_saved_trust, model_thinking_summary_for_count, parse_setting_value, session_label,
-    settings_rows, system_time_nanos,
+    settings_rows, system_time_nanos, thinking_row_value,
 };
 #[cfg(test)]
 pub(crate) use settings_rows::{settings_rows_for_test, settings_rows_for_test_with_images};

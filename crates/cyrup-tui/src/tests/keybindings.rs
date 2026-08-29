@@ -59,6 +59,36 @@ fn select_and_editor_maps_merge_their_own_ids_only() {
     );
 }
 
+/// TUI-067 — `tui.input.copy` reaches [`EditorAction::PassThrough`], under both the canonical id and
+/// pi's legacy bare `copy` (`core/keybindings.ts:260`). Before the arm existed, `merge_entries`'
+/// `let Some(action) = from_id(&id) else { continue }` discarded the entry with no diagnostic.
+#[test]
+fn editor_keymap_merges_tui_input_copy() {
+    // Bound to nothing by default, deliberately: cyrup's editor map claims no `ctrl+c`, so the
+    // chord already reaches the app tier and upstream's default entry would change nothing here.
+    let stock = EditorKeymap::default();
+    assert_eq!(stock.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)), None);
+    assert_eq!(stock.key_label(EditorAction::PassThrough), None);
+
+    let mut ek = EditorKeymap::default();
+    let issues = ek.merge_json(r#"{ "tui.input.copy": "ctrl+q" }"#).unwrap();
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(
+        ek.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        Some(EditorAction::PassThrough)
+    );
+
+    // The legacy spelling lands on the same destination through the rename table.
+    let mut legacy = EditorKeymap::default();
+    legacy.merge_json(r#"{ "copy": "ctrl+q" }"#).unwrap();
+    assert_eq!(
+        legacy.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        Some(EditorAction::PassThrough)
+    );
+    assert_eq!(EditorAction::from_id("tui.input.copy"), Some(EditorAction::PassThrough));
+    assert_eq!(EditorAction::from_id("copy"), Some(EditorAction::PassThrough));
+}
+
 #[test]
 fn models_keymap_merges_app_models_ids_only() {
     // The scoped-models bespoke map (`app.models.*`, core/keybindings.ts:150-175) picks only its ids.

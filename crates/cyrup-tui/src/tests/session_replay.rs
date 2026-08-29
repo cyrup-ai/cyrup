@@ -41,7 +41,7 @@ fn app() -> App<TestBackend> {
 
 fn user(text: &str) -> AgentMessage {
     AgentMessage::Core(Message::User {
-        content: vec![Content::Text { text: text.to_string(), text_signature: None }],
+        content: vec![Content::Text { text: text.into(), text_signature: None }],
         timestamp: 0,
     })
 }
@@ -60,7 +60,7 @@ fn assistant(content: Vec<Content>) -> AgentMessage {
 }
 
 fn text(t: &str) -> Content {
-    Content::Text { text: t.to_string(), text_signature: None }
+    Content::Text { text: t.into(), text_signature: None }
 }
 
 fn tool_call(name: &str, args: serde_json::Value) -> Content {
@@ -72,7 +72,7 @@ fn tool_call_id(id: &str, name: &str, args: serde_json::Value) -> Content {
     Content::ToolCall(ToolCall {
         id: ToolCallId::from(id),
         name: name.to_string(),
-        arguments,
+        arguments: arguments.into(),
         thought_signature: None,
     })
 }
@@ -85,7 +85,7 @@ fn tool_result_id(id: &str, name: &str, body: &str) -> AgentMessage {
     AgentMessage::Core(Message::ToolResult {
         tool_call_id: ToolCallId::from(id),
         tool_name: name.to_string(),
-        content: vec![Content::Text { text: body.to_string(), text_signature: None }],
+        content: vec![Content::Text { text: body.into(), text_signature: None }],
         is_error: false,
         details: None,
         timestamp: 0,
@@ -160,7 +160,7 @@ fn replay_preserves_message_order_including_tools() {
         user("read the config"),
         assistant(vec![
             Content::Thinking {
-                thinking: "I should open it first".to_string(),
+                thinking: "I should open it first".into(),
                 thinking_signature: None,
                 redacted: false,
             },

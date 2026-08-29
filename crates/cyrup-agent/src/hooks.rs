@@ -181,7 +181,7 @@ pub fn default_convert_to_llm(msgs: &[AgentMessage]) -> Vec<Message> {
             AgentMessage::User { content, timestamp } => {
                 Some(Message::User { content: content.clone(), timestamp: timestamp.unwrap_or(0) })
             }
-            AgentMessage::Assistant(a) => Some(Message::Assistant(a.clone())),
+            AgentMessage::Assistant(a) => Some(Message::Assistant((**a).clone())),
             AgentMessage::ToolResult(t) => Some(Message::ToolResult {
                 tool_call_id: t.tool_call_id.clone(),
                 tool_name: t.tool_name.clone(),

@@ -247,7 +247,7 @@ async fn a_tool_added_mid_run_is_callable_from_that_turn_onward_and_not_before()
                 t.content
                     .iter()
                     .filter_map(|c| match c {
-                        Content::Text { text, .. } => Some(text.clone()),
+                        Content::Text { text, .. } => Some(text.to_string()),
                         _ => None,
                     })
                     .collect::<String>(),
@@ -462,7 +462,7 @@ async fn a_mid_run_added_tool_is_still_permission_gated() {
         .content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .collect();
@@ -555,7 +555,7 @@ async fn a_mid_run_added_tool_is_gated_by_the_extension_tool_call_seam() {
         .content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .collect();

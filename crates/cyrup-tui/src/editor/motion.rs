@@ -124,7 +124,7 @@ impl InputEditor {
     /// (`editor.ts:1869-1889`), i.e. with
     /// `{ segment: (t) => this.segment(t, "word"), isAtomicSegment: isPasteMarker }`.
     ///
-    /// The segment walk itself lives in [`find_word_backward`](super::word_nav::find_word_backward),
+    /// The segment walk itself lives in [`find_word_backward`],
     /// shared with the single-line [`crate::text_input::Input`]; what stays here is what has no
     /// single-line analogue — the marker-aware char-column segmentation and the row edge, where col
     /// 0 steps to the previous line's end (`editor.ts:1874-1881`).
@@ -156,7 +156,7 @@ impl InputEditor {
 
     /// The word-right target — the mirror of [`Self::word_left_target`], pi's `findWordForward`
     /// (`word-navigation.ts:76-114`) as `moveWordForwards` calls it (`editor.ts:2064-2083`). The
-    /// walk is [`find_word_forward`](super::word_nav::find_word_forward); the row edge (col ==
+    /// walk is [`find_word_forward`]; the row edge (col ==
     /// line length steps to the next line's start) stays here.
     pub(super) fn word_right_target(&self) -> (usize, usize) {
         let Some(line) = self.lines.get(self.row) else { return (self.row, self.col) };

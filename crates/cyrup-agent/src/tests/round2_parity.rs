@@ -429,10 +429,10 @@ async fn gap3_run_agent_loop_continue_rejects_empty_and_trailing_assistant() {
     // Trailing assistant => ContinueFromAssistant.
     let ctx = AgentContext {
         system_prompt: String::new(),
-        messages: vec![AgentMessage::Assistant(faux_assistant_message(
+        messages: vec![AgentMessage::Assistant(Arc::new(faux_assistant_message(
             vec![faux_text("prev")],
             StopReason::Stop,
-        ))],
+        )))],
         tools: Vec::new(),
     };
     let trailing = run_agent_loop_continue(
@@ -483,10 +483,10 @@ async fn gap3_agent_loop_continue_pull_stream_validates_up_front() {
     // A trailing assistant message must be rejected synchronously, before spawning.
     let ctx = AgentContext {
         system_prompt: String::new(),
-        messages: vec![AgentMessage::Assistant(faux_assistant_message(
+        messages: vec![AgentMessage::Assistant(Arc::new(faux_assistant_message(
             vec![faux_text("prev")],
             StopReason::Stop,
-        ))],
+        )))],
         tools: Vec::new(),
     };
     let res = agent_loop_continue(ctx, AgentLoopConfig::new(model_ref()), RunCancel::new(), sf);

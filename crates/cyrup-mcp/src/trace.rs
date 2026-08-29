@@ -6,9 +6,9 @@
 //! # The property the whole module is shaped around
 //!
 //! **Tracing must never change MCP request/response behaviour.** Every latch is one-way, every
-//! failure path is silent, [`TraceWriter::write`] is sync and infallible, and
-//! [`TracingTransport::send`] rethrows the inner outcome unchanged. A tracer that can fail a connect
-//! is worse than no tracer.
+//! failure path is silent, [`TraceWriter::write`] is sync and infallible, and [`TracingTransport`]'s
+//! `send` — its `rmcp` `Transport` impl — rethrows the inner outcome unchanged. A tracer that can
+//! fail a connect is worse than no tracer.
 
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, PoisonError};

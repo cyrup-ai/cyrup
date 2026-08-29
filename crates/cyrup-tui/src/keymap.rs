@@ -336,6 +336,22 @@ pub enum EditorAction {
     HistoryPrevious,
     /// The forward half — `tui.editor.historyNext` (`keybindings.ts:72-75`, `editor.ts:772-776`).
     HistoryNext,
+    /// Decline the key: the editor does NOT consume it, so it falls through as
+    /// [`crate::editor::EditorOutcome::Ignored`] instead of being inserted or acted on. This is
+    /// `tui.input.copy` (`tui/src/keybindings.ts:36`; `:146` `defaultKeys: "ctrl+c"`, "Copy
+    /// selection"), the one upstream id whose entire handler is the bare `return` at
+    /// `tui/src/components/editor.ts:653-655`, under the comment "Ctrl+C - let parent handle
+    /// (exit/clear)".
+    ///
+    /// **TUI-067 — bound to nothing by [`EditorKeymap::default`], deliberately.** Upstream needs the
+    /// default `ctrl+c` entry because its editor would otherwise swallow the chord; cyrup's default
+    /// editor map binds no `ctrl+c` at all, so the chord already reaches the app tier and a default
+    /// here would change nothing. What was missing is the DESTINATION: with no arm in
+    /// [`EditorAction::from_id`], [`merge_entries`]' `let Some(action) = from_id(&id) else
+    /// { continue }` dropped a user's `tui.input.copy` rebind silently — not even a
+    /// [`KeybindingIssue`] — so the id was config-inert. The observable effect of a rebind is that
+    /// the editor stops INSERTING the rebound chord and declines it instead.
+    PassThrough,
 }
 
 impl EditorAction {
@@ -411,6 +427,12 @@ impl EditorAction {
             "tui.input.newLine" | "editor.newLine" | "newLine" => E::NewLine,
             "tui.input.submit" | "editor.submit" | "submit" => E::Submit,
             "tui.input.tab" | "editor.tab" | "tab" => E::Tab,
+            // TUI-067 (`tui/src/keybindings.ts:36`). The legacy BARE spelling is pi's own `copy`
+            // (`coding-agent/src/core/keybindings.ts:260`, mirrored in cyrup's migration table at
+            // `cyrup-config/src/keybindings.rs:70`), which is why it is carried here the way
+            // `newLine`/`submit`/`tab` carry theirs. There is no `editor.copy` alias: cyrup never
+            // shipped a spelling for this id, because it had no destination at all until now.
+            "tui.input.copy" | "copy" => E::PassThrough,
             _ => return None,
         })
     }

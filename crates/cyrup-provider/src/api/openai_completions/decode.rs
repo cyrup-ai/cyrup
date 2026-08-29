@@ -74,12 +74,12 @@ where
         let ev = match dec.blocks.get(idx) {
             Some(Block::Text(text)) => StreamEvent::TextEnd {
                 content_index: idx,
-                content: text.clone(),
+                content: text.to_string(),
                 partial,
             },
             Some(Block::Thinking { text, .. }) => StreamEvent::ThinkingEnd {
                 content_index: idx,
-                content: text.clone(),
+                content: text.to_string(),
                 partial,
             },
             Some(Block::Tool {
@@ -87,12 +87,13 @@ where
                 name,
                 args,
                 thought_signature,
+                ..
             }) => StreamEvent::ToolCallEnd {
                 content_index: idx,
                 tool_call: ToolCall {
                     id: ToolCallId::from(id.as_str()),
                     name: name.clone(),
-                    arguments: parse_partial_json(args),
+                    arguments: parse_partial_json(args).into(),
                     thought_signature: thought_signature.clone(),
                 },
                 partial,
@@ -242,7 +243,7 @@ async fn process_chunk(
             Some(idx) => idx,
             None => return false,
         };
-        if let Some(Block::Text(buf)) = dec.blocks.get_mut(idx) {
+        if let Some(Block::Text(buf)) = dec.block_mut(idx) {
             buf.push_str(text);
         }
         let partial = dec.snapshot(model, api);
@@ -273,7 +274,7 @@ async fn process_chunk(
             Some(idx) => idx,
             None => return false,
         };
-        if let Some(Block::Thinking { text, .. }) = dec.blocks.get_mut(idx) {
+        if let Some(Block::Thinking { text, .. }) = dec.block_mut(idx) {
             text.push_str(reason_text);
         }
         let partial = dec.snapshot(model, api);
@@ -307,7 +308,7 @@ async fn process_chunk(
                 if let Some(&idx) = dec.tool_by_id.get(id) {
                     if let Some(Block::Tool {
                         thought_signature, ..
-                    }) = dec.blocks.get_mut(idx)
+                    }) = dec.block_mut(idx)
                     {
                         *thought_signature = Some(serialized);
                     }

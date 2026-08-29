@@ -69,7 +69,7 @@ async fn incomplete_status_splits_on_the_provider_reason() {
             .await
             .last()
             .and_then(StreamEvent::terminal_message)
-            .cloned()
+            .map(|m| (**m).clone())
             .expect("terminal")
     }
 
@@ -112,13 +112,13 @@ async fn requested_priority_tier_survives_a_default_response_tier() {
         .await
         .last()
         .and_then(StreamEvent::terminal_message)
-        .cloned()
+        .map(|m| (**m).clone())
         .expect("terminal");
     let priority = drain(SSE, Some("priority"))
         .await
         .last()
         .and_then(StreamEvent::terminal_message)
-        .cloned()
+        .map(|m| (**m).clone())
         .expect("terminal");
     // The baseline must be genuinely non-zero, or the ratio assertion below is vacuous — the
     // model now carries real rates precisely so this can be checked.
@@ -149,7 +149,7 @@ async fn an_unrequested_tier_prices_at_the_responses_own_default() {
         .await
         .last()
         .and_then(StreamEvent::terminal_message)
-        .cloned()
+        .map(|m| (**m).clone())
         .expect("terminal");
     // 1000 input @ $1/1e6 + 1000 output @ $2/1e6 = 0.003, undoubled.
     assert!(
@@ -182,7 +182,7 @@ async fn a_codex_error_event_ends_the_turn_with_upstream_text() {
         .await
         .last()
         .and_then(StreamEvent::terminal_message)
-        .cloned()
+        .map(|m| (**m).clone())
         .expect("terminal");
     assert_eq!(msg.stop_reason, StopReason::Error);
     let text = msg.error_message.unwrap_or_default();
@@ -199,7 +199,7 @@ async fn malformed_sse_json_reports_the_codex_protocol_error() {
         .await
         .last()
         .and_then(StreamEvent::terminal_message)
-        .cloned()
+        .map(|m| (**m).clone())
         .expect("terminal");
     let text = msg.error_message.unwrap_or_default();
     assert!(

@@ -58,7 +58,7 @@ fn join_text(content: &[Content], sep: &str) -> String {
     content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -69,7 +69,7 @@ fn thinking_of(content: &[Content]) -> String {
     content
         .iter()
         .filter_map(|c| match c {
-            Content::Thinking { thinking, .. } => Some(thinking.clone()),
+            Content::Thinking { thinking, .. } => Some(thinking.to_string()),
             _ => None,
         })
         .collect::<Vec<_>>()

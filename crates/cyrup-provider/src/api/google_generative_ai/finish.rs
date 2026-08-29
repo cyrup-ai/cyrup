@@ -18,13 +18,13 @@ pub(super) async fn close_current(dec: &mut Decoder, model: &Model, api: &ApiId,
     let ev = match (kind, dec.blocks.get(idx)) {
         (CurrentKind::Text, Some(Content::Text { text, .. })) => StreamEvent::TextEnd {
             content_index: idx,
-            content: text.clone(),
+            content: text.to_string(),
             partial,
         },
         (CurrentKind::Thinking, Some(Content::Thinking { thinking, .. })) => {
             StreamEvent::ThinkingEnd {
                 content_index: idx,
-                content: thinking.clone(),
+                content: thinking.to_string(),
                 partial,
             }
         }
@@ -76,7 +76,7 @@ pub(super) fn apply_usage(usage: &mut Usage, meta: &Value) {
 /// Emit a terminal error event carrying the partial snapshot (Pi catch block,
 /// google-generative-ai.ts:266-277).
 pub(super) async fn emit_error(dec: &Decoder, model: &Model, api: &ApiId, sink: &EventSink, message: String) {
-    let mut msg = dec.snapshot(model, api);
+    let mut msg = dec.snapshot_owned(model, api);
     msg.stop_reason = StopReason::Error;
     msg.error_message = Some(message);
     sink.send(StreamEvent::terminal(msg)).await;

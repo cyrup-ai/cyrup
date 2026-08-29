@@ -223,7 +223,7 @@ pub(crate) fn tool_text(result: &ToolResult) -> String {
         .content
         .iter()
         .filter_map(|c| match c {
-            cyrup_core::Content::Text { text, .. } => Some(text.clone()),
+            cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .collect::<Vec<_>>()

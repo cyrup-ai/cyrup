@@ -224,7 +224,7 @@ mod tests {
             system_prompt: None,
             messages: vec![Message::User {
                 content: vec![cyrup_core::Content::Text {
-                    text: text.to_string(),
+                    text: text.into(),
                     text_signature: None,
                 }],
                 timestamp: 0,

@@ -89,7 +89,7 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
                     Content::Text { text, .. } => js_len(text),
                     Content::Thinking { thinking, .. } => js_len(thinking),
                     Content::ToolCall(tc) => {
-                        let args = serde_json::Value::Object(tc.arguments.clone());
+                        let args = serde_json::Value::Object((*tc.arguments).clone());
                         js_len(&tc.name) + js_len(&safe_json_stringify(&args))
                     }
                     Content::Image { .. } => 0,
@@ -272,7 +272,7 @@ mod tests {
     fn user(text: &str) -> Message {
         Message::User {
             content: vec![Content::Text {
-                text: text.to_string(),
+                text: text.into(),
                 text_signature: None,
             }],
             timestamp: 0,
@@ -337,7 +337,7 @@ mod tests {
         m.content = vec![Content::ToolCall(ToolCall {
             id: ToolCallId::from("t1"),
             name: "read".into(),
-            arguments: args.clone(),
+            arguments: args.clone().into(),
             thought_signature: None,
         })];
         let json = serde_json::to_string(&serde_json::Value::Object(args)).unwrap();

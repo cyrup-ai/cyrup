@@ -78,7 +78,7 @@ fn ctx_with_tool_call_ids(ids: &[&str]) -> Context {
             Content::ToolCall(ToolCall {
                 id: ToolCallId::from(*id),
                 name: "read".into(),
-                arguments: Map::new(),
+                arguments: Map::new().into(),
                 thought_signature: None,
             })
         })

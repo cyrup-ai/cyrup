@@ -271,10 +271,13 @@ overstating what is open:
 
 Currently open, in brief:
 
-- **The above-medium set is four live rows** — `SEAM-112` (`/resume` yields a broken session and
-  bash calls repeat endlessly) and `PERM-034` ("Allow Always" does not stick), both `critical`, plus
-  `TUI-091` (reasoning blocks never render) and `SEAM-113` (`/model` does not survive into the next
-  session), both `high`. The table above counts five because `PROV-068`'s row was never struck.
+- **The above-medium set is three live rows** — `PERM-034` ("Allow Always" does not stick),
+  `critical`, plus `TUI-091` (reasoning blocks never render) and `SEAM-113` (`/model` does not
+  survive into the next session), both `high`. **`SEAM-112` was the fourth and CLOSED 2026-08-29**
+  (`/resume` yielded a broken session whose bash calls repeated endlessly): a `Length` stop cleared
+  the overflow-recovery latch on `message_end`, immediately before the post-run compaction check
+  read it, so the one-shot brake was unreachable and compact-and-retry re-drove the interrupted turn
+  without bound. The table above counts five because `PROV-068`'s row was never struck.
   **Every one of them was filed from live use rather than from reading**, and that is the ledger's
   most useful finding about itself: nine reading sweeps and a nine-surface enumeration produced an
   above-medium set of wire-and-wiring defects a careful reader can see, while four days of actually

@@ -74,7 +74,47 @@ fn thinking(current: &str, default_level: &str) -> crate::ThinkingSelector {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    crate::ThinkingSelector::new(&levels, current, default_level, "Shift+Tab".to_string())
+    crate::ThinkingSelector::new(
+        &levels,
+        current,
+        default_level,
+        "Shift+Tab".to_string(),
+        false,
+        "Ctrl+T".to_string(),
+    )
+}
+
+/// The same picker with `hideThinkingBlock` on.
+fn thinking_with_hidden(current: &str, default_level: &str) -> crate::ThinkingSelector {
+    let levels: Vec<String> = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    crate::ThinkingSelector::new(
+        &levels,
+        current,
+        default_level,
+        "Shift+Tab".to_string(),
+        true,
+        "Ctrl+T".to_string(),
+    )
+}
+
+/// The `/thinking` picker states that reasoning output is suppressed, and names the live key that
+/// restores it. This is the dialog where a user picks `max` — spending reasoning tokens — while
+/// `hideThinkingBlock` replaces the body with the static label and nothing else says so.
+#[test]
+fn thinking_selector_warns_when_thinking_output_is_hidden() {
+    let mut sel = thinking_with_hidden("max", "max");
+    let s = screen(&render_selector(&mut sel, 80, 22));
+    assert!(s.contains("Thinking output is HIDDEN"), "warning missing:\n{s}");
+    assert!(s.contains("Ctrl+T shows it"), "live toggle key not named:\n{s}");
+
+    // Additive ONLY: with the flag off the dialog is what it was, warning and its blank included.
+    let mut plain = thinking("max", "max");
+    let p = screen(&render_selector(&mut plain, 80, 22));
+    assert!(!p.contains("HIDDEN"), "warning leaked into the un-hidden dialog:\n{p}");
+    assert!(!p.contains("shows it"), "restore hint leaked into the un-hidden dialog:\n{p}");
 }
 
 fn screen(terminal: &Terminal<TestBackend>) -> String {

@@ -6,7 +6,7 @@ use crate::api::compat::{DeferredToolsMode, ResolvedCompat, sanitize_surrogates}
 use crate::context::Context;
 use crate::model::Model;
 use crate::utils::constrained_sampling::ConstrainedSamplingError;
-use cyrup_core::{AssistantMessage, Content, Message, ToolCall};
+use cyrup_core::{AssistantMessage, Content, Message, SharedStr, ToolCall};
 use serde_json::{Map, Value, json};
 
 /// Map cyrup [`Message`]s to OpenAI chat messages (Pi `convertMessages`, applying the compat flags).
@@ -202,7 +202,7 @@ fn build_assistant(am: &AssistantMessage, model: &Model, compat: &ResolvedCompat
         .collect();
     let assistant_text: String = text_parts.concat();
 
-    let thinking_blocks: Vec<(&String, &Option<String>)> = am
+    let thinking_blocks: Vec<(&SharedStr, &Option<String>)> = am
         .content
         .iter()
         .filter_map(|c| match c {

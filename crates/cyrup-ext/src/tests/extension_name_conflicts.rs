@@ -82,7 +82,7 @@ impl Tool for MarkerTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         Ok(ToolResult {
-            content: vec![Content::Text { text: self.marker.clone(), text_signature: None }],
+            content: vec![Content::Text { text: self.marker.clone().into(), text_signature: None }],
             ..Default::default()
         })
     }
@@ -134,7 +134,7 @@ async fn run(tool: &Arc<dyn Tool>) -> String {
     out.content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .collect::<Vec<_>>()

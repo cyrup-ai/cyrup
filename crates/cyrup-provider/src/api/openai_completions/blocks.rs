@@ -1,23 +1,30 @@
 //! Response decoding: the in-progress block set and the decoder's accumulated state.
 
-use super::finalize::parse_partial_json;
+use crate::api::content_cache::ContentCache;
 use crate::model::Model;
 use crate::usage::apply_cost;
 use crate::utils::provider_plumbing::now_millis;
-use cyrup_core::{ApiId, AssistantMessage, Content, StopReason, ToolCall, ToolCallId, Usage};
+use std::sync::Arc;
+use cyrup_core::{
+    ApiId, AssistantMessage, Content, LazyArgs, SharedStr, StopReason, ToolCall, ToolCallId, Usage,
+};
 use std::collections::HashMap;
 
 /// One in-progress content block, in first-appearance order (its index == `content_index`).
 pub(super) enum Block {
-    Text(String),
+    /// Shared with every snapshot taken from it, so projecting this block is a refcount bump
+    /// rather than a copy of everything streamed so far (PERF-001).
+    Text(SharedStr),
     Thinking {
-        text: String,
+        text: SharedStr,
         signature: Option<String>,
     },
     Tool {
         id: String,
         name: String,
-        args: String,
+        /// The raw accumulated argument buffer. [`LazyArgs`] recovers the `Map` from it on the
+        /// first read, so a snapshot nobody reads never parses it at all (PERF-001).
+        args: SharedStr,
         thought_signature: Option<String>,
     },
 }
@@ -26,6 +33,9 @@ pub(super) enum Block {
 #[derive(Default)]
 pub(super) struct Decoder {
     pub(super) blocks: Vec<Block>,
+    /// Memoised projection of `blocks` (PERF-001). Write to `blocks` ONLY through
+    /// [`Self::push_block`] and [`Self::block_mut`], or this goes stale.
+    cache: ContentCache,
     pub(super) text_idx: Option<usize>,
     pub(super) thinking_idx: Option<usize>,
     pub(super) tool_by_stream: HashMap<i64, usize>,
@@ -52,18 +62,49 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    /// Build the live `partial` snapshot (Pi `output`, the mutated AssistantMessage attached to
-    /// every non-terminal event, openai-completions.ts:158-175 + `partial: output`). Mirrors
+    /// Append a block. The ONLY push — it keeps [`ContentCache`] in step (PERF-001).
+    pub(super) fn push_block(&mut self, block: Block) {
+        self.blocks.push(block);
+        self.cache.push();
+    }
+
+    /// The ONLY `&mut Block`. Invalidates exactly that block's memo (PERF-001).
+    pub(super) fn block_mut(&mut self, pos: usize) -> Option<&mut Block> {
+        self.cache.invalidate(pos);
+        self.blocks.get_mut(pos)
+    }
+
+    /// The content projection, recomputing only the blocks whose memo was invalidated.
+    fn content(&mut self) -> Vec<Content> {
+        let (cache, blocks) = (&mut self.cache, &self.blocks);
+        cache.project(blocks, project_block)
+    }
+
+    /// The live `partial`, as a SHARED handle (PERF-001).
+    ///
+    /// Every non-terminal event carries this message and it is then cloned again by the
+    /// agent loop, by `MessageUpdate`, and once per live subscriber. Handing out an `Arc`
+    /// turns those into refcount bumps; the wire bytes are unchanged because serde's `rc`
+    /// feature serializes an `Arc<T>` transparently as `T`.
+    pub(super) fn snapshot(&mut self, model: &Model, api: &ApiId) -> Arc<AssistantMessage> {
+        Arc::new(self.snapshot_owned(model, api))
+    }
+
+    /// The same message, owned, for the terminal paths that stamp a stop reason onto it
+    /// before handing it to [`StreamEvent::terminal`](crate::stream::StreamEvent::terminal)/
+    /// [`StreamEvent::end_of_stream`](crate::stream::StreamEvent::end_of_stream).
+    ///
+    /// Pi `output`, the mutated `AssistantMessage` attached to every non-terminal event
+    /// (openai-completions.ts:158-175 + `partial: output`). Mirrors
     /// [`build_final_message`](super::finalize::build_final_message) but borrows: the stream is
-    /// still in progress, so `stop_reason` is
-    /// the in-flight sentinel until a `finish_reason` arrives — Pi seeds
-    /// `output.stopReason = "pending"` (openai-completions.ts:218) and attaches that same `output`
-    /// as every non-terminal event's `partial`.
-    pub(super) fn snapshot(&self, model: &Model, api: &ApiId) -> AssistantMessage {
+    /// still in progress, so `stop_reason` is the in-flight sentinel until a `finish_reason`
+    /// arrives — Pi seeds `output.stopReason = "pending"` (openai-completions.ts:218) and attaches
+    /// that same `output` as every non-terminal event's `partial`.
+    pub(super) fn snapshot_owned(&mut self, model: &Model, api: &ApiId) -> AssistantMessage {
         let mut usage = self.usage.clone().unwrap_or_default();
         apply_cost(&model.cost, &mut usage);
         AssistantMessage {
-            content: blocks_to_content(&self.blocks),
+            content: self.content(),
             provider: model.provider.clone(),
             model: model.id.as_str().to_string(),
             api: api.clone(),
@@ -82,10 +123,9 @@ impl Decoder {
 
 /// Convert in-progress decoder blocks to content (shared by the live `partial` snapshot and the
 /// terminal message). Tool args are parsed best-effort (`{}` for incomplete/invalid JSON).
-pub(super) fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
-    blocks
-        .iter()
-        .map(|block| match block {
+pub(super) fn project_block(block: &Block) -> Content {
+    {
+        match block {
             Block::Text(text) => Content::text(text.clone()),
             Block::Thinking { text, signature } => Content::Thinking {
                 thinking: text.clone(),
@@ -100,9 +140,10 @@ pub(super) fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
             } => Content::ToolCall(ToolCall {
                 id: ToolCallId::from(id.as_str()),
                 name: name.clone(),
-                arguments: parse_partial_json(args),
+                // A handle on the buffer, not a parse of it (PERF-001).
+                arguments: LazyArgs::streaming(args.clone()),
                 thought_signature: thought_signature.clone(),
             }),
-        })
-        .collect()
+        }
+    }
 }

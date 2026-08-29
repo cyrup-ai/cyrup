@@ -31,7 +31,7 @@ fn noop_sink() -> ToolUpdateSink {
 
 fn first_text(r: &ToolResult) -> String {
     match r.content.first() {
-        Some(Content::Text { text, .. }) => text.clone(),
+        Some(Content::Text { text, .. }) => text.to_string(),
         _ => String::new(),
     }
 }

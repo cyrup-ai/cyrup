@@ -672,7 +672,7 @@ impl Driver {
                                 text: content
                                     .iter()
                                     .filter_map(|block| match block {
-                                        cyrup_core::Content::Text { text, .. } => Some(text.clone()),
+                                        cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
                                         _ => None,
                                     })
                                     .collect::<Vec<_>>()

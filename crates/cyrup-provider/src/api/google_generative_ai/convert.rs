@@ -230,7 +230,7 @@ pub(super) fn assistant_parts(am: &AssistantMessage, same: bool, include_id: boo
                 let sig = resolve_thought_signature(same, tc.thought_signature.as_deref());
                 let mut fc = Map::new();
                 fc.insert("name".to_string(), json!(tc.name));
-                fc.insert("args".to_string(), Value::Object(tc.arguments.clone()));
+                fc.insert("args".to_string(), Value::Object((*tc.arguments).clone()));
                 // `...(requiresToolCallId(model.id) ? { id: block.id } : {})`
                 // (google-shared.ts:177) — the TARGET model, threaded in as `include_id`.
                 if include_id {

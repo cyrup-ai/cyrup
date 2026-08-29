@@ -57,14 +57,14 @@ fn message(
 }
 
 fn text(t: &str) -> Content {
-    Content::Text { text: t.to_string(), text_signature: None }
+    Content::Text { text: t.into(), text_signature: None }
 }
 
 fn tool_call() -> Content {
     Content::ToolCall(ToolCall {
         id: ToolCallId::from("call_1"),
         name: "bash".to_string(),
-        arguments: serde_json::Map::new(),
+        arguments: serde_json::Map::new().into(),
         thought_signature: None,
     })
 }
@@ -202,11 +202,11 @@ fn a_pending_in_flight_message_adds_no_notice() {
     let msg = message(StopReason::Pending, None, vec![text("still typin")]);
     let mut app = new_app();
     app.ingest_event(&AgentSessionEvent::MessageUpdate {
-        message: AgentMessage::Assistant(msg.clone()),
+        message: AgentMessage::Assistant(std::sync::Arc::new(msg.clone())),
         assistant_message_event: Box::new(StreamEvent::TextDelta {
             content_index: 0,
             delta: "still typin".to_string(),
-            partial: msg,
+            partial: std::sync::Arc::new(msg),
         }),
     });
     app.draw().unwrap();

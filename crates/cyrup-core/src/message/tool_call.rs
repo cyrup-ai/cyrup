@@ -1,5 +1,6 @@
 //! The model-issued [`ToolCall`] and its self-tagging serializer (func-01 §4.4).
 
+use crate::lazy_args::LazyArgs;
 use crate::ToolCallId;
 
 /// A model-issued tool call (func-01 §4.4).
@@ -17,10 +18,13 @@ pub struct ToolCall {
     pub id: ToolCallId,
     pub name: String,
     /// Tool arguments. Pi types this as `Record<string, any>` — always a JSON object (types.ts:348);
-    /// cyrup mirrors that exactly with `serde_json::Map<String, Value>`, so the type can no longer
-    /// hold a non-object (array/string/number/null). Decoders that tolerate streaming partial-JSON
-    /// yield an empty object (`{}`) for incomplete/invalid input rather than a scalar.
-    pub arguments: serde_json::Map<String, serde_json::Value>,
+    /// cyrup mirrors that exactly with [`LazyArgs`], which derefs to, serializes as and
+    /// deserializes from `serde_json::Map<String, Value>`, so the type still cannot hold a
+    /// non-object (array/string/number/null). Decoders that tolerate streaming partial-JSON yield
+    /// an empty object (`{}`) for incomplete/invalid input rather than a scalar. The indirection
+    /// exists so a streamed snapshot can carry the raw argument buffer and build the map only if
+    /// something reads it (PERF-001).
+    pub arguments: LazyArgs,
     /// Provider-opaque (Google); stripped on cross-provider handoff (func-01 R-01-030).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub thought_signature: Option<String>,
@@ -65,7 +69,7 @@ mod tests {
         let tc = ToolCall {
             id: "tc1".into(),
             name: "read".into(),
-            arguments: serde_json::Map::new(),
+            arguments: serde_json::Map::new().into(),
             thought_signature: None,
         };
         let s = serde_json::to_string(&tc).expect("serialize");

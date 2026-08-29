@@ -174,7 +174,7 @@ mod tests {
             content: vec![Content::ToolCall(ToolCall {
                 id: ToolCallId::from("call_1"),
                 name: name.to_string(),
-                arguments: serde_json::Map::new(),
+                arguments: serde_json::Map::new().into(),
                 thought_signature: None,
             })],
             provider: "anthropic".into(),

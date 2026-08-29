@@ -1,5 +1,6 @@
 //! The streaming event model + per-request options (arch-01 §8 / func-01 §8).
 
+use std::sync::Arc;
 use cyrup_core::{
     AssistantMessage, CancelToken, EventStream, ModelThinkingLevel, ProviderId, SessionId,
     StopReason, ToolCall,
@@ -499,51 +500,51 @@ impl TryFrom<StopReason> for DoneReason {
 #[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum StreamEvent {
     #[serde(rename = "start")]
-    Start { partial: AssistantMessage },
+    Start { partial: Arc<AssistantMessage> },
     #[serde(rename = "text_start")]
     TextStart {
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "text_delta")]
     TextDelta {
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "text_end")]
     TextEnd {
         content_index: usize,
         content: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "thinking_start")]
     ThinkingStart {
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "thinking_delta")]
     ThinkingDelta {
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "thinking_end")]
     ThinkingEnd {
         content_index: usize,
         content: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "toolcall_start")]
     ToolCallStart {
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "toolcall_delta")]
     ToolCallDelta {
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Pi `toolcall_end` (types.ts:463). The `tool_call` field carries Pi's `type:"toolCall"`
     /// discriminant first (Pi `ToolCall.type`, types.ts:345) because [`ToolCall`] now self-tags via
@@ -553,7 +554,7 @@ pub enum StreamEvent {
     ToolCallEnd {
         content_index: usize,
         tool_call: ToolCall,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Terminal: normal completion. `reason` ∈ {stop, length, toolUse} (Pi narrows the `done` reason
     /// to `Extract<StopReason,"stop"|"length"|"toolUse">`, types.ts:464); `message.stop_reason`
@@ -561,14 +562,14 @@ pub enum StreamEvent {
     #[serde(rename = "done")]
     Done {
         reason: DoneReason,
-        message: AssistantMessage,
+        message: Arc<AssistantMessage>,
     },
     /// Terminal: error/abort. `reason` ∈ {error, aborted} (Pi narrows the `error` reason to
     /// `Extract<StopReason,"aborted"|"error">`, types.ts:465); the final message is keyed `error`.
     #[serde(rename = "error")]
     Error {
         reason: ErrorReason,
-        error: AssistantMessage,
+        error: Arc<AssistantMessage>,
     },
 }
 
@@ -595,10 +596,10 @@ impl StreamEvent {
             }
         }
         match DoneReason::try_from(message.stop_reason) {
-            Ok(reason) => StreamEvent::Done { reason, message },
+            Ok(reason) => StreamEvent::Done { reason, message: Arc::new(message) },
             Err(reason) => StreamEvent::Error {
                 reason,
-                error: message,
+                error: Arc::new(message),
             },
         }
     }
@@ -650,7 +651,7 @@ impl StreamEvent {
     }
 
     /// The final message iff this is a terminal event (func-01 R-01-023).
-    pub fn terminal_message(&self) -> Option<&AssistantMessage> {
+    pub fn terminal_message(&self) -> Option<&Arc<AssistantMessage>> {
         match self {
             StreamEvent::Done { message, .. } => Some(message),
             StreamEvent::Error { error, .. } => Some(error),
@@ -660,7 +661,7 @@ impl StreamEvent {
 
     /// The per-event `partial` snapshot for a non-terminal event (Pi `event.partial`); `None` for
     /// the terminals (which carry the full `message`/`error` instead).
-    pub fn partial(&self) -> Option<&AssistantMessage> {
+    pub fn partial(&self) -> Option<&Arc<AssistantMessage>> {
         match self {
             StreamEvent::Start { partial }
             | StreamEvent::TextStart { partial, .. }
@@ -683,7 +684,7 @@ pub async fn collect_message(mut stream: EventStream<StreamEvent>) -> AssistantM
     let mut last: Option<AssistantMessage> = None;
     while let Some(ev) = stream.next().await {
         if let Some(msg) = ev.terminal_message() {
-            last = Some(msg.clone());
+            last = Some((**msg).clone());
         }
     }
     last.unwrap_or_else(|| {
@@ -717,7 +718,7 @@ pub fn create_assistant_message_event_stream()
         |e: &StreamEvent| matches!(e, StreamEvent::Done { .. } | StreamEvent::Error { .. }),
         |e: &StreamEvent| {
             e.terminal_message()
-                .cloned()
+                .map(|m| (**m).clone())
                 .unwrap_or_else(synth_terminal_less_message)
         },
         synth_terminal_less_message,
@@ -742,8 +743,8 @@ mod tests {
     use super::*;
     use cyrup_core::{ToolCallId, Usage};
 
-    fn empty_partial() -> AssistantMessage {
-        AssistantMessage {
+    fn empty_partial() -> Arc<AssistantMessage> {
+        Arc::new(AssistantMessage {
             content: Vec::new(),
             provider: ProviderId::from("faux"),
             model: "faux-1".into(),
@@ -757,7 +758,7 @@ mod tests {
             error_message: None,
             raw_stop_reason: None,
             timestamp: 0,
-        }
+        })
     }
 
     /// Gap 1: every `type` discriminant is byte-1:1 with Pi's `AssistantMessageEvent` literals
@@ -863,7 +864,7 @@ mod tests {
             tool_call: ToolCall {
                 id: ToolCallId::from("tc1"),
                 name: "read".into(),
-                arguments: serde_json::Map::new(),
+                arguments: serde_json::Map::new().into(),
                 thought_signature: None,
             },
             partial: empty_partial(),
@@ -941,7 +942,7 @@ mod tests {
     #[test]
     fn terminal_routes_stop_reason_without_panic() {
         let mk = |stop: StopReason| {
-            let mut m = empty_partial();
+            let mut m = (*empty_partial()).clone();
             m.stop_reason = stop;
             m
         };

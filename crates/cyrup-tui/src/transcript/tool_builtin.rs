@@ -158,7 +158,8 @@ pub(super) fn render_write_result(run: &ToolRun, theme: &UiTheme, out: &mut Vec<
 /// (`renderCall`, `:385`) and the settled result (`renderResult`'s `setEditPreview` from
 /// `details.diff`, `:400-411`) write, the result overwriting the preview. So the result diff is
 /// tested first here, exactly as `renderResult` runs before `buildEditCallComponent` rebuilds the
-/// component. The two are read with the same accessors [`render_edit`] uses, so the tint can never
+/// component. The two are read with the same accessors [`render_edit_call`] and
+/// [`render_edit_result`] use, so the tint can never
 /// disagree with the body drawn inside it.
 pub(super) fn edit_header_preview(run: &ToolRun) -> crate::theme::EditHeaderPreview {
     use crate::theme::EditHeaderPreview as P;
@@ -463,7 +464,7 @@ pub(super) fn render_ls_result(
 /// `createAllToolDefinitions()[toolName]` (`tool-execution.ts`, the field the two
 /// `get*Renderer()` merges and `hasRendererDefinition()` all read).
 ///
-/// Asked ONCE per block by [`tool_lines`](super::tool_render::tool_lines) so the call side and the
+/// Asked ONCE per block by [`tool_lines`] so the call side and the
 /// result side consult the same answer, which is what lets an extension override one side of a
 /// BUILT-IN tool and still get the built-in's other side — upstream's
 /// `this.toolDefinition.renderCall ?? this.builtInToolDefinition.renderCall`, resolved

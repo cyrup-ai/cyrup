@@ -40,7 +40,7 @@ fn noop_sink() -> ToolUpdateSink {
 fn first_text(r: &ToolResult) -> String {
     for c in &r.content {
         if let Content::Text { text, .. } = c {
-            return text.clone();
+            return text.to_string();
         }
     }
     String::new()
@@ -1437,7 +1437,7 @@ fn update_text(u: &ToolUpdate) -> String {
     u.content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .collect()

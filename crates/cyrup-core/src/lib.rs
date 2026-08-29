@@ -13,8 +13,11 @@ pub mod constrained_sampling;
 pub mod diagnostics;
 pub mod error;
 pub mod event_stream;
+pub mod json;
 pub mod keyed_lock;
+pub mod lazy_args;
 pub mod message;
+pub mod shared_str;
 pub mod tool;
 
 pub use cancel::{CancelToken, RunCancel};
@@ -32,10 +35,12 @@ pub use event_stream::{
     finalizing_channel, Finalizing, FinalizingSink, FinalizingStream,
 };
 pub use keyed_lock::{Cancelled, KeyedAcquire, KeyedGuard, KeyedLockMap, KeyedLocks};
+pub use lazy_args::LazyArgs;
 pub use message::{
     AssistantMessage, Content, Cost, DeferredHandle, Message, ModelThinkingLevel, StopReason,
     TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, Usage, UNRESOLVED_API,
 };
+pub use shared_str::SharedStr;
 pub use tool::{
     ExecMode, Tool, ToolError, ToolRenderKind, ToolResult, ToolUpdate, ToolUpdateSink,
 };

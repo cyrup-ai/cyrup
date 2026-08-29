@@ -225,7 +225,7 @@ async fn process_function_call(
     let tool_call = ToolCall {
         id: ToolCallId::from(tool_call_id.as_str()),
         name,
-        arguments,
+        arguments: arguments.into(),
         thought_signature,
     };
 
@@ -242,7 +242,7 @@ async fn process_function_call(
     {
         return false;
     }
-    let delta = serde_json::to_string(&Value::Object(tool_call.arguments.clone()))
+    let delta = serde_json::to_string(&tool_call.arguments)
         .unwrap_or_else(|_| "{}".to_string());
     let partial = dec.snapshot(model, api);
     if !sink

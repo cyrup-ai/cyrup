@@ -42,6 +42,13 @@ impl InputEditor {
 
         // 3. Resolve a bound editor action.
         if let Some(action) = self.keymap.action_for(ev) {
+            // `tui.input.copy` (`editor.ts:653-655`) is handled by a bare `return` upstream: the
+            // editor declines the key and changes NOTHING — not even the sticky goal column, which
+            // is why this returns ahead of `apply_editor_action`'s `reset_preferred_col` rather
+            // than through its arm (TUI-067).
+            if action == EditorAction::PassThrough {
+                return EditorOutcome::Ignored;
+            }
             return self.apply_editor_action(action);
         }
 
@@ -337,6 +344,9 @@ impl InputEditor {
                 self.jump = Some(JumpDir::Backward);
                 EditorOutcome::Edited
             }
+            // Intercepted by [`Self::handle_key`] before it reaches here, so that a declined key
+            // does not re-seed the goal column above. Kept as the same answer for a direct caller.
+            E::PassThrough => EditorOutcome::Ignored,
         }
     }
 }

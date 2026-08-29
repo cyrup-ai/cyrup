@@ -86,7 +86,7 @@ impl RunCtx {
             self.emit(AgentEvent::ToolExecutionStart {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
-                args: Value::Object(call.arguments.clone()),
+                args: Value::Object((*call.arguments).clone()),
             })
             .await?;
             let fin = self.immediate_error(

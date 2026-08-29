@@ -301,7 +301,7 @@ fn subagent_tool_call() -> Content {
     Content::ToolCall(cyrup_core::ToolCall {
         id: ToolCallId::from("tc-subagent"),
         name: "subagent".to_string(),
-        arguments: serde_json::Map::new(),
+        arguments: serde_json::Map::new().into(),
         thought_signature: None,
     })
 }
@@ -336,7 +336,7 @@ fn assistant_with(blocks: Vec<Content>) -> AgentMessage {
         "x",
     );
     msg.content = blocks;
-    AgentMessage::Assistant(msg)
+    AgentMessage::Assistant(std::sync::Arc::new(msg))
 }
 
 /// Sanity: the two `Arc`-shared imports above are the same extension the binary loads.

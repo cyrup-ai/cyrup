@@ -48,7 +48,7 @@ fn noop_sink() -> ToolUpdateSink {
 fn first_text(r: &ToolResult) -> String {
     for c in &r.content {
         if let Content::Text { text, .. } = c {
-            return text.clone();
+            return text.to_string();
         }
     }
     String::new()

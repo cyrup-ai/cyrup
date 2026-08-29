@@ -1885,7 +1885,7 @@ done
 
     fn text_of(content: &[Content]) -> String {
         match content.first() {
-            Some(Content::Text { text, .. }) => text.clone(),
+            Some(Content::Text { text, .. }) => text.to_string(),
             other => panic!("expected text content, got {other:?}"),
         }
     }

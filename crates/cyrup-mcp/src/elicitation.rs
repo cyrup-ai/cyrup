@@ -1,9 +1,9 @@
 //! `elicitation-handler.ts` — `elicitation/create`, both legs.
 //!
 //! A server asks the human a typed, schema-validated question (**form** mode) or asks to open a URL
-//! (**url** mode). [`crate::runtime::McpClientHandler::create_elicitation`] is the entry point;
-//! [`crate::runtime::initialize_mcp`]'s step 6 installs the hook, gated on
-//! `settings.elicitation(has_ui)`.
+//! (**url** mode). [`McpClientHandler`](crate::runtime::McpClientHandler)'s `create_elicitation` —
+//! its `rmcp` `ClientHandler` impl — is the entry point; [`crate::runtime::initialize_mcp`]'s step 6
+//! installs the hook, gated on `settings.elicitation(has_ui)`.
 //!
 //! # Unknown property types drop the field, as upstream does
 //!

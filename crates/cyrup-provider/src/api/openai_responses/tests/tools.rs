@@ -84,7 +84,7 @@ fn assistant_tool_call(id: &str, name: &str) -> Message {
         content: vec![Content::ToolCall(ToolCall {
             id: ToolCallId::from(id),
             name: name.to_string(),
-            arguments: serde_json::Map::new(),
+            arguments: serde_json::Map::new().into(),
             thought_signature: None,
         })],
         provider: "anthropic".into(),
@@ -398,7 +398,7 @@ fn the_search_call_id_hashes_the_full_tool_call_id_and_comma_joined_names() {
         content: vec![Content::ToolCall(ToolCall {
             id: ToolCallId::from("call_1|fc_item_1"),
             name: "base_tool".to_string(),
-            arguments: serde_json::Map::new(),
+            arguments: serde_json::Map::new().into(),
             thought_signature: None,
         })],
         provider: "openai".into(),

@@ -1128,7 +1128,7 @@ mod tests {
             .unwrap();
 
         let text = match r.content.first() {
-            Some(Content::Text { text, .. }) => text.clone(),
+            Some(Content::Text { text, .. }) => text.to_string(),
             _ => String::new(),
         };
         // Exactly Pi's row: match separator `:`, then the parenthesized marker. No context rows
@@ -1161,7 +1161,7 @@ mod tests {
             .unwrap();
 
         let text = match r.content.first() {
-            Some(Content::Text { text, .. }) => text.clone(),
+            Some(Content::Text { text, .. }) => text.to_string(),
             _ => String::new(),
         };
         assert_eq!(text, "a.txt:2: NEEDLE");
@@ -1179,7 +1179,7 @@ mod tests {
             .await
             .unwrap();
         match r.content.first() {
-            Some(Content::Text { text, .. }) => text.clone(),
+            Some(Content::Text { text, .. }) => text.to_string(),
             _ => String::new(),
         }
     }
@@ -1879,7 +1879,7 @@ mod tests {
             .await
             .unwrap();
         match r.content.first() {
-            Some(Content::Text { text, .. }) => text.clone(),
+            Some(Content::Text { text, .. }) => text.to_string(),
             _ => String::new(),
         }
     }

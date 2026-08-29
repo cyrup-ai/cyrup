@@ -46,7 +46,7 @@ fn first_text(m: &Message) -> String {
     blocks
         .iter()
         .find_map(|b| match b {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .unwrap_or_default()

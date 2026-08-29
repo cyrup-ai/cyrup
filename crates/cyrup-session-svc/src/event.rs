@@ -5,6 +5,7 @@
 //! rpc front-ends (func-11 Open-Question resolved: yes, one schema). Snake_case `type` tags match
 //! Pi's event-type names; payload fields are camelCase via the embedded agent types.
 
+use std::sync::Arc;
 use cyrup_agent::{AgentEvent, AgentMessage, ToolResultMessage};
 use cyrup_core::{Content, ToolCallId};
 use cyrup_provider::StreamEvent;
@@ -377,7 +378,7 @@ pub(crate) fn agent_message_to_core(m: &AgentMessage) -> Option<cyrup_core::Mess
         AgentMessage::User { content, timestamp } => {
             Some(Message::User { content: content.clone(), timestamp: timestamp.unwrap_or(0) })
         }
-        AgentMessage::Assistant(a) => Some(Message::Assistant(a.clone())),
+        AgentMessage::Assistant(a) => Some(Message::Assistant((**a).clone())),
         AgentMessage::ToolResult(t) => Some(Message::ToolResult {
             tool_call_id: t.tool_call_id.clone(),
             tool_name: t.tool_name.clone(),
@@ -471,7 +472,7 @@ pub(crate) fn core_message_to_agent(m: &cyrup_core::Message) -> AgentMessage {
         Message::User { content, timestamp } => {
             AgentMessage::User { content: content.clone(), timestamp: Some(*timestamp) }
         }
-        Message::Assistant(a) => AgentMessage::Assistant(a.clone()),
+        Message::Assistant(a) => AgentMessage::Assistant(Arc::new(a.clone())),
         Message::ToolResult {
             tool_call_id,
             tool_name,

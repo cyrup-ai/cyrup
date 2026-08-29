@@ -81,7 +81,14 @@ fn thinking(current: &str, default_level: &str) -> crate::ThinkingSelector {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    crate::ThinkingSelector::new(&levels, current, default_level, "Shift+Tab".to_string())
+    crate::ThinkingSelector::new(
+        &levels,
+        current,
+        default_level,
+        "Shift+Tab".to_string(),
+        false,
+        "Ctrl+T".to_string(),
+    )
 }
 
 fn is_rule(row: &str) -> bool {
