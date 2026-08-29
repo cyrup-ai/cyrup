@@ -1,7 +1,8 @@
 ---
-stage: new
+stage: aug
 status: pending
-updated: 2026-08-29 02:33
+updated: 2026-08-29 03:05
+aug_against: cyrup HEAD f3bf9f0 · pi v0.84.2 (agent-loop.ts unchanged from ported baseline)
 ---
 
 # Deep-copying the transcript per turn where pi copies pointers
@@ -72,6 +73,19 @@ The declaration to change is
     messages: Vec<AgentMessage>,
 ```
 
+> **[AUG] A THIRD whole-transcript deep-copy seam is missing from this table.** Besides the loop
+> accumulator (§1) and the session seam (§4 step 4), `cyrup-ext` copies the entire transcript on
+> every `agent_end` too, live whenever any extension subscribes to it:
+> [`cyrup-ext/src/event.rs:536`](../../../crates/cyrup-ext/src/event.rs) —
+> `AgentEvent::AgentEnd { messages } => HostEvent::AgentEnd { messages: messages.clone() }` —
+> reached from [`cyrup-ext/src/subscriber.rs:65`](../../../crates/cyrup-ext/src/subscriber.rs)
+> (`ExtSubscriber::on_event`, gated on `no_subscribers`). `HostEvent::AgentEnd` is declared
+> `Vec<AgentMessage>` at [`event.rs:314`](../../../crates/cyrup-ext/src/event.rs) and is then
+> serialized to a JSON string for the guest at
+> [`cyrup-ext/src/host/live.rs:2145`](../../../crates/cyrup-ext/src/host/live.rs)
+> (`serde_json::to_string(messages)`). Because `Arc<T>` serializes identically to `T`, this field
+> can become `Vec<Arc<AgentMessage>>` with the guest payload byte-unchanged — see §6.
+
 ## 2. What pi does
 
 [`agent-loop.ts:163,186,219,229,234`](../../../../pi/packages/agent/src/agent-loop.ts):
@@ -95,6 +109,14 @@ content, because JS has no way to.
 ---
 
 ## 3. Required implementation
+
+> **[AUG] Correction — step 1's "Every `.clone()` … then becomes a pointer copy with no other
+> edit" is FALSE.** Three of the four per-turn clones do not feed a bare `Vec::clone`; they feed
+> the **hook seam**, which is typed on `Vec<AgentMessage>` / `&[AgentMessage]`. Changing only the
+> field types makes the compiler demand an `unwrap_or_clone` right back at the seam boundary,
+> re-introducing the deep copy on the hot path. Realizing the win requires changing the hook-seam
+> element type too — a cross-crate change (`cyrup-agent` → `cyrup-session-svc` → `cyrup-ext`). The
+> exact sites and the recommended plan are in §6; read §6 before starting.
 
 1. **Change the element type to `Arc<AgentMessage>`** on `RunCtx::messages`,
    `RunCtx::new_messages`, and `AgentState::messages`
@@ -146,6 +168,10 @@ Two reasons it is still worth doing despite the modest absolute number:
   it is worst exactly when the user has the most invested in the session — the opposite of
   where you want a cost curve.
 - **It is nearly free to fix and it removes a way to be slower than the thing we port.**
+  **[AUG] “nearly free” is optimistic.** The field-type change is trivial, but it drags the
+  hook-seam element type and three `agent_end` seams with it across three crates (§6). The change
+  is mechanical and low-risk, but it is not a one-liner; budget it as a contained cross-crate
+  refactor, not a five-minute edit.
 
 If a measurement contradicts the estimate above, put the measurement in this file and
 re-prioritise. Do not let the estimate stand in for a number once a number is available.
@@ -168,3 +194,174 @@ re-prioritise. Do not let the estimate stand in for a number once a number is av
 5. **The suite is green under the real gate:**
    `cargo test --workspace --features test-fixtures --no-fail-fast`, and
    `cargo clippy --workspace --all-targets --features test-fixtures` exits **0**.
+6. **[AUG] `base_messages` no longer deep-copies.** After the change, `transform_context`
+   receives the transcript without a per-message content copy (i.e. the hot path at
+   [`stream.rs:40`](../../../crates/cyrup-agent/src/agent/run/stream.rs) is a pointer copy). This
+   is the criterion that catches a “changed the field, kept the seam typed on `AgentMessage`”
+   half-fix, which compiles and passes 1–5 while quietly re-cloning at the seam boundary.
+
+---
+
+## 6. [AUG] Research pass — verified sites, corrections, and the ordered plan
+
+*All line numbers in §1–§4 were re-checked against cyrup HEAD `f3bf9f0` and are accurate. pi
+`agent-loop.ts` is byte-identical to the ported baseline at v0.84.2 (`messages: [...context.messages,
+...prompts]` at `:106`, `let messages = context.messages;` at `:284`, `newMessages.push(…)` /
+`{ type:"agent_end", messages: newMessages }` at `:187/:194/:274`) — the parity claim holds.*
+
+### 6.1 The `no Arc::make_mut` precondition is CONFIRMED
+
+cyrup never mutates a snapshotted message in place. Grepping `\.messages\[` across
+`cyrup-agent/src` finds exactly one hit, a test assertion
+([`tests/round2_parity.rs:404`](../../../crates/cyrup-agent/src/tests/round2_parity.rs)). Every
+write to `self.messages` / `self.new_messages` / `state.messages` is a `push` of a freshly built
+message ([`turn.rs:35-36,43-44,76-77`](../../../crates/cyrup-agent/src/agent/run/turn.rs),
+[`mod.rs:259-260`](../../../crates/cyrup-agent/src/agent/run/mod.rs),
+[`state.rs` reducer `MessageEnd` arm](../../../crates/cyrup-agent/src/state.rs)). Notably cyrup
+does **not** replicate pi's in-place `context.messages[len-1] = finalMessage`
+(`agent-loop.ts:346/359/374`); cyrup pushes the final assistant message in `turn.rs` after
+`stream_assistant` returns instead. So DoD #4 is structurally satisfiable and `Arc::make_mut` is
+genuinely never needed. **Push sites wrap once**: `self.messages.push(Arc::new(m))`.
+
+### 6.2 The hot path runs THROUGH the hook seam — this is the real scope
+
+The four per-turn clones split by how they are consumed:
+
+| clone | consumed by | element type today | to stay cheap |
+| --- | --- | --- | --- |
+| [`stream.rs:40`](../../../crates/cyrup-agent/src/agent/run/stream.rs) `base_messages` | `Hooks::transform_context(msgs: Vec<AgentMessage>)` **by value** | `Vec<AgentMessage>` | seam must take `Vec<Arc<AgentMessage>>` |
+| [`tools/mod.rs:63`](../../../crates/cyrup-agent/src/agent/run/tools/mod.rs) `ctx_messages` | `AgentContextView.messages: &[AgentMessage]` **by borrow** | `&[AgentMessage]` | view must be `&[Arc<AgentMessage>]` |
+| [`turn.rs:99`](../../../crates/cyrup-agent/src/agent/run/turn.rs) `ctx_messages` | `AgentContextView.messages` (prepare_next_turn) | `&[AgentMessage]` | " |
+| [`turn.rs:160`](../../../crates/cyrup-agent/src/agent/run/turn.rs) `ctx_messages_after` | `AgentContextView.messages` (should_stop_after_turn) | `&[AgentMessage]` | " |
+
+The seam is defined in [`cyrup-agent/src/hooks.rs`](../../../crates/cyrup-agent/src/hooks.rs):
+`transform_context` takes `Vec<AgentMessage>` (`:220-226`), `convert_to_llm` takes
+`&[AgentMessage]` (`:215`), `AgentContextView.messages: &'a [AgentMessage]` (`:24`), and `PostTurn`
+carries the same (`:114-117`). `convert_to_llm` is fed the **output** of `transform_context`
+(`stream.rs:43-49`), so its element type follows whatever `transform_context` returns.
+
+**Real implementations that move with the seam** (each is small and mechanical — mostly `m.as_ref()`
+in match arms):
+- [`cyrup-agent/src/hooks.rs`](../../../crates/cyrup-agent/src/hooks.rs) — trait defaults +
+  `default_convert_to_llm`.
+- [`cyrup-session-svc/src/hooks.rs:179,223`](../../../crates/cyrup-session-svc/src/hooks.rs) — the
+  live `convert_to_llm` / `transform_context`.
+- [`cyrup-ext/src/hooks.rs:130`](../../../crates/cyrup-ext/src/hooks.rs) — the extension
+  `transform_context` wrapper.
+
+### 6.3 The three `agent_end` seams (step 4 was one-third complete)
+
+`AgentEvent::AgentEnd.messages` flows to three deep-copy sites, all fixed by making the payload
+`Vec<Arc<AgentMessage>>`:
+
+1. **Loop accumulator** — constructed at
+   [`turn.rs:52,177,197`](../../../crates/cyrup-agent/src/agent/run/turn.rs),
+   [`mod.rs:221`](../../../crates/cyrup-agent/src/agent/run/mod.rs) and
+   [`lifecycle.rs:375`](../../../crates/cyrup-agent/src/agent/lifecycle.rs) (`vec![fm.clone()]`).
+   Extractor at [`loop_fn.rs:217`](../../../crates/cyrup-agent/src/loop_fn.rs).
+2. **Session seam** — [`event.rs:328-329`](../../../crates/cyrup-session-svc/src/event.rs) and
+   [`subscriber.rs:196-197`](../../../crates/cyrup-session-svc/src/subscriber.rs); the field is
+   declared at [`event.rs:154`](../../../crates/cyrup-session-svc/src/event.rs). Also removes the
+   per-subscriber `ev.clone()` transcript copy at
+   [`subscriber.rs:68,72`](../../../crates/cyrup-session-svc/src/subscriber.rs).
+3. **Extension seam** — [`cyrup-ext/src/event.rs:314,536`](../../../crates/cyrup-ext/src/event.rs)
+   (missed by §1; see the §1 [AUG] note). `HostEvent::AgentEnd.messages` → `Vec<Arc<AgentMessage>>`;
+   [`live.rs:2145`](../../../crates/cyrup-ext/src/host/live.rs) `serde_json::to_string` is
+   unchanged (Arc is transparent to serde).
+
+**One signature ripple:**
+[`retry.rs:75`](../../../crates/cyrup-session-svc/src/session/retry.rs)
+`will_retry_after_agent_end(&self, messages: &[AgentMessage])` is called at `subscriber.rs:197`
+with the `AgentEnd` payload; change its parameter to `&[Arc<AgentMessage>]` and deref in the
+`.iter().rev()` match arm (`AgentMessage::Assistant(a)` → match on `m.as_ref()`).
+
+**Downstream is safe:** every front-end consumer of `AgentSessionEvent::AgentEnd` matches
+`{ .. }` and ignores `messages`
+([`cyrup-tui/.../event_extract.rs:14`](../../../crates/cyrup-tui/src/app/event_extract.rs),
+[`events_fold.rs:41`](../../../crates/cyrup-tui/src/app/events_fold.rs),
+[`cyrup-modes/.../json_event.rs:144`](../../../crates/cyrup-modes/src/json_event.rs)), and
+`--json`/RPC serialization is byte-identical because `Arc<T>` serializes as `T`. **DoD #3 holds.**
+
+### 6.4 Scope decision: LEAVE `StateInner::messages` / `AgentStateSnapshot` alone (Phase 2, optional)
+
+Step 1 lumps `AgentState::messages` ([`state.rs`](../../../crates/cyrup-agent/src/state.rs)) into
+the core change. **It does not belong there for DoD #1**, and it is the single highest-blast-radius
+piece:
+
+- The four *per-turn* clones are all off `RunCtx::{messages,new_messages}` — none off
+  `StateInner::messages`. `StateInner::messages` grows one message at a time in the reducer
+  (O(message), not O(transcript)) and is deep-copied only in
+  [`snapshot()` at `state.rs:122`](../../../crates/cyrup-agent/src/state.rs), which is an
+  **accessor-path** call (`retry.rs:141`, `bash.rs:280`, `auto_compaction.rs:396`,
+  `accessors.rs:316`), **not** the per-turn loop. So leaving it as `Vec<AgentMessage>` satisfies
+  “a *turn's* cost no longer scales.”
+- `AgentStateSnapshot.messages` is **public** (`Vec<AgentMessage>`) and consumed by ~8 session-svc
+  sites that take it by value and mutate (`let mut msgs = …snapshot().messages`). Converting it
+  either forces an Arc ripple across all of them or a deref-copy in `snapshot()` that defeats the
+  purpose.
+- **Cost of leaving it:** `RunCtx` is seeded from `state.messages.clone()`
+  ([`lifecycle.rs:270`](../../../crates/cyrup-agent/src/agent/lifecycle.rs)); with `RunCtx` Arc'd
+  and `StateInner` not, the seed becomes `st.messages.iter().map(|m| Arc::new(m.clone())).collect()`
+  — **one** deep copy at *run start* (once per user prompt), off the per-turn path. That is a large
+  reduction from `4 × turns × sizeof` to `1 × sizeof` per run and it is honest to say the per-run
+  seed still scales with history; making it a pointer copy is exactly what Phase 2 buys, at the
+  price of the public-snapshot ripple. **Recommend Phase 1 only; open Phase 2 as its own task with
+  the snapshot-API decision recorded.**
+
+### 6.5 Public return surfaces: keep `Vec<AgentMessage>` (one deref-clone per run)
+
+`RunCtx::run` returns `self.new_messages.clone()`
+([`mod.rs:245`](../../../crates/cyrup-agent/src/agent/run/mod.rs)); this flows to
+`RunHandle::finished() -> Vec<AgentMessage>`
+([`lifecycle.rs:26`](../../../crates/cyrup-agent/src/agent/lifecycle.rs)),
+`run_agent_loop -> Vec<AgentMessage>` and `AgentLoopStream = FinalizingStream<AgentEvent,
+Vec<AgentMessage>>` ([`loop_fn.rs`](../../../crates/cyrup-agent/src/loop_fn.rs)). Recommendation:
+**keep the public return type `Vec<AgentMessage>`** and pay one `Arc::unwrap_or_clone`/`(*m).clone()`
+deref-map at the single return site — a once-per-run cost, off the hot path, that avoids widening
+the public API. Every in-tree caller ignores the value anyway (`let _ = handle.finished().await`,
+[`run.rs:151,166`](../../../crates/cyrup-session-svc/src/session/run.rs)). Making the loop's
+`agent_end` extractor (`loop_fn.rs:217`) do the same deref-map keeps the finalizing-stream result
+type unchanged.
+
+### 6.6 Cost model, confirmed
+
+`AssistantMessage` ([`cyrup-core/src/message/assistant.rs:30`](../../../crates/cyrup-core/src/message/assistant.rs))
+owns `content: Vec<Content>`, provider/model/api strings, `usage`, optional
+`Vec<AssistantMessageDiagnostic>`, boxed `DeferredHandle`, `error_message`, etc. — so a `Vec` clone
+deep-copies every content block's bytes, exactly the cost the task describes. `Content` blocks
+(text/tool-call args/tool-result payloads) are where the bytes live; the estimate in §4 stands.
+
+### 6.7 Ordered implementation plan for `exec`
+
+1. **`cyrup-agent` field + seam types.** `RunCtx::{messages,new_messages}` →
+   `Vec<Arc<AgentMessage>>` ([`run/mod.rs:62,69`](../../../crates/cyrup-agent/src/agent/run/mod.rs)).
+   Change the hook seam element type in
+   [`hooks.rs`](../../../crates/cyrup-agent/src/hooks.rs): `transform_context(Vec<Arc<AgentMessage>>)
+   -> Vec<Arc<AgentMessage>>`, `convert_to_llm(&[Arc<AgentMessage>])`,
+   `AgentContextView.messages: &'a [Arc<AgentMessage>]`, `PostTurn.messages`. Wrap at push sites;
+   the `ctx_messages` locals become pointer-cheap `self.messages.clone()`.
+2. **`AgentEvent::AgentEnd.messages` → `Vec<Arc<AgentMessage>>`**
+   ([`event.rs:271`](../../../crates/cyrup-agent/src/event.rs)); update `loop_fn.rs:217` extractor
+   (deref-map to keep the public stream result `Vec<AgentMessage>`, per §6.5) and the failure-path
+   constructors (`mod.rs:221`, `lifecycle.rs:375`, `turn.rs:52/177/197`).
+3. **Hook impls follow the seam:** `cyrup-session-svc/src/hooks.rs`, `cyrup-ext/src/hooks.rs`
+   (mechanical `m.as_ref()` edits).
+4. **Session seam:** `AgentSessionEvent::AgentEnd.messages`
+   ([`event.rs:154`](../../../crates/cyrup-session-svc/src/event.rs)) → `Vec<Arc<AgentMessage>>`;
+   fix `event.rs:328-329`, `subscriber.rs:196-197`, and `will_retry_after_agent_end`'s signature
+   (`retry.rs:75`) + its match arm.
+5. **Extension seam:** `HostEvent::AgentEnd.messages`
+   ([`cyrup-ext/src/event.rs:314`](../../../crates/cyrup-ext/src/event.rs)) →
+   `Vec<Arc<AgentMessage>>`; `event.rs:536` becomes a pointer clone; `live.rs:2145` unchanged.
+6. **Update the doc comment** at
+   [`run/mod.rs:63-66`](../../../crates/cyrup-agent/src/agent/run/mod.rs) (step 5 of §3) to record
+   that the `Arc` element type is what makes the snapshot pi's `.slice()`.
+7. **Do NOT touch** `StateInner::messages` / `AgentStateSnapshot` / the public
+   `RunHandle::finished` return type (§6.4/§6.5).
+
+**Test blast radius** (for the green-suite DoD, not new tests): construction/match sites over
+`AgentEnd { messages }` and `snapshot().messages` live in ~11 `cyrup-agent` test files
+(`agent_loop.rs`, `pending_containment.rs`, `round2_parity.rs`, `untracked_misses.rs`, …) and a
+few `cyrup-session-svc`/`cyrup-ext` tests; most match `{ .. }` or `.iter()` and need only
+`m.as_ref()` derefs or `Arc::new(…)` wraps. Per flux rules this task adds **no** tests or
+benchmarks — `/flux/tests` owns fixing any that the type change disturbs.
