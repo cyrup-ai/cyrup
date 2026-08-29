@@ -71,6 +71,15 @@ pub struct ThinkingSelector {
     /// `keyDisplayText("app.thinking.cycle")` (`:81`) — resolved from the app's LIVE table at
     /// construction, so a rebind changes the sentence.
     cycle_key: String,
+    /// **[CYRUP-DELTA]** `hideThinkingBlock` at construction. Upstream's picker never states it,
+    /// because upstream's `setHideThinkingBlock` re-renders the prior assistant messages
+    /// (`assistant-message.ts:57-62`) and the suppression is visible on screen. Under ADR-0001
+    /// cyrup's committed rows have already left the render tree (`TUI-N06`), so this is the one
+    /// place a user picks a reasoning level while the output of that choice is being swallowed.
+    hidden: bool,
+    /// The live `app.thinking.toggle` label, so the warning names the actual key rather than a
+    /// hardcoded `Ctrl+T` — the same reason [`Self::cycle_key`] is resolved and not literal.
+    toggle_key: String,
 }
 
 impl ThinkingSelector {
@@ -82,7 +91,14 @@ impl ThinkingSelector {
     /// * `default_level` — `settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL`
     ///   (`:4797`), the row that gets the ` · default` badge.
     /// * `cycle_key` — the already-formatted `app.thinking.cycle` label for the hint sentence.
-    pub fn new(levels: &[String], current: &str, default_level: &str, cycle_key: String) -> Self {
+    pub fn new(
+        levels: &[String],
+        current: &str,
+        default_level: &str,
+        cycle_key: String,
+        hidden: bool,
+        toggle_key: String,
+    ) -> Self {
         let all = levels
             .iter()
             .map(|level| {
@@ -102,6 +118,8 @@ impl ThinkingSelector {
             list: SelectList::new(Vec::new(), ColumnLayout::SLASH),
             input: Input::new(),
             cycle_key,
+            hidden,
+            toggle_key,
         };
         sel.rebuild(current);
         sel
@@ -173,6 +191,22 @@ impl ThinkingSelector {
             format!("{} cycles thinking levels in-session", self.cycle_key),
             theme.base_style(),
         ))); // :81
+        // **[CYRUP-DELTA]** — additive, and only when the flag is on: with it off this dialog is
+        // byte-identical to upstream's. Picking a level here while `hideThinkingBlock` is set
+        // spends reasoning tokens whose output is replaced by the static `Thinking...` label, and
+        // nothing else on screen says so.
+        if self.hidden {
+            lines.push(Line::from(""));
+            let how = if self.toggle_key.is_empty() {
+                "set hideThinkingBlock to false to show it".to_string()
+            } else {
+                format!("{} shows it", self.toggle_key)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("Thinking output is HIDDEN - {how}"),
+                theme.warning_style(),
+            )));
+        }
         lines.push(Line::from("")); // :82
         // The shared `Input.render` prompt — an unstyled `"> "` at column 0 (`input.ts:380`),
         // because `:86` adds `this.searchInput` to the container as a bare child.

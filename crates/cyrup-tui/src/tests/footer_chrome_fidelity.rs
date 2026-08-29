@@ -934,6 +934,25 @@ fn c14_footer_has_no_queued_segment() {
     );
 }
 
+/// **[CYRUP-DELTA]** the right cluster marks a suppressed reasoning body. Under ADR-0001 a
+/// `hideThinkingBlock` flip leaves already-committed scrollback untouched (`TUI-N06`), so without
+/// this the footer advertises `• max` while every reasoning body is replaced by the static label.
+#[test]
+fn right_cluster_marks_thinking_hidden_and_is_unchanged_when_visible() {
+    let mut status = StatusLine::new("anthropic/claude-opus-5");
+    status.set_reasoning(true);
+    status.set_thinking_level("max");
+    assert!(status.text().contains("• max"), "baseline: [{}]", status.text());
+    assert!(!status.text().contains("hidden"), "clean when visible: [{}]", status.text());
+
+    status.set_thinking_hidden(true);
+    assert!(status.text().contains("• max (hidden)"), "marked: [{}]", status.text());
+
+    // Back off again — the marker is not sticky.
+    status.set_thinking_hidden(false);
+    assert!(!status.text().contains("hidden"), "not sticky: [{}]", status.text());
+}
+
 /// MIRROR (C14): every segment pi DOES build is still there, in pi's order
 /// (`footer.ts:130-161`).
 #[test]

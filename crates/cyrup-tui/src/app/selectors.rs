@@ -38,6 +38,14 @@ impl<B: Backend> App<B> {
                         .keys_label(Action::ThinkingCycle)
                         .map(|k| crate::chrome::format_key_text(&k, true))
                         .unwrap_or_default(),
+                    // The live flag and the live `app.thinking.toggle` label, read the same way
+                    // and for the same reason as the cycle key above.
+                    self.state.transcript.hide_thinking_block(),
+                    self.state
+                        .keymap
+                        .keys_label(Action::ThinkingToggle)
+                        .map(|k| crate::chrome::format_key_text(&k, true))
+                        .unwrap_or_default(),
                 )),
                 None,
             ),
@@ -365,7 +373,7 @@ impl<B: Backend> App<B> {
                 // (`settings-list.ts:222-225`); doing it just after the pop is the same frame on
                 // screen, and keeps the "did this close pop a settings list?" question in one place.
                 if let Some(row) = Self::submenu_row_for(kind) {
-                    self.set_settings_row_value(row, &value);
+                    self.set_submenu_row_value(kind, row, &value);
                 }
                 match command {
                     Some(c) => AppAction::Command(c),
@@ -381,7 +389,7 @@ impl<B: Backend> App<B> {
                 let command = self.confirm_selector_as_default(kind, &value);
                 self.close_selector(false);
                 if let Some(row) = Self::submenu_row_for(kind) {
-                    self.set_settings_row_value(row, &value);
+                    self.set_submenu_row_value(kind, row, &value);
                 }
                 match command {
                     Some(c) => AppAction::Command(c),
@@ -706,6 +714,19 @@ impl<B: Backend> App<B> {
     /// PARENT of the picker that produced the value, and for the two-step per-model flow the
     /// grandparent. A frame that is not a [`SettingsSelector`], or has no such row, is skipped —
     /// `update_value` is a no-op for an unknown id, exactly like upstream's `find`.
+    /// Write a confirmed submenu pick back into its `/settings` row. The thinking row carries the
+    /// `hideThinkingBlock` marker, so it goes through the formatter the row was BUILT with — a bare
+    /// `set_settings_row_value` here would drop the marker on confirm and leave the row claiming
+    /// reasoning is visible while it is suppressed.
+    fn set_submenu_row_value(&mut self, kind: SelectorKind, id: &str, value: &str) {
+        let shown = if kind == SelectorKind::Thinking {
+            thinking_row_value(value, self.state.transcript.hide_thinking_block())
+        } else {
+            value.to_string()
+        };
+        self.set_settings_row_value(id, &shown);
+    }
+
     pub(crate) fn set_settings_row_value(&mut self, id: &str, value: &str) {
         let mut frame = self.state.selector.as_mut();
         while let Some(active) = frame {

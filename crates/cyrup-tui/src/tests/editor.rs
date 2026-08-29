@@ -146,6 +146,32 @@ fn ctrl_char_is_ignored_by_editor() {
     assert!(ed.is_empty());
 }
 
+/// TUI-067 — `tui.input.copy` is the one upstream id whose job is to make the editor DECLINE a key
+/// (`editor.ts:653-655`'s bare `return`). It had no `EditorAction` destination, so `merge_entries`
+/// dropped the entry silently and the rebind did nothing.
+#[test]
+fn tui_input_copy_rebind_makes_the_editor_decline_the_key() {
+    // Stock: the id is bound to nothing, so 'q' is still ordinary typed text.
+    let mut ed = InputEditor::new();
+    assert_eq!(ed.handle_key(&key(KeyCode::Char('q'))), EditorOutcome::Edited);
+    assert_eq!(ed.text(), "q");
+
+    // The discriminating case. Rebound onto a PRINTABLE chord the editor would otherwise insert,
+    // the declination has to win — this is the assertion that fails without the `from_id` arm,
+    // because a dropped entry leaves 'q' typing itself.
+    let mut ed = InputEditor::new();
+    let issues = ed.merge_keybindings_json(r#"{ "tui.input.copy": "q" }"#).unwrap();
+    assert!(issues.is_empty(), "a known id with a valid chord reports no issue: {issues:?}");
+    assert_eq!(ed.handle_key(&key(KeyCode::Char('q'))), EditorOutcome::Ignored);
+    assert!(ed.is_empty(), "a declined key must not be inserted");
+
+    // The Ctrl+Q form from the row's own Verify clause: resolved, declined, buffer untouched.
+    let mut ed = InputEditor::new();
+    ed.merge_keybindings_json(r#"{ "tui.input.copy": "ctrl+q" }"#).unwrap();
+    assert_eq!(ed.handle_key(&ctrl('q')), EditorOutcome::Ignored);
+    assert!(ed.is_empty());
+}
+
 fn ctrl(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
 }

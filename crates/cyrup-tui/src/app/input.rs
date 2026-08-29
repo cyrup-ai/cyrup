@@ -454,7 +454,7 @@ impl<B: Backend> App<B> {
                 // the settings write is unavailable (or simply before the loop turns) would
                 // otherwise leave the view unchanged AND compute the same `hidden` again on the
                 // next press — a key that toggles nothing, twice.
-                self.state.transcript.set_hide_thinking_block(hidden);
+                self.state.set_hide_thinking(hidden);
                 self.state
                     .transcript
                     .push_status(if hidden {
