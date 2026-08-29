@@ -267,15 +267,29 @@ impl AgentSession {
     }
 
     /// The subscriber's `message_end` handler for an ASSISTANT message (Pi `_handleAgentEvent` tail,
-    /// agent-session.ts:562-577): track the last assistant message (drives the post-run loop) and — on
-    /// a non-error response — clear the overflow latch and reset the retry counter, emitting
-    /// `auto_retry_end{success:true}` if a retry sequence was in flight.
+    /// agent-session.ts:673-694 @v0.84.3): track the last assistant message (drives the post-run
+    /// loop), clear the overflow latch on a response that is neither an error NOR a length stop, and
+    /// reset the retry counter on any non-error response, emitting `auto_retry_end{success:true}` if
+    /// a retry sequence was in flight.
+    ///
+    /// SEAM-112 — the two clears carry DIFFERENT predicates upstream and must not be fused into one
+    /// early return. pi guards the latch with `stopReason !== "error" && stopReason !== "length"`
+    /// (`agent-session.ts:678`) and the retry counter with `stopReason !== "error"` alone (`:684`).
+    /// cyrup kept only the shared arm, so every `Length` message cleared the latch here — i.e.
+    /// immediately BEFORE `check_compaction` reads it (`auto_compaction.rs:85`) for the overflow
+    /// case a `Length` message triggers (`is_context_overflow` case 3, `overflow.rs:101-109`). The
+    /// read was therefore always `false`, the one-shot brake at `:85-98` was unreachable, and
+    /// overflow recovery re-compacted and re-drove the interrupted turn without bound — re-running
+    /// the same tool call on every pass. `Length` is a retriable, NOT-completed response here for
+    /// the same reason it is one at `auto_compaction.rs:400-407`.
     pub(crate) async fn on_assistant_message_end(&self, assistant: &AssistantMessage) {
         *Self::lock(&self.last_assistant) = Some(assistant.clone());
         if assistant.stop_reason == cyrup_core::StopReason::Error {
             return;
         }
-        *Self::lock(&self.overflow_recovery_attempted) = false;
+        if assistant.stop_reason != cyrup_core::StopReason::Length {
+            *Self::lock(&self.overflow_recovery_attempted) = false;
+        }
         let attempt = {
             let mut at = Self::lock(&self.retry_attempt);
             let v = *at;
