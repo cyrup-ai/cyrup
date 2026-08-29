@@ -311,11 +311,12 @@ impl AgentSession {
                 // `agent.state.messages` exactly as the run found it.
                 //
                 // cyrup ran it unconditionally, before `match result`, which mattered most on the
-                // path that reaches here: `check_compaction` (`:4868`) calls `drop_trailing_assistant`
-                // (`:4775-4781`) to strip the overflow response from the agent transcript BEFORE
-                // compacting, but that response was already persisted on `message_end`, so an
-                // aborted or erroring compaction re-seeded it straight back out of the session
-                // file — the exact state `Agent::continue_run` rejects with `ContinueFromAssistant`.
+                // path that reaches here: `check_compaction` (`session/auto_compaction.rs:78`) calls
+                // `drop_trailing_assistant` (`session/retry.rs:140`) to strip the overflow response
+                // from the agent transcript BEFORE compacting, but that response was already
+                // persisted on `message_end`, so an aborted or erroring compaction re-seeded it
+                // straight back out of the session file — the exact state `Agent::continue_run`
+                // rejects with `ContinueFromAssistant`.
                 //
                 // pi `agent-session.ts:2280`: re-seed the AGENT's in-memory transcript from the
                 // compacted context. `appendCompaction` only writes the JSONL entry — this
@@ -380,13 +381,15 @@ impl AgentSession {
                 // rejects that state, so remove the retriable error or truncated-length response
                 // again before continuing the interrupted turn."
                 //
-                // Concretely on cyrup's side: `check_compaction` (`:4868`) calls
-                // `drop_trailing_assistant`, then this run's re-seed above pulls the SAME response
-                // back out of the session file (it was written on `message_end`). Without this
-                // re-drop `handle_post_agent_run` (`:867-869`) returns `true`,
-                // `Agent::continue_run` (cyrup-agent/src/agent.rs:1985-2026) sees a trailing
-                // assistant with both queues empty and returns `ContinueFromAssistant`, and
-                // `drive_run` (`:803`) breaks — overflow recovery compacts and never retries.
+                // Concretely on cyrup's side: `check_compaction` (`session/auto_compaction.rs:78`)
+                // calls `drop_trailing_assistant` (`session/retry.rs:140`), then this run's re-seed
+                // above pulls the SAME response back out of the session file (it was written on
+                // `message_end`). Without this re-drop `handle_post_agent_run`
+                // (`session/run.rs:235-237`) returns `true`, `Agent::continue_run`
+                // (`cyrup-agent/src/agent/lifecycle.rs:209`, `cyrup-agent/src/loop_fn.rs:200`
+                // and `:280`) sees a trailing assistant with both queues empty and returns
+                // `ContinueFromAssistant`, and `drive_run` (`session/run.rs:170`) breaks —
+                // overflow recovery compacts and never retries.
                 //
                 // The predicate is pi's exact one — `stopReason === "error" || === "length"` — and
                 // is deliberately NARROWER than [`Self::drop_trailing_assistant`]'s "any trailing
