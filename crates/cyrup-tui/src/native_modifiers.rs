@@ -118,6 +118,38 @@ pub fn host_platform() -> &'static str {
 ///
 /// At v0.83.0 the second disjunct did not exist (`terminal.ts:311`, Apple Terminal only); the
 /// `win32` arm is v0.84.1.
+///
+/// `[CYRUP-DELTA]` **The `win32` arm is ported and correct, and cannot be reached in this runtime.**
+/// It is kept because it is what upstream does and because it becomes live the moment anything puts
+/// the Windows console into VT-input mode. Nothing does today, and that is the whole difference.
+///
+/// Upstream's Windows helper is named for its primary job: `win32-console-mode.c:65-72` exports
+/// `enable_virtual_terminal_input`, which runs `SetConsoleMode(handle, mode |
+/// ENABLE_VIRTUAL_TERMINAL_INPUT)`. That switch replaces `INPUT_RECORD` key events with a VT escape
+/// stream, discarding the modifier bits the console had already decoded — so pi must recover them
+/// with `GetAsyncKeyState` (`:38-58`). The probe is the repair for a loss upstream elects.
+///
+/// cyrup does not elect it. crossterm 0.29 sets `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on the OUTPUT
+/// handle only (`ansi_support.rs:17`) and never the input flag; its Windows `enable_raw_mode` merely
+/// clears `NOT_RAW_MODE_MASK` (`terminal/sys/windows.rs:31-38`); and its event source reads console
+/// records, mapping `SHIFT_PRESSED` straight into `KeyModifiers::SHIFT`
+/// (`event/sys/windows/parse.rs:81`). A real Shift+Enter therefore arrives with `SHIFT` already set
+/// and is rejected by this function's own `ev.modifiers != KeyModifiers::NONE` guard, one line below,
+/// before any probe is consulted. There is no byte-stream fallback to reach it by either:
+/// `WindowsEventSource::new` is `Console::from(Handle::current_in_handle()?)`
+/// (`event/source/windows.rs:28`), so with no console handle it fails to construct rather than
+/// degrading to escapes.
+///
+/// The consequence is that Windows keeps the modifier data pi throws away, so on the configuration
+/// analysed above this arm is inert.
+///
+/// **A Windows probe is registered regardless** (`crates/cyrup/src/main.rs`), and deliberately. The
+/// analysis above is a source read of crossterm performed on Linux; it has never been observed on
+/// Windows, and it holds only while nothing enables VT input. Weigh the two errors: an inert probe
+/// costs a `#[cfg(windows)]` module, while a missing one costs every Windows user a Shift+Enter that
+/// submits their message instead of inserting a newline, silently, the moment any of that changes.
+/// This is the one place in this crate where an uncalled function is kept on purpose rather than
+/// treated as an unported caller, and this paragraph is why.
 pub fn should_detect_native_shift_enter(
     ev: &KeyEvent,
     platform: &str,
