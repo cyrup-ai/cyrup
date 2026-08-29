@@ -1,6 +1,6 @@
 ---
 stage: aug
-status: in-progress
+status: done
 updated: 2026-08-29 17:05
 aug_against: cyrup HEAD 7913760 · pi v0.84.1 (`packages/tui/src/tui.ts`) · every citation re-verified and every number re-measured on this host, `--release`
 ---
@@ -1407,8 +1407,9 @@ from the same pipeline, but nothing in it touches the re-highlight or the redund
     `--features test-fixtures` is required or two `[[bin]]` targets never build. The no-panic
     lints (`unwrap_used`, `expect_used`, `panic`, `indexing_slicing`) fire **only** under
     clippy — check the exit code, not the output.
-19. **The go/no-go.** With §3.0b and §3.0 landed, a turn holding 2,000 lines of code should
-    cost ~194 µs of layout and ~160 µs of highlight per frame instead of ~350 ms. If the
+19. **The go/no-go.** With §3.0a, §3.0b and §3.0 landed, a turn holding 2,000 lines of code
+    should cost ~194 µs of layout and ~130 µs of highlight per frame instead of ~350 ms, and a
+    collapsed 2,000-line `read` in the same turn should cost ~1.9 ms instead of ~357 ms. If the
     spinner no longer slips at the largest reachable transcript, §3.3 is **not** justified by
     CPU and the remaining case rests on tty blocking alone (§1) — record that and decide
     deliberately rather than by momentum.
@@ -1417,27 +1418,35 @@ from the same pipeline, but nothing in it touches the re-highlight or the redund
 
 ## 6. The probes
 
-All three are standalone crates under `./tmp`, no workspace edit, `--release`.
+All five are standalone crates under `./tmp`, no workspace edit, `--release`. Each reproduces
+the production function **verbatim** rather than approximating it.
 
 | probe | reproduces | key result |
 | --- | --- | --- |
 | [`tmp/perf005-probe`](../../../tmp/perf005-probe) | §0.2 — the hit path, A→D | 91 ms → 194 µs at 16k rows |
 | [`tmp/perf005-miss`](../../../tmp/perf005-miss) | §0.3 — `wrapped_height` (E), naive vs move-based wrap (F/G) | E = 88 ms at 16k; G is 1.7× F |
-| [`tmp/perf005-hl`](../../../tmp/perf005-hl) | §0.4/§3.0b — `highlight_inner` verbatim, and the resumable form | 174 µs / code line; 87 ms at 500 lines; flat after §3.0b |
+| [`tmp/perf005-hl`](../../../tmp/perf005-hl) | §0.4 — `highlight_inner` verbatim, and the resumable form | 174 µs / code line; 87 ms at 500 lines |
+| **[`tmp/perf005-hl2`](../../../tmp/perf005-hl2)** *(AUG-3)* | §0.7 — memo hit vs re-highlight (B1), `shown`-bounded vs full (B2), **equivalence assertion** (B3), resumable cursor (B4) | 99–233× memo; **99.5% of a collapsed body's highlight is discarded**; 66–3078× resumable |
+| **[`tmp/perf005-wrapeq`](../../../tmp/perf005-wrapeq)** *(AUG-3)* | §0.8 — `wrap_line` + `wrapped_height` verbatim, 22 shapes × width sweep | **20/22 agree**; the 2 that do not are a tab (unreachable) and a whitespace-only over-width row |
 
-`perf005-miss` and `perf005-hl` need
+`perf005-miss`, `perf005-hl`, `perf005-hl2` and `perf005-wrapeq` need
 `ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }` — `line_count`
 is behind that feature, which `cyrup-tui/Cargo.toml:84` already enables.
 
-**Three traps.**
+**Four traps.**
 
 * **Measure in `--release`.** A debug allocator's noise swamps the C→D difference entirely.
 * **Measure the frame, not the clone.** The deep clone is ~4% of the hit path; a probe that
   times `lines.clone()` alone reports the least important of the three costs as the finding.
-  That is how the previous round nearly stopped at the wrong fix.
+  That is how the first round nearly stopped at the wrong fix.
 * **Measure the MISS, not the hit.** `push_assistant_delta` bumps the generation, so the hit
   path is not the streaming path. A probe that only exercises `RenderCache` hits misses the
   syntect term entirely — which is the whole of §0.4, and 4× everything else combined.
+* **[AUG-3] Enumerate the CALL SITES, not the function.** §0.4 priced `highlight_inner`
+  correctly and still missed 99.5% of the available win, because it followed one of the two
+  paths that reach it. Before pricing a hot function, `grep` for every caller and ask whether
+  each one's content is static or growing — they need different fixes, and the static one was
+  both cheaper and bigger here.
 
 ---
 
