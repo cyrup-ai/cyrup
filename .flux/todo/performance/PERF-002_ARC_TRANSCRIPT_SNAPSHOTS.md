@@ -1,8 +1,9 @@
 ---
 stage: aug
-status: pending
-updated: 2026-08-29 03:05
+status: in-progress
+updated: 2026-08-29 04:16
 aug_against: cyrup HEAD f3bf9f0 · pi v0.84.2 (agent-loop.ts unchanged from ported baseline)
+aug_reverified: cyrup HEAD 8f49433 (= f3bf9f0 + 1 commit; zero diff in cyrup-agent/session-svc/ext)
 ---
 
 # Deep-copying the transcript per turn where pi copies pointers
@@ -10,7 +11,7 @@ aug_against: cyrup HEAD f3bf9f0 · pi v0.84.2 (agent-loop.ts unchanged from port
 > **This is a parity regression, not an optimisation.** pi's working-transcript snapshot is
 > a JS `.slice()` — an O(n) *pointer* copy. cyrup's port spells it `Vec::clone()`, which is
 > a `.slice()` **plus a deep copy of every message's content**. The port comment at
-> [`agent/run/mod.rs:63-64`](../../../crates/cyrup-agent/src/agent/run/mod.rs) says
+> [`agent/run/mod.rs:63-68`](../../../crates/cyrup-agent/src/agent/run/mod.rs) says
 > `.slice()` and means it; the type chosen underneath does something stronger and slower.
 
 ---
@@ -82,7 +83,7 @@ The declaration to change is
 > (`ExtSubscriber::on_event`, gated on `no_subscribers`). `HostEvent::AgentEnd` is declared
 > `Vec<AgentMessage>` at [`event.rs:314`](../../../crates/cyrup-ext/src/event.rs) and is then
 > serialized to a JSON string for the guest at
-> [`cyrup-ext/src/host/live.rs:2145`](../../../crates/cyrup-ext/src/host/live.rs)
+> [`cyrup-ext/src/host/live.rs:2146`](../../../crates/cyrup-ext/src/host/live.rs)
 > (`serde_json::to_string(messages)`). Because `Arc<T>` serializes identically to `T`, this field
 > can become `Vec<Arc<AgentMessage>>` with the guest payload byte-unchanged — see §6.
 
@@ -136,11 +137,11 @@ content, because JS has no way to.
    `AgentSessionEvent`'s equivalent
    ([`event.rs:329`](../../../crates/cyrup-session-svc/src/event.rs)) should hold
    `Vec<Arc<AgentMessage>>` too, so `Fanout::emit`'s per-subscriber `ev.clone()`
-   ([`subscriber.rs:67,71`](../../../crates/cyrup-session-svc/src/subscriber.rs)) stops
+   ([`subscriber.rs:68,72`](../../../crates/cyrup-session-svc/src/subscriber.rs)) stops
    deep-copying the whole transcript once per subscriber per `agent_end`.
 
 5. **Update the doc comment at
-   [`agent/run/mod.rs:63-66`](../../../crates/cyrup-agent/src/agent/run/mod.rs)** to record
+   [`agent/run/mod.rs:63-68`](../../../crates/cyrup-agent/src/agent/run/mod.rs)** to record
    that the `Arc` element type is what makes this snapshot pi's `.slice()` rather than
    something stronger — so the next reader does not "simplify" it back to
    `Vec<AgentMessage>`.
@@ -194,11 +195,16 @@ re-prioritise. Do not let the estimate stand in for a number once a number is av
 5. **The suite is green under the real gate:**
    `cargo test --workspace --features test-fixtures --no-fail-fast`, and
    `cargo clippy --workspace --all-targets --features test-fixtures` exits **0**.
-6. **[AUG] `base_messages` no longer deep-copies.** After the change, `transform_context`
-   receives the transcript without a per-message content copy (i.e. the hot path at
-   [`stream.rs:40`](../../../crates/cyrup-agent/src/agent/run/stream.rs) is a pointer copy). This
-   is the criterion that catches a “changed the field, kept the seam typed on `AgentMessage`”
-   half-fix, which compiles and passes 1–5 while quietly re-cloning at the seam boundary.
+6. **[AUG] Neither per-turn transcript snapshot deep-copies.** After the change BOTH inputs to
+   `transform_context` are pointer copies: `base_messages` at
+   [`stream.rs:40`](../../../crates/cyrup-agent/src/agent/run/stream.rs) **and** the extension
+   seam's `HostEvent::Context` build at
+   [`cyrup-ext/src/hooks.rs:135`](../../../crates/cyrup-ext/src/hooks.rs), which runs every turn
+   via `PolicyHooks`' unconditional delegation (§6.8). This is the criterion that catches a
+   “changed the field, kept a seam typed on `AgentMessage`” half-fix, which compiles and passes
+   1–5 while quietly re-cloning at the `transform_context` or `HostEvent::Context` boundary.
+   **[AUG-2] §6.8 is mandatory for this DoD** — leaving `HostEvent::Context` as `Vec<AgentMessage>`
+   either fails to compile or invites a `(**m).clone()` that silently restores the per-turn copy.
 
 ---
 
@@ -247,7 +253,9 @@ in match arms):
 - [`cyrup-session-svc/src/hooks.rs:179,223`](../../../crates/cyrup-session-svc/src/hooks.rs) — the
   live `convert_to_llm` / `transform_context`.
 - [`cyrup-ext/src/hooks.rs:130`](../../../crates/cyrup-ext/src/hooks.rs) — the extension
-  `transform_context` wrapper.
+  `transform_context` wrapper. **[AUG-2] NOT mechanical** — it routes the transcript through its
+  own owned-`Vec` `HostEvent::Context`, a distinct per-turn deep-copy seam that needs the same Arc
+  treatment as the `agent_end` trio; see **§6.8**.
 
 ### 6.3 The three `agent_end` seams (step 4 was one-third complete)
 
@@ -266,8 +274,10 @@ in match arms):
    [`subscriber.rs:68,72`](../../../crates/cyrup-session-svc/src/subscriber.rs).
 3. **Extension seam** — [`cyrup-ext/src/event.rs:314,536`](../../../crates/cyrup-ext/src/event.rs)
    (missed by §1; see the §1 [AUG] note). `HostEvent::AgentEnd.messages` → `Vec<Arc<AgentMessage>>`;
-   [`live.rs:2145`](../../../crates/cyrup-ext/src/host/live.rs) `serde_json::to_string` is
-   unchanged (Arc is transparent to serde).
+   [`live.rs:2146`](../../../crates/cyrup-ext/src/host/live.rs) `serde_json::to_string` is
+   unchanged (Arc is transparent to serde — precondition confirmed in §6.9). This is **not** the
+   only extension transcript seam — the `transform_context` path (`HostEvent::Context`) is a
+   separate per-turn one; see §6.8.
 
 **One signature ripple:**
 [`retry.rs:75`](../../../crates/cyrup-session-svc/src/session/retry.rs)
@@ -352,9 +362,13 @@ deep-copies every content block's bytes, exactly the cost the task describes. `C
    (`retry.rs:75`) + its match arm.
 5. **Extension seam:** `HostEvent::AgentEnd.messages`
    ([`cyrup-ext/src/event.rs:314`](../../../crates/cyrup-ext/src/event.rs)) →
-   `Vec<Arc<AgentMessage>>`; `event.rs:536` becomes a pointer clone; `live.rs:2145` unchanged.
+   `Vec<Arc<AgentMessage>>`; `event.rs:536` becomes a pointer clone; `live.rs:2146` unchanged.
+   **Then also do the `transform_context` seam (§6.8):** `HostEvent::Context.messages`
+   ([`event.rs:300`](../../../crates/cyrup-ext/src/event.rs)) and `EventPatch::Context.messages`
+   ([`contract.rs:58`](../../../crates/cyrup-ext/src/contract.rs)) → `Vec<Arc<AgentMessage>>`; the
+   build at `hooks.rs:135` becomes a pointer clone; `contract.rs:114` / `live.rs:2077` unchanged.
 6. **Update the doc comment** at
-   [`run/mod.rs:63-66`](../../../crates/cyrup-agent/src/agent/run/mod.rs) (step 5 of §3) to record
+   [`run/mod.rs:63-68`](../../../crates/cyrup-agent/src/agent/run/mod.rs) (step 5 of §3) to record
    that the `Arc` element type is what makes the snapshot pi's `.slice()`.
 7. **Do NOT touch** `StateInner::messages` / `AgentStateSnapshot` / the public
    `RunHandle::finished` return type (§6.4/§6.5).
@@ -365,3 +379,74 @@ deep-copies every content block's bytes, exactly the cost the task describes. `C
 few `cyrup-session-svc`/`cyrup-ext` tests; most match `{ .. }` or `.iter()` and need only
 `m.as_ref()` derefs or `Arc::new(…)` wraps. Per flux rules this task adds **no** tests or
 benchmarks — `/flux/tests` owns fixing any that the type change disturbs.
+
+### 6.8 [AUG-2] The extension `transform_context` seam deep-copies the transcript EVERY turn — a per-turn site §6.2/§6.3 missed
+
+§6.2 files `cyrup-ext/src/hooks.rs:130` under "mechanical `m.as_ref()` edits." It is not
+mechanical. The extension `transform_context` wrapper carries the transcript through its **own
+owned-`Vec` HostEvent** — `HostEvent::Context` — which is a per-turn full-transcript deep-copy in
+exactly the same class as `base_messages`, on exactly the hot path DoD #6 targets. Getting
+`stream.rs:40` to a pointer copy while leaving this alone means DoD #6 is *not* met with any
+extension wired.
+
+**The path, verified at HEAD `8f49433`:**
+
+1. The loop calls `self.hooks.transform_context(base_messages)` at
+   [`stream.rs:40`](../../../crates/cyrup-agent/src/agent/run/stream.rs).
+2. In the wired stack that resolves to `PolicyHooks::transform_context`
+   ([`cyrup-session-svc/src/hooks.rs:223`](../../../crates/cyrup-session-svc/src/hooks.rs)), whose
+   body **unconditionally delegates** to the extension seam —
+   `self.inner.transform_context(msgs, cancel).await`
+   ([`hooks.rs:228`](../../../crates/cyrup-session-svc/src/hooks.rs)) — every turn, no gate.
+3. `ExtensionHooks::transform_context`
+   ([`cyrup-ext/src/hooks.rs:130`](../../../crates/cyrup-ext/src/hooks.rs)) then builds
+   `HostEvent::Context { messages: msgs.clone() }`
+   ([`hooks.rs:135`](../../../crates/cyrup-ext/src/hooks.rs)) — **an unconditional deep copy**,
+   because `msgs.clone()` runs BEFORE the `no_subscribers` gate that lives inside
+   `dispatch_block_mutate` ([`dispatch.rs:415`](../../../crates/cyrup-ext/src/dispatch.rs)). Even a
+   session with no `context`-subscribing extension pays the whole-transcript copy on every turn.
+
+**Owned-`Vec` seams that must move with the element type (identical treatment to the `agent_end`
+trio in §6.3):**
+
+| site | today | after |
+| --- | --- | --- |
+| [`cyrup-ext/src/event.rs:300`](../../../crates/cyrup-ext/src/event.rs) `HostEvent::Context.messages` | `Vec<AgentMessage>` | `Vec<Arc<AgentMessage>>` |
+| [`cyrup-ext/src/contract.rs:58`](../../../crates/cyrup-ext/src/contract.rs) `EventPatch::Context.messages` | `Vec<AgentMessage>` | `Vec<Arc<AgentMessage>>` |
+| [`cyrup-ext/src/hooks.rs:135`](../../../crates/cyrup-ext/src/hooks.rs) build | deep copy | pointer clone |
+| [`cyrup-ext/src/hooks.rs:138`](../../../crates/cyrup-ext/src/hooks.rs) return `Ok(messages)` | — | unchanged (now `Vec<Arc<_>>`, matches the new `transform_context` return type) |
+| [`cyrup-ext/src/contract.rs:114`](../../../crates/cyrup-ext/src/contract.rs) patch `*messages = m` | — | unchanged (both sides `Vec<Arc<_>>`) |
+| [`cyrup-ext/src/host/live.rs:2077`](../../../crates/cyrup-ext/src/host/live.rs) `serde_json::to_string(messages)` | — | **unchanged** (Arc transparent, §6.9) |
+
+The guest-return path needs **no manual `Arc::new`**: `EventPatch::Context` is deserialized from
+the guest's JSON, and with serde's `rc` feature on (§6.9) a JSON array deserializes straight into
+`Vec<Arc<AgentMessage>>`, wrapping each element once — the exact analogue of "push sites wrap
+once." So `contract.rs:114`'s `*messages = m` stays a one-line assignment.
+
+**Why the half-fix bites here specifically.** With `transform_context` retyped to
+`Vec<Arc<AgentMessage>>` (§6.7 step 1/3) but `HostEvent::Context` left `Vec<AgentMessage>`,
+`hooks.rs:135` will not compile (`Vec<Arc<_>>` → `Vec<_>` mismatch). The path-of-least-resistance
+"fix" is `messages: msgs.iter().map(|m| (**m).clone()).collect()`, which compiles, passes DoD
+1–5, and silently restores the exact per-turn deep copy this task exists to remove. **Change the
+field, not the clone.**
+
+*(Complementary micro-opt, independent of the Arc change: add
+`if self.dispatch.no_subscribers(EventKind::Context) { return Ok(msgs); }` before `hooks.rs:135`
+to elide even the pointer-`Vec` allocation when nothing subscribes to `context`. Reasonable, but
+NOT a substitute — it still deep-copies whenever a `context` subscriber IS present, so the Arc
+change remains required for DoD #6. Note the transcript-carrying HostEvents are exactly two:
+`Context` here and `AgentEnd` in §6.3; `MessageEnd` carries a single message, and the tool seams
+carry args, not the transcript.)*
+
+### 6.9 [AUG-2] Precondition CONFIRMED: serde's `rc` feature is enabled — the "Arc is transparent to serde" premise holds
+
+The task leans on "`Arc<T>` serializes identically to `T`" at four seams (§1 [AUG], §6.3, §6.8,
+and the `live.rs` sites). That is true **only** when serde's `rc` feature is enabled; without it
+`Arc<AgentMessage>` has no `Serialize`/`Deserialize` impl and every serialized/deserialized seam
+in this task fails to compile. Verified at
+[`cyrup/Cargo.toml:145`](../../../Cargo.toml): `serde = { version = "1", features = ["derive",
+"rc"] }`, and every crate on this path takes `serde.workspace = true` (`cyrup-core`,
+`cyrup-agent`, `cyrup-ext`, `cyrup-session-svc`). So the `live.rs:2077`/`:2146` byte-identical
+guest serialization, the guest-patch deserialization in §6.8, and the `--json`/RPC output in §6.3
+are all safe. This is a load-bearing precondition — record it so a future `rc`-feature removal is
+understood to break this task, not just this seam.
