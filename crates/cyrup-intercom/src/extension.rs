@@ -1227,6 +1227,7 @@ mod tests {
                 context_pct: None,
                 context_tokens: None,
                 context_window: None,
+                tmux_pane: None,
                 extra: Default::default(),
             },
             message: crate::transport::protocol::Message {
@@ -1264,6 +1265,7 @@ mod tests {
                     context_pct: None,
                     context_tokens: None,
                     context_window: None,
+                    tmux_pane: None,
                     extra: Default::default(),
                 },
                 crate::transport::protocol::Message {

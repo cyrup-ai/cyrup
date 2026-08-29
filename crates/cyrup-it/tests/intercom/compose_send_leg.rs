@@ -39,6 +39,7 @@ fn session() -> SessionInfo {
         context_pct: None,
         context_tokens: None,
         context_window: None,
+        tmux_pane: None,
         extra: Default::default(),
     }
 }
@@ -57,6 +58,7 @@ fn registration(cwd: &str) -> SessionRegistration {
         started_at: 0u64.into(),
         last_activity: 0u64.into(),
         status: None,
+        tmux_pane: None,
         extra: Default::default(),
     }
 }
