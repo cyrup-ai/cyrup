@@ -1,7 +1,7 @@
 ---
 stage: aug
 status: done
-updated: 2026-08-29 01:59
+updated: 2026-08-29 02:14
 ---
 
 # SEAM-112: /resume Produces A Broken Session
@@ -11,178 +11,274 @@ updated: 2026-08-29 01:59
 `/resume` produces a broken session: **nothing renders, and bash tool calls repeat
 endlessly.** Filed 2026-08-15 from live use, `critical`.
 
-The render half is closed. **The open question is narrowly: why do the bash calls repeat?**
+The render half is closed (`879eb4e`). The open half was: *why do the bash calls repeat?*
+
+**That is now answered in source, and the fix is a two-line change.** No live reproduction is
+required, and none is requested. Read "Root cause" below, apply "The change", update the two
+ledger rows, done.
 
 ---
 
-## Audit results — settled, do not re-investigate
+## Root cause — SETTLED
 
-### The ledger's three candidates: two dead, one narrowed to nothing
+**cyrup's one-shot overflow-recovery brake is unarmable for `StopReason::Length`, because the
+very message that arms it clears it first. The port dropped one arm of pi's guard.**
 
-**Candidate (2) — the generation bump racing the install. FALSE, structurally impossible.**
-[`runtime.rs`](../../crates/cyrup-session-svc/src/runtime.rs) `install_inner` assigns the
-session and the generation under the **same write lock** (`:445`, `:446`) and only then sends
-the watch notify (`:449`). No window exists.
+### The divergence, verbatim
 
-**Candidate (3) — nothing drives the new subscription. FALSE.** `on_session_swapped`
-([`run_arms.rs:143-315`](../../crates/cyrup-tui/src/app/run_arms.rs)) re-subscribes (`:163`),
-repoints the loop's handle (`:164`), and replays the conversation (`:285`, `:290`), plus ui
-sinks, read-backs, shortcuts, auth, context usage and the title. This is why "nothing renders"
-is closed.
+pi @v0.84.3 [`agent-session.ts:677-680`](../../tmp/pi/packages/coding-agent/src/core/agent-session.ts):
 
-**Candidate (1) — "the rebuilt session's tool-result path is not re-wired." DEAD in both
-halves.** The previous augmentation narrowed this to the live path and proposed that a tool
-result present in agent state but not yet persisted is erased by a wholesale re-seed. **That
-hypothesis is now disproved.** Two independent proofs:
+```ts
+const assistantMsg = event.message as AssistantMessage;
+if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length") {
+    this._overflowRecoveryAttempted = false;
+}
 
-1. **Agent state gets it synchronously.** [`state.rs:173`](../../crates/cyrup-agent/src/state.rs)
-   — `reduce` pushes every message into `st.messages` on `MessageEnd`, and its own doc states
-   it is "called while the state lock is held, BEFORE subscribers are awaited."
-2. **The session file gets it in the same awaited call.** All three tool-result sites emit
-   `MessageStart` then `MessageEnd` with `.await?` —
-   [`exec.rs:249-250`](../../crates/cyrup-agent/src/agent/run/tools/exec.rs), `exec.rs:361-362`,
-   [`mod.rs:110-111`](../../crates/cyrup-agent/src/agent/run/tools/mod.rs) — and the subscriber
-   appends the finalized message to the session tree on `MessageEnd`
-   ([`subscriber.rs:171`](../../crates/cyrup-session-svc/src/subscriber.rs)).
+// Reset retry counter immediately on successful assistant response
+if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) { /* auto_retry_end */ }
+```
 
-There is no window. **Stop looking for a lost tool result.**
-
-The resume seed is likewise fine: [`builder.rs:1499`](../../crates/cyrup-session-svc/src/builder.rs)
-seeds through `raw_message_to_agent`
-([`event.rs:418`](../../crates/cyrup-session-svc/src/event.rs)), whose `Core` arm carries an
-explicit `Message::ToolResult → AgentMessage::ToolResult` arm preserving `tool_call_id`.
-
-### The row's citations have drifted — navigate by symbol
-
-| Row cites | Reality at HEAD |
-| --- | --- |
-| `run.rs:344` (`Some(ev) = events.next()`) | **`:397`** |
-| `run.rs:293` (swap arm) | **`:331`** (`swapped = session_swapped`) |
-| `run_arms.rs:158` (re-subscribe) | **`:163`/`:164`** |
-| `agent.rs:1985-2026` (`continue_run`) | **file split** — [`agent/lifecycle.rs:209`](../../crates/cyrup-agent/src/agent/lifecycle.rs), [`loop_fn.rs:200`,`:280`](../../crates/cyrup-agent/src/loop_fn.rs) |
-| `session.rs:5550-5562` | **no such file** |
-| `subscriber.rs:89-93`, `runtime.rs:513`, `session_bind.rs:4` | correct |
-
----
-
-## The leading hypothesis — the overflow latch is not one-shot
-
-Every in-source `SEAM-112` marker sits on compaction / re-seed / retry, not on the swap path.
-[`round8_postrun.rs:177`](../../crates/cyrup-session-svc/src/tests/round8_postrun.rs) states it
-outright: *"after a successful OVERFLOW compaction the interrupted turn must actually be
-RETRIED."*
-
-The overflow guard is `overflow_recovery_attempted`
-([`session/mod.rs:242`](../../crates/cyrup-session-svc/src/session/mod.rs)). It is read and set
-in [`auto_compaction.rs:85`,`:100`](../../crates/cyrup-session-svc/src/session/auto_compaction.rs)
-to make overflow recovery one-shot. It is **cleared in two places**
-([`run.rs:247`,`:278`](../../crates/cyrup-session-svc/src/session/run.rs)) — and the second is
-the problem:
+cyrup [`session/run.rs:273-279`](../../crates/cyrup-session-svc/src/session/run.rs):
 
 ```rust
-// run.rs:273 — on_assistant_message_end
-if assistant.stop_reason == cyrup_core::StopReason::Error {
-    return;
+pub(crate) async fn on_assistant_message_end(&self, assistant: &AssistantMessage) {
+    *Self::lock(&self.last_assistant) = Some(assistant.clone());
+    if assistant.stop_reason == cyrup_core::StopReason::Error {
+        return;                                   // <- covers ERROR only
+    }
+    *Self::lock(&self.overflow_recovery_attempted) = false;   // <- LENGTH reaches here
+    // ... retry-counter reset ...
 }
-*Self::lock(&self.overflow_recovery_attempted) = false;
 ```
 
-The early return covers **only** `StopReason::Error`. A normal tool-calling turn ends with
-`StopReason::ToolUse`, falls through, and **clears the latch**. So in a tool-calling loop the
-"one-shot" guard is re-armed on every single turn.
+The port fused pi's **two independently-guarded** statements into **one** early `return` and, in
+doing so, kept only the predicate they share (`!== "error"`). **`&& stopReason !== "length"` was
+lost.** The doc comment above the function records the drift in prose — it says "on a non-error
+response", where upstream is "on a response that is neither an error nor a length stop".
 
-Combine that with the retry tail (`auto_compaction.rs:375`, `will_retry` → `continue_run`
-re-driving the interrupted turn) and the cycle is:
+### Why that makes the loop unbounded
+
+`overflow_recovery_attempted` ([`session/mod.rs:242`](../../crates/cyrup-session-svc/src/session/mod.rs))
+is the only brake on the compact-and-retry cycle. It is read and set in
+[`auto_compaction.rs:85`,`:100`](../../crates/cyrup-session-svc/src/session/auto_compaction.rs):
+
+```rust
+if same_model && is_context_overflow(assistant, Some(window)) {
+    let will_retry = assistant.stop_reason != cyrup_core::StopReason::Stop;
+    if !will_retry { return self.run_auto_compaction(CompactionReason::Overflow, false).await; }
+    if *Self::lock(&self.overflow_recovery_attempted) {
+        /* emit CompactionEnd{error_message: "Context overflow recovery failed after one
+           compact-and-retry attempt..."} */
+        return Ok(false);                                  // <- the brake
+    }
+    *Self::lock(&self.overflow_recovery_attempted) = true;
+    self.drop_trailing_assistant().await;
+    return self.run_auto_compaction(CompactionReason::Overflow, will_retry).await;
+}
+```
+
+[`is_context_overflow`](../../crates/cyrup-provider/src/utils/overflow.rs) (`:79-113`) fires on
+exactly three shapes:
+
+| case | stop reason | condition | `will_retry` |
+| --- | --- | --- | --- |
+| 1 | `Error` | error text matches an overflow pattern | **true** |
+| 2 | `Stop` | `input + cache_read > window` | false |
+| 3 | `Length` | `usage.output == 0 && input*100 >= window*99` | **true** |
+
+So the brake is consulted on **case 1 and case 3 only**. Now order the two handlers — the
+subscriber runs `on_assistant_message_end` on `message_end`, and `check_compaction` runs later
+from `handle_post_agent_run` on `agent_end` ([`run.rs:235`](../../crates/cyrup-session-svc/src/session/run.rs)):
+
+- **Case 1 (`Error`)** — `run.rs:275` returns early, the latch survives, `:85` can see `true`.
+  The brake works. Parity-correct.
+- **Case 3 (`Length`)** — `run.rs:275` does **not** return, `:278` sets the latch to `false`,
+  and *then* `:85` reads it. **The read is `false` on every pass, unconditionally.** `:85-98` is
+  unreachable code on this path; `:100` re-sets a latch that the next `Length` message will
+  clear again.
 
 ```
-overflow -> latch was false -> compact -> will_retry -> continue_run
-   -> turn re-runs the SAME bash call -> assistant message_end (ToolUse) -> latch CLEARED
-   -> overflow -> compact -> ... unbounded
+Length overflow -> latch CLEARED at run.rs:278 -> :85 reads false -> :100 set true
+   -> drop_trailing_assistant -> compact -> will_retry -> continue_run
+   -> the interrupted turn re-runs, re-issuing the SAME bash call
+   -> next assistant is Length again -> latch CLEARED again -> ... forever
 ```
 
-Each pass re-executes the identical bash command. **This is the reported symptom exactly.**
+pi's cycle terminates after **exactly one** attempt. cyrup's has **no termination condition at
+all** — not "usually loops", not "loops if compaction is weak": the guard can never be observed
+`true`, so the loop is structurally unbounded. Every pass re-drives the interrupted turn, so
+every pass re-executes the identical bash command. **That is the reported symptom, exactly, and
+it is the only unbounded loop in the audited surface.**
 
-A resumed session is the natural way to enter it: it starts at or near the context limit, so
-the very first turn can overflow.
+A resumed session is the natural way in: it starts at or near the context limit, so the very
+first turn can land in case 3 (`input >= 99% of window`, output truncated to nothing).
 
-**The cycle terminates only if compaction actually shrinks the context.** The same file
-documents a prior bug of precisely that shape — compaction "reported success while the very
-next turn still shipped the ENTIRE pre-compaction history to the provider: zero token
-reduction, full cost" (`auto_compaction.rs:327`). If any resumed-session path leaves the
-re-seed ineffective, the loop never exits.
+### Two independent corroborations in this repo
 
-**This is a hypothesis with a specific numeric check, not a conclusion.** It is unproven until
-the live run below confirms it. It is recorded because it explains an *endless* repeat — which
-none of the row's three candidates does, and which the previous augmentation's hypothesis
-cannot, now that both halves of candidate (1) are dead.
+1. **cyrup already knows `Error | Length` is the retriable pair.**
+   [`auto_compaction.rs:399-404`](../../crates/cyrup-session-svc/src/session/auto_compaction.rs)
+   re-drops the trailing message when `matches!(a.stop_reason, StopReason::Error | StopReason::Length)`,
+   with the in-source comment "remove the retriable error **or truncated-length** response again
+   before continuing the interrupted turn." The compaction side of the port carries both arms;
+   the latch side carries one. **The asymmetry is the bug.**
+2. **The failure mode has already been observed here.** `PROV-069`'s closure note
+   ([`01-cyrup-core-and-provider.md:330`](../../docs/gap-analysis/01-cyrup-core-and-provider.md))
+   records that a port of pi's `isRecoverableLength` "was drafted and REVERTED because it routes
+   a truncated turn into `run_auto_compaction`, which ... trades truncation for **compaction
+   spam**." Compaction spam is what an unbrakeable `Length` → compact-and-retry cycle produces.
+   That note is describing this defect from the other side.
 
 ---
 
-## The work
+## Settled — do not re-investigate
 
-### 1. Instrument, reproduce ONCE, read
+**Candidate (1), "the rebuilt session's tool-result path is not re-wired." DEAD in both halves.**
+Tool results reach agent state and the session file synchronously, in the same awaited call:
+[`state.rs:173`](../../crates/cyrup-agent/src/state.rs) pushes into `st.messages` on `MessageEnd`
+"while the state lock is held, BEFORE subscribers are awaited"; all three emit sites
+([`exec.rs:249-250`](../../crates/cyrup-agent/src/agent/run/tools/exec.rs), `exec.rs:361-362`,
+[`mod.rs:110-111`](../../crates/cyrup-agent/src/agent/run/tools/mod.rs)) `.await?` a
+`MessageStart`/`MessageEnd` pair, and [`subscriber.rs:171`](../../crates/cyrup-session-svc/src/subscriber.rs)
+appends to the session tree on `MessageEnd`. There is no window. The resume seed is likewise
+intact: [`builder.rs:1499`](../../crates/cyrup-session-svc/src/builder.rs) seeds through
+`raw_message_to_agent` ([`event.rs:418`](../../crates/cyrup-session-svc/src/event.rs)), whose
+`Core` arm has an explicit `Message::ToolResult → AgentMessage::ToolResult` preserving
+`tool_call_id`.
 
-Log at exactly these points, then run **one** `/resume` on a session large enough to overflow,
-let the bash call repeat two or three times, and stop. Do not characterise by re-running.
+**Candidate (2), the generation bump racing the install. FALSE, structurally impossible.**
+[`runtime.rs`](../../crates/cyrup-session-svc/src/runtime.rs) `install_inner` assigns session
+(`:445`) and generation (`:446`) under one write lock, notifying only after (`:449`).
 
-- **latch cleared** — `run.rs:277`: log `assistant.stop_reason` on every clear. This is the
-  load-bearing line; a `ToolUse` here is the hypothesis firing.
-- **latch read / set** — `auto_compaction.rs:85` and `:100`.
-- **compaction effectiveness** — `auto_compaction.rs:340`: log `estimated_tokens_after`
-  alongside the model's context window, and the seeded message count.
-- **retry decision** — `auto_compaction.rs:375`: log `will_retry`.
-- **tool result** — `turn.rs:76`: log `tool_call_id` and `tool_name`, to correlate the repeats.
+**Candidate (3), nothing drives the new subscription. FALSE.** `on_session_swapped`
+([`run_arms.rs:143-315`](../../crates/cyrup-tui/src/app/run_arms.rs)) re-subscribes (`:163`),
+repoints the loop handle (`:164`) and replays the conversation (`:285`,`:290`).
 
-### 2. Read the log against this decision tree
+**The previous augmentation's proposed fix — "widen the early return to cover `ToolUse`" — is
+WRONG. Do not apply it.** Three reasons:
+1. `is_context_overflow` never returns `true` for a `ToolUse` message (table above), so a
+   `ToolUse` turn can never be the turn that consults the latch. Suppressing its clear fixes
+   nothing.
+2. pi clears the latch on `ToolUse` (`"toolUse" !== "error" && !== "length"`). Suppressing it
+   would *introduce* a divergence into code that is currently correct.
+3. It would leave the actual divergence — `Length` — in place.
 
-- **`ToolUse` appears on a latch clear, and compaction repeats** → the hypothesis is
-  confirmed. Fix at `run.rs:277`: the clear must not re-arm overflow recovery for a turn that
-  merely ended in a tool call. Restrict it to a genuinely completed response — pi's own
-  intent at `agent-session.ts:562-577` is a *non-error response*, and a `ToolUse` turn is not
-  a completed response. Widen the early return to cover `ToolUse` (and any stop reason that
-  implies the turn is still in flight) rather than removing the clear, which would break the
-  legitimate reset after a real answer.
-- **`estimated_tokens_after` does not drop, or drops but stays above the window** → the
-  compaction is ineffective on this path; the latch is then a symptom and the fix is at the
-  re-seed. Follow the ordering already established at `auto_compaction.rs:307` (success path
-  only) and `:375` (re-drop the retriable tail).
-- **The latch stays set and the loop still repeats** → the driver is not overflow recovery;
-  fall back to logging at `agent/lifecycle.rs:209` and `loop_fn.rs:200`/`:280` to see what is
-  re-entering the run.
-- **No compaction at all in the log** → the repeat is not compaction-driven; the remaining
-  surface is the request projection, where `AgentMessage::ToolResult` maps back at
-  [`hooks.rs:185`](../../crates/cyrup-agent/src/hooks.rs) — check `tool_call_id` correlation.
+---
 
-### 3. Fix at the root cause
+## The change
 
-Do not suppress the repeat. A guard that merely caps the loop leaves a session that silently
-burns the context window.
+### A. The fix — [`crates/cyrup-session-svc/src/session/run.rs:269-279`](../../crates/cyrup-session-svc/src/session/run.rs)
 
-### 4. Correct the row's stale citations
+**Split the two guards.** Do **not** widen the early `return`: pi resets the retry counter on a
+`length` stop (its second `if` is guarded by `!== "error"` alone), so returning early for
+`Length` would fix the latch and break the retry counter in one stroke.
+
+Replace:
+
+```rust
+    /// The subscriber's `message_end` handler for an ASSISTANT message (Pi `_handleAgentEvent` tail,
+    /// agent-session.ts:562-577): track the last assistant message (drives the post-run loop) and — on
+    /// a non-error response — clear the overflow latch and reset the retry counter, emitting
+    /// `auto_retry_end{success:true}` if a retry sequence was in flight.
+    pub(crate) async fn on_assistant_message_end(&self, assistant: &AssistantMessage) {
+        *Self::lock(&self.last_assistant) = Some(assistant.clone());
+        if assistant.stop_reason == cyrup_core::StopReason::Error {
+            return;
+        }
+        *Self::lock(&self.overflow_recovery_attempted) = false;
+```
+
+with:
+
+```rust
+    /// The subscriber's `message_end` handler for an ASSISTANT message (Pi `_handleAgentEvent` tail,
+    /// agent-session.ts:673-694 @v0.84.3): track the last assistant message (drives the post-run
+    /// loop), clear the overflow latch on a response that is neither an error NOR a length stop, and
+    /// reset the retry counter on any non-error response, emitting `auto_retry_end{success:true}` if
+    /// a retry sequence was in flight.
+    ///
+    /// SEAM-112 — the two clears carry DIFFERENT predicates upstream and must not be fused into one
+    /// early return. pi guards the latch with `stopReason !== "error" && stopReason !== "length"`
+    /// (`agent-session.ts:678`) and the retry counter with `stopReason !== "error"` alone (`:684`).
+    /// cyrup kept only the shared arm, so every `Length` message cleared the latch here — i.e.
+    /// immediately BEFORE `check_compaction` reads it (`auto_compaction.rs:85`) for the overflow
+    /// case a `Length` message triggers (`is_context_overflow` case 3, `overflow.rs:101-109`). The
+    /// read was therefore always `false`, the one-shot brake at `:85-98` was unreachable, and
+    /// overflow recovery re-compacted and re-drove the interrupted turn without bound — re-running
+    /// the same tool call on every pass. `Length` is a retriable, NOT-completed response here for
+    /// the same reason it is one at `auto_compaction.rs:399-404`.
+    pub(crate) async fn on_assistant_message_end(&self, assistant: &AssistantMessage) {
+        *Self::lock(&self.last_assistant) = Some(assistant.clone());
+        if assistant.stop_reason == cyrup_core::StopReason::Error {
+            return;
+        }
+        if assistant.stop_reason != cyrup_core::StopReason::Length {
+            *Self::lock(&self.overflow_recovery_attempted) = false;
+        }
+```
+
+Everything below that line (the `attempt` read and the `AutoRetryEnd` emit) is unchanged and
+must keep running for `Length`.
+
+Resulting truth table, which is pi's exactly:
+
+| stop reason | latch cleared | retry counter reset |
+| --- | --- | --- |
+| `Error` | no | no |
+| `Length` | **no** *(was: yes)* | yes |
+| `Stop` / `ToolUse` / `Aborted` / `Deferred` | yes | yes |
+
+### B. Ledger citations
 
 Repoint the drifted references in the `SEAM-112` rows
 ([`08-cyrup-session-svc-and-modes.md:410`](../../docs/gap-analysis/08-cyrup-session-svc-and-modes.md),
-[`00-residual-ledger.md:24`](../../docs/gap-analysis/00-residual-ledger.md)) to the symbols in
-the drift table, and strike candidates (1)–(3), all now disproved.
+[`00-residual-ledger.md:24`](../../docs/gap-analysis/00-residual-ledger.md)), strike candidates
+(1)–(3) as disproved, and record the root cause and fix.
+
+| Row cites | Reality at HEAD |
+| --- | --- |
+| `run.rs:344` (`Some(ev) = events.next()`) | **`cyrup-tui/src/app/run.rs:397`** |
+| `run.rs:293` (swap arm) | **`:331`** (`swapped = session_swapped`) |
+| `run_arms.rs:158` (re-subscribe) | **`run_arms.rs:163`/`:164`** |
+| `agent.rs:1985-2026` (`continue_run`) | **file split** — [`agent/lifecycle.rs:209`](../../crates/cyrup-agent/src/agent/lifecycle.rs), [`loop_fn.rs:200`,`:280`](../../crates/cyrup-agent/src/loop_fn.rs) |
+| `session.rs:5550-5562`, `session.rs:4868`, `:4775-4781` | **no such file** — the split is `session/run.rs`, `session/auto_compaction.rs`, `session/retry.rs` |
+| `subscriber.rs:89-93`, `runtime.rs:513`, `session_bind.rs:4` | correct |
+
+Note in the row that `auto_compaction.rs`'s in-source comments still cite the pre-split
+`session.rs:4868` / `:4775-4781` offsets (`:314`, `:326`, `:383`, `:392`); repoint them to
+`session/auto_compaction.rs:78` and `session/retry.rs:140` while editing that file.
 
 ---
 
-## Out of scope
+## Out of scope — with reasons, so they are not re-attempted
 
-- The swap path (`on_session_swapped`, `install_inner`, `Fanout::invalidate`) — correct at HEAD.
-- The resume seed's tool-result fidelity — proved intact.
-- The "nothing renders" half, closed by `879eb4e`.
-- Persisting or de-duplicating tool results — they are already persisted synchronously.
+- **Porting pi's `isRecoverableLength`** ([`overflow.ts:171-173`](../../tmp/pi/packages/ai/src/utils/overflow.ts),
+  joined into the Case-1 `if` at `agent-session.ts:2135`). It is **deliberately absent**: tracked
+  as PARITY-GAPS **VL-P10** ([`PARITY-GAPS.md:839`](../../docs/gap-analysis/PARITY-GAPS.md)) and
+  explicitly drafted-and-reverted under `PROV-069`. It widens the compact-and-retry trigger; it is
+  a different ticket, and landing it here would enlarge the very cycle this task is closing.
+- **The `ToolUse` latch clear** — upstream-faithful, see above.
+- **The swap path** (`on_session_swapped`, `install_inner`, `Fanout::invalidate`) — correct at HEAD.
+- **The resume seed's tool-result fidelity** — proved intact.
+- **The "nothing renders" half** — closed by `879eb4e`.
+- **Persisting or de-duplicating tool results** — already synchronous.
+- **Any cap, counter, or circuit-breaker on the retry loop.** The brake already exists at
+  `auto_compaction.rs:85`; it was simply never reachable. Make it reachable, add nothing.
 
 ---
 
 ## Definition of done
 
-1. One instrumented `/resume` captured, and the log names which decision-tree branch fired.
-2. The reason the model re-issues the identical call is stated in one sentence grounded in
-   that log.
-3. The fix is applied at that branch; if it is the latch, the clear no longer re-arms overflow
-   recovery on a turn that ended in a tool call, while still resetting after a real response.
-4. A second `/resume` under the same conditions no longer repeats the call.
-5. Temporary instrumentation removed; `cargo check --workspace --all-targets` clean.
-6. The `SEAM-112` rows carry corrected citations and the three disproved candidates struck.
+1. `on_assistant_message_end` no longer clears `overflow_recovery_attempted` for
+   `StopReason::Length`, and still resets the retry counter for it — the truth table above holds.
+2. The change is the guard split shown in A, not a widened early `return`, and nothing else in
+   the function moved.
+3. `auto_compaction.rs:85`'s `if *Self::lock(&self.overflow_recovery_attempted)` arm is reachable
+   for a `Length`-triggered overflow: a second consecutive `Length` overflow emits
+   `CompactionEnd { will_retry: false, error_message: Some("Context overflow recovery failed
+   after one compact-and-retry attempt. …") }` and `check_compaction` returns `Ok(false)`, so
+   `handle_post_agent_run` returns `false` and the run settles instead of re-driving the turn.
+4. The stale in-source citations in `auto_compaction.rs` (`:314`, `:326`, `:383`, `:392`) point
+   at the post-split paths.
+5. The two `SEAM-112` ledger rows carry the corrected citations, the three struck candidates, and
+   the root cause + fix.
+6. `cargo check --workspace --all-targets` clean.
