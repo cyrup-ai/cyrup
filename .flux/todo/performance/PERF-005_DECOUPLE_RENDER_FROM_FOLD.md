@@ -1,8 +1,8 @@
 ---
 stage: aug
-status: done
-updated: 2026-08-29 05:34
-aug_against: cyrup HEAD 8f49433 · pi v0.84.1 (`packages/tui/src/tui.ts`) · all numbers re-measured on this host, `--release`
+status: in-progress
+updated: 2026-08-29 17:05
+aug_against: cyrup HEAD 7913760 · pi v0.84.1 (`packages/tui/src/tui.ts`) · every citation re-verified and every number re-measured on this host, `--release`
 ---
 
 # Move rendering off the event-fold task
@@ -21,15 +21,46 @@ aug_against: cyrup HEAD 8f49433 · pi v0.84.1 (`packages/tui/src/tui.ts`) · all
 > **~500 lines of code in the active turn**, because a streaming turn re-runs
 > `syntect` over its *entire* code content on *every single frame* — 174 µs per code line,
 > 86 ms at 500 lines, 109% of the spinner tick. §3.0 does not touch that term at all.
-> The required fix set is now **§3.0b first** (resumable highlighter, 300×), then §3.0
+>
+> **[AUG-3] And the cheapest fix in the whole task was still missing.** There are TWO syntect
+> consumers, not one (§0.7). The second — `highlight_code_lines` on tool result bodies
+> ([`tool_builtin.rs:58`](../../../crates/cyrup-tui/src/transcript/tool_builtin.rs)) —
+> highlights the **entire** output and then renders `total.min(10)` rows. At a 2,000-line
+> `read` that is **356 ms per frame of which 99.5% is discarded**, and the fix is one `.take()`
+> with **proven byte-identical output** (§0.7 B2/B3). It is a smaller edit than anything else
+> here and a larger win than §3.0.
+>
+> The required fix set is now **§3.0a first** (bound the highlight to what is shown — one
+> argument, 187×), then **§3.0b** (resumable/memoised highlighter, 66–3078×), then §3.0
 > (wrapped-row cache, removes two full O(n) passes worth ~180 ms at 16k rows), then §3.1.
+
+---
+
+## AUG-3 CHANGE LOG — what moved since the last round
+
+Re-verified against **HEAD `7913760`** (the AUG-2 round read `8f49433`; `crates/cyrup-tui`
+moved 31 files between them). Everything below is a correction to this file, not to the code.
+
+| | AUG-2 said | verified now | consequence |
+| --- | --- | --- | --- |
+| `run_arms.rs` draw sites | `:310,352,358,367,376,422,436,463,475,504,515,521,529,541,550,562,572,608,618,630,640,647` | **all −3**: `:307,349,355,364,373,419,433,460,472,501,512,518,526,538,547,559,569,605,615,627,637,644` | §3.1's call-site list re-numbered below |
+| `bump_render_generation()` sites | 39 | **40** | §0.3's argument is unchanged and stronger |
+| `walk.rs` final wrap | `:834-838` | **`:837`** | citation only |
+| `indexing_slicing` lint | "`lib.rs:46-50`" | **workspace-denied** in root `Cargo.toml`; `lib.rs:50` denies `clippy::string_slice` only | still `.get(..)`, but cite the right place |
+| syntect consumers | one (`highlight_lines`) | **two** — `highlight_code_lines` is called from `tool_builtin.rs:58` and `:109` | **new §0.7 / §3.0a** |
+| §3.0's height oracle | assumed `rows.len() == wrapped_height(...)` | **two different wrappers; they disagree on 2 of 22 cases** | **new §0.8** — `render_cache.rs` must be re-anchored |
+| 30 production `draw_synchronized()` sites | 30 | **30** (3 `crossterm.rs`, 3 `run.rs`, 2 `run_action.rs`, 22 `run_arms.rs`) | unchanged |
+| pi `tui.ts` anchors `:343,772,783,806,900` | — | **all exact**; `requestRender(` = 106 in `interactive-mode.ts`; `renderNow()` = 1 (`:815`) | unchanged |
+| `arc-swap` at `Cargo.toml:287` | — | **exact**, used by `cyrup-mcp`, `cyrup-resources`, `cyrup-session` | unchanged |
+| `ParseState: Clone` | claimed | **verified** — `syntect-5.3.0/src/parsing/parser.rs:57-58` `#[derive(Debug, Clone, Eq, PartialEq)]` | §3.0b is sound |
 
 ---
 
 ## 0. READ THIS FIRST
 
-Six findings. §0.1 is inherited. **§0.3, §0.4 and §0.5 are new this round and they move the
-work.**
+Eight findings. §0.1 is inherited. §0.3–§0.5 came from the AUG-2 round. **§0.7 and §0.8 are
+new this round; §0.7 adds the cheapest fix in the task and §0.8 removes a correctness trap
+from §3.0 that would otherwise present as a rendering regression.**
 
 ### 0.1 Do not re-do TUI-092
 
@@ -320,6 +351,170 @@ pi cannot get *parallelism* (§2), but it gets **coalescing across arms and a bo
 rate**, which cyrup does not. That is a straight port and it subsumes F3's within-arm drain
 with a structural guarantee.
 
+### 0.7 [AUG-3] THERE ARE TWO SYNTECT CONSUMERS, AND THE SECOND ONE THROWS 99.5% OF ITS WORK AWAY
+
+§0.4 found the syntect term. It found **one** of its two call paths. `grep` the crate:
+
+```bash
+grep -rn 'highlight_lines\|highlight_code_lines' crates/cyrup-tui/src --include=*.rs \
+  | grep -v 'fn highlight'
+# markdown/walk.rs:815              highlight_lines(code, lang, self.theme)      <- §0.4's path
+# transcript/tool_builtin.rs:58     highlight_code_lines(&replace_tabs(&output), l, theme)
+# transcript/tool_builtin.rs:109    highlight_code_lines(&replace_tabs(&display), l, theme)
+```
+
+The two paths have **different content dynamics and therefore need different fixes**:
+
+| | A — `highlight_lines` | B — `highlight_code_lines` |
+| --- | --- | --- |
+| called from | [`MdRenderer::emit_fence_rows`](../../../crates/cyrup-tui/src/markdown/walk.rs) `walk.rs:815` | [`tool_builtin.rs:58`](../../../crates/cyrup-tui/src/transcript/tool_builtin.rs) (`read` result), `:109` (`write`/`edit` preview) |
+| content | a fence in the streaming partial — **grows by append** | a settled tool result — **immutable once `run.result` is `Some`** |
+| fix | resumable `ParseState` (§3.0b) | bound to what is shown (§3.0a) + content memo (§3.0b) |
+
+**B is the worse of the two, and it is trivially fixable.** `tool_builtin.rs` highlights the
+**whole** output and then renders at most ten rows unless the block is expanded:
+
+```rust
+// transcript/tool_builtin.rs:57-63 — verbatim
+let highlighted =
+    lang.and_then(|l| crate::markdown::highlight_code_lines(&replace_tabs(&output), l, theme));
+let all = trim_trailing_empty(output.split('\n').collect());
+let total = all.len();
+let shown = if expanded { total } else { total.min(10) };   // <- TEN
+out.push(Line::default());
+for (i, l) in all.iter().take(shown).enumerate() {
+    out.push(body_line(l, highlighted.as_ref(), i, theme));  // <- indices 0..shown only
+}
+```
+
+and `body_line` reads that vector with **`.get(idx)`**
+([`transcript/layout.rs:371`](../../../crates/cyrup-tui/src/transcript/layout.rs)):
+
+```rust
+    match highlighted.and_then(|h| h.get(idx)) {
+        Some(l) => l.clone(),
+        None => Line::styled(replace_tabs(raw), theme.tool_output_style()),
+    }
+```
+
+so a vector that covers only `0..shown` is **indistinguishable** from one that covers
+`0..total`. syntect is a forward line-at-a-time state machine, so the first `shown` rows of a
+full-block highlight are bit-identical to a highlight that stops after `shown` lines —
+B3 below asserts exactly that.
+
+Measured, `--release` — [`tmp/perf005-hl2`](../../../tmp/perf005-hl2), `highlight_inner`
+reproduced verbatim with a `take(limit)`:
+
+**B2 — a collapsed tool body, per frame**
+
+| output lines | today (highlight all) | bounded to `shown` = 10 | discarded |
+| --- | --- | --- | --- |
+| 50 | **8.60 ms** | 1 910 µs | 77.8% |
+| 100 | **19.08 ms** | 1 884 µs | 90.1% |
+| 250 | **44.76 ms** | 1 920 µs | 95.7% |
+| 500 | **88.21 ms** | 1 910 µs | 97.8% |
+| 1 000 | **180.73 ms** | 1 922 µs | 98.9% |
+| 2 000 | **356.88 ms** | 1 907 µs | **99.5%** |
+
+**B3 — equivalence**: the first 10 rows of the full highlight compare `==` to the 10-row
+bounded highlight, at a 2,000-line body. The probe asserts it; the change is not an
+approximation.
+
+**B1 — and when the block IS expanded, a content memo still wins**, because the body is
+immutable: a hit is a `Vec<Line>` clone, not a re-parse.
+
+| lines | re-highlight (today) | memo hit (clone) | speedup |
+| --- | --- | --- | --- |
+| 50 | 8.80 ms | 42 µs | **207×** |
+| 100 | 17.66 ms | 85 µs | **207×** |
+| 250 | 43.95 ms | 214 µs | **206×** |
+| 500 | 102.70 ms | 441 µs | **233×** |
+| 1 000 | 195.10 ms | 1 970 µs | **99×** |
+| 2 000 | 457.88 ms | 2 972 µs | **154×** |
+
+A `read` of a 2,000-line file is not a pathological case for a coding agent — it is Tuesday.
+And every one of these milliseconds is paid on **every frame of the rest of the turn**, because
+`push_assistant_delta` keeps bumping the generation (§0.3) long after the tool settled.
+
+### 0.8 [AUG-3] §3.0 SILENTLY CHANGES THE HEIGHT ORACLE — AND A TEST FILE PINS THE OLD ONE
+
+§3.0 replaces the cached `wrapped_height` with `rows.len()`. Those are **two different
+wrapping implementations**:
+
+* `wrapped_height` = `Paragraph::line_count` = **ratatui's `WordWrapper`**
+  ([`layout.rs:384-391`](../../../crates/cyrup-tui/src/transcript/layout.rs)).
+* `rows` = `wrap_all_owned` → **cyrup's own `wrap_line`**, a port of pi's `wrapSingleLine`
+  (`tui/src/utils.ts:857-936`), which right-trims every produced row
+  ([`layout.rs:110-127`](../../../crates/cyrup-tui/src/transcript/layout.rs)).
+
+The AUG-2 draft assumed they agree. **They do not.** Both reproduced verbatim and compared over
+22 content shapes at width 20 — [`tmp/perf005-wrapeq`](../../../tmp/perf005-wrapeq):
+
+```
+case                                    ratatui wrap_all  agree
+----------------------------------------------------------------
+empty vec / empty lines / short / exactly-width / width+1     ok
+trailing space fits / overflows / leading spaces              ok
+prose wraps / long unbreakable token / double space run       ok
+cjk wide / emoji zwj / multi-span prose / multi-span overflow  ok
+blank between prose / tool-output shape (12 rows)             ok
+tab (expanded upstream)                       1        2 **NO**
+line of only spaces > width                   2        1 **NO**
+
+disagreements: 2 / 22
+```
+
+plus a width sweep (10→120) on a real prose paragraph and a pre-wrapped 50-row body at three
+widths: **all agree**. So the disagreement is confined to two shapes:
+
+1. **A tab.** Unreachable by construction — [`layout.rs:11-17`](../../../crates/cyrup-tui/src/transcript/layout.rs)
+   states it: *"a tab can no longer reach `wrap_line`, because `text_lines` and `normalize_line`
+   expand it upstream of every `Line` construction"*, and `replace_tabs` (`layout.rs:272`) is
+   applied on the tool path. Verified: the only disagreement is in the probe, which
+   deliberately bypasses that normalisation.
+2. **A whitespace-only row wider than the pane.** Reachable — from `tool_lines` and
+   `BashExecution::render_lines`, which carry no pre-wrapped guarantee. `wrap_line` reports 1
+   row, ratatui reports 2.
+
+**The important part is which one is right after §3.0.** Today `wrapped_height` is a
+*prediction* of what `Paragraph::render(.wrap(...))` will paint, so it has to model ratatui.
+After §3.0 the `.wrap()` is **gone** and the rows in the cache *are* the rows that get blitted —
+so `rows.len()` is not an estimate of the height, it **is** the height, and
+`wrapped_height` becomes a *wrong* oracle rather than a right one.
+
+That makes the following an obligation, not an option:
+
+**[`transcript/tests/render_cache.rs`](../../../crates/cyrup-tui/src/transcript/tests/render_cache.rs)
+must be re-anchored, not deleted** — it asserts the old oracle in **18 places**, including
+`assert_fresh` (`:32-40`), which runs after *every step* of a simulated turn:
+
+```rust
+fn assert_fresh(view: &mut TranscriptView, theme: &UiTheme, step: &str) {
+    let fresh = view.lines(80, theme);
+    let fresh_h = wrapped_height(&fresh, 80);              // <- becomes wrap_all_owned(...).len()
+    let cache = view.cached_render(80, theme);
+    assert_eq!(cache.lines, fresh, …);                     // <- becomes cache.rows vs wrapped fresh
+    assert_eq!(cache.wrapped_height, fresh_h, …);          // <- becomes cache.rows.len()
+    assert_eq!(view.content_height(80, theme), fresh_h, …);
+}
+```
+
+The mechanical re-anchor is: `wrapped_height(&fresh, w)` → `wrap_all_owned(fresh.clone(), w).len()`,
+`cache.lines` → `cache.rows.as_slice()` compared against `wrap_all_owned(fresh, w)`,
+`cache.wrapped_height` → `cache.rows.len()`, and the three `POISON_HEIGHT` pokes
+(`:72`, `:86`, `:107`, `:119`, `:274`) become pokes at `cache.rows`. `:355`
+(`render_cache.lines = vec![Line::from("SENTINEL-LINE")]`) becomes an `Arc::new(vec![...])`.
+
+Four other files read these members and must be checked in the same change:
+[`tests/assembled_render.rs:250,281`](../../../crates/cyrup-tui/src/tests/assembled_render.rs)
+(the PROSE-WRAP regression test — it asserts the viewport is **not** sized to `lines.len()`, so
+it must keep passing and is the best single proof §3.0 did not regress height),
+[`transcript/tests/progressive_commit.rs:35,41`](../../../crates/cyrup-tui/src/transcript/tests/progressive_commit.rs)
+(`content_height` stays bounded), [`transcript/tests/osc_hyperlinks.rs:279`](../../../crates/cyrup-tui/src/transcript/tests/osc_hyperlinks.rs)
+(`content_height` equal with links on and off — pins §3.0's `links` handling), and
+[`tests/render_cache_tick.rs:82`](../../../crates/cyrup-tui/src/tests/render_cache_tick.rs)
+(bump-before-draw, which §3.1 also touches).
+
 ---
 
 ## 1. The coupling
@@ -376,20 +571,201 @@ fold. §3.1 is not a cyrup innovation; it is a port of behaviour cyrup skipped.
 
 ## 3. Required implementation
 
-Five stages. The order is now **§3.0b, §3.0, §3.1, §3.2, §3.3** — §3.0b moved to the front
-because §0.4 shows it owns the dominant term.
+Five stages. The order is now **§3.0a, §3.0b, §3.0, §3.1, §3.2, §3.3** — §3.0a is new and goes
+first because it is one argument for a 187× win with proven-identical output; §3.0b follows
+because §0.4/§0.7 show the syntect term is what actually crosses the spinner tick.
 
-### 3.0b Make the markdown miss path incremental — resumable syntect
+### 3.0a Stop highlighting what is not shown — one `take`, 187×, output-identical
 
-**This is the largest single win in the task and the previous round missed it entirely.**
+**Do this first. It is the smallest edit in the task and the largest ratio.**
 
-syntect is a line-at-a-time state machine and `ParseState` **derives `Clone`**
-(`syntect-5.3.0/src/parsing/parser.rs:57-58`); syntect's own doc comment on that type is about
-caching it. A streaming code fence only ever *appends* lines, so the parse state after line N
-is still valid when line N+1 arrives. Keep it instead of throwing it away.
+[`transcript/tool_builtin.rs:57-63`](../../../crates/cyrup-tui/src/transcript/tool_builtin.rs)
+computes `shown` **after** it has already highlighted everything. Invert that: compute `shown`
+first and highlight `0..shown`. Same at the `write`/`edit` preview site, `:105-117`.
 
-Add a cursor beside the existing `OnceLock<SyntaxSet>` in
-[`markdown/highlight.rs`](../../../crates/cyrup-tui/src/markdown/highlight.rs):
+Give `highlight_code_lines` a row bound rather than adding a second entry point — there is one
+highlighter here for the same reason `wrap_line` is the only wrapper (`layout.rs:44-46`):
+
+```rust
+/// … existing doc comment, plus:
+///
+/// `max_rows` bounds the parse to the rows the caller will actually read. `body_line`
+/// (`transcript/layout.rs:369-373`) indexes the returned vector with `.get(idx)` for
+/// `idx` in `0..shown`, and syntect is a forward line-at-a-time state machine, so the first
+/// `max_rows` rows of a full-block highlight are **identical** to a highlight that stops there.
+/// A collapsed `read` block shows `total.min(10)` rows (`tool_builtin.rs:61`) and used to
+/// highlight all `total` of them: 356 ms/frame at a 2,000-line file, 99.5% of it discarded,
+/// on EVERY frame of the rest of the turn because `push_assistant_delta` keeps bumping the
+/// render generation (`transcript/stream.rs:55-56`).
+pub(crate) fn highlight_code_lines(
+    code: &str,
+    lang: &str,
+    theme: &UiTheme,
+    max_rows: usize,
+) -> Option<Vec<Line<'static>>> {
+```
+
+and thread it into `highlight_inner`'s loop as `code.split('\n').take(max_rows)`. Both call
+sites become:
+
+```rust
+        // `shown` BEFORE the highlight, not after it (§3.0a).
+        let all = trim_trailing_empty(output.split('\n').collect());
+        let total = all.len();
+        let shown = if expanded { total } else { total.min(10) };
+        let highlighted = lang.and_then(|l| {
+            crate::markdown::highlight_code_lines(&replace_tabs(&output), l, theme, shown)
+        });
+```
+
+Note `replace_tabs(&output)` still runs over the whole body — leave it; it is a linear string
+pass, not a parse, and it is what the `body_line` fallback re-applies per row.
+
+`highlight_lines` (the markdown path) takes **no** bound: a fence renders in full, so `shown`
+has no meaning there. Pass `usize::MAX` internally.
+
+The **only** behavioural risk is a caller that reads past `shown`. There is none:
+`push_read_truncation` (`tool_builtin.rs:70`) and `more_lines_hint` take the *count*, not the
+highlighted rows. Confirm with `grep -n 'highlighted' crates/cyrup-tui/src/transcript/tool_builtin.rs`
+— every use is `body_line(l, highlighted.as_ref(), i, theme)` inside `.take(shown)`.
+
+### 3.0b Make the highlighter incremental — resumable for the fence, memoised for the body
+
+**This is the largest single win in the task and the AUG-2 round located it in the wrong place.**
+
+syntect is a line-at-a-time state machine and `ParseState` **derives `Clone`** — verified at
+`syntect-5.3.0/src/parsing/parser.rs:57-58`, `#[derive(Debug, Clone, Eq, PartialEq)]`. A
+streaming code fence only ever *appends* lines, so the parse state after line N is still valid
+when line N+1 arrives. Keep it instead of throwing it away.
+
+**Put BOTH caches inside [`markdown/highlight.rs`](../../../crates/cyrup-tui/src/markdown/highlight.rs),
+beside the existing `OnceLock<SyntaxSet>` — not in `TranscriptView`.** The AUG-2 draft hung a
+`Vec<HighlightCursor>` off `TranscriptView` keyed by fence ordinal. Do not do that, for three
+reasons that only surface once you try to write it:
+
+1. `highlight_lines` is called from `MdRenderer::emit_fence_rows` (`walk.rs:815`), deep inside
+   the token walk. `TranscriptView` is not reachable from there, and threading
+   `&mut Vec<HighlightCursor>` down means changing `render`, `render_with_text_color`,
+   `render_message`, `MdRenderer::new` and every one of their test callers — a wide public
+   signature change for a private cache.
+2. It fixes path A only. Path B (`highlight_code_lines`, §0.7) never goes through
+   `MdRenderer` at all, so the tool bodies keep paying full freight.
+3. "Fence ordinal within the turn" is not stable: a fence in the *committed* prefix and a fence
+   in the streaming partial are rendered by different calls, and `trim_partial_closing_fence`
+   can open or close the last fence between frames.
+
+The objection AUG-2 raised against a map — *"the key would have to be the code text, which
+changes every delta, so a map only grows"* — is answered by splitting the two dynamics, because
+**only one block per frame ever grows**: the last fence of the streaming partial. Everything
+else (closed fences, settled tool bodies) is immutable.
+
+```rust
+/// Incremental highlighting state, thread-local because the whole render path is single-
+/// threaded (`TranscriptView::render` runs on the run-loop task; after §3.2 the fold still owns
+/// materialisation) and a thread-local costs no synchronisation on the hot path.
+///
+/// `try_borrow_mut` rather than `borrow_mut`: `RefCell` panics on re-entrancy and the workspace
+/// denies `clippy::panic`. The mermaid fallback re-enters `emit_fence_rows` (`walk.rs:756`), so
+/// the defensive form is not theoretical — and its fallback is exactly today's uncached
+/// behaviour, which is always correct.
+thread_local! {
+    static HL: std::cell::RefCell<HighlightState> = std::cell::RefCell::new(HighlightState::new());
+}
+
+struct HighlightState {
+    /// THE growing block: the last fence of the streaming partial. Exactly one, because only
+    /// the tail fence appends — every earlier fence in the same turn is closed and immutable.
+    cursor: Option<HighlightCursor>,
+    /// The immutable blocks: closed fences and settled tool bodies. Bounded, evicted by
+    /// insertion order, so it cannot grow the way a text-keyed map would.
+    memo: std::collections::VecDeque<(MemoKey, std::rc::Rc<Vec<Line<'static>>>)>,
+}
+
+/// 16 entries covers a turn's worth of closed fences plus the visible tool blocks; past that,
+/// the evicted entry rebuilds at exactly today's cost.
+const MEMO_CAP: usize = 16;
+
+/// Invalidation key. `hash` of the code text because the body is immutable once keyed; `lang`
+/// because a fence's info string can change while it streams (```` ```ru ```` → ```` ```rust ````);
+/// `theme_generation` because the emitted spans carry RESOLVED colours, exactly as `RenderCache`
+/// keys on it (`transcript/mod.rs:326`); `max_rows` because §3.0a makes the row bound part of
+/// the result. Hash-only would be a collision bet — store `len` too and compare it, which costs
+/// one `usize` and removes the bet.
+#[derive(PartialEq, Eq)]
+struct MemoKey { hash: u64, len: usize, lang: String, theme_generation: u64, max_rows: usize }
+
+/// A resumable highlight of ONE growing code block.
+struct HighlightCursor {
+    lang: String,
+    theme_generation: u64,
+    /// The exact text already consumed, so the prefix test below is a comparison, not a guess.
+    consumed_text: String,
+    /// The syntect state after `consumed_text`. THE reason this type exists.
+    parse: ParseState,
+    rows: Vec<Line<'static>>,
+}
+```
+
+The entry point replaces the body of `highlight_inner` and nothing above it:
+
+```rust
+fn highlight_inner(code: &str, lang: &str, syntax: &SyntaxReference, ss: &SyntaxSet,
+                   theme: &UiTheme, max_rows: usize) -> Option<Vec<Line<'static>>> {
+    HL.with(|hl| {
+        let Ok(mut st) = hl.try_borrow_mut() else {
+            return highlight_uncached(code, syntax, ss, theme, max_rows);  // today's loop, verbatim
+        };
+        // 1. Immutable hit? Clone the rows — 99-233× cheaper than re-parsing (§0.7 B1).
+        if let Some(rows) = st.memo_get(code, lang, theme.generation, max_rows) {
+            return Some(rows.as_ref().clone());
+        }
+        // 2. A strict line-prefix EXTENSION of what the cursor already consumed? Parse the tail.
+        //    This is what makes reuse SOUND: a delta appends, but a re-render after an edit, a
+        //    `/clear`, or a committed-then-restreamed turn does not. Anything that is not a
+        //    strict prefix extension rebuilds from scratch — correctness first, and the rebuild
+        //    is exactly today's cost, so the worst case is a wash.
+        st.resume_or_rebuild(code, lang, theme, syntax, ss, max_rows)
+    })
+}
+```
+
+**Two rules the implementation must not violate.**
+
+**(a) Do not consume the last line of an OPEN fence into the cursor.** The live path runs
+`trim_partial_closing_fence` ([`cache.rs:163`](../../../crates/cyrup-tui/src/transcript/cache.rs)),
+so the final line of a streaming block can be a partial token that changes on the next delta.
+Parse `code` up to its last `\n` into the cursor and re-parse the tail each frame. One line is
+~130 µs, flat, and it is the difference between correct and subtly-wrong colouring.
+
+**(b) Only complete blocks enter the memo.** A block is memo-eligible when its text is not a
+prefix of anything currently streaming — in practice, whenever `highlight_code_lines` is the
+caller (settled tool bodies, always) and when a fence's text has stopped growing.
+
+**Do not lose the fallbacks.** [`highlight_lines`](../../../crates/cyrup-tui/src/markdown/highlight.rs)
+at `:12-29` returns `flat()` for an empty/unknown language token or any syntect fault, and
+[`highlight_code_lines`](../../../crates/cyrup-tui/src/markdown/highlight.rs) at `:42-69`
+returns `None` for the same and strips the 2-space gutter. Both must keep behaving exactly as
+they do — the caches sit *inside* `highlight_inner`'s position, below those gates, so an
+unknown language never reaches them.
+
+Measured, `--release` — [`tmp/perf005-hl2`](../../../tmp/perf005-hl2) B4, the cost of the frame
+a streaming delta produces, with `ParseState::clone()` included (production keeps the state and
+does not pay it, so these are over-estimates):
+
+| code lines already in the fence | today (re-highlight all) | §3.0b (parse the new line) | speedup |
+| --- | --- | --- | --- |
+| 50 | 9.13 ms | 137 µs | **66×** |
+| 100 | 18.03 ms | 116 µs | **155×** |
+| 250 | 45.41 ms | 116 µs | **393×** |
+| 500 | 91.07 ms | 134 µs | **682×** |
+| 1 000 | 176.89 ms | 131 µs | **1 346×** |
+| 2 000 | 354.89 ms | 115 µs | **3 078×** |
+
+The §3.0b column is **flat** — one line's parse, independent of block size.
+
+<!-- AUG-2's cursor sketch, superseded by the design above; kept because its field-by-field
+     rationale is still the right rationale. -->
+<details><summary>AUG-2's original <code>HighlightCursor</code> sketch (superseded)</summary>
 
 ```rust
 /// A resumable highlight of ONE code block. `highlight_inner` used to build a fresh
@@ -452,33 +828,7 @@ as `Vec<HighlightCursor>` indexed by the block's ordinal within the turn, reset 
 `commit_assistant`/`discard_streaming`. Ordinal is stable during a stream because fences only
 ever appear in order and only the last one grows.
 
-**Do not lose the fallbacks.** [`highlight_lines`](../../../crates/cyrup-tui/src/markdown/highlight.rs)
-at `:12-29` returns `flat()` for an empty/unknown language token or any syntect fault, and
-[`highlight_code_lines`](../../../crates/cyrup-tui/src/markdown/highlight.rs) at `:42-69`
-returns `None` for the same and strips the 2-space gutter. Both must keep behaving exactly as
-they do — the cursor sits *inside* `highlight_inner`'s position, below those gates.
-
-**Also handle the streaming-fence case explicitly.** The live path runs
-`trim_partial_closing_fence` (`cache.rs`, via `crate::markdown::trim_partial_closing_fence`)
-so an unterminated fence still parses. That means the *last* line of a streaming block can be
-a partial token that changes on the next delta. Do not consume the final line into the cursor
-while the fence is open: parse `code` up to its last `\n` and re-parse the tail each frame.
-One line of re-parse is ~174 µs, flat.
-
-Measured — the cost of the frame a delta produces, at a given amount of already-highlighted
-code ([`tmp/perf005-hl`](../../../tmp/perf005-hl)):
-
-| code lines already in the turn | today (re-highlight all) | §3.0b (parse the new line) | speedup |
-| --- | --- | --- | --- |
-| 50 | 8.68 ms | 130 µs | **67×** |
-| 100 | 17.80 ms | 205 µs | **87×** |
-| 250 | 44.00 ms | 157 µs | **280×** |
-| 500 | 85.90 ms | 282 µs | **304×** |
-| 1 000 | 175.07 ms | 54 µs | **3 265×** |
-| 2 000 | 349.34 ms | 157 µs | **2 219×** |
-
-The §3.0b column is **flat** — it is one line's parse, independent of turn size. (It includes
-a `ParseState::clone()` the probe needs and production does not, so it is an over-estimate.)
+</details>
 
 ### 3.0 Make a frame O(visible), not O(active turn)
 
@@ -579,9 +929,10 @@ becomes a refcount bump, a slice, and a bounded blit:
     }
 ```
 
-`.get(..)` rather than `[..]` — `cyrup-tui` denies `clippy::indexing_slicing` and
-`clippy::string_slice` ([`lib.rs:46-50`](../../../crates/cyrup-tui/src/lib.rs)), and those
-lints fire **only under `cargo clippy`**, never `cargo build`/`cargo test`.
+`.get(..)` rather than `[..]` — `clippy::indexing_slicing` is **workspace**-denied
+([`Cargo.toml` `[workspace.lints.clippy]`](../../../Cargo.toml)) and `clippy::string_slice` is
+denied crate-locally at [`lib.rs:50`](../../../crates/cyrup-tui/src/lib.rs). Both fire **only
+under `cargo clippy`**, never `cargo build`/`cargo test`.
 
 `content_height` becomes `self.cached_render(width, theme).rows.len()`.
 
@@ -590,26 +941,45 @@ which pays the identical triple today — `entry_lines` → `wrapped_height(&lin
 `to_vec()` + a full wrap, `:282`) → `Paragraph::new(lines).wrap(…)` inside `insert_before`
 (`:285-287`), a **third** wrap. Build `rows` with `wrap_all_owned`, use `rows.len()` as the
 `insert_before` height, and drop `.wrap(Wrap { trim: false })` from the `Paragraph`. Note the
-`#[cfg(any(test, feature = "scrollback-accumulator"))]` line at `:271` clones again; leave it,
+`#[cfg(any(test, feature = "scrollback-accumulator"))]` line at `:274` clones again; leave it,
 it is already gated out of production by TUI-092 F1.
 
-Three hazards, each of which will look like a rendering regression if missed:
+This is also where §3.0 becomes *safer* than it looks: today `insert_before(height, …)`
+reserves a height **predicted** by one wrapper and then paints with another
+(`Paragraph::wrap`). After the change the reserved height and the painted rows are the same
+`Vec`, so the PROSE-WRAP clipping class (R-ARCH-TUI-003/-005) becomes unrepresentable rather
+than merely fixed.
 
+Four hazards, each of which will look like a rendering regression if missed:
+
+* **[AUG-3] `rows.len()` is NOT `wrapped_height(...)` — and that is correct, but the tests
+  disagree.** §0.8 measures the two wrappers over 22 shapes: 20 agree, 2 do not (a tab, which
+  `replace_tabs`/`normalize_line` make unreachable, and a whitespace-only row wider than the
+  pane, which `tool_lines`/`BashExecution::render_lines` CAN produce). After §3.0 the
+  `Paragraph` carries no `.wrap()`, so `rows` *are* the painted rows and `rows.len()` is the
+  height by definition; `wrapped_height` becomes the wrong oracle. **Re-anchor
+  `transcript/tests/render_cache.rs` (18 assertions, listed in §0.8) rather than deleting it**,
+  and keep `tests/assembled_render.rs:250,281` green — that is the PROSE-WRAP regression test
+  and it is the best single proof §3.0 did not regress height.
 * **`content_height` must keep meaning wrapped rows.** It feeds `live_region_height` →
   `region_constraints` → the inline viewport height
   ([`app/layout.rs:174`](../../../crates/cyrup-tui/src/app/layout.rs),
   [`app/draw.rs:56-140`](../../../crates/cyrup-tui/src/app/draw.rs)). `rows.len()` is the same
   quantity, now exact rather than re-measured — but a `lines.len()` left anywhere would
   under-size the viewport and reintroduce the PROSE-WRAP truncation `wrapped_height` was
-  written for.
+  written for. `transcript/tests/progressive_commit.rs:35,41` and
+  `transcript/tests/osc_hyperlinks.rs:279` both read `content_height` and must stay green.
 * **`osc::inject` alignment.** Its doc requires the marked cells to exist before injection and
   `Buffer::diff_iter` to stay column-aligned. Slicing changes *which* rows reach the buffer,
   not their cell layout, so the contract holds — but injection must still run **after**
   `render_widget`, exactly as it does now.
-* **`wrapped_height` has six other callers** and they are unrelated to this change — the
-  selector title (`selector/mod.rs:206`), `text_input.rs:604`, `login_dialog.rs:460`,
-  `extension_editor.rs:205`, `chrome.rs:159`, `altscreen/document.rs:125`. Keep the free
-  function; only the two transcript call sites go away.
+* **`wrapped_height` keeps five other DIRECT production callers** — verified with
+  `grep -rn 'wrapped_height(' crates/cyrup-tui/src --include=*.rs | grep -v 'fn wrapped_height'`:
+  `selector/mod.rs:208` (inside `title_wrapped_height`), `login_dialog.rs:460` **and** `:470`,
+  `altscreen/document.rs:125`, `chrome.rs:159`. (AUG-2 listed `text_input.rs:604` and
+  `extension_editor.rs:205`; those call `title_wrapped_height`, not `wrapped_height` — they are
+  *indirect* and need no edit.) Keep the free function crate-public; only the two transcript
+  call sites (`cache.rs:42`, `app/draw.rs:282`) go away.
 
 ### 3.1 Port pi's frame scheduler — request, don't paint
 
@@ -702,12 +1072,19 @@ exists to remove.
 Then convert the 30 call sites:
 
 * **25 become `self.frames.request();`** — pi's `requestRender()`: all 22 in `run_arms.rs`
-  (`:310,352,358,367,376,422,436,463,475,504,515,521,529,541,550,562,572,608,618,630,640,647`),
+  (**re-verified at HEAD `7913760`, every AUG-2 number was 3 too high**)
+  `:307,349,355,364,373,419,433,460,472,501,512,518,526,538,547,559,569,605,615,627,637,644`,
   the events arm at [`run_action.rs:339`](../../../crates/cyrup-tui/src/app/run_action.rs),
   and `on_altscreen_tick` at [`run.rs:453`](../../../crates/cyrup-tui/src/app/run.rs) (an
-  ordinary arm despite living in `run.rs`). Note `run_arms.rs:640` is a tail-position
-  `self.draw_synchronized()` whose value is the fn's return — it becomes
-  `self.frames.request(); Ok(())`.
+  ordinary arm despite living in `run.rs`). Note `run_arms.rs:637` is a tail-position
+  `self.draw_synchronized()` — it is `on_share_msg`, whose return type is
+  `Result<(), TuiError>` — so it becomes `self.frames.request(); Ok(())`.
+
+  Regenerate the list rather than trusting it; the file moves:
+
+  ```bash
+  grep -n 'draw_synchronized' crates/cyrup-tui/src/app/run_arms.rs
+  ```
 * **The input arm** ([`run_action.rs:268`](../../../crates/cyrup-tui/src/app/run_action.rs))
   becomes `self.frames.request_immediate();` — pi's `requestImmediateRender()` at
   `tui.ts:896-900`, for the reason pi states in that comment.
@@ -729,18 +1106,20 @@ Then convert the 30 call sites:
 
 **Four structural guards read the source and will fail — re-anchor them, do not delete them.**
 They use `include_str!` on the very files being edited and count `draw_synchronized()`
-literally:
+literally. All four verified present at HEAD:
 
 | file | what it pins | becomes |
 | --- | --- | --- |
-| [`run_loop_draw_coalescing.rs`](../../../crates/cyrup-tui/src/tests/run_loop_draw_coalescing.rs) | `arm.matches("draw_synchronized()").count() == 1` per arm; ordering `ArmGuard` < `now_or_never` drain < draw | count `frames.request()` instead; ordering becomes guard < drain < request |
-| [`run_loop_input_priority.rs`](../../../crates/cyrup-tui/src/tests/run_loop_input_priority.rs) | the input arm sits above every ticker in the `biased;` block | unchanged, but the rationale comment it quotes moves (§3.5) |
-| [`render_cache_tick.rs`](../../../crates/cyrup-tui/src/tests/render_cache_tick.rs) | `bump_render_tick()` precedes the draw in `on_spinner_tick` / `on_elapsed_tick` | bump-before-**request** |
-| [`resize_viewport_failure.rs`](../../../crates/cyrup-tui/src/tests/resize_viewport_failure.rs) | draw behaviour on a failed viewport resize | check whether its site is one of the five synchronous survivors |
+| [`run_loop_draw_coalescing.rs`](../../../crates/cyrup-tui/src/tests/run_loop_draw_coalescing.rs) | `arm.matches("draw_synchronized()").count() == 1` per arm (`:111`, `:158`); ordering `ArmGuard` < `now_or_never` drain < draw (`:127`, `:170`) | count `frames.request()` instead; ordering becomes guard < drain < request |
+| [`run_loop_input_priority.rs`](../../../crates/cyrup-tui/src/tests/run_loop_input_priority.rs) | the input arm sits above every ticker in the `biased;` block (`:53-70`) | unchanged, but the rationale comment it quotes moves (§3.5) |
+| [`render_cache_tick.rs`](../../../crates/cyrup-tui/src/tests/render_cache_tick.rs) | `bump_render_tick()` precedes the draw in `on_spinner_tick` / `on_elapsed_tick` (`:76-79`, `:102-105`) | bump-before-**request**; the `:82` message needs rewording too |
+| [`resize_viewport_failure.rs`](../../../crates/cyrup-tui/src/tests/resize_viewport_failure.rs) | draw behaviour on a failed viewport resize — it drives a **fault-injecting backend**, not a source scan, so it is likely unaffected | verify it still exercises a real paint; if its trigger is one of the five synchronous survivors, nothing changes |
 
-`arm_body()` in the first of these **panics** with *"if the loop was re-split, re-anchor this
-guard rather than reading to EOF"* when an anchor stops matching — that message is the
-instruction; follow it.
+All three source-scanning guards `include_str!` `../app/run.rs` (+ `run_arms.rs`,
+`run_action.rs`, `transcript/cache.rs`), so **every one of them breaks the moment the loop is
+re-split**. `arm_body()` **panics** with *"if the loop was re-split, re-anchor this guard rather
+than reading to EOF"* when an anchor stops matching — that message is the instruction; follow
+it.
 
 ### 3.2 Split the state the renderer reads from the state the loop mutates
 
@@ -882,18 +1261,28 @@ argues about a *drawn* one.
 
 ### 3.5 Correct the comments that this change makes false
 
-Three in-code comments become actively misleading and must be rewritten **in the same change**,
+Four in-code comments become actively misleading and must be rewritten **in the same change**,
 or the next reader re-derives the wrong model:
 
-* [`run.rs:293-315`](../../../crates/cyrup-tui/src/app/run.rs) — the `biased;` rationale
-  currently tells the reader that arm ORDER is what protects the keyboard. After §3.1 it is
-  not; the frame cap and the preempting input request are. The ordering remains load-bearing
-  for the cancel arm and the session-swap arm (`:321-330`) and that half must stay.
+* [`run.rs:293-301`](../../../crates/cyrup-tui/src/app/run.rs) — the `biased;` rationale
+  currently tells the reader that arm ORDER is what protects the keyboard. Verified verbatim
+  at HEAD: *"as soon as one `draw_synchronized` costs more than a tick — which is what growing
+  transcripts do — the input arm is never reached again and the keyboard dies while the screen
+  keeps animating. Do NOT 'tidy' the input arm back down among the tickers."* After §3.1 that
+  is no longer the mechanism; the frame cap and the preempting input request are. The ordering
+  remains load-bearing for the cancel arm and the session-swap arm and that half must stay —
+  `run_loop_input_priority.rs` still pins it.
+* **The SECOND copy of that rationale**, on the input arm itself
+  ([`run.rs:304-315`](../../../crates/cyrup-tui/src/app/run.rs)), which ends *"this arm ends in
+  `draw_synchronized()` anyway — so servicing a key repaints the frame the spinner would have
+  drawn"*. After §3.1 the arm ends in `request_immediate()`, so the sentence is false as
+  written even though its conclusion still holds. AUG-2 missed this one.
 * [`transcript/cache.rs:36-40`](../../../crates/cyrup-tui/src/transcript/cache.rs) —
   *"`markdown::render` emits ONE un-wrapped `Line` per prose paragraph"*. Already false at HEAD
-  (§0.2); after §3.0 it describes deleted code.
-* [`app/draw.rs:278-281`](../../../crates/cyrup-tui/src/app/draw.rs) — the same false claim on
-  the commit path, used there to justify the `.wrap()` §3.0 removes.
+  (§0.2 — `walk.rs:837` wraps); after §3.0 it describes deleted code.
+* [`app/draw.rs:277-281`](../../../crates/cyrup-tui/src/app/draw.rs) — the same false claim on
+  the commit path (*"`entry_lines` emits one un-wrapped `Line` per prose paragraph"*), used
+  there to justify the `.wrap()` §3.0 removes.
 
 ---
 
@@ -901,16 +1290,22 @@ or the next reader re-derives the wrong model:
 
 | stage | risk | benefit | evidence |
 | --- | --- | --- | --- |
-| **§3.0b** resumable syntect | **low** — one file, one struct, the existing loop body moved | **67–300×**; removes the term that actually crosses the spinner tick, at ~500 code lines | measured, §0.4 / §6 |
-| **§3.0** wrapped-row cache + windowed paint | **low** — one cache shape, no terminal, no threads | **~180 ms → ~194 µs** at a 16k-row turn; frame becomes constant in turn size; closes the §0.5 scroll bug | measured, §0.2 / §0.3 |
+| **§3.0a** bound the highlight to `shown` | **lowest** — one parameter, two call sites, output proven identical | **187×** on a collapsed 2,000-line `read`: 356.88 ms → 1.9 ms/frame, 99.5% of the work was discarded | measured + equivalence-asserted, §0.7 B2/B3 |
+| **§3.0b** resumable + memoised syntect | **low** — one file, contained behind `highlight_inner`, fallbacks untouched | **66–3078×** on the streaming fence; **99–233×** on an expanded tool body; removes the term that crosses the spinner tick | measured, §0.4 / §0.7 B1 / §3.0b B4 |
+| **§3.0** wrapped-row cache + windowed paint | **low-medium** — one cache shape, no terminal, no threads, but **18 test assertions re-anchor** (§0.8) | **~180 ms → ~194 µs** at a 16k-row turn; frame becomes constant in turn size; closes the §0.5 scroll bug and makes PROSE-WRAP clipping unrepresentable | measured, §0.2 / §0.3 / §0.8 |
 | **§3.1** frame scheduler | **low** — one struct, one loop statement, 26 call-site edits, 4 structural guards re-anchored | frames capped at 62.5 Hz; coalescing across arms, not just within one | pi parity, `tui.ts:343,772-822,896-900` |
 | **§3.2** `FrameState` publish | **medium** — every chrome component gains a `lines()` seam | none alone; a prerequisite | — |
 | **§3.3** render thread | **high** — terminal ownership, shutdown ordering, panic safety, escape hatch | only against a **blocking tty write**, which nothing above touches | argued, §1; not measured |
 
-**Do §3.0b, §3.0 and §3.1 unconditionally, in that order.** §3.0b first because §0.4 shows it
-owns the dominant term and it is independent of everything else — it lands alone, in one file.
-§3.0 second because it is what makes §3.2's publish an `Arc::clone`. Then re-measure before
-committing to §3.2/§3.3.
+**Do §3.0a, §3.0b, §3.0 and §3.1 unconditionally, in that order.** §3.0a first because it is
+the smallest edit in the task and it beats every other stage on ratio, with an equivalence proof
+rather than an argument. §3.0b second because §0.4/§0.7 show the syntect term is what actually
+crosses the spinner tick, and it lands in one file. §3.0 third because it is what makes §3.2's
+publish an `Arc::clone`. Then re-measure before committing to §3.2/§3.3.
+
+**§3.0a and §3.0b compose but do not overlap**: §3.0a shrinks the *input* to the highlighter,
+§3.0b removes the *repetition*. A collapsed 2,000-line `read` inside a streaming turn pays
+356.88 ms today, 1.9 ms after §3.0a alone, and a memo-hit clone (~15 µs at 10 rows) after both.
 
 The earlier recommendation to land [PERF-001](PERF-001_STREAM_SNAPSHOT_QUADRATIC.md) first
 still holds for §3.2/§3.3 and does not hold for §3.0b/§3.0: PERF-001 removes provider-side CPU
@@ -920,19 +1315,37 @@ from the same pipeline, but nothing in it touches the re-highlight or the redund
 
 ## 5. Definition of Done
 
-### 5.1 After §3.0b — the markdown miss path
+### 5.1 After §3.0a — the highlighter's input
+
+0. **Nothing is highlighted that is not rendered.** `highlight_code_lines` takes a `max_rows`
+   bound; both `tool_builtin.rs` call sites compute `shown` **before** the highlight and pass
+   it. `grep -n 'highlight_code_lines' crates/cyrup-tui/src/transcript/tool_builtin.rs` shows
+   `shown` as the last argument at both sites.
+0b. **The rendered output is byte-identical.** The existing `tool_builtin` / `read` / `edit`
+   preview tests pass unchanged — they are the equivalence check, and §0.7 B3 is the reason to
+   expect them to. If any of them changes output, `max_rows` was threaded below `shown`.
+
+### 5.1b After §3.0b — the markdown miss path
 
 1. **A streaming frame re-parses only new code lines.** `ParseState::new(` appears in
    `markdown/highlight.rs` only on the cursor's rebuild path, never once per call:
    `grep -c 'ParseState::new' crates/cyrup-tui/src/markdown/highlight.rs` is 1.
 2. **The invalidation key is complete.** The cursor rebuilds on a language change, a
    `theme.generation` change, and on any input that is not a strict line-prefix extension of
-   what it already consumed.
+   what it already consumed. The memo key additionally carries `len` alongside `hash`, so a
+   hash collision cannot serve wrong rows.
 3. **The fallbacks are untouched.** An empty or unknown language token still takes
    `highlight_lines`' `flat()` branch; `highlight_code_lines` still returns `None` for the same
    and still strips the 2-space gutter (T5 / TUI-FIDELITY §2 span semantics unchanged).
 4. **An open streaming fence stays correct.** The final, still-growing line is re-parsed each
    frame rather than consumed into the cursor.
+4b. **The memo is bounded and cannot panic.** `MEMO_CAP` entries, evicted by insertion order;
+   the `RefCell` is entered with `try_borrow_mut` and the failure path is today's uncached
+   highlight, so re-entrancy degrades performance and never correctness. `cargo clippy` exit 0
+   is the check that no `borrow_mut`/`unwrap` slipped in — `clippy::panic` does **not** fire
+   under `cargo test`.
+4c. **Both consumers benefit.** A settled tool body re-renders from the memo, not from syntect:
+   after a `read` completes, subsequent streaming frames in the same turn do not re-parse it.
 
 ### 5.2 After §3.0 — frame cost
 
@@ -943,11 +1356,17 @@ from the same pipeline, but nothing in it touches the re-highlight or the redund
    nothing.
 6. **Content is wrapped exactly once per materialisation**, through `wrap_all_owned`, which
    **moves** every already-fitting row. The `wrapped_height` measurement pass is gone from both
-   `cached_render` and `flush_committed`; the free function survives for its six other callers.
+   `cached_render` (`cache.rs:42`) and `flush_committed` (`app/draw.rs:282`); the free function
+   survives for its five other direct callers (§3.0 hazard 4).
 7. **Height has one definition.** `rows.len()` is both the scroll bound and `content_height`;
    no `lines.len()` remains on either path. A long single-paragraph streaming answer reserves
    its full wrapped height in the inline region, is tail-anchored on the newest text (§0.5),
    and is not clipped on commit (R-ARCH-TUI-003/-005).
+7b. **The height tests are re-anchored, not deleted.** `transcript/tests/render_cache.rs`
+   compares against `wrap_all_owned(...).len()` — the new oracle — in all 18 places (§0.8), and
+   `tests/assembled_render.rs:250,281`, `transcript/tests/progressive_commit.rs:35,41` and
+   `transcript/tests/osc_hyperlinks.rs:279` pass **unmodified**. Those three are the
+   independent check; if any needs editing to pass, the height changed and §3.0 regressed.
 8. **OSC-8 links still land on the right text** — the href table is cached with the rows it was
    built from, and injection still runs after the blit.
 

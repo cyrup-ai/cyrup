@@ -1,44 +1,66 @@
 ---
 stage: aug
 status: done
-updated: 2026-08-29 04:12
+updated: 2026-08-29 16:56
 ---
 
 # Get the per-entry `fdatasync` off the session-write path
 
-> **Measured: ~1138 µs per persisted entry vs 1.16 µs for the write alone — 980×.** On ext4
+> **Measured: ~1106 µs per persisted entry vs 1.17 µs for the write alone — 946×.** On ext4
 > (`/dev/root`, the volume `$HOME` lives on). Every persisted session entry pays a full device
 > flush, synchronously, on a tokio worker thread, while holding the session mutex.
+>
+> **The fix is measured too: 1.72 µs/entry through the real `append_line`**, running the §3 code
+> as written (§8). That is a **643×** reduction, with every durability guarantee intact.
 
 ---
 
 ## 0. READ THIS FIRST — three traps, two of which will make you build the wrong thing
 
-### Verification stamp (re-audited at `8f49433`, 2026-08-29)
+### Verification stamp (re-audited at `7913760`, 2026-08-29 16:56)
 
 Every file:line, every upstream citation and every number below was re-checked against the working
-tree at HEAD `8f49433`. **All code citations are exact.** The measurements were independently
-re-run on this host (§6) and reproduce within noise. **One claim in the previous revision was
-false and has been corrected — see §3.4.** Read that correction before you write any code: the
-previous rationale would lead you to believe an invariant is enforced by a flag when it is
-actually enforced by construction order, and that flag *does* change in the direction the old text
-said it could not.
+tree at HEAD `7913760` (the branch moved on from `8f49433`; `store.rs` itself is byte-identical).
+The measurements were independently re-run on this host (§7) and reproduce within noise.
+
+**This revision does something the previous ones did not: the prescribed code was actually
+compiled, clippy'd and run.** A standalone crate carrying the same `#![forbid(unsafe_code)]` and
+the same no-panic deny set was built from §3's listings verbatim; see
+[`tmp/perf004-verify/store-option-c-verified.rs`](../../../tmp/perf004-verify/store-option-c-verified.rs).
+That exercise found **two real defects in the prescribed code** and proved one hazard is not
+hypothetical:
+
+1. **§3.1 as previously written breaks the clippy gate.** `clippy::type_complexity` fires on
+   `Vec<(Arc<File>, Arc<Mutex<Option<String>>>)>`. It is warn-by-default, and this workspace's
+   steady state is *zero* warnings — so the code as specified would have been committed and then
+   discovered by DoD 9. Fixed with a `type PendingSync` alias (§3.1).
+2. **§3.3's error ordering caused avoidable data loss.** Checking the deferred sync error *before*
+   the write means the entry that reports a *previous* flush failure is itself never written —
+   converting a past power-loss-durability degradation into present, permanent loss of a good
+   entry. Corrected to write-then-report (§3.3), which persists everything *and* still surfaces
+   the error exactly once. Proven both ways.
+3. **§3.4's stale fd is silent data loss, and is now demonstrated.** With the `self.file = None`
+   removed from `rewrite`, the follow-up append returns `Ok(())` and the file reads `"hdr\n"`
+   instead of `"hdr\nnew\n"`. No error, anywhere. See §3.4.
+
+One claim in an earlier revision was false and remains corrected in §3.4 (the `flushed` flag
+rationale). Read that correction before you write any code.
 
 **(a) Measuring this on `/tmp` reports NO DIFFERENCE, and `/tmp` here is tmpfs.**
 
 ```
   /tmp  (tmpfs, RAM-backed):  write 0.8 us | write+fdatasync    1.3 us  ->    2x
-  $HOME (ext4, /dev/root)  :  write 1.2 us | write+fdatasync 1137.8 us ->  980x
+  $HOME (ext4, /dev/root)  :  write 1.2 us | write+fdatasync 1106.5 us ->  946x
 ```
 
 `df -T` confirms it: `/` is `ext4` on `/dev/root` (96 G), `/tmp` is a separate 16 G `tmpfs`.
-**Measure on the real filesystem the session file actually lives on.** The probe is in §6.
+**Measure on the real filesystem the session file actually lives on.** The probe is in §7.
 
 **(b) The recommendation in the original draft of this task was WRONG. Do not implement it.**
 
 That draft recommended *"keep the sync, move the whole write to a background writer thread fed by
 an unbounded channel"* (option B below). B **weakens durability below pi's**, which is the exact
-opposite of what it claims, and it breaks read-after-write for four production call sites and a
+opposite of what it claims, and it breaks read-after-write for **five** production call sites and a
 dozen tests. The reasoning is in §2 and it is the single most important thing on this page. The
 correct answer is **option C**, it is smaller than B, and it needs no fence, no queue, no shutdown
 protocol and no error-routing plumbing.
@@ -75,16 +97,18 @@ numbers exact at HEAD):
 
 Five defects, in descending order of cost:
 
-1. **`sync_data()` — ~1137 µs of the ~1141.** The whole problem.
+1. **`sync_data()` — ~1106 µs of the ~1110.** The whole problem.
 2. **`OpenOptions::…open()` per call.** The fd is not held: an `open`+`close` pair per entry where
-   one long-lived `O_APPEND` fd would do. Measured cost of the reopen: **3.29 µs vs 1.16 µs held**,
+   one long-lived `O_APPEND` fd would do. Measured cost of the reopen: **3.24 µs vs 1.17 µs held**,
    i.e. the reopen is ~3× the entire cost of the write it wraps.
 3. **The comment at `:52-53` is false of the code at `:54-55`.** It claims "One `write` of
    `<json>\n`" — the code issues **two** `write(2)` calls, payload then newline. `O_APPEND`
    atomicity is *per `write` call*, so the invariant the comment asserts (and that R-04-032's
    tolerant reader is specified against) does not actually hold: a concurrent appender on the same
    file can interleave between the two, producing `{"a":1}{"b":2}\n\n`. Coalescing into one buffer
-   is free — it is also **1.13 µs/entry faster** (2.29 → 1.16) — and makes the comment true.
+   is free — it is also **1.12 µs/entry faster** (2.29 → 1.17) — and makes the comment true. §8
+   includes a concurrency test that drives 8 threads × 250 appends through one path and asserts no
+   line tears; it passes against the §3 code.
 4. **`f.flush()` is a no-op** on a bare `File` (no `BufWriter`). Harmless, but it is dead code that
    reads as if it does something.
 5. **It is synchronous inside an async lock, on a tokio worker.** The caller chain, verified
@@ -95,23 +119,27 @@ Five defects, in descending order of cost:
    `impl EventSubscriber for SvcSubscriber::on_event`, an `async fn` on a
    `#[tokio::main(flavor = "multi_thread")]` runtime
    ([`main.rs:48`](../../../crates/cyrup/src/main.rs))
-   → [`manager/append.rs:23`](../../../crates/cyrup-session/src/manager/append.rs) `append_agent_message`
+   → [`manager/append.rs:24`](../../../crates/cyrup-session/src/manager/append.rs) `append_agent_message`
    → [`manager/mod.rs:127`](../../../crates/cyrup-session/src/manager/mod.rs) `push_entry`
    → [`manager/mod.rs:143`](../../../crates/cyrup-session/src/manager/mod.rs) `persist_last()?`
-   → [`manager/mod.rs:147-159`](../../../crates/cyrup-session/src/manager/mod.rs) `persist_last`
-   → `store.append_line` (`:153`).
+   → [`manager/mod.rs:147-161`](../../../crates/cyrup-session/src/manager/mod.rs) `persist_last`
+   → `store.append_line` (`:154`) — which `rg -n append_line crates/` confirms is its **only**
+   production caller in the workspace.
 
-   So each entry blocks **a runtime worker for ~1.14 ms** *and* holds
-   `Arc<AsyncMutex<SessionManager>>` ([`subscriber.rs:101`](../../../crates/cyrup-session-svc/src/subscriber.rs))
+   So each entry blocks **a runtime worker for ~1.11 ms** *and* holds
+   `Arc<AsyncMutex<SessionManager>>` ([`subscriber.rs:102`](../../../crates/cyrup-session-svc/src/subscriber.rs))
    for that whole time — serializing every other manager access (`session_file()`, fork resolution,
    `list_sessions`, the TUI's tree reads) behind a device flush. A tool-using turn persists
    `3 + N` entries (user, assistant-with-calls, one per tool result, final assistant), so a 5-call
-   turn stalls ≈ **9 ms** inside the lock.
+   turn stalls ≈ **8.9 ms** inside the lock.
 
 **Note what is already lost:** `subscriber.rs:171` and `:177-184` both discard the `Result`
-(`let _ = …`). The highest-volume caller of `append_line` **already** swallows every persistence
-error today. That is relevant to DoD 5 — it is a pre-existing hole, and option C is the only option
-here that does not widen it.
+(`let _ = …`), and `:171` is the **only** `append_message` call site in `cyrup-session-svc` or
+`cyrup-tui` (`rg -n 'append_message\(' crates/cyrup-session-svc/src crates/cyrup-tui/src`). The
+highest-volume caller of `append_line` **already** swallows every persistence error today. That is
+relevant to DoD 5 — it is a pre-existing hole, and option C is the only option here that does not
+widen it. It is also why §3.3's write-then-report ordering is safe: an `Err` returned *after* a
+successful write cannot mislead a caller that never reads it.
 
 `rewrite` ([`store.rs:62-93`](../../../crates/cyrup-session/src/store.rs)) also syncs, but it runs
 only on a migration or an eager clone/branch seed — twice in a session's life, not per entry.
@@ -127,10 +155,10 @@ returns**, because that is what decides which failures lose data.
 | | on `append_line` return, the bytes are… | survives `SIGKILL`/`process::exit` | survives power loss | caller cost/entry |
 | --- | --- | --- | --- | --- |
 | **pi** (`appendFileSync`) | in the **page cache** | ✅ yes | ❌ no | ~3 µs |
-| **cyrup today** | on the **device** | ✅ yes | ✅ yes | **~1141 µs** |
+| **cyrup today** | on the **device** | ✅ yes | ✅ yes | **~1110 µs** |
 | **A.** drop `sync_data()` | in the page cache | ✅ yes | ❌ no | 1.2 µs |
 | **B.** async writer thread | in a **userspace queue** | ❌ **NO** | ❌ no (until drained) | ~0.5 µs |
-| **C.** sync write, async sync | in the **page cache** | ✅ yes | ✅ yes, after ≤1 round | **1.2 µs** |
+| **C.** sync write, async sync | in the **page cache** | ✅ yes | ✅ yes, after ≤1 round | **1.72 µs (measured, §8)** |
 
 Read the `SIGKILL` column. **Option B is the only row that loses data to a process crash** — the
 queue dies with the process. B is not "the same durability, moved off the caller"; it is
@@ -147,22 +175,28 @@ guarantee cyrup has today and pays 1.2 µs for it.
 **C also costs nothing to prove correct**, which B cannot claim:
 
 - **Read-after-write is preserved for free.** The page cache is coherent: any reader — including a
-  *different process* — sees the bytes the instant `write` returns. Under B, four production sites
-  read a live session's file and would see a stale tail (all four re-verified at HEAD):
+  *different process* — sees the bytes the instant `write` returns. Under B, **five** production
+  sites read a live session's file and would see a stale tail (all five re-verified at HEAD):
   - [`fork_context.rs:491`](../../../crates/cyrup-ext-subagents/src/fork_context.rs) —
     `SessionManager::open(&persisted_path)?` re-reads the **live parent's file from disk** to build
     a subagent's forked branch (the code even documents it as a "THROWAWAY handle on the parent's
-    PERSISTED file"). A queued tail means the subagent silently starts from a truncated transcript.
+    PERSISTED file", `:487`). A queued tail means the subagent silently starts from a truncated
+    transcript.
   - [`session/files.rs:79`](../../../crates/cyrup-session-svc/src/session/files.rs) —
-    `SessionManager::open(path)?` then `append_session_info` on **another** session's file.
+    `SessionManager::open(path)?` then `append_session_info` on **another** session's file
+    (`rename_session_file`, `:69`).
+  - [`session/files.rs:160`](../../../crates/cyrup-session-svc/src/session/files.rs) —
+    `rename_session_file_at`, the same two calls made by the **pre-launch** `--resume` picker
+    before any session service exists (SEAM-062). *This site was missing from earlier revisions.*
   - [`runtime.rs:606`](../../../crates/cyrup-session-svc/src/runtime.rs) — `SessionManager::open(&file)?`
     on a session switch/branch.
   - [`listing.rs:55`](../../../crates/cyrup-session/src/listing.rs) — `list_in_dir` streams every
     file for the `/resume` picker's titles and message counts.
 - **Ordering is exact by construction.** Writes stay on the caller's thread behind `&mut self`;
-  there is no second writer to order against.
+  there is no second writer to order against. §8 asserts this over 200 sequential appends and over
+  8 concurrent threads.
 - **No test changes.** At least a dozen tests append and then immediately read the file — e.g.
-  [`tests/sessions.rs:70,117`](../../../crates/cyrup-session/src/tests/sessions.rs)
+  [`tests/sessions.rs:71,116`](../../../crates/cyrup-session/src/tests/sessions.rs)
   (`std::fs::read_to_string(&file)` immediately after the append that creates it), and
   [`tests/parity.rs:585-593`](../../../crates/cyrup-session/src/tests/parity.rs), which drives a
   bare `DiskStore` directly. Under B each needs a fence; under C each is untouched.
@@ -179,22 +213,22 @@ does not.
 
 ### Why the batched sync needs no timer
 
-Measured on this host, ext4 (§6 for the probe; these are the fresh numbers):
+Measured on this host, ext4 (§7 for the probe; these are the fresh numbers):
 
 ```
-  write only (held fd, one write)  :     1.16 us/entry
+  write only (held fd, one write)  :     1.17 us/entry
   write only (held fd, two writes) :     2.29 us/entry     <- what the code does today
-  reopen + write, no sync          :     3.29 us/entry     <- the per-call open+close today
-  write + fdatasync every entry    :  1137.84 us/entry     <- what the code does today
-  write + fdatasync every 8        :   161.46 us/entry
-  fdatasync with nothing dirty     :    35.38 us/call
+  reopen + write, no sync          :     3.24 us/entry     <- the per-call open+close today
+  write + fdatasync every entry    :  1106.45 us/entry     <- what the code does today
+  write + fdatasync every 8        :   140.46 us/entry
+  fdatasync with nothing dirty     :    36.79 us/call
 ```
 
 A background syncer that simply **drains everything queued behind the message that woke it, dedups,
 and syncs once** self-tunes with no configuration: at one entry per turn it syncs once per entry
 (off-thread, invisible); during a burst, every entry that arrives inside the ~1.1 ms flush collapses
 into the *next* single flush. Adding a debounce timer would only make the quiet case worse. The
-`35 µs` row is why the dedup is worth having rather than syncing per queued message.
+`36.79 µs` row is why the dedup is worth having rather than syncing per queued message.
 
 ---
 
@@ -206,6 +240,11 @@ enough, and all three are available at the workspace's `rust-version = "1.96"` (
 stabilised 1.80; `io::Error::other` 1.74). `cyrup-session` has **no logging dependency** — verified:
 `rg 'tracing|log::|eprintln|println!' crates/cyrup-session/src` matches **zero** files — and must
 not gain one; the error path in §3.3 is built on the existing `Result` for that reason.
+
+> **The listings in §3.0–3.4 are the exact text that was compiled, clippy'd (exit 0, zero warnings)
+> and run under seven behavioural tests.** The verified source is
+> [`tmp/perf004-verify/store-option-c-verified.rs`](../../../tmp/perf004-verify/store-option-c-verified.rs).
+> Transcribe from there; do not re-derive.
 
 ### 3.0 Imports to add at the top of `store.rs`
 
@@ -224,8 +263,10 @@ Mirror the precedent and the doc-comment style of `FILE_MUTATION_LOCKS`
 ([`cyrup-tools/src/lock.rs:28`](../../../crates/cyrup-tools/src/lock.rs)): a `LazyLock` static whose
 comment justifies *why* it is global rather than per-owner. That file is the house style for exactly
 this decision — read its comment before writing yours. (`LazyLock` is already used in 11 files
-across the workspace; `std::thread::Builder::new()` in 5, e.g.
-[`spawn/signal.rs:603`](../../../crates/cyrup-ext-subagents/src/spawn/signal.rs).)
+across the workspace; `std::thread::Builder::new()` in **4** — `cyrup-provider/src/auth/oauth/callback.rs`,
+`cyrup-tui/src/{clipboard,open_browser}.rs`, and
+[`spawn/signal.rs:603`](../../../crates/cyrup-ext-subagents/src/spawn/signal.rs), the last of which
+is `#[cfg(all(test, unix))]`, so the three production precedents are the first three.)
 
 Global, not per-`DiskStore`, because store instances are not stable: `adopt_branch`
 **replaces** `self.store` wholesale
@@ -311,12 +352,19 @@ impl Syncer {
 }
 ```
 
-The worker loop — coalesce, dedup, then ack:
+The worker loop — coalesce, dedup, then ack. **Note the `PendingSync` alias: it is not cosmetic.**
+Spelling the vec `Vec<(Arc<File>, Arc<Mutex<Option<String>>>)>` inline trips
+`clippy::type_complexity`, which is warn-by-default and would break this workspace's zero-warning
+steady state (DoD 9). Confirmed by compiling both forms.
 
 ```rust
+/// One queued flush: the handle, plus the slot its failure is reported through. Named because
+/// `clippy::type_complexity` fires on the bare tuple below and the gate expects zero warnings.
+type PendingSync = (Arc<File>, Arc<Mutex<Option<String>>>);
+
 fn run(rx: Receiver<SyncReq>) {
     // Reused across rounds to keep the loop allocation-free in steady state.
-    let mut round: Vec<(Arc<File>, Arc<Mutex<Option<String>>>)> = Vec::new();
+    let mut round: Vec<PendingSync> = Vec::new();
     let mut acks: Vec<Sender<()>> = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
 
@@ -390,14 +438,20 @@ six are the complete set (`rg -n 'DiskStore::new' crates/`).
 
 ### 3.3 The new `append_line`
 
+> **Read the error ordering before you copy this.** The deferred sync error is taken *first* but
+> reported *last* — after the write. The obvious spelling (early-`return` the stale error before
+> writing) is **wrong**: it drops the current, perfectly good entry in order to report that an
+> *earlier* entry's flush failed, turning a power-loss-durability degradation into immediate,
+> permanent data loss. Both orderings were built and tested; check-then-write yields `"a\nc\n"`
+> (entry `b` gone), write-then-report yields `"a\nb\nc\n"` with the same single error surfaced.
+
 ```rust
     fn append_line(&mut self, line: &str) -> Result<(), SessionError> {
         // The `fdatasync` is the only part of this write that is no longer synchronous, so this
         // is where its failure re-enters the caller's `Result`. Take-once: reported exactly one
-        // time, then cleared.
-        if let Some(msg) = self.take_sync_error() {
-            return Err(SessionError::Io(std::io::Error::other(msg)));
-        }
+        // time, then cleared. Taken up-front but returned at the BOTTOM — a stale flush error
+        // must not cost us this entry (see the note in PERF-004 §3.3).
+        let deferred = self.take_sync_error();
         let file = self.handle()?;
         // ONE `write` of `<json>\n` — R-04-032. The buffer is assembled first *precisely* so this
         // is a single `write(2)`: `O_APPEND` atomicity is per-call, and that is what bounds a
@@ -415,7 +469,10 @@ six are the complete set (`rg -n 'DiskStore::new' crates/`).
         // The bytes are the kernel's now — visible to every reader, and safe against a process
         // crash. Only the device flush is deferred.
         SESSION_SYNCER.request(&file, &self.sync_err);
-        Ok(())
+        match deferred {
+            Some(msg) => Err(SessionError::Io(std::io::Error::other(msg))),
+            None => Ok(()),
+        }
     }
 ```
 
@@ -449,9 +506,25 @@ points at the **old, unlinked inode**, and every subsequent append writes into a
 read. Add `self.file = None;` at the top of both `rewrite` and `create_exclusive` (the latter
 defensively — it creates a fresh inode).
 
-> **⚠️ CORRECTION — the previous revision of this task justified this wrongly.**
+> **⚠️ This failure is SILENT, and it has now been demonstrated rather than argued.** Building the
+> §3 code with the `self.file = None` removed from `rewrite` only, then running
+> `append("old") → rewrite("hdr\n") → append("new")`:
+>
+> ```
+> assertion `left == right` failed: append went to the unlinked inode
+>   left: "hdr\n"
+>  right: "hdr\nnew\n"
+> ```
+>
+> The second `append_line` returned **`Ok(())`**. No error is raised anywhere — the write succeeds
+> against a valid fd whose inode has no directory entry, so the bytes are written and then
+> destroyed when the last handle closes. Restoring the one line makes the test pass. This is the
+> single highest-risk line in the change; §8's `stale_fd_after_rewrite_lands_in_the_named_file` is
+> the regression that catches it.
+
+> **⚠️ CORRECTION carried forward — the previous revision justified this wrongly.**
 > It claimed the bug is latent "because `flushed` only ever goes `false → true`
-> ([`manager/mod.rs:147-159`](../../../crates/cyrup-session/src/manager/mod.rs))". **That is false.**
+> ([`manager/mod.rs:147-161`](../../../crates/cyrup-session/src/manager/mod.rs))". **That is false.**
 > [`adopt_branch`](../../../crates/cyrup-session/src/manager/branched_session.rs) at `:147` assigns
 > `self.flushed = flushed;` from a value computed at `:125-130`, which is `false` whenever the
 > retained branch has no assistant message — so a manager that was `flushed == true` can and does
@@ -461,11 +534,11 @@ defensively — it creates a fresh inode).
 > `rewrite` call site operates on a store constructed a few lines earlier and **never yet appended
 > to** — [`lifecycle.rs:85`](../../../crates/cyrup-session/src/manager/lifecycle.rs) → `rewrite` at
 > `:96`, [`lifecycle.rs:116`](../../../crates/cyrup-session/src/manager/lifecycle.rs) → `rewrite` at
-> `:120`, and [`branched_session.rs:120`](../../../crates/cyrup-session/src/manager/branched_session.rs)
+> `:119`, and [`branched_session.rs:120`](../../../crates/cyrup-session/src/manager/branched_session.rs)
 > → `rewrite` at `:126`. So no `rewrite` currently follows an `append_line` on the same instance,
-> and the stale fd cannot be observed today. **Do not rely on that staying true either** — it is an
-> accident of three call sites, not an enforced property, which is exactly why the invalidation is
-> mandatory rather than optional.
+> and the stale fd cannot be observed *by today's call graph*. **Do not rely on that staying true**
+> — it is an accident of three call sites, not an enforced property, and the demonstration above is
+> what the accident is protecting you from. The invalidation is mandatory, not optional.
 
 Also add:
 
@@ -483,9 +556,11 @@ impl Drop for DiskStore {
 }
 ```
 
-Adding `Drop` is safe here: nothing in the workspace destructures or partially moves out of a
-`DiskStore` (it is only ever constructed by `DiskStore::new` and used behind
-`Box<dyn SessionStore>`), so the "cannot move out of a type that implements Drop" rule cannot bite.
+Adding `Drop` is safe here, and this was checked rather than assumed: `rg -n 'DiskStore\s*\{|\.store\b' crates/cyrup-session/src`
+shows nothing in the workspace destructures or partially moves out of a `DiskStore` — it is only
+ever constructed by `DiskStore::new` and used behind `Box<dyn SessionStore>` — so the "cannot move
+out of a type that implements Drop" rule cannot bite. (`LazyLock` statics are never dropped, so
+touching `SESSION_SYNCER` from a destructor at teardown is also well-defined.)
 
 ### 3.5 The shutdown barrier
 
@@ -508,8 +583,8 @@ Wire it at the three exit points, in this order of importance:
 1. [`session/lifecycle.rs:67 dispose_with`](../../../crates/cyrup-session-svc/src/session/lifecycle.rs) —
    the seam every host teardown funnels through (`dispose` at `:33` delegates to it;
    `runtime.dispose()` at [`runtime.rs:774`](../../../crates/cyrup-session-svc/src/runtime.rs) is
-   reached from [`main.rs`](../../../crates/cyrup/src/main.rs) on quit *and* on a TUI-loop error).
-   It is an `async fn`, so call it as
+   reached from [`main.rs:681`](../../../crates/cyrup/src/main.rs) on quit *and* on a TUI-loop
+   error). It is an `async fn`, so call it as
    `let _ = tokio::task::spawn_blocking(flush_session_writes).await;` — the point of the task is not
    to put file I/O back on a runtime worker.
 2. [`signals.rs:218` and `:231`](../../../crates/cyrup/src/signals.rs) — both
@@ -540,15 +615,18 @@ them to a process crash, which is *weaker* than pi rather than stronger.
 
 1. **`create_exclusive` and `rewrite` stay fully synchronous, sync included.** They are the
    first-flush and migration paths, they run once or twice per session, and both callers need the
-   result before proceeding ([`manager/mod.rs:147-159`](../../../crates/cyrup-session/src/manager/mod.rs),
+   result before proceeding ([`manager/mod.rs:147-161`](../../../crates/cyrup-session/src/manager/mod.rs),
    [`lifecycle.rs:85,116,197`](../../../crates/cyrup-session/src/manager/lifecycle.rs)).
-2. **`MemStore` is untouched.** All four of its methods stay no-ops
-   ([`store.rs:129-159`](../../../crates/cyrup-session/src/store.rs)).
+2. **`MemStore` is untouched.** All **five** of its trait methods stay as they are — `path` → `None`,
+   `is_persisted` → `false`, and `append_line`/`rewrite`/`create_exclusive` → `Ok(())`
+   ([`store.rs:131-159`](../../../crates/cyrup-session/src/store.rs)). (Earlier revisions said
+   "four"; the trait has five.)
 3. **The `SessionStore` trait signature is unchanged** — no new methods, no `async`. It is `pub`
    from [`lib.rs:57`](../../../crates/cyrup-session/src/lib.rs). (For accuracy: `rg 'impl SessionStore'`
-   finds **no** implementor outside `store.rs`, so this is a public-API constraint rather than a
-   "you will break another impl" one — but it is still the difference between a contained change
-   and a cross-crate one, and there is no reason to spend it.)
+   finds **no** implementor outside `store.rs` — only `:42` `DiskStore` and `:131` `MemStore` — so
+   this is a public-API constraint rather than a "you will break another impl" one, but it is still
+   the difference between a contained change and a cross-crate one, and there is no reason to spend
+   it.)
 4. **No new dependency in `cyrup-session/Cargo.toml`.**
 5. **`#![forbid(unsafe_code)]`** ([`lib.rs:15`](../../../crates/cyrup-session/src/lib.rs)) stays;
    nothing here needs `unsafe` (`Arc::as_ptr(…) as usize` is a safe operation).
@@ -562,74 +640,55 @@ them to a process crash, which is *weaker* than pi rather than stronger.
 
 - **fd budget is a non-issue.** One held fd per live `DiskStore`; there is one per `SessionManager`,
   plus short-lived throwaways that are explicitly dropped
-  ([`fork_context.rs:494`](../../../crates/cyrup-ext-subagents/src/fork_context.rs) calls
+  ([`fork_context.rs:495`](../../../crates/cyrup-ext-subagents/src/fork_context.rs) calls
   `drop(throwaway)`). `listing.rs` creates no stores. The syncer holds `Arc` clones only for the
   duration of a round.
 - **`TempDir` teardown racing a queued sync is harmless.** A test's `tempfile::TempDir` may unlink
   the session file while the syncer still holds an fd; `fsync` on an unlinked-but-open inode is
   well-defined on Linux and simply succeeds.
 - **Clippy**: the deny set is `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`
-  (`Cargo.toml [workspace.lints.clippy]`). The code above uses none of them —
+  (`Cargo.toml:98-101 [workspace.lints.clippy]`). The code above uses none of them —
   `unwrap_or_else(|p| p.into_inner())` is the sanctioned poison handling, and every `send`/`recv`
-  result is explicitly discarded or matched. `return_self_not_must_use = "warn"` does not apply to
-  `Syncer::start` (it takes no `self`).
-- **`let mut w: &File = &file;`** relies on `Arc<File>` derefing to `File` and on
+  result is explicitly discarded or matched. `return_self_not_must_use = "warn"` (`:102`) does not
+  apply to `Syncer::start` (it takes no `self`). **The one lint that DOES fire is
+  `type_complexity`** — see §3.1; it is warn-only but the gate expects zero warnings.
+- **A sync error with no subsequent append is dropped.** `take_sync_error` surfaces through the
+  *next* `append_line`; if a session's last write is the one that fails to flush, nobody hears. The
+  `Drop` impl does not report it either (there is no `Result` to report into). Accept this: under
+  option C a lost sync error costs power-loss durability on the final entry only, and
+  `cyrup-session` has no logging dependency to report it through (§3).
+- **`let mut w: &File = &file;`** relies on deref coercion from `&Arc<File>` and on
   `impl Write for &File`; `w` must be `mut` because `Write::write_all` takes `&mut self` (the
-  mutability is of the `&File` binding, not of the file).
+  mutability is of the `&File` binding, not of the file). This compiles — confirmed, not assumed.
 
 ---
 
 ## 6. Order of work
 
-1. Imports (§3.0), then `SyncReq` + `Syncer` + `SESSION_SYNCER` + `run` (§3.1), including the
-   `tx: None` inline-sync fallback and the send-failure fallback.
+Transcribe from [`tmp/perf004-verify/store-option-c-verified.rs`](../../../tmp/perf004-verify/store-option-c-verified.rs)
+— it is this plan's code, already compiled and tested — adapting names back to the real
+`SessionError`/`SessionStore`/`Entry`/`SessionHeader` types.
+
+1. Imports (§3.0), then `SyncReq` + `Syncer` + `SESSION_SYNCER` + `PendingSync` + `run` (§3.1),
+   including the `tx: None` inline-sync fallback and the send-failure fallback. **Use the
+   `PendingSync` alias** or clippy warns.
 2. `DiskStore` fields + `handle()` + `take_sync_error()` (§3.2).
-3. Rewrite `append_line` (§3.3) — single buffered write, held fd, deferred sync, sticky error.
-4. `self.file = None` in `rewrite`/`create_exclusive`, and `impl Drop` (§3.4). **Do not skip.**
+3. Rewrite `append_line` (§3.3) — single buffered write, held fd, deferred sync, sticky error
+   **reported after the write, not before**.
+4. `self.file = None` in `rewrite`/`create_exclusive`, and `impl Drop` (§3.4). **Do not skip —
+   skipping it loses appends silently, demonstrated in §3.4.**
 5. `flush_session_writes` + the `lib.rs:57` re-export + the three call sites (§3.5).
 6. The module doc comment (§3.6).
 7. `cargo test -p cyrup-session`, then the full gate (DoD 9).
 
 ---
 
-## 7. Definition of Done
+## 7. The measurement probe
 
-No new tests, benchmarks or documentation files are required. The existing suite is the gate.
-
-1. **A persisted entry costs the caller <10 µs**, measured on ext4 (not tmpfs — §0a), down from
-   ~1141 µs. Expected ≈1.2 µs.
-2. **Durability is not reduced on any axis.** When `append_line` returns `Ok`, the bytes are in the
-   page cache, so a `SIGKILL`, an `abort`, or a `std::process::exit` loses nothing — matching pi
-   exactly. The device flush follows within one syncer round, preserving the power-loss guarantee
-   cyrup has today and pi does not.
-3. **Ordering is exact**, including across a rapid burst and across two managers writing different
-   files — which holds by construction, since the write never leaves the caller's thread.
-4. **Read-after-write is unchanged.** A reader that opens the file the instant `append_line`
-   returns sees the entry. Specifically:
-   [`fork_context.rs:491`](../../../crates/cyrup-ext-subagents/src/fork_context.rs) still forks a
-   complete parent transcript, and the `/resume` listing
-   ([`listing.rs:55`](../../../crates/cyrup-session/src/listing.rs)) still reports a live session's
-   current message count.
-5. **A write failure is still visible synchronously.** ENOSPC/EACCES from the `write` returns from
-   `append_line` exactly as today. A *sync* failure is reported by the next `append_line` (§3.3)
-   rather than being dropped. (The workspace has hit ENOSPC mid-run before; this path must not go
-   quiet when it happens again.)
-6. **The tolerant-reader invariant is stronger than before, not weaker.** The append is now
-   genuinely one `write(2)`, so at most one partial final line is possible — R-04-032,
-   `store.rs:52-53`, which becomes an accurate comment.
-7. **No tokio worker is occupied by file I/O.** The syncer is one OS thread; `append_line` uses no
-   `spawn_blocking`; the only `spawn_blocking` is the single teardown barrier (§3.5).
-8. **A stale fd is impossible after a `rewrite`.** `rewrite`'s rename is followed by an append that
-   lands in the file the path names — the §3.4 invalidation, verified by reading the file back.
-9. **The suite is green under the real gate:**
-   `cargo test --workspace --features test-fixtures --no-fail-fast`, and
-   `cargo clippy --workspace --all-targets --features test-fixtures` exits **0** (the no-panic
-   lints do **not** fire under `cargo build`/`cargo test`; check the exit code, not the output).
-
-### The probe
+Run this **on ext4** (`$HOME`), never `/tmp` — see §0a.
 
 ```python
-import os, time, tempfile
+import os, time, tempfile, shutil
 d = tempfile.mkdtemp(dir=os.path.expanduser("~"))   # MUST be the real fs, not /tmp
 p = os.path.join(d, "s.jsonl")
 line = b'{"x":"' + b'y'*400 + b'"}\n'
@@ -654,10 +713,96 @@ bench("write + fdatasync each",      lambda fd, n: [(os.write(fd, line), os.fdat
 bench("write + fdatasync every 8",   lambda fd, n: [(os.write(fd, line), os.fdatasync(fd) if (i+1) % 8 == 0 else None) for i in range(n)])
 bench("fdatasync, nothing dirty",    lambda fd, n: [os.fdatasync(fd) for _ in range(n)])
 bench("reopen+write, no sync",       reopen)
-
-import shutil; shutil.rmtree(d)
+shutil.rmtree(d)
 ```
 
-Independent run on this host (ext4, `/dev/root`, 2026-08-29, HEAD `8f49433`):
-`1.16` · `2.29` · `1137.84` · `161.46` · `35.38` · `3.29` µs — reproducing the original
-measurements within noise.
+Runs on this host (ext4, `/dev/root`), two independent sessions a day apart:
+
+| | `8f49433` | `7913760` |
+| --- | --- | --- |
+| write only (1 write) | 1.16 | **1.17** |
+| write only (2 writes: HEAD) | 2.29 | **2.29** |
+| write + fdatasync each | 1137.84 | **1106.45** |
+| write + fdatasync every 8 | 161.46 | **140.46** |
+| fdatasync, nothing dirty | 35.38 | **36.79** |
+| reopen + write, no sync | 3.29 | **3.24** |
+
+The only mobile number is the flush itself, and it moves by ~3%. The conclusion does not depend on
+which run you take.
+
+---
+
+## 8. The reference implementation is already verified — use it
+
+Everything in §3 was transcribed into a standalone crate carrying `#![forbid(unsafe_code)]` and the
+workspace's exact `[lints.clippy]` deny set, then built and exercised. Source:
+[`tmp/perf004-verify/store-option-c-verified.rs`](../../../tmp/perf004-verify/store-option-c-verified.rs).
+
+```
+cargo build          -> exit 0
+cargo clippy --all-targets -> exit 0, ZERO warnings   (after the PendingSync alias; see §3.1)
+cargo test           -> 7 passed; 0 failed
+```
+
+The seven tests, and the DoD clause each one discharges:
+
+| test | proves | DoD |
+| --- | --- | --- |
+| `read_after_write_is_immediate_and_ordered` | 200 appends, each re-read from a fresh `open` immediately after; count and order exact | 3, 4 |
+| `append_is_one_write_syscall_worth_of_bytes` | `{"a":1}\n{"b":2}\n` — no doubled newline | 6 |
+| `concurrent_appenders_never_tear_a_line` | 8 threads × 250 appends to one path via 8 stores: 2000 lines, none torn | 6 |
+| `stale_fd_after_rewrite_lands_in_the_named_file` | append-after-`rewrite` reaches the live inode; **fails loudly without §3.4** | 8 |
+| `sync_error_surfaces_on_the_next_append_then_clears` | deferred error reported once, then cleared, **and the entry still persisted** | 5 |
+| `barrier_waits_for_queued_flushes` | `flush_session_writes()` returns only after the queue drains | 7 |
+| `caller_cost_per_entry_is_microseconds_not_milliseconds` | **1.72 µs/entry** over 2000 appends, asserted `< 10` | 1 |
+
+**1.72 µs measured through the real `append_line`**, against ~1106 µs today: a **643×** reduction.
+The gap between 1.72 and the raw 1.17 µs write is the channel send plus the `Arc` clones — i.e. the
+coordination overhead of option C is ~0.55 µs, three orders of magnitude below what it removes.
+
+These seven are **not** required deliverables (DoD adds no new test files). They exist so that
+whoever implements this can diff their `store.rs` against a version already known to work, and can
+re-run them in `tmp/` if a behaviour is in doubt.
+
+---
+
+## 9. Definition of Done
+
+No new tests, benchmarks or documentation files are required. The existing suite is the gate.
+
+1. **A persisted entry costs the caller <10 µs**, measured on ext4 (not tmpfs — §0a), down from
+   ~1106 µs. Measured at **1.72 µs** on the reference implementation (§8).
+2. **Durability is not reduced on any axis.** When `append_line` returns `Ok`, the bytes are in the
+   page cache, so a `SIGKILL`, an `abort`, or a `std::process::exit` loses nothing — matching pi
+   exactly. The device flush follows within one syncer round, preserving the power-loss guarantee
+   cyrup has today and pi does not.
+3. **Ordering is exact**, including across a rapid burst and across two managers writing different
+   files — which holds by construction, since the write never leaves the caller's thread.
+   (§8 `read_after_write_is_immediate_and_ordered`, `concurrent_appenders_never_tear_a_line`.)
+4. **Read-after-write is unchanged.** A reader that opens the file the instant `append_line`
+   returns sees the entry. Specifically:
+   [`fork_context.rs:491`](../../../crates/cyrup-ext-subagents/src/fork_context.rs) still forks a
+   complete parent transcript, both rename paths
+   ([`session/files.rs:79`](../../../crates/cyrup-session-svc/src/session/files.rs) and `:160`)
+   still see the live tail, and the `/resume` listing
+   ([`listing.rs:55`](../../../crates/cyrup-session/src/listing.rs)) still reports a live session's
+   current message count.
+5. **A write failure is still visible synchronously.** ENOSPC/EACCES from the `write` returns from
+   `append_line` exactly as today. A *sync* failure is reported by the next `append_line` (§3.3)
+   rather than being dropped — **and that entry is still written**, because the error is returned
+   after the write, not instead of it. (The workspace has hit ENOSPC mid-run before; this path must
+   not go quiet when it happens again.)
+6. **The tolerant-reader invariant is stronger than before, not weaker.** The append is now
+   genuinely one `write(2)`, so at most one partial final line is possible — R-04-032,
+   `store.rs:52-53`, which becomes an accurate comment.
+7. **No tokio worker is occupied by file I/O.** The syncer is one OS thread; `append_line` uses no
+   `spawn_blocking`; the only `spawn_blocking` is the single teardown barrier (§3.5).
+8. **A stale fd is impossible after a `rewrite`.** `rewrite`'s rename is followed by an append that
+   lands in the file the path names — the §3.4 invalidation. Note this failure returns `Ok(())`
+   when it is wrong, so it must be checked by **reading the file back**, not by checking a result.
+9. **The suite is green under the real gate:**
+   `cargo test --workspace --features test-fixtures --no-fail-fast`, and
+   `cargo clippy --workspace --all-targets --features test-fixtures` exits **0** (the no-panic
+   lints do **not** fire under `cargo build`/`cargo test`; check the exit code, not the output).
+   Zero *warnings* too, not just zero errors — `type_complexity` (§3.1) is the one this change can
+   realistically trip.

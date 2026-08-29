@@ -1,10 +1,20 @@
 ---
 stage: aug
 status: done
-updated: 2026-08-29 04:16
+updated: 2026-08-29 16:56
 aug_against: cyrup HEAD f3bf9f0 · pi v0.84.2 (agent-loop.ts unchanged from ported baseline)
 aug_reverified: cyrup HEAD 8f49433 — AUG-3 pass re-checked every cyrup file:line EXACT; serde `rc` + clone-before-gate preconditions re-confirmed; pi at v0.84.2-48 (see §7)
+aug_revised: cyrup HEAD 7913760 — **PERF-001 LANDED AND CHANGED THIS TASK'S COST MODEL.** §0/§4/§6.6 restated, 8 line numbers corrected, 6 missed seam sites added, 1 new in-scope win found. **READ §8 BEFORE §0.**
 ---
+
+> ## ⚠️ START AT [§8](#8-aug-4-revision-pass--head-7913760-after-perf-001-landed)
+> PERF-001 merged (`04d6fa5` → `b8a53db` → HEAD `7913760`) and it rewrote the exact types this
+> task is about: `AgentMessage::Assistant` is **already** `Arc<AssistantMessage>`, `Content::Text`
+> is **already** a refcounted `SharedStr`, and `ToolCall::arguments` is **already** a refcounted
+> `LazyArgs`. The headline claim below — "a deep copy of every message's content, all bytes" — is
+> **no longer true for text**, which is the bulk of a transcript. The task is still worth doing and
+> the plan in §6.7 is still correct, but **the justification, the sizing, and eight `file:line`
+> citations changed**. §8 supersedes §0, §4, §6.6, DoD #1, and parts of §6.2/§6.7.
 
 # Deep-copying the transcript per turn where pi copies pointers
 
@@ -30,6 +40,13 @@ because `AgentMessage` owns its content inline:
 | allocations | 1 | 1 + one per string in every message | 1 |
 | snapshot isolation | yes | yes | yes |
 
+> **[AUG-4] The middle column is now WRONG — PERF-001 already fixed most of it.** At HEAD
+> `7913760` a `Vec<AgentMessage>::clone()` costs `O(image bytes + JSON payload bytes)` plus one
+> small allocation per content block — **not** `O(total transcript bytes)`. Assistant messages,
+> text, thinking and tool-call arguments are all already refcounted. See **[§8.2](#82-the-new-cost-model-what-a-vecagentmessageclone-actually-costs-at-head-7913760)**
+> for the corrected table and **[§8.3](#83-the-task-is-still-worth-doing--the-argument-just-moved)**
+> for why the task survives that correction.
+
 The third column is what the doc comment already describes. Getting there is a type change,
 not a semantics change: `AgentMessage` is only ever *read* through these snapshots — the
 loop mutates `self.messages` by `push`, never by editing a message in place — so shared
@@ -49,16 +66,16 @@ between the two"). A borrow cannot express that. `Arc` can.
 
 | site | binding | why it exists |
 | --- | --- | --- |
-| [`agent/run/stream.rs:40`](../../../crates/cyrup-agent/src/agent/run/stream.rs) | `base_messages` | the loop's own working copy for the request (pi `context.messages`, `agent-loop.ts:283`) |
+| [`agent/run/stream.rs:41`](../../../crates/cyrup-agent/src/agent/run/stream.rs) | `base_messages` | the loop's own working copy for the request (pi `context.messages`, `agent-loop.ts:283`) |
 | [`agent/run/tools/mod.rs:63`](../../../crates/cyrup-agent/src/agent/run/tools/mod.rs) | `ctx_messages` | per-call hook context view (pi `currentContext.messages`, `agent-loop.ts:691`) |
-| [`agent/run/turn.rs:99`](../../../crates/cyrup-agent/src/agent/run/turn.rs) | `ctx_messages` | `prepare_next_turn` context |
-| [`agent/run/turn.rs:160`](../../../crates/cyrup-agent/src/agent/run/turn.rs) | `ctx_messages_after` | `should_stop_after_turn` re-snapshot |
+| [`agent/run/turn.rs:100`](../../../crates/cyrup-agent/src/agent/run/turn.rs) | `ctx_messages` | `prepare_next_turn` context |
+| [`agent/run/turn.rs:161`](../../../crates/cyrup-agent/src/agent/run/turn.rs) | `ctx_messages_after` | `should_stop_after_turn` re-snapshot |
 
 Plus the accumulator and state copies on the same path:
 
 | site | what |
 | --- | --- |
-| [`agent/run/turn.rs:52,177,197`](../../../crates/cyrup-agent/src/agent/run/turn.rs) | `self.new_messages.clone()` into `AgentEvent::AgentEnd` (three sites) |
+| [`agent/run/turn.rs:53,178,198`](../../../crates/cyrup-agent/src/agent/run/turn.rs) | `self.new_messages.clone()` into `AgentEvent::AgentEnd` (three sites) |
 | [`agent/run/mod.rs:245`](../../../crates/cyrup-agent/src/agent/run/mod.rs) | `self.new_messages.clone()` |
 | [`agent/lifecycle.rs:180,270`](../../../crates/cyrup-agent/src/agent/lifecycle.rs) | `state.messages.clone()` |
 | [`state.rs:122`](../../../crates/cyrup-agent/src/state.rs) | `messages: self.messages.clone()` |
@@ -157,11 +174,20 @@ mattering, that is a separate task with its own evidence.)
 ## 4. Honest sizing — read this before prioritising
 
 **This was not measured end to end, and it is much smaller than
-[PERF-001](PERF-001_STREAM_SNAPSHOT_QUADRATIC.md).** The structural cost is
+[PERF-001](PERF-001_STREAM_SNAPSHOT_QUADRATIC.md).** ~~The structural cost is
 `4 × sizeof(transcript)` of `memcpy` plus one allocation per string per copy, per turn.
 For a 400 KB transcript that is ~1.6 MB and a few hundred microseconds; for a 10 MB
 transcript (a long session with large tool outputs) it is ~40 MB and single-digit
-milliseconds per turn.
+milliseconds per turn.~~
+
+> **[AUG-4] THE STRUCK-THROUGH SIZING IS OBSOLETE.** PERF-001 landed and text no longer copies,
+> so "4 × sizeof(transcript)" massively overstates the remaining cost for a text-only session and
+> *understates* how sharply it is now concentrated in two places. The corrected figure is
+> `4 × (image bytes + JSON payload bytes)` per turn, plus ~4 small allocations per content block.
+> Concretely: a text-only 10 MB transcript now costs **~0** byte-copying (only allocator churn),
+> while a transcript holding three pasted screenshots costs up to **54 MB of `memcpy` per turn**
+> — because `Content::Image.data` is an owned base64 `String` capped at 4.5 MB each. Full
+> derivation and the evidence in **[§8.2](#82-the-new-cost-model-what-a-vecagentmessageclone-actually-costs-at-head-7913760)**.
 
 Two reasons it is still worth doing despite the modest absolute number:
 
@@ -181,8 +207,13 @@ re-prioritise. Do not let the estimate stand in for a number once a number is av
 
 ## 5. Definition of Done
 
-1. **A turn's cost no longer scales with transcript size.** Prompting in a session with a
-   10 MB transcript costs the same per-turn snapshot work as one with a 100 KB transcript.
+1. **A turn's cost no longer scales with transcript size.** ~~Prompting in a session with a
+   10 MB transcript costs the same per-turn snapshot work as one with a 100 KB transcript.~~
+   **[AUG-4] Restated for the post-PERF-001 world**, because the old phrasing is now satisfied
+   *by accident* for a text-only session and so cannot discriminate a real fix from no fix:
+   **prompting in a session holding several megabytes of IMAGE content, `Custom`/`App` JSON
+   payloads, or `ToolResult.details` costs the same per-turn snapshot work as one holding none.**
+   Image content is the sharp end (§8.2) — construct the check there or it proves nothing.
 2. **Snapshot isolation is intact.** A `prepare_next_turn` context override, and a mid-run
    external `set_messages`, still do not cross between the loop's working copy and the
    agent's observable `state.messages` — the invariant
@@ -333,9 +364,15 @@ the public API. Every in-tree caller ignores the value anyway (`let _ = handle.f
 `agent_end` extractor (`loop_fn.rs:217`) do the same deref-map keeps the finalizing-stream result
 type unchanged.
 
-### 6.6 Cost model, confirmed
+### 6.6 Cost model, confirmed ~~— SUPERSEDED by §8.2~~
 
-`AssistantMessage` ([`cyrup-core/src/message/assistant.rs:30`](../../../crates/cyrup-core/src/message/assistant.rs))
+> **[AUG-4] SUPERSEDED.** This paragraph described the pre-PERF-001 types and is kept only so the
+> delta is legible. `AssistantMessage.content` is still `Vec<Content>`, but `Content` no longer
+> owns its text: `Text.text`/`Thinking.thinking` are `SharedStr` and `ToolCall.arguments` is
+> `LazyArgs`, both O(1) to clone. And `AgentMessage::Assistant` is now `Arc<AssistantMessage>`, so
+> the entire assistant arm clones in constant time. **Read [§8.2](#82-the-new-cost-model-what-a-vecagentmessageclone-actually-costs-at-head-7913760) instead.**
+
+~~`AssistantMessage`~~ ([`cyrup-core/src/message/assistant.rs:30`](../../../crates/cyrup-core/src/message/assistant.rs))
 owns `content: Vec<Content>`, provider/model/api strings, `usage`, optional
 `Vec<AssistantMessageDiagnostic>`, boxed `DeferredHandle`, `error_message`, etc. — so a `Vec` clone
 deep-copies every content block's bytes, exactly the cost the task describes. `Content` blocks
@@ -517,10 +554,302 @@ load-bearing ones, each re-read this pass:
   line drift on a read-only oracle and changes NOTHING about the cyrup work — left as-is
   deliberately so a future reader doesn’t burn a turn “correcting” a pi line that will drift again.
 
-### 7.4 Bottom line for `exec`
+### 7.4 Bottom line for `exec` ~~— superseded by §8.8~~
 
 The plan in §6.7 (steps 1–7) is ready to execute verbatim; §6.8 is mandatory (DoD #6/#2); §6.4/§6.5
 draw the scope boundary (do **not** touch `StateInner::messages` / `AgentStateSnapshot` / the public
-`RunHandle::finished` return type in Phase 1). No citation in this file needs updating before
-starting. If the compiler points at a `file:line` that disagrees with this document, HEAD moved
+`RunHandle::finished` return type in Phase 1). ~~No citation in this file needs updating before
+starting.~~ If the compiler points at a `file:line` that disagrees with this document, HEAD moved
 after `8f49433` — re-grep that one site before editing; everything else in the plan still holds.
+
+> **[AUG-4] HEAD did move — §7's own escape clause fired.** §7 was written against `8f49433`;
+> HEAD is now `7913760`. Eight citations drifted and six seam sites were missing. §7.1's claim
+> that every line number is "EXACT" is **no longer true** — see §8.4. The §6.7 plan itself still
+> holds, amended by §8.8.
+
+---
+
+## 8. [AUG-4] Revision pass @ HEAD `7913760` — after PERF-001 landed
+
+*This pass re-ran every grep behind §1–§7 against the working tree at HEAD `7913760`. Unlike §7,
+which confirmed a static tree, this one found **substantive movement**: the sibling task PERF-001
+merged and changed the very types this task reasons about. Nothing below is a style note — each
+item either corrects a false statement, adds a site whose omission is a compile error, or removes
+a deep copy the earlier passes did not see.*
+
+### 8.1 What changed under this task
+
+`git log --oneline -3` at HEAD:
+
+```
+7913760 Merge remote-tracking branch 'origin/main' into david/performance
+b8a53db Merge pull request #104 from cyrup-ai/claude/perf-stream-snapshot-quadratic
+04d6fa5 perf(provider,core,agent): make the streamed `partial` linear, not quadratic
+```
+
+`04d6fa5` is **PERF-001**, the task §4 names as "much larger than this one." It introduced three
+new `cyrup-core` types and rewired the message types onto them:
+
+| introduced | file | what it does |
+| --- | --- | --- |
+| [`SharedStr`](../../../crates/cyrup-core/src/shared_str.rs) | `cyrup-core/src/shared_str.rs` | append-only string behind `Arc<RwLock<String>>` + cached `OnceLock<Arc<str>>`; **`Clone` is O(1) in every state** (`:156-175`) |
+| [`LazyArgs`](../../../crates/cyrup-core/src/lazy_args.rs) | `cyrup-core/src/lazy_args.rs` | tool args parsed on first read; **`Clone` is O(1) in every state** (`:63-72`) |
+| `parse_streaming_json_object` | `cyrup-core/src/json.rs` | the salvage parser `LazyArgs` defers to |
+
+And it changed four field/variant types that this task's cost model depended on:
+
+| site | before | **after (HEAD `7913760`)** |
+| --- | --- | --- |
+| [`cyrup-agent/src/event.rs:36`](../../../crates/cyrup-agent/src/event.rs) `AgentMessage::Assistant` | `AssistantMessage` | **`Arc<AssistantMessage>`** |
+| [`cyrup-core/.../content.rs:19`](../../../crates/cyrup-core/src/message/content.rs) `Content::Text.text` | `String` | **`SharedStr`** |
+| [`cyrup-core/.../content.rs:26`](../../../crates/cyrup-core/src/message/content.rs) `Content::Thinking.thinking` | `String` | **`SharedStr`** |
+| [`cyrup-core/.../tool_call.rs:27`](../../../crates/cyrup-core/src/message/tool_call.rs) `ToolCall.arguments` | `serde_json::Map<String,Value>` | **`LazyArgs`** |
+
+The `AgentMessage::Assistant` doc comment PERF-001 added says the quiet part out loud, and it is
+the same argument this task makes: *"Owning it here meant a deep copy at each of those points, on
+every stream delta. The wire is unchanged: serde's `rc` feature serializes an `Arc<T>`
+transparently as `T`."* **PERF-001 independently validated this task's technique** — including the
+`rc` precondition §6.9 identified — and shipped it one layer down.
+
+### 8.2 The NEW cost model: what a `Vec<AgentMessage>::clone()` actually costs at HEAD `7913760`
+
+Per-variant, verified against the current type definitions:
+
+| `AgentMessage` variant | clone cost NOW | why |
+| --- | --- | --- |
+| `Assistant(Arc<AssistantMessage>)` | **O(1)** ✅ | refcount bump — already fixed by PERF-001 |
+| `User { content: Vec<Content>, .. }` | O(blocks) + **image bytes** | see the `Content` table below |
+| `ToolResult(ToolResultMessage)` | O(blocks) + **image bytes + `details` JSON** | `details: Option<Value>` is a deep `serde_json` clone; `added_tool_names: Vec<String>`, `tool_name: String` are small deep copies |
+| `Custom { payload: Value, details: Option<Value>, .. }` | **O(payload bytes)** | two deep `serde_json::Value` clones |
+| `App { payload: serde_json::Map<String,Value>, .. }` | **O(payload bytes)** | deep `Map` clone ([`event.rs:71-75`](../../../crates/cyrup-agent/src/event.rs)) |
+
+And per `Content` block:
+
+| `Content` variant | clone cost NOW |
+| --- | --- |
+| `Text { text: SharedStr, text_signature: Option<String> }` | **O(1)** for the text; one small alloc iff a signature is present |
+| `Thinking { thinking: SharedStr, .. }` | **O(1)** for the text |
+| `ToolCall(ToolCall)` | args **O(1)** (`LazyArgs`); `id` + `name` + `thought_signature` are small deep copies |
+| `Image { data: String, mime_type: String }` | **O(base64 bytes) — THE residual** |
+
+**`Content::Image.data` is the sharp end and it has a hard, documented ceiling.**
+[`cyrup-tools/src/tools/read.rs:521`](../../../crates/cyrup-tools/src/tools/read.rs) sets
+`MAX_B64_BYTES` to **4.5 MB of base64** — "Pi's headroom below Anthropic's 5MB limit
+(image-resize-core.ts:22)" — and `read.rs:588`/`:675` build `Content::Image { data: base64_encode(…) }`
+right at that budget. So **one** image block costs up to 4.5 MB per `Vec` clone, and this task's
+four per-turn snapshots make that **18 MB per turn per image**. Three pasted screenshots in a
+session → **~54 MB of `memcpy` on every single turn, for the rest of that session.**
+
+**Corrected headline for §0's table, middle column:**
+
+| | pre-PERF-001 (what §0 describes) | **HEAD `7913760` (actual)** | after this task |
+| --- | --- | --- | --- |
+| cost | O(total transcript bytes) | **O(image bytes + JSON payload bytes) + O(blocks) allocs** | O(n) pointer bumps |
+| a 10 MB text-only transcript | ~10 MB copied | **~0 bytes copied**, ~N small allocs | 0 |
+| a transcript with 3 images | ~13.5 MB copied | **~13.5 MB copied** — unchanged | 0 |
+
+### 8.3 The task is still worth doing — the argument just moved
+
+A fair reading of §8.2 is "PERF-001 took the general case; what's left is a special case." That is
+true, and it should be stated honestly rather than papered over. Three reasons it is still work,
+in descending strength:
+
+1. **The image case is not exotic and it is the worst-shaped cost curve in the file.** Pasting a
+   screenshot into a coding session is routine, and the cost is paid on *every subsequent turn* of
+   that session, not once. 4.5 MB × 4 snapshots × every turn is a real, sustained, user-visible
+   regression against pi, which copies a pointer. Nothing else in the loop behaves that way now.
+2. **`Custom` / `App` / `ToolResult.details` are `serde_json::Value` and will never get a
+   `SharedStr`-style fix** — §6.6's own note explains why (`Value` is foreign and has no shared
+   variant; that is exactly the reasoning [`lazy_args.rs:9-11`](../../../crates/cyrup-core/src/lazy_args.rs)
+   gives for deferring rather than sharing). `Arc<AgentMessage>` is the *only* lever that makes
+   those blocks cheap to snapshot.
+3. **It removes the whole class rather than the current instance.** PERF-001 fixed the types that
+   were expensive *in July*. `Arc<AgentMessage>` makes the snapshot O(n) regardless of what any
+   future field holds — which is precisely the property the port comment at `run/mod.rs:63-68`
+   already claims. This is the difference between matching pi's *behaviour* and matching its
+   *complexity class*.
+
+**What NOT to claim.** Do not justify this task with "the transcript is deep-copied four times per
+turn" any more — for a text session that is now false, and a reviewer who checks will discount the
+whole file. Justify it with the image/JSON residual and the complexity-class argument above.
+
+### 8.4 Line-number corrections — eight citations drifted (verified at `7913760`)
+
+§7.1 asserted every cyrup `file:line` was "EXACT." Six were off by one at the time it was written
+(they sit in files PERF-001 never touched, so this was an error in §7, not drift), and two moved
+because PERF-001 inserted lines above them. **Corrected table — trust this one:**
+
+| cited as | **actual at `7913760`** | content | cause |
+| --- | --- | --- | --- |
+| `stream.rs:40` | **`stream.rs:41`** | `let base_messages = self.messages.clone();` | §7 error (`:38-40` is the comment block) |
+| `turn.rs:52` | **`turn.rs:53`** | `AgentEnd { messages: self.new_messages.clone() }` (error/abort path) | §7 error |
+| `turn.rs:99` | **`turn.rs:100`** | `let ctx_messages = self.messages.clone();` | §7 error |
+| `turn.rs:160` | **`turn.rs:161`** | `let ctx_messages_after = self.messages.clone();` | §7 error |
+| `turn.rs:177` | **`turn.rs:178`** | `AgentEnd { … }` (`should_stop_after_turn` path) | §7 error |
+| `turn.rs:197` | **`turn.rs:198`** | `AgentEnd { … }` (normal exit) | §7 error |
+| `agent/event.rs:271` | **`agent/event.rs:280`** | `AgentEvent::AgentEnd { messages: Vec<AgentMessage> }` decl | PERF-001 (+9: `use std::sync::Arc` + Assistant doc) |
+| `session-svc/event.rs:154` | **`session-svc/event.rs:155`** | `AgentSessionEvent::AgentEnd.messages` decl | PERF-001 (+1: `use std::sync::Arc`) |
+| `agent/hooks.rs:114/117` | **`agent/hooks.rs:117`** only | `PostTurn.messages` (`:114` is the `struct` line) | §7 imprecision |
+
+**Re-verified EXACT and needing no change:** `tools/mod.rs:63` · `run/mod.rs:62,69,221,245` ·
+`run/mod.rs:63-68` (the `.slice()` doc comment) · `state.rs:122` (and `:93`/`:140` for the Phase-2
+fields) · `loop_fn.rs:120,217` · `lifecycle.rs:180,270,375` · `hooks.rs:24,215,220,222,224` ·
+`ext/event.rs:300,314,536` · `ext/contract.rs:58,114` · `ext/hooks.rs:130,135,138` ·
+`ext/host/live.rs:2077,2146` · `ext/subscriber.rs:62,65` · `ext/dispatch.rs:415` ·
+`session-svc/subscriber.rs:68,72,196,197,198` · `session-svc/retry.rs:75` · `Cargo.toml:145`.
+
+### 8.5 SIX seam sites the §6.2/§6.7 inventory MISSED — each is a compile error or a silent re-copy
+
+§6.2 lists four seam members (`AgentContextView.messages`, `PostTurn.messages`, `convert_to_llm`,
+`transform_context`). A full `grep -rn '\[AgentMessage\]\|Vec<AgentMessage>'` over the three
+crates' non-test sources finds **six more that carry the per-turn snapshot** and must flip with it:
+
+| # | site | declaration | why it must change |
+| --- | --- | --- | --- |
+| 1 | [`agent/hooks.rs:39`](../../../crates/cyrup-agent/src/hooks.rs) | `BeforeToolCall.messages: &'a [AgentMessage]` | fed from `self.new_messages`; **compile error** if left |
+| 2 | [`agent/hooks.rs:135`](../../../crates/cyrup-agent/src/hooks.rs) | `TurnUpdate.context: Option<Vec<AgentMessage>>` | the `prepare_next_turn` **override**, assigned straight into `self.messages` at [`turn.rs:134`](../../../crates/cyrup-agent/src/agent/run/turn.rs) (`self.messages = ctx;`) — **hard compile error** if left |
+| 3 | [`agent/hooks.rs:178`](../../../crates/cyrup-agent/src/hooks.rs) | `default_convert_to_llm(msgs: &[AgentMessage])` | the free fn behind the trait default at `:215` |
+| 4 | [`run/tools/exec.rs:36`](../../../crates/cyrup-agent/src/agent/run/tools/exec.rs) | `ctx_messages: &[AgentMessage]` | carries the `tools/mod.rs:63` snapshot into `execute_parallel` |
+| 5 | [`run/tools/exec.rs:260`](../../../crates/cyrup-agent/src/agent/run/tools/exec.rs) | `ctx_messages: &[AgentMessage]` | … and into `execute_sequential` |
+| 6 | [`run/tools/preflight.rs:21`](../../../crates/cyrup-agent/src/agent/run/tools/preflight.rs) + [`run/tools/finalize.rs:20`](../../../crates/cyrup-agent/src/agent/run/tools/finalize.rs) | `ctx_messages: &[AgentMessage]` | … and into the per-call preflight/finalize halves |
+
+**#2 is the dangerous one.** `TurnUpdate.context` is `pub` on a `pub struct`, so leaving it as
+`Vec<AgentMessage>` while `RunCtx::messages` becomes `Vec<Arc<AgentMessage>>` breaks `turn.rs:134`
+outright — and the path-of-least-resistance repair is
+`self.messages = ctx.into_iter().map(Arc::new).collect()`, which is *acceptable* (a per-override
+cost, not per-turn, and overrides are rare) **but only if chosen deliberately**. The prescribed
+path is to flip the field to `Option<Vec<Arc<AgentMessage>>>` so the override is a move, not a
+re-wrap; a hook that builds a fresh context is constructing messages anyway, and wrapping at
+construction is the same "push sites wrap once" rule from §6.1.
+
+**Also note the full `Vec<AgentMessage>` surface that must NOT change** (§6.4/§6.5 scope boundary,
+now enumerated so "which ones?" is not a judgement call during exec): `state.rs:93` (`StateInner`),
+`state.rs:140` (`AgentStateSnapshot`), `loop_fn.rs:44,170,176,190,208,211,243`, `queue.rs:51,59,73`,
+`run/mod.rs:22,99,225,229,241`, `agent/builder.rs:21,76`, `agent/prompt.rs:13,57,58`,
+`agent/lifecycle.rs:21,26,70,71,75`, `agent/facade.rs:119,154`, and every
+`cyrup-session-svc/src/session/*` occurrence. These are queue / builder / public-API surfaces, not
+the per-turn path.
+
+### 8.6 NEW in-scope win PERF-001 left on the table: `turn.rs` deep-copies the assistant message THREE times per turn
+
+PERF-001 wrapped the push sites mechanically, and the mechanical wrap is `Arc::new(asst.clone())` —
+which allocates a fresh `Arc` **and deep-copies the message into it**, defeating the sharing at the
+exact moment it is created. Verified at [`turn.rs:40-83`](../../../crates/cyrup-agent/src/agent/run/turn.rs):
+
+```rust
+40:  let asst = self.stream_assistant().await?;             // AssistantMessage (owned)
+44:  self.messages.push(AgentMessage::Assistant(Arc::new(asst.clone())));       // deep copy #1
+45:  self.new_messages.push(AgentMessage::Assistant(Arc::new(asst.clone())));   // deep copy #2
+49:  message: AgentMessage::Assistant(Arc::new(asst)),      // (error path — a move, fine)
+83:  message: AgentMessage::Assistant(Arc::new(asst.clone())),                  // deep copy #3
+```
+
+So the two transcripts and the `turn_end` event each hold a **separate** `AssistantMessage`, and
+`Arc::ptr_eq` between `self.messages.last()` and `self.new_messages.last()` is `false`. Three deep
+copies per turn, every turn.
+
+**Required change** — build the `Arc` once, clone the handle:
+
+```rust
+// The turn's assistant message is shared by the two working transcripts and the `turn_end`
+// event; build the handle ONCE so the three carry the same allocation (PERF-001 wrapped these
+// mechanically as `Arc::new(asst.clone())`, which deep-copied into each).
+let asst = Arc::new(self.stream_assistant().await?);
+self.messages.push(AgentMessage::Assistant(Arc::clone(&asst)));
+self.new_messages.push(AgentMessage::Assistant(Arc::clone(&asst)));
+
+if matches!(asst.stop_reason, StopReason::Error | StopReason::Aborted) {   // Deref — unchanged
+    self.emit(AgentEvent::TurnEnd {
+        message: AgentMessage::Assistant(Arc::clone(&asst)),
+        …
+// :83
+    message: AgentMessage::Assistant(Arc::clone(&asst)),
+```
+
+The read sites need nothing: `tool_calls(&asst)` (`:57`), `asst.stop_reason` (`:47`, `:64`),
+`self.execute_tool_calls(&asst, &calls)` (`:67`) and `message: &asst` (`:105`, `:166`, whose field
+is `PostTurn.message: &'a AssistantMessage` at [`hooks.rs:120`](../../../crates/cyrup-agent/src/hooks.rs))
+are all coercion sites, so `&Arc<T>` → `&T` applies. If the compiler disagrees at either
+struct-literal field, spell it `&*asst` — do **not** reach for `.clone()`.
+
+This is independent of the `Vec<Arc<_>>` change, is ~6 lines, and removes 3 whole-message deep
+copies per turn on its own. **Do it first** (§8.8 step 0) so the rest of the work builds on a
+correct push site, and so the win is real even if Phase 1 is deferred.
+
+### 8.7 Explicitly OUT of scope: `convert_to_llm` still rebuilds the whole transcript every turn
+
+Record this so exec does not believe DoD #1 covers it, and so a later reader does not file it as a
+regression this task introduced. Every turn, [`stream.rs:52`](../../../crates/cyrup-agent/src/agent/run/stream.rs)
+calls `convert_to_llm(&transformed)`, which builds a fresh `Vec<Message>` over the entire
+transcript. Both live implementations deep-copy each assistant message out of its `Arc`:
+
+- [`agent/hooks.rs:184`](../../../crates/cyrup-agent/src/hooks.rs) — `AgentMessage::Assistant(a) => Some(Message::Assistant((**a).clone()))`
+- [`session-svc/hooks.rs:44`](../../../crates/cyrup-session-svc/src/hooks.rs) — the same `(**a).clone()`
+
+The cause is that `cyrup_core::Message::Assistant` still holds `AssistantMessage` **by value**
+([`conversation.rs:26`](../../../crates/cyrup-core/src/message/conversation.rs)). Post-PERF-001
+this is O(blocks) rather than O(bytes) for text — but it still deep-copies image `data` and every
+`details`/`payload` `Value`, on the same hot path, once per turn.
+
+**Scope decision: NOT in this task.** Fixing it means `Message::Assistant(Arc<AssistantMessage>)`
+in `cyrup-core`, which ripples into `cyrup-provider`'s request builders and all 10 wire APIs — a
+strictly larger blast radius than everything in §6.7 combined, and it moves a type on the provider
+boundary rather than inside the loop. **Open it as PERF-007** (PERF-003–006 are taken —
+`PARALLEL_FILE_WALK`, `SESSION_PERSIST_FSYNC`, `DECOUPLE_RENDER_FROM_FOLD`,
+`PIPELINE_STREAM_DECODE`) with this paragraph as its evidence. Do not half-start it here.
+
+### 8.8 The revised ordered plan for `exec`
+
+§6.7 remains the spine. Amended and re-ordered:
+
+0. **[NEW — do first] Fix the triple deep copy at `turn.rs:40-83`** per §8.6. Self-contained,
+   ~6 lines, no signature changes, no cross-crate ripple. Verify with `cargo check -p cyrup-agent`.
+1. **`cyrup-agent` fields + seam types.** `RunCtx::{messages,new_messages}` →
+   `Vec<Arc<AgentMessage>>` (`run/mod.rs:62,69`). Flip the seam: `AgentContextView.messages`
+   (`hooks.rs:24`), **`BeforeToolCall.messages` (`:39`)**, `PostTurn.messages` (`:117`),
+   **`TurnUpdate.context` (`:135`)**, `default_convert_to_llm` (`:178`), `convert_to_llm` (`:215`),
+   `transform_context` (`:220-224`) — the bolded members are §8.5's misses.
+2. **The four `ctx_messages` parameters** in `run/tools/{exec.rs:36, exec.rs:260, preflight.rs:21,
+   finalize.rs:20}` (§8.5 #4–6). Purely `&[AgentMessage]` → `&[Arc<AgentMessage>]` plus
+   `m.as_ref()` in match arms.
+3. **`AgentEvent::AgentEnd.messages` → `Vec<Arc<AgentMessage>>`** at **`agent/event.rs:280`**
+   (corrected from `:271`); update the constructors at `turn.rs:53,178,198`, `run/mod.rs:221`,
+   `lifecycle.rs:375`, and the `loop_fn.rs:217` extractor (deref-map, per §6.5).
+4. **Hook impls follow:** `session-svc/hooks.rs:35,179,225`, `ext/hooks.rs:130-138`.
+5. **Session seam:** `AgentSessionEvent::AgentEnd.messages` at **`session-svc/event.rs:155`**
+   (corrected from `:154`); `subscriber.rs:196-198`; `retry.rs:75` + its `:83` match arm.
+6. **Extension seams — BOTH:** `HostEvent::AgentEnd` (`ext/event.rs:314`, clone at `:536`) **and**
+   `HostEvent::Context` (`ext/event.rs:300`) + `EventPatch::Context` (`ext/contract.rs:58`), with
+   the build at `ext/hooks.rs:135` becoming a pointer clone. `contract.rs:114` and
+   `live.rs:2077,2146` stay byte-identical. **§6.8 is mandatory, not optional** — re-read its
+   "change the field, not the clone" warning before touching `ext/hooks.rs:135`.
+7. **Update the `.slice()` doc comment** at `run/mod.rs:63-68`.
+8. **Do NOT touch** `state.rs:93,140`, `RunHandle::finished`, or any surface in §8.5's
+   "must NOT change" list.
+
+### 8.9 Preconditions re-confirmed at `7913760`
+
+- **serde `rc`** — [`Cargo.toml:145`](../../../Cargo.toml) still enables it (grep for `"rc"`, not
+  `serde = ` — the line is column-aligned with multiple spaces). PERF-001 now *depends* on this
+  too, via `AgentMessage::Assistant(Arc<AssistantMessage>)`, so the feature is far better anchored
+  than when §6.9 flagged it.
+- **§6.8 clone-before-gate ordering** — still true: [`ext/hooks.rs:135`](../../../crates/cyrup-ext/src/hooks.rs)
+  builds `HostEvent::Context { messages: msgs.clone() }` on the line *before*
+  `dispatch_block_mutate`, whose `no_subscribers` gate is at
+  [`ext/dispatch.rs:415`](../../../crates/cyrup-ext/src/dispatch.rs). Unconditional, every turn.
+- **§6.1 no `Arc::make_mut` (DoD #4)** — still structurally satisfiable: every write to the three
+  transcripts is a `push` of a freshly built message; the only index-assignment on the path is
+  `turn.rs:134`'s wholesale `self.messages = ctx`, which replaces the vector, not an element.
+- **pi oracle** — unchanged at `v0.84.2-48-g59a71b235`; §7.3's behavioural confirmations and its
+  "do not fix the two 1-line pi drifts" instruction both still stand.
+
+### 8.10 Definition of Done — delta
+
+DoD #1 is restated in §5 (image/JSON-bearing transcript, not "10 MB transcript"). Items #2–#6 are
+unchanged and still correct. Add one:
+
+7. **[AUG-4] The turn's assistant message is one allocation, not four.** After §8.6,
+   `self.messages.last()` and `self.new_messages.last()` hold the *same* `Arc` — `Arc::ptr_eq` is
+   `true` — and the `turn_end` event carries a third handle to it rather than a third copy. This
+   is the criterion that catches the mechanical-wrap pattern PERF-001 left behind, which compiles,
+   passes every other DoD item, and looks correct.
