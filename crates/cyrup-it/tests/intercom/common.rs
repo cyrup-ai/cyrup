@@ -83,6 +83,7 @@ pub fn registration(name: &str) -> SessionRegistration {
         started_at: now_ms().into(),
         last_activity: now_ms().into(),
         status: None,
+        tmux_pane: None,
         extra: Default::default(),
     }
 }

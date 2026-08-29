@@ -1075,6 +1075,7 @@ mod tests {
                 context_pct: None,
                 context_tokens: None,
                 context_window: None,
+                tmux_pane: None,
                 extra: Default::default(),
             };
             let message = crate::transport::protocol::Message {
@@ -1311,6 +1312,7 @@ mod tests {
                 started_at: now_ms().into(),
                 last_activity: now_ms().into(),
                 status: None,
+                tmux_pane: None,
                 extra: Default::default(),
             };
             let client = Arc::new(
@@ -1366,6 +1368,7 @@ mod tests {
                 context_pct: None,
                 context_tokens: None,
                 context_window: None,
+                tmux_pane: None,
                 extra: Default::default(),
             };
             assert!(state.waiter.try_deliver(&peer, &reply), "the waiter slot must be armed");

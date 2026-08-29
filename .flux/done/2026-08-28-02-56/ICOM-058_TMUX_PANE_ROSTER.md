@@ -1,7 +1,7 @@
 ---
-stage: aug
-status: done
-updated: 2026-08-27 22:26
+stage: qa
+status: completed
+updated: 2026-08-29 01:15
 ---
 
 # Surface tmux pane ids in the session roster
@@ -11,6 +11,58 @@ updated: 2026-08-27 22:26
 > Reference checkout: [`./tmp/pi-intercom`](../../tmp/pi-intercom). Gap analysis:
 > `docs/gap-analysis/11-cyrup-intercom.md` — **ICOM-058** (line 311).
 
+## 0. Re-verified 2026-08-29 against `af1a63b`
+
+Re-checked after ICOM-056 and ICOM-016 merged (PR #98). **The upstream research is perfect and needs
+no correction; the cyrup-side line numbers had drifted badly, and the exhaustive-literal inventory in
+Step 8 was missing a site.**
+
+**Upstream, all exact — do not re-derive:**
+
+| Claim | Verified |
+| --- | --- |
+| `tmuxPane?: string` on `SessionInfo` | `types.ts:42` |
+| The SAME guard line twice | `broker/protocol.ts:168` and `:203` |
+| `currentTmuxPane()` reading `process.env.TMUX_PANE?.trim()` | `index.ts:531-532` |
+| The render fragment ``` `session.tmuxPane ? ` · tmux ${…}` : ""` ``` | `index.ts:551` |
+| The registration spread `...(tmuxPane ? { tmuxPane } : {})` | `index.ts:891,900` |
+| The broker's whitelist copy | `broker/broker.ts:475` |
+| The overlay does NOT render it | `ui/session-list.ts` — **0** hits for `tmuxPane` |
+
+**Cyrup-side citations corrected this pass:**
+
+| Was | Now | Symbol |
+| --- | --- | --- |
+| `protocol.rs:237-300` | `protocol.rs:239-302` | `SessionInfo` |
+| `protocol.rs:297-299` | `protocol.rs:299-301` | the `extra` capture |
+| `protocol.rs:632-666` | `protocol.rs:673-707` | `SessionRegistration` |
+| `identity.rs:62-75` | `identity.rs:67-80` | the env-inventory precedent |
+| `connect.rs:562-582` | `connect.rs:581-601` | `build_registration` |
+| `tools/intercom/mod.rs:210-258` | `:225-273` | `format_session_list_row` |
+| `format_context.rs:68-81` | `:70-83` | `format_context_usage` |
+
+**The Step 8 inventory was wrong, and would have broken the build.** It listed FIVE
+`SessionRegistration` literals; there are **six**. The missing one is
+`transport/protocol.rs:1022`, an exhaustive literal inside
+`client_register_serializes_with_pi_field_names`. Step 8 below now lists all six, and every
+`SessionInfo` line number is re-derived. **Re-derive both lists again at exec time** — this is the
+third brief this session whose enumerated literal list had drifted, and it is the single most likely
+cause of a failed build on a task of this shape.
+
+**Still true, so the plan stands unchanged:**
+
+- `SessionInfo` still ends `context_pct` → `context_tokens` → `context_window` → `extra`, so Step 1's
+  insertion point (after `context_window`, before `extra`) is still upstream's declaration order.
+- The `#[serde(flatten)] extra` capture is intact, so the interop claim in the Objective holds:
+  `tmuxPane` round-trips today as an opaque key and this task promotes it to a modelled one.
+- `list.rs:44,57` and `list_cwd.rs:73,82` both still call `format_session_list_row`, so one edit to
+  one function still surfaces the pane in both actions.
+- ICOM-056 and ICOM-016 added no field to `SessionInfo` and no new literal of either type; they
+  touched `session_state.rs`, `transport/client.rs`, `seams.rs`, `extension.rs`, `inbound.rs` and
+  `tools/intercom/*`, which is why so many line numbers moved while the SET did not.
+
+---
+
 ## Objective
 
 Port upstream `4af53db` (v0.11.0, "feat: surface tmux pane ids in roster") in full: model `tmuxPane`
@@ -19,7 +71,7 @@ on both wire types, read `$TMUX_PANE` at registration, copy it onto the broker's
 `intercom{action:"list-cwd"}` print — omitting it entirely when the session is not in a tmux pane.
 
 **Interop is not at risk today.** `SessionInfo`'s `#[serde(flatten)] extra` capture
-([`transport/protocol.rs:297-299`](../../crates/cyrup-intercom/src/transport/protocol.rs)) already
+([`transport/protocol.rs:299-301`](../../crates/cyrup-intercom/src/transport/protocol.rs)) already
 round-trips `tmuxPane` verbatim from a v0.12.0 peer through a cyrup broker. This task promotes it
 from opaque passthrough to a **modelled, produced and rendered** field. After the change the key is
 emitted explicitly (`#[serde(rename_all = "camelCase")]` → `tmuxPane`) instead of via `extra`, so the
@@ -162,12 +214,12 @@ Nothing new is to be invented. Every mechanism this change needs is already in t
 | Need | Existing thing to reuse | Location |
 | --- | --- | --- |
 | `x !== undefined && typeof x !== "string"` on the wire | `#[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]` — the `[NON-NULL]` idiom | [`transport/protocol.rs:102-118`](../../crates/cyrup-intercom/src/transport/protocol.rs) |
-| Reading an env var as identity, with a pure testable core | `native_supervisor_channel_available_from(env: impl Fn(&str) -> Option<String>)` + a process-env wrapper; the module is "the crate's single env inventory" | [`identity.rs:62-75`](../../crates/cyrup-intercom/src/identity.rs) |
-| The roster row `intercom{list}` prints | `format_session_list_row` — the 1:1 port of `formatSessionListRow`, already carrying the `idPrefix` 4th arg and the `tags`/`suffix` ladder | [`tools/intercom/mod.rs:210-258`](../../crates/cyrup-intercom/src/tools/intercom/mod.rs) |
-| "absent optional renders the empty string, concatenated inline" | `format_context_usage` — returns `String::new()` when `context_pct` is `None`, so the row is byte-for-byte the pre-feature row | [`format_context.rs:68-81`](../../crates/cyrup-intercom/src/format_context.rs) |
-| JS `||` falsy on a string (`""` falls through) | `.as_deref().filter(\|n\| !n.is_empty())` — used by `display_name` and by `session_title` | [`tools/intercom/mod.rs:206-208`](../../crates/cyrup-intercom/src/tools/intercom/mod.rs), [`ui/session_list.rs:22-33`](../../crates/cyrup-intercom/src/ui/session_list.rs) |
+| Reading an env var as identity, with a pure testable core | `native_supervisor_channel_available_from(env: impl Fn(&str) -> Option<String>)` + a process-env wrapper; the module is "the crate's single env inventory" | [`identity.rs:67-80`](../../crates/cyrup-intercom/src/identity.rs) |
+| The roster row `intercom{list}` prints | `format_session_list_row` — the 1:1 port of `formatSessionListRow`, already carrying the `idPrefix` 4th arg and the `tags`/`suffix` ladder | [`tools/intercom/mod.rs:225-273`](../../crates/cyrup-intercom/src/tools/intercom/mod.rs) |
+| "absent optional renders the empty string, concatenated inline" | `format_context_usage` — returns `String::new()` when `context_pct` is `None`, so the row is byte-for-byte the pre-feature row | [`format_context.rs:70-83`](../../crates/cyrup-intercom/src/format_context.rs) |
+| JS `||` falsy on a string (`""` falls through) | `.as_deref().filter(\|n\| !n.is_empty())` — used by `display_name` and by `session_title` | [`tools/intercom/mod.rs:221-223`](../../crates/cyrup-intercom/src/tools/intercom/mod.rs), [`ui/session_list.rs:22-33`](../../crates/cyrup-intercom/src/ui/session_list.rs) |
 | Optional-tag suppression with no stray separator | `session_title`'s `let suffix = if tags.is_empty() { String::new() } else { … }` | [`ui/session_list.rs:22-33`](../../crates/cyrup-intercom/src/ui/session_list.rs) |
-| The registration builder that runs on every reconnect | `build_registration` | [`connect.rs:562-582`](../../crates/cyrup-intercom/src/connect.rs) |
+| The registration builder that runs on every reconnect | `build_registration` | [`connect.rs:581-601`](../../crates/cyrup-intercom/src/connect.rs) |
 | The broker's stored-`SessionInfo` whitelist | `BrokerState::handle_register`'s `let info = SessionInfo { … }` | [`broker/session.rs:88-107`](../../crates/cyrup-intercom/src/broker/session.rs) |
 
 **`intercom{list}` and `intercom{list-cwd}` need no edit at all.** Both already call
@@ -187,7 +239,7 @@ roster row this task must change is `format_session_list_row`. `session_title` i
 
 ### Step 1 — `SessionInfo.tmux_pane` — [`transport/protocol.rs`](../../crates/cyrup-intercom/src/transport/protocol.rs)
 
-Add the field to `struct SessionInfo` (`:237-300`) **after `context_window` and before `extra`**,
+Add the field to `struct SessionInfo` (`:239-302`) **after `context_window` and before `extra`**,
 matching upstream's declaration order:
 
 ```rust
@@ -213,7 +265,7 @@ one the `extra` capture used to reproduce.
 
 ### Step 2 — `SessionRegistration.tmux_pane` — same file
 
-Add the same field to `struct SessionRegistration` (`:632-666`) **after `status`, before `extra`**:
+Add the same field to `struct SessionRegistration` (`:673-707`) **after `status`, before `extra`**:
 
 ```rust
     /// `tmuxPane` (`v0.12.0 types.ts:36-42`), carried on the registration by `buildRegistration`'s
@@ -231,7 +283,7 @@ Add the same field to `struct SessionRegistration` (`:632-666`) **after `status`
 ### Step 3 — the environment read — [`identity.rs`](../../crates/cyrup-intercom/src/identity.rs)
 
 `identity.rs` is the crate's single env inventory; the port of `currentTmuxPane` belongs there, next
-to `native_supervisor_channel_available_from` (`:62-75`), in the same `*_from(env)` + wrapper shape.
+to `native_supervisor_channel_available_from` (`:67-80`), in the same `*_from(env)` + wrapper shape.
 
 **The variable name is `TMUX_PANE`, with no `CYRUP_` prefix.** The crate's prefix rule renames pi's
 *own* variables (`PI_INTERCOM_*` → `CYRUP_INTERCOM_*`); `TMUX_PANE` is exported by **tmux** into
@@ -270,7 +322,7 @@ pub fn current_tmux_pane() -> Option<String> {
 }
 ```
 
-### Step 4 — populate the registration — [`connect.rs:562-582`](../../crates/cyrup-intercom/src/connect.rs)
+### Step 4 — populate the registration — [`connect.rs:581-601`](../../crates/cyrup-intercom/src/connect.rs)
 
 In `build_registration`, add one field to the `SessionRegistration { … }` literal, after `status`:
 
@@ -302,7 +354,7 @@ In `BrokerState::handle_register`'s `let info = SessionInfo { … }`, add after 
 and `handle_presence` mutates the stored `session.info` field-by-field, so the register-time pane
 survives every presence update. Record that as a deliberate no-op if a note is warranted.
 
-### Step 6 — render it — [`tools/intercom/mod.rs:210-258`](../../crates/cyrup-intercom/src/tools/intercom/mod.rs)
+### Step 6 — render it — [`tools/intercom/mod.rs:225-273`](../../crates/cyrup-intercom/src/tools/intercom/mod.rs)
 
 Extend `format_session_list_row`, inline, exactly where upstream put it — the term goes **inside** the
 model parentheses, **after** `format_context_usage`:
@@ -352,17 +404,23 @@ session — a hard-coded `None` would be a silent divergence:
 `SessionInfo` and `SessionRegistration` are plain structs with no `Default`, so **every** literal in
 the crate must gain the new field for it to compile. The complete list:
 
-`SessionRegistration { … }` — [`connect.rs:564`](../../crates/cyrup-intercom/src/connect.rs) (Step 4),
+`SessionRegistration { … }` — SIX sites, re-derived against this branch's base:
+[`connect.rs:583`](../../crates/cyrup-intercom/src/connect.rs) (Step 4),
 [`bin/cyrup_intercom_child_fixture.rs:100`](../../crates/cyrup-intercom/src/bin/cyrup_intercom_child_fixture.rs) (Step 7),
-`session_state.rs:1214`, `transport/client.rs:977`, `tools/intercom/mod.rs:617`.
+`session_state.rs:1305`, `transport/client.rs:985`, `tools/intercom/mod.rs:617`, and
+**`transport/protocol.rs:1022`** — the last of these is NOT in the original list and is exhaustive; it
+is the `client_register_serializes_with_pi_field_names` test, which asserts the emitted field names.
+Adding `tmux_pane: None` there leaves its assertions unchanged, because `skip_serializing_if` keeps an
+absent pane off the wire — which is itself the proof that Step 1's serde attributes are right.
 
-`SessionInfo { … }` — [`broker/session.rs:88`](../../crates/cyrup-intercom/src/broker/session.rs) (Step 5),
+`SessionInfo { … }` — SEVENTEEN sites:
+[`broker/session.rs:88`](../../crates/cyrup-intercom/src/broker/session.rs) (Step 5),
 [`seams.rs:152`](../../crates/cyrup-intercom/src/seams.rs) (the synthetic `subagent-result` relay
 sender — `tmux_pane: None`, since a synthetic sender has no terminal; note it inline next to the
 existing `runtime_fallback_alias: None` note), `seams.rs:375`, `seams.rs:419`, `ui/compose.rs:251`,
-`ui/inline_message.rs:299`, `ui/session_list.rs:191`, `session_state.rs:972`, `session_state.rs:1263`,
-`project_target.rs:183`, `reply_tracker.rs:392`, `transport/client.rs:1364`, `transport/client.rs:1417`,
-`tools/intercom/mod.rs:762`, `extension.rs:1144`, `extension.rs:1181`, `inbound.rs:657`.
+`ui/inline_message.rs:453`, `ui/session_list.rs:191`, `session_state.rs:1063`, `session_state.rs:1354`,
+`project_target.rs:183`, `reply_tracker.rs:392`, `transport/client.rs:1372`, `transport/client.rs:1425`,
+`tools/intercom/mod.rs:762`, `extension.rs:1215`, `extension.rs:1252`, `inbound.rs:686`.
 
 All of those but the three named above take `tmux_pane: None`. Sites that build a `SessionInfo` via
 `serde_json::from_value!` ([`format_context.rs:90`](../../crates/cyrup-intercom/src/format_context.rs))

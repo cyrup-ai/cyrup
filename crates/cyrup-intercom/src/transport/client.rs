@@ -991,6 +991,7 @@ mod tests {
             started_at: now_ms().into(),
             last_activity: now_ms().into(),
             status: None,
+            tmux_pane: None,
             extra: Default::default(),
         }
     }
@@ -1384,6 +1385,7 @@ mod tests {
             context_pct: None,
             context_tokens: None,
             context_window: None,
+            tmux_pane: None,
             extra: Default::default(),
         };
         let message = Message {
@@ -1437,6 +1439,7 @@ mod tests {
             context_pct: None,
             context_tokens: None,
             context_window: None,
+            tmux_pane: None,
             extra: Default::default(),
         }
     }

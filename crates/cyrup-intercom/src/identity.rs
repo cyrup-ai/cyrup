@@ -74,6 +74,36 @@ pub fn native_supervisor_channel_available() -> bool {
     native_supervisor_channel_available_from(|k| std::env::var(k).ok())
 }
 
+/// `TMUX_PANE` — NOT `CYRUP_TMUX_PANE`. The `CYRUP_` prefix rule applies to pi's OWN variables
+/// (`PI_INTERCOM_*` → `CYRUP_INTERCOM_*`); this one is exported by **tmux itself** into every pane's
+/// process environment, so renaming it would read a variable nothing ever sets and the pane term
+/// would never populate. Do not "fix" this in a later prefix sweep.
+pub const ENV_TMUX_PANE: &str = "TMUX_PANE";
+
+/// `currentTmuxPane()` (`v0.12.0 index.ts:531-534`):
+///
+/// ```text
+/// const pane = process.env.TMUX_PANE?.trim();
+/// return pane ? pane : undefined;
+/// ```
+///
+/// Upstream's own comment is the rationale: `$TMUX_PANE` is inherited at process start and immutable
+/// for the lifetime — moving the pane between windows keeps its id — so it is a stable join key a
+/// peer can use to live-resolve the current window via tmux. Absent outside tmux.
+///
+/// Trimmed AND blank-rejected here, at the producer, so a cyrup session never puts a
+/// whitespace-only pane id on the wire.
+#[must_use]
+pub fn current_tmux_pane_from(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    env(ENV_TMUX_PANE).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// [`current_tmux_pane_from`] over the process environment.
+#[must_use]
+pub fn current_tmux_pane() -> Option<String> {
+    current_tmux_pane_from(|k| std::env::var(k).ok())
+}
+
 /// `getNamePollMs()` (`v0.10.1 index.ts:486-495`, 10 lines):
 ///
 /// ```text

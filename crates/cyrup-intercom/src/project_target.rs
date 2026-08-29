@@ -195,6 +195,7 @@ mod tests {
             context_pct: None,
             context_tokens: None,
             context_window: None,
+            tmux_pane: None,
             extra: Default::default(),
         }
     }

@@ -111,6 +111,9 @@ async fn run() -> i32 {
         started_at: now_ms().into(),
         last_activity: now_ms().into(),
         status: None,
+        // This binary registers as a genuine broker participant, so it reports its pane like any
+        // other session; a hard-coded `None` would be a silent divergence from every real client.
+        tmux_pane: cyrup_intercom::identity::current_tmux_pane(),
         extra: Default::default(),
     };
 

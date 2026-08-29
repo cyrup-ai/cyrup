@@ -594,6 +594,11 @@ pub fn build_registration(state: &SharedIntercomState, params: &ConnectParams) -
         // (`connect_once`), so reading `config.status` here re-registered a session that dropped
         // mid-tool-call as having no lifecycle status at all.
         status: Some(state.current_status()),
+        // `...(tmuxPane ? { tmuxPane } : {})` (`v0.12.0 index.ts:891,900`). Read from the LIVE
+        // environment on every reconnect rung, exactly as upstream re-runs `currentTmuxPane()`
+        // inside `buildRegistration`; `$TMUX_PANE` is immutable for the process lifetime, so every
+        // rung produces the same value and a re-register never changes the peer's pane term.
+        tmux_pane: crate::identity::current_tmux_pane(),
         extra: Default::default(),
     }
 }

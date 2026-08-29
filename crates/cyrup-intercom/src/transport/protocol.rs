@@ -295,6 +295,20 @@ pub struct SessionInfo {
     /// `v0.9.2 broker/client.ts:182-186`).
     #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
     pub context_window: Option<serde_json::Number>,
+    /// `tmuxPane` (`v0.12.0 types.ts:42`): the tmux pane id (e.g. `"%212"`) of the session's
+    /// terminal, read from `$TMUX_PANE` at registration and copied onto the stored `SessionInfo` by
+    /// the broker (`v0.12.0 broker/broker.ts:475`).
+    ///
+    /// Additive at v0.11.0 (`4af53db`). Present only when the session runs inside a tmux pane;
+    /// absent for cloud, headless and IDE-embedded sessions. Upstream's own note is the reason it is
+    /// worth relaying: the pane id is IMMUTABLE for the process lifetime — unlike the window name —
+    /// so a peer can live-resolve the current window from it via tmux.
+    ///
+    /// `[NON-NULL]` — `isSessionInfo` guards it with
+    /// `value.tmuxPane !== undefined && typeof value.tmuxPane !== "string"`
+    /// (`v0.12.0 broker/protocol.ts:168`), so an explicit `null` is fatal, exactly as for `status`.
+    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    pub tmux_pane: Option<String>,
     /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`. A newer pi broker's additive keys survive a cyrup hop,
     /// and a JSON array can no longer fill this struct positionally.
     #[serde(flatten)]
@@ -701,6 +715,16 @@ pub struct SessionRegistration {
     /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`. Carries `extensions` and the context trio, both of which
     /// upstream reads (or ignores) without modelling them on this type. The `[MAP-ONLY]` half is
     /// upstream's own explicit `Array.isArray(value)` bail (`v0.9.2 broker/broker.ts:191-193`).
+    /// `tmuxPane` (`v0.12.0 types.ts:42`), carried on the registration by `buildRegistration`'s
+    /// `...(tmuxPane ? { tmuxPane } : {})` spread (`v0.12.0 index.ts:900`) and copied onto the
+    /// stored `SessionInfo` at `v0.12.0 broker/broker.ts:475`.
+    ///
+    /// `[NON-NULL]`, and unlike `runtimeFallbackAlias` this one IS validated by
+    /// `isSessionRegistration` upstream (`v0.12.0 broker/protocol.ts:203`) — so modelling it with
+    /// [`present_non_null`] puts cyrup neither looser nor stricter than pi: a non-string destroys
+    /// the connection on both sides.
+    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    pub tmux_pane: Option<String>,
     #[serde(flatten)]
     pub extra: UnknownFields,
 }
@@ -1028,6 +1052,7 @@ mod tests {
                 started_at: 1u64.into(),
                 last_activity: 2u64.into(),
                 status: None,
+                tmux_pane: None,
                 extra: UnknownFields::default(),
             },
             session_id: Some("sess-1".to_string()),

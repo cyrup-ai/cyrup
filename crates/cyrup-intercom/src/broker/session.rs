@@ -98,6 +98,11 @@ impl BrokerState {
             started_at: registration.started_at,
             last_activity: registration.last_activity,
             status: registration.status,
+            // `...(session.tmuxPane !== undefined ? { tmuxPane: session.tmuxPane } : {})`
+            // (`v0.12.0 broker/broker.ts:475`). The stored `SessionInfo` is a WHITELIST, so an
+            // un-copied field would be dropped by a cyrup broker even though the registration
+            // carried it — the roster is built from THIS value, not from the registration.
+            tmux_pane: registration.tmux_pane,
             peer_uid: None,
             // `trustedLocal` — broker-owned, never from the payload (`broker.ts:374`), and a
             // property of the BOUND ENDPOINT rather than of the platform (ICOM-015): false for the

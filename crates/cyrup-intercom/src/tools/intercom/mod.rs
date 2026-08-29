@@ -222,6 +222,17 @@ pub(super) fn display_name(session: &SessionInfo) -> &str {
 /// and is the only place upstream surfaces a peer's context usage — `ui/session-list.ts` does not.
 /// It renders the empty string whenever `contextPct` is absent, so a peer that reports nothing is
 /// byte-for-byte the pre-v0.8.0 row.
+///
+/// ICOM-058 added the `tmuxPane` term on the same terms, from `v0.12.0 index.ts:546-553`:
+///
+/// ```text
+/// const pane = session.tmuxPane ? ` · tmux ${session.tmuxPane}` : "";
+/// return `• ${name} (${idPrefix}) — ${session.cwd} (${session.model}${formatContextUsage(session)}${pane})${suffix}`;
+/// ```
+///
+/// It follows the context usage inside the same parentheses, and — like it — the overlay
+/// (`ui/session-list.ts:36-42`, and [`crate::ui::session_list::session_title`]) deliberately does
+/// NOT render it.
 pub(super) fn format_session_list_row(
     session: &SessionInfo,
     current_cwd: &str,
@@ -246,13 +257,28 @@ pub(super) fn format_session_list_row(
         tags.push(status.clone());
     }
     let suffix = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
+    // `const pane = session.tmuxPane ? ` · tmux ${session.tmuxPane}` : ""` (`v0.12.0 index.ts:551`).
+    // Same empty-string-means-omitted contract [`format_context_usage`] already uses: a session
+    // outside tmux renders byte-for-byte the pre-v0.11.0 row — no column, no placeholder, no
+    // dangling `·`. The term sits INSIDE the model parentheses, immediately after the context usage.
+    //
+    // Upstream's check is JS-falsy, so `""` already renders nothing. The `trim()` is a display-only
+    // strengthening: a conforming peer cannot send whitespace-only (the producer trims —
+    // [`crate::identity::current_tmux_pane`]), but a hostile one can, and ` · tmux    ` is exactly
+    // the stray separator this must never print. It changes nothing on the wire.
+    let pane = session
+        .tmux_pane
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map_or_else(String::new, |p| format!(" · tmux {p}"));
     format!(
-        "• {} ({}) — {} ({}{}){}",
+        "• {} ({}) — {} ({}{}{}){}",
         name,
         id_prefix,
         session.cwd,
         session.model,
         format_context_usage(session),
+        pane,
         suffix
     )
 }
@@ -623,6 +649,7 @@ mod tests {
             started_at: now_ms().into(),
             last_activity: now_ms().into(),
             status: None,
+            tmux_pane: None,
             extra: Default::default(),
         };
         let client = Arc::new(
@@ -774,6 +801,7 @@ mod tests {
             context_pct: None,
             context_tokens: None,
             context_window: None,
+            tmux_pane: None,
             extra: Default::default(),
         }
     }
