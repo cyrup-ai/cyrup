@@ -1,6 +1,7 @@
 //! The typed [`Content`] block and the per-role content deserializers (func-01 §4.4).
 
 use super::tool_call::ToolCall;
+use crate::shared_str::SharedStr;
 
 /// A typed content block (func-01 §4.4).
 ///
@@ -15,14 +16,14 @@ use super::tool_call::ToolCall;
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Content {
     Text {
-        text: String,
+        text: SharedStr,
         /// Legacy opaque id string OR a JSON-encoded [`crate::TextSignatureV1`] (Pi `textSignature`,
         /// types.ts:325). Use [`crate::TextSignatureV1::parse`]/`encode` for the structured form.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         text_signature: Option<String>,
     },
     Thinking {
-        thinking: String,
+        thinking: SharedStr,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         thinking_signature: Option<String>,
         /// Pi `redacted?: boolean` (types.ts:335) — OMITTED when unset. Pi only ever emits
@@ -98,14 +99,14 @@ impl serde::Serialize for Content {
 }
 
 impl Content {
-    pub fn text(s: impl Into<String>) -> Self {
+    pub fn text(s: impl Into<SharedStr>) -> Self {
         Content::Text { text: s.into(), text_signature: None }
     }
-    pub fn thinking(s: impl Into<String>) -> Self {
+    pub fn thinking(s: impl Into<SharedStr>) -> Self {
         Content::Thinking { thinking: s.into(), thinking_signature: None, redacted: false }
     }
     /// A text block carrying a (legacy or [`crate::TextSignatureV1`]-encoded) signature.
-    pub fn text_with_signature(s: impl Into<String>, signature: impl Into<String>) -> Self {
+    pub fn text_with_signature(s: impl Into<SharedStr>, signature: impl Into<String>) -> Self {
         Content::Text { text: s.into(), text_signature: Some(signature.into()) }
     }
 }
@@ -233,7 +234,7 @@ mod tests {
         let tc = ToolCall {
             id: "t".into(),
             name: "n".into(),
-            arguments: serde_json::Map::new(),
+            arguments: serde_json::Map::new().into(),
             thought_signature: Some("g".into()),
         };
         let c = Content::ToolCall(tc);

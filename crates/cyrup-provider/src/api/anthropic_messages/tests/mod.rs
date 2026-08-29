@@ -12,6 +12,7 @@ mod decode;
 mod deferred_tools;
 mod headers;
 mod params;
+mod perf001;
 mod tool_references;
 mod tools;
 
@@ -118,7 +119,7 @@ fn tc_assistant(calls: &[(&str, &str)]) -> Message {
                 Content::ToolCall(ToolCall {
                     id: ToolCallId::from(*id),
                     name: (*name).to_string(),
-                    arguments: Map::new(),
+                    arguments: Map::new().into(),
                     thought_signature: None,
                 })
             })

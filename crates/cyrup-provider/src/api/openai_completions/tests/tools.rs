@@ -29,7 +29,7 @@ fn kimi_deferred_tools_move_from_the_tools_array_into_an_inline_system_message()
                 content: vec![Content::ToolCall(ToolCall {
                     id: ToolCallId::from("c1"),
                     name: "early".into(),
-                    arguments: Map::new(),
+                    arguments: Map::new().into(),
                     thought_signature: None,
                 })],
                 provider: "moonshotai".into(),

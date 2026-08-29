@@ -41,7 +41,7 @@ use crate::provider::Provider;
 use crate::stream::{ErrorReason, StreamEvent, StreamOptions};
 use cyrup_core::{
     ApiId, AssistantMessage, Content, Cost, DeferredHandle, EventStream, Message, ProviderId,
-    StopReason, ToolCall, ToolCallId, Usage,
+    SharedStr, StopReason, ToolCall, ToolCallId, Usage,
 };
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -432,7 +432,7 @@ fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEv
     let mk = |content: Vec<Content>| {
         let mut p = proto.clone();
         p.content = content;
-        p
+        Arc::new(p)
     };
 
     let mut events = vec![StreamEvent::Start {
@@ -453,7 +453,7 @@ fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEv
                 for chunk in split_by_token_size(text, &mut rng, min, max) {
                     grown.push_str(&chunk);
                     if let Some(Content::Text { text: t, .. }) = cur.get_mut(i) {
-                        *t = grown.clone();
+                        *t = SharedStr::from(&grown);
                     }
                     events.push(StreamEvent::TextDelta {
                         content_index: i,
@@ -466,7 +466,7 @@ fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEv
                 }
                 events.push(StreamEvent::TextEnd {
                     content_index: i,
-                    content: text.clone(),
+                    content: text.to_string(),
                     partial: mk(cur.clone()),
                 });
                 acc = cur;
@@ -482,7 +482,7 @@ fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEv
                 for chunk in split_by_token_size(thinking, &mut rng, min, max) {
                     grown.push_str(&chunk);
                     if let Some(Content::Thinking { thinking: t, .. }) = cur.get_mut(i) {
-                        *t = grown.clone();
+                        *t = SharedStr::from(&grown);
                     }
                     events.push(StreamEvent::ThinkingDelta {
                         content_index: i,
@@ -495,7 +495,7 @@ fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEv
                 }
                 events.push(StreamEvent::ThinkingEnd {
                     content_index: i,
-                    content: thinking.clone(),
+                    content: thinking.to_string(),
                     partial: mk(cur.clone()),
                 });
                 acc = cur;
@@ -506,7 +506,7 @@ fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEv
                 cur.push(Content::ToolCall(ToolCall {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
-                    arguments: serde_json::Map::new(),
+                    arguments: serde_json::Map::new().into(),
                     thought_signature: None,
                 }));
                 events.push(StreamEvent::ToolCallStart {
@@ -555,7 +555,7 @@ struct StreamState {
     events: std::vec::IntoIter<StreamEvent>,
     cancel: Option<cyrup_core::CancelToken>,
     tokens_per_second: Option<f64>,
-    prev_partial: AssistantMessage,
+    prev_partial: Arc<AssistantMessage>,
     done: bool,
 }
 
@@ -592,7 +592,7 @@ pub fn faux_event_stream(
         events: events.into_iter(),
         cancel: options.cancel.clone(),
         tokens_per_second: chunk.tokens_per_second,
-        prev_partial: proto_empty,
+        prev_partial: Arc::new(proto_empty),
         done: false,
     };
     Box::pin(futures::stream::unfold(state, |mut st| async move {
@@ -605,7 +605,7 @@ pub fn faux_event_stream(
             && cancel.is_cancelled()
         {
             st.done = true;
-            let aborted = aborted_message(&st.prev_partial);
+            let aborted = Arc::new(aborted_message(&st.prev_partial));
             return Some((
                 StreamEvent::Error {
                     reason: ErrorReason::Aborted,
@@ -804,7 +804,7 @@ fn content_to_text(content: &[Content]) -> String {
     content
         .iter()
         .map(|b| match b {
-            Content::Text { text, .. } => text.clone(),
+            Content::Text { text, .. } => text.to_string(),
             Content::Image {
                 mime_type, data, ..
             } => {
@@ -820,8 +820,8 @@ fn assistant_content_to_text(content: &[Content]) -> String {
     content
         .iter()
         .map(|b| match b {
-            Content::Text { text, .. } => text.clone(),
-            Content::Thinking { thinking, .. } => thinking.clone(),
+            Content::Text { text, .. } => text.to_string(),
+            Content::Thinking { thinking, .. } => thinking.to_string(),
             Content::ToolCall(tc) => {
                 format!(
                     "{}:{}",
@@ -880,11 +880,11 @@ fn serialize_context(context: &Context) -> String {
 
 // ---- Scripting helpers (func-01 §15; Pi faux.ts:49-94) ----
 
-pub fn faux_text(s: impl Into<String>) -> Content {
+pub fn faux_text(s: impl Into<SharedStr>) -> Content {
     Content::text(s)
 }
 
-pub fn faux_thinking(s: impl Into<String>) -> Content {
+pub fn faux_thinking(s: impl Into<SharedStr>) -> Content {
     Content::thinking(s)
 }
 
@@ -912,7 +912,8 @@ pub fn faux_tool_call_with_id(
         arguments: match arguments {
             serde_json::Value::Object(map) => map,
             _ => serde_json::Map::new(),
-        },
+        }
+        .into(),
         thought_signature: None,
     })
 }

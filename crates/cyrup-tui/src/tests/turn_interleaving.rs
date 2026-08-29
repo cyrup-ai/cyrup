@@ -56,7 +56,7 @@ fn assistant(text: &str, tool: Option<(&str, &str, serde_json::Value)>) -> Assis
         content.push(Content::ToolCall(cyrup_core::ToolCall {
             id: cyrup_core::ToolCallId::from(id),
             name: name.to_string(),
-            arguments,
+            arguments: arguments.into(),
             thought_signature: None,
         }));
     }
@@ -73,13 +73,13 @@ fn assistant_step(
     text: &str,
     tool: Option<(&str, &str, serde_json::Value)>,
 ) {
-    let partial = AssistantMessage::errored(
+    let partial = std::sync::Arc::new(AssistantMessage::errored(
         ProviderId::from("anthropic"),
         "claude",
         None,
         StopReason::Stop,
         "",
-    );
+    ));
     app.ingest_event(&AgentSessionEvent::MessageStart {
         message: AgentMessage::Assistant(partial.clone()),
     });
@@ -92,7 +92,7 @@ fn assistant_step(
         }),
     });
     app.ingest_event(&AgentSessionEvent::MessageEnd {
-        message: AgentMessage::Assistant(assistant(text, tool)),
+        message: AgentMessage::Assistant(std::sync::Arc::new(assistant(text, tool))),
     });
 }
 
@@ -390,24 +390,24 @@ fn ansi256_tool_tints_quantise_exactly_as_pi_does() {
 #[test]
 fn a_forwarded_terminal_then_message_end_commits_the_text_once() {
     let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
-    let partial = AssistantMessage::errored(
+    let partial = std::sync::Arc::new(AssistantMessage::errored(
         ProviderId::from("anthropic"),
         "claude",
         None,
         StopReason::Stop,
         "",
-    );
+    ));
     let final_msg = assistant("only once", None);
     app.ingest_event(&AgentSessionEvent::AgentStart);
     app.ingest_event(&AgentSessionEvent::MessageStart {
         message: AgentMessage::Assistant(partial),
     });
     app.ingest_event(&AgentSessionEvent::MessageUpdate {
-        message: AgentMessage::Assistant(final_msg.clone()),
+        message: AgentMessage::Assistant(std::sync::Arc::new(final_msg.clone())),
         assistant_message_event: Box::new(StreamEvent::terminal(final_msg.clone())),
     });
     app.ingest_event(&AgentSessionEvent::MessageEnd {
-        message: AgentMessage::Assistant(final_msg),
+        message: AgentMessage::Assistant(std::sync::Arc::new(final_msg)),
     });
     app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();

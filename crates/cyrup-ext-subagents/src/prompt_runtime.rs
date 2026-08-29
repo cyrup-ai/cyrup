@@ -1068,9 +1068,9 @@ fn strip_assistant_subagent_tool_calls(message: &AgentMessage) -> Option<AgentMe
     if kept.is_empty() {
         return None;
     }
-    let mut assistant = assistant.clone();
+    let mut assistant = (**assistant).clone();
     assistant.content = kept;
-    Some(AgentMessage::Assistant(assistant))
+    Some(AgentMessage::Assistant(Arc::new(assistant)))
 }
 
 /// The JSON Pointer the caller's whole schema is relocated to once nested under the wrapper's
@@ -2052,7 +2052,7 @@ impl NativeExtension for SubagentPromptRuntime {
                     return HookOutcome::Noop;
                 };
                 let mut content = content.clone();
-                content.push(cyrup_core::Content::Text { text: nudge, text_signature: None });
+                content.push(cyrup_core::Content::Text { text: nudge.into(), text_signature: None });
                 HookOutcome::Mutate(EventPatch::ToolResult {
                     content: Some(content),
                     details: None,
@@ -2331,7 +2331,7 @@ mod tool_budget_runtime_tests {
             name: name.to_string(),
             input: serde_json::json!({}),
             content: vec![cyrup_core::Content::Text {
-                text: "ok".to_string(),
+                text: "ok".into(),
                 text_signature: None,
             }],
             details: None,
@@ -3424,14 +3424,14 @@ mod tests {
             "x",
         );
         msg.content = blocks;
-        AgentMessage::Assistant(msg)
+        AgentMessage::Assistant(std::sync::Arc::new(msg))
     }
 
     fn tool_call_block(name: &str) -> Content {
         Content::ToolCall(cyrup_core::ToolCall {
             id: ToolCallId::from("tc-1"),
             name: name.to_string(),
-            arguments: serde_json::Map::new(),
+            arguments: serde_json::Map::new().into(),
             thought_signature: None,
         })
     }

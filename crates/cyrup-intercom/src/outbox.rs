@@ -2,10 +2,11 @@
 //! the surface through which an extension OTHER than the agent sends an intercom message, and the
 //! ten-code result contract it switches on.
 //!
-//! An extension emits [`INTERCOM_OUTBOX_REQUEST_EVENT`] on the inter-extension bus and receives
-//! exactly one [`INTERCOM_OUTBOX_RESULT_EVENT`] back per `requestId`. The `code` on that result is
-//! the contract: an extension switches on it to decide whether to retry, re-prompt, or give up, so
-//! every variant is reachable from its own condition and none is a catch-all.
+//! An extension emits [`crate::outbox::INTERCOM_OUTBOX_REQUEST_EVENT`] on the inter-extension bus
+//! and receives exactly one [`crate::outbox::INTERCOM_OUTBOX_RESULT_EVENT`] back per `requestId`.
+//! The `code` on that result is the contract: an extension switches on it to decide whether to
+//! retry, re-prompt, or give up, so every variant is reachable from its own condition and none is
+//! a catch-all.
 
 use std::sync::Arc;
 

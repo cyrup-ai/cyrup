@@ -145,7 +145,7 @@ async fn push_text(
         if !close_current(dec, model, api, sink).await {
             return false;
         }
-        dec.blocks.push(Content::text(""));
+        dec.push_block(Content::text(""));
         dec.current = Some(CurrentKind::Text);
         let idx = dec.block_index();
         let partial = dec.snapshot(model, api);
@@ -160,7 +160,7 @@ async fn push_text(
         }
     }
     let idx = dec.block_index();
-    if let Some(Content::Text { text, .. }) = dec.blocks.get_mut(idx) {
+    if let Some(Content::Text { text, .. }) = dec.block_mut(idx) {
         text.push_str(delta);
     }
     let partial = dec.snapshot(model, api);
@@ -184,7 +184,7 @@ async fn push_thinking(
         if !close_current(dec, model, api, sink).await {
             return false;
         }
-        dec.blocks.push(Content::thinking(""));
+        dec.push_block(Content::thinking(""));
         dec.current = Some(CurrentKind::Thinking);
         let idx = dec.block_index();
         let partial = dec.snapshot(model, api);
@@ -199,7 +199,7 @@ async fn push_thinking(
         }
     }
     let idx = dec.block_index();
-    if let Some(Content::Thinking { thinking, .. }) = dec.blocks.get_mut(idx) {
+    if let Some(Content::Thinking { thinking, .. }) = dec.block_mut(idx) {
         thinking.push_str(delta);
     }
     let partial = dec.snapshot(model, api);

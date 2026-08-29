@@ -55,7 +55,7 @@ fn first_user_text(messages: &[Message]) -> Option<String> {
             content
                 .iter()
                 .filter_map(|c| match c {
-                    Content::Text { text, .. } => Some(text.clone()),
+                    Content::Text { text, .. } => Some(text.to_string()),
                     _ => None,
                 })
                 .collect::<String>(),

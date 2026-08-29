@@ -131,7 +131,7 @@ async fn decodes_multichunk_tool_call() {
     assert_eq!(tc.id.as_str(), "call_9");
     assert_eq!(tc.name, "add");
     assert_eq!(
-        serde_json::Value::Object(tc.arguments),
+        serde_json::Value::Object(tc.arguments.into()),
         json!({ "a": 1, "b": 2 })
     );
 
@@ -211,7 +211,7 @@ async fn decodes_reasoning_to_thinking() {
                 message.content,
                 vec![
                     Content::Thinking {
-                        thinking: "think hard".to_string(),
+                        thinking: "think hard".into(),
                         thinking_signature: Some("reasoning_content".to_string()),
                         redacted: false,
                     },

@@ -500,7 +500,7 @@ async fn a_02_4_before_tool_call_block() {
     let blocked = blocked.expect("a tool-result message");
     assert!(blocked.is_error);
     let text = match &blocked.content[0] {
-        Content::Text { text, .. } => text.clone(),
+        Content::Text { text, .. } => text.to_string(),
         _ => panic!("text content"),
     };
     assert!(text.contains("nope"), "block reason surfaced: {text}");
@@ -550,7 +550,7 @@ async fn a_02_5_after_tool_call_details_only_replace() {
         .expect("tool result");
     // content untouched (replace-not-merge: only details provided)
     let text = match &tr.content[0] {
-        Content::Text { text, .. } => text.clone(),
+        Content::Text { text, .. } => text.to_string(),
         _ => panic!("text"),
     };
     assert!(text.starts_with("echo:"), "content kept: {text}");
@@ -725,7 +725,7 @@ impl StreamFn for BlockingStreamFn {
             StreamEvent::terminal(message)
         });
         let start = StreamEvent::Start {
-            partial: faux_assistant_message(Vec::new(), StopReason::Stop),
+            partial: Arc::new(faux_assistant_message(Vec::new(), StopReason::Stop)),
         };
         Box::pin(futures::stream::iter(vec![start]).chain(tail))
     }

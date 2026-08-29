@@ -1,12 +1,13 @@
 //! Response decoding — per-event block handling and event emission.
 
 use super::blocks::{Block, Decoder};
+use std::sync::Arc;
 use super::claude_code::remap_decoded_tool_name;
 use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
 use crate::utils::json_parse::parse_streaming_json_object;
-use cyrup_core::{ApiId, AssistantMessage, StopReason, ToolCall, ToolCallId};
+use cyrup_core::{ApiId, AssistantMessage, SharedStr, StopReason, ToolCall, ToolCallId};
 use serde_json::Value;
 
 pub(super) async fn process_block_start(
@@ -26,13 +27,9 @@ pub(super) async fn process_block_start(
             // Seed from the payload Anthropic ships on the open event (Pi
             // `text: event.content_block.text ?? ""`, anthropic-messages.ts:591). Dropping it loses
             // the first chunk of the block whenever the server front-loads text here.
-            dec.blocks.push(Block::Text {
+            dec.push_block(Block::Text {
                 index,
-                text: cb
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
+                text: cb.get("text").and_then(Value::as_str).unwrap_or("").into(),
             });
             send_with_pos(dec, model, api, sink, |pos, partial| {
                 StreamEvent::TextStart {
@@ -48,13 +45,9 @@ pub(super) async fn process_block_start(
             // 599-600). The signature especially: a thinking block replayed back to Anthropic
             // without its signature is rejected, so a server that delivers the signature on the
             // open event (and never as a `signature_delta`) must not have it discarded.
-            dec.blocks.push(Block::Thinking {
+            dec.push_block(Block::Thinking {
                 index,
-                thinking: cb
-                    .get("thinking")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
+                thinking: cb.get("thinking").and_then(Value::as_str).unwrap_or("").into(),
                 signature: cb
                     .get("signature")
                     .and_then(Value::as_str)
@@ -76,9 +69,9 @@ pub(super) async fn process_block_start(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            dec.blocks.push(Block::Thinking {
+            dec.push_block(Block::Thinking {
                 index,
-                thinking: "[Reasoning redacted]".to_string(),
+                thinking: "[Reasoning redacted]".into(),
                 signature: data,
                 redacted: true,
             });
@@ -104,11 +97,11 @@ pub(super) async fn process_block_start(
             } else {
                 raw_name.to_string()
             };
-            dec.blocks.push(Block::Tool {
+            dec.push_block(Block::Tool {
                 index,
                 id,
                 name,
-                partial_json: String::new(),
+                partial_json: SharedStr::new(),
             });
             send_with_pos(dec, model, api, sink, |pos, partial| {
                 StreamEvent::ToolCallStart {
@@ -141,7 +134,7 @@ pub(super) async fn process_block_delta(
     match delta.get("type").and_then(Value::as_str) {
         Some("text_delta") => {
             let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
-            if let Some(Block::Text { text: acc, .. }) = dec.blocks.get_mut(pos) {
+            if let Some(Block::Text { text: acc, .. }) = dec.block_mut(pos) {
                 acc.push_str(text);
             }
             let partial = dec.snapshot(model, api);
@@ -154,7 +147,7 @@ pub(super) async fn process_block_delta(
         }
         Some("thinking_delta") => {
             let text = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
-            if let Some(Block::Thinking { thinking, .. }) = dec.blocks.get_mut(pos) {
+            if let Some(Block::Thinking { thinking, .. }) = dec.block_mut(pos) {
                 thinking.push_str(text);
             }
             let partial = dec.snapshot(model, api);
@@ -170,7 +163,9 @@ pub(super) async fn process_block_delta(
                 .get("partial_json")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if let Some(Block::Tool { partial_json, .. }) = dec.blocks.get_mut(pos) {
+            if let Some(Block::Tool { partial_json, .. }) = dec.block_mut(pos) {
+                // O(delta): the append is amortised and no parse happens here at all — see
+                // [`SharedStr`] and [`LazyArgs`](cyrup_core::LazyArgs) (PERF-001).
                 partial_json.push_str(text);
             }
             let partial = dec.snapshot(model, api);
@@ -183,7 +178,7 @@ pub(super) async fn process_block_delta(
         }
         Some("signature_delta") => {
             let sig = delta.get("signature").and_then(Value::as_str).unwrap_or("");
-            if let Some(Block::Thinking { signature, .. }) = dec.blocks.get_mut(pos) {
+            if let Some(Block::Thinking { signature, .. }) = dec.block_mut(pos) {
                 signature.push_str(sig);
             }
             true // signature deltas do not emit a stream event (Pi anthropic-messages.ts:640-647)
@@ -208,12 +203,12 @@ pub(super) async fn process_block_stop(
     let ev = match dec.blocks.get(pos) {
         Some(Block::Text { text, .. }) => StreamEvent::TextEnd {
             content_index: pos,
-            content: text.clone(),
+            content: text.to_string(),
             partial,
         },
         Some(Block::Thinking { thinking, .. }) => StreamEvent::ThinkingEnd {
             content_index: pos,
-            content: thinking.clone(),
+            content: thinking.to_string(),
             partial,
         },
         Some(Block::Tool {
@@ -226,7 +221,7 @@ pub(super) async fn process_block_stop(
             tool_call: ToolCall {
                 id: ToolCallId::from(id.as_str()),
                 name: name.clone(),
-                arguments: parse_streaming_json_object(Some(partial_json)),
+                arguments: parse_streaming_json_object(Some(partial_json)).into(),
                 thought_signature: None,
             },
             partial,
@@ -238,14 +233,14 @@ pub(super) async fn process_block_stop(
 
 /// Push a `*_start` event for the just-pushed block (its position is `len-1`).
 async fn send_with_pos<F>(
-    dec: &Decoder,
+    dec: &mut Decoder,
     model: &Model,
     api: &ApiId,
     sink: &EventSink,
     make: F,
 ) -> bool
 where
-    F: FnOnce(usize, AssistantMessage) -> StreamEvent,
+    F: FnOnce(usize, Arc<AssistantMessage>) -> StreamEvent,
 {
     let pos = dec.blocks.len().saturating_sub(1);
     let partial = dec.snapshot(model, api);
@@ -262,8 +257,14 @@ pub(super) async fn finish_blocks(_dec: &Decoder, _model: &Model, _api: &ApiId, 
 
 /// Emit a terminal error event carrying the partial snapshot's content (Pi's catch block,
 /// anthropic-messages.ts:727-736).
-pub(super) async fn emit_error(dec: &Decoder, model: &Model, api: &ApiId, sink: &EventSink, message: String) {
-    let mut msg = dec.snapshot(model, api);
+pub(super) async fn emit_error(
+    dec: &mut Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+    message: String,
+) {
+    let mut msg = dec.snapshot_owned(model, api);
     msg.stop_reason = StopReason::Error;
     msg.error_message = Some(message);
     sink.send(StreamEvent::terminal(msg)).await;

@@ -164,7 +164,10 @@ pub use utils::estimate::{
     ContextUsageEstimate, calculate_context_tokens, estimate_context_tokens,
     estimate_message_tokens, estimate_text_tokens,
 };
-pub use utils::json_parse::{parse_streaming_json, parse_streaming_json_object, repair_json};
+pub use utils::json_parse::{
+    JsonShape, StreamingArgs, parse_streaming_json, parse_streaming_json_object,
+    parse_streaming_json_object_incomplete, repair_json,
+};
 pub use utils::node_http_proxy::{
     ProxyError, UNSUPPORTED_PROXY_PROTOCOL_MESSAGE, resolve_http_proxy_url_for_target,
 };

@@ -11,7 +11,7 @@
 //! ## Engine decision, 2026-08-28
 //! pi calls `render()` from the JS package `grok-mermaid` (`mermaid.ts:2`). The Rust counterpart
 //! chosen here is the [`mermaid_text`] crate (MIT), driven source-to-text through
-//! [`mermaid_text::render`]. See the workspace `Cargo.toml` for why `mermansi` was rejected after
+//! [`fn@mermaid_text::render`]. See the workspace `Cargo.toml` for why `mermansi` was rejected after
 //! being tried first (it forces `serde_json/preserve_order` on the whole workspace).
 //!
 //! ## Span classes are INFERRED FROM THE RENDERED GEOMETRY
@@ -58,7 +58,7 @@
 //! * Geometry is indexed by DISPLAY column, so a zero-width combining mark inside a label shifts
 //!   the columns after it on that row and can misclassify its tail.
 //!
-//! [`mermaid_text::render`] is used rather than `render_with_width`: the latter compacts the gap
+//! [`fn@mermaid_text::render`] is used rather than `render_with_width`: the latter compacts the gap
 //! configuration to fit a budget, which pi never does. pi measures the finished art and falls back
 //! to the raw fence when it does not fit (`mermaid.ts:76`), so the width check below stays ours.
 //!

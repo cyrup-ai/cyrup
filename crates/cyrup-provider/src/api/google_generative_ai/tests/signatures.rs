@@ -16,7 +16,7 @@ fn keeps_signed_empty_thinking_block() {
         "gemini-3-pro-preview",
         vec![
             Content::Thinking {
-                thinking: String::new(),
+                thinking: "".into(),
                 thinking_signature: Some(VALID_SIG.to_string()),
                 redacted: false,
             },
@@ -43,7 +43,7 @@ fn keeps_signed_empty_text_block() {
         "gemini-3-pro-preview",
         vec![
             Content::Text {
-                text: String::new(),
+                text: "".into(),
                 text_signature: Some(VALID_SIG.to_string()),
             },
             a_tool_call(),
@@ -70,12 +70,12 @@ fn still_drops_unsigned_empty_blocks() {
         "gemini-3-pro-preview",
         vec![
             Content::Thinking {
-                thinking: String::new(),
+                thinking: "".into(),
                 thinking_signature: None,
                 redacted: false,
             },
             Content::Text {
-                text: "   ".to_string(),
+                text: "   ".into(),
                 text_signature: None,
             },
             a_tool_call(),
@@ -97,7 +97,7 @@ fn still_drops_empty_block_with_invalid_signature() {
         "gemini-3-pro-preview",
         vec![
             Content::Text {
-                text: String::new(),
+                text: "".into(),
                 text_signature: Some("not base64!".to_string()),
             },
             a_tool_call(),
@@ -121,12 +121,12 @@ fn cross_provider_drops_signed_empty_blocks_unconditionally() {
         "other-model",
         vec![
             Content::Thinking {
-                thinking: String::new(),
+                thinking: "".into(),
                 thinking_signature: Some(VALID_SIG.to_string()),
                 redacted: false,
             },
             Content::Text {
-                text: String::new(),
+                text: "".into(),
                 text_signature: Some(VALID_SIG.to_string()),
             },
             a_tool_call(),
@@ -147,7 +147,7 @@ fn cross_provider_keeps_non_empty_thinking_as_text() {
         "google",
         "other-model",
         vec![Content::Thinking {
-            thinking: "reasoned".to_string(),
+            thinking: "reasoned".into(),
             thinking_signature: Some(VALID_SIG.to_string()),
             redacted: false,
         }],

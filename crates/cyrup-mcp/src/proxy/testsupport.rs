@@ -262,7 +262,7 @@ pub(crate) fn ctx_with(
 
 pub(crate) fn text_of(result: &ToolResult) -> String {
     match result.content.first() {
-        Some(Content::Text { text, .. }) => text.clone(),
+        Some(Content::Text { text, .. }) => text.to_string(),
         other => panic!("expected text content, got {other:?}"),
     }
 }

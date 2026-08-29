@@ -54,7 +54,7 @@ fn request_body_matches_openai_shape() {
                     arguments: json!({ "city": "Paris" })
                         .as_object()
                         .cloned()
-                        .expect("object"),
+                        .expect("object").into(),
                     thought_signature: None,
                 })],
                 provider: "together".into(),

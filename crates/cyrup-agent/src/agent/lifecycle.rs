@@ -11,7 +11,7 @@ use crate::error::{AgentError, BusyEntry, ContinueSurface};
 use crate::event::{AgentEvent, AgentMessage};
 use crate::state::{reduce, GenerationConfig, StateInner};
 use crate::subscriber::EventSubscriber;
-use cyrup_core::{Content, RunCancel, StopReason};
+use cyrup_core::{Content, RunCancel, SharedStr, StopReason};
 use futures::future::FutureExt;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, watch};
@@ -155,7 +155,7 @@ impl Agent {
     /// so it carries the identical AGENT-034 fast-path check.
     pub async fn prompt_with_images(
         &self,
-        text: impl Into<String>,
+        text: impl Into<SharedStr>,
         images: Vec<Content>,
     ) -> Result<RunHandle, AgentError> {
         if self.is_running() {
@@ -346,7 +346,7 @@ impl Agent {
                         stop_reason,
                         error_message,
                     );
-                    let fm = AgentMessage::Assistant(failure);
+                    let fm = AgentMessage::Assistant(Arc::new(failure));
                     emit_standalone(
                         &fail_subs,
                         &fail_state,

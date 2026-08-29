@@ -254,7 +254,7 @@ pub(super) fn last_assistant(events: &[AgentEvent]) -> AssistantMessage {
         .iter()
         .rev()
         .find_map(|e| match e {
-            AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) } => Some(a.clone()),
+            AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) } => Some((**a).clone()),
             _ => None,
         })
         .expect("an assistant message_end")

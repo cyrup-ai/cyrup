@@ -241,7 +241,7 @@ pub(super) fn mark_activity(scroll: &mut ScrollState) {
 /// `updateLayout(contentHeight, viewportHeight, requestRender)`
 /// (`components/scroll-view.ts:181-193`), minus the render callback cyrup's loop does not need.
 ///
-/// This is where `follow: end` earns its keep: while [`is_following_end`] holds, the offset is
+/// This is where `follow: end` earns its keep: while `is_following_end` holds, the offset is
 /// pulled to the new bottom, so output appended since the last frame is on screen without the user
 /// asking (`:186`). Otherwise the offset only ever shrinks to fit (`:187`), so a user reading
 /// history is not yanked anywhere. Reaching the bottom by shrinkage re-arms the follow

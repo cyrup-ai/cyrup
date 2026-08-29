@@ -190,7 +190,7 @@ pub(super) fn build_assistant(
                     "type": "tool_use",
                     "id": tc.id.as_str(),
                     "name": name,
-                    "input": Value::Object(tc.arguments.clone()),
+                    "input": Value::Object((*tc.arguments).clone()),
                 }));
             }
             _ => {}

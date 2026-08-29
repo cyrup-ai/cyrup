@@ -1,9 +1,10 @@
 //! The extension-bus frames and the shared `extensions`-field validators
 //! (`v0.9.2 broker/broker.ts:446-456,551-585,961-969,1159-1182`).
 //!
-//! ICOM-016 landed the bus EFFECTS, so the broker now advertises [`EXTENSION_BUS_FEATURE`] on
-//! `registered` and a conforming pi client sends these frames as a matter of course. This module
-//! owns all four halves: the capability bookkeeping, the per-namespace owner election
+//! ICOM-016 landed the bus EFFECTS, so the broker now advertises
+//! [`EXTENSION_BUS_FEATURE`](crate::transport::protocol::EXTENSION_BUS_FEATURE) on `registered` and
+//! a conforming pi client sends these frames as a matter of course. This module owns all four
+//! halves: the capability bookkeeping, the per-namespace owner election
 //! ([`BrokerState::recompute_namespace_owners`]), the `extension_publish` fan-out, and the
 //! revision-checked commit that drives [`super::extension_state`].
 //!

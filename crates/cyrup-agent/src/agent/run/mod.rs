@@ -210,7 +210,7 @@ impl RunCtx {
             stop_reason,
             error_message,
         );
-        let fm = AgentMessage::Assistant(failure);
+        let fm = AgentMessage::Assistant(Arc::new(failure));
         // This IS Pi's catch handler, so a subscriber that fails while it runs has nowhere further
         // to unwind (pi's throw would escape `runWithLifecycle` entirely and reach the caller of
         // `prompt()`); the closing quartet is emitted best-effort.

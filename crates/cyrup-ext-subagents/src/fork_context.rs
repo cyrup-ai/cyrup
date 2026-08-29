@@ -847,7 +847,7 @@ mod tests {
 
     fn thinking(signature: Option<&str>, redacted: bool) -> Content {
         Content::Thinking {
-            thinking: "chain of thought".to_string(),
+            thinking: "chain of thought".into(),
             thinking_signature: signature.map(str::to_string),
             redacted,
         }

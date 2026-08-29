@@ -41,7 +41,7 @@ pub(crate) fn coding_agent_convert_to_llm(msgs: &[AgentMessage]) -> Vec<Message>
             AgentMessage::User { content, timestamp } => {
                 out.push(Message::User { content: content.clone(), timestamp: timestamp.unwrap_or(0) });
             }
-            AgentMessage::Assistant(a) => out.push(Message::Assistant(a.clone())),
+            AgentMessage::Assistant(a) => out.push(Message::Assistant((**a).clone())),
             AgentMessage::ToolResult(t) => out.push(Message::ToolResult {
                 tool_call_id: t.tool_call_id.clone(),
                 tool_name: t.tool_name.clone(),

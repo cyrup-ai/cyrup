@@ -36,11 +36,11 @@ fn new_app() -> App<TestBackend> {
 }
 
 fn thinking(t: &str) -> Content {
-    Content::Thinking { thinking: t.to_string(), thinking_signature: None, redacted: false }
+    Content::Thinking { thinking: t.into(), thinking_signature: None, redacted: false }
 }
 
 fn text(t: &str) -> Content {
-    Content::Text { text: t.to_string(), text_signature: None }
+    Content::Text { text: t.into(), text_signature: None }
 }
 
 /// An assistant message shell (no content) — the `partial` a streaming frame carries.
@@ -73,14 +73,14 @@ fn done(content: Vec<Content>) -> StreamEvent {
 fn feed(app: &mut App<TestBackend>, ev: StreamEvent) {
     let terminal = ev.terminal_message().cloned();
     app.ingest_event(&AgentSessionEvent::MessageStart {
-        message: AgentMessage::Assistant(blank()),
+        message: AgentMessage::Assistant(std::sync::Arc::new(blank())),
     });
     match terminal {
         Some(message) => app.ingest_event(&AgentSessionEvent::MessageEnd {
             message: AgentMessage::Assistant(message),
         }),
         None => app.ingest_event(&AgentSessionEvent::MessageUpdate {
-            message: AgentMessage::Assistant(blank()),
+            message: AgentMessage::Assistant(std::sync::Arc::new(blank())),
             assistant_message_event: Box::new(ev),
         }),
     }
@@ -116,7 +116,7 @@ fn streaming_thinking_deltas_render_in_the_live_viewport() {
             StreamEvent::ThinkingDelta {
                 content_index: 0,
                 delta: chunk.to_string(),
-                partial: blank(),
+                partial: std::sync::Arc::new(blank()),
             },
         );
     }
@@ -206,7 +206,7 @@ fn interrupt_discards_the_live_reasoning() {
         StreamEvent::ThinkingDelta {
             content_index: 0,
             delta: REASONING.to_string(),
-            partial: blank(),
+            partial: std::sync::Arc::new(blank()),
         },
     );
     app.transcript_mut().discard_streaming();

@@ -144,7 +144,7 @@ fn cfg() -> HostConfig {
 fn assert_blocked(result: &cyrup_agent::ToolResultMessage) {
     assert!(result.is_error, "a fault-blocked call yields an isError tool result");
     let text = match &result.content[0] {
-        Content::Text { text, .. } => text.clone(),
+        Content::Text { text, .. } => text.to_string(),
         other => panic!("expected text content, got {other:?}"),
     };
     assert!(

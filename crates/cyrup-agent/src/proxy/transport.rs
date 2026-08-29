@@ -177,7 +177,10 @@ fn error_terminal(
     let mut error = builder.partial().clone();
     error.stop_reason = reason.into();
     error.error_message = Some(message);
-    StreamEvent::Error { reason, error }
+    StreamEvent::Error {
+        reason,
+        error: std::sync::Arc::new(error),
+    }
 }
 
 #[cfg(test)]

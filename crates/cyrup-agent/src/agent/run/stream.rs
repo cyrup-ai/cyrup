@@ -2,6 +2,7 @@
 //! `message_start`..`message_end` pair — including on abort — so the caller's closing sequence is
 //! complete.
 
+use std::sync::Arc;
 use super::{RunCtx, RunFailure};
 use crate::agent::message::{empty_assistant, errored_assistant};
 use crate::event::{AgentEvent, AgentMessage};
@@ -144,7 +145,10 @@ impl RunCtx {
         // `partial` snapshot (Pi `event.partial`, agent-loop.ts:313-340): distinct text / thinking /
         // toolCall content blocks (with signatures) and streaming tool-call args — NOT a single
         // collapsed text block. The provider exposes this via `StreamEvent::partial()` (stream.rs).
-        let mut partial = empty_assistant(&model);
+        // The running partial is held as a SHARED handle: refreshing it from each event, and
+        // re-emitting it on `message_update`, were three deep copies of the whole message per
+        // delta (PERF-001).
+        let mut partial = Arc::new(empty_assistant(&model));
         let mut final_msg: Option<AssistantMessage> = None;
 
         'consume: loop {
@@ -167,11 +171,11 @@ impl RunCtx {
                     // `output.errorMessage = error.message` (anthropic-messages.ts:718,733-734; the
                     // faux provider's `createAbortedMessage` uses the same string, faux.ts:291-297) —
                     // NOT the bare `"aborted"`.
-                    let mut aborted = partial.clone();
+                    let mut aborted = (*partial).clone();
                     aborted.stop_reason = StopReason::Aborted;
                     aborted.error_message = Some("Request was aborted".to_string());
                     self.emit(AgentEvent::MessageEnd {
-                        message: AgentMessage::Assistant(aborted.clone()),
+                        message: AgentMessage::Assistant(Arc::new(aborted.clone())),
                     })
                     .await?;
                     return Ok(aborted);
@@ -199,11 +203,11 @@ impl RunCtx {
                         // Break out of the consume loop so a (non-conforming) post-terminal event can
                         // neither emit a stray `message_update` nor overwrite the final `partial`.
                         StreamEvent::Done { message, .. } => {
-                            final_msg = Some(message.clone());
+                            final_msg = Some((**message).clone());
                             break 'consume;
                         }
                         StreamEvent::Error { error, .. } => {
-                            final_msg = Some(error.clone());
+                            final_msg = Some((**error).clone());
                             break 'consume;
                         }
                         // Every other event is a content-block start/delta/end (text, thinking, OR
@@ -235,11 +239,13 @@ impl RunCtx {
         });
         if !started {
             self.emit(AgentEvent::MessageStart {
-                message: AgentMessage::Assistant(final_msg.clone()),
+                message: AgentMessage::Assistant(Arc::new(final_msg.clone())),
             })
             .await?;
         }
-        self.emit(AgentEvent::MessageEnd { message: AgentMessage::Assistant(final_msg.clone()) })
+        self.emit(AgentEvent::MessageEnd {
+            message: AgentMessage::Assistant(Arc::new(final_msg.clone())),
+        })
             .await?;
         Ok(final_msg)
     }

@@ -1,7 +1,8 @@
 //! Stream decoding (Pi processResponsesStream, openai-responses-shared.ts:295-531):
 //! the decoder state and the SSE frame loop.
 
-use super::blocks::{RBlock, blocks_to_content};
+use super::blocks::{RBlock, project_block};
+use crate::api::content_cache::ContentCache;
 use super::errors::emit_error;
 use super::events::{ProcessResult, process_event};
 use super::slots::SlotKind;
@@ -11,6 +12,7 @@ use crate::model::Model;
 use crate::stream::sse::SseFrame;
 use crate::stream::StreamEvent;
 use crate::utils::provider_plumbing::now_millis;
+use std::sync::Arc;
 use cyrup_core::{ApiId, AssistantMessage, StopReason, Usage};
 use futures::{Stream, StreamExt};
 use serde_json::Value;
@@ -18,6 +20,9 @@ use std::collections::HashMap;
 
 pub(super) struct RDecoder {
     pub(super) blocks: Vec<RBlock>,
+    /// Memoised projection of `blocks` (PERF-001). Write to `blocks` ONLY through
+    /// [`Self::push_block`] and [`Self::block_mut`], or this goes stale.
+    cache: ContentCache,
     /// Active output-index → (block position, kind). Removed on `output_item.done`.
     pub(super) slots: HashMap<i64, (usize, SlotKind)>,
     pub(super) usage: Usage,
@@ -39,6 +44,7 @@ impl Default for RDecoder {
     fn default() -> Self {
         Self {
             blocks: Vec::new(),
+            cache: ContentCache::default(),
             slots: HashMap::new(),
             usage: Usage::default(),
             response_id: None,
@@ -54,9 +60,39 @@ impl Default for RDecoder {
 }
 
 impl RDecoder {
-    pub(super) fn snapshot(&self, model: &Model, api: &ApiId) -> AssistantMessage {
+    /// Append a block. The ONLY push — it keeps [`ContentCache`] in step (PERF-001).
+    pub(super) fn push_block(&mut self, block: RBlock) {
+        self.blocks.push(block);
+        self.cache.push();
+    }
+
+    /// The ONLY `&mut RBlock`. Invalidates exactly that block's memo (PERF-001).
+    pub(super) fn block_mut(&mut self, pos: usize) -> Option<&mut RBlock> {
+        self.cache.invalidate(pos);
+        self.blocks.get_mut(pos)
+    }
+
+    /// The content projection, recomputing only the blocks whose memo was invalidated.
+    fn content(&mut self) -> Vec<cyrup_core::Content> {
+        let (cache, blocks) = (&mut self.cache, &self.blocks);
+        cache.project(blocks, project_block)
+    }
+
+    /// The live `partial`, as a SHARED handle (PERF-001).
+    ///
+    /// Every non-terminal event carries this message and it is then cloned again by the
+    /// agent loop, by `MessageUpdate`, and once per live subscriber. Handing out an `Arc`
+    /// turns those into refcount bumps; the wire bytes are unchanged because serde's `rc`
+    /// feature serializes an `Arc<T>` transparently as `T`.
+    pub(super) fn snapshot(&mut self, model: &Model, api: &ApiId) -> Arc<AssistantMessage> {
+        Arc::new(self.snapshot_owned(model, api))
+    }
+
+    /// The same message, owned, for the terminal paths that stamp a stop reason onto it
+    /// before handing it to [`StreamEvent::terminal`]/[`StreamEvent::end_of_stream`].
+    pub(super) fn snapshot_owned(&mut self, model: &Model, api: &ApiId) -> AssistantMessage {
         AssistantMessage {
-            content: blocks_to_content(&self.blocks),
+            content: self.content(),
             provider: model.provider.clone(),
             model: model.id.as_str().to_string(),
             api: api.clone(),
@@ -116,7 +152,7 @@ where
         }
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             emit_error(
-                &dec,
+                &mut dec,
                 model,
                 api,
                 sink,
@@ -129,7 +165,7 @@ where
             ProcessResult::Continue => {}
             ProcessResult::Dropped => return,
             ProcessResult::Error(msg) => {
-                emit_error(&dec, model, api, sink, msg).await;
+                emit_error(&mut dec, model, api, sink, msg).await;
                 return;
             }
         }
@@ -149,7 +185,7 @@ where
     // the fallback is applied here, the same guard `bedrock_converse_stream.rs:454-457` carries.
     // The `|| "An unknown error occurred"` fallback dates to `v0.83.0 openai-responses.ts:174`
     // (unconditional there), so this is a PORT BUG at the ported baseline, not version lag.
-    let mut message = dec.snapshot(model, api);
+    let mut message = dec.snapshot_owned(model, api);
     if dec.saw_terminal && dec.stop_reason == StopReason::Error && message.error_message.is_none() {
         message.error_message = Some("An unknown error occurred".to_string());
     }

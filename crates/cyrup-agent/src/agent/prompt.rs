@@ -2,7 +2,7 @@
 
 use super::util::now_millis;
 use crate::event::AgentMessage;
-use cyrup_core::Content;
+use cyrup_core::{Content, SharedStr};
 
 // ---------------------------------------------------------------------------
 // Public entry-point helpers
@@ -16,7 +16,7 @@ pub struct PromptInput {
 impl PromptInput {
     /// A single user message carrying `text` followed by image attachments (Pi
     /// `normalizePromptInput`, agent.ts:379-383): `[{type:"text"}, ...images]`.
-    pub fn text_with_images(text: impl Into<String>, images: Vec<Content>) -> Self {
+    pub fn text_with_images(text: impl Into<SharedStr>, images: Vec<Content>) -> Self {
         let mut content = vec![Content::text(text)];
         content.extend(images);
         // Pi `normalizePromptInput` stamps the string-input user message with `Date.now()`

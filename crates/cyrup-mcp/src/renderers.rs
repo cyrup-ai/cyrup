@@ -554,7 +554,7 @@ impl McpContentBlock {
     #[must_use]
     pub fn into_core(self) -> cyrup_core::Content {
         match self {
-            Self::Text(text) => cyrup_core::Content::Text { text, text_signature: None },
+            Self::Text(text) => cyrup_core::Content::Text { text: text.into(), text_signature: None },
             Self::Image { data, mime_type } => cyrup_core::Content::Image { data, mime_type },
         }
     }
@@ -568,8 +568,8 @@ impl McpContentBlock {
     #[must_use]
     pub fn from_core(content: &cyrup_core::Content) -> Self {
         match content {
-            cyrup_core::Content::Text { text, .. } => Self::Text(text.clone()),
-            cyrup_core::Content::Thinking { thinking, .. } => Self::Text(thinking.clone()),
+            cyrup_core::Content::Text { text, .. } => Self::Text(text.to_string()),
+            cyrup_core::Content::Thinking { thinking, .. } => Self::Text(thinking.to_string()),
             cyrup_core::Content::ToolCall(_) => Self::Text(String::new()),
             cyrup_core::Content::Image { data, mime_type } => {
                 Self::Image { data: data.clone(), mime_type: mime_type.clone() }

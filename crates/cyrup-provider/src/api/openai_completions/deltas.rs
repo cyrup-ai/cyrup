@@ -5,7 +5,7 @@ use super::decode::REASONING_FIELDS;
 use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
-use cyrup_core::ApiId;
+use cyrup_core::{ApiId, SharedStr};
 use serde_json::Value;
 
 /// The id of a `reasoning.encrypted` detail (Pi `isEncryptedReasoningDetail`): requires
@@ -37,7 +37,7 @@ pub(super) async fn ensure_text_block(
         return Some(idx);
     }
     let idx = dec.blocks.len();
-    dec.blocks.push(Block::Text(String::new()));
+    dec.push_block(Block::Text(SharedStr::new()));
     dec.text_idx = Some(idx);
     let partial = dec.snapshot(model, api);
     if !sink
@@ -65,8 +65,8 @@ pub(super) async fn ensure_thinking_block(
         return Some(idx);
     }
     let idx = dec.blocks.len();
-    dec.blocks.push(Block::Thinking {
-        text: String::new(),
+    dec.push_block(Block::Thinking {
+        text: SharedStr::new(),
         signature: Some(signature.to_string()),
     });
     dec.thinking_idx = Some(idx);
@@ -116,10 +116,10 @@ pub(super) async fn process_tool_call_delta(
         Some(idx) => idx,
         None => {
             let idx = dec.blocks.len();
-            dec.blocks.push(Block::Tool {
+            dec.push_block(Block::Tool {
                 id: id.unwrap_or("").to_string(),
                 name: name.unwrap_or("").to_string(),
-                args: String::new(),
+                args: SharedStr::new(),
                 thought_signature: None,
             });
             if let Some(si) = stream_index {
@@ -151,7 +151,7 @@ pub(super) async fn process_tool_call_delta(
         name: bname,
         args,
         thought_signature,
-    }) = dec.blocks.get_mut(idx)
+    }) = dec.block_mut(idx)
     {
         if let Some(i) = id
             && bid.is_empty()
@@ -164,6 +164,8 @@ pub(super) async fn process_tool_call_delta(
             *bname = n.to_string();
         }
         if !args_fragment.is_empty() {
+            // O(delta): the append is amortised and no parse happens here at all — see
+            // [`SharedStr`] and [`LazyArgs`](cyrup_core::LazyArgs) (PERF-001).
             args.push_str(args_fragment);
         }
         if let Some(sig) = pending {

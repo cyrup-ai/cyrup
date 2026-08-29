@@ -71,7 +71,7 @@ fn tool_result_text(result: &cyrup_core::ToolResult) -> String {
         .content
         .iter()
         .find_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .unwrap_or_default()

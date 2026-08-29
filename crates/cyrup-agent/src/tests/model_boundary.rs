@@ -489,10 +489,10 @@ async fn gap19_continue_from_assistant_skips_initial_steering_poll() {
         faux_assistant_message(vec![faux_text("a2")], StopReason::Stop),
     ]);
     let agent = Agent::builder(model_ref(), sf)
-        .messages(vec![AgentMessage::Assistant(faux_assistant_message(
+        .messages(vec![AgentMessage::Assistant(Arc::new(faux_assistant_message(
             vec![faux_text("seed")],
             StopReason::Stop,
-        ))])
+        )))])
         .build();
     agent.steer(AgentMessage::user_text("steer-1"));
     agent.steer(AgentMessage::user_text("steer-2"));
@@ -505,7 +505,7 @@ async fn gap19_continue_from_assistant_skips_initial_steering_poll() {
     let events = rec.snapshot();
     let user_text = |m: &AgentMessage| match m {
         AgentMessage::User { content, .. } => content.iter().find_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         }),
         _ => None,

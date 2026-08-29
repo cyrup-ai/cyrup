@@ -82,7 +82,7 @@ fn queued(app: &mut App<TestBackend>, steering: &[&str], follow_up: &[&str]) {
 fn dispatched(app: &mut App<TestBackend>, text: &str) {
     app.ingest_event(&AgentSessionEvent::MessageStart {
         message: AgentMessage::User {
-            content: vec![Content::Text { text: text.to_string(), text_signature: None }],
+            content: vec![Content::Text { text: text.into(), text_signature: None }],
             timestamp: None,
         },
     });

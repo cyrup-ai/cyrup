@@ -1,14 +1,14 @@
 //! Stream decoding (Pi processResponsesStream, openai-responses-shared.ts:295-531):
 //! per-event dispatch.
 
-use super::blocks::{RBlock, blocks_to_content};
+use super::blocks::{RBlock, project_block};
 use super::decoder::RDecoder;
 use super::finalize::finalize_response;
 use super::slots::{SlotKind, create_slot, get_or_create_slot};
 use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
-use cyrup_core::{ApiId, Content, TextPhase, TextSignatureV1, ToolCall, ToolCallId};
+use cyrup_core::{ApiId, Content, SharedStr, TextPhase, TextSignatureV1, ToolCall, ToolCallId};
 use serde_json::{Map, Value};
 
 pub(super) enum ProcessResult {
@@ -68,7 +68,7 @@ pub(super) async fn process_event(
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
             let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
             if let Some(ci) = dec.slot(oi, SlotKind::Thinking) {
-                if let Some(RBlock::Thinking { thinking, .. }) = dec.blocks.get_mut(ci) {
+                if let Some(RBlock::Thinking { thinking, .. }) = dec.block_mut(ci) {
                     thinking.push_str(delta);
                 }
                 emit!(StreamEvent::ThinkingDelta {
@@ -80,7 +80,7 @@ pub(super) async fn process_event(
         }
         "response.reasoning_summary_part.done" => {
             if let Some(ci) = dec.slot(oi, SlotKind::Thinking) {
-                if let Some(RBlock::Thinking { thinking, .. }) = dec.blocks.get_mut(ci) {
+                if let Some(RBlock::Thinking { thinking, .. }) = dec.block_mut(ci) {
                     thinking.push_str("\n\n");
                 }
                 emit!(StreamEvent::ThinkingDelta {
@@ -93,7 +93,7 @@ pub(super) async fn process_event(
         "response.output_text.delta" | "response.refusal.delta" => {
             let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
             if let Some(ci) = dec.slot(oi, SlotKind::Text) {
-                if let Some(RBlock::Text { text, .. }) = dec.blocks.get_mut(ci) {
+                if let Some(RBlock::Text { text, .. }) = dec.block_mut(ci) {
                     text.push_str(delta);
                 }
                 emit!(StreamEvent::TextDelta {
@@ -106,7 +106,9 @@ pub(super) async fn process_event(
         "response.function_call_arguments.delta" => {
             let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
             if let Some(ci) = dec.slot(oi, SlotKind::Tool) {
-                if let Some(RBlock::Tool { partial_json, .. }) = dec.blocks.get_mut(ci) {
+                if let Some(RBlock::Tool { partial_json, .. }) = dec.block_mut(ci) {
+                    // O(delta): the append is amortised and no parse happens here at all — see
+                    // [`SharedStr`] and [`LazyArgs`](cyrup_core::LazyArgs) (PERF-001).
                     partial_json.push_str(delta);
                 }
                 emit!(StreamEvent::ToolCallDelta {
@@ -120,9 +122,12 @@ pub(super) async fn process_event(
             let arguments = event.get("arguments").and_then(Value::as_str).unwrap_or("");
             if let Some(ci) = dec.slot(oi, SlotKind::Tool) {
                 let mut maybe_delta: Option<String> = None;
-                if let Some(RBlock::Tool { partial_json, .. }) = dec.blocks.get_mut(ci) {
+                if let Some(RBlock::Tool { partial_json, .. }) = dec.block_mut(ci) {
+                    // REPLACES the buffer rather than appending to it. The buffer is the block's
+                    // only argument state, so the snapshot below projects the post-`done`
+                    // arguments with nothing further to repair (PERF-001).
                     let previous = partial_json.clone();
-                    *partial_json = arguments.to_string();
+                    *partial_json = SharedStr::from(arguments);
                     if let Some(rest) = arguments
                         .strip_prefix(previous.as_str())
                         .filter(|r| !r.is_empty())
@@ -156,7 +161,7 @@ pub(super) async fn process_event(
                     } else if !content.is_empty() {
                         content
                     } else if let Some(RBlock::Thinking { thinking, .. }) = dec.blocks.get(ci) {
-                        thinking.clone()
+                        thinking.to_string()
                     } else {
                         String::new()
                     };
@@ -164,9 +169,9 @@ pub(super) async fn process_event(
                     if let Some(RBlock::Thinking {
                         thinking,
                         signature,
-                    }) = dec.blocks.get_mut(ci)
+                    }) = dec.block_mut(ci)
                     {
-                        *thinking = final_text.clone();
+                        *thinking = SharedStr::from(&final_text);
                         *signature = sig;
                     }
                     dec.slots.remove(&oi);
@@ -184,8 +189,8 @@ pub(super) async fn process_event(
                         .and_then(Value::as_str)
                         .and_then(parse_phase);
                     let sig = TextSignatureV1::new(id, phase).encode();
-                    if let Some(RBlock::Text { text, signature }) = dec.blocks.get_mut(ci) {
-                        *text = final_text.clone();
+                    if let Some(RBlock::Text { text, signature }) = dec.block_mut(ci) {
+                        *text = SharedStr::from(&final_text);
                         *signature = Some(sig);
                     }
                     dec.slots.remove(&oi);
@@ -197,19 +202,24 @@ pub(super) async fn process_event(
                 }
                 ("function_call", SlotKind::Tool) => {
                     let raw = item.get("arguments").and_then(Value::as_str).unwrap_or("");
-                    if let Some(RBlock::Tool { partial_json, .. }) = dec.blocks.get_mut(ci) {
+                    if let Some(RBlock::Tool { partial_json, .. }) = dec.block_mut(ci) {
+                        // REPLACES the buffer rather than appending to it; the buffer is the
+                        // block's only argument state, so nothing derived needs repairing after it
+                        // (PERF-001).
                         if !raw.is_empty() {
-                            *partial_json = raw.to_string();
+                            *partial_json = SharedStr::from(raw);
                         } else if partial_json.is_empty() {
-                            *partial_json = "{}".to_string();
+                            *partial_json = SharedStr::from("{}");
                         }
                     }
-                    let tool_call = match blocks_to_content(&dec.blocks).get(ci) {
+                    // Project just this block rather than every block: the old call rebuilt the
+                    // whole message's content to read one entry out of it.
+                    let tool_call = match dec.blocks.get(ci).map(project_block) {
                         Some(Content::ToolCall(tc)) => tc.clone(),
                         _ => ToolCall {
                             id: ToolCallId::from(""),
                             name: String::new(),
-                            arguments: Map::new(),
+                            arguments: Map::new().into(),
                             thought_signature: None,
                         },
                     };

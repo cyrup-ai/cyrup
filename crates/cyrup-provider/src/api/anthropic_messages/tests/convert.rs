@@ -73,7 +73,7 @@ fn redacted_thinking_replays_as_redacted_block() {
     m.reasoning = false;
     let am = AssistantMessage {
         content: vec![Content::Thinking {
-            thinking: "[Reasoning redacted]".to_string(),
+            thinking: "[Reasoning redacted]".into(),
             thinking_signature: Some("OPAQUE".to_string()),
             redacted: true,
         }],
@@ -99,7 +99,7 @@ fn redacted_thinking_replays_as_redacted_block() {
 fn empty_signature_thinking_becomes_text_unless_allowed() {
     let am = AssistantMessage {
         content: vec![Content::Thinking {
-            thinking: "raw reasoning".to_string(),
+            thinking: "raw reasoning".into(),
             thinking_signature: None,
             redacted: false,
         }],

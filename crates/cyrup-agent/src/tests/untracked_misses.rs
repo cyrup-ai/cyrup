@@ -32,7 +32,7 @@ use super::support::*;
 fn user_text_of(m: &Message) -> Option<String> {
     match m {
         Message::User { content, .. } => content.iter().find_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         }),
         _ => None,
@@ -42,7 +42,7 @@ fn user_text_of(m: &Message) -> Option<String> {
 fn agent_user_text_of(m: &AgentMessage) -> Option<String> {
     match m {
         AgentMessage::User { content, .. } => content.iter().find_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         }),
         _ => None,
@@ -268,8 +268,8 @@ impl StreamFn for HangingStreamFn {
         let empty = faux_assistant_message(vec![], StopReason::Stop);
         let with_text = faux_assistant_message(vec![faux_text("hello")], StopReason::Stop);
         let head = futures::stream::iter(vec![
-            StreamEvent::Start { partial: empty },
-            StreamEvent::TextDelta { content_index: 0, delta: "hello".into(), partial: with_text },
+            StreamEvent::Start { partial: Arc::new(empty.clone()) },
+            StreamEvent::TextDelta { content_index: 0, delta: "hello".into(), partial: Arc::new(with_text) },
         ]);
         Box::pin(head.chain(futures::stream::pending()))
     }
@@ -328,11 +328,11 @@ impl StreamFn for PostTerminalStreamFn {
         let ok = faux_assistant_message(vec![faux_text("ok")], StopReason::Stop);
         let leak = faux_assistant_message(vec![faux_text("LEAK")], StopReason::Stop);
         let events = vec![
-            StreamEvent::Start { partial: empty.clone() },
-            StreamEvent::TextDelta { content_index: 0, delta: "ok".into(), partial: ok.clone() },
+            StreamEvent::Start { partial: Arc::new(empty.clone()) },
+            StreamEvent::TextDelta { content_index: 0, delta: "ok".into(), partial: Arc::new(ok.clone()) },
             StreamEvent::terminal(ok),
             // Post-terminal stray event — must be ignored.
-            StreamEvent::TextDelta { content_index: 0, delta: "LEAK".into(), partial: leak },
+            StreamEvent::TextDelta { content_index: 0, delta: "LEAK".into(), partial: Arc::new(leak) },
         ];
         Box::pin(futures::stream::iter(events))
     }
@@ -361,7 +361,7 @@ async fn miss6_no_message_update_after_terminal() {
     });
     let text = last
         .map(|a| a.content.iter().filter_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         }).collect::<Vec<_>>())
         .unwrap_or_default();

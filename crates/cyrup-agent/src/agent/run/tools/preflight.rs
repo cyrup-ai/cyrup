@@ -8,7 +8,7 @@ use crate::agent::run::RunCtx;
 use crate::agent::util::now_millis;
 use crate::event::{AgentMessage, ToolResultMessage};
 use crate::hooks::{AgentContextView, BeforeOutcome, BeforeToolCall};
-use cyrup_core::{AssistantMessage, Content, ToolCall};
+use cyrup_core::{AssistantMessage, Content, SharedStr, ToolCall};
 use cyrup_provider::validate_tool_call;
 use serde_json::Value;
 
@@ -35,7 +35,7 @@ impl RunCtx {
         // Normalize the raw model-emitted arguments via the tool's `prepare_arguments` compat shim
         // BEFORE schema validation (Pi `prepareToolCallArguments` → `validateToolArguments`,
         // agent-loop.ts:548-560,578-579). Default impl is identity.
-        let prepared = tool.prepare_arguments(Value::Object(call.arguments.clone())).await;
+        let prepared = tool.prepare_arguments(Value::Object((*call.arguments).clone())).await;
         // Validate AND coerce against the tool's JSON-Schema `parameters` (R-02-020 / func-01
         // R-01-034). On failure surface an immediate isError tool-result so the model can retry on
         // the next turn; the tool is NOT executed.
@@ -127,7 +127,7 @@ impl RunCtx {
     pub(super) fn immediate_error(
         &self,
         call: &ToolCall,
-        msg: impl Into<String>,
+        msg: impl Into<SharedStr>,
         terminate: bool,
     ) -> Finalized {
         // AGENT-009 — `details: {}`, not absent: pi writes the empty object literal, so the JSONL

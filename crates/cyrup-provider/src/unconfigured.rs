@@ -152,7 +152,7 @@ impl Provider for UnconfiguredProvider {
         };
         let event = StreamEvent::Error {
             reason: ErrorReason::Error,
-            error: message,
+            error: std::sync::Arc::new(message),
         };
         Box::pin(tokio_stream::once(event))
     }

@@ -2,19 +2,24 @@
 
 use crate::model::Model;
 use crate::usage::apply_cost;
-use crate::utils::json_parse::parse_streaming_json_object;
+use crate::api::content_cache::ContentCache;
 use crate::utils::provider_plumbing::now_millis;
-use cyrup_core::{ApiId, AssistantMessage, Content, StopReason, ToolCall, ToolCallId, Usage};
+use std::sync::Arc;
+use cyrup_core::{
+    ApiId, AssistantMessage, Content, LazyArgs, SharedStr, StopReason, ToolCall, ToolCallId, Usage,
+};
 
 /// One in-progress content block, keyed by the Anthropic `index`.
 pub(super) enum Block {
     Text {
         index: i64,
-        text: String,
+        /// Shared with every snapshot taken from it, so projecting this block is a refcount bump
+        /// rather than a copy of everything streamed so far (PERF-001).
+        text: SharedStr,
     },
     Thinking {
         index: i64,
-        thinking: String,
+        thinking: SharedStr,
         signature: String,
         redacted: bool,
     },
@@ -22,7 +27,9 @@ pub(super) enum Block {
         index: i64,
         id: String,
         name: String,
-        partial_json: String,
+        /// The raw accumulated argument buffer. [`LazyArgs`] recovers the `Map` from it on the
+        /// first read, so a snapshot nobody reads never parses it at all (PERF-001).
+        partial_json: SharedStr,
     },
 }
 
@@ -40,6 +47,9 @@ impl Block {
 #[derive(Default)]
 pub(super) struct Decoder {
     pub(super) blocks: Vec<Block>,
+    /// Memoised projection of `blocks`. Write to `blocks` ONLY through [`Self::push_block`] and
+    /// [`Self::block_mut`], or this goes stale.
+    cache: ContentCache,
     pub(super) usage: Usage,
     pub(super) response_id: Option<String>,
     pub(super) stop_reason: Option<StopReason>,
@@ -60,16 +70,66 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
+    /// Seed a decoder for one stream.
+    ///
+    /// Exists so [`ContentCache`] can stay a PRIVATE field: a `..Default::default()` struct literal
+    /// at the driver's call site would require every field to be visible there, and the memo's
+    /// whole correctness argument is that nothing outside this file can write it.
+    pub(super) fn new(is_oauth: bool, tool_names: Vec<String>) -> Self {
+        Self {
+            is_oauth,
+            tool_names,
+            ..Default::default()
+        }
+    }
+
     pub(super) fn position_of(&self, index: i64) -> Option<usize> {
         self.blocks.iter().position(|b| b.index() == index)
     }
 
-    /// Build the live `partial` snapshot.
-    pub(super) fn snapshot(&self, model: &Model, api: &ApiId) -> AssistantMessage {
+    /// Append a block. The ONLY push — it keeps [`ContentCache`] in step (PERF-001).
+    pub(super) fn push_block(&mut self, block: Block) {
+        self.blocks.push(block);
+        self.cache.push();
+    }
+
+    /// The ONLY `&mut Block`. Invalidates exactly that block's memo and nothing else, so a delta
+    /// against block *i* re-projects block *i* and leaves every sibling's cached `Content` alone
+    /// (PERF-001).
+    pub(super) fn block_mut(&mut self, pos: usize) -> Option<&mut Block> {
+        self.cache.invalidate(pos);
+        self.blocks.get_mut(pos)
+    }
+
+    /// The content projection, recomputing only the blocks whose memo was invalidated.
+    fn content(&mut self) -> Vec<Content> {
+        let (cache, blocks) = (&mut self.cache, &self.blocks);
+        cache.project(blocks, project_block)
+    }
+
+    /// The live `partial`, as a SHARED handle (PERF-001).
+    ///
+    /// Every non-terminal event carries this message and it is then cloned again by the
+    /// agent loop, by `MessageUpdate`, and once per live subscriber. Handing out an `Arc`
+    /// turns those into refcount bumps; the wire bytes are unchanged because serde's `rc`
+    /// feature serializes an `Arc<T>` transparently as `T`.
+    pub(super) fn snapshot(&mut self, model: &Model, api: &ApiId) -> Arc<AssistantMessage> {
+        Arc::new(self.snapshot_owned(model, api))
+    }
+
+    /// The same message, owned, for the terminal paths that stamp a stop reason onto it
+    /// before handing it to [`StreamEvent::terminal`](crate::stream::StreamEvent::terminal)/
+    /// [`StreamEvent::end_of_stream`](crate::stream::StreamEvent::end_of_stream).
+    ///
+    /// `&mut self` for [`Self::content`]'s memo only. Everything the message carries beyond
+    /// `content` is still recomputed per call — the fresh `timestamp` and the `apply_cost` over the
+    /// live `usage` — because neither is a pure function of the blocks and freezing either would
+    /// change what a subscriber observes (PERF-001).
+    pub(super) fn snapshot_owned(&mut self, model: &Model, api: &ApiId) -> AssistantMessage {
         let mut usage = self.usage.clone();
         apply_cost(&model.cost, &mut usage);
         AssistantMessage {
-            content: blocks_to_content(&self.blocks),
+            content: self.content(),
             provider: model.provider.clone(),
             model: model.id.as_str().to_string(),
             api: api.clone(),
@@ -91,36 +151,38 @@ impl Decoder {
     }
 }
 
-fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
-    blocks
-        .iter()
-        .map(|b| match b {
-            Block::Text { text, .. } => Content::text(text.clone()),
-            Block::Thinking {
-                thinking,
-                signature,
-                redacted,
-                ..
-            } => Content::Thinking {
-                thinking: thinking.clone(),
-                thinking_signature: if signature.is_empty() {
-                    None
-                } else {
-                    Some(signature.clone())
-                },
-                redacted: *redacted,
+/// Project ONE block to its `Content`. Was the body of a `blocks_to_content(&[Block])` map, split
+/// out per block so [`ContentCache`] can memoise it (PERF-001). The arms are unchanged.
+fn project_block(b: &Block) -> Content {
+    match b {
+        Block::Text { text, .. } => Content::text(text.clone()),
+        Block::Thinking {
+            thinking,
+            signature,
+            redacted,
+            ..
+        } => Content::Thinking {
+            thinking: thinking.clone(),
+            thinking_signature: if signature.is_empty() {
+                None
+            } else {
+                Some(signature.clone())
             },
-            Block::Tool {
-                id,
-                name,
-                partial_json,
-                ..
-            } => Content::ToolCall(ToolCall {
-                id: ToolCallId::from(id.as_str()),
-                name: name.clone(),
-                arguments: parse_streaming_json_object(Some(partial_json)),
-                thought_signature: None,
-            }),
-        })
-        .collect()
+            redacted: *redacted,
+        },
+        Block::Tool {
+            id,
+            name,
+            partial_json,
+            ..
+        } => Content::ToolCall(ToolCall {
+            id: ToolCallId::from(id.as_str()),
+            name: name.clone(),
+            // A handle on the buffer, not a parse of it: the arguments are recovered by the same
+            // whole-buffer parse the terminal `toolcall_end` uses, but only if something reads
+            // them (PERF-001).
+            arguments: LazyArgs::streaming(partial_json.clone()),
+            thought_signature: None,
+        }),
+    }
 }

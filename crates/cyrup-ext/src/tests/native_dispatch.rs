@@ -34,7 +34,7 @@ fn tool_call_msg(
     let tc = cyrup_core::ToolCall {
         id: tool_call_id.clone(),
         name: tool_name.to_string(),
-        arguments,
+        arguments: arguments.into(),
         thought_signature: None,
     };
     let msg = cyrup_core::AssistantMessage {
@@ -166,7 +166,7 @@ async fn a08_1b_turn_index_is_derived_and_resets_per_agent_run() {
     // subscribed to agent_start, but the counter must still reset (the gate runs AFTER the counter).
     let turn_end = || {
         let (msg, _tc) = tool_call_msg("read", &"tc".into(), &json!({}));
-        AgentEvent::TurnEnd { message: AgentMessage::Assistant(msg), tool_results: vec![] }
+        AgentEvent::TurnEnd { message: AgentMessage::Assistant(Arc::new(msg)), tool_results: vec![] }
     };
     sub.on_event(&AgentEvent::AgentStart, CancelToken::new()).await;
     sub.on_event(&AgentEvent::TurnStart, CancelToken::new()).await;
@@ -525,13 +525,13 @@ async fn a08_5_context_hook_filters_messages() {
 
     let msgs = vec![
         AgentMessage::user_text("hi"),
-        AgentMessage::Assistant(cyrup_core::AssistantMessage::errored(
+        AgentMessage::Assistant(Arc::new(cyrup_core::AssistantMessage::errored(
             "faux".into(),
             "m",
             Some("faux".into()),
             cyrup_core::StopReason::Stop,
             "x",
-        )),
+        ))),
         AgentMessage::user_text("bye"),
     ];
     let out = hooks.transform_context(msgs, CancelToken::new()).await.unwrap();

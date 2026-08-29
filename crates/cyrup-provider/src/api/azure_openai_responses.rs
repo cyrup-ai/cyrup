@@ -740,7 +740,7 @@ mod tests {
                     content: vec![cyrup_core::Content::ToolCall(cyrup_core::ToolCall {
                         id: cyrup_core::ToolCallId::from("call_1"),
                         name: "base_tool".to_string(),
-                        arguments: serde_json::Map::new(),
+                        arguments: serde_json::Map::new().into(),
                         thought_signature: None,
                     })],
                     provider: "azure-openai-responses".into(),

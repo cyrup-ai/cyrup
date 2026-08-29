@@ -42,15 +42,15 @@ pub(super) async fn process_tool_call(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        dec.blocks.push(Content::ToolCall(ToolCall {
+        dec.push_block(Content::ToolCall(ToolCall {
             id: ToolCallId::from(call_id.as_str()),
             name,
-            arguments: Map::new(),
+            arguments: Map::new().into(),
             thought_signature: None,
         }));
         let block_idx = dec.block_index();
         dec.tool_blocks_by_key.insert(key.clone(), block_idx);
-        dec.tool_partial_args.insert(block_idx, String::new());
+        dec.open_tool_args(block_idx);
         let partial = dec.snapshot(model, api);
         if !sink
             .send(StreamEvent::ToolCallStart {
@@ -73,9 +73,9 @@ pub(super) async fn process_tool_call(
         Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
         None => String::new(),
     };
-    if let Some(buf) = dec.tool_partial_args.get_mut(&block_idx) {
-        buf.push_str(&args_delta);
-    }
+    // Routed through the decoder so the scratch write also invalidates that block's memo
+    // (PERF-001): this decoder's projection depends on the scratch, not only on `blocks`.
+    dec.push_tool_args(block_idx, &args_delta);
 
     let partial = dec.snapshot(model, api);
     sink.send(StreamEvent::ToolCallDelta {
@@ -96,13 +96,13 @@ pub(super) async fn close_current(dec: &mut Decoder, model: &Model, api: &ApiId,
     let ev = match (kind, dec.blocks.get(idx)) {
         (CurrentKind::Text, Some(Content::Text { text, .. })) => StreamEvent::TextEnd {
             content_index: idx,
-            content: text.clone(),
+            content: text.to_string(),
             partial,
         },
         (CurrentKind::Thinking, Some(Content::Thinking { thinking, .. })) => {
             StreamEvent::ThinkingEnd {
                 content_index: idx,
-                content: thinking.clone(),
+                content: thinking.to_string(),
                 partial,
             }
         }
@@ -134,11 +134,11 @@ pub(super) async fn finalize_tool_blocks(
         let tool_call = ToolCall {
             id,
             name,
-            arguments: args.clone(),
+            arguments: args.clone().into(),
             thought_signature: None,
         };
-        if let Some(Content::ToolCall(tc)) = dec.blocks.get_mut(idx) {
-            tc.arguments = args;
+        if let Some(Content::ToolCall(tc)) = dec.block_mut(idx) {
+            tc.arguments = args.into();
         }
         let partial = dec.snapshot(model, api);
         if !sink

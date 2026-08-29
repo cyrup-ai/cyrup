@@ -6,7 +6,7 @@ use super::decoder::RDecoder;
 use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
-use cyrup_core::ApiId;
+use cyrup_core::{ApiId, SharedStr};
 use serde_json::Value;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -27,14 +27,14 @@ pub(super) fn create_slot(
     let (block, kind) = match item_type {
         "reasoning" => (
             RBlock::Thinking {
-                thinking: String::new(),
+                thinking: SharedStr::new(),
                 signature: None,
             },
             SlotKind::Thinking,
         ),
         "message" => (
             RBlock::Text {
-                text: String::new(),
+                text: SharedStr::new(),
                 signature: None,
             },
             SlotKind::Text,
@@ -55,11 +55,10 @@ pub(super) fn create_slot(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let partial_json = item
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            // A slot can open with arguments already present; the buffer carries them, and there
+            // is no derived scanner to seed alongside it (PERF-001).
+            let partial_json: SharedStr =
+                item.get("arguments").and_then(Value::as_str).unwrap_or("").into();
             (
                 RBlock::Tool {
                     call_id,
@@ -72,7 +71,7 @@ pub(super) fn create_slot(
         }
         _ => return None,
     };
-    dec.blocks.push(block);
+    dec.push_block(block);
     let ci = dec.blocks.len() - 1;
     dec.slots.insert(output_index, (ci, kind));
     Some((ci, kind))

@@ -61,7 +61,7 @@ impl RunCtx {
             self.emit(AgentEvent::ToolExecutionStart {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
-                args: Value::Object(call.arguments.clone()),
+                args: Value::Object((*call.arguments).clone()),
             })
             .await?;
             match self.prepare(assistant, ctx_messages, call).await {
@@ -190,7 +190,7 @@ impl RunCtx {
                     let (tn, ar) = calls
                         .iter()
                         .find(|c| c.id == call_id)
-                        .map(|c| (c.name.clone(), Value::Object(c.arguments.clone())))
+                        .map(|c| (c.name.clone(), Value::Object((*c.arguments).clone())))
                         .unwrap_or_default();
                     self.emit(AgentEvent::ToolExecutionUpdate {
                         tool_call_id: call_id,
@@ -204,13 +204,13 @@ impl RunCtx {
                     let (args, call) = calls
                         .iter()
                         .find(|c| c.id == call_id)
-                        .map(|c| (Value::Object(c.arguments.clone()), c.clone()))
+                        .map(|c| (Value::Object((*c.arguments).clone()), c.clone()))
                         .unwrap_or_else(|| {
                             // Defensive: the id always matches a source call; synthesize a stand-in.
                             (Value::Null, ToolCall {
                                 id: call_id.clone(),
                                 name: tool_name.clone(),
-                                arguments: serde_json::Map::new(),
+                                arguments: serde_json::Map::new().into(),
                                 thought_signature: None,
                             })
                         });
@@ -268,7 +268,7 @@ impl RunCtx {
             self.emit(AgentEvent::ToolExecutionStart {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
-                args: Value::Object(call.arguments.clone()),
+                args: Value::Object((*call.arguments).clone()),
             })
             .await?;
 
@@ -312,7 +312,7 @@ impl RunCtx {
                                     self.emit(AgentEvent::ToolExecutionUpdate {
                                         tool_call_id: call.id.clone(),
                                         tool_name: call.name.clone(),
-                                        args: Value::Object(call.arguments.clone()),
+                                        args: Value::Object((*call.arguments).clone()),
                                         partial_result: update_value(&u),
                                     })
                                     .await?;
@@ -339,7 +339,7 @@ impl RunCtx {
                         self.emit(AgentEvent::ToolExecutionUpdate {
                             tool_call_id: call.id.clone(),
                             tool_name: call.name.clone(),
-                            args: Value::Object(call.arguments.clone()),
+                            args: Value::Object((*call.arguments).clone()),
                             partial_result: update_value(&u),
                         })
                         .await?;

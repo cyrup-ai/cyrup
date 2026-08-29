@@ -304,7 +304,7 @@ impl<B: Backend> App<B> {
                         self.state.transcript.push_tool_start_defined(
                             call.name.clone(),
                             Some(call.id.as_str().to_string()),
-                            Value::Object(call.arguments.clone()),
+                            Value::Object((*call.arguments).clone()),
                             None,
                             has_definition,
                         );
