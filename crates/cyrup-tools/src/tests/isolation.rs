@@ -158,9 +158,10 @@ async fn protected_paths_block_writes_pass_reads() {
 
 /// ADR-0003 D8(4), the in-crate half — **the guard's scope is the fs seam only**.
 ///
-/// pi has no protected-path concept at all (`pi/packages/coding-agent/src/core/tools/write.ts:
-/// 195-225` @v0.83.0 resolves the path and calls `ops.writeFile` with no predicate), so the
-/// default backend must write `.env` like any other file; and even when an embedder opts in via
+/// pi's core has no protected-path predicate (`write.ts::createWriteToolDefinition` resolves the
+/// path and calls `ops.writeFile` with none), and pi's opt-in
+/// `examples/extensions/protected-paths.ts` is off until a user installs it — so the default
+/// backend must write `.env` like any other file; and even when an embedder opts in via
 /// `SessionConfig::protect_paths`, only `fs` is decorated — `bash` reaches the same file, which is
 /// why the flag is no longer on by default (ADR-0003 D5/D6).
 ///
@@ -172,7 +173,7 @@ async fn protected_fs_is_fs_only_and_bash_is_never_covered() {
     let cwd = dir.path().to_path_buf();
 
     // (a) Undecorated (the shipped default after ADR-0003 D5): `write` to `.env` succeeds, exactly
-    // like pi's `write.ts:195-225`.
+    // like pi's `write.ts::createWriteToolDefinition`.
     let plain: Arc<dyn FsOps> = Arc::new(LocalFs);
     let write_plain = WriteTool::new(
         plain,

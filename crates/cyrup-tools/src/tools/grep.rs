@@ -49,10 +49,16 @@ struct GrepInput {
 ///    and on nothing else, composed as `suggest_other_engine(suggest_text(suggest_multiline(msg)))`
 ///    (ripgrep 14.1.0 `crates/core/flags/hiargs.rs:505-510` for the inner two, `:366-373` for the
 ///    outer one). The three predicates below are those verbatim
-///    (`hiargs.rs:1412-1462`). `suggest_other_engine` is `cfg!(feature = "pcre2")`-gated in
-///    ripgrep, and it IS reachable from Pi: Pi downloads the official `BurntSushi/ripgrep` release
-///    asset (tools-manager.ts:50-70), which release CI builds with `--features pcre2`
-///    (`.github/workflows/release.yml`, `cargo build --release --features pcre2`).
+///    (`hiargs.rs:1412-1462`). `suggest_other_engine` forwards to `suggest_pcre2`, whose first
+///    statement is `if !cfg!(feature = "pcre2") { return None; }` (`hiargs.rs:1416-1419`) — so the
+///    hint is a property of the BUILD, and that gate is TRUE for the binary Pi runs. Pi downloads
+///    the official `BurntSushi/ripgrep` release asset (tools-manager.ts:50-70), and release CI
+///    builds EVERY matrix target with `--features pcre2` under `PCRE2_SYS_STATIC=1`
+///    (`.github/workflows/release.yml:177`, env at `:60-61`), including
+///    `x86_64-unknown-linux-musl` — the asset Pi names for Linux (`release.yml:69`). With the
+///    verbatim stderr passthrough above (grep.ts:309-310), the suggestion block IS part of Pi's
+///    tool output, so cyrup emits it too. cyrup cannot honour the `--pcre2` it advises; see
+///    [`RgFlags::PCRE2_IS_DECLINED`] for that divergence and why it is recorded, not erased.
 /// 3. ripgrep prefixes every top-level error with `rg: ` (`crates/core/messages.rs:50`, reached
 ///    from `eprintln_locked!("{:#}", err)` at `crates/core/main.rs:62`).
 fn rg_pattern_error(err: &grep_regex::Error) -> String {
@@ -1938,6 +1944,108 @@ mod tests {
             "-q must not silence the result set: {out}"
         );
         assert!(!out.contains("No matches found"), "{out}");
+    }
+
+    /// `--engine`, `--pre` and `--pre-glob` are recognised, declined, and CONSUME THEIR VALUE.
+    ///
+    /// `parse` advances past the flag itself, but only a match arm that calls `take()` advances
+    /// past the value. A value-taking flag left on the catch-all therefore hands its argument back
+    /// to the top of the loop, where a leading `-` makes it parse as a flag in its own right — so
+    /// a config written in ripgrep's canonical one-argument-per-line form silently applied its
+    /// NEXT line. See [`RgFlags::PCRE2_IS_DECLINED`] and [`RgFlags::PREPROCESSOR_IS_DECLINED`].
+    #[test]
+    fn declined_value_taking_flags_consume_their_value() {
+        assert!(
+            RgFlags::PCRE2_IS_DECLINED.contains("grep-pcre2"),
+            "the refusal must stay cited to the crate cyrup does not link"
+        );
+        assert!(
+            RgFlags::PREPROCESSOR_IS_DECLINED.contains("ops/mod.rs:437"),
+            "the refusal must stay cited to the seam that has no exec"
+        );
+        assert!(
+            RgFlags::PREPROCESSOR_IS_DECLINED.contains("--no-pre"),
+            "the negations belong to the group the const explains"
+        );
+
+        // Each of these silently applied its second line before the flags were recognised:
+        // case-insensitive, inverted, and literal respectively.
+        assert_eq!(RgFlags::parse("--engine\n-i\n"), RgFlags::default());
+        assert_eq!(RgFlags::parse("--pre\n-v\n"), RgFlags::default());
+        assert_eq!(RgFlags::parse("--pre-glob\n-F\n"), RgFlags::default());
+
+        // The inline form has no trailing line to leak, and the switches take no value at all.
+        assert_eq!(RgFlags::parse("--engine=pcre2\n"), RgFlags::default());
+        assert_eq!(
+            RgFlags::parse(
+                "-P\n-z\n--pcre2\n--no-pcre2\n--pre\n--no-pre\n--search-zip\n--no-search-zip\n"
+            ),
+            RgFlags::default()
+        );
+        // `--no-pre` is a SWITCH (`Pre::update` asserts there is no affirmative switch for
+        // `--pre`, defs.rs:5431-5435), so it must not call `take()`. If it ever did, it would
+        // swallow the following line and this would read `None`.
+        assert_eq!(RgFlags::parse("--no-pre\n-i\n").case, Some(CaseMode::Insensitive));
+        assert_eq!(
+            RgFlags::parse("--auto-hybrid-regex\n--no-auto-hybrid-regex\n"),
+            RgFlags::default()
+        );
+
+        // Not passing for the wrong reason: the leaked lines are live flags on their own.
+        assert_eq!(RgFlags::parse("-i\n").case, Some(CaseMode::Insensitive));
+        assert!(RgFlags::parse("-v\n").invert_match);
+        assert!(RgFlags::parse("-F\n").fixed_strings);
+    }
+
+    /// Every ripgrep 14.1.0 flag that TAKES a value consumes it, in both spellings.
+    ///
+    /// `parse` advances past the flag but only a `take()` arm advances past the value, so a
+    /// value-taking flag left on the catch-all handed its argument back to the top of the loop —
+    /// where a leading `-` made it parse as a flag and apply. 20 long forms and 9 short forms were
+    /// in that state. `-d` was the worst of them: `--max-depth` is honoured, `-d` was not, so the
+    /// two spellings of one flag produced different result sets.
+    #[test]
+    fn every_value_taking_flag_consumes_its_value() {
+        // Long forms.
+        assert_eq!(RgFlags::parse("--replace\n-i\n"), RgFlags::default());
+        assert_eq!(RgFlags::parse("--max-columns\n-v\n"), RgFlags::default());
+        assert_eq!(RgFlags::parse("--context\n-F\n"), RgFlags::default());
+        // Short forms — a separate list, so separately guarded.
+        assert_eq!(RgFlags::parse("-r\n-i\n"), RgFlags::default());
+        assert_eq!(RgFlags::parse("-M\n-v\n"), RgFlags::default());
+        assert_eq!(RgFlags::parse("-C\n-F\n"), RgFlags::default());
+
+        // `-d` is HONOURED, not dropped: the two spellings of `--max-depth` must agree, in both
+        // the next-line and cluster-tail forms.
+        assert_eq!(RgFlags::parse("-d\n2\n").max_depth, Some(2));
+        assert_eq!(RgFlags::parse("-d2\n").max_depth, Some(2));
+        assert_eq!(RgFlags::parse("--max-depth\n2\n").max_depth, Some(2));
+
+        // Not passing for the wrong reason — the leaked lines are live flags on their own.
+        assert_eq!(RgFlags::parse("-i\n").case, Some(CaseMode::Insensitive));
+        assert!(RgFlags::parse("-v\n").invert_match);
+        assert!(RgFlags::parse("-F\n").fixed_strings);
+
+        // The catch-all still IGNORES a flag from a newer ripgrep rather than failing. Its value
+        // can still leak — the arity of an unknown flag is unknowable here — and that is the
+        // deliberate limit of this fix, not an oversight.
+        assert_eq!(RgFlags::parse("--some-future-flag\n"), RgFlags::default());
+    }
+
+    /// All four unicode names write the same engine-independent bool, last occurrence winning.
+    ///
+    /// `NoPcre2Unicode::update` is one line — `args.no_unicode = v.unwrap_switch();`
+    /// (`defs.rs:4711-4714`) — and `--no-pcre2-unicode` / `--pcre2-unicode` are DEPRECATED aliases
+    /// of `--no-unicode` / `--unicode` (`defs.rs:4692-4707`). Nothing about them is pcre2-gated,
+    /// so the Rust engine honours all four; ripgrep proves the cross pairs at `defs.rs:4851-4860`.
+    #[test]
+    fn all_four_unicode_names_write_the_same_flag() {
+        assert!(RgFlags::parse("--no-unicode\n").no_unicode);
+        assert!(RgFlags::parse("--no-pcre2-unicode\n").no_unicode);
+        // The cross pairs ripgrep tests by name — the later occurrence wins, both directions.
+        assert!(!RgFlags::parse("--no-unicode\n--pcre2-unicode\n").no_unicode);
+        assert!(!RgFlags::parse("--no-pcre2-unicode\n--unicode\n").no_unicode);
+        assert!(RgFlags::parse("--unicode\n--no-pcre2-unicode\n").no_unicode);
     }
 
     /// The config layer sits UNDER the caller's arguments — ripgrep's own `config_args ++ cli_args`

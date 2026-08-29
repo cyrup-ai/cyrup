@@ -30,7 +30,7 @@ use cyrup_session::prompt::{
 };
 use cyrup_session::SessionLayout;
 use cyrup_tools::{
-    Availability, Backend, BashOpts, PermissionPolicy, ProtectedFs, ToolRegistry,
+    Availability, Backend, BashOpts, PermissionPolicy, ProtectedFs, ProtectedPaths, ToolRegistry,
     ToolsOptions, TraversalFs,
 };
 use tokio::sync::Mutex as AsyncMutex;
@@ -179,9 +179,16 @@ pub struct SessionConfig {
     pub permission_policy: PermissionPolicy,
     /// [CYRUP-DELTA] Wrap the **fs** backend in [`ProtectedFs`], refusing `write`/`edit` to
     /// `.env`, `.git/` and `node_modules/` (R-12-006). **Off by default** and embedder-only: there
-    /// is deliberately no CLI flag and no `settings.json` key, because pi has no protected-path
-    /// concept at all — `pi/packages/coding-agent/src/core/tools/write.ts:195-225` @v0.83.0
-    /// resolves the path and calls `ops.writeFile` with no path predicate (ADR-0003 D5/D6).
+    /// is deliberately no CLI flag and no `settings.json` key. pi's *core* has no protected-path
+    /// predicate — `write.ts::createWriteToolDefinition` resolves the path and calls
+    /// `ops.writeFile` with none, and `edit.ts::execute` does the same — so this `false` default
+    /// matches default pi exactly. pi nonetheless SHIPS the guard, as an auto-discovered opt-in
+    /// extension over the same three names (`examples/extensions/protected-paths.ts`, catalogued
+    /// at `docs/extensions.md:2944`, blocking `write`/`edit` at the `tool_call` gate and equally
+    /// blind to `bash`). What is `[CYRUP-DELTA]` is this **configuration surface**, not the
+    /// capability: pi's `src/` has no `protectedPaths` option, and cyrup's user-reachable
+    /// equivalent of pi's enablement is a `.cyrup/extensions/` extension on `tool_call` — which is
+    /// why there is no flag and no settings key here (ADR-0003 D5/D6).
     ///
     /// Scope is the **fs seam only**: the process seam is passed through undecorated (see the
     /// `Backend { fs, proc: base.proc.clone() }` construction below), so `bash 'echo x >> .env'`
@@ -244,9 +251,11 @@ impl SessionConfig {
             exclude_tools: Vec::new(),
             custom_tools: Vec::new(),
             permission_policy: PermissionPolicy::new(),
-            // ADR-0003 D5: pi has no protected-path concept (`write.ts:195-225` @v0.83.0 writes
-            // whatever path it is given), and `bash` bypassed the guard anyway, so on-by-default
-            // bought nothing and cost a failed turn. Inert embedder-only opt-in now.
+            // ADR-0003 D5: pi's core writes whatever path it is given
+            // (`write.ts::createWriteToolDefinition` -> `ops.writeFile`, no predicate), and pi's
+            // own opt-in extension is off until a user installs it — so `false` IS default-pi
+            // parity. `bash` bypassed the guard anyway, so on-by-default bought nothing and cost a
+            // failed turn. Inert embedder-only opt-in now.
             protect_paths: false,
             confine_to_cwd: false,
             extension_flag_values: Vec::new(),
@@ -871,7 +880,14 @@ impl SessionBuilder {
             fs = Arc::new(TraversalFs::new(fs, cwd.clone()));
         }
         if cfg.protect_paths {
-            fs = Arc::new(ProtectedFs::with_defaults(fs));
+            // ROOTED at the session cwd: `write` hands the backend an absolutized path
+            // (`tools/write.rs:106`), so an unrooted matcher would test the cwd's own components
+            // and refuse every write in a session rooted under e.g. `node_modules/`.
+            fs = Arc::new(ProtectedFs::rooted(
+                fs,
+                cwd.clone(),
+                ProtectedPaths::defaults(),
+            ));
         }
         let backend = Backend { fs, proc: base.proc.clone() };
         // The live session metadata every `bash` child gets as `CYRUP_*` (Pi's `resolveSpawnContext`
