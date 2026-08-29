@@ -97,6 +97,125 @@ fn set_process_name(name: &str) {
     let _ = c_name;
 }
 
+/// The live-keyboard probe `cyrup_tui::native_modifiers` cannot host: reading it needs `unsafe`, and
+/// that crate is `#![forbid(unsafe_code)]`. Here for the same reason [`set_process_name`] is, and it
+/// is registered from [`run`] beside it.
+///
+/// Ports `pi/packages/tui/native/darwin/src/darwin-modifiers.c` (@v0.84.1) — the same four names
+/// against the same four masks (`:23-28`), read from the same source state (`:46`). Upstream reaches
+/// this through a prebuilt N-API addon and answers "no modifier pressed" whenever the addon is
+/// missing (`native-modifiers.ts:39-52`); a direct framework link cannot be missing, so the only
+/// hosts without a probe are the ones this module is not compiled for.
+///
+/// Upstream also skips the helper on any arch that is not `x64`/`arm64` (`native-modifiers.ts:24`).
+/// That is a constraint of shipping prebuilt binaries, not a behaviour, and is deliberately not
+/// ported.
+#[cfg(target_os = "macos")]
+mod native_modifier_probe {
+    use cyrup_tui::ModifierKey;
+
+    /// `kCGEventSourceStateCombinedSessionState`. `CGEventSourceStateID` is a SIGNED 32-bit enum —
+    /// `objc2-core-graphics` generates it as `CGEventSourceStateID(pub i32)`, and its
+    /// `kCGEventSourceStatePrivate = -1` settles the question.
+    const COMBINED_SESSION_STATE: i32 = 0;
+    /// The four `kCGEventFlagMask*` values `darwin-modifiers.c:24-27` selects between.
+    const FLAG_MASK_SHIFT: u64 = 0x0002_0000;
+    const FLAG_MASK_CONTROL: u64 = 0x0004_0000;
+    const FLAG_MASK_ALTERNATE: u64 = 0x0008_0000;
+    const FLAG_MASK_COMMAND: u64 = 0x0010_0000;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        /// `CGEventFlags CGEventSourceFlagsState(CGEventSourceStateID stateID)` — `CGEventFlags` is
+        /// `uint64_t`. Bound under a snake-case name so the declaration needs no lint suppression.
+        #[link_name = "CGEventSourceFlagsState"]
+        fn cg_event_source_flags_state(state_id: i32) -> u64;
+    }
+
+    /// `isModifierPressed` — `darwin-modifiers.c:31-55`.
+    pub(super) fn probe(key: ModifierKey) -> bool {
+        let mask = match key {
+            ModifierKey::Shift => FLAG_MASK_SHIFT,
+            ModifierKey::Control => FLAG_MASK_CONTROL,
+            ModifierKey::Option => FLAG_MASK_ALTERNATE,
+            ModifierKey::Command => FLAG_MASK_COMMAND,
+        };
+        // SAFETY: `CGEventSourceFlagsState` takes one integer state id by value and returns a
+        // bitmask by value. It borrows no memory from this frame, mutates nothing in this process,
+        // and reads only the window server's live modifier state, so there is no pointer to keep
+        // valid and no aliasing to uphold. It is safe to call from any thread at any time.
+        let flags = unsafe { cg_event_source_flags_state(COMBINED_SESSION_STATE) };
+        flags & mask != 0
+    }
+}
+
+/// The Windows half of the same seam, ported from
+/// `pi/packages/tui/native/win32/src/win32-console-mode.c` (@v0.84.1): `GetAsyncKeyState` against the
+/// generic and sided virtual-key codes for each modifier (`:57-61`), tested with pi's own
+/// `KEY_PRESSED_MASK` of `0x8000` (`:8`, `:54`).
+///
+/// **This cannot fire in cyrup's current configuration, and is registered anyway.** The reason it
+/// cannot is recorded in full on `cyrup_tui::should_detect_native_shift_enter`: upstream's helper
+/// puts the console into `ENABLE_VIRTUAL_TERMINAL_INPUT` mode and so must recover modifiers that
+/// crossterm — which never sets that flag — still has, and hands over as `KeyModifiers::SHIFT`
+/// before the rescue's `modifiers != NONE` guard. That analysis is a source read performed on Linux,
+/// never observed on Windows, and it holds only while nothing enables VT input. If any of that
+/// changes, a registered probe is the difference between Shift+Enter inserting a newline and
+/// submitting the message; an unregistered one is a silent regression for every Windows user.
+#[cfg(windows)]
+mod native_modifier_probe {
+    use cyrup_tui::ModifierKey;
+
+    /// `KEY_PRESSED_MASK` — the high bit of `GetAsyncKeyState`'s `SHORT` means "currently down".
+    const KEY_PRESSED_MASK: u16 = 0x8000;
+
+    /// Virtual-key codes, values corroborated against `windows-sys`'s
+    /// `Win32::UI::Input::KeyboardAndMouse`.
+    const VK_SHIFT: i32 = 16;
+    const VK_CONTROL: i32 = 17;
+    const VK_MENU: i32 = 18;
+    const VK_LWIN: i32 = 91;
+    const VK_RWIN: i32 = 92;
+    const VK_LSHIFT: i32 = 160;
+    const VK_RSHIFT: i32 = 161;
+    const VK_LCONTROL: i32 = 162;
+    const VK_RCONTROL: i32 = 163;
+    const VK_LMENU: i32 = 164;
+    const VK_RMENU: i32 = 165;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        /// `SHORT WINAPI GetAsyncKeyState(int vKey)` — `WINAPI` is `__stdcall`, which is what
+        /// `extern "system"` selects on 32-bit Windows and plain C elsewhere. Bound under a
+        /// snake-case name so the declaration needs no lint suppression.
+        #[link_name = "GetAsyncKeyState"]
+        fn get_async_key_state(v_key: i32) -> i16;
+    }
+
+    /// `is_key_pressed` — `win32-console-mode.c:52-55`, including its cast through `unsigned short`
+    /// before the mask.
+    fn is_key_pressed(virtual_key: i32) -> bool {
+        // SAFETY: `GetAsyncKeyState` takes one integer by value and returns one by value. It borrows
+        // no memory from this frame, mutates nothing in this process, and reads only the OS's live
+        // keyboard state. It is safe to call from any thread at any time, and on any value of
+        // `virtual_key` — an out-of-range code simply reports "not pressed".
+        let state = unsafe { get_async_key_state(virtual_key) };
+        (state as u16) & KEY_PRESSED_MASK != 0
+    }
+
+    /// `is_modifier_name_pressed` — `win32-console-mode.c:57-63`, the same generic-plus-sided groups.
+    pub(super) fn probe(key: ModifierKey) -> bool {
+        let keys: &[i32] = match key {
+            ModifierKey::Shift => &[VK_SHIFT, VK_LSHIFT, VK_RSHIFT],
+            ModifierKey::Control => &[VK_CONTROL, VK_LCONTROL, VK_RCONTROL],
+            ModifierKey::Option => &[VK_MENU, VK_LMENU, VK_RMENU],
+            // Upstream tests only the two sided Win keys here — there is no generic `VK_WIN`.
+            ModifierKey::Command => &[VK_LWIN, VK_RWIN],
+        };
+        keys.iter().copied().any(is_key_pressed)
+    }
+}
+
 async fn run() -> anyhow::Result<i32> {
     // Process identity, first half — pi `cli.ts:12` `process.title = APP_NAME` (SEAM-070). The
     // rpc-mode suffix (pi's separate `rpc-entry.ts:6`) is applied once the mode is resolved, below.
@@ -108,6 +227,18 @@ async fn run() -> anyhow::Result<i32> {
     // conflating the two is how SEAM-070 stayed unfiled. The env half is TOOL-031 / PARITY-GAPS
     // PB-5 (area 04).
     set_process_name("cyrup");
+
+    // The Shift+Enter rescue's one missing link (UW-1). `cyrup_tui` wires the whole chain —
+    // `app/input_reader.rs` calls `rescue_native_shift_enter` with the live platform and
+    // `TERM_PROGRAM` — but `is_native_modifier_pressed` answers `false` until something registers a
+    // probe, so on a terminal that encodes nothing on Enter (Apple Terminal sends one `\r` for both
+    // Enter and Shift+Enter) the rescue could never fire and Shift+Enter submitted the message.
+    //
+    // Registration is NOT gated on `TERM_PROGRAM`: that gate is upstream's and lives inside
+    // `should_detect_native_shift_enter`, which reads the env per keystroke. Gating here as well
+    // would freeze the decision to whatever the variable held at process start.
+    #[cfg(any(target_os = "macos", windows))]
+    cyrup_tui::set_native_modifier_probe(native_modifier_probe::probe);
 
     // Pi `resetTimings()` at the top of `main()` (main.ts:474). The namespace is explicit here
     // because the table is process-global, exactly as pi's module-level Map is (AGENT-027).
