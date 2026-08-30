@@ -264,3 +264,107 @@ async fn human_allow_always_survives_into_a_later_turn_of_the_same_session() {
         "STILL one dialog after a second turn: the always-rule outlived the turn that created it"
     );
 }
+
+// ---------------------------------------------------------------- PERM-034 diagnostic probes
+//
+// The two tests above prove the gate LOGIC: an always-decision written on an instance is read back
+// by that same instance, across a tool call and across a turn. Both build the extension with the
+// BARE constructor and hand it to the harness pre-built, so neither can see the two mechanisms the
+// live report is consistent with. These add them.
+
+/// The owner's actual command rather than `echo hi`. `rm -rf ./tmp/test` is a single command unit,
+/// so `b3e1a6d`'s tree-sitter decomposition is a no-op for it and the stored subject is the literal
+/// string — if this diverges from the `echo hi` result, the subject derivation is implicated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn perm034_allow_always_sticks_for_the_reported_command() {
+    let (harness, executed, selects, _dir) =
+        interactive_harness("Allow Always", &["rm -rf ./tmp/test", "rm -rf ./tmp/test"]).await;
+
+    harness.run("go").await.unwrap();
+
+    assert_eq!(
+        executed.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        vec!["rm -rf ./tmp/test".to_string(), "rm -rf ./tmp/test".to_string()],
+        "both calls executed"
+    );
+    assert_eq!(
+        selects.load(Ordering::SeqCst),
+        1,
+        "PERM-034: only the FIRST call may prompt; the always-rule must cover the second"
+    );
+}
+
+/// A COMPOUND command. Post-`b3e1a6d` the bash arm decomposes into units and
+/// `pick_most_restrictive` returns ONE unit's result, so `result.command` — and therefore the
+/// approval subject — is the winning UNIT, not the string the user typed. The next identical call
+/// re-decomposes and must land on the same unit for the stored rule to match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn perm034_allow_always_sticks_for_a_compound_command() {
+    let cmd = "rm -rf ./tmp/test && echo done";
+    let (harness, _executed, selects, _dir) = interactive_harness("Allow Always", &[cmd, cmd]).await;
+
+    harness.run("go").await.unwrap();
+
+    assert_eq!(
+        selects.load(Ordering::SeqCst),
+        1,
+        "PERM-034/compound: the always-rule must cover the second identical compound call"
+    );
+}
+
+/// **PIN — this is UPSTREAM behaviour, not a defect. Do not "fix" it.**
+///
+/// A reload DOES wipe every "Allow Always" grant, and pi does exactly the same. Both sides clear
+/// `sessionApprovals` unconditionally from `session_start` AND from `session_shutdown`
+/// (`pi-permission-system` `index.ts:1828-1831`/`:1862-1865` @v0.8.0 ↔ `extension/native.rs`'s two
+/// arms), both take `reason: "reload"` on those events (`extensions/types.ts:565`/`:618`
+/// @pi v0.83.0), and on both sides it is only the `resources_discover` reload that deliberately
+/// spares the store (pi `:1844-1859`) — it clears the dedup cache alone.
+///
+/// This was measured while diagnosing PERM-034 ("Allow Always does not stick"). It reproduces the
+/// reported symptom exactly — approve always, reload, get re-prompted — which makes it an
+/// attractive and WRONG explanation. Filed here as a pin so the next reader does not re-derive it
+/// and file a port bug against faithful code. If cyrup turns out to re-prompt where pi does not,
+/// the divergence is in WHEN the two dispatch these events, not in what the handlers do with them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn perm034_a_reload_wipes_always_grants_exactly_as_upstream_does() {
+    use cyrup_core::CancelToken;
+    use cyrup_ext::event::HostEvent;
+
+    let (harness, _executed, selects, _dir) =
+        interactive_harness("Allow Always", &["rm -rf ./tmp/test"]).await;
+
+    harness.run("first turn").await.unwrap();
+    assert_eq!(selects.load(Ordering::SeqCst), 1, "turn 1 prompts exactly once");
+
+    // The store-clearing half of `ExtensionFacade::reload` (`cyrup-ext/src/facade.rs:2142`), in its
+    // order: shutdown the outgoing set, then start the fresh one. Note the session's own
+    // `start_announced` latch (`session/lifecycle.rs:193`) does NOT gate these — the facade
+    // dispatches to extensions directly — which is why a reload reaches the handler at all.
+    let cancel = CancelToken::new();
+    let dispatcher = harness.session().services().ext_host.dispatcher();
+    dispatcher
+        .dispatch_notify(
+            &HostEvent::SessionShutdown { reason: "reload".into(), target_session_file: None },
+            &cancel,
+        )
+        .await;
+    dispatcher
+        .dispatch_notify(
+            &HostEvent::SessionStart { reason: "reload".into(), previous_session_file: None },
+            &cancel,
+        )
+        .await;
+
+    harness.append_responses(vec![
+        FauxResponse::tool_call("bash", serde_json::json!({ "command": "rm -rf ./tmp/test" })),
+        FauxResponse::text("done"),
+    ]);
+    harness.run("second turn").await.unwrap();
+
+    assert_eq!(
+        selects.load(Ordering::SeqCst),
+        2,
+        "the reload cleared the store, so the second turn prompts again — upstream does this too"
+    );
+}

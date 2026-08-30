@@ -54,7 +54,9 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 > `0 critical / 5 high` headline below is false: all five of those rows closed on 2026-08-15, and the
 > twelve area tables carried **three unstruck `critical` severity cells** when this correction was
 > measured (`SEAM-112`, `PERM-034`, `TUI-092`) and three unstruck `high` ones (`PROV-068`, `TUI-091`,
-> `SEAM-113`) — **2 + 4** after `TUI-092`'s de-escalation landed later in the same batch. See
+> `SEAM-113`) — **2 + 4** after `TUI-092`'s de-escalation landed later in the same batch. **All three
+> of those criticals are now struck: `SEAM-112` fixed 2026-08-29, `TUI-092` closed 2026-08-20, and
+> `PERM-034` closed 2026-08-29 as REFUTED (a faithful port, not a gap).** See
 > §0a, which tables them. **The 237/606 figures are stale by roughly a hundred rows** — five closing
 > batches landed on 2026-08-15 without reconciling this file — and no replacement total is published
 > here **because the twelve tables were being edited by other writers in the same batch that produced
@@ -277,7 +279,7 @@ Where the re-audit moved an item to a different class, the id moves section and 
 > | id | area | sev | one line |
 > |---|---|---|---|
 > | ~~`SEAM-112`~~ | 08 | ~~**crit**~~ **CLOSED 2026-08-29** | `/resume` produced a broken session: nothing rendered and bash tool calls repeated endlessly. Render half closed at `879eb4e`; the repetition was a port divergence — pi guards the overflow-latch clear with `stopReason !== "error" && stopReason !== "length"` and the port kept only the shared arm, so a `Length` message cleared `overflow_recovery_attempted` on `message_end` immediately before `check_compaction` read it, leaving the one-shot brake unreachable and compact-and-retry unbounded. See area 08. |
-> | `PERM-034` | 10 | **crit** | *(renumbered from `PERM-033` on 2026-08-19 — id collision; see area 10.)* "Allow Always" does not stick — the same tool/command is re-prompted within one session, which makes the permission gate unusable. Both halves are wired (`extension.rs:1717`/`:2023` write, `:1464`/`:1634`/`:2211` read), so it is **not** the dead-seam class |
+> | ~~`PERM-034`~~ | 10 | ~~**crit**~~ **CLOSED 2026-08-29 — REFUTED** | *(renumbered from `PERM-033` on 2026-08-19 — id collision; see area 10.)* "Allow Always" does not stick. **Not a gap — the port is faithful and no code changed.** Both sides clear `sessionApprovals` unconditionally from `session_start` AND `session_shutdown` (pi `index.ts:1828-1831`/`:1862-1865` @v0.8.0), so a reload wiping always-grants is upstream behaviour, now pinned by a test rather than filed as a bug. The subject round-trips byte-identically for simple, reported and compound commands; the per-instance-store suspect is structurally impossible (one `Arc` shared process-wide). Falsification condition recorded in area 10 — reopen only on a re-prompt inside one session with no reload and no session switch |
 > | `TUI-092` | 07 | ~~crit~~ **high** | The TUI degrades from smooth to a total lockup. **Its severity cell was corrected `critical` → `high` inside this batch**; its own bug file's `**Severity**` header has said `high` since round 2 (`bugs/TUI-092-progressive-lockup.md`); the three clauses that justified `critical` are all false at HEAD — Ctrl+D is bound (`keymap.rs:655` → `app/input.rs:126-129` → `app/run_action.rs:16`), Ctrl+C is bound (`keymap.rs:656` → `app/input.rs:219-231`), and `TUI-088` is CLOSED |
 > | `PROV-068` | 01 | high | An explicit `null` in `thinkingLevelMap` reads as UNSUPPORTED, collapsing most reasoning models to two rungs (`cyrup-provider/src/collection.rs:794-807`) |
 > | `TUI-091` | 07 | high | Reasoning blocks never render although every layer is wired — and as of 2026-08-19 the row has **zero live hypotheses**; its last named candidate is refuted in the area file |
