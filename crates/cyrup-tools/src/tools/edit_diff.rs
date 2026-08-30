@@ -1,6 +1,7 @@
 //! Line-ending/BOM handling + diff/patch generation for `edit` (R-03-018/019, arch-03 §6.4).
 
 use similar::TextDiff;
+use std::collections::HashMap;
 use unicode_normalization::UnicodeNormalization;
 
 const BOM: &str = "\u{feff}";
@@ -284,6 +285,177 @@ struct FuzzyMatch {
     index: usize,
     match_length: usize,
     used_fuzzy: bool,
+    /// Indentation the searched buffer carries that `old_text` did not. `None` for every tier
+    /// except the line-anchored one, and [`reindent`] leaves the replacement untouched for
+    /// `None`, so tiers 1 and 2 stay bit-for-bit unaffected.
+    ///
+    /// It must NOT be an empty `String` for tiers 1 and 2: `Some("")` is a real line-anchored
+    /// outcome — a needle authored MORE indented than the file dedents to a zero delta — and
+    /// that case still has to re-base the replacement, which an empty-string sentinel would
+    /// silently skip.
+    indent: Option<String>,
+}
+
+/// One line-anchored match: a run of whole lines whose bodies equal the needle's bodies after
+/// the fuzzy fold, `trim_end`, and removal of a **uniform** indentation prefix.
+struct LineAnchored {
+    /// Byte offset of the first matched line, in the buffer that was searched.
+    index: usize,
+    /// Byte length of the matched region in that same buffer.
+    match_length: usize,
+    /// The indentation the buffer carries that the dedented needle does not.
+    indent: String,
+}
+
+fn leading_ws_len(s: &str) -> usize {
+    s.len() - s.trim_start().len()
+}
+
+/// Every line-anchored match of `old_text` in `content`.
+///
+/// [CYRUP-DELTA] Pi has no equivalent: `fuzzyFindText` (edit-diff.ts:206-244) stops after the
+/// normalized-buffer pass, so an `oldText` at the wrong indent depth is *not found* upstream and
+/// is found here. This is the tier every production applier ships — codex `apply_patch`'s third
+/// pass (seek_sequence.rs:58), aider's `match_but_for_leading_whitespace`
+/// (editblock_coder.py:276), git's `--ignore-whitespace` (apply.c:2544) — and it carries their
+/// safety rule: the indentation delta must be a SINGLE value across every non-blank line, so a
+/// block whose tokens coincide at ragged indentation is rejected rather than mangled.
+///
+/// Offsets are reported in the buffer that was searched, so `apply_replacements` splices the
+/// ORIGINAL lines and the fuzzy overlay — with its line-count invariant — is never involved.
+fn line_anchored_matches(content: &str, old_text: &str) -> Vec<LineAnchored> {
+    let (needle_body, needle_had_eol) = match old_text.strip_suffix('\n') {
+        Some(rest) => (rest, true),
+        None => (old_text, false),
+    };
+    // Per-line folding is equivalent to folding the buffer: NFKC never inserts or removes `\n`
+    // (see `normalize_for_fuzzy`) and `trim_end` is already line-local.
+    let folded: Vec<String> = needle_body.split('\n').map(normalize_for_fuzzy).collect();
+    // An all-whitespace needle stays on pi's path: `count_occurrences` drives it into the
+    // duplicate error (edit-diff.ts:333), and matching it here would change that remediation.
+    if folded.iter().all(|l| l.trim().is_empty()) {
+        return Vec::new();
+    }
+    // Uniformly outdent the needle by its own minimum indent, so a needle carrying *some* of the
+    // file's indentation normalizes the same as one carrying none
+    // (aider `replace_part_with_missing_leading_whitespace`, editblock_coder.py:248-255).
+    let common = folded
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| leading_ws_len(l))
+        .min()
+        .unwrap_or(0);
+    let needle: Vec<&str> = folded
+        .iter()
+        .map(|l| {
+            if l.trim().is_empty() {
+                l.as_str()
+            } else {
+                l.get(common..).unwrap_or(l.as_str())
+            }
+        })
+        .collect();
+
+    let spans = get_line_spans(content);
+    let width = needle.len();
+    let mut out: Vec<LineAnchored> = Vec::new();
+    if width == 0 || spans.len() < width {
+        return out;
+    }
+    for i in 0..=spans.len().saturating_sub(width) {
+        let mut indents: Vec<String> = Vec::new();
+        let mut ok = true;
+        for (k, n) in needle.iter().enumerate() {
+            let Some((s, e)) = spans.get(i + k) else {
+                ok = false;
+                break;
+            };
+            let raw = content.get(*s..*e).unwrap_or("");
+            let body = normalize_for_fuzzy(raw.strip_suffix('\n').unwrap_or(raw));
+            if body.trim_start() != n.trim_start() {
+                ok = false;
+                break;
+            }
+            if !n.trim().is_empty() {
+                // The prefix the file carries that the needle does not. Requires the file line to
+                // be at least as long, i.e. only the outdented-needle direction is allowed.
+                let Some(prefix) = body.len().checked_sub(n.len()).and_then(|w| body.get(..w))
+                else {
+                    ok = false;
+                    break;
+                };
+                if !prefix.chars().all(char::is_whitespace) {
+                    ok = false;
+                    break;
+                }
+                indents.push(prefix.to_string());
+            }
+        }
+        if !ok {
+            continue;
+        }
+        // THE false-apply bound: one indentation delta, or no match at all.
+        let Some(first) = indents.first() else {
+            continue;
+        };
+        if indents.iter().any(|d| d != first) {
+            continue;
+        }
+        let (Some((start, _)), Some((_, last_end))) = (spans.get(i), spans.get(i + width - 1))
+        else {
+            continue;
+        };
+        let last_body_end = content
+            .get(..*last_end)
+            .and_then(|s| s.strip_suffix('\n'))
+            .map_or(*last_end, str::len);
+        let end = if needle_had_eol {
+            *last_end
+        } else {
+            last_body_end
+        };
+        out.push(LineAnchored {
+            index: *start,
+            match_length: end.saturating_sub(*start),
+            indent: first.clone(),
+        });
+    }
+    out
+}
+
+/// Re-indent `new_text` to the depth the matched region carries.
+///
+/// Mirrors aider's `replace_part_with_missing_leading_whitespace` (editblock_coder.py:269): the
+/// replacement is outdented by its own uniform margin and then re-indented by the prefix
+/// captured from the file, so a replacement authored at the wrong depth still lands at the
+/// file's depth. `indent` is `None` for every match that did not come from the line-anchored
+/// tier, and `None` returns `new_text` untouched — tiers 1 and 2 are bit-for-bit unaffected.
+///
+/// `Some("")` is NOT the same as `None`. A needle authored *more* indented than the file
+/// dedents to a zero delta, and the replacement — authored at that same too-deep margin — still
+/// has to be re-based, or the edit writes correct text at an indentation the file never had.
+fn reindent(new_text: &str, indent: Option<&str>) -> String {
+    let Some(indent) = indent else {
+        return new_text.to_string();
+    };
+    let lines: Vec<&str> = new_text.split('\n').collect();
+    let common = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| leading_ws_len(l))
+        .min()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|l| {
+            if l.trim().is_empty() {
+                (*l).to_string()
+            } else {
+                format!("{indent}{}", l.get(common..).unwrap_or(l))
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
 }
 
 /// `fuzzyFindText` (edit-diff.ts:206-244): exact match first, then normalized-space match. The
@@ -295,6 +467,7 @@ fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatch {
             index: idx,
             match_length: old_text.len(),
             used_fuzzy: false,
+            indent: None,
         };
     }
     let fuzzy_content = normalize_for_fuzzy(content);
@@ -312,13 +485,30 @@ fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatch {
             index: idx,
             match_length: fuzzy_old.len(),
             used_fuzzy: true,
+            indent: None,
         },
-        None => FuzzyMatch {
-            found: false,
-            index: 0,
-            match_length: 0,
-            used_fuzzy: false,
-        },
+        None => {
+            // [CYRUP-DELTA] Tier 3, tried only once both of pi's passes have failed: a
+            // line-anchored match that ignores a UNIFORM indentation difference. `used_fuzzy`
+            // stays false because the offsets are in the buffer that was searched, so the
+            // ordinary `apply_replacements` path handles it.
+            if let Some(m) = line_anchored_matches(content, old_text).into_iter().next() {
+                return FuzzyMatch {
+                    found: true,
+                    index: m.index,
+                    match_length: m.match_length,
+                    used_fuzzy: false,
+                    indent: Some(m.indent),
+                };
+            }
+            FuzzyMatch {
+                found: false,
+                index: 0,
+                match_length: 0,
+                used_fuzzy: false,
+                indent: None,
+            }
+        }
     }
 }
 
@@ -494,8 +684,94 @@ fn err_empty(path: &str, i: usize, total: usize) -> EditError {
     })
 }
 
-fn err_not_found(path: &str, i: usize, total: usize) -> EditError {
-    EditError(if total == 1 {
+/// Similarity floor for showing a near-miss. Below this the "closest" region is noise and naming
+/// it would mislead more than the bare failure does. Aider uses the same 0.6 over
+/// `difflib.SequenceMatcher` (editblock_coder.py:602).
+const NEAR_MISS_THRESHOLD: f32 = 0.6;
+/// Extra original lines shown either side of the near-miss window (editblock_coder.py:623).
+const NEAR_MISS_CONTEXT: usize = 5;
+
+/// The window of `content` most similar to `old_text`, as a 1-indexed start line and the lines
+/// themselves, or `None` when nothing clears [`NEAR_MISS_THRESHOLD`].
+///
+/// Scores every same-length line window with `similar::TextDiff::ratio()`. This drives **only**
+/// the not-found message: no caller may use it to select a replacement target.
+fn nearest_region(content: &str, old_text: &str) -> Option<(usize, String)> {
+    let hay: Vec<&str> = content.split('\n').collect();
+    let needle: Vec<&str> = old_text.split('\n').collect();
+    let width = needle.len();
+    if width == 0 || hay.len() < width {
+        return None;
+    }
+    // `ratio()` is `2 * matched / (old_len + new_len)`; both sides are `width` lines here, so it
+    // reduces to `matched / width`. `matched` is Myers' matching subsequence, which is a
+    // sub-multiset of the window's multiset overlap with the needle — so that overlap, divided by
+    // `width`, is an upper bound on the score, and it slides in O(1) per window.
+    //
+    // A window whose bound clears neither the floor nor the running best can never be the one
+    // reported, so it never pays for a diff. The window chosen and the score it carries are
+    // identical to scoring every window; on a large file almost none of them are scored at all.
+    let mut want: HashMap<&str, i32> = HashMap::new();
+    for line in &needle {
+        *want.entry(line).or_insert(0) += 1;
+    }
+    let mut have: HashMap<&str, i32> = HashMap::new();
+    let mut overlap: i32 = 0;
+    let mut best: Option<(f32, usize)> = None;
+    for i in 0..=hay.len().saturating_sub(width) {
+        if i == 0 {
+            for &line in hay.get(..width).unwrap_or(&[]) {
+                let slot = have.entry(line).or_insert(0);
+                *slot += 1;
+                if *slot <= want.get(line).copied().unwrap_or(0) {
+                    overlap += 1;
+                }
+            }
+        } else {
+            if let Some(&out) = hay.get(i - 1) {
+                let slot = have.entry(out).or_insert(0);
+                *slot -= 1;
+                if *slot < want.get(out).copied().unwrap_or(0) {
+                    overlap -= 1;
+                }
+            }
+            if let Some(&inc) = hay.get(i + width - 1) {
+                let slot = have.entry(inc).or_insert(0);
+                *slot += 1;
+                if *slot <= want.get(inc).copied().unwrap_or(0) {
+                    overlap += 1;
+                }
+            }
+        }
+        let bound = f64::from(overlap) / width as f64;
+        if bound < f64::from(NEAR_MISS_THRESHOLD)
+            || best.is_some_and(|(b, _)| bound <= f64::from(b))
+        {
+            continue;
+        }
+        let Some(window) = hay.get(i..i + width) else {
+            continue;
+        };
+        // `from_slices` over the line slices rather than `from_lines` over a joined String: the
+        // ratio is computed from element counts either way, so the score is unchanged, and no
+        // String is allocated to score a window.
+        let ratio = TextDiff::from_slices(window, &needle).ratio();
+        if best.is_none_or(|(b, _)| ratio > b) {
+            best = Some((ratio, i));
+        }
+    }
+    let (ratio, start) = best?;
+    if ratio < NEAR_MISS_THRESHOLD {
+        return None;
+    }
+    let from = start.saturating_sub(NEAR_MISS_CONTEXT);
+    let to = (start + width + NEAR_MISS_CONTEXT).min(hay.len());
+    let shown = hay.get(from..to)?.join("\n");
+    Some((from + 1, shown))
+}
+
+fn err_not_found(path: &str, i: usize, total: usize, content: &str, old: &str) -> EditError {
+    let head = if total == 1 {
         format!(
             "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
         )
@@ -503,6 +779,15 @@ fn err_not_found(path: &str, i: usize, total: usize) -> EditError {
         format!(
             "Could not find edits[{i}] in {path}. The oldText must match exactly including all whitespace and newlines."
         )
+    };
+    // [CYRUP-DELTA] Pi stops at the sentence above (edit-diff.ts:258-267). Cyrup appends the
+    // closest region so the caller repairs the needle in one round instead of re-reading and
+    // guessing. Purely additive: no match/apply decision consults `nearest_region`.
+    EditError(match nearest_region(content, old) {
+        Some((line, shown)) => {
+            format!("{head}\nClosest region in {path} starts at line {line}:\n{shown}")
+        }
+        None => head,
     })
 }
 
@@ -562,9 +847,15 @@ pub fn apply_edits_to_normalized_content(
     for (i, (old, new)) in normalized_edits.iter().enumerate() {
         let mr = fuzzy_find_text(&replacement_base, old);
         if !mr.found {
-            return Err(err_not_found(path, i, total));
+            return Err(err_not_found(path, i, total, &replacement_base, old));
         }
-        let occ = count_occurrences(&replacement_base, old);
+        // `count_occurrences` only sees normalized SUBSTRING occurrences, so it reports 0 for a
+        // match that came from the line-anchored tier. Taking the count from the tier that
+        // actually matched keeps the uniqueness rule — the false-apply bound — in force there.
+        let occ = match count_occurrences(&replacement_base, old) {
+            0 => line_anchored_matches(&replacement_base, old).len(),
+            n => n,
+        };
         if occ > 1 {
             return Err(err_duplicate(path, i, total, occ));
         }
@@ -572,7 +863,7 @@ pub fn apply_edits_to_normalized_content(
             edit_index: i,
             match_index: mr.index,
             match_length: mr.match_length,
-            new_text: new.clone(),
+            new_text: reindent(new, mr.indent.as_deref()),
         });
     }
 
@@ -821,5 +1112,145 @@ mod tests {
         ];
         let e = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap_err();
         assert!(e.0.contains("overlap in f.txt"), "got: {}", e.0);
+    }
+
+    /// [CYRUP-DELTA] Tier 3 (`line_anchored_matches`). Pi's `fuzzyFindText`
+    /// (edit-diff.ts:206-244) stops after the normalized-buffer pass, so an `oldText` that is
+    /// the right code at the wrong indent depth is *not found* upstream and is found here.
+    #[test]
+    fn line_anchored_tier_rebases_to_the_files_own_indent() {
+        let content = "mod a {\n    fn foo() {\n        bar();\n    }\n}\n";
+        let want = "mod a {\n    fn foo() {\n        baz();\n    }\n}\n";
+        // Authored with no indentation at all.
+        let edits = vec![(
+            "fn foo() {\n    bar();\n}".to_string(),
+            "fn foo() {\n    baz();\n}".to_string(),
+        )];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.rs").unwrap();
+        assert_eq!(r.new_content, want);
+        // Authored carrying only SOME of it — 2 spaces where the file has 4. The needle is
+        // outdented by its own minimum first, so both spellings land the same
+        // (aider `replace_part_with_missing_leading_whitespace`, editblock_coder.py:248-255).
+        let edits = vec![(
+            "  fn foo() {\n      bar();\n  }".to_string(),
+            "  fn foo() {\n      baz();\n  }".to_string(),
+        )];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.rs").unwrap();
+        assert_eq!(r.new_content, want);
+    }
+
+    /// The false-apply bound. The indentation delta must be ONE value across every non-blank
+    /// line; a block whose tokens coincide at ragged depths is refused, never rewritten.
+    #[test]
+    fn ragged_indentation_is_refused_rather_than_mangled() {
+        // Same tokens as the needle, but at depths 4, 12 and 6 — no single offset fits.
+        let content = "mod a {\n    fn foo() {\n            bar();\n      }\n}\n";
+        let edits = vec![("fn foo() {\n    bar();\n}".to_string(), "X".to_string())];
+        let e = apply_edits_to_normalized_content(content, &edits, "f.rs").unwrap_err();
+        assert!(
+            e.0.starts_with("Could not find the exact text in f.rs."),
+            "got: {}",
+            e.0
+        );
+    }
+
+    /// `count_occurrences` only sees normalized SUBSTRING occurrences and reports 0 for a
+    /// line-anchored match, so the uniqueness rule — the other half of the false-apply bound —
+    /// has to be fed from the tier that actually matched.
+    #[test]
+    fn two_indent_different_copies_are_a_duplicate_not_a_write() {
+        let content = "mod a {\n    fn foo() {\n        bar();\n    }\n}\nmod b {\n        fn foo() {\n            bar();\n        }\n}\n";
+        let edits = vec![("fn foo() {\n    bar();\n}".to_string(), "X".to_string())];
+        let e = apply_edits_to_normalized_content(content, &edits, "f.rs").unwrap_err();
+        assert!(
+            e.0.contains("Found 2 occurrences of the text in f.rs"),
+            "got: {}",
+            e.0
+        );
+    }
+
+    /// A needle authored MORE indented than the file dedents to a zero delta. That is a real
+    /// line-anchored match, not the absence of one: the replacement — authored at the same
+    /// too-deep margin — still has to be re-based, or correct text lands at an indentation the
+    /// file never had.
+    #[test]
+    fn a_zero_indent_delta_still_rebases_the_replacement() {
+        let content = "a\n  b\n";
+        let edits = vec![("  a\n    b".to_string(), "  a\n    c".to_string())];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        assert_eq!(r.new_content, "a\n  c\n");
+    }
+
+    /// Tiers 1 and 2 are pi's, and the new tier must leave them bit-for-bit alone.
+    #[test]
+    fn exact_and_fuzzy_tiers_are_untouched_by_the_line_anchored_tier() {
+        // Tier 1: the needle is a substring INSIDE an indented line. Pi replaces exactly those
+        // bytes and re-indents nothing; a `reindent` that fired here would mangle the result.
+        let content = "fn a() {\n\t\tone();\n}\n";
+        let edits = vec![("one();".to_string(), "\tone();\n\ttwo();".to_string())];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.rs").unwrap();
+        assert_eq!(r.new_content, "fn a() {\n\t\t\tone();\n\ttwo();\n}\n");
+        // Tier 2: a trailing-whitespace-only difference still takes the fuzzy overlay.
+        let content = "alpha   \nbeta\n";
+        let edits = vec![("alpha\nbeta".to_string(), "gamma\ndelta".to_string())];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        assert_eq!(r.new_content, "gamma\ndelta\n");
+    }
+
+    /// Pi sends an all-whitespace `oldText` into `countOccurrences` (edit-diff.ts:333), which
+    /// raises the DUPLICATE error — different remediation advice from "not found". The
+    /// line-anchored count must stay a FALLBACK, consulted only when the substring count is 0,
+    /// or this input changes its answer.
+    #[test]
+    fn whitespace_only_old_text_still_reports_duplicates() {
+        let content = "mod a {\n    fn foo() {\n        bar();\n    }\n}\n";
+        let edits = vec![("   ".to_string(), "X".to_string())];
+        let e = apply_edits_to_normalized_content(content, &edits, "f.rs").unwrap_err();
+        assert!(e.0.contains("occurrences"), "got: {}", e.0);
+        assert!(!e.0.contains("Could not find"), "got: {}", e.0);
+    }
+
+    /// [CYRUP-DELTA] Pi stops at the sentence (edit-diff.ts:258-267); cyrup appends the closest
+    /// region so the caller repairs the needle in one round. Similarity picks what to SHOW and
+    /// never what to write.
+    #[test]
+    fn not_found_names_the_closest_region() {
+        let content = "mod a {\n    fn foo() {\n        bar();\n    }\n}\n";
+        let edits = vec![(
+            "    fn foo() {\n        quux();\n    }".to_string(),
+            "X".to_string(),
+        )];
+        let e = apply_edits_to_normalized_content(content, &edits, "f.rs").unwrap_err();
+        // Pi's sentence still LEADS the message.
+        assert!(
+            e.0.starts_with(
+                "Could not find the exact text in f.rs. The old text must match exactly including all whitespace and newlines."
+            ),
+            "got: {}",
+            e.0
+        );
+        // The appended region names its 1-indexed start line and shows the file's real bytes.
+        assert!(
+            e.0.contains("Closest region in f.rs starts at line 1:"),
+            "got: {}",
+            e.0
+        );
+        assert!(e.0.contains("bar();"), "got: {}", e.0);
+    }
+
+    /// The delta is ADDITIVE: below the similarity floor the message is byte-identical to pi's.
+    /// Without this, lowering the floor would decorate every failure with a bogus region.
+    #[test]
+    fn a_far_miss_keeps_pis_bare_sentence() {
+        let content = "mod a {\n    fn foo() {\n        bar();\n    }\n}\n";
+        let edits = vec![(
+            "totally unrelated content here\nnot in the file at all\nnope".to_string(),
+            "X".to_string(),
+        )];
+        let e = apply_edits_to_normalized_content(content, &edits, "f.rs").unwrap_err();
+        assert_eq!(
+            e.0,
+            "Could not find the exact text in f.rs. The old text must match exactly including all whitespace and newlines."
+        );
     }
 }
