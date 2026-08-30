@@ -164,7 +164,13 @@ pub(crate) fn edit_preview(
     }
     Some(
         cyrup_tools::tools::edit_diff::compute_edits_diff(path, &edits, cwd)
-            .map(|p| p.diff)
+            .map(|p| {
+                if p.unapplied.is_empty() {
+                    p.diff
+                } else {
+                    format!("{}\n{}", p.diff, p.unapplied.join("\n"))
+                }
+            })
             .map_err(|e| e.to_string()),
     )
 }

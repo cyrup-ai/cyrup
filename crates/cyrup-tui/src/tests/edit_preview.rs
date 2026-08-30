@@ -251,3 +251,52 @@ fn mirror_post_write_diff_still_renders_without_any_preview() {
     assert!(has_diff_row(&text, '-', "bravo"), "post-write removed line missing:\n{text}");
     assert!(has_diff_row(&text, '+', "BRAVO"), "post-write added line missing:\n{text}");
 }
+
+/// [CYRUP-DELTA] A partial batch previews as `Ok` — the survivors' diff — plus one line per edit
+/// that will not land. Pi has nothing to show here, because the call would be discarded whole.
+/// This is the branch in `edit_preview` that joins `unapplied` onto the diff, and it is what a
+/// user reads while deciding whether to approve a write that will only partly succeed.
+#[test]
+fn edit_preview_names_the_edits_that_will_not_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("hello.txt");
+    std::fs::write(&file, BEFORE).unwrap();
+
+    // Wider than the 72 the other cases use: the shortfall sentence must not wrap through the
+    // fragment being asserted.
+    let mut app = App::new(TestBackend::new(120, 24), UiTheme::dark()).unwrap();
+    app.set_title_cwd(dir.path().to_path_buf());
+    start_edit(
+        &mut app,
+        "call-partial",
+        json!({ "path": "hello.txt", "edits": [
+            { "oldText": "bravo", "newText": "BRAVO" },
+            { "oldText": "zzz", "newText": "9" },
+        ] }),
+    );
+
+    let text = viewport(&app);
+    // What WILL land is still previewed.
+    assert!(
+        has_diff_row(&text, '-', "bravo"),
+        "surviving edit not previewed:\n{text}"
+    );
+    assert!(
+        has_diff_row(&text, '+', "BRAVO"),
+        "surviving edit not previewed:\n{text}"
+    );
+    // And what will NOT is named — without the near-miss region, which belongs in the result.
+    assert!(
+        text.contains("Could not find edits[1] in hello.txt."),
+        "shortfall not named:\n{text}"
+    );
+    assert!(
+        !text.contains("Closest region"),
+        "region leaked into the preview:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        BEFORE,
+        "the preview must not have touched the file"
+    );
+}
