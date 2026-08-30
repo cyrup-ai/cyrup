@@ -121,6 +121,11 @@ pub use cyrup_session::layout::{encode_cwd, SessionLayout, SessionsRoot};
 /// definition instead of carrying a second copy of the same walk.
 pub use cyrup_session::git_paths::{find_git_paths, GitPaths};
 pub use cyrup_session::listing::{list_all, list_in_dir};
+/// Re-exported so the bin's signal handlers and the TUI's wedge-escalation path can drain the
+/// session fsync queue before a hard `process::exit` without a direct `cyrup-session`
+/// dependency (PERF-004 §3.5). A courtesy, not a correctness requirement: the bytes are
+/// already in the page cache, so only power-loss durability is outstanding.
+pub use cyrup_session::flush_session_writes;
 pub use cyrup_tools::{Availability, PermissionPolicy};
 /// Re-exported so front-ends (`cyrup-modes` RPC `set_steering_mode`/`set_follow_up_mode`) can name
 /// the queue-drain mode [`AgentSession::set_steering_mode`] takes without a direct `cyrup-agent` dep.

@@ -72,7 +72,7 @@
 use std::sync::Arc;
 
 use cyrup_sdk::core::CancelToken;
-use cyrup_session_svc::{AgentSessionRuntime, AppMode};
+use cyrup_session_svc::{flush_session_writes, AgentSessionRuntime, AppMode};
 use cyrup_tools::kill_tracked_detached_children;
 
 /// Which shutdown signal was delivered, so a REPEAT delivery can exit with the conventional code.
@@ -215,6 +215,10 @@ pub fn spawn_abort_on_signal(
             // escalation and by nothing upstream. This closes a hole cyrup's own delta opened.
             let again = wait_for_signal().await;
             kill_tracked_detached_children();
+            // PERF-004 §3.5: this arm hard-exits without reaching `runtime.dispose()`, so it is
+            // the one path that must drain the session fsync queue itself. Synchronous on
+            // purpose — it is already a hard exit and one flush round is ~200 µs.
+            flush_session_writes();
             std::process::exit(again.exit_code());
         });
 
@@ -228,6 +232,9 @@ pub fn spawn_abort_on_signal(
 
         if let Some(code) = first_delivery_exit_code(host, first) {
             runtime.dispose().await;
+            // `dispose` already drained the session fsync queue (PERF-004 §3.5); this covers
+            // anything appended between it returning and the exit below.
+            flush_session_writes();
             std::process::exit(code);
         }
 
