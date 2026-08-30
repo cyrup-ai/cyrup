@@ -1,24 +1,17 @@
-//! `resolveTargetInCwd` / `formatSessionRefs` — the cwd-scoped target resolver from
-//! `pi-intercom/project-agent.ts` (`v0.10.1`, 324 lines), ported WITHOUT the Herdr half.
+//! `resolveTargetInCwd` / `formatSessionRefs` / `waitForProjectSession` — the cwd-scoped target
+//! resolver and the post-launch registration wait from `pi-intercom/project-agent.ts` (`v0.12.0`,
+//! 324 lines; the file is byte-identical at `v0.10.1`, `sha1 bb336e38`).
 //!
-//! # [CYRUP-DELTA] — the Herdr pane launcher is not ported
+//! Both halves of that file are now ported. The pure resolver is here (`resolveTargetInCwd` at
+//! `:188-226`, `formatSessionRefs` at `:298-302`, `waitForProjectSession` at `:255-296`); the
+//! launcher half — `HerdrClient`, `openProjectPane`, `resolveProjectRoot` — is
+//! [`crate::project_pane`], split out because it spawns processes and this module is pure.
 //!
-//! `project-agent.ts` is two things bolted together: a pure resolver (`ProjectTargetResolution`,
-//! `resolveTargetInCwd` at `:188-226`, `formatSessionRefs` at `:298-302`) and a `HerdrClient` that
-//! shells out to a `herdr` binary from `HERDR_BIN` to open a project pane and start a new agent
-//! there (`:53-155`, `openProjectPane` at `:227+`, `waitForProjectSession`). Only the resolver is
-//! ported here.
-//!
-//! Reason: whether cyrup shells out to `herdr` at all is an open product question
-//! (`docs/gap-analysis/11-cyrup-intercom.md`, ICOM-042 "OQ"), and `cyrup-ext-subagents` already
-//! carries a deliberate Herdr-inspector divergence that a fresh call here would contradict. The
-//! resolver half needs no external binary and is what makes `intercom({action:"send", cwd})`
-//! addressable at all, so it lands independently — as ICOM-042's own Fix directs.
-//!
-//! The one user-visible consequence is in [`crate::tools::intercom`]: upstream's
-//! "no session in that cwd" error ends with `Pass openProjectPaneIfMissing: true to open a Herdr
-//! project pane and start Pi there.` (`v0.10.1 index.ts:1221`). cyrup omits that sentence rather
-//! than advertise a parameter the tool would reject.
+//! ICOM-042 landed the launcher against **Herdr**, upstream's own backend, so
+//! `intercom({action:"send"|"ask", cwd, openProjectPaneIfMissing:true})` opens a project pane and
+//! starts cyrup in it exactly as pi does. [`wait_for_project_session`] is what makes that new
+//! session addressable: it is not on the roster until the agent inside the pane connects and
+//! registers.
 
 use crate::cwd::same_cwd;
 use crate::transport::protocol::SessionInfo;
@@ -40,7 +33,7 @@ pub enum ProjectTargetResolution {
     },
     /// `{ kind: "missing", targetCwd, reason }`. Upstream's `reason` is `string | undefined` in the
     /// type but is populated at both `missing` return sites (`:198`, `:225`), which is why the
-    /// `existing.reason ?? …` fallback at `index.ts:1221` is unreachable.
+    /// `existing.reason ?? …` fallback at `v0.10.1 index.ts:1205` is unreachable.
     Missing {
         /// The normalized directory the lookup ran against.
         target_cwd: String,
@@ -173,6 +166,86 @@ pub fn resolve_target_in_cwd(
     })
 }
 
+/// `waitForProjectSession(client, input)` (`v0.12.0 project-agent.ts:255-296`).
+///
+/// A launched pane is not yet addressable: the agent inside it has to connect and `register` before
+/// the broker lists it. This polls the roster until it does.
+///
+/// `before_session_ids` is snapshotted BEFORE the launch (`index.ts:1532`), so the new session is
+/// identified by DIFFERENCE. A cwd-only filter would happily return a peer that was already
+/// starting there for its own reasons.
+///
+/// `launcher_name` parameterizes only the timeout sentence's vendor noun; with the Herdr backend
+/// ICOM-042 shipped, that sentence is upstream's verbatim apart from `Pi` → `cyrup`.
+///
+/// # Errors
+/// - `"Cancelled"` when `cancel` fires (`:269`), checked both at the top of each poll and while
+///   sleeping between them.
+/// - the ambiguity string at `:289` when more than one new session registers there.
+/// - the timeout string at `:295`.
+/// - the roster fetch's own error, when the broker connection fails outright.
+pub async fn wait_for_project_session(
+    client: &crate::transport::client::IntercomClient,
+    project_root: &str,
+    current_session_id: &str,
+    before_session_ids: &std::collections::HashSet<String>,
+    to: Option<&str>,
+    cancel: &cyrup_core::CancelToken,
+    launcher_name: &str,
+) -> Result<SessionInfo, String> {
+    use std::time::Duration;
+    let timeout = Duration::from_millis(crate::project_pane::DEFAULT_PROJECT_AGENT_TIMEOUT_MS);
+    let poll = Duration::from_millis(crate::project_pane::DEFAULT_PROJECT_AGENT_POLL_MS);
+    // `Math.min(5_000, timeoutMs)` (`:270`) — one roster fetch may not outlive the whole wait.
+    let list_timeout = timeout.min(Duration::from_secs(5));
+    let started = tokio::time::Instant::now();
+
+    while started.elapsed() < timeout {
+        if cancel.is_cancelled() {
+            return Err("Cancelled".to_string());
+        }
+        let sessions =
+            client.list_sessions_with_timeout(list_timeout).await.map_err(|e| e.to_string())?;
+
+        // `:272-282` — with an explicit `to`, reuse the SAME resolver the non-launch path uses, so
+        // the id/name/prefix ladder cannot drift between the two. A resolver ERROR here (one of the
+        // three ambiguity strings) is deliberately swallowed and retried: mid-launch ambiguity is
+        // transient, and upstream's `resolved.kind === "found"` test ignores it identically.
+        if let Some(to) = to.map(str::trim).filter(|t| !t.is_empty()) {
+            if let Ok(ProjectTargetResolution::Found { session, .. }) =
+                resolve_target_in_cwd(&sessions, current_session_id, project_root, Some(to))
+            {
+                return Ok(*session);
+            }
+        } else {
+            let new_in_project: Vec<&SessionInfo> = sessions
+                .iter()
+                .filter(|s| !before_session_ids.contains(&s.id) && same_cwd(&s.cwd, project_root))
+                .collect();
+            match new_in_project.as_slice() {
+                [only] => return Ok((*only).clone()),
+                [] => {}
+                many => {
+                    return Err(format!(
+                        "Multiple new intercom sessions registered in {project_root}: {}. Address one explicitly.",
+                        format_session_refs(many)
+                    ));
+                }
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(poll) => {}
+            () = cancel.cancelled() => return Err("Cancelled".to_string()),
+        }
+    }
+
+    // `:295`, with the vendor noun parameterized and the product name substituted.
+    Err(format!(
+        "Timed out waiting for a cyrup intercom session to register in {project_root}. \
+         The {launcher_name} pane may still be starting, or cyrup-intercom may not be loaded there."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
@@ -218,7 +291,8 @@ mod tests {
     }
 
     /// `:197-199` — zero OTHER sessions is `missing` with upstream's exact reason, NOT an error, so
-    /// the caller can decide (upstream: offer the Herdr pane; cyrup: report it).
+    /// the caller can decide: offer the Herdr pane when `openProjectPaneIfMissing` is set, else
+    /// report the reason. Both arms live in [`crate::tools::intercom`].
     #[test]
     fn no_peers_is_missing_with_upstreams_reason() {
         let sessions = vec![session("me", None, "/w/proj")];

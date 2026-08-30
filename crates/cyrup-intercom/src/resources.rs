@@ -138,8 +138,14 @@ mod tests {
     /// The shipped text is the v0.10.1 port, not a paraphrase: its front matter carries pi's own
     /// `name:`, and the two forced divergences (ICOM-004's `[CYRUP-DELTA]`) are BOTH applied —
     /// pi's `PI_INTERCOM_ASK_TIMEOUT_MS` is gone in favour of the variable this build actually
-    /// reads, and no passage instructs the model to pass `openProjectPaneIfMissing`, which the
-    /// tool schema does not advertise (ICOM-042's Herdr residual).
+    /// reads, and every parameter the body names is advertised by `parameters_schema()`.
+    ///
+    /// ICOM-042 INVERTED the second half of this. It used to assert `openProjectPaneIfMissing` was
+    /// absent, because the schema did not advertise it; the launcher has since landed, so the
+    /// skill documents it and the schema must carry it. The intent never changed — the skill must
+    /// not tell the model to pass a parameter this build does not accept — so the check is now
+    /// expressed AGAINST THE SCHEMA rather than against a hard-coded name, and it cannot go stale
+    /// in either direction again.
     #[test]
     fn the_shipped_skill_documents_only_actions_and_env_vars_this_build_honours() {
         let files = bundled_skill_files();
@@ -158,13 +164,24 @@ mod tests {
             body.contains(crate::identity::ENV_INTERCOM_ASK_TIMEOUT_MS),
             "the ask-timeout override this build honours is documented"
         );
-        // Every action the skill tells the model to call must be in the tool's own enum, and the
-        // Herdr params must appear nowhere outside the YAML-comment delta note.
-        assert!(
-            !body.contains("openProjectPaneIfMissing"),
-            "the skill must not document a parameter the schema rejects"
-        );
+        // Every action the skill tells the model to call must be in the tool's own enum, and every
+        // PARAMETER it names must be advertised too. The parameter half is schema-driven rather
+        // than a name list, so it stays true whichever way the schema moves next.
         let schema = crate::tools::intercom::parameters_schema();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("the schema is an object with properties");
+        for param in ["openProjectPaneIfMissing", "focus", "cwd", "to", "message"] {
+            if body.contains(param) {
+                assert!(
+                    properties.contains_key(param),
+                    "the skill documents `{param}`, which `parameters_schema()` does not advertise \
+                     — a model told to pass it would have the key silently dropped by \
+                     `IntercomParams` (which carries no `deny_unknown_fields`), getting neither \
+                     the effect nor an error"
+                );
+            }
+        }
         let advertised: Vec<String> = schema["properties"]["action"]["enum"]
             .as_array()
             .expect("the action property carries an enum")
