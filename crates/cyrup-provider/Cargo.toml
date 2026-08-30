@@ -64,7 +64,6 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 dashmap = { workspace = true }
 reqwest = { workspace = true }
-eventsource-stream = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
 # PROV-030: RS256 assertion signing for the Vertex ADC service-account arm (auth/google_adc.rs).

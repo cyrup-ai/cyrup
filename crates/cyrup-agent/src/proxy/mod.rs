@@ -9,8 +9,8 @@
 //! the agent loop already consumes.
 //!
 //! Transport reuses cyrup-provider's existing SSE client ([`cyrup_provider::open_sse`],
-//! arch-01 §7.1) — the same `reqwest`+`rustls`+`eventsource-stream` path every direct provider uses
-//! — so no new dependency is introduced. `POST {proxyUrl}/api/stream` with `Authorization: Bearer`
+//! arch-01 §7.1) — the same `reqwest`+`rustls` path every direct provider uses, framed by
+//! cyrup-provider's in-tree SSE framer — so no new dependency is introduced. `POST {proxyUrl}/api/stream` with `Authorization: Bearer`
 //! and the `{ model, context, options }` body matches Pi `streamProxy` (proxy.ts:152-164); the
 //! `cancel` token drives the abort that Pi performs via `reader.cancel` (proxy.ts:141-145).
 

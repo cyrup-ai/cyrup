@@ -24,9 +24,8 @@
 //! ## Mechanism divergences, and why
 //!
 //! * **Framing.** Pi hand-rolls its SSE reader (`readPiMessagesEvents`): split on `\n\n`, take the
-//!   FIRST line starting with `data:`. cyrup reuses [`open_sse`], the crate's shared
-//!   `eventsource-stream` decoder, because there is no ambient `fetch`/`ReadableStream` to hand a
-//!   bespoke reader. For a one-JSON-object-per-`data:`-line stream — which is what this protocol
+//!   FIRST line starting with `data:`. cyrup reuses [`open_sse`], the crate's shared in-tree SSE
+//!   decoder, because there is no ambient `fetch`/`ReadableStream` to hand a bespoke reader. For a one-JSON-object-per-`data:`-line stream — which is what this protocol
 //!   is — the two agree frame for frame; a multi-line `data:` field is joined with `\n` by the
 //!   spec-compliant decoder where Pi would have taken only the first line.
 //! * **`response.body` null check.** Pi throws ``${model.provider} response has no body``

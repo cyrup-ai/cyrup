@@ -202,7 +202,12 @@ uuid                 = { version = "1", features = ["v7"] }
 # ONLY way to make an outbound request — would hand back raw compressed bytes for any server that
 # compresses (the common case), silently diverging from what a real `fetch()`-based client sees.
 reqwest              = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream", "http2", "gzip", "brotli", "deflate", "zstd"] }
-eventsource-stream   = { version = "0.2.3" }
+# PERF-006 — SSE framing moved in-tree (`cyrup-provider/src/stream/framer.rs`), so
+# `eventsource-stream` 0.2.3 is gone and `nom` leaves the graph with it. Its BOM strip matched
+# `is_bom` on a `char` then sliced by byte, panicking the turn on any `text/event-stream` that
+# opened with a BOM; and its per-line `String::split_off` made framing quadratic in the byte
+# length of a single buffer. The in-tree framer also drops an `unsafe
+# { String::from_utf8_unchecked }` from the dependency graph.
 bytes                = { version = "1" }
 base64               = { version = "0.22" }
 # PROV-030 — RS256 signing for the Google Vertex ADC `service_account` arm. pi delegates the whole
