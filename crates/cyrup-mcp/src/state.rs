@@ -240,12 +240,12 @@ impl McpState {
 
     /// Observe the status snapshot — the seam `/mcp`, the footer and the panel read.
     ///
-    /// **The publisher is wired; only this reader is missing.** [`Self::publish_status`] runs on the
-    /// `crate::runtime` startup and reload paths and on every `crate::live` connection change, so the
-    /// channel carries real snapshots at runtime. All three consumers named above, though — `/mcp`,
-    /// the footer and the panel — are the `/mcp` dispatcher's, and that is `TODO(MCP-394)`, not
-    /// ported, so nothing outside this crate's tests subscribes yet. The channel is live; it is its
-    /// readers that MCP-394 owns.
+    /// **The publisher is wired; the subscriber is still missing.** [`Self::publish_status`] runs on
+    /// the `crate::runtime` startup and reload paths and on every `crate::live` connection change,
+    /// so the channel carries real snapshots at runtime. Nothing outside this crate's tests
+    /// subscribes: `/mcp`'s listing and panel both build a snapshot on demand through
+    /// `crate::live::create_mcp_status_snapshot` rather than watching this channel, so the reader
+    /// this is shaped for — a footer that repaints on change — has not been built.
     #[must_use]
     pub fn subscribe_status(&self) -> watch::Receiver<McpStatusSnapshot> {
         self.status_events.subscribe()
@@ -514,9 +514,10 @@ pub struct McpServerStatusSnapshot {
     pub resource_count: Option<usize>,
     /// Emitted only for [`McpServerRuntimeStatus::Failed`], and only inside the 60-second window.
     ///
-    /// **Written, never read:** `crate::live` computes it on every snapshot, but the "failed N
-    /// seconds ago" line it feeds is drawn by the `/mcp` status renderer — `TODO(MCP-394)`, not
-    /// ported.
+    /// **Written, never read.** `crate::live` computes it on every snapshot, but the "failed N
+    /// seconds ago" line it feeds has no renderer: `/mcp`'s listing prints the failure *reason*
+    /// from `crate::live::failure_message` and the panel shows the same string, so neither needs
+    /// the age. Kept because it is part of the published snapshot's wire shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_ago_seconds: Option<u64>,
     /// ALWAYS emitted, even for an enabled server: it duplicates `status == Disabled` and consumers

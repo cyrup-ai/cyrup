@@ -181,8 +181,8 @@ impl McpDirs {
 
     /// `<agent_dir>/mcp-onboarding.json`.
     ///
-    /// **No caller yet.** `crate::onboarding` is the only reader/writer of this file and its only
-    /// consumer is the `/mcp` setup panel, whose dispatcher is `TODO(MCP-394)` and is not ported.
+    /// Called by `crate::commands`' `/mcp` and `/mcp setup` arms and by
+    /// [`crate::panel_host::SetupCallbacks`], all of which reach `crate::onboarding` through it.
     #[must_use]
     pub fn onboarding_state(&self) -> PathBuf {
         self.agent_path(ONBOARDING_FILE)

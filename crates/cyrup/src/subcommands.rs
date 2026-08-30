@@ -31,8 +31,10 @@ use cyrup_tui::{
 };
 
 /// The recognized subcommand verbs (Pi: `install`/`remove`/`update`/`list` + `uninstall` alias +
-/// `config`). `config` is dispatched specially (Pi `handleConfigCommand`).
-const SUBCOMMANDS: [&str; 6] = ["install", "remove", "uninstall", "update", "list", "config"];
+/// `config`, plus cyrup's `mcp`). `config` and `mcp` are both dispatched specially — neither takes
+/// `PackageCommand`'s flag grammar.
+const SUBCOMMANDS: [&str; 7] =
+    ["install", "remove", "uninstall", "update", "list", "config", "mcp"];
 
 /// Whether `argv` (program name already stripped) begins with a package/config subcommand.
 pub fn first_subcommand(argv: &[String]) -> Option<&str> {
@@ -452,6 +454,14 @@ pub async fn dispatch(
     dirs: &ConfigDirs,
     cli_trust_override: Option<bool>,
 ) -> Result<Option<i32>> {
+    // `mcp` is dispatched specially, like `config` below: its verbs are not package verbs and it
+    // takes none of `PackageCommand`'s flag grammar. MCP-049 (`cli.js:197-218`).
+    if argv.first().map(String::as_str) == Some("mcp") {
+        // `.get(1..)` rather than `&argv[1..]`: the slice is provably in bounds but the workspace
+        // denies `clippy::indexing_slicing`.
+        return Ok(Some(crate::mcp_cmd::run(argv.get(1..).unwrap_or_default(), dirs)));
+    }
+
     // `config` is handled specially (Pi `handleConfigCommand`).
     if argv.first().map(String::as_str) == Some("config") {
         // `if (rest.includes("-h") || rest.includes("--help")) { printConfigCommandHelp(); return

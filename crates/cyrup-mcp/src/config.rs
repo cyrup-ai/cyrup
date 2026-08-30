@@ -873,6 +873,29 @@ impl ServerEntry {
         self.disabled == Some(true)
     }
 
+    /// `definition.auth === "oauth" && definition.oauth !== false
+    /// && definition.oauth?.grantType !== "client_credentials"` — three of the four conditions in
+    /// `getConnectionStatus`' OAuth guard (`commands.ts:511-516`); the fourth is a *resolved* URL,
+    /// which stays at the call site because resolving it can fail and the caller already holds it.
+    ///
+    /// **Strictly narrower than [`crate::oauth::supports_oauth`], and not a substitute for it.**
+    /// `supports_oauth` answers "could this server ever do OAuth" and ends in
+    /// `definition.auth.is_none()`, so a header-less URL server that declares no `auth` at all says
+    /// `true`. This answers "does this server have a stored *user* token worth inspecting", which
+    /// requires `auth` to say `oauth` outright. `client_credentials` is excluded because it needs no
+    /// user token: reporting `needs-auth` for one would send the user into a browser flow that
+    /// grant type never runs.
+    #[must_use]
+    pub fn uses_oauth_authorization_code(&self) -> bool {
+        self.auth == Some(AuthMode::Named(AuthKind::Oauth))
+            && !matches!(self.oauth, Some(OAuthSetting::Disabled(false)))
+            && !matches!(
+                &self.oauth,
+                Some(OAuthSetting::Config(config))
+                    if config.grant_type == Some(OAuthGrantType::ClientCredentials)
+            )
+    }
+
     /// `definition.lifecycle ?? "lazy"`.
     #[must_use]
     pub fn lifecycle_mode(&self) -> ServerLifecycle {
@@ -1730,8 +1753,10 @@ pub fn parse_json_config(raw: &str, path: &str) -> Result<RawJson, String> {
 ///
 /// **No production caller.** The load ladder reads files through [`read_validated_config`], which
 /// swallows a parse failure into a diagnostic and carries on; this is the variant that *reports* it
-/// to the caller, which is what an editor of a single document wants — and that caller is the `/mcp`
-/// panel, `TODO(MCP-394)`.
+/// to the caller, which is what an editor of a single document wants. The `/mcp` panel now exists
+/// and does not edit documents — it toggles `directTools` and writes through
+/// [`write_direct_tools_config`] — so this still has no caller, and the one it is shaped for has
+/// not been built.
 pub fn parse_config_document(raw: &str, path: &str) -> Result<McpConfig, String> {
     let document = parse_json_config(raw, path)?;
     Ok(validate_config(&document, Path::new(path), &mut Vec::new()))
@@ -2713,9 +2738,11 @@ impl ConfigContext {
     /// connects `eager` servers at load — and `cyrup_config::settings`' `SettingsManager` already
     /// draws exactly this line for every other project-scoped config.
     ///
-    /// **No production caller yet.** The caller is whoever holds `HostServices::is_project_trusted`
-    /// — the `/mcp` dispatcher (`TODO(MCP-394)`) and the setup panel; until one of them lands the
-    /// ladder runs at the upstream-identical default of `true`.
+    /// **No production caller yet.** The caller would be whoever holds
+    /// `HostServices::is_project_trusted`. The `/mcp` and `/mcp setup` arms now build their config
+    /// ladders (`crate::commands`, `crate::panel_host::SetupCallbacks::context`) and neither
+    /// threads the trust verdict through, so the ladder still runs at the upstream-identical
+    /// default of `true`.
     #[must_use]
     pub fn with_project_trusted(mut self, trusted: bool) -> Self {
         self.project_trusted = trusted;
@@ -2737,8 +2764,9 @@ impl ConfigContext {
     /// Whether the project layer is trusted — see [`Self::with_project_trusted`].
     ///
     /// **No production reader yet.** The trust verdict is consumed inside this module by
-    /// [`Self::source_contributes`]; the accessor exists for the `/mcp` panel, which renders a
-    /// present-but-untrusted project source and whose dispatcher is `TODO(MCP-394)`.
+    /// [`Self::source_contributes`]. The accessor is shaped for a panel that renders a
+    /// present-but-untrusted project source; the setup panel now exists and does not draw that
+    /// distinction, so nothing reads this.
     #[must_use]
     pub fn project_trusted(&self) -> bool {
         self.project_trusted
@@ -3312,7 +3340,10 @@ pub struct CompatibilityImportsResult {
 
 /// `buildStarterProjectConfig()` — literally `{ "mcpServers": {} }`.
 ///
-/// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+/// **Still no production caller.** `/mcp setup` scaffolds through
+/// [`ConfigContext::write_starter_project_config`] and previews through
+/// [`ConfigContext::preview_starter_project_config`], both of which build the raw document
+/// directly. This typed form is what an `McpConfig`-shaped caller would want and there is none.
 #[must_use]
 pub fn build_starter_project_config() -> McpConfig {
     McpConfig::default()
@@ -3328,7 +3359,7 @@ fn starter_raw() -> RawObject {
 /// `previewSharedServerEntry(filePath, serverName, entry)` — the write preview for adding one
 /// server to an arbitrary shared file (a preset, or the RepoPrompt proposal).
 ///
-/// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+/// Called by [`crate::panel_host::SetupCallbacks`] for the RepoPrompt and known-server rows.
 #[must_use]
 pub fn preview_shared_server_entry(
     path: &Path,
@@ -3348,7 +3379,7 @@ pub fn preview_shared_server_entry(
 /// written (`skip_serializing_if = "Option::is_none"` throughout); every *other* key in the file,
 /// known or not, survives because the surrounding document is the raw one.
 ///
-/// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+/// Called by [`crate::panel_host::SetupCallbacks`] when a setup row is confirmed.
 pub fn write_shared_server_entry(
     path: &Path,
     server_name: &str,
@@ -3375,7 +3406,7 @@ pub fn write_shared_server_entry(
 /// `{ ...servers[name] }` would spread a string into `{0:"x"}`, which is not a behaviour worth
 /// reproducing and which no config can reach through [`to_server_entries`] anyway.
 ///
-/// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+/// Called by `crate::commands`' `/mcp` panel arm, with the changes the panel returned.
 pub fn write_direct_tools_config(
     changes: &IndexMap<String, BoolOrList>,
     provenance: &IndexMap<String, ServerProvenance>,
@@ -3435,7 +3466,8 @@ impl ConfigContext {
     /// is reported rather than silently normalised — the opposite of the load path's contract, and
     /// deliberately so.
     ///
-    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+    /// Called by `crate::commands`' `arm_set_disabled` — `/mcp disable` and `/mcp enable` (MCP-389),
+    /// not by a panel.
     pub fn write_project_server_disabled_override(
         &self,
         server_name: &str,
@@ -3597,7 +3629,8 @@ impl ConfigContext {
     /// sources contribute no servers, so they contribute no provenance either. Anything else would
     /// hand out a write target for a server that is not loaded.
     ///
-    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+    /// Called by `crate::commands`' `/mcp` panel arm and by `crate::extension`'s `/mcp-auth` picker,
+    /// both of which hand the map to [`crate::ui::McpPanelModel::new`].
     #[must_use]
     pub fn server_provenance(
         &self,
@@ -3691,7 +3724,8 @@ impl ConfigContext {
     /// preview *and* in the write. That is upstream, and it is why the preview of a first-time
     /// import shows two changes rather than one.
     ///
-    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+    /// Called by [`crate::panel_host::SetupCallbacks::preview_imports`], from inside the setup
+    /// panel's `render` on every frame.
     #[must_use]
     pub fn preview_compatibility_imports(&self, import_kinds: &[ImportKind]) -> ConfigWritePreview {
         let target = self.user_path();
@@ -3712,7 +3746,8 @@ impl ConfigContext {
     /// call does not touch the file's mtime. That matters because the onboarding path calls it on
     /// every start.
     ///
-    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+    /// Called by [`crate::panel_host::SetupCallbacks::adopt_imports`] and by `cyrup mcp init` in
+    /// the `cyrup` binary.
     pub fn ensure_compatibility_imports(
         &self,
         import_kinds: &[ImportKind],
@@ -3746,7 +3781,47 @@ impl ConfigContext {
 
     /// `previewStarterProjectConfig(cwd)` — the `{ "mcpServers": {} }` scaffold's preview.
     ///
-    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+    /// Called by [`crate::panel_host::SetupCallbacks::preview_starter_project`].
+    /// Set `settings.hostConfigDiscovery = "on"` in the adapter-owned global file
+    /// ([`Self::user_path`]) — MCP-049's second writer.
+    ///
+    /// Returns `false` and writes nothing when it is already `"on"`, so a second `cyrup mcp init`
+    /// does not touch the mtime — the same idempotence contract
+    /// [`Self::ensure_compatibility_imports`] has, and for the same reason.
+    ///
+    /// CYRUP-DELTA: upstream's `writePiConfig` (`cli.js:145-148`) rewrites the WHOLE document from a
+    /// spread, so it can only be idempotent by luck. This merges into the raw object, preserving key
+    /// order and every key it does not touch. Neither preserves comments — [`RawJson`] has no comment
+    /// variant and the parse strips them.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`write_raw_config_object`] returns for an unwritable target.
+    pub fn enable_host_config_discovery(&self) -> McpResult<bool> {
+        let target = self.user_path();
+        let mut raw = read_raw_config_object(&target);
+        let mut settings = match raw.get("settings") {
+            Some(RawJson::Object(existing)) => existing.clone(),
+            // A non-object `settings` is REPLACED, matching upstream's spread of a non-object into
+            // an object literal. `read_validated_config` is equally lenient about it.
+            _ => RawObject::new(),
+        };
+        if settings
+            .get("hostConfigDiscovery")
+            .and_then(RawJson::as_str)
+            .is_some_and(|value| value == "on")
+        {
+            return Ok(false);
+        }
+        settings.insert(
+            "hostConfigDiscovery".to_string(),
+            RawJson::String("on".to_string()),
+        );
+        raw.insert("settings".to_string(), RawJson::Object(settings));
+        write_raw_config_object(&target, &raw)?;
+        Ok(true)
+    }
+
     #[must_use]
     pub fn preview_starter_project_config(&self) -> ConfigWritePreview {
         build_config_write_preview(&self.project_path(), &starter_raw())
@@ -3756,7 +3831,7 @@ impl ConfigContext {
     /// there. Upstream does not merge here and neither does this: the caller is the setup panel,
     /// which only offers the action when the file does not exist.
     ///
-    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+    /// Called by [`crate::panel_host::SetupCallbacks::scaffold_project_config`].
     pub fn write_starter_project_config(&self) -> McpResult<PathBuf> {
         let target = self.project_path();
         write_raw_config_object(&target, &starter_raw())?;
@@ -3851,7 +3926,9 @@ pub struct ConfigDiscoverySource {
     /// untrusted. The rung still appears, with its real [`Self::server_count`], so the panel can say
     /// *"present, not loaded"* instead of pretending the file is empty.
     ///
-    /// **Not read in production yet**: the renderer is the `/mcp` setup panel (`TODO(MCP-394)`).
+    /// **Not read in production yet.** The setup panel now exists but renders each source's
+    /// `exists` and `server_count` without distinguishing a rung that is present from one that
+    /// contributes, so this field is carried and not shown.
     pub contributes: bool,
 }
 
@@ -3932,7 +4009,8 @@ pub struct RepoPromptDiscovery {
     pub configured: bool,
     /// Where it was found.
     ///
-    /// **Not read in production yet**: the renderer is the `/mcp` setup panel (`TODO(MCP-394)`).
+    /// **Not read in production yet**: the setup panel renders `target_path`, not this. Kept
+    /// because the discovery builder fills it and a future "already configured, here" row wants it.
     pub configured_path: Option<PathBuf>,
     /// The binary that was probed for, when not configured.
     pub executable_path: Option<PathBuf>,
@@ -4058,7 +4136,7 @@ impl ConfigContext {
     /// A port that implemented this in terms of the summary would change both the cost and the
     /// warning output of the setup panel.
     ///
-    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+    /// Called by `cyrup mcp init` in the `cyrup` binary.
     #[must_use]
     pub fn config_discovery_paths(&self) -> Vec<ConfigDiscoveryPath> {
         self.sources()
@@ -4077,7 +4155,7 @@ impl ConfigContext {
     /// This one **does** parse (through `resolveImportPath`) and warns with
     /// `` `Failed to discover imported MCP config from ${kind}:` ``.
     ///
-    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+    /// Called by `cyrup mcp init` in the `cyrup` binary.
     #[must_use]
     pub fn find_available_import_configs(
         &self,
@@ -4119,7 +4197,7 @@ impl ConfigContext {
     /// `getMcpStandardConfigSummary(overridePath, cwd)` — the narrow summary, with its own
     /// fingerprint over `sources` alone.
     ///
-    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+    /// Called by `crate::commands`' `/mcp` panel arm, to decide the shared-config notice.
     #[must_use]
     pub fn mcp_standard_config_summary(
         &self,
@@ -4242,7 +4320,8 @@ impl ConfigContext {
     /// then `getMergedSettings` again, then `getConfigSourceSummaries`), so a malformed file warns
     /// three times. Here the settings walk happens once.
     ///
-    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
+    /// Called by `crate::commands`' `/mcp setup` arm and re-read by
+    /// [`crate::panel_host::SetupCallbacks`] on every RepoPrompt query.
     #[must_use]
     pub fn mcp_discovery_summary(
         &self,

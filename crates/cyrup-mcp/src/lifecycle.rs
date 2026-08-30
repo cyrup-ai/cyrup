@@ -610,12 +610,12 @@ impl McpLifecycleManager {
     /// disappears from the live config. Drops the definition from **all five** maps; the identity
     /// fence then rejects any convergence pass still running against it.
     ///
-    /// **No production caller.** `index.ts:338` is inside the config-change path of the `/mcp`
-    /// dispatcher, which is `TODO(MCP-394)` and not ported (see `crate::ui`'s note at
-    /// `open_mcp_panel` and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer
-    /// until MCP-394 lands). Nothing else removes a server mid-generation: registration is
-    /// one-directional today, and a deleted `mcp.json` entry is only noticed at the next
-    /// generation's build. When MCP-394 lands this is the call its config-change arm makes.
+    /// **No production caller.** `index.ts:338` is inside the *config-change* path — upstream
+    /// diffs the live config after a write and unregisters what disappeared. `/mcp`'s arms are
+    /// ported and none of them does that: a panel edit writes `directTools` and re-syncs the tool
+    /// surface, and a `/mcp disable` write tells the user to run `/reload`, which rebuilds the
+    /// generation from scratch. So nothing removes a server mid-generation, and a deleted
+    /// `mcp.json` entry is still only noticed at the next generation's build.
     pub fn unregister_server(&self, name: &str) {
         let Ok(mut registry) = self.registry.lock() else {
             return;

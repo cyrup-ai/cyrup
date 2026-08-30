@@ -429,6 +429,13 @@ impl App<InlineBackend<Stdout>> {
                     for overlay in self.state.overlays.iter_mut() {
                         changed |= overlay.tick();
                     }
+                    // MCP-362 — an overlay that has decided to close itself without a keystroke.
+                    // Dropping the `ExtensionOverlay` fires its one-shot, releasing the blocked
+                    // extension task: the release lives in `Drop`, not in the pop, so this is the
+                    // same teardown path `handle_overlay_key`'s `pop()` takes.
+                    let before = self.state.overlays.len();
+                    self.state.overlays.retain(|overlay| !overlay.should_close());
+                    changed |= self.state.overlays.len() != before;
                     if changed {
                         self.frames.request();
                     }

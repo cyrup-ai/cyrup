@@ -664,6 +664,7 @@ pub trait NativeExtension: Send + Sync {
         Err(ExtError::Component(format!("native extension has no handler for shortcut `{key}`")))
     }
 
+
     /// Render a tool CALL / custom MESSAGE this extension declared a renderer for (Pi
     /// `renderCall`, extensions/types.ts:489). `key` is the TOOL NAME for a tool renderer
     /// declared via [`InitApi::register_tool_renderer`], or the CUSTOM TYPE for a message renderer

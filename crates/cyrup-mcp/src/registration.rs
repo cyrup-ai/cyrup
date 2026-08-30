@@ -2579,17 +2579,21 @@ pub fn prompt_command_description(spec: &PromptCommandSpec) -> String {
 
 /// `/mcp`'s descriptor. The description is `index.ts`'s literal.
 ///
-/// `completions` carries the nine static subcommands — the first branch of upstream's
+/// `completions` carries the eight static subcommands — the first branch of upstream's
 /// `getArgumentCompletions`, whose values are knowable at init. Its *second* branch (server names
-/// for `reconnect`/`enable`/`disable`/`logout`/`token`) is only knowable at runtime and needs the
-/// dynamic argument-completion seam (HA-2 / MCP-041), which the native tier does not have.
+/// for `reconnect`/`enable`/`disable`/`logout`) is only knowable at runtime and is served by the
+/// dynamic argument-completion seam (HA-2 / MCP-041).
+///
+/// There is deliberately no `token` entry. Upstream declares eight subcommands and none of them is
+/// `token` (`index.ts:476-485`); 13h's switch table gives it no arm. A ninth completion that falls
+/// through to the default arm would open the browser panel — a completion that lies about what it
+/// does.
 #[must_use]
 pub fn mcp_command_descriptor() -> CommandDescriptor {
     CommandDescriptor {
         description: "Show MCP server status".to_string(),
         completions: [
-            "reconnect", "tools", "prompts", "setup", "logout", "token", "disable", "enable",
-            "status",
+            "reconnect", "tools", "prompts", "setup", "logout", "disable", "enable", "status",
         ]
         .iter()
         .map(|value| (*value).to_string())
@@ -2656,6 +2660,9 @@ pub struct RegisteredSurface {
 pub trait SurfaceSink {
     fn register_tool(&mut self, tool: Arc<dyn cyrup_core::Tool>);
     fn register_command(&mut self, name: String, desc: cyrup_ext::CommandDescriptor);
+    /// MCP-041's opt-in — `InitApi::add_autocomplete`. Defaulted to a no-op because the LATE sink
+    /// has no such verb: a re-sync never re-registers `/mcp`, so it never needs to re-opt-in.
+    fn add_autocomplete(&mut self, _command: String) {}
     fn register_tool_renderer(&mut self, tool_name: String);
 
     /// Declare the event subscription bitset. Load-time only: the bitset is read once when the
@@ -2707,6 +2714,10 @@ pub trait SurfaceSink {
 }
 
 impl SurfaceSink for InitApi {
+    fn add_autocomplete(&mut self, command: String) {
+        InitApi::add_autocomplete(self, command);
+    }
+
     fn register_tool(&mut self, tool: Arc<dyn cyrup_core::Tool>) {
         InitApi::register_tool(self, tool);
     }
@@ -2845,6 +2856,13 @@ pub fn register_surface<S: SurfaceSink + ?Sized>(
     // the discovered surface, so re-registering would be churn and a spurious `/` menu rebuild.
     if api.register_fixed_commands() {
         api.register_command(MCP_COMMAND.to_string(), mcp_command_descriptor());
+        // MCP-041 — the opt-in that carries `/mcp` into the front-end's dynamic-completion table.
+        // `mcp_command_descriptor`'s eight static rows are the completer's FIRST branch; the second
+        // (server names for `reconnect`/`logout`/`disable`/`enable`) is only knowable at runtime and
+        // reaches the popup through this table plus
+        // `NativeExtension::labelled_argument_completions`. `/mcp-auth` deliberately does NOT opt in
+        // — upstream declares no completer for it.
+        api.add_autocomplete(MCP_COMMAND.to_string());
         surface.command_names.push(MCP_COMMAND.to_string());
         api.register_command(MCP_AUTH_COMMAND.to_string(), mcp_auth_command_descriptor());
         surface.command_names.push(MCP_AUTH_COMMAND.to_string());

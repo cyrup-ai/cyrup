@@ -24,8 +24,7 @@ pub use limits::StoreLimits;
 pub use live::{LiveExtension, WasmTool};
 pub use overlay::{
     CustomOption, CustomSpec, InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode,
-    OverlayLine, OverlayOutcome, OverlaySpan, SpecOverlay,
-};
+    OverlayLine, OverlayOutcome, OverlaySpan, SpecOverlay, OverlayOptions,};
 pub use services::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, ExecOutput, FsCaps, GuestState,
     DENIED_EXEC, DENIED_NET, DENIED_UI,

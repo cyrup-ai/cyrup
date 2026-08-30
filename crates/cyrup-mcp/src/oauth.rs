@@ -3765,13 +3765,15 @@ async fn refresh_tokens(
 /// `NotAuthenticated` when no tokens are stored, else `expired ? Expired : Authenticated` — so a
 /// `None` expiry reads as `Authenticated`.
 ///
-/// # No caller yet, and the reason is MCP-394
+/// # No caller yet — and its sibling now has one
 ///
-/// This and [`remove_auth`] are the status and remove verbs of the `/mcp` surface. `/mcp-auth
-/// <server>` — the *login* verb — is routed (MCP-334, `extension.rs:1483`); `/mcp` itself is
-/// registered and then deliberately left on the trait's default answer, because its dispatcher is
-/// not ported (`extension.rs:2085-2088`). These two belong to that dispatcher, not to this module,
-/// and are kept ready for it rather than deleted.
+/// This and [`remove_auth`] are the status and remove verbs of the `/mcp` surface. Both the login
+/// verb (`/mcp-auth <server>`, MCP-334) and the remove verb (`/mcp logout <server>`, which calls
+/// [`remove_auth`]) are now routed. This one is not: the `/mcp` status listing derives each
+/// server's rung from the connection map and the failure window
+/// (`crate::live::create_mcp_status_snapshot`) rather than from stored credentials, and the panel's
+/// own credential rung reads [`crate::credentials::McpAuthStore::inspect_auth_for_url`]
+/// synchronously. So nothing needs the async form, and it is kept rather than deleted.
 pub async fn get_auth_status(
     server_name: &str,
     server_url: &str,
@@ -3797,8 +3799,8 @@ pub async fn get_auth_status(
 /// `removeAuth(serverName, options)` (`mcp-auth-flow.ts:915`), in order, with abort checks
 /// interleaved at four points.
 ///
-/// **`/mcp`'s remove verb, and it waits on MCP-394 with the rest of that tier.** See
-/// [`get_auth_status`] for why neither verb has a caller yet.
+/// **`/mcp logout <server>`'s first step**, called by `crate::commands`' `arm_logout`, which then
+/// closes the connection still holding the old token.
 pub async fn remove_auth(server_name: &str, options: &AuthenticateOptions) -> McpResult<()> {
     let runtime = get_runtime(options.runtime.as_ref())?;
     let signal = options.combined_signal(&runtime);

@@ -30,7 +30,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use cyrup_ext::{
-    InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine,
+    InteractiveOverlay, OverlayOptions, OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine,
     OverlayOutcome as ExtOverlayOutcome, OverlaySpan,
 };
 
@@ -65,6 +65,15 @@ pub trait Overlay: Send {
     fn tick(&mut self) -> bool {
         false
     }
+    /// Whether the overlay wants to close itself **without a keystroke** — the host-side mirror of
+    /// [`cyrup_ext::host::InteractiveOverlay::should_close`].
+    ///
+    /// [`Self::tick`] returns "did the frame change?", which structurally cannot say "tear me down",
+    /// so an inactivity deadline could previously only be honoured on the next key press. The run
+    /// loop consults this after every tick.
+    fn should_close(&self) -> bool {
+        false
+    }
 }
 
 // =================================================================================================
@@ -72,17 +81,13 @@ pub trait Overlay: Send {
 // `interactive-mode.ts:2719`)
 // =================================================================================================
 
-/// pi's `overlayOptions` for the extension custom-UI path, as `pi-subagents` passes them
-/// (`src/tui/fleet.ts:872-874`: `{ anchor: "center", width: "95%", minWidth: 60, maxHeight: "85%",
-/// margin: 1 }`). They are the ONLY concrete overlay geometry upstream states, so they are the
-/// adapter's geometry rather than a cyrup invention.
-const OVERLAY_WIDTH_PCT: u16 = 95;
-/// pi `minWidth: 60`.
-const OVERLAY_MIN_WIDTH: u16 = 60;
-/// pi `maxHeight: "85%"`.
-const OVERLAY_MAX_HEIGHT_PCT: u16 = 85;
-/// pi `margin: 1`.
-const OVERLAY_MARGIN: u16 = 1;
+// pi's `overlayOptions` for the extension custom-UI path — `{ anchor: "center", width: "95%",
+// minWidth: 60, maxHeight: "85%", margin: 1 }` (`src/tui/fleet.ts:872-874`) — used to live here as
+// four `const`s. MCP-368 moved them into `OverlayOptions::default()` in `cyrup-ext`, which is where
+// an overlay can now override them per component.
+//
+// They are NOT kept here as that impl's source: `cyrup-ext` cannot depend on `cyrup-tui`, so a copy
+// on this side could only ever drift out of agreement with the one that is actually read.
 
 /// Adapts an extension-owned [`InteractiveOverlay`] onto this crate's [`Overlay`] z-stack.
 ///
@@ -109,21 +114,23 @@ impl ExtensionOverlay {
     /// against a concrete frame. Exposed (crate-visible) so a test can assert the geometry without
     /// a real terminal.
     #[must_use]
-    pub(crate) fn box_rect(area: Rect, content_rows: u16) -> Rect {
-        let usable_w = area.width.saturating_sub(OVERLAY_MARGIN.saturating_mul(2));
-        let usable_h = area.height.saturating_sub(OVERLAY_MARGIN.saturating_mul(2));
+    pub(crate) fn box_rect(area: Rect, content_rows: u16, options: OverlayOptions) -> Rect {
+        let usable_w = area.width.saturating_sub(options.margin.saturating_mul(2));
         // `95%` of the frame, floored at `minWidth: 60`, but never wider than what is actually
-        // there — pi's own `minWidth` cannot manufacture columns a terminal does not have.
-        let width = u32::from(area.width)
-            .saturating_mul(u32::from(OVERLAY_WIDTH_PCT))
-            .checked_div(100)
-            .unwrap_or(0);
-        let width = u16::try_from(width).unwrap_or(u16::MAX).max(OVERLAY_MIN_WIDTH).min(usable_w);
-        let max_h = u32::from(area.height)
-            .saturating_mul(u32::from(OVERLAY_MAX_HEIGHT_PCT))
-            .checked_div(100)
-            .unwrap_or(0);
-        let max_h = u16::try_from(max_h).unwrap_or(u16::MAX).min(usable_h).max(1);
+        // there — pi's own `minWidth` cannot manufacture columns a terminal does not have. A
+        // `width: Some(n)` (MCP-368: the MCP panels' 82 and 92) replaces the percentage and is
+        // clamped the same way, so a narrow terminal still wins.
+        let width = match options.width {
+            Some(fixed) => u32::from(fixed),
+            None => u32::from(area.width)
+                .saturating_mul(u32::from(options.width_pct))
+                .checked_div(100)
+                .unwrap_or(0),
+        };
+        let width = u16::try_from(width).unwrap_or(u16::MAX).max(options.min_width).min(usable_w);
+        // The height budget is `OverlayOptions::max_rows`, shared with MCP-377's windowing so the
+        // adapter and the component cannot disagree about how many rows there are.
+        let max_h = options.max_rows(area.height);
         let height = content_rows.clamp(1, max_h);
         // `anchor: "center"`.
         let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
@@ -157,10 +164,13 @@ impl Overlay for ExtensionOverlay {
         // which lands its whole frame at exactly the `maxHeight: "85%"` this box then enforces.
         // Handing it the already-85%-clipped box height instead would apply that factor twice and
         // shrink the roster on every frame.
-        let probe = Self::box_rect(area, area.height);
+        // Read once per frame: the component owns its geometry (MCP-368), and asking twice could
+        // see two different answers mid-frame.
+        let options = self.inner.options();
+        let probe = Self::box_rect(area, area.height, options);
         let lines = self.inner.render(probe.width as usize, area.height as usize);
         let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        let rect = Self::box_rect(area, rows);
+        let rect = Self::box_rect(area, rows, options);
         let painted: Vec<Line<'static>> = lines
             .into_iter()
             .take(rect.height as usize)
@@ -187,6 +197,11 @@ impl Overlay for ExtensionOverlay {
 
     fn tick(&mut self) -> bool {
         self.inner.tick()
+    }
+
+    /// Delegated, so an extension overlay's own inactivity deadline reaches the run loop.
+    fn should_close(&self) -> bool {
+        self.inner.should_close()
     }
 }
 
@@ -359,7 +374,7 @@ mod tests {
     fn geometry_is_upstreams_center_95pct_min60_max85pct() {
         let area = Rect { x: 0, y: 0, width: 100, height: 40 };
         // 95% of 100 = 95, inside the margin-2 usable 98.
-        let rect = ExtensionOverlay::box_rect(area, 100);
+        let rect = ExtensionOverlay::box_rect(area, 100, OverlayOptions::default());
         assert_eq!(rect.width, 95);
         // Content wanted 100 rows; `maxHeight: 85%` of 40 = 34, and usable is 38, so 34 wins.
         assert_eq!(rect.height, 34);
@@ -371,14 +386,14 @@ mod tests {
     #[test]
     fn min_width_60_never_exceeds_the_real_terminal() {
         // 95% of 40 = 38, below `minWidth: 60`; the usable width (40 - 2 margin) caps it.
-        let rect = ExtensionOverlay::box_rect(Rect { x: 0, y: 0, width: 40, height: 20 }, 5);
+        let rect = ExtensionOverlay::box_rect(Rect { x: 0, y: 0, width: 40, height: 20 }, 5, OverlayOptions::default());
         assert_eq!(rect.width, 38);
         assert_eq!(rect.height, 5);
     }
 
     #[test]
     fn a_short_component_shrinks_the_box_to_its_own_row_count() {
-        let rect = ExtensionOverlay::box_rect(Rect { x: 0, y: 0, width: 100, height: 40 }, 6);
+        let rect = ExtensionOverlay::box_rect(Rect { x: 0, y: 0, width: 100, height: 40 }, 6, OverlayOptions::default());
         assert_eq!(rect.height, 6);
     }
 
