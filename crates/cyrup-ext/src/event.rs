@@ -2,6 +2,7 @@
 //! `Subscriptions` bitset (arch-08 §3.4). `HostEvent` mirrors the func-08 §5 catalog; `EventKind`
 //! indexes the 64-bit subscription bitset that gates dispatch (R-08-034 / R-ARCH-EXT-014).
 
+use std::sync::Arc;
 use cyrup_agent::{AgentEvent, AgentMessage, ToolResultMessage};
 use cyrup_core::{Content, Message, ToolCallId};
 use serde_json::Value;
@@ -297,7 +298,7 @@ pub enum HostEvent {
         usage: Option<cyrup_core::Usage>,
     },
     // 5.3 agent & turn — mutating + notify
-    Context { messages: Vec<AgentMessage> },
+    Context { messages: Vec<Arc<AgentMessage>> },
     MessageEnd { message: Message },
     /// `before_agent_start` (Pi types.ts:665): the user prompt + images + the (chainable)
     /// system prompt and its options. A handler may inject a message and/or replace the prompt;
@@ -311,7 +312,7 @@ pub enum HostEvent {
         injected: Vec<Message>,
     },
     AgentStart,
-    AgentEnd { messages: Vec<AgentMessage> },
+    AgentEnd { messages: Vec<Arc<AgentMessage>> },
     /// `turn_start` (Pi `TurnStartEvent`, types.ts:688-693): the turn index AND a wall-clock
     /// `timestamp` (Pi `Date.now()`, agent-session.ts:624). `turn_index` is derived in the
     /// `ExtSubscriber` fan-out layer (mirroring Pi's `AgentSession._turnIndex`), not on the raw event.

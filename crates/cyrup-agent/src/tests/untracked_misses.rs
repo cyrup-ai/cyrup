@@ -65,7 +65,7 @@ impl Hooks for ContextOverrideHook {
         // Pi `currentContext = snapshot.context` (agent-loop.ts:228) replaces only the loop copy.
         if self.turns.fetch_add(1, Ordering::SeqCst) == 0 {
             Ok(Some(TurnUpdate {
-                context: Some(vec![AgentMessage::user_text("CTXOVERRIDE")]),
+                context: Some(vec![Arc::new(AgentMessage::user_text("CTXOVERRIDE"))]),
                 ..TurnUpdate::default()
             }))
         } else {

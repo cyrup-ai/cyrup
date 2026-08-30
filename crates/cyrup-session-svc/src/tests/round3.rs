@@ -126,9 +126,9 @@ async fn retry_toggles_classification_and_backoff() {
 
     // will_retry_after_agent_end scans the last assistant message.
     assert!(session
-        .will_retry_after_agent_end(&[cyrup_agent::AgentMessage::Assistant(Arc::new(transient.clone()))]));
+        .will_retry_after_agent_end(&[Arc::new(cyrup_agent::AgentMessage::Assistant(Arc::new(transient.clone())))]));
     assert!(!session
-        .will_retry_after_agent_end(&[cyrup_agent::AgentMessage::Assistant(Arc::new(clean.clone()))]));
+        .will_retry_after_agent_end(&[Arc::new(cyrup_agent::AgentMessage::Assistant(Arc::new(clean.clone())))]));
 
     // prepare_retry: first attempt waits the backoff and signals continue; the budget then exhausts.
     assert_eq!(session.retry_attempt(), 0);

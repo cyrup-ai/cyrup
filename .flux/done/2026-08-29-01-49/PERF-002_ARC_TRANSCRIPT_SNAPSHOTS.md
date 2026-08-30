@@ -1,13 +1,23 @@
 ---
-stage: aug
-status: done
-updated: 2026-08-29 16:56
+stage: qa
+status: completed
+updated: 2026-08-30 06:10
 aug_against: cyrup HEAD f3bf9f0 · pi v0.84.2 (agent-loop.ts unchanged from ported baseline)
 aug_reverified: cyrup HEAD 8f49433 — AUG-3 pass re-checked every cyrup file:line EXACT; serde `rc` + clone-before-gate preconditions re-confirmed; pi at v0.84.2-48 (see §7)
 aug_revised: cyrup HEAD 7913760 — **PERF-001 LANDED AND CHANGED THIS TASK'S COST MODEL.** §0/§4/§6.6 restated, 8 line numbers corrected, 6 missed seam sites added, 1 new in-scope win found. **READ §8 BEFORE §0.**
+aug_reverified_2: cyrup **main `1130485`** (AUG-5, after PERF-003/004/005/006 + #109 landed) — every
+  AUG-4 citation re-checked and ALL EXACT; both preconditions re-confirmed; **a 7th seam site found**
+  (`session-svc/event.rs:330`); 1 citation corrected. **§9 is additive to §8, not a replacement.**
 ---
 
-> ## ⚠️ START AT [§8](#8-aug-4-revision-pass--head-7913760-after-perf-001-landed)
+> ## ⚠️ START AT [§9](#9-aug-5-re-verification--main-1130485--the-aug-4-pass-holds-plus-one-missed-seam), THEN [§8](#8-aug-4-revision-pass--head-7913760-after-perf-001-landed)
+> **AUG-5 re-verified this file against `main` at `1130485`. Every AUG-4 citation is still EXACT —
+> nothing drifted across the five PRs that landed since.** §9 adds one seam site §8.5 missed
+> (`session-svc/event.rs:330`, a live transcript clone on the unbound-session `AgentEnd` path)
+> and corrects one line number. Everything below §9 stands as written.
+>
+> ---
+>
 > PERF-001 merged (`04d6fa5` → `b8a53db` → HEAD `7913760`) and it rewrote the exact types this
 > task is about: `AgentMessage::Assistant` is **already** `Arc<AssistantMessage>`, `Content::Text`
 > is **already** a refcounted `SharedStr`, and `ToolCall::arguments` is **already** a refcounted
@@ -633,7 +643,7 @@ And per `Content` block:
 | `Image { data: String, mime_type: String }` | **O(base64 bytes) — THE residual** |
 
 **`Content::Image.data` is the sharp end and it has a hard, documented ceiling.**
-[`cyrup-tools/src/tools/read.rs:521`](../../../crates/cyrup-tools/src/tools/read.rs) sets
+[`cyrup-tools/src/tools/read.rs:522`](../../../crates/cyrup-tools/src/tools/read.rs) sets
 `MAX_B64_BYTES` to **4.5 MB of base64** — "Pi's headroom below Anthropic's 5MB limit
 (image-resize-core.ts:22)" — and `read.rs:588`/`:675` build `Content::Image { data: base64_encode(…) }`
 right at that budget. So **one** image block costs up to 4.5 MB per `Vec` clone, and this task's
@@ -712,6 +722,8 @@ crates' non-test sources finds **six more that carry the per-turn snapshot** and
 | 4 | [`run/tools/exec.rs:36`](../../../crates/cyrup-agent/src/agent/run/tools/exec.rs) | `ctx_messages: &[AgentMessage]` | carries the `tools/mod.rs:63` snapshot into `execute_parallel` |
 | 5 | [`run/tools/exec.rs:260`](../../../crates/cyrup-agent/src/agent/run/tools/exec.rs) | `ctx_messages: &[AgentMessage]` | … and into `execute_sequential` |
 | 6 | [`run/tools/preflight.rs:21`](../../../crates/cyrup-agent/src/agent/run/tools/preflight.rs) + [`run/tools/finalize.rs:20`](../../../crates/cyrup-agent/src/agent/run/tools/finalize.rs) | `ctx_messages: &[AgentMessage]` | … and into the per-call preflight/finalize halves |
+
+**A SEVENTH site was found in AUG-5 — see [§9.3](#93-a-seventh-seam-site-the-85-table-misses).**
 
 **#2 is the dangerous one.** `TurnUpdate.context` is `pub` on a `pub struct`, so leaving it as
 `Vec<AgentMessage>` while `RunCtx::messages` becomes `Vec<Arc<AgentMessage>>` breaks `turn.rs:134`
@@ -853,3 +865,129 @@ unchanged and still correct. Add one:
    `true` — and the `turn_end` event carries a third handle to it rather than a third copy. This
    is the criterion that catches the mechanical-wrap pattern PERF-001 left behind, which compiles,
    passes every other DoD item, and looks correct.
+
+---
+
+## 9. [AUG-5] Re-verification @ main `1130485` — the AUG-4 pass holds, plus one missed seam
+
+AUG-4 was written at `7913760`, a merge commit on branch **`david/performance`** — not on `main`.
+Since then **five PRs have landed on main**: PERF-003 (#107), PERF-004 (#108), the edit-tool
+change (#109), PERF-006 (#110), and PERF-005. This pass re-checked every citation against
+**`main` at `1130485`**.
+
+**Headline: AUG-4's corrections were right, and nothing drifted.** That is unusual and worth
+stating plainly — the four landed PRs touched `cyrup-tools`, `cyrup-session`, `cyrup-session-svc`
+and `cyrup-provider`, and the per-turn path this task rewrites lives almost entirely in
+`cyrup-agent/src/agent/run/`, which none of them touched.
+
+### 9.1 Every AUG-4 citation re-verified EXACT at `1130485`
+
+The §8.4 "trust this one" table — all nine, individually checked:
+
+| citation | content at `1130485` | ✓ |
+| --- | --- | --- |
+| `stream.rs:41` | `let base_messages = self.messages.clone();` | ✅ |
+| `turn.rs:53` | `AgentEnd { messages: self.new_messages.clone() }` (error/abort) | ✅ |
+| `turn.rs:100` | `let ctx_messages = self.messages.clone();` | ✅ |
+| `turn.rs:161` | `let ctx_messages_after = self.messages.clone();` | ✅ |
+| `turn.rs:178` | `AgentEnd { … }` (`should_stop_after_turn`) | ✅ |
+| `turn.rs:198` | `AgentEnd { … }` (normal exit) | ✅ |
+| `agent/event.rs:280` | `messages: Vec<AgentMessage>,` | ✅ |
+| `session-svc/event.rs:155` | `messages: Vec<AgentMessage>,` | ✅ |
+| `agent/hooks.rs:117` | `pub messages: &'a [AgentMessage],` | ✅ |
+
+The §8.5 six seam sites — all exact: `hooks.rs:39` (`BeforeToolCall.messages`), `hooks.rs:135`
+(`TurnUpdate.context: Option<Vec<AgentMessage>>`), `hooks.rs:178` (`default_convert_to_llm`),
+`exec.rs:36`, `exec.rs:260`, `preflight.rs:21`, `finalize.rs:20`. And `turn.rs:134`
+(`self.messages = ctx;`) — the hard compile error §8.5 #2 warns about — is exact.
+
+§8.6's finding is exact and still live. `turn.rs:44`, `:45` and `:83` each read
+`AgentMessage::Assistant(Arc::new(asst.clone()))` — **three deep copies of the assistant message
+per turn**, with `:49` correctly a move on the error path. PERF-001's mechanical wrap is still
+defeating its own sharing at the moment of creation.
+
+Also re-verified exact: `ext/event.rs:300,314,536` · `ext/host/live.rs:2077,2146` ·
+`session-svc/subscriber.rs:196-198` · `tools/mod.rs:63` · `run/mod.rs:221,245` ·
+`lifecycle.rs:180,270,375` · `loop_fn.rs:120,217` · `state.rs:122`.
+
+### 9.2 Both load-bearing preconditions re-confirmed independently
+
+- **serde `rc`** — [`Cargo.toml:145`](../../../Cargo.toml) reads
+  `serde = { version = "1", features = ["derive", "rc"] }`. Exact. `Arc<T>` serializes
+  transparently as `T`, so the wire is unchanged.
+- **No `Arc::make_mut`** — `grep -rn 'make_mut' crates/` returns exactly one hit, and it is a
+  *doc comment* in [`proxy/builder.rs:45`](../../../crates/cyrup-agent/src/proxy/builder.rs)
+  explaining why an `Arc` was **not** used there. Zero call sites. The precondition holds.
+
+### 9.3 A SEVENTH seam site the §8.5 table misses
+
+[`session-svc/event.rs:329-330`](../../../crates/cyrup-session-svc/src/event.rs):
+
+```rust
+AgentEvent::AgentEnd { messages } => {
+    AgentSessionEvent::AgentEnd { messages: messages.clone(), will_retry: false }
+}
+```
+
+This is inside `AgentSessionEvent::from_agent` (`:286`), and it is a **full transcript deep-clone
+that no inventory in this file lists**. §8.4 cites `session-svc/event.rs:154/155` — the *variant
+declaration* — and §8.5 lists `subscriber.rs:196`, but neither names this conversion.
+
+**It is live, not dead code.** [`subscriber.rs:195-206`](../../../crates/cyrup-session-svc/src/subscriber.rs)
+routes `AgentEnd` two ways:
+
+| binding | path | clone site |
+| --- | --- | --- |
+| `(AgentEnd, Some(session))` | inline at `:196-199`, computes the real `will_retry` | `subscriber.rs:197` ✅ *listed* |
+| `(AgentEnd, None)` | falls through to `from_agent(event)` at `:204` | **`event.rs:330`** ❌ *missing* |
+
+So the **unbound-session** `AgentEnd` takes an unlisted path. `:206`'s `_ =>` arm sends every
+other variant through `from_agent` too, but only the `AgentEnd` arm clones a transcript.
+
+**Consequence for `exec`:** once `AgentSessionEvent::AgentEnd.messages` flips to
+`Vec<Arc<AgentMessage>>` per §8.8, `event.rs:330` is a **compile error** — exactly the class §8.5
+was written to enumerate. Add it to that table as site #7; the fix is the same one-word change
+(`messages.clone()` stays, but now clones handles). Nothing else in `from_agent` is affected.
+
+### 9.4 One citation corrected in place
+
+`read.rs:521` → **`read.rs:522`**. `:521` is the doc comment; the constant
+`const MAX_B64_BYTES: usize = 4_718_592;` is at `:522`. The 4.5 MB figure and its Pi provenance
+(`image-resize-core.ts:22`) are both correct.
+
+### 9.5 The §8.2 cost model re-verified — `Image` is still the residual
+
+Confirmed against the current type definitions:
+[`Content::Image { data: String, mime_type: String }`](../../../crates/cyrup-core/src/message/content.rs)
+still holds base64 in an owned `String`; `Content::Text`/`Thinking` are `SharedStr` (O(1) clone);
+`ToolCall.arguments` is `LazyArgs` (O(1)); `AgentMessage::Assistant` is `Arc<AssistantMessage>`
+(O(1)). [`Custom.payload: Value`](../../../crates/cyrup-agent/src/event.rs) (`:41`) and
+`App.payload: serde_json::Map` (`:75`) are still deep `serde_json` clones.
+
+So §8.2's headline stands unchanged at `1130485`: **a text-only transcript already costs ~0 bytes
+to clone; images and JSON payloads are the entire remaining cost.**
+
+### 9.6 `live.rs:2077` / `:2146` need no change beyond the type
+
+Both are `serde_json::to_string(messages)` feeding the wasm guest. Under serde's `rc` feature an
+`Arc<AgentMessage>` serializes byte-identically to an `AgentMessage`, so **the guest-visible JSON
+is unchanged and these two sites need no edit at all** once the type flips. Worth knowing before
+`exec` reaches them and starts hand-unwrapping.
+
+### 9.7 Net assessment
+
+**The plan in §8.8 is sound and ready to execute**, with one addition: `session-svc/event.rs:330`
+joins the §8.5 seam list as site #7.
+
+Three things to carry into exec:
+
+1. **§8.6 is the cheapest real win in the file** — three deep copies of the assistant message per
+   turn, removed by building one `Arc` and cloning the handle. It is independent of the
+   `Vec<Arc<…>>` flip and could land on its own.
+2. **The compile errors are the map.** Flipping `RunCtx::messages` makes the seam sites fail to
+   build; §8.5 (+ §9.3) is the complete list of where. Do not "fix" any of them by re-wrapping
+   with `.into_iter().map(Arc::new)` — that reintroduces the copy the task exists to remove,
+   except at `TurnUpdate.context`, where §8.5 #2 sanctions it only if the field is *not* flipped.
+3. **Scope boundary is enumerated, not judgement.** §8.5's "must NOT change" list plus §6.4/§6.5
+   settle every `Vec<AgentMessage>` that stays. Re-verified: `state.rs:93,140`, `loop_fn.rs`,
+   `queue.rs`, `run/mod.rs:22,99,225,229,241`, `builder.rs`, `prompt.rs`, `facade.rs`.

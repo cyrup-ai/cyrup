@@ -33,20 +33,26 @@ impl RunCtx {
                     self.emit(AgentEvent::MessageEnd { message: m.clone() }).await?;
                     // Pi pushes each injected steering/follow-up message onto the loop's working copy
                     // (`currentContext.messages.push`, agent-loop.ts:186).
-                    self.messages.push(m.clone());
+                    let m = Arc::new(m);
+                    self.messages.push(Arc::clone(&m));
                     self.new_messages.push(m);
                 }
 
-                let asst = self.stream_assistant().await?;
+                // The turn's assistant message is shared by the two working transcripts and the
+                // `turn_end` event, so build the handle ONCE and clone the pointer. Wrapping at
+                // each use (`Arc::new(asst.clone())`) allocates a fresh `Arc` and deep-copies the
+                // message into it, which defeats the sharing at the moment it is created.
+                let asst = Arc::new(self.stream_assistant().await?);
                 // Pi's `streamAssistantResponse` leaves the final assistant message in the loop's
                 // working copy (`currentContext.messages`, agent-loop.ts:346/348/361/363); mirror that
                 // before tool execution / the post-turn hooks read the context.
-                self.messages.push(AgentMessage::Assistant(Arc::new(asst.clone())));
-                self.new_messages.push(AgentMessage::Assistant(Arc::new(asst.clone())));
+                let asst_msg = Arc::new(AgentMessage::Assistant(Arc::clone(&asst)));
+                self.messages.push(Arc::clone(&asst_msg));
+                self.new_messages.push(asst_msg);
 
                 if matches!(asst.stop_reason, StopReason::Error | StopReason::Aborted) {
                     self.emit(AgentEvent::TurnEnd {
-                        message: AgentMessage::Assistant(Arc::new(asst)),
+                        message: AgentMessage::Assistant(Arc::clone(&asst)),
                         tool_results: Vec::new(),
                     })
                     .await?;
@@ -74,13 +80,14 @@ impl RunCtx {
                     for r in &tool_results {
                         // Pi pushes each tool result onto the loop's working copy
                         // (`currentContext.messages.push(result)`, agent-loop.ts:213).
-                        self.messages.push(AgentMessage::ToolResult(r.clone()));
-                        self.new_messages.push(AgentMessage::ToolResult(r.clone()));
+                        let r = Arc::new(AgentMessage::ToolResult(r.clone()));
+                        self.messages.push(Arc::clone(&r));
+                        self.new_messages.push(r);
                     }
                 }
 
                 self.emit(AgentEvent::TurnEnd {
-                    message: AgentMessage::Assistant(Arc::new(asst.clone())),
+                    message: AgentMessage::Assistant(Arc::clone(&asst)),
                     tool_results: tool_results.clone(),
                 })
                 .await?;

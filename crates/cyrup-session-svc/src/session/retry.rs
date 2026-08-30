@@ -4,6 +4,7 @@
 //! (`max_retries`/`max_retry_delay_ms`); this decides whether a final assistant turn carrying a
 //! transient error is worth an exponential backoff and an `agent.continue()`.
 
+use std::sync::Arc;
 use cyrup_agent::AgentMessage;
 use cyrup_core::AssistantMessage;
 use cyrup_provider::{RetryPolicy, is_context_overflow, is_retryable_assistant_error};
@@ -72,14 +73,14 @@ impl AgentSession {
     /// Whether the run that just ended will retry (Pi `_willRetryAfterAgentEnd`, agent-session.ts:561).
     /// True iff auto-retry is enabled, the budget is not exhausted, and the last assistant message is
     /// a retryable error.
-    pub fn will_retry_after_agent_end(&self, messages: &[AgentMessage]) -> bool {
+    pub fn will_retry_after_agent_end(&self, messages: &[Arc<AgentMessage>]) -> bool {
         if !self.auto_retry_enabled() || self.retry_attempt() >= self.retry_max_retries {
             return false;
         }
         messages
             .iter()
             .rev()
-            .find_map(|m| match m {
+            .find_map(|m| match m.as_ref() {
                 AgentMessage::Assistant(a) => Some(self.is_retryable_error(a)),
                 _ => None,
             })

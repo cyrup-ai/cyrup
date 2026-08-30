@@ -835,7 +835,7 @@ async fn agent025_transform_failure_agent_end_carries_only_the_failure_message()
         "pi emits `{{ type: \"agent_end\", messages: [failureMessage] }}` (agent.ts:511) — the \
          single synthetic message, NOT the whole run accumulator: {end:?}"
     );
-    match &end[0] {
+    match end[0].as_ref() {
         AgentMessage::Assistant(a) => {
             assert_eq!(a.stop_reason, StopReason::Error);
             assert_eq!(a.error_message.as_deref(), Some("compaction budget exceeded"));
@@ -854,9 +854,9 @@ struct CancelAwareTransform;
 impl Hooks for CancelAwareTransform {
     async fn transform_context(
         &self,
-        _msgs: Vec<AgentMessage>,
+        _msgs: Vec<Arc<AgentMessage>>,
         cancel: CancelToken,
-    ) -> Result<Vec<AgentMessage>, HookError> {
+    ) -> Result<Vec<Arc<AgentMessage>>, HookError> {
         cancel.cancelled().await;
         Err(HookError::new("context build interrupted"))
     }
@@ -891,7 +891,7 @@ async fn agent025_transform_failure_after_abort_reports_aborted() {
         })
         .expect("an agent_end");
     assert_eq!(end.len(), 1);
-    match &end[0] {
+    match end[0].as_ref() {
         AgentMessage::Assistant(a) => assert_eq!(
             a.stop_reason,
             StopReason::Aborted,

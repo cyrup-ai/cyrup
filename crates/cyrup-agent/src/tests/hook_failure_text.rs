@@ -185,7 +185,7 @@ struct FailingConvert;
 
 #[async_trait::async_trait]
 impl Hooks for FailingConvert {
-    async fn convert_to_llm(&self, _msgs: &[AgentMessage]) -> Result<Vec<Message>, HookError> {
+    async fn convert_to_llm(&self, _msgs: &[Arc<AgentMessage>]) -> Result<Vec<Message>, HookError> {
         Err(HookError::new("custom role \"memo\" has no LLM projection"))
     }
 }

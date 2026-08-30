@@ -277,6 +277,6 @@ pub enum AgentEvent {
         tool_results: Vec<ToolResultMessage>,
     },
     AgentEnd {
-        messages: Vec<AgentMessage>,
+        messages: Vec<Arc<AgentMessage>>,
     },
 }

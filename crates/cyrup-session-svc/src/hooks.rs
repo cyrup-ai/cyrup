@@ -32,12 +32,12 @@ const BLOCKED_IMAGE_TEXT: &str = "Image reading is disabled.";
 /// [`cyrup_session::agent_message::custom_to_message`], pi's `case "custom"` (`:162-168`): before
 /// this, a `custom` message was dropped here while the SAME message rendered into the request after
 /// a compaction re-seed, because `build_context()` had already flattened it to a `user` turn.
-pub(crate) fn coding_agent_convert_to_llm(msgs: &[AgentMessage]) -> Vec<Message> {
+pub(crate) fn coding_agent_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Message> {
     use cyrup_session::agent_message::AgentMessage as Raw;
 
     let mut out = Vec::with_capacity(msgs.len());
     for m in msgs {
-        match m {
+        match m.as_ref() {
             AgentMessage::User { content, timestamp } => {
                 out.push(Message::User { content: content.clone(), timestamp: timestamp.unwrap_or(0) });
             }
@@ -176,7 +176,7 @@ fn filter_images(content: &[cyrup_core::Content]) -> Vec<cyrup_core::Content> {
 
 #[async_trait::async_trait]
 impl Hooks for PolicyHooks {
-    async fn convert_to_llm(&self, msgs: &[AgentMessage]) -> Result<Vec<Message>, HookError> {
+    async fn convert_to_llm(&self, msgs: &[Arc<AgentMessage>]) -> Result<Vec<Message>, HookError> {
         // SESS-043 — pi's `convertToLlmWithBlockImages` is `blockImages(convertToLlm(messages))`
         // (`coding-agent/src/core/sdk.ts:256-289` @v0.83.0) over the CODING-AGENT `convertToLlm`,
         // not the agent package's base one. This previously delegated to `inner` (the extension
@@ -222,9 +222,9 @@ impl Hooks for PolicyHooks {
 
     async fn transform_context(
         &self,
-        msgs: Vec<AgentMessage>,
+        msgs: Vec<Arc<AgentMessage>>,
         cancel: CancelToken,
-    ) -> Result<Vec<AgentMessage>, HookError> {
+    ) -> Result<Vec<Arc<AgentMessage>>, HookError> {
         self.inner.transform_context(msgs, cancel).await
     }
 

@@ -59,14 +59,20 @@ pub(crate) struct RunCtx {
     gen_config: GenerationConfig,
     tools: Vec<Arc<dyn Tool>>,
     cancel: RunCancel,
-    new_messages: Vec<AgentMessage>,
+    new_messages: Vec<Arc<AgentMessage>>,
     /// The loop's OWN working transcript — Pi `currentContext.messages`, a `.slice()` SNAPSHOT of the
     /// agent's `messages` taken at run start, NOT the live `Arc` (agent.ts:424-429; agent-loop.ts:104-107).
     /// This is the array the loop reads to build each LLM payload and that a `prepare_next_turn`
     /// context override replaces. The agent's observable `state.messages` grows INDEPENDENTLY via the
     /// reducer on `message_end` (agent.ts:519-522), so neither a context override nor a mid-run
     /// external `set_messages` leaks between the two — exactly as in Pi.
-    messages: Vec<AgentMessage>,
+    ///
+    /// `Vec<Arc<AgentMessage>>`, not `Vec<AgentMessage>`, so that snapshot is what Pi's `.slice()`
+    /// actually is: a copy of the POINTERS. Cloning it per turn used to deep-copy every message —
+    /// after PERF-001 that is O(1) for text, thinking and tool arguments, but still O(bytes) for
+    /// `Content::Image` base64 (capped at 4.5 MB each) and for `Custom`/`App` JSON payloads. The
+    /// element type is what makes the snapshot O(n) pointer bumps regardless of what it holds.
+    messages: Vec<Arc<AgentMessage>>,
     turn_index: usize,
     /// On continue-from-assistant, the first `getSteeringMessages` poll returns `[]` so a second
     /// queued steering message is not drained a turn too early (Pi `skipInitialSteeringPoll`,
@@ -117,7 +123,10 @@ impl RunCtx {
             tools,
             cancel,
             new_messages: Vec::new(),
-            messages,
+            // The run-start snapshot arrives owned (§6.5 keeps the entry surface
+            // `Vec<AgentMessage>`); wrap each message once, here, so every per-turn snapshot of
+            // this vector downstream is a pointer copy.
+            messages: messages.into_iter().map(Arc::new).collect(),
             turn_index: 0,
             skip_initial_steering_poll,
             header_fn: None,
@@ -218,8 +227,8 @@ impl RunCtx {
         let _ = self.emit(AgentEvent::MessageEnd { message: fm.clone() }).await;
         let _ =
             self.emit(AgentEvent::TurnEnd { message: fm.clone(), tool_results: Vec::new() }).await;
-        let _ = self.emit(AgentEvent::AgentEnd { messages: vec![fm.clone()] }).await;
-        self.new_messages = vec![fm];
+        let _ = self.emit(AgentEvent::AgentEnd { messages: vec![Arc::new(fm.clone())] }).await;
+        self.new_messages = vec![Arc::new(fm)];
     }
 
     fn poll_steering(&self) -> Vec<AgentMessage> {
@@ -242,7 +251,12 @@ impl RunCtx {
         if let Err(RunFailure(msg)) = self.run_entry(entry).await {
             self.emit_run_failure(msg).await;
         }
-        self.new_messages.clone()
+        // §6.5: the public return type stays `Vec<AgentMessage>`, so the handles are unwrapped
+        // exactly once per run. Off the hot path, and every in-tree caller discards the value.
+        self.new_messages
+            .iter()
+            .map(|m| (**m).clone())
+            .collect()
     }
 
     async fn run_entry(&mut self, entry: EntryStart) -> Result<(), RunFailure> {
@@ -256,7 +270,8 @@ impl RunCtx {
                     // Pi appends each prompt to the loop's working copy (`currentContext.messages`,
                     // agent-loop.ts:106/187) — the observable `state.messages` grows separately via
                     // the reducer on the `message_end` above.
-                    self.messages.push(p.clone());
+                    let p = Arc::new(p);
+                    self.messages.push(Arc::clone(&p));
                     self.new_messages.push(p);
                 }
                 self.run_loop(true).await

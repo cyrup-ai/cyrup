@@ -25,6 +25,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::hooks::coding_agent_convert_to_llm;
+
+/// PERF-002 flipped the converter to take `&[Arc<AgentMessage>]`; these tests build owned
+/// messages, so wrap them here rather than restating every fixture.
+fn arcs<I: IntoIterator<Item = cyrup_agent::AgentMessage>>(
+    msgs: I,
+) -> Vec<Arc<cyrup_agent::AgentMessage>> {
+    msgs.into_iter().map(Arc::new).collect()
+}
 use crate::{SessionBuilder, SessionConfig};
 use cyrup_core::{Content, Message, StopReason};
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
@@ -153,7 +161,7 @@ async fn compaction_reseeds_the_transcript_from_pi_s_raw_context() {
     // (4) …and the request the model actually receives is unchanged: applying pi's `convertToLlm`
     //     to the transcript reproduces `build_context()` exactly. This is the no-regression half —
     //     the flattening now happens once, at the boundary, instead of at seeding time.
-    let at_boundary = coding_agent_convert_to_llm(&transcript);
+    let at_boundary = coding_agent_convert_to_llm(&arcs(transcript.clone()));
     let flattened = session.messages().await;
     assert_eq!(
         at_boundary.len(),
@@ -293,7 +301,7 @@ async fn resuming_a_session_seeds_the_transcript_from_pi_s_raw_context() {
     // (4) The flattening now happens ONCE, at the request boundary, exactly where pi puts it: the
     //     wrapper prose reappears there, and the `!!` output is dropped there
     //     (`convertToLlm`'s `case \"bashExecution\"`, messages.ts:152-156).
-    let at_boundary = coding_agent_convert_to_llm(&transcript);
+    let at_boundary = coding_agent_convert_to_llm(&arcs(transcript.clone()));
     let rendered: Vec<String> = at_boundary.iter().map(text_of).collect();
     assert!(
         rendered
@@ -326,7 +334,7 @@ fn the_llm_boundary_renders_pi_s_declaration_merged_roles() {
     };
     // The pre-fix boundary. Kept as an explicit witness of what changed.
     assert!(
-        cyrup_agent::default_convert_to_llm(std::slice::from_ref(&custom)).is_empty(),
+        cyrup_agent::default_convert_to_llm(&arcs([custom.clone()])).is_empty(),
         "the BASE convertToLlm drops custom roles (agent/src/harness/messages.ts:120)"
     );
 
@@ -342,7 +350,7 @@ fn the_llm_boundary_renders_pi_s_declaration_merged_roles() {
         payload: branch_payload,
     };
 
-    let out = coding_agent_convert_to_llm(&[custom, app]);
+    let out = coding_agent_convert_to_llm(&arcs([custom, app]));
     assert_eq!(out.len(), 2, "both roles render to exactly one user message each: {out:?}");
     assert_eq!(text_of(&out[0]), "remember the deploy freeze", "pi's `case \"custom\"` (:162-168)");
     let branch = text_of(&out[1]);
@@ -406,11 +414,11 @@ fn a_live_bash_execution_renders_like_a_reseeded_one_and_honours_exclude_from_co
         details: None,
         timestamp: Some(7),
     };
-    let live_out = coding_agent_convert_to_llm(std::slice::from_ref(&live));
+    let live_out = coding_agent_convert_to_llm(&arcs([live.clone()]));
     assert_eq!(live_out.len(), 1, "one user turn, as pi's `case \"bashExecution\"` returns");
     assert_eq!(
         text_of(&live_out[0]),
-        text_of(&coding_agent_convert_to_llm(&[reseeded(false)])[0]),
+        text_of(&coding_agent_convert_to_llm(&arcs([reseeded(false)]))[0]),
         "the live and post-compaction renderings of one execution must not disagree"
     );
     assert!(
@@ -427,10 +435,10 @@ fn a_live_bash_execution_renders_like_a_reseeded_one_and_honours_exclude_from_co
         timestamp: Some(7),
     };
     assert!(
-        coding_agent_convert_to_llm(std::slice::from_ref(&excluded)).is_empty(),
+        coding_agent_convert_to_llm(&arcs([excluded.clone()])).is_empty(),
         "`!!` output must never reach the model, on the live turn or after a compaction"
     );
-    assert!(coding_agent_convert_to_llm(&[reseeded(true)]).is_empty());
+    assert!(coding_agent_convert_to_llm(&arcs([reseeded(true)])).is_empty());
 
     // (c) A genuine extension `custom` message is untouched by the role routing above.
     let ext = Agent::Custom {
@@ -439,7 +447,7 @@ fn a_live_bash_execution_renders_like_a_reseeded_one_and_honours_exclude_from_co
         details: None,
         timestamp: Some(8),
     };
-    let out = coding_agent_convert_to_llm(std::slice::from_ref(&ext));
+    let out = coding_agent_convert_to_llm(&arcs([ext.clone()]));
     assert_eq!(out.len(), 1);
     assert_eq!(text_of(&out[0]), "keep me");
 }
@@ -478,7 +486,7 @@ fn raw_message_to_agent_preserves_every_pi_role() {
     }
     // …and it still disappears at the boundary, exactly as pi's `case "bashExecution"` does.
     assert!(
-        coding_agent_convert_to_llm(&[crate::event::raw_message_to_agent(&bash)]).is_empty(),
+        coding_agent_convert_to_llm(&arcs([crate::event::raw_message_to_agent(&bash)])).is_empty(),
         "`!!` bash output is excluded from the REQUEST, never from the transcript"
     );
 

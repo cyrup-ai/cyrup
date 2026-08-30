@@ -1018,20 +1018,20 @@ fn is_parent_only_custom(message: &AgentMessage) -> bool {
 /// they are its own work rather than the parent's. A plain child keeps neither.
 #[must_use]
 pub fn strip_parent_only_subagent_messages(
-    messages: &[AgentMessage],
+    messages: &[Arc<AgentMessage>],
     preserve_fanout_tool_history: bool,
-) -> Option<Vec<AgentMessage>> {
+) -> Option<Vec<Arc<AgentMessage>>> {
     let mut changed = false;
-    let mut filtered: Vec<AgentMessage> = Vec::with_capacity(messages.len());
+    let mut filtered: Vec<Arc<AgentMessage>> = Vec::with_capacity(messages.len());
     for message in messages {
         let drop_subagent_tool_result = !preserve_fanout_tool_history
-            && matches!(message, AgentMessage::ToolResult(tr) if tr.tool_name == SUBAGENT_TOOL_NAME);
+            && matches!(message.as_ref(), AgentMessage::ToolResult(tr) if tr.tool_name == SUBAGENT_TOOL_NAME);
         if is_parent_only_custom(message) || drop_subagent_tool_result {
             changed = true;
             continue;
         }
         if preserve_fanout_tool_history {
-            filtered.push(message.clone());
+            filtered.push(Arc::clone(message));
             continue;
         }
         match strip_assistant_subagent_tool_calls(message) {
@@ -1039,7 +1039,7 @@ pub fn strip_parent_only_subagent_messages(
             // message existed only to make the call, so it is dropped rather than sent empty.
             None => changed = true,
             Some(stripped) => {
-                if stripped != *message {
+                if !Arc::ptr_eq(&stripped, message) {
                     changed = true;
                 }
                 filtered.push(stripped);
@@ -1052,9 +1052,11 @@ pub fn strip_parent_only_subagent_messages(
 /// pi `stripAssistantSubagentToolCallBlocks` (`:132-139`): remove `subagent` tool-call blocks from
 /// an assistant message; `None` means the message became empty and must be dropped entirely.
 /// Any non-assistant message passes through untouched.
-fn strip_assistant_subagent_tool_calls(message: &AgentMessage) -> Option<AgentMessage> {
-    let AgentMessage::Assistant(assistant) = message else {
-        return Some(message.clone());
+/// Returns the SAME handle when nothing was stripped, so the caller's `Arc::ptr_eq` check is an
+/// exact "was this message rewritten?" test and an untouched message is never re-allocated.
+fn strip_assistant_subagent_tool_calls(message: &Arc<AgentMessage>) -> Option<Arc<AgentMessage>> {
+    let AgentMessage::Assistant(assistant) = message.as_ref() else {
+        return Some(Arc::clone(message));
     };
     let kept: Vec<Content> = assistant
         .content
@@ -1063,14 +1065,14 @@ fn strip_assistant_subagent_tool_calls(message: &AgentMessage) -> Option<AgentMe
         .cloned()
         .collect();
     if kept.len() == assistant.content.len() {
-        return Some(message.clone());
+        return Some(Arc::clone(message));
     }
     if kept.is_empty() {
         return None;
     }
     let mut assistant = (**assistant).clone();
     assistant.content = kept;
-    Some(AgentMessage::Assistant(Arc::new(assistant)))
+    Some(Arc::new(AgentMessage::Assistant(Arc::new(assistant))))
 }
 
 /// The JSON Pointer the caller's whole schema is relocated to once nested under the wrapper's
@@ -3436,11 +3438,17 @@ mod tests {
         })
     }
 
+    /// PERF-002 flipped the stripper to `&[Arc<AgentMessage>]`; these fixtures build owned
+    /// messages, so wrap them at the call rather than restating each one.
+    fn arcs(msgs: Vec<AgentMessage>) -> Vec<Arc<AgentMessage>> {
+        msgs.into_iter().map(Arc::new).collect()
+    }
+
     #[test]
     fn every_parent_only_custom_type_is_dropped_from_a_childs_context() {
         for kind in PARENT_ONLY_CUSTOM_MESSAGE_TYPES {
             let messages = vec![AgentMessage::user_text("task"), custom(kind)];
-            let out = strip_parent_only_subagent_messages(&messages, false)
+            let out = strip_parent_only_subagent_messages(&arcs(messages), false)
                 .unwrap_or_else(|| panic!("{kind} must be stripped"));
             assert_eq!(out.len(), 1, "{kind} must be dropped");
         }
@@ -3454,9 +3462,9 @@ mod tests {
             tool_result("subagent"),
             tool_result("bash"),
         ];
-        let out = strip_parent_only_subagent_messages(&messages, false).expect("changed");
+        let out = strip_parent_only_subagent_messages(&arcs(messages), false).expect("changed");
         assert_eq!(out.len(), 3, "only the subagent toolResult is dropped");
-        match &out.get(1) {
+        match out.get(1).map(|m| m.as_ref()) {
             Some(AgentMessage::Assistant(a)) => {
                 assert_eq!(a.content.len(), 1, "the subagent toolCall block is gone");
                 assert!(matches!(a.content.first(), Some(Content::Text { .. })));
@@ -3464,7 +3472,7 @@ mod tests {
             other => panic!("expected an assistant message, got {other:?}"),
         }
         assert!(
-            matches!(out.get(2), Some(AgentMessage::ToolResult(tr)) if tr.tool_name == "bash"),
+            matches!(out.get(2).map(|m| m.as_ref()), Some(AgentMessage::ToolResult(tr)) if tr.tool_name == "bash"),
             "an unrelated tool result must survive"
         );
     }
@@ -3474,7 +3482,7 @@ mod tests {
     #[test]
     fn an_assistant_message_that_was_only_a_subagent_call_is_dropped() {
         let messages = vec![assistant(vec![tool_call_block("subagent")])];
-        let out = strip_parent_only_subagent_messages(&messages, false).expect("changed");
+        let out = strip_parent_only_subagent_messages(&arcs(messages), false).expect("changed");
         assert!(out.is_empty());
     }
 
@@ -3486,9 +3494,9 @@ mod tests {
             tool_result("subagent"),
             custom("subagent-notify"),
         ];
-        let out = strip_parent_only_subagent_messages(&messages, true).expect("the notice changed it");
+        let out = strip_parent_only_subagent_messages(&arcs(messages), true).expect("the notice changed it");
         assert_eq!(out.len(), 2, "both subagent tool messages survive");
-        assert!(out.iter().all(|m| !matches!(m, AgentMessage::Custom { .. })));
+        assert!(out.iter().all(|m| !matches!(m.as_ref(), AgentMessage::Custom { .. })));
     }
 
     /// Nothing to strip must report NO change, so the dispatcher leaves the list untouched rather
@@ -3496,6 +3504,6 @@ mod tests {
     #[test]
     fn a_clean_context_reports_no_change() {
         let messages = vec![AgentMessage::user_text("task"), tool_result("bash")];
-        assert!(strip_parent_only_subagent_messages(&messages, false).is_none());
+        assert!(strip_parent_only_subagent_messages(&arcs(messages), false).is_none());
     }
 }
