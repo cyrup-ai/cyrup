@@ -7,6 +7,7 @@ use cyrup_core::{
 };
 use futures::StreamExt;
 
+mod framer;
 pub mod sse;
 
 /// Prompt-cache retention preference (func-01 §11).

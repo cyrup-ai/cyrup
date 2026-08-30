@@ -1,12 +1,15 @@
 ---
-stage: aug
-status: in-progress
-updated: 2026-08-29 16:57
-aug_against: cyrup HEAD 7913760 (branch david/performance, PERF-001 landed at 04d6fa5) · reqwest 0.13.4 · hyper 1.10.1 · hyper-util 0.1.20 · eventsource-stream 0.2.3 · nom 7.1.3 · tokio 1.52.3 · serde_json 1.0.150
-measured_on: this host, `--release`, 4 runs, medians reported. Probes kept at
-  [`crates/cyrup/tmp/perf006/src/bin/`](../../../crates/cyrup/tmp/perf006/src/bin/framer.rs) (gitignored);
-  upstream vendored for citation at
-  [`crates/cyrup/tmp/eventsource-stream-0.2.3/`](../../../crates/cyrup/tmp/eventsource-stream-0.2.3/src/event_stream.rs).
+stage: qa
+status: completed
+updated: 2026-08-30 02:55
+aug_against: cyrup HEAD 7913760 (branch david/performance) · reqwest 0.13.4 · hyper 1.10.1 · hyper-util 0.1.20 · eventsource-stream 0.2.3 · nom 7.1.3 · tokio 1.52.3 · serde_json 1.0.150
+aug_reverified: cyrup main **b7a564d** (AUG-5, after PERF-003/004/005 landed) — every citation re-checked
+  on a FRESH CLONE. All cyrup-side line numbers EXACT; 2 upstream line numbers corrected; 2 call-site
+  counts corrected; the probe tree is GONE. **READ §9 FIRST.**
+measured_on: a PREVIOUS host and branch, `--release`, 4 runs, medians. **The probes that produced
+  these numbers are GONE — §9.1.** Upstream is re-vendored for citation at
+  [`tmp/eventsource-stream-0.2.3/`](../../../tmp/eventsource-stream-0.2.3/src/event_stream.rs);
+  `tmp/` is gitignored, so re-create it with the one-liner in §9.1 if missing.
 ---
 
 # Replace the SSE framer
@@ -25,6 +28,12 @@ measured_on: this host, `--release`, 4 runs, medians reported. Probes kept at
 
 ---
 
+> ## ⚠️ START AT [§9](#9-aug-5-re-verification--main-b7a564d-on-a-fresh-clone--read-before-0)
+> AUG-5 re-verified this file against **`main` at `b7a564d`** on a **fresh clone**. The §4 plan is
+> unchanged and ready to type in — but **the probe tree every §3 number cites is GONE** (`tmp/` is
+> gitignored at any depth), two upstream line numbers were wrong, and two call-site counts were
+> wrong. §9 supersedes §3's "reproduce with" instruction and corrects §4.1's `parser.rs` citation.
+
 ## 0. What changed since the previous augmentation — read this first
 
 The previous revision was written at `8f49433`. Four things have moved, and three of them
@@ -42,7 +51,7 @@ territory, but it is no longer a PERF-006 hand-off.
 
 **(b) THE §7.2 FRAMER SKETCH IN THE PREVIOUS REVISION WAS WRONG — 11 divergences out of 32
 cases.** It was re-derived from the SSE spec rather than read off
-[`EventBuilder`](../../../crates/cyrup/tmp/eventsource-stream-0.2.3/src/event_stream.rs), and it
+[`EventBuilder`](../../../tmp/eventsource-stream-0.2.3/src/event_stream.rs), and it
 got the dispatch rule backwards. Measured, not reasoned — see §3.2 for the full table. The
 central error: the sketch armed dispatch on *"a field was seen"* (`saw_field`), where the actual
 rule is *"a blank line always attempts dispatch; the attempt EMITS only if the data buffer is
@@ -52,7 +61,7 @@ a suppressed dispatch leaks its event-type buffer into the next frame. **§4 car
 algorithm, verified 32/34 identical against upstream.**
 
 **(c) `eventsource-stream` 0.2.3 PANICS on a leading BOM, and the panic is reachable from
-`open_sse`.** [`event_stream.rs:266-275`](../../../crates/cyrup/tmp/eventsource-stream-0.2.3/src/event_stream.rs)
+`open_sse`.** [`event_stream.rs:266-275`](../../../tmp/eventsource-stream-0.2.3/src/event_stream.rs)
 strips the BOM with `&string[1..]` after matching `is_bom` on a `char`. U+FEFF is **three** bytes
 in UTF-8, so byte index 1 is not a char boundary:
 
@@ -61,12 +70,12 @@ thread 'main' panicked at eventsource-stream-0.2.3/src/event_stream.rs:271:36:
 start byte index 1 is not a char boundary; it is inside '\u{feff}' (bytes 0..3 of string)
 ```
 
-Reproduced by [`framer.rs`](../../../crates/cyrup/tmp/perf006/src/bin/framer.rs), case
+Reproduced by `framer.rs` *(gone — §9.1)*, case
 *"BOM at stream start"*. A provider, proxy or CDN that prepends a UTF-8 BOM to
 `text/event-stream` kills the turn. The workspace's no-panic policy cannot see it — it is
 `clippy::indexing_slicing` **inside a dependency** — and neither can `#![forbid(unsafe_code)]`,
 which the same dependency violates in
-[`utf8_stream.rs:69`](../../../crates/cyrup/tmp/eventsource-stream-0.2.3/src/utf8_stream.rs)
+[`utf8_stream.rs:69`](../../../tmp/eventsource-stream-0.2.3/src/utf8_stream.rs)
 (`unsafe { String::from_utf8_unchecked(bytes) }`). The corrected framer handles the BOM at the
 byte level and returns the right frames.
 
@@ -115,7 +124,7 @@ stages and cannot be pipelined: it is bounded (`STREAM_BUFFER = 64`,
 `Fanout::emit`, which awaits **every** subscriber
 ([`subscriber.rs:63-76`](../../../crates/cyrup-session-svc/src/subscriber.rs) — *"backpressure →
 slows the agent, never drops"*) all the way to the TUI draw. Measured with
-[`hop.rs`](../../../crates/cyrup/tmp/perf006/src/bin/hop.rs), a consumer's per-event cost passes
+`hop.rs` *(gone — §9.1)*, a consumer's per-event cost passes
 through to the producer ~1:1:
 
 | consumer cost/event | serial | pipelined | speedup |
@@ -127,7 +136,7 @@ through to the producer ~1:1:
 A TUI frame draw is far more than 5 µs — [PERF-005](PERF-005_DECOUPLE_RENDER_FROM_FOLD.md) exists
 precisely because the renderer sits on this path — so the 5–20 µs rows are the operating regime.
 Against that, the pipeline costs two channels, an ordering obligation across
-**27 `decode_stream(` call sites in 18 files**, three separate cancellation observations, and a
+**29 `decode_stream(` call sites in 19 files**, three separate cancellation observations, and a
 forward-travelling error protocol (four of the five terminal paths in
 [`driver.rs`](../../../crates/cyrup-provider/src/api/anthropic_messages/driver.rs) need decoder
 state that lives in stage C, while the transport error is detected in stage A, so an error must
@@ -223,7 +232,7 @@ Note its no-panic style: `self.buffer.get(..n).ok_or(…)?` everywhere, never `s
 
 `--release`, 4 runs, medians. Fixture: 128 KB prose + 256 KB tool call = **1,544 KB raw,
 9,540 frames**. Reproduce with
-[`crates/cyrup/tmp/perf006/src/bin/framer.rs`](../../../crates/cyrup/tmp/perf006/src/bin/framer.rs).
+`perf006/src/bin/framer.rs` *(gone — §9.1)*.
 
 ### 3.1 Framing cost
 
@@ -241,15 +250,15 @@ signal that the quadratic is gone by construction, and it is what makes §0d's w
 unnecessary.
 
 The quadratic's mechanism, for the record: `parse_event` does `buffer.split_off(consumed)` **per
-line** ([`event_stream.rs:221-223`](../../../crates/cyrup/tmp/eventsource-stream-0.2.3/src/event_stream.rs)),
+line** ([`event_stream.rs:221-223`](../../../tmp/eventsource-stream-0.2.3/src/event_stream.rs)),
 allocating a new `String` and memcpy'ing the whole *remaining* buffer each time; and `Utf8Stream`
 re-validates and moves the entire accumulated buffer per chunk
-([`utf8_stream.rs:59-70`](../../../crates/cyrup/tmp/eventsource-stream-0.2.3/src/utf8_stream.rs)).
+([`utf8_stream.rs:59-70`](../../../tmp/eventsource-stream-0.2.3/src/utf8_stream.rs)).
 With one giant buffer both are O(n²) in the stream's byte length.
 
 It is not a production bug — the shipping path is `resp.bytes_stream().eventsource()` and hyper
 delivers per-HTTP-chunk — but it is a live cost across the crate's whole offline test surface:
-**30 `decode_sse_bytes` call sites in 14 files**, including
+**26 `decode_sse_bytes` call sites in 14 files**, including
 [`truncation_parity.rs:196-231`](../../../crates/cyrup-provider/src/api/truncation_parity.rs)'s
 `events(wire, raw)`, which drives five wire APIs from one helper.
 
@@ -301,10 +310,10 @@ Four independent justifications, any one of which would carry it:
 ### 4.1 The algorithm — read off `EventBuilder`, not re-derived
 
 This is the WHATWG *event stream interpretation* algorithm as `eventsource-stream` implements it
-([`event_stream.rs:24-110`](../../../crates/cyrup/tmp/eventsource-stream-0.2.3/src/event_stream.rs)).
+([`event_stream.rs:19-113`](../../../tmp/eventsource-stream-0.2.3/src/event_stream.rs)).
 Implement exactly these rules. Every one of them is load-bearing for a case in §3.2.
 
-**Line terminators** (`parser.rs:216`, `end_of_line`): `\r\n`, lone `\r`, or `\n`.
+**Line terminators** (`parser.rs:79-85`, `end_of_line`): `\r\n`, lone `\r`, or `\n`.
 **A trailing `\r` that is the last byte of the buffer is NOT yet a terminator** — the `\n` may be
 in the next chunk. Hold it. At EOF an unterminated line is silently dropped (upstream returns
 `Incomplete` forever and the stream just ends).
@@ -339,7 +348,7 @@ dispatch resets the buffers whether or not it emitted*.
 ### 4.2 The framer — new file `crates/cyrup-provider/src/stream/framer.rs`
 
 Verified 32/34 against upstream by
-[`framer.rs`](../../../crates/cyrup/tmp/perf006/src/bin/framer.rs). Ship this shape.
+`framer.rs` *(gone — §9.1)*. Ship this shape.
 
 ```rust
 //! Incremental SSE framing — the WHATWG "event stream interpretation" algorithm over a byte
@@ -571,7 +580,7 @@ Then in [`sse.rs`](../../../crates/cyrup-provider/src/stream/sse.rs):
    contains `"timed out"`. `normalize_error_body` also stays: a `FrameError::Utf8` message is
    short, but the cap is what keeps provider-controlled bytes out of
    `AssistantMessage.error_message`.
-5. **`:514-526`** — `decode_sse_bytes` keeps its **exact** signature and return type (30 call
+5. **`:514-526`** — `decode_sse_bytes` keeps its **exact** signature and return type (26 call
    sites depend on it):
    ```rust
    pub fn decode_sse_bytes(bytes: impl Into<Bytes>) -> FrameStream {
@@ -586,7 +595,7 @@ Then in [`sse.rs`](../../../crates/cyrup-provider/src/stream/sse.rs):
    }
    ```
 
-Nothing else in the crate changes. The six decoders, all 27 `decode_stream(` call sites, and
+Nothing else in the crate changes. The six decoders, all 29 `decode_stream(` call sites, and
 `SseFrame` itself are untouched.
 
 ### 4.5 Drop the dependency
@@ -672,6 +681,151 @@ Two things follow:
    through `decode_sse_bytes`, so they are the existing behavioural check on §4 and must pass
    unchanged — no fixture, no expected value and no assertion may be edited to accommodate the new
    framer. If one needs editing, the framer is wrong.
-7. `crates/cyrup/tmp/` is untouched by the commit (gitignored at
-   [`.gitignore:7`](../../../.gitignore)) and nothing new is added under `crates/` beyond
-   `framer.rs`.
+7. Nothing new is added under `crates/` beyond `framer.rs`. `tmp/` at any level is gitignored
+   ([`.gitignore:7`](../../../.gitignore) — the rule is `tmp/`, not `/tmp/`), so the re-vendored
+   `tmp/eventsource-stream-0.2.3/` cannot enter the commit; confirm with `git status --short`
+   that it does not appear.
+
+---
+
+## 9. [AUG-5] Re-verification @ main `b7a564d`, on a fresh clone — READ BEFORE §0
+
+The previous augmentation was written at `7913760` on branch **`david/performance`**. This pass
+re-checked **every** citation against **`main` at `b7a564d`** (PERF-003, PERF-004 and PERF-005 have
+landed since) in a **freshly cloned container**. The headline: **the plan in §4 is sound and its
+cyrup-side citations are exact — but the evidence base in §3 is not reproducible here, and two
+upstream line numbers were wrong.**
+
+### 9.1 🔴 The probe tree is GONE — §3's numbers cannot be re-run as written
+
+`.gitignore:7` is `tmp/` — **unanchored**, so it ignores a `tmp` directory *at any depth*, including
+`crates/cyrup/tmp/`. That tree was scratch on a branch, never committed, and this container is a
+fresh clone. All of it is absent:
+
+| cited artifact | status |
+| --- | --- |
+| `perf006/src/bin/framer.rs` — the 34-case equivalence harness **and** the BOM-panic reproducer | **gone** |
+| `perf006/src/bin/hop.rs` — the §1 consumer-cost table | **gone** |
+| `crates/cyrup/tmp/eventsource-stream-0.2.3/` — vendored upstream, target of 7 citations | **gone** |
+
+Upstream has been **re-vendored** during this pass, so every `event_stream.rs` / `utf8_stream.rs` /
+`parser.rs` citation in this file is live again and was re-verified below. Re-create it with:
+
+```bash
+cp -r ~/.cargo/registry/src/index.crates.io-*/eventsource-stream-0.2.3 tmp/
+```
+
+**What this means for `/exec` — do NOT rebuild the probe harness.** §3's measurements stand as
+*historical evidence for why this work was chosen*; they are not a deliverable and re-deriving them
+is benchmark work this task does not want. The **equivalence gate is the one already named in DoD
+item 6**: `truncation_parity.rs`, `sse.rs`'s own module tests, and all six decoders' fixture suites
+replay through `decode_sse_bytes`, and they must pass **unedited**. That is the real check on §4,
+and it is stronger than a throwaway probe because it runs in CI forever.
+
+The one thing genuinely lost is the **BOM-panic reproducer** (§0c). The panic is still provable by
+reading upstream — re-verified verbatim at `event_stream.rs:266-275` in §9.3 below — so §0c's claim
+stands on the source, not on a probe.
+
+### 9.2 Cyrup-side citations: ALL EXACT at `b7a564d`, no edits needed
+
+Re-checked individually, not spot-checked:
+
+| citation | verified |
+| --- | --- |
+| `sse.rs:46` — the single `use eventsource_stream::…` line | ✅ exact; still the **only** occurrence in `crates/` |
+| `sse.rs:168-175` — `SseFrame { event: String, data: String }`, `Clone/Debug/PartialEq/Eq` | ✅ exact — confirms §4.2's struct literal compiles |
+| `sse.rs:295` — `type FrameStream = Pin<Box<dyn Stream<Item = Result<SseFrame, ProviderError>> + Send>>` | ✅ exact — §4.4 item 5's return type is right |
+| `sse.rs:297` — `type EsInner` | ✅ exact |
+| `sse.rs:317` — `fn flatten_source_chain` | ✅ exact |
+| `sse.rs:466` — `Box::pin(resp.bytes_stream().eventsource())` | ✅ exact |
+| `sse.rs:478` — `biased;` in the cancel arm | ✅ exact (cited as `:477-478`; the `tokio::select!` opens at `:477`) |
+| `sse.rs:514` — `pub fn decode_sse_bytes(bytes: impl Into<Bytes>) -> FrameStream` | ✅ exact |
+| `sse.rs:775` — `a_stall_mid_stream_ends_the_stream_with_an_error` | ✅ exact; its `contains("timed out")` assertion is at `:808` |
+| `stream.rs:10` — `pub mod sse;` | ✅ exact — §4.4's two-line registration applies cleanly |
+| all six decoder frame loops (§2.3) | ✅ all six are `while let Some(frame) = frames.next().await {` at the cited lines |
+| `bedrock_converse_stream/framing.rs:22-45` | ✅ exact — `#[derive(Default)] pub(super) struct EventStreamDecoder { buffer: Vec<u8> }` at `:28-31` |
+| `Cargo.toml:205`, `crates/cyrup-provider/Cargo.toml:67` | ✅ both exact |
+| `tests/perf001.rs:7-15` | ✅ exact, quoted text matches verbatim |
+
+**`cargo tree --workspace -i nom` re-run at `b7a564d`:**
+
+```
+nom v7.1.3
+└── eventsource-stream v0.2.3
+    └── cyrup-provider v0.0.0
+```
+
+§4's claim 3 is **confirmed**: `eventsource-stream` is `nom`'s only path into the tree.
+
+### 9.3 Upstream citations: 2 corrected, and the load-bearing algorithm re-confirmed
+
+Re-read against the re-vendored copy. **Corrected in place above:**
+
+| was | is | note |
+| --- | --- | --- |
+| `parser.rs:216` (`end_of_line`) | **`parser.rs:79-85`** | `parser.rs` is only **118 lines**; `:216` cannot exist. The *rule* was right: `alt((crlf, take_while_m_n(1,1,is_cr), take_while_m_n(1,1,is_lf)))` |
+| `event_stream.rs:24-110` (`EventBuilder`) | **`:19-113`** | `struct` opens at `:19`, `impl` at `:24`, `add` at `:45`, `dispatch` at `:95-113` |
+
+**The three rules §0b says the previous sketch got backwards were re-verified against the source,
+because they are the entire difference between a correct framer and an 11/32-wrong one:**
+
+1. *Only a blank line dispatches* — `RawEventLine::Empty => self.is_complete = true`
+   (`event_stream.rs:71`). `id` (`:57`) and `retry` (`:62`) parse their values and set
+   `is_complete` **never**. ✅
+2. *A dispatch resets both buffers even when it emits nothing* — `core::mem::take(self)` at `:96`
+   runs **before** the emptiness check at `:100-102`. ✅
+3. *A dispatch emits only if the data buffer is non-empty* — `if event.data.is_empty() { return
+   None; }` at `:100-102`. ✅
+
+Also re-confirmed, each backing a specific §4.1 row: `event` **replaces** the type buffer
+(`:51`, `self.event.event = val.to_string()`); `data` appends value **plus one `\u{000A}`**
+unconditionally (`:53-55`); one trailing LF is popped (`:104-106`); an empty type becomes
+`"message"` (`:108-110`).
+
+§4.2's deliberate divergence — `data.ends_with('\n')` instead of upstream's
+`is_lf(data.chars().next_back().unwrap())` (`:104`) — is **correct and strictly better**: identical
+behaviour, one fewer panic path. Upstream's `unwrap` is guarded by `:100`, so it is not itself a
+live bug; §4.2's version simply does not need the guard. And §4.2's warning not to re-check
+emptiness after the pop is **right** — traced through upstream, `event: ping\ndata:\n\n` gives
+`data = "\n"` → passes `:100` → pops to `""` → emits `("ping","")`.
+
+**The two upstream defects are re-confirmed verbatim:**
+
+- **The BOM panic** (`event_stream.rs:266-275`): `if is_bom(string.chars().next().unwrap()) {
+  &string[1..] }` at `:270-271` — `is_bom` matches a **`char`**, then the slice indexes by
+  **byte**. U+FEFF is 3 bytes in UTF-8, so `&string[1..]` splits it and panics.
+- **The quadratic** (`event_stream.rs:221-223`): `let rem = buffer.split_off(consumed); *buffer =
+  rem;` **per line** — a fresh `String` plus a memcpy of the whole remainder each time. Compounded
+  by `utf8_stream.rs:59-70`, which `core::mem::take`s and re-validates the entire accumulated
+  buffer **per chunk**, and whose `:69` is the graph's
+  `unsafe { String::from_utf8_unchecked(bytes) }`.
+
+### 9.4 Two call-site counts were wrong — corrected in place
+
+Re-counted at `b7a564d`:
+
+| claim | was | is |
+| --- | --- | --- |
+| `decode_sse_bytes` call sites | 30 in 14 files | **26 in 14 files** |
+| `decode_stream(` call sites | 27 in 18 files | **29 in 19 files** |
+
+Neither changes any conclusion — none of these sites are edited, which is precisely §2.3's point —
+but DoD item 2 leans on the first as the reason `decode_sse_bytes`'s signature is frozen, so it
+should be right.
+
+### 9.5 Net assessment for `/exec`
+
+**The §4 plan is unchanged and ready to type in.** Nothing in this pass moved the design; §4.1's
+algorithm, §4.2's framer, §4.3's adapter and §4.4's five-line rewiring all survive re-verification
+against both the current tree and the re-vendored upstream.
+
+Three things to carry into exec:
+
+1. **Do not chase §3's numbers.** The probes are gone (§9.1); the fixture suites are the gate.
+2. **`SseFramer::next_frame` is not sticky on a UTF-8 error** — it advances `self.start` past the
+   bad line *before* the `?`. That is safe **only** because `frame_bytes` sets `done = true` on
+   `Err` (§4.3) and never polls again. Keep that arm exactly as §4.3 writes it; if the framer is
+   ever driven directly, a second call would silently resume past the corruption.
+3. **§4.6's spec question still needs a human.** `spec/` is not in this workspace, so whether
+   swapping a spec-named dependency requires an arch-01 amendment cannot be settled here. Surface
+   it; do not fabricate spec text, and do not let it block the change.

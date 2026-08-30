@@ -1,5 +1,17 @@
-//! Direct-wire HTTP + SSE transport (arch-01 §7.1: `reqwest` + `rustls`, no native-tls, +
-//! `eventsource-stream`).
+//! Direct-wire HTTP + SSE transport (arch-01 §7.1: `reqwest` + `rustls`, no native-tls).
+//!
+//! [CYRUP-DELTA] arch-01 §7.1 names `eventsource-stream` for the framing layer; framing is now
+//! in-tree ([`super::framer`]). Two defects in `eventsource-stream` 0.2.3 forced it. Its BOM
+//! strip matches `is_bom` on a `char` and then slices `&string[1..]` by *byte*
+//! (`event_stream.rs:270-271`) — U+FEFF is three bytes in UTF-8, so a provider, proxy or CDN
+//! that prepends a BOM to `text/event-stream` panics the turn, and neither the workspace's
+//! no-panic lints nor `#![forbid(unsafe_code)]` can see it inside a dependency. And its
+//! `parse_event` does a `String::split_off` per line while `Utf8Stream` re-validates the whole
+//! accumulated buffer per chunk, which is quadratic in the byte length of a single buffer — the
+//! regime every [`decode_sse_bytes`] call site takes. The in-tree framer implements the same
+//! WHATWG "event stream interpretation" algorithm, read off upstream's own `EventBuilder`
+//! rather than re-derived, and produces equivalent frames; it also drops `nom` and an
+//! `unsafe { String::from_utf8_unchecked }` from the dependency graph.
 //!
 //! A submodule of [`crate::stream`] so the request side and the event side share one module root.
 //!
@@ -43,7 +55,8 @@ use crate::utils::provider_retry::{
 };
 use bytes::Bytes;
 use cyrup_core::CancelToken;
-use eventsource_stream::{Event as EsEvent, EventStreamError, Eventsource};
+
+use super::framer::{FrameError, frame_bytes};
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -295,7 +308,7 @@ pub async fn build_client_for_target_forcing_http1(
 type FrameStream = Pin<Box<dyn Stream<Item = Result<SseFrame, ProviderError>> + Send>>;
 
 type EsInner =
-    Pin<Box<dyn Stream<Item = Result<EsEvent, EventStreamError<reqwest::Error>>> + Send>>;
+    Pin<Box<dyn Stream<Item = Result<SseFrame, FrameError<reqwest::Error>>> + Send>>;
 
 struct SseState {
     es: EsInner,
@@ -463,7 +476,7 @@ pub async fn open_sse(
         }
     };
 
-    let es: EsInner = Box::pin(resp.bytes_stream().eventsource());
+    let es: EsInner = Box::pin(frame_bytes(resp.bytes_stream()));
     let state = SseState {
         es,
         cancel,
@@ -482,24 +495,23 @@ pub async fn open_sse(
             }
             next = state.es.next() => match next {
                 None => None,
-                Some(Ok(ev)) => {
-                    Some((Ok(SseFrame { event: ev.event, data: ev.data }), state))
-                }
+                Some(Ok(frame)) => Some((Ok(frame), state)),
                 Some(Err(e)) => {
                     state.done = true;
-                    // `EventStreamError` has an empty `Error::source` impl, so a wrapped transport
-                    // failure has to be unwrapped by hand to reach its reason (see
-                    // `flatten_source_chain`) — a mid-stream idle timeout is otherwise reported only
-                    // as "error decoding response body".
+                    // reqwest's own `Display` is terse — a read timeout renders as "error decoding
+                    // response body" — and the real reason lives only in `Error::source` (see
+                    // `flatten_source_chain`). That string is the sole input to
+                    // `is_retryable_assistant_error`, so a mid-stream idle timeout has to carry
+                    // "timed out" through to it.
                     let text = match &e {
-                        EventStreamError::Transport(inner) => {
+                        FrameError::Transport(inner) => {
                             format!("Transport error: {}", flatten_source_chain(inner))
                         }
-                        other => other.to_string(),
+                        FrameError::Utf8(inner) => format!("UTF8 error: {inner}"),
                     };
-                    // Capped for the same reason the non-2xx body is: an `EventStreamError::Parser`
-                    // embeds the offending input, which is provider-controlled and unbounded, and
-                    // this string lands in `AssistantMessage.error_message` verbatim.
+                    // Capped for the same reason the non-2xx body is: this string lands in
+                    // `AssistantMessage.error_message` verbatim, and the bytes that provoked it
+                    // are provider-controlled.
                     Some((Err(ProviderError::Decode(normalize_error_body(&text))), state))
                 }
             },
@@ -514,15 +526,12 @@ pub async fn open_sse(
 pub fn decode_sse_bytes(bytes: impl Into<Bytes>) -> FrameStream {
     let bytes = bytes.into();
     let byte_stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(bytes) });
-    let es = byte_stream.eventsource();
-    let stream = es.map(|ev| match ev {
-        Ok(ev) => Ok(SseFrame {
-            event: ev.event,
-            data: ev.data,
-        }),
-        Err(e) => Err(ProviderError::Decode(e.to_string())),
-    });
-    Box::pin(stream)
+    Box::pin(frame_bytes(byte_stream).map(|r| {
+        r.map_err(|e| match e {
+            FrameError::Transport(io) => ProviderError::Decode(io.to_string()),
+            FrameError::Utf8(inner) => ProviderError::Decode(format!("UTF8 error: {inner}")),
+        })
+    }))
 }
 
 #[cfg(test)]
