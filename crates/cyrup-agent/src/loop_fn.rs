@@ -214,7 +214,9 @@ fn agent_event_stream() -> (AgentLoopSink, AgentLoopStream) {
     let (sink, stream) = finalizing_channel(
         |e: &AgentEvent| matches!(e, AgentEvent::AgentEnd { .. }),
         |e: &AgentEvent| match e {
-            AgentEvent::AgentEnd { messages } => messages.clone(),
+            // §6.5: `AgentLoopStream`'s result type stays `Vec<AgentMessage>`, so unwrap the
+            // handles here — once per run, at the terminal event, off the per-turn path.
+            AgentEvent::AgentEnd { messages } => messages.iter().map(|m| (**m).clone()).collect(),
             _ => Vec::new(),
         },
         Vec::new,

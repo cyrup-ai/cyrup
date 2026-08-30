@@ -152,7 +152,7 @@ pub enum AgentSessionEvent {
         tool_results: Vec<ToolResultMessage>,
     },
     AgentEnd {
-        messages: Vec<AgentMessage>,
+        messages: Vec<Arc<AgentMessage>>,
         /// Whether the run that just ended will be auto-retried (Pi `agent_end.willRetry`,
         /// agent-session.ts:132/541). Computed in the persist+fan-out subscriber from the session's
         /// live retry state; `false` for an unbound session (no post-run driver, never retries).

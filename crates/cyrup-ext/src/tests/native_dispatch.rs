@@ -509,7 +509,7 @@ impl NativeExtension for DropAssistant {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         if let HostEvent::Context { messages } = ev {
-            let filtered: Vec<AgentMessage> =
+            let filtered: Vec<Arc<AgentMessage>> =
                 messages.iter().filter(|m| !m.is_assistant()).cloned().collect();
             return HookOutcome::Mutate(crate::EventPatch::Context { messages: filtered });
         }
@@ -534,7 +534,7 @@ async fn a08_5_context_hook_filters_messages() {
         ))),
         AgentMessage::user_text("bye"),
     ];
-    let out = hooks.transform_context(msgs, CancelToken::new()).await.unwrap();
+    let out = hooks.transform_context(msgs.into_iter().map(Arc::new).collect(), CancelToken::new()).await.unwrap();
     assert_eq!(out.len(), 2);
     assert!(out.iter().all(|m| !m.is_assistant()));
 }

@@ -348,9 +348,9 @@ impl FailingTransform {
 impl Hooks for FailingTransform {
     async fn transform_context(
         &self,
-        _msgs: Vec<AgentMessage>,
+        _msgs: Vec<Arc<AgentMessage>>,
         _cancel: CancelToken,
-    ) -> Result<Vec<AgentMessage>, HookError> {
+    ) -> Result<Vec<Arc<AgentMessage>>, HookError> {
         Err(HookError::new(self.0))
     }
 }

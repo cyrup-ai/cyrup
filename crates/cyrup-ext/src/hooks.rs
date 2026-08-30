@@ -129,9 +129,13 @@ impl Hooks for ExtHooks {
     /// Filter/replace the LLM context (R-08-028 subset). Runs before `convert_to_llm`.
     async fn transform_context(
         &self,
-        msgs: Vec<AgentMessage>,
+        msgs: Vec<Arc<AgentMessage>>,
         cancel: CancelToken,
-    ) -> Result<Vec<AgentMessage>, HookError> {
+    ) -> Result<Vec<Arc<AgentMessage>>, HookError> {
+        // `msgs.clone()` is a POINTER clone now (PERF-002). It runs before the `no_subscribers`
+        // gate inside `dispatch_block_mutate`, so every turn paid a whole-transcript deep copy
+        // here even with no `context`-subscribing extension wired. Do not "fix" a type mismatch
+        // at this line by unwrapping the handles — that restores exactly that copy.
         let ev = HostEvent::Context { messages: msgs.clone() };
         match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
             Reduced::Pass(ev) => match *ev {

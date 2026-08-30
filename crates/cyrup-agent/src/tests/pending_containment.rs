@@ -103,7 +103,7 @@ async fn pending_never_reaches_a_settled_event_or_the_transcript() {
                 AgentEvent::MessageEnd { message } | AgentEvent::TurnEnd { message, .. } => {
                     vec![message]
                 }
-                AgentEvent::AgentEnd { messages } => messages.iter().collect(),
+                AgentEvent::AgentEnd { messages } => messages.iter().map(|m| m.as_ref()).collect(),
                 _ => continue,
             };
             for m in msgs {

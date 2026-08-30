@@ -2,6 +2,7 @@
 //! schema, run `before_tool_call` — yielding either a prepared executor or an immediate error
 //! result the model can retry from.
 
+use std::sync::Arc;
 use super::{Finalized, Prep};
 use crate::agent::message::{empty_details, result_value_of};
 use crate::agent::run::RunCtx;
@@ -18,7 +19,7 @@ impl RunCtx {
     pub(super) async fn prepare(
         &self,
         assistant: &AssistantMessage,
-        ctx_messages: &[AgentMessage],
+        ctx_messages: &[Arc<AgentMessage>],
         call: &ToolCall,
     ) -> Prep {
         let tool = match self.find_tool(&call.name) {

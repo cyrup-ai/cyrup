@@ -202,21 +202,21 @@ async fn a_childs_context_loses_the_parents_orchestration_bookkeeping() {
         parent_notice("subagent-notify"),
         bash_tool_result(),
     ];
-    let out = hooks.transform_context(messages, CancelToken::new()).await.unwrap();
+    let out = hooks.transform_context(messages.into_iter().map(Arc::new).collect(), CancelToken::new()).await.unwrap();
 
     assert!(
-        !out.iter().any(|m| matches!(m, AgentMessage::Custom { kind, .. } if kind == "subagent-notify")),
+        !out.iter().any(|m| matches!(m.as_ref(), AgentMessage::Custom { kind, .. } if kind == "subagent-notify")),
         "the parent's completion notice must not reach the child"
     );
     assert!(
         !out.iter().any(
-            |m| matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name == "subagent")
+            |m| matches!(m.as_ref(), AgentMessage::ToolResult(tr) if tr.tool_name == "subagent")
         ),
         "the parent's subagent results must not reach the child"
     );
     let assistant_blocks = out
         .iter()
-        .find_map(|m| match m {
+        .find_map(|m| match m.as_ref() {
             AgentMessage::Assistant(a) => Some(a.content.clone()),
             _ => None,
         })
@@ -229,11 +229,11 @@ async fn a_childs_context_loses_the_parents_orchestration_bookkeeping() {
     );
     // MIRRORS: the child's real work is untouched.
     assert!(
-        out.iter().any(|m| matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name == "bash")),
+        out.iter().any(|m| matches!(m.as_ref(), AgentMessage::ToolResult(tr) if tr.tool_name == "bash")),
         "an unrelated tool result must survive"
     );
     assert!(
-        out.iter().any(|m| matches!(m, AgentMessage::User { .. })),
+        out.iter().any(|m| matches!(m.as_ref(), AgentMessage::User { .. })),
         "the user's own request must survive"
     );
     assert!(
@@ -254,14 +254,14 @@ async fn a_fanout_child_keeps_its_own_delegation_history() {
         subagent_tool_result(),
         parent_notice("subagent_control_notice"),
     ];
-    let out = hooks.transform_context(messages, CancelToken::new()).await.unwrap();
+    let out = hooks.transform_context(messages.into_iter().map(Arc::new).collect(), CancelToken::new()).await.unwrap();
 
     assert_eq!(out.len(), 2, "only the parent-only notice is dropped: {out:?}");
     assert!(
-        out.iter().any(|m| matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name == "subagent")),
+        out.iter().any(|m| matches!(m.as_ref(), AgentMessage::ToolResult(tr) if tr.tool_name == "subagent")),
         "a fanout child's own subagent result is its own work"
     );
-    assert!(out.iter().all(|m| !matches!(m, AgentMessage::Custom { .. })));
+    assert!(out.iter().all(|m| !matches!(m.as_ref(), AgentMessage::Custom { .. })));
 }
 
 /// A process that is not a subagent child attaches nothing at all — no prompt rewrite, no context
@@ -279,8 +279,12 @@ async fn a_non_child_process_attaches_no_runtime() {
         rewritten_prompt(&host).await.is_none(),
         "no listener => the assembled prompt is used verbatim"
     );
-    let messages = vec![AgentMessage::user_text("hi"), parent_notice("subagent-notify")];
-    let out = host.hooks().transform_context(messages.clone(), CancelToken::new()).await.unwrap();
+    let messages = [AgentMessage::user_text("hi"), parent_notice("subagent-notify")];
+    let out = host
+        .hooks()
+        .transform_context(messages.iter().cloned().map(Arc::new).collect(), CancelToken::new())
+        .await
+        .unwrap();
     assert_eq!(out.len(), messages.len(), "a top-level session keeps its own notices");
 }
 

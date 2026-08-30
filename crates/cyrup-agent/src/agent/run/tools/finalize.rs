@@ -1,6 +1,7 @@
 //! Tool result finalization: apply `after_tool_call` (replace-not-merge per field) and build the
 //! finalized result + transcript message the batch returns.
 
+use std::sync::Arc;
 use super::Finalized;
 use crate::agent::message::{empty_details, result_value_of};
 use crate::agent::run::RunCtx;
@@ -17,7 +18,7 @@ impl RunCtx {
     pub(super) async fn finalize(
         &self,
         assistant: &AssistantMessage,
-        ctx_messages: &[AgentMessage],
+        ctx_messages: &[Arc<AgentMessage>],
         call: &ToolCall,
         source_index: usize,
         args: Value,

@@ -309,7 +309,7 @@ async fn agent007_failing_prepare_next_turn_emits_pis_full_failure_quartet() {
         })
         .expect("an agent_end");
     assert_eq!(end.len(), 1, "agent_end carries only the failure message, got {end:?}");
-    assert!(matches!(&end[0], AgentMessage::Assistant(a) if a.error_message.as_deref() == Some("prepare exploded")));
+    assert!(matches!(end[0].as_ref(), AgentMessage::Assistant(a) if a.error_message.as_deref() == Some("prepare exploded")));
 
     // The run's returned messages match `agent_end`, exactly as the catch_unwind twin settles.
     assert_eq!(new.len(), 1);
@@ -391,7 +391,7 @@ async fn gap3_agent_loop_pull_stream_finalizes_to_new_messages() {
 
     // Pull events; the terminal agent_end carries the run's new messages.
     let mut saw_agent_start = false;
-    let mut final_messages: Vec<AgentMessage> = Vec::new();
+    let mut final_messages: Vec<Arc<AgentMessage>> = Vec::new();
     while let Some(ev) = stream.next().await {
         match ev {
             AgentEvent::AgentStart => saw_agent_start = true,

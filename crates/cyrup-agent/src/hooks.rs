@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// inspect the system prompt / tools / messages without the runtime copying the transcript.
 pub struct AgentContextView<'a> {
     pub system_prompt: &'a str,
-    pub messages: &'a [AgentMessage],
+    pub messages: &'a [Arc<AgentMessage>],
     pub tools: &'a [Arc<dyn Tool>],
 }
 
@@ -36,7 +36,7 @@ pub struct BeforeToolCall<'a> {
     pub tool_call_id: &'a ToolCallId,
     pub args: &'a mut Value,
     /// The new messages produced so far this run (retained for backward-compat).
-    pub messages: &'a [AgentMessage],
+    pub messages: &'a [Arc<AgentMessage>],
     /// The assistant message that requested this tool call (Pi `assistantMessage`, types.ts:90).
     pub assistant_message: &'a AssistantMessage,
     /// The raw tool-call block from `assistant_message.content` (Pi `toolCall`, types.ts:92).
@@ -114,7 +114,7 @@ pub struct AfterOverride {
 pub struct PostTurn<'a> {
     /// The new messages this run will return if it exits here (Pi `newMessages`, types.ts:137 —
     /// cyrup's pre-existing field name).
-    pub messages: &'a [AgentMessage],
+    pub messages: &'a [Arc<AgentMessage>],
     pub turn_index: usize,
     /// The assistant message that completed the turn (Pi `message`, types.ts:119).
     pub message: &'a AssistantMessage,
@@ -132,7 +132,7 @@ pub struct PostTurn<'a> {
 /// one-shot. A `None` field keeps the current baseline. `context` replaces the working transcript.
 #[derive(Clone, Default)]
 pub struct TurnUpdate {
-    pub context: Option<Vec<AgentMessage>>,
+    pub context: Option<Vec<Arc<AgentMessage>>>,
     pub model: Option<ModelRef>,
     pub thinking_level: Option<ModelThinkingLevel>,
     /// Replacement tool set for the rest of the run (Pi `AgentContext.tools`, carried inside the
@@ -175,9 +175,9 @@ impl std::fmt::Debug for TurnUpdate {
 
 /// The default `convert_to_llm`: keep only `user`/`assistant`/`toolResult`, drop `Custom`
 /// (func-02 R-02-029/052).
-pub fn default_convert_to_llm(msgs: &[AgentMessage]) -> Vec<Message> {
+pub fn default_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Message> {
     msgs.iter()
-        .filter_map(|m| match m {
+        .filter_map(|m| match m.as_ref() {
             AgentMessage::User { content, timestamp } => {
                 Some(Message::User { content: content.clone(), timestamp: timestamp.unwrap_or(0) })
             }
@@ -212,16 +212,16 @@ pub fn default_convert_to_llm(msgs: &[AgentMessage]) -> Vec<Message> {
 pub trait Hooks: Send + Sync {
     /// Runs after `transform_context`; converts `AgentMessage[]` to LLM `Message[]`, dropping
     /// custom roles (func-02 R-02-029/030). Default = [`default_convert_to_llm`].
-    async fn convert_to_llm(&self, msgs: &[AgentMessage]) -> Result<Vec<Message>, HookError> {
+    async fn convert_to_llm(&self, msgs: &[Arc<AgentMessage>]) -> Result<Vec<Message>, HookError> {
         Ok(default_convert_to_llm(msgs))
     }
 
     /// Per-request, BEFORE `convert_to_llm` (func-02 R-02-028). Default = identity.
     async fn transform_context(
         &self,
-        msgs: Vec<AgentMessage>,
+        msgs: Vec<Arc<AgentMessage>>,
         _cancel: CancelToken,
-    ) -> Result<Vec<AgentMessage>, HookError> {
+    ) -> Result<Vec<Arc<AgentMessage>>, HookError> {
         Ok(msgs)
     }
 

@@ -372,7 +372,7 @@ impl Agent {
                         &fail_subs,
                         &fail_state,
                         &fail_cancel,
-                        AgentEvent::AgentEnd { messages: vec![fm.clone()] },
+                        AgentEvent::AgentEnd { messages: vec![Arc::new(fm.clone())] },
                     )
                     .await;
                     guard.complete(vec![fm]);

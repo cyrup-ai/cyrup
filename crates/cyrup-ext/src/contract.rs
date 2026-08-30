@@ -2,6 +2,7 @@
 //! [`HookOutcome`]; the dispatcher folds outcomes left-to-right in load order. For `[mutate]`,
 //! later handlers observe the folded value (chaining, R-08-011).
 
+use std::sync::Arc;
 use crate::event::HostEvent;
 use cyrup_agent::AgentMessage;
 use cyrup_core::{Content, Message};
@@ -55,7 +56,7 @@ pub enum EventPatch {
         usage: Option<cyrup_core::Usage>,
     },
     /// `context`: filter/replace the message list.
-    Context { messages: Vec<AgentMessage> },
+    Context { messages: Vec<Arc<AgentMessage>> },
     /// `message_end`: replace the message.
     Message(Box<Message>),
     /// `before_agent_start`: system-prompt replacement + optional injection.

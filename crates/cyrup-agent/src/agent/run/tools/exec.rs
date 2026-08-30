@@ -33,7 +33,7 @@ impl RunCtx {
     pub(super) async fn execute_parallel(
         &self,
         assistant: &AssistantMessage,
-        ctx_messages: &[AgentMessage],
+        ctx_messages: &[Arc<AgentMessage>],
         calls: &[ToolCall],
     ) -> Result<Batch, RunFailure> {
         let n = calls.len();
@@ -257,7 +257,7 @@ impl RunCtx {
     pub(super) async fn execute_sequential(
         &self,
         assistant: &AssistantMessage,
-        ctx_messages: &[AgentMessage],
+        ctx_messages: &[Arc<AgentMessage>],
         calls: &[ToolCall],
     ) -> Result<Batch, RunFailure> {
         let mut tool_results = Vec::new();
