@@ -257,6 +257,14 @@ struct Replacement {
 pub struct AppliedEdits {
     pub base_content: String,
     pub new_content: String,
+    /// Edit indices that were applied, ascending.
+    pub applied: Vec<usize>,
+    /// `(index, message)` for each edit that was NOT applied, ascending by index.
+    ///
+    /// **A non-empty `failed` means the write is partial** — every caller must inspect it. The
+    /// messages are the `err_*` strings verbatim, so a failing edit reads exactly as it does
+    /// today, near-miss region included.
+    pub failed: Vec<(usize, String)>,
 }
 
 /// `normalizeForFuzzyMatch` (edit-diff.ts:33-54): NFKC first (edit-diff.ts:36), then strip trailing
@@ -676,6 +684,27 @@ fn apply_replacements_preserving_unchanged_lines(
     Ok(result)
 }
 
+/// The failure messages of a batch, in edit order, as one block.
+///
+/// Identical messages collapse to one. Only the overlap message is shared by construction — it
+/// names both indices and is pushed once per member — so this is exactly the "print the overlap
+/// sentence once" rule and nothing else: every other `err_*` message embeds its own `edits[i]`,
+/// so two distinct failures can never collide.
+///
+/// A single failure joins to itself, byte for byte. Two assertions pin that:
+/// `a_far_miss_keeps_pis_bare_sentence` below and
+/// `literally_empty_old_text_still_takes_the_dedicated_error` in `pi_tool_semantics.rs`. Do not add a header,
+/// a bullet or a trailing newline here.
+pub(crate) fn join_failures(failed: &[(usize, String)]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for (_, m) in failed {
+        if !seen.contains(&m.as_str()) {
+            seen.push(m);
+        }
+    }
+    seen.join("\n\n")
+}
+
 fn err_empty(path: &str, i: usize, total: usize) -> EditError {
     EditError(if total == 1 {
         format!("oldText must not be empty in {path}.")
@@ -828,12 +857,16 @@ pub fn apply_edits_to_normalized_content(
         .map(|(o, n)| (normalize_to_lf(o), normalize_to_lf(n)))
         .collect();
 
-    for (i, (old, _)) in normalized_edits.iter().enumerate() {
-        if old.is_empty() {
-            return Err(err_empty(path, i, total));
-        }
-    }
-
+    // [CYRUP-DELTA] `used_fuzzy` is decided over ALL edits, before any failure is known, so an
+    // edit that matches fuzzily and is then dropped for duplicate-count or overlap still puts the
+    // batch in fuzzy space. Deliberate: recomputing it over the survivors needs a re-match whose
+    // termination is not obvious, and the only difference is trailing whitespace on the edited
+    // lines that landed. A not-found edit cannot cause it — that arm leaves `used_fuzzy` false,
+    // as do tier 1 and the line-anchored tier; only the tier-2 hit sets it.
+    //
+    // This now also sees empty needles, because the pre-loop that rejected them is gone. That is
+    // deliberate and inert: `str::find("")` is `Some(0)`, so an empty needle takes tier 1 and
+    // contributes `used_fuzzy: false` — the batch's fuzzy decision is unchanged.
     let used_fuzzy = normalized_edits
         .iter()
         .any(|(old, _)| fuzzy_find_text(normalized_content, old).used_fuzzy);
@@ -844,10 +877,19 @@ pub fn apply_edits_to_normalized_content(
     };
 
     let mut matched: Vec<Replacement> = Vec::new();
+    let mut failed: Vec<(usize, String)> = Vec::new();
     for (i, (old, new)) in normalized_edits.iter().enumerate() {
+        // [CYRUP-DELTA] Pi pre-checks every `oldText` and throws before matching anything
+        // (edit-diff.ts:310-314), discarding the whole call. Here an empty needle is one
+        // malformed edit among possibly-good ones, so it fails only itself.
+        if old.is_empty() {
+            failed.push((i, err_empty(path, i, total).0));
+            continue;
+        }
         let mr = fuzzy_find_text(&replacement_base, old);
         if !mr.found {
-            return Err(err_not_found(path, i, total, &replacement_base, old));
+            failed.push((i, err_not_found(path, i, total, &replacement_base, old).0));
+            continue;
         }
         // `count_occurrences` only sees normalized SUBSTRING occurrences, so it reports 0 for a
         // match that came from the line-anchored tier. Taking the count from the tier that
@@ -857,7 +899,8 @@ pub fn apply_edits_to_normalized_content(
             n => n,
         };
         if occ > 1 {
-            return Err(err_duplicate(path, i, total, occ));
+            failed.push((i, err_duplicate(path, i, total, occ).0));
+            continue;
         }
         matched.push(Replacement {
             edit_index: i,
@@ -867,19 +910,56 @@ pub fn apply_edits_to_normalized_content(
         });
     }
 
+    // [CYRUP-DELTA] An overlapping pair drops BOTH members. Each matched uniquely, so applying
+    // either would invent a winner the model never asked for and cannot predict. An edit that
+    // overlaps any other is dropped, so a chain of three drops entirely. Pi aborts the call.
+    //
+    // Comparing only ADJACENT pairs is sufficient. Sorted by `match_index`, suppose survivors
+    // `P < Q` overlap, i.e. `P.end > Q.start`. Let `R` be the element immediately after `P`;
+    // since `P.start <= R.start <= Q.start`, we get `P.end > Q.start >= R.start`, so the adjacent
+    // pair `(P, R)` overlaps and `P` was collided — contradicting `P` surviving. After `retain`,
+    // survivors are therefore pairwise disjoint, which is what makes the reverse-offset splice in
+    // `apply_replacements` sound over a subset of the batch.
     matched.sort_by_key(|m| m.match_index);
+    let mut collided: Vec<usize> = Vec::new();
     for pair in matched.windows(2) {
         if let [prev, cur] = pair
             && prev.match_index + prev.match_length > cur.match_index
         {
-            return Err(EditError(format!(
+            let msg = format!(
                 "edits[{}] and edits[{}] overlap in {path}. Merge them into one edit or target disjoint regions.",
                 prev.edit_index, cur.edit_index
-            )));
+            );
+            collided.push(prev.edit_index);
+            collided.push(cur.edit_index);
+            failed.push((prev.edit_index, msg.clone()));
+            failed.push((cur.edit_index, msg));
         }
+    }
+    matched.retain(|m| !collided.contains(&m.edit_index));
+    failed.sort_by_key(|(i, _)| *i);
+    // An edit that collides with BOTH neighbours is reported once, naming the first collision.
+    // `sort_by_key` is stable, so the surviving entry is the earlier push.
+    failed.dedup_by_key(|(i, _)| *i);
+
+    if matched.is_empty() {
+        // Nothing survived: write nothing and report every failure, exactly as an
+        // all-or-nothing call does today.
+        //
+        // `failed` is empty here only when `edits` itself was empty. `EditTool::execute` rejects
+        // that upstream (edit.rs:260-268) and the TUI preview never builds one, but this is a
+        // `pub` entry point and before partial application it fell through to the no-change arm —
+        // so keep that wording rather than handing a caller an empty message.
+        return Err(if failed.is_empty() {
+            err_no_change(path, total)
+        } else {
+            EditError(join_failures(&failed))
+        });
     }
 
     let base_content = normalized_content.to_string();
+    // The `?` is deliberate: the overlay's line-count invariant is a bug in the matcher, not a
+    // per-edit failure, and it writes nothing. Do not route it into `failed`.
     let new_content = if used_fuzzy {
         apply_replacements_preserving_unchanged_lines(
             normalized_content,
@@ -891,12 +971,21 @@ pub fn apply_edits_to_normalized_content(
     };
 
     if base_content == new_content {
-        return Err(err_no_change(path, total));
+        let mut msg = err_no_change(path, total).0;
+        if !failed.is_empty() {
+            msg.push_str("\n\n");
+            msg.push_str(&join_failures(&failed));
+        }
+        return Err(EditError(msg));
     }
 
+    let mut applied: Vec<usize> = matched.iter().map(|m| m.edit_index).collect();
+    applied.sort_unstable();
     Ok(AppliedEdits {
         base_content,
         new_content,
+        applied,
+        failed,
     })
 }
 
@@ -905,6 +994,11 @@ pub fn apply_edits_to_normalized_content(
 pub struct EditDiffPreview {
     pub diff: String,
     pub first_changed_line: Option<usize>,
+    /// One line per edit that will NOT apply — the first line of its failure message, which for
+    /// a not-found is pi's sentence without the near-miss region (`err_not_found` joins head to
+    /// region with a single `\n`, and every other `err_*` message is one line already). The
+    /// preview names the shortfall; the full region belongs in the tool result, not a diff header.
+    pub unapplied: Vec<String>,
 }
 
 /// `computeEditsDiff` (edit-diff.ts:514-547) — compute the diff one or more edits WOULD produce
@@ -948,9 +1042,18 @@ pub fn compute_edits_diff(
     let applied = apply_edits_to_normalized_content(&normalized, edits, path).map_err(|e| e.0)?;
     let (diff, first_changed_line) =
         generate_diff_string(&applied.base_content, &applied.new_content);
+    // A partial batch reaches here as `Ok` where it used to be `Err`, so the TUI renders the
+    // survivors' diff during the permission prompt for a call that will ultimately fail. That is
+    // the point: the user sees exactly what is about to be written, plus what will not land.
+    let unapplied = applied
+        .failed
+        .iter()
+        .map(|(_, m)| m.lines().next().unwrap_or_default().to_string())
+        .collect();
     Ok(EditDiffPreview {
         diff,
         first_changed_line,
+        unapplied,
     })
 }
 
@@ -1056,6 +1159,10 @@ mod tests {
         );
     }
 
+    /// [CYRUP-DELTA] This batch used to abort whole: `edits[1]` failing discarded `edits[0]`
+    /// even though it matched uniquely. It now applies what matched and reports the rest, so the
+    /// call returns `Ok` carrying a failure. The indexed wording it was written to pin is
+    /// unchanged — it just travels in `failed` instead of in an `Err`.
     #[test]
     fn not_found_error_is_indexed_for_multi() {
         let content = "one\ntwo\n";
@@ -1063,11 +1170,15 @@ mod tests {
             ("one".to_string(), "1".to_string()),
             ("zzz".to_string(), "9".to_string()),
         ];
-        let e = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap_err();
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        assert_eq!(r.applied, vec![0], "applied: {:?}", r.applied);
+        assert_eq!(r.new_content, "1\ntwo\n", "new_content: {}", r.new_content);
+        assert_eq!(r.failed.len(), 1, "failed: {:?}", r.failed);
+        assert_eq!(r.failed[0].0, 1, "failed: {:?}", r.failed);
         assert!(
-            e.0.contains("Could not find edits[1] in f.txt"),
+            r.failed[0].1.contains("Could not find edits[1] in f.txt"),
             "got: {}",
-            e.0
+            r.failed[0].1
         );
     }
 
@@ -1252,5 +1363,296 @@ mod tests {
             e.0,
             "Could not find the exact text in f.rs. The old text must match exactly including all whitespace and newlines."
         );
+    }
+    // ---------------------------------------------------------------------------------------
+    // [CYRUP-DELTA] Partial batch application. Pi discards every edit in a call when one fails
+    // (edit.ts:369-374); cyrup applies what matched uniquely and reports the rest. Aider does the
+    // same in both engines (editblock_coder.py:41-43, :120-122). These pin the new contract.
+    // ---------------------------------------------------------------------------------------
+
+    /// The headline case: one bad needle among five no longer discards the other four.
+    #[test]
+    fn one_unmatchable_edit_no_longer_discards_the_rest_of_the_batch() {
+        let content = "a\nb\nc\nd\ne\n";
+        let edits = vec![
+            ("a".to_string(), "A".to_string()),
+            ("b".to_string(), "B".to_string()),
+            ("c".to_string(), "C".to_string()),
+            ("d".to_string(), "D".to_string()),
+            ("zzz".to_string(), "Z".to_string()),
+        ];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        assert_eq!(r.new_content, "A\nB\nC\nD\ne\n", "got: {}", r.new_content);
+        assert_eq!(r.applied, vec![0, 1, 2, 3], "applied: {:?}", r.applied);
+        assert_eq!(r.failed.len(), 1, "failed: {:?}", r.failed);
+        assert_eq!(r.failed[0].0, 4, "failed: {:?}", r.failed);
+        assert!(
+            r.failed[0].1.contains("Could not find edits[4] in f.txt"),
+            "got: {}",
+            r.failed[0].1
+        );
+    }
+
+    /// EVERY failure is named, not just the first — otherwise a caller repairs one needle per
+    /// round trip instead of all of them at once.
+    #[test]
+    fn every_failing_edit_is_reported_ascending_by_index() {
+        let content = "one\ntwo\n";
+        let edits = vec![
+            ("one".to_string(), "1".to_string()),
+            ("xxx".to_string(), "X".to_string()),
+            ("yyy".to_string(), "Y".to_string()),
+        ];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        assert_eq!(r.applied, vec![0], "applied: {:?}", r.applied);
+        let indices: Vec<usize> = r.failed.iter().map(|(i, _)| *i).collect();
+        assert_eq!(indices, vec![1, 2], "failed: {:?}", r.failed);
+        assert!(
+            r.failed[0].1.contains("edits[1]") && r.failed[1].1.contains("edits[2]"),
+            "failed: {:?}",
+            r.failed
+        );
+    }
+
+    /// An overlapping pair drops BOTH members — each matched uniquely, so applying either would
+    /// invent a winner the caller never asked for — while the rest of the call still lands.
+    #[test]
+    fn an_overlapping_pair_drops_both_and_the_rest_of_the_batch_still_lands() {
+        let content = "abcdef\nzz\n";
+        let edits = vec![
+            ("abcd".to_string(), "X".to_string()),
+            ("cdef".to_string(), "Y".to_string()),
+            ("zz".to_string(), "Z".to_string()),
+        ];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        assert_eq!(r.new_content, "abcdef\nZ\n", "got: {}", r.new_content);
+        assert_eq!(r.applied, vec![2], "applied: {:?}", r.applied);
+        let indices: Vec<usize> = r.failed.iter().map(|(i, _)| *i).collect();
+        assert_eq!(indices, vec![0, 1], "failed: {:?}", r.failed);
+    }
+
+    /// An empty `oldText` fails only itself. The sibling here needs the FUZZY tier, which also
+    /// pins that the batch-level `used_fuzzy` decision still lands correctly now that its scan
+    /// sees empty needles: `str::find("")` is `Some(0)`, so an empty needle takes tier 1 and
+    /// contributes `used_fuzzy: false` rather than dragging the batch out of fuzzy space.
+    #[test]
+    fn an_empty_old_text_fails_only_itself_and_leaves_the_fuzzy_tier_intact() {
+        let content = "alpha   \nbeta\n";
+        let edits = vec![
+            (String::new(), "x".to_string()),
+            ("alpha\nbeta".to_string(), "gamma\ndelta".to_string()),
+        ];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        assert_eq!(r.new_content, "gamma\ndelta\n", "got: {}", r.new_content);
+        assert_eq!(r.applied, vec![1], "applied: {:?}", r.applied);
+        assert_eq!(r.failed.len(), 1, "failed: {:?}", r.failed);
+        assert_eq!(r.failed[0].0, 0, "failed: {:?}", r.failed);
+        assert!(
+            r.failed[0].1.contains("edits[0].oldText must not be empty"),
+            "got: {}",
+            r.failed[0].1
+        );
+    }
+
+    /// Nothing matched ⇒ nothing written, reading exactly as an all-or-nothing call does today.
+    #[test]
+    fn a_batch_in_which_every_edit_fails_writes_nothing_and_reports_all_of_them() {
+        let content = "one\ntwo\n";
+        let edits = vec![
+            ("xxx".to_string(), "X".to_string()),
+            ("yyy".to_string(), "Y".to_string()),
+        ];
+        let e = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap_err();
+        assert!(e.0.contains("Could not find edits[0]"), "got: {}", e.0);
+        assert!(e.0.contains("Could not find edits[1]"), "got: {}", e.0);
+    }
+
+    /// The ordinary path is untouched: a batch in which everything matches is byte-identical to
+    /// what it produced before partial application existed, and reports no failures.
+    #[test]
+    fn a_fully_successful_batch_is_unchanged_and_reports_no_failures() {
+        let content = "alpha\nbeta\ngamma\n";
+        let edits = vec![
+            ("alpha".to_string(), "A".to_string()),
+            ("gamma".to_string(), "G".to_string()),
+        ];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        assert_eq!(r.new_content, "A\nbeta\nG\n", "got: {}", r.new_content);
+        assert_eq!(r.applied, vec![0, 1], "applied: {:?}", r.applied);
+        assert!(r.failed.is_empty(), "failed: {:?}", r.failed);
+    }
+
+    /// A failure carries its FULL near-miss region even when it travels in `failed` rather than
+    /// in an `Err` — the report is not abbreviated because siblings succeeded.
+    #[test]
+    fn a_failing_edit_in_a_partial_batch_still_carries_its_near_miss_region() {
+        let content = "mod a {\n    fn foo() {\n        bar();\n    }\n}\n";
+        let edits = vec![
+            ("mod a {".to_string(), "mod z {".to_string()),
+            (
+                "    fn foo() {\n        quux();\n    }".to_string(),
+                "X".to_string(),
+            ),
+        ];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.rs").unwrap();
+        assert_eq!(r.applied, vec![0], "applied: {:?}", r.applied);
+        assert_eq!(r.failed.len(), 1, "failed: {:?}", r.failed);
+        let msg = &r.failed[0].1;
+        assert!(
+            msg.starts_with("Could not find edits[1] in f.rs."),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("Closest region in f.rs starts at line 1:"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("bar();"), "got: {msg}");
+    }
+
+    /// The preview names the shortfall in one line per edit that will not land, and does NOT
+    /// carry the near-miss region — that belongs in the tool result, not in a diff header.
+    #[test]
+    fn the_preview_names_the_shortfall_without_the_near_miss_region() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("f.rs"),
+            "mod a {\n    fn foo() {\n        bar();\n    }\n}\n",
+        )
+        .unwrap();
+        let edits = [
+            ("mod a {".to_string(), "mod z {".to_string()),
+            (
+                "    fn foo() {\n        quux();\n    }".to_string(),
+                "X".to_string(),
+            ),
+        ];
+        let preview = compute_edits_diff("f.rs", &edits, dir.path()).unwrap();
+        assert!(!preview.diff.is_empty(), "no diff for the surviving edit");
+        assert_eq!(
+            preview.unapplied,
+            vec![
+                "Could not find edits[1] in f.rs. The oldText must match exactly including all whitespace and newlines."
+                    .to_string()
+            ],
+            "unapplied: {:?}",
+            preview.unapplied
+        );
+        assert!(
+            !preview.unapplied.join("\n").contains("Closest region"),
+            "the preview must not carry the region: {:?}",
+            preview.unapplied
+        );
+    }
+
+    /// Overlap is detected by comparing ADJACENT pairs only, which is sound because a span that
+    /// reaches a later edit necessarily reaches its own successor first. Here `edits[0]` covers
+    /// both others; it collides with `edits[1]` and both drop, and `edits[2]` — never compared
+    /// against `edits[0]` at all — still lands, because the span that covered it is gone.
+    #[test]
+    fn a_span_covering_two_later_edits_leaves_a_disjoint_survivor() {
+        let content = "abcdefgh\n";
+        let edits = vec![
+            ("abcdefgh".to_string(), "X".to_string()),
+            ("bc".to_string(), "Y".to_string()),
+            ("fg".to_string(), "Z".to_string()),
+        ];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        assert_eq!(r.new_content, "abcdeZh\n", "got: {}", r.new_content);
+        assert_eq!(r.applied, vec![2], "applied: {:?}", r.applied);
+        let indices: Vec<usize> = r.failed.iter().map(|(i, _)| *i).collect();
+        assert_eq!(indices, vec![0, 1], "failed: {:?}", r.failed);
+    }
+
+    /// The overlap message names both indices and is recorded against each member, so joining it
+    /// naively prints the same sentence twice. `join_failures` collapses identical messages.
+    #[test]
+    fn an_overlapping_pairs_one_sentence_is_reported_once_not_per_member() {
+        let content = "abcdef\n";
+        let edits = vec![
+            ("abcd".to_string(), "X".to_string()),
+            ("cdef".to_string(), "Y".to_string()),
+        ];
+        let e = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap_err();
+        assert_eq!(
+            e.0.matches("overlap in f.txt").count(),
+            1,
+            "the overlap sentence is duplicated: {}",
+            e.0
+        );
+    }
+    /// [CYRUP-DELTA] An empty batch is rejected by `EditTool::execute` upstream, but this is a
+    /// `pub` entry point: before partial application it fell through to the no-change arm, and it
+    /// must not regress to an EMPTY error message now that `matched.is_empty()` returns first.
+    #[test]
+    fn an_empty_batch_keeps_the_no_change_wording_instead_of_an_empty_message() {
+        let e = apply_edits_to_normalized_content("x\n", &[], "f.txt").unwrap_err();
+        assert_eq!(
+            e.0,
+            "No changes made to f.txt. The replacements produced identical content."
+        );
+    }
+
+    /// The no-change arm composes TWO messages: pi's "no changes made" sentence and the failures
+    /// of the edits that never matched. Reaching it needs every SURVIVING edit to be a no-op and
+    /// at least one sibling to fail — the one composition in this change no other guard reaches.
+    /// Nothing is written: the core returns `Err`, so the survivors' no-op never lands either.
+    #[test]
+    fn a_no_change_batch_still_reports_the_edits_that_failed() {
+        let content = "same\nother\n";
+        let edits = vec![
+            ("same".to_string(), "same".to_string()),
+            ("zzz".to_string(), "9".to_string()),
+        ];
+        let e = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap_err();
+        // Both halves, in order, separated by a blank line — the composition IS the behaviour.
+        assert_eq!(
+            e.0,
+            "No changes made to f.txt. The replacements produced identical content.\n\n\
+             Could not find edits[1] in f.txt. The oldText must match exactly including all \
+             whitespace and newlines."
+        );
+    }
+
+    /// A chain of three: `edits[1]` collides with BOTH neighbours and so is pushed twice. It must
+    /// appear in `failed` ONCE, naming the first collision. `join_failures` would mask a duplicate
+    /// inside the message, so this asserts `failed` directly — and `compute_edits_diff` maps
+    /// `failed` into `unapplied`, where a duplicate becomes a repeated line in the preview.
+    #[test]
+    fn an_edit_colliding_with_both_neighbours_is_reported_once() {
+        let content = "abcdefgh\nzz\n";
+        let edits = vec![
+            ("abcd".to_string(), "W".to_string()),
+            ("cdef".to_string(), "X".to_string()),
+            ("efgh".to_string(), "Y".to_string()),
+            ("zz".to_string(), "Z".to_string()),
+        ];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        // The whole chain drops; the disjoint edit still lands.
+        assert_eq!(r.new_content, "abcdefgh\nZ\n", "got: {}", r.new_content);
+        assert_eq!(r.applied, vec![3], "applied: {:?}", r.applied);
+        let indices: Vec<usize> = r.failed.iter().map(|(i, _)| *i).collect();
+        assert_eq!(indices, vec![0, 1, 2], "each collider once: {:?}", r.failed);
+        // ...and edits[1]'s entry names the FIRST collision, not the second.
+        assert!(
+            r.failed[1].1.contains("edits[0] and edits[1] overlap"),
+            "got: {}",
+            r.failed[1].1
+        );
+    }
+    /// `applied` is documented ascending, but `matched` is sorted by MATCH POSITION, so
+    /// `sort_unstable` is the only thing making that true. These edits are listed in the opposite
+    /// order to their positions in the file — the one shape where the two orders differ. Every
+    /// other guard's survivors happen to coincide, so the sort is a no-op in all of them.
+    #[test]
+    fn applied_is_ascending_by_edit_index_not_by_match_position() {
+        let content = "beta\nalpha\n";
+        let edits = vec![
+            ("alpha".to_string(), "A".to_string()),
+            ("beta".to_string(), "B".to_string()),
+        ];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        assert_eq!(r.new_content, "B\nA\n", "got: {}", r.new_content);
+        // `matched` is [edits[1] @0, edits[0] @5]; `applied` must still read [0, 1].
+        assert_eq!(r.applied, vec![0, 1], "applied: {:?}", r.applied);
     }
 }

@@ -306,9 +306,9 @@ impl Tool for EditTool {
             .iter()
             .map(|e| (e.old_text.clone(), e.new_text.clone()))
             .collect();
-        let applied = edit_diff::apply_edits_to_normalized_content(&norm, &pairs, &input.path)
+        let outcome = edit_diff::apply_edits_to_normalized_content(&norm, &pairs, &input.path)
             .map_err(|e| error::invalid(e.0))?;
-        let new_body = applied.new_content;
+        let new_body = outcome.new_content;
 
         if cancel.is_cancelled() {
             return Err(error::aborted());
@@ -331,9 +331,22 @@ impl Tool for EditTool {
             return Err(error::aborted());
         }
 
+        // [CYRUP-DELTA] Pi throws on the first failing edit and writes nothing (edit.ts:369-374).
+        // Cyrup writes what matched and then reports failure, so one bad needle no longer discards
+        // the edits beside it. `Err` is deliberate: a partial batch did not satisfy the request,
+        // and a model that skims a success line must not come away believing every edit landed.
+        // Aider reports the same way and for the same reason (editblock_coder.py:120-122).
+        if !outcome.failed.is_empty() {
+            return Err(error::invalid(partial_batch_message(
+                &input.path,
+                &outcome.applied,
+                &outcome.failed,
+            )));
+        }
+
         let (diff, first_changed_line) =
-            edit_diff::generate_diff_string(&applied.base_content, &new_body);
-        let patch = edit_diff::unified_patch(&input.path, &applied.base_content, &new_body);
+            edit_diff::generate_diff_string(&outcome.base_content, &new_body);
+        let patch = edit_diff::unified_patch(&input.path, &outcome.base_content, &new_body);
 
         let count = input.edits.len();
         Ok(ToolResult {
@@ -353,6 +366,29 @@ impl Tool for EditTool {
     }
 }
 
+/// The tool-result text for a batch that applied some edits and not others: every failure, then
+/// the indices that landed so the model does not re-send them.
+///
+/// Takes the two fields rather than `&AppliedEdits` on purpose. `execute` moves `new_content` out
+/// of the struct one statement after the call, and Rust forbids borrowing a partially-moved value
+/// (`E0382`), so `&outcome` here does not compile. Borrowing the fields does — which is the same
+/// thing the `generate_diff_string` call below already relies on for `base_content`. Do not
+/// "simplify" this to take the struct, and do not clone `new_content` to work around it.
+fn partial_batch_message(path: &str, applied: &[usize], failed: &[(usize, String)]) -> String {
+    let failures = edit_diff::join_failures(failed);
+    let names: Vec<String> = applied.iter().map(|i| format!("edits[{i}]")).collect();
+    let listed = match names.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        // Unreachable by construction: `Ok` requires a non-empty `matched`. Defensive, not dead.
+        None => return failures,
+    };
+    format!(
+        "{failures}\n\n{listed} applied successfully and {path} was written. \
+         Do not re-send them — reply with corrected versions of the edits above."
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
@@ -360,7 +396,9 @@ mod tests {
     use crate::config::EditOpts;
     use crate::lock::FileMutationLocks;
     use crate::ops::local::LocalFs;
-    use cyrup_core::{CancelToken, Tool, ToolCallId, ToolUpdate, ToolUpdateSink};
+    use cyrup_core::{
+        CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink,
+    };
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -376,6 +414,15 @@ mod tests {
 
     fn noop_sink() -> ToolUpdateSink {
         Box::new(|_u: ToolUpdate| {})
+    }
+
+    /// Established shape (`pi_tool_semantics.rs:32-37`) — `clippy::panic` is not allowed in this
+    /// module, so read the text without one.
+    fn first_text(r: &ToolResult) -> String {
+        match r.content.first() {
+            Some(Content::Text { text, .. }) => text.to_string(),
+            _ => String::new(),
+        }
     }
 
     /// Byte-diff vs Pi `prepareEditArguments` (edit.ts:109-117): a legacy `{oldText,newText}` pair
@@ -712,6 +759,118 @@ mod tests {
         assert_eq!(
             tool.constrained_sampling(),
             cyrup_core::experimental_tool_sampling()
+        );
+    }
+    // ---------------------------------------------------------------------------------------
+    // [CYRUP-DELTA] Partial batch application, at the TOOL boundary. `edit_diff.rs` guards the
+    // core; these guard the contract a model actually reads — what reached disk, and what the
+    // error says about it. Pi discards the whole call on the first failing edit
+    // (edit.ts:369-374), so there is nothing to port and every assertion here is a delta.
+    // ---------------------------------------------------------------------------------------
+
+    /// All three halves of "writes the survivors and then reports failure", because each is a
+    /// separate way to be wrong: the call fails, the survivor reached DISK, and the message names
+    /// what landed so the model does not re-send it.
+    #[tokio::test]
+    async fn a_partial_batch_writes_the_survivors_and_names_them_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let edit = tool(dir.path().to_path_buf());
+
+        let err = edit
+            .execute(
+                ToolCallId::from("tc-partial"),
+                json!({ "path": "f.txt", "edits": [
+                    { "oldText": "one", "newText": "1" },
+                    { "oldText": "zzz", "newText": "9" },
+                ] }),
+                CancelToken::new(),
+                noop_sink(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "1\ntwo\nthree\n",
+            "the surviving edit must reach disk — that is the whole feature"
+        );
+        // Asserted WHOLE. This sentence is the deliverable; a `contains` on a fragment would pass
+        // through a mangled one, and the model's next move depends on reading it correctly.
+        assert_eq!(
+            err.to_string(),
+            "Could not find edits[1] in f.txt. The oldText must match exactly including all \
+             whitespace and newlines.\n\nedits[0] applied successfully and f.txt was written. \
+             Do not re-send them — reply with corrected versions of the edits above."
+        );
+    }
+
+    /// `split_last`'s multi-element arm. The guard above only ever reaches `Some((last, []))`, so
+    /// a broken list join — "edits[3] applied successfully", or a stray Oxford comma — survives it.
+    #[tokio::test]
+    async fn several_applied_indices_are_listed_in_the_partial_batch_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "a\nb\nc\nd\n").unwrap();
+        let edit = tool(dir.path().to_path_buf());
+
+        let err = edit
+            .execute(
+                ToolCallId::from("tc-list"),
+                json!({ "path": "f.txt", "edits": [
+                    { "oldText": "a", "newText": "A" },
+                    { "oldText": "b", "newText": "B" },
+                    { "oldText": "zzz", "newText": "Z" },
+                    { "oldText": "d", "newText": "D" },
+                ] }),
+                CancelToken::new(),
+                noop_sink(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "A\nB\nc\nD\n");
+        assert!(
+            err.to_string().contains(
+                "edits[0], edits[1] and edits[3] applied successfully and f.txt was written."
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// The success path is untouched: `partial_batch_message` must not appear when nothing failed,
+    /// and the count still names every edit in the call. The only existing coverage of this line
+    /// is a `contains("Successfully replaced")` on a SINGLE edit
+    /// (`cross_registry_mutation_lock.rs:264`), which cannot see a wrong count.
+    #[tokio::test]
+    async fn a_fully_successful_batch_still_reports_pis_success_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "a\nb\nc\nd\n").unwrap();
+        let edit = tool(dir.path().to_path_buf());
+
+        let out = edit
+            .execute(
+                ToolCallId::from("tc-ok"),
+                json!({ "path": "f.txt", "edits": [
+                    { "oldText": "a", "newText": "A" },
+                    { "oldText": "b", "newText": "B" },
+                ] }),
+                CancelToken::new(),
+                noop_sink(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "A\nB\nc\nd\n");
+        assert_eq!(
+            first_text(&out),
+            "Successfully replaced 2 block(s) in f.txt."
+        );
+        assert!(
+            out.details.is_some(),
+            "the success path still carries the diff/patch details"
         );
     }
 }
