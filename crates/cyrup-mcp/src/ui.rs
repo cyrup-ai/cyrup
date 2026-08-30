@@ -97,6 +97,19 @@ pub const REFRESH_MS: u64 = 250;
 pub const MIN_PANEL_WIDTH: usize = 24;
 /// `mcp-setup-panel.ts` `COMPACT_WIDTH` — an `inner_w` below this takes the compact branch.
 pub const COMPACT_WIDTH: usize = 60;
+/// The rows [`McpSetupPanelModel::render_bounded`] emits AFTER `render_actions` returns — the
+/// bottom border, and nothing else. The footer hint lives inside `render_actions` and is budgeted
+/// there as part of [`TRAILING_ROWS`].
+const SETUP_CHROME_ROWS: usize = 1;
+/// The rows `render_actions` appends below the action list regardless of windowing: a blank line,
+/// another blank line, and the footer hint. The preview sits between them and is variable, so it is
+/// measured rather than counted here.
+const TRAILING_ROWS: usize = 3;
+/// Room for both `… more above` / `… more below` markers. Reserved unconditionally — which of
+/// them renders depends on the window that depends on them.
+const MARKER_ROWS: usize = 2;
+/// Room for the one `Add a known server` heading the row loop can emit inside a window.
+const HEADING_ROWS: usize = 1;
 /// `mcp-setup-panel.ts` `COMPACT_ACTION_ROWS`.
 pub const COMPACT_ACTION_ROWS: usize = 7;
 /// `mcp-setup-panel.ts` `DESKTOP_PREVIEW_WIDTH`.
@@ -977,10 +990,10 @@ impl KeySpec {
 /// copy (`up` / `down` / `return`, which are also upstream's own no-manager fallbacks) and a
 /// cross-crate test is what keeps the two from drifting.
 ///
-/// # No production caller (MCP-394)
+/// # Read at every panel open
 ///
 /// Nothing outside this module's tests ever builds one. Both panels take their keys from whoever
-/// opens them, and the only opener is the `/mcp` dispatcher — `TODO(MCP-394)`, not ported; see the
+/// opens them, and the openers are `crate::commands`' `/mcp` and `/mcp setup` arms; see the
 /// note above [`open_mcp_panel`] and `crate::extension`'s `/mcp` arm, which keeps the command
 /// trait's default answer until it lands.
 #[derive(Clone, Debug)]
@@ -1083,7 +1096,8 @@ impl PanelKeys {
     /// "no manager" arm.
     ///
     /// **No production caller.** The agent dir is read for a panel that is about to open, and the
-    /// only thing that opens one is the `/mcp` dispatcher — `TODO(MCP-394)`, not ported — so today
+    /// only thing that opens one is a `/mcp` panel arm, which resolves them through
+    /// [`PanelKeys::from_agent_dir`] at every open, so
     /// only this module's tests reach it.
     #[must_use]
     pub fn from_agent_dir(agent_dir: &Path) -> Self {
@@ -1317,7 +1331,7 @@ impl McpPanelResult {
     /// A server absent from [`Self::changes`] stays absent here, which is what stops
     /// `writeDirectToolsConfig` from touching its config file at all.
     ///
-    /// **No production caller.** This is the write-back argument named by the `TODO(MCP-394)` above
+    /// Called by `/mcp`'s panel arm, which passes the result to
     /// [`open_mcp_panel`]: the `writeDirectToolsConfig` -> `onDirectToolsConfigChanged` chain that
     /// would consume it belongs to the unported `/mcp` dispatcher, not to the panel.
     #[must_use]
@@ -1400,11 +1414,11 @@ pub enum PanelInputOutcome {
     Run(PanelJob),
 }
 
-// TODO(MCP-392): `buildMcpPanelCallbacks`' eight-rung connection-status derivation — the per-open
+// `buildMcpPanelCallbacks`' eight-rung connection-status derivation — the per-open
 // `authStatusFailures` map, the `resolveServerUrl`-throws-gives-`failed` arm and the four-condition
-// OAuth guard — is the `/mcp` dispatcher's, not the panel's: it reads `McpState`'s connection map and
-// the credential store. This trait is the seam it plugs into, and nothing in this module derives a
-// status of its own.
+// OAuth guard — is NOT the panel's: it reads `McpState`'s connection map and the credential store,
+// so it lives in `crate::panel_host` (MCP-392). This trait is the seam it plugs into, and nothing in
+// this module derives a status of its own.
 
 /// The synchronous half of `McpPanelCallbacks` (`types.ts`) plus its two promise-returning members.
 ///
@@ -1414,9 +1428,8 @@ pub enum PanelInputOutcome {
 /// file every time; keep that — it is how the panel observes what `updateMetadataCache` just
 /// flushed.
 ///
-/// **No production implementor.** Building one is `buildMcpPanelCallbacks`' job (see the
-/// `TODO(MCP-392)` above), which is the `/mcp` dispatcher's — `TODO(MCP-394)`, not ported — so all
-/// three implementors in the tree are `#[cfg(test)]`.
+/// The production implementor is [`crate::panel_host::PanelCallbacks`], built once per panel open
+/// by `/mcp`'s and `/mcp-auth`'s arms. The three others in the tree are `#[cfg(test)]`.
 pub trait McpPanelCallbacks: Send + Sync + 'static {
     /// `getConnectionStatus(serverName)`. Never returns [`ConnectionStatus::Connecting`].
     fn connection_status(&self, server: &str) -> ConnectionStatus;
@@ -1970,7 +1983,7 @@ impl McpPanelModel {
     /// The flattened list the cursor indexes into.
     ///
     /// **No production caller:** the overlay in this module renders from the private field, and the
-    /// out-of-module reader would be the `/mcp` dispatcher — `TODO(MCP-394)`, not ported.
+    /// out-of-module reader is `/mcp`'s panel arm.
     #[must_use]
     pub fn visible_items(&self) -> &[VisibleItem] {
         &self.visible_items
@@ -1979,7 +1992,7 @@ impl McpPanelModel {
     /// The cursor's position in [`Self::visible_items`].
     ///
     /// **No production caller**, for the same reason as [`Self::visible_items`]: the reader is the
-    /// unported `/mcp` dispatcher (`TODO(MCP-394)`).
+    /// `/mcp` panel arm.
     #[must_use]
     pub fn cursor_index(&self) -> usize {
         self.cursor_index
@@ -1989,7 +2002,7 @@ impl McpPanelModel {
     ///
     /// **No production caller:** the "(unsaved)" hint in this module reads the private field, and
     /// the out-of-module reader — the `/mcp` dispatcher, deciding whether a close needs a
-    /// write-back — is `TODO(MCP-394)`, not ported.
+    /// write-back — is `/mcp`'s panel arm.
     #[must_use]
     pub fn is_dirty(&self) -> bool {
         self.dirty
@@ -2000,7 +2013,7 @@ impl McpPanelModel {
     ///
     /// **No production caller:** the overlay in this module does that truncation off the private
     /// field, so the accessor's only reader is out-of-module — the `/mcp` dispatcher, which is
-    /// `TODO(MCP-394)` and not ported.
+    /// `/mcp`'s panel arm.
     #[must_use]
     pub fn auth_notice(&self) -> Option<&str> {
         self.auth_notice.as_deref()
@@ -2009,7 +2022,7 @@ impl McpPanelModel {
     /// The "will copy to user config on save" notice, un-truncated.
     ///
     /// **No production caller**, for the same reason as [`Self::auth_notice`]: the out-of-module
-    /// reader is the unported `/mcp` dispatcher (`TODO(MCP-394)`).
+    /// reader is `/mcp`'s panel arm.
     #[must_use]
     pub fn import_notice(&self) -> Option<&str> {
         self.import_notice.as_deref()
@@ -3296,13 +3309,13 @@ impl InteractiveOverlay for McpPanelOverlay {
 
     fn tick(&mut self) -> bool {
         let changed = self.drain_job();
-        // TODO(MCP-362): the one place the seam is genuinely short: `tick` returns `bool`, so an
-        // overlay cannot ask the host to close itself. Upstream's `setTimeout` fires at exactly
-        // 60 s and calls `done({cancelled: true, changes: {}})` with the panel still on screen. The
-        // best available approximation is to publish the cancelled result at the deadline and close
-        // on the next keystroke; the residue is that an untouched panel stays painted. Closing it
-        // needs `tick` to be able to return an `OverlayOutcome` (or a `should_close` companion) —
-        // recorded as a host addition, not absorbed.
+        // MCP-362 — upstream's `setTimeout(() => done({cancelled: true, changes: {}}), 60_000)`.
+        // The cancelled result is published here and `should_close` tears the panel down on the
+        // same tick, so an untouched panel no longer stays painted until the next keystroke.
+        //
+        // Resolved-cadence residue, kept: a POLLED deadline fires within one `REFRESH_MS`, so the
+        // panel can live up to 250 ms longer than upstream's timer — and at `refresh_ms() == 0`
+        // there is no tick at all, so it would never auto-cancel.
         if !self.expired && Instant::now() >= self.deadline {
             self.expired = true;
             self.model.expire();
@@ -3310,6 +3323,26 @@ impl InteractiveOverlay for McpPanelOverlay {
             return true;
         }
         changed
+    }
+
+    /// MCP-362 — the deadline [`Self::tick`] set. The host drops the overlay on the tick that sees
+    /// this, which is what makes the auto-cancel close the panel rather than only mark it.
+    ///
+    /// `expired` is one-way, so a keystroke racing the tick cannot resurrect the panel; the
+    /// `if self.expired` early-close in `handle_key` stays for exactly that race.
+    /// MCP-368 — `mcp-panel.ts`'s `width: 82`, a FIXED column count rather than the adapter's 95%% default.
+    ///
+    /// The height half stays default: `OverlayOptions::max_rows` is what MCP-377's body windowing
+    /// reads, so the two cannot disagree about the row budget.
+    fn options(&self) -> cyrup_ext::host::OverlayOptions {
+        cyrup_ext::host::OverlayOptions {
+            width: Some(82),
+            ..cyrup_ext::host::OverlayOptions::default()
+        }
+    }
+
+    fn should_close(&self) -> bool {
+        self.expired
     }
 }
 
@@ -3385,7 +3418,7 @@ pub enum NoticeTone {
 /// `ensureCompatibilityImports`' result, as the panel reads it.
 ///
 /// **Never produced in production:** its only producer is a [`SetupPanelCallbacks`] implementor, and
-/// the `/mcp setup` dispatcher that would supply one is `TODO(MCP-394)` — not ported.
+/// the only producer is [`crate::panel_host::SetupCallbacks`], which `/mcp setup` builds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdoptImportsOutcome {
     /// What was actually added; **empty means nothing was written**.
@@ -3398,9 +3431,8 @@ pub struct AdoptImportsOutcome {
 /// key written into the file is its `id` — adding "Chrome DevTools" writes `"chrome-devtools"` and
 /// notices `Added Chrome DevTools to ...` (MCP-379).
 ///
-/// **Never produced in production**, for the same reason as [`AdoptImportsOutcome`]: the only
-/// producer is a [`SetupPanelCallbacks`] implementor, and `/mcp setup`'s dispatcher is the unported
-/// `TODO(MCP-394)`.
+/// Produced by [`crate::panel_host::SetupCallbacks`], the same implementor that produces
+/// [`AdoptImportsOutcome`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddServerOutcome {
     /// The file written.
@@ -3418,8 +3450,8 @@ pub struct AddServerOutcome {
 /// keystroke. That amplification is the poll-repaint residue, filed rather than cached away
 /// (MCP-375).
 ///
-/// **No production implementor.** `/mcp setup`'s dispatcher is what builds one, and it is
-/// `TODO(MCP-394)` — not ported — so the single implementor in the tree is `#[cfg(test)]`.
+/// The production implementor is [`crate::panel_host::SetupCallbacks`], built by `/mcp setup`. The
+/// other one in the tree is `#[cfg(test)]`.
 pub trait SetupPanelCallbacks: Send + Sync + 'static {
     /// `previewImports(imports)`.
     fn preview_imports(&self, imports: &[ImportKind]) -> ConfigWritePreview;
@@ -3677,7 +3709,7 @@ impl McpSetupPanelModel {
     /// The current screen.
     ///
     /// **No production caller:** the overlay in this module renders from the private field; this
-    /// accessor is for the `/mcp setup` dispatcher, which is `TODO(MCP-394)` and not ported.
+    /// accessor is for `/mcp setup`'s arm.
     #[must_use]
     pub fn screen(&self) -> SetupScreen {
         self.screen
@@ -3686,7 +3718,7 @@ impl McpSetupPanelModel {
     /// Whether an async write is in flight.
     ///
     /// **No production caller**, for the same reason as [`Self::screen`]: the reader is the unported
-    /// `/mcp setup` dispatcher (`TODO(MCP-394)`).
+    /// `/mcp setup` arm.
     #[must_use]
     pub fn is_busy(&self) -> bool {
         self.busy
@@ -3701,7 +3733,7 @@ impl McpSetupPanelModel {
     /// Whether `done()` has been called.
     ///
     /// **No production caller:** the overlay in this module tears down off the private flag; the
-    /// out-of-module reader — the `/mcp setup` dispatcher — is `TODO(MCP-394)`, not ported.
+    /// out-of-module reader is `/mcp setup`'s arm.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed
@@ -4005,8 +4037,23 @@ impl McpSetupPanelModel {
 
     /// `render(width)` (13h §3.6). The corners are **uncoloured** here, unlike `mcp-panel.ts`,
     /// where the whole border string is wrapped in the border colour.
+    ///
+    /// Unbounded: `render_bounded(width, usize::MAX)`, which is exactly the behaviour every existing
+    /// caller — including this module's thirteen tests — already depends on.
     #[must_use]
     pub fn render(&self, width: usize) -> Vec<OverlayLine> {
+        self.render_bounded(width, usize::MAX)
+    }
+
+    /// [`Self::render`] with a row budget (MCP-377).
+    ///
+    /// The budget comes from [`cyrup_ext::host::OverlayOptions::max_rows`] — the same function the
+    /// adapter's `box_rect` uses for the box height — so the component and the host cannot disagree
+    /// about how many rows there are. Without it a long action list is painted past the bottom of
+    /// the box and silently clipped by the adapter's `.take(rect.height)`, with no `… more below`
+    /// to tell the user there is more.
+    #[must_use]
+    pub fn render_bounded(&self, width: usize, max_rows: usize) -> Vec<OverlayLine> {
         let panel_w = width.max(MIN_PANEL_WIDTH);
         let inner_w = panel_w.saturating_sub(2);
         let content_w = Self::content_width(inner_w);
@@ -4048,10 +4095,22 @@ impl McpSetupPanelModel {
 
         lines.push(border("\u{251c}", "\u{2524}"));
 
+        // Whatever the frame has left after this panel's own chrome — the bottom border plus
+        // everything already pushed above. Saturating, so a frame smaller than the chrome yields a
+        // one-row window rather than underflowing.
+        //
+        // Computed for EVERY screen, not just the action ones. `Imports` and `Paths` render one row
+        // per entry and used to receive no budget at all, so `render_bounded(w, 1)` returned the
+        // whole screen — 23 rows for a six-rung ladder — and the adapter clipped the excess with
+        // `.take(rect.height)`. That is the same silent truncation MCP-377 removed from the action
+        // list, on the two screens the sweep did not cover.
+        let body_rows = max_rows.saturating_sub(lines.len()).saturating_sub(SETUP_CHROME_ROWS);
         match self.screen {
-            SetupScreen::Imports => lines.extend(self.render_imports(inner_w)),
-            SetupScreen::Paths => lines.extend(self.render_paths(inner_w)),
-            SetupScreen::Empty | SetupScreen::Setup => lines.extend(self.render_actions(inner_w)),
+            SetupScreen::Imports => lines.extend(self.render_imports(inner_w, body_rows)),
+            SetupScreen::Paths => lines.extend(self.render_paths(inner_w, body_rows)),
+            SetupScreen::Empty | SetupScreen::Setup => {
+                lines.extend(self.render_actions(inner_w, body_rows));
+            }
         }
 
         lines.push(border("\u{2514}", "\u{2518}"));
@@ -4063,15 +4122,32 @@ impl McpSetupPanelModel {
     /// The compact branch **is** reachable: `ExtensionOverlay`'s `OVERLAY_MIN_WIDTH = 60` means
     /// `inner_w` bottoms out at 58, so any terminal narrower than about 63 columns takes it.
     fn visible_action_range(&self, total: usize) -> (usize, usize) {
-        if total <= COMPACT_ACTION_ROWS {
+        self.visible_action_range_within(total, COMPACT_ACTION_ROWS)
+    }
+
+    /// The cursor-tracking window every list screen shares (MCP-377).
+    ///
+    /// Extracted from [`Self::visible_action_range_within`] when the `Imports` and `Paths` screens
+    /// gained a budget: three lists, one windowing rule. A budget of `0` would window to nothing,
+    /// so it is floored at one row — an unusable panel is worse than a cramped one.
+    fn window_within(cursor: usize, total: usize, rows: usize) -> (usize, usize) {
+        let rows = rows.max(1);
+        if total <= rows {
             return (0, total);
         }
-        let half = COMPACT_ACTION_ROWS / 2;
-        let start = self
-            .action_cursor
-            .saturating_sub(half)
-            .min(total.saturating_sub(COMPACT_ACTION_ROWS));
-        (start, total.min(start + COMPACT_ACTION_ROWS))
+        let half = rows / 2;
+        let start = cursor.saturating_sub(half).min(total.saturating_sub(rows));
+        (start, total.min(start + rows))
+    }
+
+    /// [`Self::visible_action_range`] with an explicit row budget (MCP-377).
+    ///
+    /// The compact branch's budget is `COMPACT_ACTION_ROWS`; MCP-377 derives one from the frame so
+    /// the list windows at **every** width rather than only below `COMPACT_WIDTH`. A budget of `0`
+    /// would window to nothing, so it is floored at one row — an unusable panel is worse than a
+    /// cramped one.
+    fn visible_action_range_within(&self, total: usize, rows: usize) -> (usize, usize) {
+        Self::window_within(self.action_cursor, total, rows)
     }
 
     /// `renderActions(innerW)`.
@@ -4086,13 +4162,42 @@ impl McpSetupPanelModel {
     // height `render` is handed, which changes what the user sees and therefore wants the live
     // terminal pass first. The width half (upstream's fixed 82/92 columns) is HA-3 and is the
     // host's: `open_overlay` takes no options bag.
-    fn render_actions(&self, inner_w: usize) -> Vec<OverlayLine> {
+    fn render_actions(&self, inner_w: usize, action_rows: usize) -> Vec<OverlayLine> {
         let t = self.theme;
         let mut lines: Vec<OverlayLine> = Vec::new();
         let actions = self.actions();
         let compact = inner_w < COMPACT_WIDTH;
-        let (start, end) =
-            if compact { self.visible_action_range(actions.len()) } else { (0, actions.len()) };
+
+        // MCP-377 — the budget is for EVERYTHING this function returns, not for the action rows
+        // alone. Below the rows it appends a blank, the preview, another blank and the footer hint,
+        // and either side of them up to two `… more` markers; the loop can also emit one
+        // `Add a known server` heading. Windowing against `action_rows` without subtracting those
+        // made the returned vec overrun `max_rows`, and the adapter then clipped the excess with
+        // `.take(rect.height)` — the silent truncation this unit exists to remove.
+        //
+        // The preview is computed ONCE, here, because it is the only variable term and the window
+        // cannot be chosen without its height. Both markers are reserved unconditionally: reserving
+        // only the ones that will render would need the window that depends on them, and the cost
+        // of guessing high is one blank row.
+        let preview =
+            self.action_preview(self.selected_action().as_ref(), Self::preview_width(inner_w));
+        let budget = action_rows
+            .saturating_sub(preview.len())
+            .saturating_sub(TRAILING_ROWS)
+            .saturating_sub(MARKER_ROWS)
+            .saturating_sub(HEADING_ROWS);
+
+        // The narrow branch keeps its own fixed budget; a caller that passed a frame-derived one
+        // windows at every width. `usize::MAX` is `render`'s "unbounded", which saturates to a
+        // budget far above `actions.len()` and so takes the whole list — exactly today's
+        // behaviour for a wide panel.
+        let (start, end) = if compact {
+            self.visible_action_range(actions.len())
+        } else if budget < actions.len() {
+            self.visible_action_range_within(actions.len(), budget)
+        } else {
+            (0, actions.len())
+        };
 
         if start > 0 {
             lines.push(self.pad_text(inner_w, t.muted, format!("\u{2026} {start} more above")));
@@ -4133,9 +4238,9 @@ impl McpSetupPanelModel {
         }
         lines.push(self.pad_text(inner_w, Style::plain(), ""));
 
-        for line in
-            self.action_preview(self.selected_action().as_ref(), Self::preview_width(inner_w))
-        {
+        // The same `preview` the budget above was computed from — recomputing it here could
+        // yield a different height and reopen the overrun.
+        for line in preview {
             lines.push(self.pad_text(inner_w, Style::plain(), line));
         }
         lines.push(self.pad_text(inner_w, Style::plain(), ""));
@@ -4153,7 +4258,7 @@ impl McpSetupPanelModel {
 
     /// `renderImports(innerW)` — the write preview is recomputed from the *currently selected* set
     /// on every frame.
-    fn render_imports(&self, inner_w: usize) -> Vec<OverlayLine> {
+    fn render_imports(&self, inner_w: usize, body_rows: usize) -> Vec<OverlayLine> {
         let t = self.theme;
         let mut lines = vec![
             self.pad_text(
@@ -4163,7 +4268,38 @@ impl McpSetupPanelModel {
             ),
             self.pad_text(inner_w, Style::plain(), ""),
         ];
-        for (index, entry) in self.discovery.imports.iter().enumerate() {
+
+        // The selection and its preview are resolved BEFORE the window, for the same reason
+        // `render_actions` resolves its preview first: the preview is the only variable term and
+        // the window cannot be chosen without its height.
+        let selected: Vec<ImportKind> = self
+            .discovery
+            .imports
+            .iter()
+            .filter(|entry| self.selected_imports.contains(&entry.kind))
+            .map(|entry| entry.kind)
+            .collect();
+        let preview = Self::format_write_preview(
+            "Compatibility import write preview",
+            &self.callbacks.preview_imports(&selected),
+            &[],
+            Self::preview_width(inner_w),
+        );
+        // Everything this function emits that is not an import row: the two intro rows already
+        // pushed, the blank before the preview, the preview itself, and both `\u{2026} more` markers.
+        let budget = body_rows
+            .saturating_sub(lines.len())
+            .saturating_sub(1)
+            .saturating_sub(preview.len())
+            .saturating_sub(MARKER_ROWS);
+        let total = self.discovery.imports.len();
+        let (start, end) = Self::window_within(self.import_cursor, total, budget);
+
+        if start > 0 {
+            lines.push(self.pad_text(inner_w, t.muted, format!("\u{2026} {start} more above")));
+        }
+        for index in start..end {
+            let Some(entry) = self.discovery.imports.get(index) else { continue };
             let mut row = StyledText::new();
             if index == self.import_cursor {
                 row.push(t.selected, "\u{203a}");
@@ -4178,28 +4314,24 @@ impl McpSetupPanelModel {
             ));
             lines.push(self.pad_line(inner_w, &row));
         }
+        if end < total {
+            lines.push(self.pad_text(
+                inner_w,
+                t.muted,
+                format!("\u{2026} {} more below", total - end),
+            ));
+        }
         lines.push(self.pad_text(inner_w, Style::plain(), ""));
-        let selected: Vec<ImportKind> = self
-            .discovery
-            .imports
-            .iter()
-            .filter(|entry| self.selected_imports.contains(&entry.kind))
-            .map(|entry| entry.kind)
-            .collect();
-        let preview = self.callbacks.preview_imports(&selected);
-        for line in Self::format_write_preview(
-            "Compatibility import write preview",
-            &preview,
-            &[],
-            Self::preview_width(inner_w),
-        ) {
+        // The same `preview` the budget was computed from — recomputing it here could yield a
+        // different height and reopen the overrun.
+        for line in preview {
             lines.push(self.pad_text(inner_w, Style::plain(), line));
         }
         lines
     }
 
     /// `renderPaths(innerW)` — **no preview block on this screen**.
-    fn render_paths(&self, inner_w: usize) -> Vec<OverlayLine> {
+    fn render_paths(&self, inner_w: usize, body_rows: usize) -> Vec<OverlayLine> {
         let t = self.theme;
         let mut lines = vec![
             self.pad_text(
@@ -4209,7 +4341,17 @@ impl McpSetupPanelModel {
             ),
             self.pad_text(inner_w, Style::plain(), ""),
         ];
-        for (index, path) in self.detected_paths().iter().enumerate() {
+        let paths = self.detected_paths();
+        // No preview block on this screen, so the only non-row cost is the two intro rows above
+        // and both markers.
+        let budget = body_rows.saturating_sub(lines.len()).saturating_sub(MARKER_ROWS);
+        let (start, end) = Self::window_within(self.path_cursor, paths.len(), budget);
+
+        if start > 0 {
+            lines.push(self.pad_text(inner_w, t.muted, format!("\u{2026} {start} more above")));
+        }
+        for index in start..end {
+            let Some(path) = paths.get(index) else { continue };
             let mut row = StyledText::new();
             if index == self.path_cursor {
                 row.push(t.selected, "\u{203a}");
@@ -4218,6 +4360,13 @@ impl McpSetupPanelModel {
             }
             row.raw(format!(" {}", path.display()));
             lines.push(self.pad_line(inner_w, &row));
+        }
+        if end < paths.len() {
+            lines.push(self.pad_text(
+                inner_w,
+                t.muted,
+                format!("\u{2026} {} more below", paths.len() - end),
+            ));
         }
         lines
     }
@@ -4623,8 +4772,14 @@ impl McpSetupOverlay {
 }
 
 impl InteractiveOverlay for McpSetupOverlay {
-    fn render(&mut self, width: usize, _height: usize) -> Vec<OverlayLine> {
-        self.model.render(width)
+    /// MCP-377 — the row budget comes from this overlay's OWN [`Self::options`], resolved against
+    /// the frame height the host hands in. That is the same `max_rows` the adapter's `box_rect`
+    /// uses for the box, so the list windows to exactly the rows that will be painted instead of
+    /// overflowing and being silently clipped.
+    fn render(&mut self, width: usize, height: usize) -> Vec<OverlayLine> {
+        let rows = cyrup_ext::host::InteractiveOverlay::options(self)
+            .max_rows(u16::try_from(height).unwrap_or(u16::MAX));
+        self.model.render_bounded(width, rows as usize)
     }
 
     fn handle_key(&mut self, key: OverlayKey) -> OverlayOutcome {
@@ -4649,14 +4804,34 @@ impl InteractiveOverlay for McpSetupOverlay {
 
     fn tick(&mut self) -> bool {
         let changed = self.drain_job();
-        // TODO(MCP-362): see [`McpPanelOverlay::tick`] — the deadline cannot close the overlay by
-        // itself, so it is honoured on the next keystroke instead.
+        // MCP-362 — see [`McpPanelOverlay::tick`]: the deadline closes the overlay through
+        // `should_close` on this same tick.
         if !self.expired && Instant::now() >= self.deadline {
             self.expired = true;
             self.model.expire();
             return true;
         }
         changed
+    }
+
+    /// MCP-362 — the deadline [`Self::tick`] set. The host drops the overlay on the tick that sees
+    /// this, which is what makes the auto-cancel close the panel rather than only mark it.
+    ///
+    /// `expired` is one-way, so a keystroke racing the tick cannot resurrect the panel; the
+    /// `if self.expired` early-close in `handle_key` stays for exactly that race.
+    /// MCP-368 — `mcp-setup-panel.ts`'s `width: 92`, a FIXED column count rather than the adapter's 95%% default.
+    ///
+    /// The height half stays default: `OverlayOptions::max_rows` is what MCP-377's body windowing
+    /// reads, so the two cannot disagree about the row budget.
+    fn options(&self) -> cyrup_ext::host::OverlayOptions {
+        cyrup_ext::host::OverlayOptions {
+            width: Some(92),
+            ..cyrup_ext::host::OverlayOptions::default()
+        }
+    }
+
+    fn should_close(&self) -> bool {
+        self.expired
     }
 }
 
@@ -4753,7 +4928,7 @@ pub fn footer_status_text(config: &McpConfig, counts: FooterCounts) -> Option<St
 ///
 /// **No production caller.** Both halves of the one-shot belong to the `/mcp` dispatcher: it renders
 /// the lines and, once the panel has actually opened, stamps the returned fingerprint with
-/// [`crate::onboarding::mark_shared_config_hint_shown`]. That dispatcher is `TODO(MCP-394)` and not
+/// [`crate::onboarding::mark_shared_config_hint_shown`]. That dispatcher now exists and does
 /// ported, so nothing consumes either half yet.
 #[must_use]
 pub fn shared_config_notice_lines(
@@ -4807,17 +4982,16 @@ pub fn shared_config_notice_lines(
 // own spelling of upstream's predicate — `hasUI && mode === "tui"`, which `commands.ts` duplicated
 // from `init.ts`'s `isTuiMode` — is [`crate::runtime::ContextSnapshot::is_tui_mode`].
 //
-// What the `/mcp` dispatcher still owes (MCP-394) is the *fallback output* v2.26.1 chose per
-// command, one arm per guard: `/mcp` and `/mcp status` re-render `showStatus()` as text
+// The *fallback output* v2.26.1 chose per command is the dispatcher's, one arm per guard, and
+// `crate::commands` implements all three: `/mcp` and `/mcp status` re-render `showStatus()` as text
 // (`commands.ts:553-557`), while `/mcp setup` (`:415-418`) and `/mcp-auth`'s picker (`:612-615`)
 // notify at `info` with [`panel_unavailable_message`] / [`auth_panel_unavailable_message`].
 
 /// `openMcpAuthPanel`'s `noticeLines` (MCP-391), rendered under the search row.
 ///
-/// **No production reader.** The `/mcp-auth` picker it decorates is the overlay one, opened by the
-/// `/mcp` dispatcher — `TODO(MCP-394)`, not ported. `crate::extension`'s live `/mcp-auth` arm runs a
-/// `select` dialog instead and deliberately uses its own prompt (`AUTH_PICKER_PROMPT` there), which
-/// is why this constant is not simply shared.
+/// Read by `crate::extension`'s bare `/mcp-auth` arm, which opens this panel with `auth_only` set
+/// (MCP-391). It names the panel's own keybindings, so it is meaningful only for the overlay — the
+/// `select` dialog this arm used before the swap could not honour "press Enter or ctrl+a".
 pub const AUTH_PANEL_NOTICE: &str =
     "Select an OAuth MCP server and press Enter or ctrl+a to authenticate.";
 
@@ -4827,10 +5001,9 @@ pub const AUTH_PANEL_NOTICE: &str =
 /// `commands.ts:415-418` @v2.26.1 (upstream `5787ecd`); see the section note above for why the
 /// guard that emits it is a host capability probe here rather than a mode string comparison.
 ///
-/// **No production caller — and the contrast with its twin is the point.**
-/// [`auth_panel_unavailable_message`] below **is** wired: `crate::extension`'s `/mcp-auth` arm emits
-/// it whenever no terminal overlay is available. This one is `/mcp setup`'s refusal, and `/mcp
-/// setup` is dispatched by the arm that is still `TODO(MCP-394)`, so nothing emits it yet.
+/// Emitted by `crate::commands`' `/mcp setup` arm whenever no terminal overlay is available — both
+/// for a non-TUI mode and for a host that declines the overlay. Its twin
+/// [`auth_panel_unavailable_message`] is the same guard on the `/mcp-auth` side.
 #[must_use]
 pub fn panel_unavailable_message(mode: &str) -> String {
     format!(
@@ -4853,12 +5026,12 @@ pub fn auth_panel_unavailable_message(mode: &str) -> String {
     )
 }
 
-// TODO(MCP-394): the rest of `openMcpPanel`'s orchestration belongs to the `/mcp` dispatcher, not
-// here — the flag/override config-path resolution, the zero-servers-delegates-to-setup path, and the
+// The rest of `openMcpPanel`'s orchestration belongs to the `/mcp` dispatcher, not here — the
+// flag/override config-path resolution, the zero-servers-delegates-to-setup path, and the
 // `writeDirectToolsConfig` -> `onDirectToolsConfigChanged` -> notify chain whose **error** arm sets
-// `configChanged`. This function owns only the half that is genuinely the panel's: getting the
-// result back out of a `bool`-returning `open_overlay`. Use [`McpPanelResult::to_config_changes`]
-// for the write-back argument.
+// `configChanged`. All of it lives in `crate::commands`' `arm_browser_panel`. This function owns
+// only the half that is genuinely the panel's: getting the result back out of a `bool`-returning
+// `open_overlay`. The write-back argument is [`McpPanelResult::to_config_changes`].
 
 /// Open the `/mcp` browser panel (or, with `auth_only`, the `/mcp-auth` picker) and block the
 /// calling extension task until it closes.
@@ -4872,9 +5045,8 @@ pub fn auth_panel_unavailable_message(mode: &str) -> String {
 /// `None` is pi's `if (!ctx.hasUI)` branch — no renderer is attached, so the caller falls back to
 /// `showStatus`. It is **not** an error.
 ///
-/// **No production caller.** The `TODO(MCP-394)` directly above owns it: `crate::extension`'s `/mcp`
-/// arm keeps the command trait's default answer until that dispatcher is ported, and when it lands
-/// the arm becomes a call to this function.
+/// Called by `crate::commands`' `/mcp` arm and, with `auth_only`, by `crate::extension`'s bare
+/// `/mcp-auth` arm.
 #[must_use]
 pub fn open_mcp_panel(
     services: &dyn cyrup_ext::host::HostServices,
@@ -4897,8 +5069,7 @@ pub fn open_mcp_panel(
 /// setup panel's own `done()` carries no value — whether anything was written is tracked by the
 /// caller's [`SetupPanelCallbacks`] implementation, which is where `configChanged` lives upstream.
 ///
-/// **No production caller**, for the same reason as [`open_mcp_panel`]: `/mcp setup` is dispatched by
-/// the unported `TODO(MCP-394)` arm.
+/// Called by `crate::commands`' `/mcp setup` arm, and by `/mcp`'s own zero-servers delegation.
 #[must_use]
 pub fn open_mcp_setup_panel(
     services: &dyn cyrup_ext::host::HostServices,
@@ -5823,6 +5994,207 @@ mod tests {
             screen,
             PanelKeys::default(),
         )
+    }
+
+    /// A discovery the size a real machine produces: the full six-rung ladder, all of it present on
+    /// disk, plus every host config `ImportKind` knows about.
+    ///
+    /// The `empty_discovery` fixture renders the `Imports` and `Paths` screens as pure chrome, so it
+    /// cannot see a list that is not windowed. This one can — `detected_paths` is one row per
+    /// existing source plus one per import.
+    fn populated_discovery() -> McpDiscoverySummary {
+        use crate::config::{
+            ConfigDiscoverySource, DiscoveryKind, ImportConfigSummary, SourceId, SourceScope,
+        };
+        const IDS: [SourceId; 6] = [
+            SourceId::SharedGlobal,
+            SourceId::AgentsGlobal,
+            SourceId::AgentsNestedGlobal,
+            SourceId::PiGlobal,
+            SourceId::SharedProject,
+            SourceId::PiProject,
+        ];
+        let mut discovery = empty_discovery();
+        discovery.sources = IDS
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| ConfigDiscoverySource {
+                id,
+                label: "rung",
+                path: PathBuf::from(format!("/home/someone/config/rung-{index}/mcp.json")),
+                exists: true,
+                scope: SourceScope::Global,
+                kind: DiscoveryKind::Shared,
+                server_count: 1,
+                contributes: true,
+            })
+            .collect();
+        discovery.imports = ImportKind::ALL
+            .into_iter()
+            .map(|kind| ImportConfigSummary {
+                kind,
+                path: PathBuf::from(format!("/home/someone/.{kind}/mcp.json")),
+                server_count: 1,
+            })
+            .collect();
+        discovery.has_any_config = true;
+        discovery.has_any_detected_paths = true;
+        discovery.total_server_count = 6;
+        discovery
+    }
+
+    fn populated_setup_model(screen: SetupScreen) -> McpSetupPanelModel {
+        McpSetupPanelModel::new(
+            populated_discovery(),
+            OnboardingState::default(),
+            Arc::new(StubSetup),
+            screen,
+            PanelKeys::default(),
+        )
+    }
+
+    /// MCP-362 — the deadline now CLOSES the panel rather than only marking it. `tick` sets
+    /// `expired` and `should_close` is what the host reads on that same tick to drop the overlay;
+    /// before this, an untouched panel stayed painted until the next keystroke.
+    ///
+    /// `expired` is one-way, which is what stops a keystroke racing the tick from resurrecting a
+    /// panel whose cancelled result has already been published.
+    #[tokio::test]
+    async fn an_expired_overlay_asks_the_host_to_close_it() {
+        use cyrup_ext::host::InteractiveOverlay;
+
+        let mut overlay = McpSetupOverlay::new(
+            setup_model(SetupScreen::Setup),
+            Arc::new(StubSetup),
+            tokio::runtime::Handle::current(),
+        );
+        assert!(!overlay.should_close(), "a fresh overlay stays open");
+
+        // Expire it the way the clock would, then let `tick` observe the deadline.
+        overlay.deadline = Instant::now() - Duration::from_millis(1);
+        assert!(overlay.tick(), "crossing the deadline changes the frame");
+        assert!(
+            overlay.should_close(),
+            "the host must be told to drop it on THIS tick, not the next keystroke"
+        );
+        // One-way: ticking again cannot un-expire it.
+        overlay.tick();
+        assert!(overlay.should_close());
+    }
+
+    /// MCP-377 — `render(width)` is exactly `render_bounded(width, usize::MAX)`, which is what makes
+    /// the sibling additive: every existing caller, including this module's own render tests, keeps
+    /// its behaviour unchanged.
+    #[test]
+    fn render_is_render_bounded_with_no_budget() {
+        let model = setup_model(SetupScreen::Setup);
+        assert_eq!(model.render(80), model.render_bounded(80, usize::MAX));
+    }
+
+    /// MCP-377's point: a small budget windows the action list at a **wide** width. The old
+    /// compact-only branch windowed solely below `COMPACT_WIDTH`, so a long list at 80 columns was
+    /// painted past the bottom of the box and silently clipped by the adapter's `.take(height)`.
+    #[test]
+    fn a_small_budget_windows_the_action_list_at_a_wide_width() {
+        let model = setup_model(SetupScreen::Setup);
+        let full = model.render_bounded(80, usize::MAX);
+        let clipped = model.render_bounded(80, 6);
+        assert!(
+            clipped.len() < full.len(),
+            "a budget of 6 must produce fewer rows than unbounded ({} vs {})",
+            clipped.len(),
+            full.len()
+        );
+    }
+
+    /// **The invariant `render_bounded` exists to hold**, and the one that was false until the
+    /// budget accounted for `render_actions`' own trailing block.
+    ///
+    /// `clipped.len() < full.len()` — the assertion above — passes for ANY over-reservation *and*
+    /// for an overrun, which is why it did not catch the arithmetic being wrong. This is the
+    /// property that actually matters: whatever the caller budgets, the panel fits.
+    ///
+    /// Below the trailing cost the saturating chain yields a zero window, `visible_action_range_within`
+    /// floors it at one row, and the total settles at that floor — so the sweep starts where a frame
+    /// can hold the chrome at all rather than pretending any `n` is honourable.
+    #[test]
+    fn render_bounded_never_exceeds_its_budget() {
+        for screen in
+            [SetupScreen::Setup, SetupScreen::Empty, SetupScreen::Imports, SetupScreen::Paths]
+        {
+            let model = populated_setup_model(screen);
+            let unbounded = model.render_bounded(80, usize::MAX).len();
+            let floor = model.render_bounded(80, 1).len();
+
+            // THE ASSERTION THAT MAKES THE SWEEP BELOW ABLE TO FAIL.
+            //
+            // The sweep starts at `floor`, and `floor` is itself a render — so on a screen that
+            // ignores its budget entirely, `floor` IS the unbounded height and every budget in the
+            // sweep is trivially large enough. That is exactly how `Imports` and `Paths` passed
+            // this test while `render_bounded(80, 1)` returned all 22 and 23 of their rows: the
+            // sweep was comparing a render against a number derived from the same render.
+            //
+            // A screen that windows has a floor strictly below its full height. A screen that does
+            // not, does not. Assert that first, and the sweep afterwards means something.
+            assert!(
+                floor < unbounded,
+                "{screen:?} renders {floor} rows at a budget of 1 and {unbounded} unbounded \u{2014}                  the budget is being ignored, and the sweep below cannot see it"
+            );
+
+            for budget in floor..=floor + 24 {
+                let rendered = model.render_bounded(80, budget);
+                assert!(
+                    rendered.len() <= budget,
+                    "{screen:?} at budget {budget} rendered {} rows",
+                    rendered.len()
+                );
+            }
+        }
+    }
+
+    /// The boundary, asserted as a TRANSITION rather than a fixed number: there is a budget at which
+    /// every action renders with no truncation marker, and one row below it the marker appears. That
+    /// is what proves the window tracks the budget instead of a constant.
+    ///
+    /// The transition does NOT sit at the unbounded height. `render_actions` reserves both `\u{2026} more`
+    /// markers and the `Add a known server` heading unconditionally, because which of them render
+    /// depends on the window that depends on them. So a panel can under-fill by up to three rows.
+    /// That pessimism is deliberate and is the cheap side of the trade: over-reserving costs blank
+    /// rows, under-reserving costs a silently clipped panel, which is the bug this unit removes.
+    #[test]
+    fn the_boundary_budget_shows_every_action_without_a_marker() {
+        let model = setup_model(SetupScreen::Setup);
+        let unbounded = model.render_bounded(80, usize::MAX).len();
+
+        // Walk up from the floor to the first budget that renders the whole panel untruncated.
+        let floor = model.render_bounded(80, 1).len();
+        let boundary = (floor..=unbounded + 8)
+            .find(|budget| !render_text(&model.render_bounded(80, *budget)).contains("more below"))
+            .expect("some budget renders the panel whole");
+
+        let at = model.render_bounded(80, boundary);
+        assert!(!render_text(&at).contains("more below"), "at the boundary, nothing is truncated");
+        assert!(at.len() <= boundary, "and the budget still holds");
+
+        assert!(
+            render_text(&model.render_bounded(80, boundary - 1)).contains("more below"),
+            "one row below the boundary the marker must appear, or the window is not tracking \
+             the budget at all"
+        );
+    }
+
+    /// Join a rendered panel back into plain text, for assertions about what a row says.
+    fn render_text(lines: &[OverlayLine]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]

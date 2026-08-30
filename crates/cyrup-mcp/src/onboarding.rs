@@ -18,14 +18,14 @@
 //! from colliding on the temp file — without it, one process's partial write lands under the
 //! other's rename.
 //!
-//! # No production consumer yet (MCP-394)
+//! # Who reads and writes this at runtime
 //!
-//! Upstream's consumers are `commands.ts` (`/mcp`) and `mcp-setup-panel.ts`. Here the module's only
-//! reader is `crate::ui`'s setup panel — `McpSetupPanelModel`, which takes an [`OnboardingState`] by
-//! value, and `crate::ui::shared_config_notice_lines` — and that panel is opened only by the `/mcp`
-//! dispatcher, which is `TODO(MCP-394)` and not ported. So every load, write and flag-stamp below
-//! is exercised by this module's own tests and by nothing else; the file is not written at runtime
-//! today.
+//! Upstream's consumers are `commands.ts` (`/mcp`) and `mcp-setup-panel.ts`, and both have
+//! counterparts here. [`load_onboarding_state`] is read by `crate::commands`' `/mcp` and
+//! `/mcp setup` arms, which hand the state to `McpSetupPanelModel` and to
+//! [`crate::panel_host::shared_config_notice`]; [`mark_shared_config_hint_shown`] is stamped by the
+//! `/mcp` arm once the panel closes, and [`mark_setup_completed`] by
+//! [`crate::panel_host::SetupCallbacks`] after every successful write.
 
 use std::path::Path;
 
@@ -49,9 +49,9 @@ pub struct OnboardingState {
     /// user's host-config landscape changes. Omitted from the file entirely when absent, matching
     /// upstream's optional key (never written as `null`).
     ///
-    /// **Written but never compared:** re-arming a hint on a changed fingerprint is a read the
-    /// `/mcp` dispatcher does, and that dispatcher is `TODO(MCP-394)` — not ported — so today the
-    /// field only round-trips through the file.
+    /// **Written but never compared.** Both stamps carry a fingerprint forward, and nothing reads
+    /// it back: re-arming a hint when the fingerprint changes is a comparison upstream makes and
+    /// neither `/mcp` arm does, so today the field only round-trips through the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_discovery_fingerprint: Option<String>,
 }
@@ -134,9 +134,9 @@ pub fn update_onboarding_state(
 /// `fingerprint ?? state.lastDiscoveryFingerprint`, and the key is omitted entirely when both are
 /// absent — which is why this takes `Option<&str>` rather than defaulting to `""`.
 ///
-/// **No production caller.** Consuming the one-shot is the `/mcp` dispatcher's step: it renders
-/// `crate::ui::shared_config_notice_lines`' output and then stamps the flag with the fingerprint
-/// that call handed back. That dispatcher is `TODO(MCP-394)` and not ported.
+/// Called by `crate::commands`' `/mcp` panel arm once the panel closes, with the fingerprint
+/// [`crate::panel_host::shared_config_notice`] handed back — and only when that call actually
+/// produced notice lines, so a notice that never rendered is not retired.
 pub fn mark_shared_config_hint_shown(
     path: &Path,
     fingerprint: Option<&str>,

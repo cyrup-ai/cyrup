@@ -131,6 +131,7 @@
 
 pub mod abort;
 pub mod agent_plugin;
+pub mod commands;
 pub mod config;
 pub mod credentials;
 pub mod dispatch;
@@ -143,6 +144,10 @@ pub mod live;
 pub mod oauth;
 pub mod onboarding;
 pub mod owner;
+/// The `/mcp` panels' production callbacks (MCP-387, MCP-392) — crate-internal: the traits they
+/// implement are `crate::ui`'s, and nothing outside this crate constructs one.
+pub(crate) mod panel_host;
+pub mod prompts;
 pub mod proxy;
 pub mod registration;
 pub mod request_headers_command;

@@ -1699,10 +1699,27 @@ fn any_notice(notices: &[(String, NotifyKind)], needle: &str) -> bool {
 /// whitespace *inside* the URL it was given — so the URL is the one whitespace-free token that
 /// names the authorization endpoint. Split on whitespace rather than on a fixed offset, because the
 /// surrounding sentence is a message under test, not a format this helper should pin.
+///
+/// MCP-390 wraps that URL in an OSC-8 hyperlink (`ESC]8;;{url}ESC\{label}ESC]8;;ESC\`, upstream's
+/// `terminalHyperlink(url, url)`), so the token no longer *starts* with `http://` — it starts with
+/// the escape. The sequence carries no whitespace, so the token is still one whitespace-delimited
+/// unit; trimming the escapes off each candidate keeps this helper agnostic about whether the
+/// notice is hyperlinked, which is the property its doc above claims.
 fn authorization_url_in(notice: &str) -> String {
     notice
         .split_whitespace()
-        .find(|token| token.starts_with("http://") && token.contains("/authorize?"))
+        .filter_map(|token| {
+            // Take the segment after the FIRST OSC-8 introducer — that is the link target — then
+            // everything up to the ESC that terminates it. `nth(1)`, not `rsplit().next()`: the
+            // sequence has a closing `ESC]8;;` too, so taking the last segment yields the trailing
+            // terminator rather than the URL. A bare URL has no introducer and `nth(1)` is `None`,
+            // so it passes through untouched.
+            let after = token.splitn(2, "\u{1b}]8;;").nth(1).unwrap_or(token);
+            let candidate = after.split('\u{1b}').next().unwrap_or(after);
+            (candidate.starts_with("http://") && candidate.contains("/authorize?"))
+                .then_some(candidate)
+        })
+        .next()
         .unwrap_or_else(|| panic!("the notice carries an authorization URL: {notice}"))
         .to_string()
 }

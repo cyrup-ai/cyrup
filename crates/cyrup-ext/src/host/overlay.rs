@@ -251,6 +251,53 @@ pub enum OverlayOutcome {
     /// The overlay asked to close (pi `this.done(...)`); the host tears it down.
     Close,
 }
+/// pi's `overlayOptions` (`interactive-mode.ts:2719`), carried **with the factory** rather than
+/// through `open_overlay`.
+///
+/// `open_overlay` is a `HostServices` trait method with a default body, a `LiveHostServices` impl
+/// and a `fenced!` macro arm whose arity the macro fixes — widening it would edit five sites across
+/// three crates to carry a value the component already knows. Upstream puts it on the factory for
+/// the same reason: `ctx.ui.custom(factory, { overlay: true, overlayOptions })`.
+///
+/// The defaults are `cyrup-tui`'s four existing constants, so every overlay that does not override
+/// [`InteractiveOverlay::options`] is painted exactly as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlayOptions {
+    /// Fixed column count (pi `width: 82 | 92`), or `None` for the percentage default.
+    pub width: Option<u16>,
+    /// pi `width: "95%"`.
+    pub width_pct: u16,
+    /// pi `minWidth: 60`.
+    pub min_width: u16,
+    /// pi `maxHeight: "85%"`.
+    pub max_height_pct: u16,
+    /// pi `margin: 1`.
+    pub margin: u16,
+}
+
+impl Default for OverlayOptions {
+    fn default() -> Self {
+        Self { width: None, width_pct: 95, min_width: 60, max_height_pct: 85, margin: 1 }
+    }
+}
+
+impl OverlayOptions {
+    /// The row budget the host will paint into, given the FRAME height.
+    ///
+    /// Called by the adapter's `box_rect` **and** by an overlay that windows its own body
+    /// (MCP-377), so the two cannot disagree — which is the whole reason the height half and the
+    /// width half are one change.
+    #[must_use]
+    pub fn max_rows(&self, frame_height: u16) -> u16 {
+        let usable = frame_height.saturating_sub(self.margin.saturating_mul(2));
+        let capped = u32::from(frame_height)
+            .saturating_mul(u32::from(self.max_height_pct))
+            .checked_div(100)
+            .unwrap_or(0);
+        u16::try_from(capped).unwrap_or(u16::MAX).min(usable).max(1)
+    }
+}
+
 
 /// An extension-owned, focus-capturing modal the host paints and feeds keystrokes to — cyrup's
 /// counterpart of pi's `ctx.ui.custom(factory, { overlay: true, … })` `Component`.
@@ -288,6 +335,25 @@ pub trait InteractiveOverlay: Send {
     /// is something the component paints for itself (`fleet.ts:809`).
     fn tick(&mut self) -> bool {
         false
+    }
+
+    /// Whether the overlay has decided to close itself **without a keystroke** — pi's
+    /// `setTimeout(() => done(...), INACTIVITY_MS)`.
+    ///
+    /// [`Self::tick`] returns `bool` (did anything change?) and structurally cannot express "tear me
+    /// down", which is why an inactivity deadline could previously only be honoured on the next key
+    /// press — leaving an expired panel painted. The host consults this after every tick and drops
+    /// the overlay when it answers `true`.
+    ///
+    /// Defaulted to `false`, so every existing overlay is unaffected.
+    fn should_close(&self) -> bool {
+        false
+    }
+
+    /// This overlay's geometry (pi's `overlayOptions`). Defaulted, so existing overlays are
+    /// untouched.
+    fn options(&self) -> OverlayOptions {
+        OverlayOptions::default()
     }
 }
 
@@ -603,5 +669,36 @@ mod tests {
             inert.handle_key(OverlayKey::plain(OverlayKeyCode::Escape)),
             OverlayOutcome::Ignored
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod overlay_options_tests {
+    use super::OverlayOptions;
+
+    /// The default is pi's `{ width: "95%", minWidth: 60, maxHeight: "85%", margin: 1 }`, so every
+    /// overlay that does not override `options()` is painted exactly as it was before MCP-368.
+    #[test]
+    fn the_default_is_pis_four_constants() {
+        let options = OverlayOptions::default();
+        assert_eq!(options.width, None);
+        assert_eq!(options.width_pct, 95);
+        assert_eq!(options.min_width, 60);
+        assert_eq!(options.max_height_pct, 85);
+        assert_eq!(options.margin, 1);
+    }
+
+    /// `max_rows` is the ONE row budget MCP-368's box height and MCP-377's body windowing share.
+    #[test]
+    fn max_rows_applies_the_percentage_then_the_margin() {
+        let options = OverlayOptions::default();
+        // 85% of 40 is 34; the margin leaves 38 usable, so the percentage binds.
+        assert_eq!(options.max_rows(40), 34);
+        // A frame so short the margin binds instead: 85% of 4 is 3, usable is 2.
+        assert_eq!(options.max_rows(4), 2);
+        // Never zero — an unusable overlay is worse than a cramped one.
+        assert_eq!(options.max_rows(1), 1);
+        assert_eq!(options.max_rows(0), 1);
     }
 }
