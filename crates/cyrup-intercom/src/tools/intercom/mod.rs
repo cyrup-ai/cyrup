@@ -73,35 +73,43 @@ struct IntercomParams {
     /// live peer there).
     #[serde(default)]
     cwd: Option<String>,
+    /// `openProjectPaneIfMissing` (`v0.12.0 index.ts:2175-2177`) — for `send`/`ask` with `cwd`,
+    /// open a visible Herdr project pane and launch cyrup there when no matching live session is
+    /// connected. Rejected without a `cwd` (`:2322-2326`, `:2437-2441`).
+    #[serde(default)]
+    open_project_pane_if_missing: Option<bool>,
+    /// `focus` (`v0.12.0 index.ts:2178-2180`) — focus the new pane. **Defaults to true**
+    /// (`project-agent.ts:239` is `input.focus !== false`, so only an explicit `false` unfocuses).
+    #[serde(default)]
+    focus: Option<bool>,
 }
 
 /// `DeliveryTarget` (`v0.10.1 index.ts:62-66`) — the id a message is actually sent to plus the
 /// label the result echoes back.
-///
-/// [CYRUP-DELTA] Upstream's third member `projectPane?: ProjectPaneLaunch` is absent: cyrup does
-/// not port the Herdr pane launcher (see [`crate::project_target`] for the full reason). Everywhere
-/// upstream branches on `target.projectPane` the cyrup code takes the non-pane arm, which is the
-/// arm every pane-less call already took upstream.
 pub(super) struct DeliveryTarget {
     pub(super) id: String,
     pub(super) label: String,
+    /// `projectPane?: ProjectPaneLaunch` (`v0.12.0 index.ts:75`). `Some` only when THIS call
+    /// launched the pane — every result and `details` branch keys off it.
+    pub(super) project_pane: Option<crate::project_pane::ProjectPaneLaunch>,
 }
 
-/// `resolveCwdDeliveryTarget(activeClient, options)` (`v0.10.1 index.ts:1192-1217`), minus the
-/// `openProjectPaneIfMissing` half.
+/// `resolveCwdDeliveryTarget`'s `options` (`v0.12.0 index.ts:1500-1506`).
 ///
-/// The three steps upstream takes before the lookup are load-bearing and all ported: the roster is
-/// fetched ONCE and reused (so `to` and `cwd` are resolved against one consistent snapshot), the
-/// caller's own row is required to be in it (the target cwd defaults to *its* cwd, not to the
-/// locally captured one), and a relative `cwd` resolves against that row's cwd with `"."` meaning
-/// "here".
-///
-/// [CYRUP-DELTA] `:1221` appends `Pass openProjectPaneIfMissing: true to open a Herdr project pane
-/// and start Pi there.` to the missing-target error. cyrup omits that sentence: the tool has no
-/// such parameter, and telling the model to pass one the schema rejects is worse than the shorter
-/// message. Everything before it is upstream's text verbatim.
+/// An options struct rather than a fifth positional argument, because upstream's is one too and
+/// because `to`/`cwd` are both `&str` — adjacent same-typed positionals are exactly the shape a
+/// caller transposes silently.
+pub(super) struct CwdDeliveryOptions<'a> {
+    pub(super) to: Option<&'a str>,
+    pub(super) cwd: &'a str,
+    pub(super) open_project_pane_if_missing: bool,
+    /// Already defaulted: `params.focus.unwrap_or(true)`.
+    pub(super) focus: bool,
+    pub(super) cancel: &'a cyrup_core::CancelToken,
+}
+
 /// `options.cwd && options.cwd !== "." ? resolvePath(currentSession.cwd, options.cwd) : currentSession.cwd`
-/// (`v0.10.1 index.ts:1205-1207`, and the identical expression at `:1903-1907` for `list-cwd`).
+/// (`v0.12.0 index.ts:1517-1519`, and the identical expression at `:2247-2249` for `list-cwd`).
 ///
 /// `current_cwd` is the cwd the BROKER reports for this session, not the locally captured one — a
 /// relative `cwd` must resolve against the directory peers can actually see this session in.
@@ -114,11 +122,35 @@ pub(super) fn resolve_target_cwd(current_cwd: &str, cwd: &str) -> String {
     }
 }
 
+/// `resolveCwdDeliveryTarget(activeClient, options)` (`v0.12.0 index.ts:1500-1543`).
+///
+/// The three steps upstream takes before the lookup are load-bearing and all ported: the roster is
+/// fetched ONCE and reused (`:1507`, so `to` and `cwd` resolve against one consistent snapshot), the
+/// caller's own row is required to be in it (`:1509-1515` — the target cwd defaults to *its* cwd,
+/// not to the locally captured one), and a relative `cwd` resolves against that row's cwd with `"."`
+/// meaning "here" (`resolve_target_cwd`).
+///
+/// The `Missing` arm then carries upstream's two outcomes. Without the flag it is the refusal at
+/// `:1529-1531`, whose second sentence names `openProjectPaneIfMissing` as the next step — text this
+/// port emits only because `parameters_schema` advertises the parameter and the launcher slot
+/// honours it. With the flag it is the launch (`:1533-1542`):
+/// [`crate::project_pane::resolve_project_root`] first, so a target that is not a directory costs no
+/// process; then the pre-launch roster snapshot (`:1533`) that lets the wait identify the new
+/// session by DIFFERENCE rather than by cwd alone; then the backend's
+/// [`open`](crate::project_pane::ProjectPaneLauncher::open); then
+/// [`crate::project_target::wait_for_project_session`] (`:1535-1541`), polling until the agent that
+/// pane started has registered with the broker and is addressable.
+///
+/// # Errors
+/// [`ToolError`] when the caller is not registered or is missing from the roster, when
+/// `resolve_target_in_cwd` reports an ambiguity, when the target is not a directory, when the
+/// backend cannot open a pane, or when the launched session never registers.
 pub(super) async fn resolve_cwd_delivery_target(
+    state: &crate::session_state::SharedIntercomState,
     client: &crate::transport::client::IntercomClient,
-    to: Option<&str>,
-    cwd: &str,
+    options: CwdDeliveryOptions<'_>,
 ) -> Result<DeliveryTarget, ToolError> {
+    let CwdDeliveryOptions { to, cwd, open_project_pane_if_missing, focus, cancel } = options;
     let sessions = client.list_sessions().await.map_err(to_tool_err)?;
     // `if (!currentSessionId) throw new Error("Current session is not registered with intercom.")`
     let Some(current_session_id) = client.session_id() else {
@@ -141,10 +173,69 @@ pub(super) async fn resolve_cwd_delivery_target(
                 .map(str::to_string)
                 .or_else(|| session.name.clone().filter(|n| !n.is_empty()))
                 .unwrap_or_else(|| session.id.clone());
-            Ok(DeliveryTarget { id: session.id.clone(), label })
+            Ok(DeliveryTarget { id: session.id.clone(), label, project_pane: None })
         }
         crate::project_target::ProjectTargetResolution::Missing { reason, .. } => {
-            Err(ToolError::new(reason))
+            let launcher = state.project_pane_launcher();
+            // `v0.12.0 index.ts:1529-1530`. The sentence naming the flag is emitted ONLY because
+            // the schema now advertises it — this is the line ICOM-042 exists to make honest.
+            if !open_project_pane_if_missing {
+                // The NOUN PHRASE is substituted whole, not the vendor name alone: with a backend
+                // bound this is upstream's sentence verbatim (`a Herdr project pane`), and with none
+                // it degrades to a bare `a project pane` instead of doubling the word.
+                let pane_noun = launcher.as_ref().map_or_else(
+                    || "project pane".to_string(),
+                    |l| format!("{} project pane", l.name()),
+                );
+                return Err(ToolError::new(format!(
+                    "{reason} Pass openProjectPaneIfMissing: true to open a {pane_noun} and start cyrup there."
+                )));
+            }
+            // `resolveProjectRoot` FIRST (`project-agent.ts:233`): a non-directory is refused
+            // before any backend is consulted, so a typo costs no process.
+            let project_root = crate::project_pane::resolve_project_root(
+                std::path::Path::new(&current_session.cwd),
+                &target_cwd,
+            )
+            .map_err(ToolError::new)?;
+
+            // `const beforeSessionIds = new Set(sessions.map(s => s.id))` (`index.ts:1533`) — the
+            // snapshot is taken from the roster ALREADY fetched above, before the launch.
+            let before: std::collections::HashSet<String> =
+                sessions.iter().map(|s| s.id.clone()).collect();
+
+            let launcher = launcher.unwrap_or_else(|| {
+                std::sync::Arc::new(crate::project_pane::UnavailableLauncher {
+                    reason: "No project pane launcher is configured for this session.".to_string(),
+                })
+            });
+            let launch = launcher
+                .open(crate::project_pane::ProjectPaneRequest {
+                    project_root: project_root.clone(),
+                    focus,
+                    cancel,
+                })
+                .await
+                .map_err(|e| ToolError::new(e.to_string()))?;
+
+            let session = crate::project_target::wait_for_project_session(
+                client,
+                &launch.project_root,
+                &current_session_id,
+                &before,
+                to,
+                cancel,
+                launcher.name(),
+            )
+            .await
+            .map_err(ToolError::new)?;
+
+            // `{ id: session.id, label: session.name || session.id, projectPane }` (`:1542`) —
+            // JS `||`, so a blank name falls through to the id. NOTE the label deliberately does
+            // NOT consider `to` here, unlike the `found` arm.
+            let label =
+                session.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| session.id.clone());
+            Ok(DeliveryTarget { id: session.id, label, project_pane: Some(launch) })
         }
     }
 }
@@ -180,7 +271,7 @@ impl IntercomTool {
             // `send`, in upstream's own `switch` order.
             "list-cwd" => self.action_list_cwd(&params, &client).await,
             "cancel" => self.action_cancel(&params, &client).await,
-            "send" => self.action_send(&params, &client).await,
+            "send" => self.action_send(&params, &client, cancel).await,
             "ask" => self.action_ask(&params, &client, cancel).await,
             "reply" => self.action_reply(&params, &client).await,
             "pending" => self.action_pending(&params, &client).await,
@@ -295,11 +386,19 @@ pub(crate) fn parameters_schema() -> serde_json::Value {
                 "enum": ["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"],
                 "description": "The intercom action to perform."
             },
-            // `v0.10.1 index.ts:1831-1833`, minus the sentence about `openProjectPaneIfMissing`
-            // (see `resolve_cwd_delivery_target`'s [CYRUP-DELTA]).
+            // `v0.12.0 index.ts:1831-1833`.
             "cwd": {
                 "type": "string",
                 "description": "Working directory filter for 'list-cwd'. For send/ask, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd."
+            },
+            // `v0.12.0 index.ts:2175-2180`, verbatim apart from `Pi` -> `cyrup`.
+            "openProjectPaneIfMissing": {
+                "type": "boolean",
+                "description": "For send/ask with cwd, open a visible Herdr project pane and launch cyrup there when no matching live session is connected."
+            },
+            "focus": {
+                "type": "boolean",
+                "description": "For openProjectPaneIfMissing, focus the new Herdr pane. Defaults to true."
             },
             "to": { "type": "string", "description": "Target session name or id (send/ask/reply). Optional for send/ask when 'cwd' is given." },
             "message": { "type": "string", "description": "Message text (send/ask/reply)." },

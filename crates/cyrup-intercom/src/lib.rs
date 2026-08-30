@@ -36,6 +36,7 @@ pub mod inbound;
 /// ICOM-056: the extension outbox and message provenance.
 pub mod outbox;
 pub mod paths;
+pub mod project_pane;
 pub mod project_target;
 pub mod relay;
 pub mod resources;

@@ -3,20 +3,24 @@
 
 use std::sync::Arc;
 
-use cyrup_core::{ToolError, ToolResult};
+use cyrup_core::{CancelToken, ToolError, ToolResult};
 
 use crate::inbound::format_attachments;
 use crate::tools::{detailed_result, text_result};
 use crate::transport::client::{IntercomClient, SendOptions};
 use crate::transport::protocol::now_ms;
 
-use super::{DeliveryTarget, IntercomParams, IntercomTool, resolve_cwd_delivery_target, to_tool_err};
+use super::{
+    CwdDeliveryOptions, DeliveryTarget, IntercomParams, IntercomTool, resolve_cwd_delivery_target,
+    to_tool_err,
+};
 
 impl IntercomTool {
     pub(super) async fn action_send(
         &self,
         params: &IntercomParams,
         client: &Arc<IntercomClient>,
+        cancel: &CancelToken,
     ) -> Result<ToolResult, ToolError> {
         // `v0.10.1 index.ts:1973-1978`: `if ((!to && !cwd) || !message)` — ONE guard and one
         // message covering all three params, because `cwd` is an alternative addressing mode
@@ -32,6 +36,43 @@ impl IntercomTool {
                 ));
             }
         };
+        let open_pane = params.open_project_pane_if_missing.unwrap_or(false);
+        // `v0.12.0 index.ts:2322-2326` — verbatim, and BEFORE the confirm, so a flag typo never
+        // costs a dialog.
+        if open_pane && cwd.is_none() {
+            return Err(ToolError::new("openProjectPaneIfMissing requires a target cwd."));
+        }
+
+        // `const confirmSend = !replyTo && config.confirmSend && ctx.hasUI` (`:2328`), hoisted
+        // above the resolution because a pane LAUNCH is a side effect the human approves BEFORE it
+        // happens, not after. `attachment_text` comes with it so both branches share one copy.
+        let confirm_send =
+            params.reply_to.is_none() && self.state.config.confirm_send && self.state.has_ui();
+        let attachment_text = params
+            .attachments
+            .as_deref()
+            .filter(|a| !a.is_empty())
+            .map(format_attachments)
+            .unwrap_or_default();
+        let launch_possible = cwd.is_some() && open_pane;
+
+        // `v0.12.0 index.ts:2330-2341`: the label is `to ?? cwd` — there is no resolved peer name
+        // yet, and if the launch fails there never will be one. Asking here is what makes the
+        // dialog a veto on the SIDE EFFECT rather than an acknowledgement after the fact.
+        if confirm_send
+            && launch_possible
+            && let Some(services) = self.state.host_services()
+        {
+            let label = to.clone().or_else(|| cwd.clone()).unwrap_or_default();
+            if !services.confirm(
+                "Send Message",
+                &format!("Send to \"{label}\":\n\n{message}{attachment_text}"),
+                &cyrup_ext::DialogOptions::default(),
+            ) {
+                return Ok(text_result("Message cancelled by user"));
+            }
+        }
+
         // `v0.10.1 index.ts:2001-2003`. With a `cwd` the target is resolved inside that
         // directory (`resolveCwdDeliveryTarget`); without one it is
         // `{ id: await resolveSessionTarget(connectedClient, to) ?? to }` — a NON-blocking
@@ -41,7 +82,16 @@ impl IntercomTool {
         // the blocking `ask` refuses up front (`:2103-2110`), because an ask has a waiter to
         // hang.
         let delivery = match cwd.as_deref() {
-            Some(cwd) => resolve_cwd_delivery_target(client, to.as_deref(), cwd).await?,
+            Some(cwd) => {
+                resolve_cwd_delivery_target(&self.state, client, CwdDeliveryOptions {
+                    to: to.as_deref(),
+                    cwd,
+                    open_project_pane_if_missing: open_pane,
+                    focus: params.focus.unwrap_or(true),
+                    cancel,
+                })
+                .await?
+            }
             None => {
                 let to_value = to.clone().unwrap_or_default();
                 DeliveryTarget {
@@ -52,14 +102,18 @@ impl IntercomTool {
                         .map_err(to_tool_err)?
                         .unwrap_or_else(|| to_value.clone()),
                     label: to_value,
+                    project_pane: None,
                 }
             }
         };
-        let DeliveryTarget { id: target, label } = delivery;
+        let DeliveryTarget { id: target, label, project_pane } = delivery;
         // `const targetDisplay = target.projectPane ? target.label : to ?? target.label;`
-        // (`:2004`). Pane-less, that is `to ?? target.label`: an explicit `to` is echoed
-        // back verbatim, and a cwd-addressed send reports the peer's resolved name.
-        let target_display = to.clone().unwrap_or(label);
+        // (`v0.12.0 index.ts:2346`). Pane-less, that is `to ?? target.label`: an explicit `to` is
+        // echoed back verbatim, and a cwd-addressed send reports the peer's resolved name. With a
+        // pane, the LAUNCHED session's own name wins over the caller's `to`, because `to` may have
+        // been a bare filter that never named this session.
+        let target_display =
+            if project_pane.is_some() { label } else { to.clone().unwrap_or(label) };
         // `v0.10.1 index.ts:2005-2010` — the SAME string as the `ask` and `reply` self-guards
         // (`:2122`, `:2205`). pi has exactly one self-target message across all three arms.
         if client.session_id().as_deref() == Some(target.as_str()) {
@@ -90,16 +144,12 @@ impl IntercomTool {
             .clone()
             .or_else(|| inferred_ask.as_ref().map(|c| c.message.id.clone()));
         // confirmSend gate (`index.ts:1524-1536`): only for a non-reply send, only when the
-        // config opts in, and only when this session actually has a UI to confirm through.
-        if params.reply_to.is_none() && self.state.config.confirm_send && self.state.has_ui()
+        // config opts in, and only when this session actually has a UI to confirm through — and
+        // only when the launch branch above did NOT already ask. Nobody is confirmed twice.
+        if confirm_send
+            && !launch_possible
             && let Some(services) = self.state.host_services()
         {
-            let attachment_text = params
-                .attachments
-                .as_deref()
-                .filter(|a| !a.is_empty())
-                .map(format_attachments)
-                .unwrap_or_default();
             let confirmed = services.confirm(
                 "Send Message",
                 // `Send to "${targetDisplay}"` (`v0.10.1 index.ts:2016`) — the human is
@@ -183,8 +233,26 @@ impl IntercomTool {
         {
             map.insert("replyTo".to_string(), serde_json::json!(reply_to));
         }
+        // `v0.12.0 index.ts:2390-2401` — the pane facts ride on the SAME `details` object.
+        if let Some(pane) = &project_pane
+            && let Some(map) = details.as_object_mut()
+        {
+            map.insert("openedProjectPane".to_string(), serde_json::json!(true));
+            map.insert("paneId".to_string(), serde_json::json!(pane.pane_id));
+            map.insert("projectRoot".to_string(), serde_json::json!(pane.project_root));
+        }
         Ok(detailed_result(
-            if inferred_ask.is_some() {
+            // The pane branch OUTRANKS the inferred-reply branch upstream (`:2392-2396`): a
+            // freshly launched session cannot have a pending ask to infer against anyway.
+            if let Some(pane) = &project_pane {
+                // `index.ts:2394` hard-codes `Herdr`; here the name rides on the launch, so this
+                // names the backend that opened THIS pane rather than whatever the slot holds by
+                // the time the string is built.
+                format!(
+                    "Opened {} project pane {} for {} and sent message to {target_display}",
+                    pane.launcher_name, pane.pane_id, pane.project_root
+                )
+            } else if inferred_ask.is_some() {
                 format!("Reply sent to {target_display} (inferred from pending ask)")
             } else {
                 format!("Message sent to {target_display}")

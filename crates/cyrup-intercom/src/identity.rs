@@ -37,6 +37,18 @@ pub const ENV_INTERCOM_LIVENESS_TIMEOUT_MS: &str = "CYRUP_INTERCOM_LIVENESS_TIME
 /// downward for a child to read back as its supervisor's id, this one is *read* by a session as its
 /// own restart-stable registration id.
 pub const ENV_INTERCOM_STABLE_ID: &str = "CYRUP_INTERCOM_STABLE_ID";
+/// `HERDR_BIN` — NOT `CYRUP_HERDR_BIN`. Same rule as [`ENV_TMUX_PANE`]: the `CYRUP_` prefix applies
+/// to pi's OWN variables, and this one belongs to the Herdr vendor, read verbatim by upstream at
+/// `v0.12.0 project-agent.ts:68` (`options.bin ?? process.env.HERDR_BIN ?? "herdr"`). A user who has
+/// already set it for Herdr itself must not have to set a second, cyrup-private spelling.
+pub const ENV_HERDR_BIN: &str = "HERDR_BIN";
+/// `CYRUP_INTERCOM_CYRUP_BIN` (pi `PI_INTERCOM_PI_BIN`, `v0.12.0 project-agent.ts:245`) — the agent
+/// binary a launched project pane runs. First rung of the ladder in
+/// [`crate::project_pane::resolve_agent_command`].
+pub const ENV_INTERCOM_CYRUP_BIN: &str = "CYRUP_INTERCOM_CYRUP_BIN";
+/// `CYRUP_BIN` (pi `PI_BIN`, `v0.12.0 project-agent.ts:245`) — the machine-wide fallback for the
+/// same, checked after [`ENV_INTERCOM_CYRUP_BIN`].
+pub const ENV_CYRUP_BIN: &str = "CYRUP_BIN";
 /// `CYRUP_SUBAGENT_ORCHESTRATOR_TARGET` (`index.ts:21`, pi `PI_SUBAGENT_ORCHESTRATOR_TARGET`).
 pub const ENV_ORCH_TARGET: &str = "CYRUP_SUBAGENT_ORCHESTRATOR_TARGET";
 /// `CYRUP_SUBAGENT_ORCHESTRATOR_SESSION_ID` (`index.ts:22`) — the preferred, stable supervisor id.

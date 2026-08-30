@@ -105,6 +105,12 @@ pub struct SharedIntercomState {
     /// though they run OUTSIDE any `HostCtx`. `None` until the builder late-binds it (or in a
     /// headless/degraded session) → the human surface degrades to a no-op, never blocks.
     host_services: Mutex<Option<Arc<dyn HostServices>>>,
+    /// The project-pane launcher backend, late-bound exactly like [`Self::host_services`] and for
+    /// the same reason: it is a host capability, not session data, and a headless session has none.
+    /// `None` until a backend is bound; [`crate::tools::intercom`] then answers
+    /// `openProjectPaneIfMissing` with [`crate::project_pane::UnavailableLauncher`] — a true
+    /// `HERDR_UNAVAILABLE` — rather than ignoring the flag.
+    project_pane_launcher: Mutex<Option<Arc<dyn crate::project_pane::ProjectPaneLauncher>>>,
     /// Whether this session has an interactive UI (pi `hasUI`, `index.ts:739-758`). Captured ONCE
     /// from the live `HostCtx::has_ui` at `SessionStart` (a static per-session property) and read by
     /// the inbound delivery policy ([`crate::inbound`]): an interactive session drives/steers a turn
@@ -184,6 +190,7 @@ impl SharedIntercomState {
         Self {
             client: Mutex::new(None),
             host_services: Mutex::new(None),
+            project_pane_launcher: Mutex::new(None),
             has_ui: AtomicBool::new(false),
             active_tools: Mutex::new(Vec::new()),
             agent_running: AtomicBool::new(false),
@@ -316,6 +323,24 @@ impl SharedIntercomState {
     #[must_use]
     pub fn host_services(&self) -> Option<Arc<dyn HostServices>> {
         self.host_services.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Late-bind the project-pane launcher (ICOM-042 §5-A: `HerdrLauncher`). Bound from the same
+    /// place `set_host_services` is, and idempotent for the same reason.
+    pub fn set_project_pane_launcher(
+        &self,
+        launcher: Arc<dyn crate::project_pane::ProjectPaneLauncher>,
+    ) {
+        *self.project_pane_launcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(launcher);
+    }
+
+    /// The bound project-pane launcher, if any. `None` is not an error — it is the headless case,
+    /// and the caller substitutes [`crate::project_pane::UnavailableLauncher`].
+    #[must_use]
+    pub fn project_pane_launcher(
+        &self,
+    ) -> Option<Arc<dyn crate::project_pane::ProjectPaneLauncher>> {
+        self.project_pane_launcher.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Record whether this session has an interactive UI (pi `hasUI`). Called ONCE from the

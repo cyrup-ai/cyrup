@@ -558,6 +558,14 @@ impl NativeExtension for IntercomExtension {
     /// background tasks OUTSIDE any `HostCtx`. Idempotent (a session rebuild rebinds the same Arc).
     fn set_host_services(&self, services: Arc<dyn HostServices>) {
         self.state.set_host_services(services);
+        // ICOM-042 §5-A — bind the project-pane launcher from the same hook, for the same reason:
+        // it is a host capability, and this is the one place that runs before `init` with the host
+        // in hand. `HerdrLauncher::from_env()` resolves `HERDR_BIN` and the agent binary but probes
+        // nothing, so binding it costs no process; whether Herdr is actually installed is decided
+        // on first use, where it becomes an honest `HERDR_UNAVAILABLE` naming what to install
+        // rather than a silently-dropped flag.
+        self.state
+            .set_project_pane_launcher(Arc::new(crate::project_pane::HerdrLauncher::from_env()));
     }
 
     /// Dispatch this extension's two commands (command-tier).

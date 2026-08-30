@@ -6,11 +6,14 @@ use std::sync::Arc;
 use cyrup_core::{CancelToken, ToolError, ToolResult};
 
 use crate::inbound::format_attachments;
-use crate::tools::text_result;
+use crate::tools::{detailed_result, text_result};
 use crate::transport::client::IntercomClient;
 use crate::transport::protocol::now_ms;
 
-use super::{DeliveryTarget, IntercomParams, IntercomTool, resolve_cwd_delivery_target, to_tool_err};
+use super::{
+    CwdDeliveryOptions, DeliveryTarget, IntercomParams, IntercomTool, resolve_cwd_delivery_target,
+    to_tool_err,
+};
 
 impl IntercomTool {
     pub(super) async fn action_ask(
@@ -31,11 +34,27 @@ impl IntercomTool {
                 ));
             }
         };
+        let open_pane = params.open_project_pane_if_missing.unwrap_or(false);
+        // `v0.12.0 index.ts:2437-2441` — the same guard `send` applies, same string. `ask` has no
+        // confirm dialog, so there is nothing to order it against; it is still first, so a flag
+        // typo costs no roster fetch.
+        if open_pane && cwd.is_none() {
+            return Err(ToolError::new("openProjectPaneIfMissing requires a target cwd."));
+        }
         // `v0.10.1 index.ts:2103-2114`. With a `cwd` the target is resolved inside that
         // directory, and `resolveCwdDeliveryTarget`'s own "no session there" error already
         // says what happened — the offline refusal below belongs to the `to`-only branch.
         let delivery = match cwd.as_deref() {
-            Some(cwd) => resolve_cwd_delivery_target(client, to.as_deref(), cwd).await?,
+            Some(cwd) => {
+                resolve_cwd_delivery_target(&self.state, client, CwdDeliveryOptions {
+                    to: to.as_deref(),
+                    cwd,
+                    open_project_pane_if_missing: open_pane,
+                    focus: params.focus.unwrap_or(true),
+                    cancel,
+                })
+                .await?
+            }
             None => {
                 let to_value = to.clone().unwrap_or_default();
                 // `v0.10.1 index.ts:2107-2113` (v0.10.0): an ask whose target is offline is
@@ -50,13 +69,13 @@ impl IntercomTool {
                         "Session \"{to_value}\" is not currently connected. Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects."
                     )));
                 };
-                DeliveryTarget { id: resolved, label: to_value }
+                DeliveryTarget { id: resolved, label: to_value, project_pane: None }
             }
         };
-        let DeliveryTarget { id: target, label } = delivery;
+        let DeliveryTarget { id: target, label, project_pane } = delivery;
         // `const targetDisplay = target.projectPane ? target.label : to ?? target.label;`
-        // (`v0.10.1 index.ts:2116`).
-        let to = to.unwrap_or(label);
+        // (`v0.12.0 index.ts:2457`) — same rule as `send`: a launched session's own name wins.
+        let to = if project_pane.is_some() { label } else { to.unwrap_or(label) };
         // `v0.10.1 index.ts:2122-2127` — pi's single self-target string, shared with `send`
         // and `reply`.
         if client.session_id().as_deref() == Some(target.as_str()) {
@@ -131,6 +150,19 @@ impl IntercomTool {
         // `v0.10.1 index.ts:2180`: `**Reply from ${targetDisplay}:**\n${replyText}${replyAttachments}`,
         // keyed off the caller-supplied `to`. Without the header a transcript that has asked
         // more than one peer cannot tell which of them answered.
-        Ok(text_result(format!("**Reply from {to}:**\n{reply_text}{reply_attachments}")))
+        // `v0.12.0 index.ts:2524` — when this call opened the pane the reply carries the same
+        // `details` payload `send` returns; without one it stays a bare text result, as today.
+        let text = format!("**Reply from {to}:**\n{reply_text}{reply_attachments}");
+        Ok(match &project_pane {
+            Some(pane) => detailed_result(
+                text,
+                serde_json::json!({
+                    "openedProjectPane": true,
+                    "paneId": pane.pane_id,
+                    "projectRoot": pane.project_root,
+                }),
+            ),
+            None => text_result(text),
+        })
     }
 }

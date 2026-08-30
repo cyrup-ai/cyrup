@@ -1,19 +1,14 @@
 ---
 # [CYRUP-DELTA] ICOM-004 — ported from `pi-intercom v0.10.1:skills/pi-intercom/SKILL.md` (452 lines)
-# with exactly two classes of divergence, both forced and both reversible:
+# with exactly ONE class of divergence, forced and reversible:
 #
 # 1. `PI_INTERCOM_ASK_TIMEOUT_MS` → `CYRUP_INTERCOM_ASK_TIMEOUT_MS` (5 sites). cyrup reads the
 #    `CYRUP_`-prefixed name (`identity.rs::ENV_INTERCOM_ASK_TIMEOUT_MS`, itself a recorded delta of
 #    `config.ts:8`), so shipping pi's spelling would document an env var this build ignores.
 #
-# 2. The `openProjectPaneIfMissing` passages (upstream `:145-157` in Pattern 6, `:241-248`
-#    "Visible Peer Sessions", the Pattern-6 bullet at `:26` and the closing clause of `:228`) are
-#    adapted, NOT carried. `openProjectPaneIfMissing` / `focus` are the Herdr half of ICOM-042 and
-#    are deliberately absent from `IntercomParams` and from the tool schema
-#    (`tools/intercom.rs` — the params were withheld so the schema never advertises an action the
-#    tool rejects), so upstream's text would instruct the model to make a call this build refuses
-#    with an unknown-field error. The cwd-TARGETING half IS ported, so every `cwd:`-scoped example
-#    is carried verbatim. Restore upstream's text verbatim the moment the Herdr pane launcher lands.
+# (ICOM-004's second divergence — the adapted `openProjectPaneIfMissing` passages — is GONE as of
+# ICOM-042, which ported the Herdr pane launcher. Upstream's `:26`, `:145-157`, `:228` and
+# `:241-248` are restored, with `Pi` -> `cyrup` under divergence 1's own rule.)
 #
 # YAML comments are ignored by the front-matter parser, exactly as in
 # `cyrup-ext-subagents/resources/agents/researcher.md`.
@@ -41,7 +36,7 @@ This skill covers how to handle those orchestrator-side escalations.
 - **Context handoffs**: Send findings from a research session to an execution session
 - **Clarification loops**: Worker asks questions, planner answers, work continues
 - **Multi-session workflows**: Coordinate between specialized sessions (frontend/backend, research/implementation)
-- **Cross-codebase peer messages**: Message an explicit live peer in another project by name, by working directory, or by both
+- **Cross-codebase peer messages**: Message an explicit live peer in another project, or open a visible Herdr project pane when a long-lived conversation is needed
 
 ## Core Patterns
 
@@ -160,20 +155,22 @@ intercom({
 })
 ```
 
-For bounded work in another repo, prefer `pi-subagents` with an explicit `cwd`;
-the child can use `contact_supervisor` for owner decisions and regular `intercom`
+Only open a Herdr project pane when you need a durable visible peer session in
+that repo. For bounded work, prefer `pi-subagents` with an explicit `cwd`; the
+child can use `contact_supervisor` for owner decisions and regular `intercom`
 for explicit peer coordination.
 
 ```typescript
 intercom({
   action: "send",
   cwd: "/path/to/other-repo",
+  openProjectPaneIfMissing: true,
   message: "Let's discuss the workbench API ergonomics in this repo."
 })
 ```
 
-`cwd` addresses a session that is already live in that directory; it never starts
-one. If multiple sessions are active there, pass `to` to select one by name or
+If a live session already exists in that `cwd`, intercom reuses it. If multiple
+sessions are active there, pass `to` to select one by name or
 session ID. To see who is live in a directory first:
 
 ```typescript
@@ -245,8 +242,8 @@ intercom({ action: "reply", to: "subagent-worker-78f659a3-1", message: "Use the 
 get the `contact_supervisor` tool. Normal sessions use the regular `intercom`
 tool. If you see the formatted supervisor decision/progress update message, treat
 it as a `contact_supervisor` escalation. A subagent may use regular `intercom` for
-peer coordination, including peers in other directories, but owner decisions
-should go through the supervisor.
+peer coordination, including peers in other directories, but owner decisions and
+new visible project panes should go through the supervisor.
 
 ## Key Differences
 
@@ -262,10 +259,11 @@ should go through the supervisor.
 ## Visible Peer Sessions
 
 For bounded cross-codebase work, prefer `pi-subagents` with an explicit `cwd`.
-`intercom` addresses sessions that are already live; it never starts one.
+Use `intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, ... })`
+only when a long-lived visible peer session is useful.
 
-Do not invent a terminal fallback inside this workflow. Ask the user before
-opening another visible surface manually.
+If Herdr is unavailable, do not invent a terminal fallback inside this workflow.
+Ask the user before opening another visible surface manually.
 
 ## Important Constraints
 
