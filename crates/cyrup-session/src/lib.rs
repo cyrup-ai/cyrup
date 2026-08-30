@@ -54,7 +54,7 @@ pub use prompt::{
     ContextStore, DocsPointers, PromptInputs, ResolvedOverride, SkillPointer, SystemPromptBuilder,
     ToolPromptContribution, TrustQuery, DEFAULT_SELECTED_TOOLS,
 };
-pub use store::{DiskStore, MemStore, SessionStore};
+pub use store::{flush_session_writes, DiskStore, MemStore, SessionStore};
 
 #[cfg(test)]
 mod tests;

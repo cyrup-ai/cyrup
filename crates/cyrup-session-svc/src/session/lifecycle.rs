@@ -7,6 +7,7 @@
 use std::sync::atomic::Ordering;
 
 use cyrup_ext::HostEvent;
+use cyrup_session::flush_session_writes;
 use cyrup_session::manager::SessionManager;
 
 use crate::error::SessionServiceError;
@@ -115,6 +116,12 @@ impl AgentSession {
         // `impl Drop for AgentSession` for the backstop covering the paths that never get here.
         self.services.ext_host.invalidate_live(None);
         self.session_cancel.cancel();
+        // PERF-004 §3.5: session appends put their bytes in the page cache synchronously and hand
+        // only the `fdatasync` to a background worker, so nothing is lost if this never runs — but
+        // this is the seam every host teardown funnels through, so it is where the outstanding
+        // flushes get drained. On the blocking pool deliberately: the point of PERF-004 is to keep
+        // file I/O off the runtime workers.
+        let _ = tokio::task::spawn_blocking(flush_session_writes).await;
     }
 
     /// Move this session's manager out from behind its lock, leaving a fresh empty in-memory

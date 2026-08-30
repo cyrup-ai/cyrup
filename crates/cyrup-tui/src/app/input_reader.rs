@@ -202,6 +202,10 @@ pub(crate) fn hard_exit_from_reader() -> ! {
         eprintln!("cyrup: run loop wedged in arm `{arm}` for {:?}", since.elapsed());
     }
     cyrup_tools::kill_tracked_detached_children();
+    // PERF-004 §3.5: the wedge escalation never reaches `runtime.dispose()`, so drain the session
+    // fsync queue here. Nothing is lost without it — the bytes are already in the page cache —
+    // but one flush round is ~200 µs and this is the last chance to make them power-loss durable.
+    cyrup_session_svc::flush_session_writes();
     // `ShutdownSignal::Interrupt.exit_code()` — the shell's `128 + SIGINT` (`signals.rs`).
     std::process::exit(130)
 }
