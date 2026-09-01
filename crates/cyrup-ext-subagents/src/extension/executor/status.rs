@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::background::{run_status, RunId, RunPaths, RunState};
 use crate::extension::executor::SubagentExecutor;
-use crate::extension::executor::paths::{default_async_root, default_results_dir};
+use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
 use crate::extension::executor::requests::StatusViewSelector;
 use crate::extension::host::native_impl::read_nested_children;
 
@@ -25,8 +25,9 @@ impl SubagentExecutor {
     /// this process existed are never re-tailed. A `read_dir` failure on the `AsyncRoot` itself is
     /// logged (pi's `console.error` in the listing `catch`) rather than silently swallowed.
     pub async fn resume_tracking(&self, cwd: &Path) {
-        let async_root = default_async_root(cwd);
-        let results_dir = default_results_dir(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let async_root = default_async_root_in(&roots, cwd);
+        let results_dir = default_results_dir_in(&roots, cwd);
         let mut entries = match tokio::fs::read_dir(&async_root).await {
             Ok(entries) => entries,
             Err(err) => {
@@ -243,8 +244,9 @@ impl SubagentExecutor {
             scan_error: None,
         };
         if include_history {
-            let async_root = default_async_root(cwd);
-            let results_dir = default_results_dir(cwd);
+            let roots = self.config_snapshot().await.roots;
+            let async_root = default_async_root_in(&roots, cwd);
+            let results_dir = default_results_dir_in(&roots, cwd);
             match crate::tui::fleet::collect_fleet_history(
                 &async_root,
                 &results_dir,
@@ -274,8 +276,9 @@ impl SubagentExecutor {
         selector: StatusViewSelector<'_>,
     ) -> Result<String, String> {
         let StatusViewSelector { view, lines, index } = selector;
-        let async_root = default_async_root(cwd);
-        let results_dir = default_results_dir(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let async_root = default_async_root_in(&roots, cwd);
+        let results_dir = default_results_dir_in(&roots, cwd);
 
         // (1) pi `run-status.ts:192-198`.
         if let Some(view) = view
@@ -356,7 +359,7 @@ impl SubagentExecutor {
             &paths,
             index,
             lines,
-            &self.transcript_session_roots(cwd),
+            &self.transcript_session_roots(cwd, &roots),
         )
     }
 
@@ -387,14 +390,14 @@ impl SubagentExecutor {
     /// `trustedSessionRootsForStatus`, `subagent-executor.ts:402-407` @v0.43.0). A recorded `sessionFile` is
     /// data a CHILD wrote, so it is never dereferenced outside these roots — see
     /// [`crate::background::fleet_view`]'s containment gate.
-    fn transcript_session_roots(&self, cwd: &Path) -> Vec<PathBuf> {
-        let mut roots = vec![
-            default_async_root(cwd),
+    fn transcript_session_roots(&self, cwd: &Path, roots: &crate::paths::Roots) -> Vec<PathBuf> {
+        let mut session_roots = vec![
+            default_async_root_in(roots, cwd),
             crate::artifacts::project_subagents_dir(cwd),
             crate::artifacts::temp_artifacts_dir(cwd),
         ];
-        roots.dedup();
-        roots
+        session_roots.dedup();
+        session_roots
     }
 }
 

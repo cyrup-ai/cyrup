@@ -72,8 +72,18 @@ const MAX_DEPTH: i64 = 3;
 // Directory roots (pi shared/types.ts TEMP_ROOT_DIR / RESULTS_DIR / ASYNC_DIR + NESTED_EVENTS_DIR)
 // =================================================================================================
 
-/// The shared scratch root every subagent scratch directory hangs off — pi's `TEMP_ROOT_DIR`
-/// (`shared/types.ts`). `<temp_dir>/cyrup-subagents`, overridable with [`TEMP_ROOT_ENV`].
+/// The scratch root the NESTED-EVENT tree and the supervisor channels hang off — pi's
+/// `TEMP_ROOT_DIR` (`shared/types.ts`). `<temp_dir>/cyrup-subagents`, overridable with
+/// [`TEMP_ROOT_ENV`].
+///
+/// # Not the same root as `background::temp_root_dir`, despite the shared upstream name
+///
+/// Both render pi's one `TEMP_ROOT_DIR`, but they read different variables and resolve to
+/// different directories: that one keys off `CYRUP_HOME` (`<CYRUP_HOME>/.cyrup/subagents`), this
+/// one reads [`TEMP_ROOT_ENV`] and never consults `CYRUP_HOME` at all. A test that sandboxes only
+/// `CYRUP_HOME` therefore relocates that tree and leaves THIS one on the shared real temp root —
+/// which is why the integration tests covering nested events and supervisor channels have to set
+/// both variables.
 ///
 /// `pub` because [`crate::native_supervisor`] hangs `supervisor-channels/` off the SAME root
 /// upstream does (`native-supervisor-channel.ts:18` — `path.join(TEMP_ROOT_DIR,
@@ -81,9 +91,17 @@ const MAX_DEPTH: i64 = 3;
 /// files somewhere the parent's poller never looks.
 #[must_use]
 pub fn temp_root_dir() -> PathBuf {
-    std::env::var_os(TEMP_ROOT_ENV)
+    temp_root_dir_from(&|key| std::env::var_os(key), std::env::temp_dir())
+}
+
+/// [`temp_root_dir`] with its two ambient inputs supplied — the crate's `_from` convention, which
+/// this resolver was the last one in the crate to lack. Its absence is why
+/// [`crate::paths::Roots::from_lookup`] could not resolve every root from one lookup.
+#[must_use]
+pub fn temp_root_dir_from(env: crate::paths::EnvLookup<'_>, os_temp_dir: PathBuf) -> PathBuf {
+    env(TEMP_ROOT_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("cyrup-subagents"))
+        .unwrap_or_else(|| os_temp_dir.join("cyrup-subagents"))
 }
 
 /// The root directory every nested-event route lives under (pi `NESTED_EVENTS_DIR`).
@@ -589,15 +607,25 @@ fn assert_safe_id(label: &str, value: &str) -> Result<(), SubagentError> {
 }
 
 fn validate_route_shape(route: &NestedRoute) -> Result<(), SubagentError> {
+    validate_route_shape_in(&nested_events_dir(), route)
+}
+
+/// [`validate_route_shape`] against an explicitly supplied nested-events root.
+///
+/// The containment check is the point of this function — a route whose sink escapes the tree the
+/// caller trusts is rejected — so the TRUSTED ROOT is what varies, never the check. It is a
+/// parameter rather than a field on [`NestedRoute`] deliberately: that type is serialized across a
+/// process boundary, so a route carrying its own root would let a child nominate the very boundary
+/// it is being checked against.
+fn validate_route_shape_in(root: &Path, route: &NestedRoute) -> Result<(), SubagentError> {
     assert_safe_id("rootRunId", &route.root_run_id)?;
     assert_safe_id("capabilityToken", &route.capability_token)?;
-    let root = nested_events_dir();
-    if !contained_path(&root, &route.event_sink) {
+    if !contained_path(root, &route.event_sink) {
         return Err(SubagentError::UnsafePathToken(
             "Nested event sink is outside the subagent nested event root.".to_string(),
         ));
     }
-    if !contained_path(&root, &route.control_inbox) {
+    if !contained_path(root, &route.control_inbox) {
         return Err(SubagentError::UnsafePathToken(
             "Nested control inbox is outside the subagent nested event root.".to_string(),
         ));
@@ -631,9 +659,26 @@ fn create_dir_all_mode(path: &Path) -> std::io::Result<()> {
 ///
 /// Returns [`SubagentError`] if `root_run_id` is unsafe or the directories/file cannot be created.
 pub fn create_nested_route(root_run_id: &str) -> Result<NestedRoute, SubagentError> {
+    create_nested_route_in(&nested_events_dir(), root_run_id)
+}
+
+/// [`create_nested_route`] under an explicitly supplied nested-events root.
+///
+/// The returned [`NestedRoute`] carries absolute `event_sink`/`control_inbox` paths, so everything
+/// downstream — `write_nested_event`, `project_nested_events` — follows the route rather than
+/// re-deriving from [`TEMP_ROOT_ENV`]. Supplying the root here is therefore enough to scope a whole
+/// nested-events tree to a caller's own directory without moving that variable on the process.
+///
+/// # Errors
+///
+/// See [`create_nested_route`].
+pub fn create_nested_route_in(
+    events_root: &Path,
+    root_run_id: &str,
+) -> Result<NestedRoute, SubagentError> {
     assert_safe_id("rootRunId", root_run_id)?;
     let capability_token = uuid::Uuid::new_v4().to_string();
-    let route_root = nested_events_dir().join(format!("{root_run_id}-{capability_token}"));
+    let route_root = events_root.join(format!("{root_run_id}-{capability_token}"));
     let event_sink = route_root.join("events");
     let control_inbox = route_root.join("controls");
     create_dir_all_mode(&event_sink).map_err(SubagentError::Spawn)?;
@@ -954,7 +999,21 @@ fn write_route_record<T: serde::Serialize>(
 /// Returns [`SubagentError`] if the route is invalid, the record fails sanitization, or the file
 /// cannot be written.
 pub fn write_nested_event(route: &NestedRoute, event: &NestedEventInput) -> Result<(), SubagentError> {
-    validate_route_shape(route)?;
+    write_nested_event_in(&nested_events_dir(), route, event)
+}
+
+/// [`write_nested_event`] validated against an explicitly supplied nested-events root, for a caller
+/// that minted its route with [`create_nested_route_in`] and therefore owns the tree.
+///
+/// # Errors
+///
+/// See [`write_nested_event`].
+pub fn write_nested_event_in(
+    events_root: &Path,
+    route: &NestedRoute,
+    event: &NestedEventInput,
+) -> Result<(), SubagentError> {
+    validate_route_shape_in(events_root, route)?;
     let record = NestedEventRecord {
         event_type: event.event_type.clone(),
         ts: event.ts,
@@ -1122,7 +1181,19 @@ pub fn apply_nested_event(registry: NestedRegistry, event: &NestedEventRecord) -
 ///
 /// Returns [`SubagentError`] if the route is invalid.
 pub fn read_nested_registry(route: &NestedRoute) -> Result<NestedRegistry, SubagentError> {
-    validate_route_shape(route)?;
+    read_nested_registry_in(&nested_events_dir(), route)
+}
+
+/// [`read_nested_registry`] validated against an explicitly supplied nested-events root.
+///
+/// # Errors
+///
+/// See [`read_nested_registry`].
+pub fn read_nested_registry_in(
+    events_root: &Path,
+    route: &NestedRoute,
+) -> Result<NestedRegistry, SubagentError> {
+    validate_route_shape_in(events_root, route)?;
     let empty = NestedRegistry {
         root_run_id: route.root_run_id.clone(),
         updated_at: 0,
@@ -1178,8 +1249,20 @@ fn write_registry_atomic(path: &Path, registry: &NestedRegistry) -> Result<(), S
 ///
 /// Returns [`SubagentError`] if the route is invalid or the sink cannot be read.
 pub fn project_nested_events(route: &NestedRoute) -> Result<NestedRegistry, SubagentError> {
-    validate_route_shape(route)?;
-    let mut registry = read_nested_registry(route)?;
+    project_nested_events_in(&nested_events_dir(), route)
+}
+
+/// [`project_nested_events`] validated against an explicitly supplied nested-events root.
+///
+/// # Errors
+///
+/// See [`project_nested_events`].
+pub fn project_nested_events_in(
+    events_root: &Path,
+    route: &NestedRoute,
+) -> Result<NestedRegistry, SubagentError> {
+    validate_route_shape_in(events_root, route)?;
+    let mut registry = read_nested_registry_in(events_root, route)?;
     let mut seen: Vec<String> = registry.processed_events.clone();
     let mut changed = false;
 
@@ -1237,6 +1320,11 @@ pub fn project_nested_events(route: &NestedRoute) -> Result<NestedRegistry, Suba
 // =================================================================================================
 
 fn route_from_root_dir(route_root: &Path) -> Option<NestedRoute> {
+    route_from_root_dir_in(&nested_events_dir(), route_root)
+}
+
+/// [`route_from_root_dir`] validated against an explicitly supplied nested-events root.
+fn route_from_root_dir_in(events_root: &Path, route_root: &Path) -> Option<NestedRoute> {
     let metadata: Value = serde_json::from_str(
         &std::fs::read_to_string(route_root.join(ROUTE_FILE)).ok()?,
     )
@@ -1249,7 +1337,7 @@ fn route_from_root_dir(route_root: &Path) -> Option<NestedRoute> {
         control_inbox: route_root.join("controls"),
         capability_token,
     };
-    validate_route_shape(&route).ok()?;
+    validate_route_shape_in(events_root, &route).ok()?;
     Some(route)
 }
 
@@ -1300,7 +1388,16 @@ pub fn project_nested_registry_for_root(
 ///
 /// Returns [`SubagentError`] if the events dir cannot be listed.
 pub fn list_nested_routes() -> Result<Vec<NestedRoute>, SubagentError> {
-    let dir = nested_events_dir();
+    list_nested_routes_in(&nested_events_dir())
+}
+
+/// [`list_nested_routes`] under an explicitly supplied nested-events root.
+///
+/// # Errors
+///
+/// See [`list_nested_routes`].
+pub fn list_nested_routes_in(dir: &Path) -> Result<Vec<NestedRoute>, SubagentError> {
+    let dir = dir.to_path_buf();
     let entries = match std::fs::read_dir(&dir) {
         Ok(read) => read,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1308,7 +1405,7 @@ pub fn list_nested_routes() -> Result<Vec<NestedRoute>, SubagentError> {
     };
     Ok(entries
         .filter_map(Result::ok)
-        .filter_map(|entry| route_from_root_dir(&dir.join(entry.file_name())))
+        .filter_map(|entry| route_from_root_dir_in(&dir, &dir.join(entry.file_name())))
         .collect())
 }
 
@@ -1655,9 +1752,22 @@ pub fn is_top_level_async_dir(async_dir_path: &Path) -> bool {
 /// nested storage subtree.
 #[must_use]
 pub fn resolve_nested_async_dir(root_run_id: &str, run: &NestedRunSummary) -> Option<PathBuf> {
+    resolve_nested_async_dir_in(&nested_runs_dir(), root_run_id, run)
+}
+
+/// [`resolve_nested_async_dir`] against an explicitly supplied nested-runs root.
+///
+/// As with the route guard, the CHECK is fixed and only the trusted root varies — a descendant
+/// whose `async_dir` escapes the tree the caller owns is still refused.
+#[must_use]
+pub fn resolve_nested_async_dir_in(
+    nested_runs_root: &Path,
+    root_run_id: &str,
+    run: &NestedRunSummary,
+) -> Option<PathBuf> {
     let async_dir = run.async_dir.as_ref()?;
     let resolved = std::path::absolute(async_dir).unwrap_or_else(|_| PathBuf::from(async_dir));
-    let nested_root = nested_runs_dir().join(root_run_id).join(&run.id);
+    let nested_root = nested_runs_root.join(root_run_id).join(&run.id);
     if resolved == nested_root || resolved.starts_with(&nested_root) {
         Some(resolved)
     } else {

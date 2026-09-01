@@ -95,8 +95,20 @@ const PROBE_PROMPT: &str = "Reply with exactly \"OK\".";
 /// (non-zero exit, spawn failure, or timeout) is classified via [`resolve_probe_status`] over the
 /// combined stderr+stdout text (`killed`/timed-out short-circuits to `Timeout`, matching pi's
 /// `result.killed === true` check).
-pub(crate) async fn probe_model(full_id: &str) -> ProbeOutcome {
-    probe_model_with(&crate::spawn::resolve_spawn_command(), full_id, PROBE_TIMEOUT_MS).await
+///
+/// `spawn` supplies the command explicitly (`SubagentExtensionConfig::spawn_command`); `None`
+/// resolves it from the environment exactly as before.
+pub(crate) async fn probe_model(
+    full_id: &str,
+    spawn: Option<&crate::spawn::SpawnCommand>,
+) -> ProbeOutcome {
+    match spawn {
+        Some(command) => probe_model_with(command, full_id, PROBE_TIMEOUT_MS).await,
+        None => {
+            probe_model_with(&crate::spawn::resolve_spawn_command(), full_id, PROBE_TIMEOUT_MS)
+                .await
+        }
+    }
 }
 
 /// The injectable core of [`probe_model`], parameterized over which [`crate::spawn::SpawnCommand`]

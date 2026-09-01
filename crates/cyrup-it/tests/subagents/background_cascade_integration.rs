@@ -28,8 +28,9 @@
 //! This file is a separate compilation unit from `cyrup-ext-subagents`'s own `lib.rs` (ordinary
 //! Cargo integration-test placement), so it is NOT bound by that crate's `#![forbid(unsafe_code)]`;
 //! the `unsafe` blocks below exist only because Rust 2024 requires `unsafe` for
-//! `std::env::set_var`/`remove_var`, and they are serialized by [`ENV_MUTATION_LOCK`] because
-//! `CYRUP_SUBAGENTS_TEMP_ROOT` is process-global state.
+//! every root this file needs is named through `Roots::sandboxed` and carried into the run by
+//! `RunnerOverrides`, so it mutates no process-global state and needs no lock — including the
+//! cascade's own mid-run root read, which `TurnLoopIo` now carries rather than re-deriving.
 
 #![allow(
     clippy::unwrap_used,
@@ -41,27 +42,20 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use tokio::sync::Mutex;
 
 use cyrup_core::ModelId;
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
 use cyrup_ext_subagents::background::control::{InterruptRequest, StopRequest, TimeoutRequest};
-use cyrup_ext_subagents::background::runner_main::{RunnerConfig, run};
+use cyrup_ext_subagents::background::runner_main::{RunnerConfig, RunnerOverrides, run_with};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::{ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus};
 use cyrup_ext_subagents::discovery::types::SystemPromptMode;
 use cyrup_ext_subagents::exec::ResolvedAgentPersona;
 use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 use cyrup_ext_subagents::spawn::nested_events::{
-    NestedEventInput, NestedRoute, NestedRunSummary, TEMP_ROOT_ENV, create_nested_route,
-    write_nested_event,
+    NestedEventInput, NestedRoute, NestedRunSummary, create_nested_route_in,
+    write_nested_event_in,
 };
-
-/// `CYRUP_SUBAGENTS_TEMP_ROOT` is process-global and every nested-events path derives from it, so
-/// the two tests in this file must not overlap. Held for each test's whole body — including the
-/// `run()` call itself, which resolves the nested-runs root from this same variable while it
-/// cascades. Mirrors the `ENV_MUTATION_LOCK` convention every other integration test in this crate
-/// uses.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
@@ -114,9 +108,9 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
 /// real fan-out child does (a `subagent.nested.started`-shaped event carrying its own summary), and
 /// create its run directory. Returns the descendant's async dir — the directory whose `control/`
 /// inbox the cascade must reach.
-fn register_live_descendant(route: &NestedRoute, temp_root: &Path, child_id: &str) -> PathBuf {
-    let async_dir = temp_root
-        .join("nested-subagent-runs")
+fn register_live_descendant(roots: &Roots, route: &NestedRoute, child_id: &str) -> PathBuf {
+    let async_dir = roots
+        .nested_runs()
         .join(&route.root_run_id)
         .join(child_id);
     std::fs::create_dir_all(&async_dir).expect("create the descendant's run dir");
@@ -165,7 +159,8 @@ fn register_live_descendant(route: &NestedRoute, temp_root: &Path, child_id: &st
     // file inbox. The signal is only ever a latency optimization.
     child.pid = None;
 
-    write_nested_event(
+    write_nested_event_in(
+        &roots.nested_events(),
         route,
         &NestedEventInput {
             event_type: "subagent.nested.started".to_string(),
@@ -188,9 +183,10 @@ struct Harness {
 
 /// Build a one-step background run that owns a nested route with one live descendant, and write its
 /// one-shot config to disk. Nothing is started yet — the caller plants a control request first.
-async fn build_run(dir: &Path, temp_root: &Path, run_token: &str, child_id: &str) -> Harness {
-    let route = create_nested_route(run_token).expect("mint a nested route");
-    let descendant_dir = register_live_descendant(&route, temp_root, child_id);
+async fn build_run(dir: &Path, roots: &Roots, run_token: &str, child_id: &str) -> Harness {
+    let route = create_nested_route_in(&roots.nested_events(), run_token)
+        .expect("mint a nested route");
+    let descendant_dir = register_live_descendant(roots, &route, child_id);
 
     let async_root = dir.join("async");
     let results_dir = dir.join("results");
@@ -260,17 +256,15 @@ async fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> T {
 /// run's own steps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupting_a_background_run_cascades_to_its_live_async_descendants() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let temp_root = dir.path().join("subagents-temp");
     std::fs::create_dir_all(&temp_root).unwrap();
-    // SAFETY: mutex-serialized, scoped env mutation — the standing convention in this crate's
-    // integration tests. Held for the whole test body because `run()` reads it while cascading.
-    unsafe {
-        std::env::set_var(TEMP_ROOT_ENV, &temp_root);
-    }
+    // The roots this run resolves against, named rather than exported. `run_with` carries them
+    // into the loop, so the cascade's own mid-run read sees THIS tree — which is what used to
+    // require moving `CYRUP_SUBAGENTS_TEMP_ROOT` on the whole process.
+    let roots = Roots::sandboxed(&temp_root);
 
-    let harness = build_run(dir.path(), &temp_root, "cascadeintr1", "childintr1").await;
+    let harness = build_run(dir.path(), &roots, "cascadeintr1", "childintr1").await;
 
     // The interrupt a caller's `control::interrupt()` would have written, already pending when the
     // runner starts — the runner's mandatory synchronous startup check picks it up and the step
@@ -283,14 +277,13 @@ async fn interrupting_a_background_run_cascades_to_its_live_async_descendants() 
     .await
     .expect("plant the interrupt request");
 
-    run(&harness.config_path, &harness.run_paths)
-        .await
-        .expect("run() never returns Err");
-
-    // SAFETY: scoped cleanup inside the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(TEMP_ROOT_ENV);
-    }
+    run_with(
+        &harness.config_path,
+        &harness.run_paths,
+        RunnerOverrides { roots: Some(roots.clone()), ..Default::default() },
+    )
+    .await
+    .expect("run() never returns Err");
 
     // The run itself paused — the pre-existing half of the behavior, asserted so a regression that
     // broke it while keeping the cascade would still be caught.
@@ -318,16 +311,15 @@ async fn interrupting_a_background_run_cascades_to_its_live_async_descendants() 
 /// resumable pause), and must cascade onward to this run's own live descendants.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delivered_timeout_request_fails_the_run_and_cascades_to_descendants() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let temp_root = dir.path().join("subagents-temp");
     std::fs::create_dir_all(&temp_root).unwrap();
-    // SAFETY: see the sibling test above.
-    unsafe {
-        std::env::set_var(TEMP_ROOT_ENV, &temp_root);
-    }
+    // The roots this run resolves against, named rather than exported. `run_with` carries them
+    // into the loop, so the cascade's own mid-run read sees THIS tree — which is what used to
+    // require moving `CYRUP_SUBAGENTS_TEMP_ROOT` on the whole process.
+    let roots = Roots::sandboxed(&temp_root);
 
-    let harness = build_run(dir.path(), &temp_root, "cascadetmo1", "childtmo1").await;
+    let harness = build_run(dir.path(), &roots, "cascadetmo1", "childtmo1").await;
 
     // What an ancestor whose own deadline expired drops into this run's inbox.
     let inbox_dir = harness.run_paths.control_inbox.parent().unwrap().to_path_buf();
@@ -340,14 +332,13 @@ async fn a_delivered_timeout_request_fails_the_run_and_cascades_to_descendants()
     .await
     .expect("plant the timeout request");
 
-    run(&harness.config_path, &harness.run_paths)
-        .await
-        .expect("run() never returns Err");
-
-    // SAFETY: scoped cleanup inside the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(TEMP_ROOT_ENV);
-    }
+    run_with(
+        &harness.config_path,
+        &harness.run_paths,
+        RunnerOverrides { roots: Some(roots.clone()), ..Default::default() },
+    )
+    .await
+    .expect("run() never returns Err");
 
     // 1. The verb was actually consumed (at-most-once: the file is gone).
     assert!(
@@ -432,16 +423,15 @@ async fn a_delivered_timeout_request_fails_the_run_and_cascades_to_descendants()
 /// (`:2281-2310`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delivered_stop_request_stops_the_run_and_cascades_to_descendants() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let temp_root = dir.path().join("subagents-temp");
     std::fs::create_dir_all(&temp_root).unwrap();
-    // SAFETY: see the sibling tests above.
-    unsafe {
-        std::env::set_var(TEMP_ROOT_ENV, &temp_root);
-    }
+    // The roots this run resolves against, named rather than exported. `run_with` carries them
+    // into the loop, so the cascade's own mid-run read sees THIS tree — which is what used to
+    // require moving `CYRUP_SUBAGENTS_TEMP_ROOT` on the whole process.
+    let roots = Roots::sandboxed(&temp_root);
 
-    let harness = build_run(dir.path(), &temp_root, "cascadestp1", "childstp1").await;
+    let harness = build_run(dir.path(), &roots, "cascadestp1", "childstp1").await;
 
     // Planted through the REAL parent-side primitive, so this covers the writer too.
     let stop_path = cyrup_ext_subagents::background::control::stop_request_path(
@@ -455,14 +445,13 @@ async fn a_delivered_stop_request_stops_the_run_and_cascades_to_descendants() {
     .await
     .expect("plant the stop request");
 
-    run(&harness.config_path, &harness.run_paths)
-        .await
-        .expect("run() never returns Err");
-
-    // SAFETY: scoped cleanup inside the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(TEMP_ROOT_ENV);
-    }
+    run_with(
+        &harness.config_path,
+        &harness.run_paths,
+        RunnerOverrides { roots: Some(roots.clone()), ..Default::default() },
+    )
+    .await
+    .expect("run() never returns Err");
 
     // 1. Consumed at most once.
     assert!(

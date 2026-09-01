@@ -6,7 +6,6 @@ use std::path::Path;
 
 use crate::background::{RunId, RunMode, RunPaths};
 use crate::background::atomic::write_atomic_json;
-use crate::background::spawn_detached::spawn_detached_runner;
 use crate::error::SubagentError;
 use crate::exec::ResolvedAgentPersona;
 use crate::fork_context::resolve_effective_context;
@@ -87,7 +86,7 @@ impl SubagentExecutor {
         // R-SA-055: resolve the agent (and therefore validate it exists) before any spawn.
         // T0.1/C13: the SAME resolved definition is projected into the plan-time persona map handed
         // to the runner, so hop 2 dispatches this agent's REAL persona rather than a placeholder.
-        let agent = self.resolve_agent(cwd, agent_name, agent_scope)?;
+        let agent = self.resolve_agent(cwd, agent_name, agent_scope, &cfg.roots)?;
         let mut resolved_persona = crate::exec::resolve_step_agent_config(&agent);
         // SUBA-047 (async half) / pi `params.toolBudget ?? agentConfig.toolBudget`
         // (`runs/background/async-execution.ts:1298`). The persona map IS what hop 2 dispatches
@@ -99,9 +98,27 @@ impl SubagentExecutor {
         }
         let resolved_agents: BTreeMap<String, ResolvedAgentPersona> =
             BTreeMap::from([(agent_name.to_string(), resolved_persona)]);
-        // Fork default-mode (Tier-2): an OMITTED call-site `context` falls back to THIS agent's own
-        // `default_context` (pi `resolveAgentDefaultContextPolicy`), an explicit value still wins.
-        let effective_context = resolve_effective_context(context, agent.default_context);
+        // Fork default-mode (Tier-2): an OMITTED call-site `context` takes the defaults ladder (pi
+        // `resolveAgentDefaultContextPolicy`), an explicit value still wins.
+        //
+        // SUBA-079: same three rungs as the foreground path, including the availability test that
+        // downgrades an INHERITED `fork` preference to `Fresh` rather than failing the launch.
+        // `cfg` is the snapshot this function already took for the depth guard above — one read
+        // per launch, matching the foreground path.
+        let can_prefer_fork = match context {
+            Option::None => self.can_prefer_fork(cwd).await,
+            Some(_) => false,
+        };
+        let effective_context = resolve_effective_context(
+            context,
+            agent_name,
+            agent.default_context,
+            crate::fork_context::resolve_default_subagent_context(
+                cfg.default_subagent_context.as_ref(),
+            )
+            .map_err(SubagentError::Management)?,
+            can_prefer_fork,
+        )?;
         // R-SA-137: eager fork-context resolution before ANY process is spawned for this batch.
         //
         // SUBA-075: `true` is upstream's own `forceThinkingOffForIndex?.(index) ?? true` fallback.
@@ -415,8 +432,12 @@ impl SubagentExecutor {
         // (ensureAccessibleDir-equivalent), then pass their ABSOLUTE paths through `RunnerConfig`
         // so the detached runner writes its terminal ResultFile into the SAME `results_dir` this
         // orchestrator created and watches — never a re-derived, never-created divergent dir.
+        // `cfg.roots` IS honoured here even though this is a detached spawn: the two roots
+        // are resolved in THIS process and cross to the runner as absolute paths in
+        // `RunnerConfig::async_root`/`results_dir`, so the child never re-derives them from its own
+        // environment. Contrast `cfg.spawn_command`, which cannot cross and is inert here.
         let (async_root, results_dir) =
-            resolve_background_storage_roots(cwd, inherited_nested_route.as_ref())?;
+            resolve_background_storage_roots(cwd, inherited_nested_route.as_ref(), &cfg.roots)?;
         crate::background::ensure_accessible_dir(&async_root)
             .await
             .map_err(SubagentError::Spawn)?;
@@ -500,7 +521,7 @@ impl SubagentExecutor {
             // one-shot config so the detached hop-2 runner enforces the SAME policy the foreground
             // path does. Without it, `subagent({..., background: true})` would be an unpoliced way
             // around an enforcing `modelScope`.
-            model_scope: Self::resolve_model_scope(cwd)?,
+            model_scope: Self::resolve_model_scope(cwd, &cfg.roots)?,
             // Nested-route inheritance (pi `config.nestedRoute`/`config.nestedSelf`,
             // `async-execution.ts:727-731,989-993` @v0.34.0): carried verbatim so the detached runner (were it
             // ever to relay ITS OWN descendants further, a later unit's concern) inherits the SAME
@@ -539,10 +560,22 @@ impl SubagentExecutor {
             .await
             .map_err(SubagentError::Spawn)?;
 
-        let pid = spawn_detached_runner(
+        // Tier 2 for a DETACHED child: this runner is a separate process that re-resolves its own
+        // binary and paths from the environment it inherits, so `cfg.spawn_command` is handed to it
+        // as the command to exec and `cfg.roots`' child override rides along as `CYRUP_HOME` on ITS
+        // `Command` — and ONLY when the roots are a sandbox the child could not derive itself.
+        // Neither is set on this process. With both unset this is byte-for-byte the previous
+        // `spawn_detached_runner` behaviour.
+        let resolved_command = cfg
+            .spawn_command
+            .clone()
+            .unwrap_or_else(crate::spawn::resolve_spawn_command);
+        let pid = crate::background::spawn_detached::spawn_detached_runner_with_command(
+            &resolved_command,
             &cfg_path,
             &run_paths.runner_stdout_log,
             &run_paths.runner_stderr_log,
+            &crate::background::parent_anchor::detached_runner_env_overlay_in(&cfg.roots),
         )?;
 
         // pi `executeAsyncChain`/`executeAsyncSingle` (`async-execution.ts:1198-1565` @v0.43.0): once
@@ -629,7 +662,7 @@ mod tests {
 
     use super::*;
     use crate::discovery::types::AgentReadScope;
-    use crate::fork_context::ContextMode;
+    use crate::fork_context::ContextRequest;
     use cyrup_core::ModelId;
     use std::sync::Arc;
 
@@ -662,7 +695,7 @@ mod tests {
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
-                context: Some(ContextMode::Fresh),
+                context: Some(ContextRequest::Fresh),
                 model_override: None,
                 agent_scope: AgentReadScope::Both,
                 acceptance: None,
@@ -788,7 +821,7 @@ mod tests {
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
-                context: Some(ContextMode::Fresh),
+                context: Some(ContextRequest::Fresh),
                 model_override: None,
                 agent_scope: AgentReadScope::Both,
                 acceptance: None,
@@ -862,7 +895,7 @@ mod tests {
                     cwd: dir.path(),
                     agent_name: "worker",
                     task: "do something",
-                    context: Some(ContextMode::Fresh),
+                    context: Some(ContextRequest::Fresh),
                     model_override: None,
                     agent_scope: AgentReadScope::Both,
                     acceptance: None,
@@ -942,7 +975,7 @@ mod tests {
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
-                context: Some(ContextMode::Fresh),
+                context: Some(ContextRequest::Fresh),
                 model_override: None,
                 agent_scope: AgentReadScope::Both,
                 acceptance: None,
@@ -1000,7 +1033,7 @@ mod tests {
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
-                context: Some(ContextMode::Fresh),
+                context: Some(ContextRequest::Fresh),
                 model_override: None,
                 agent_scope: AgentReadScope::Both,
                 acceptance: None,
@@ -1059,7 +1092,7 @@ mod tests {
                 cwd: &root,
                 agent_name: "worker",
                 task: "do something",
-                context: Some(ContextMode::Fresh),
+                context: Some(ContextRequest::Fresh),
                 model_override: None,
                 agent_scope: AgentReadScope::Both,
                 acceptance: None,
@@ -1172,7 +1205,7 @@ mod tests {
                     cwd: dir.path(),
                     agent_name: "worker",
                     task: "do something",
-                    context: Some(ContextMode::Fresh),
+                    context: Some(ContextRequest::Fresh),
                     model_override: None,
                     agent_scope: AgentReadScope::Both,
                     acceptance: Some(policy.clone()),
@@ -1257,7 +1290,7 @@ mod tests {
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
-                context: Some(ContextMode::Fresh),
+                context: Some(ContextRequest::Fresh),
                 model_override: Some(ModelId::from("anthropic/claude-override-test")),
                 agent_scope: AgentReadScope::Both,
                 acceptance: None,
@@ -1321,7 +1354,7 @@ mod tests {
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
-                context: Some(ContextMode::Fresh),
+                context: Some(ContextRequest::Fresh),
                 model_override: None,
                 agent_scope: AgentReadScope::Both,
                 acceptance: Some(policy.clone()),
@@ -1397,7 +1430,7 @@ mod tests {
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
-                context: Some(ContextMode::Fresh),
+                context: Some(ContextRequest::Fresh),
                 model_override: None,
                 agent_scope: AgentReadScope::Both,
                 acceptance: None,

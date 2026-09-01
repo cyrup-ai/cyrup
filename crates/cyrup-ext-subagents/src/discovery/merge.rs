@@ -33,7 +33,7 @@ use std::path::PathBuf;
 
 use super::types::{
     AgentDefinition, AgentModelSourceInfo, AgentOverrideConfig, AgentOverrideInfo, AgentSource,
-    LayeredOverrideSettings, OverrideField, OverrideScope,
+    LayeredOverrideSettings, OutputSpec, OverrideField, OverrideScope, ToolsOverrideField,
 };
 use crate::error::SubagentError;
 
@@ -395,6 +395,23 @@ fn apply_builtin_override(
     }
     let base_snapshot = Box::new(agent.clone());
 
+    // pi `description` (agents.ts:1258): a plain replace. Only `Value` applies — deliberately NOT
+    // `apply_field_full_replace`, whose `ExplicitClear` arm would blank the description. pi declares
+    // no `| false` clear form for this key, but `OverrideField<String>`'s untagged `Deserialize`
+    // still yields `ExplicitClear` for a JSON `false` (the `Value(String)` arm rejects a bool), so
+    // the state is reachable from a settings file and has to be decided rather than fallen into.
+    // Ignoring is the safe answer: `description` is the text the parent model reads when choosing
+    // an agent, so a nonsensical value must not erase the agent's selectability. The custom path
+    // below already ignores it; the two must not disagree on the same settings key.
+    if let OverrideField::Value(v) = &delta.description {
+        agent.description = v.clone();
+    }
+    apply_output_override(agent, &delta.output);
+    // pi `defaultReads`/`false` -> `delete next.defaultReads` (agents.ts:1261), i.e. `None` ("the
+    // agent declared no default reads"), NOT an empty list.
+    apply_field_full_replace(&mut agent.default_reads, &delta.default_reads, None, |v| {
+        Some(v.iter().map(PathBuf::from).collect())
+    });
     apply_field_full_replace(&mut agent.model, &delta.model, None, |v| {
         Some(cyrup_core::ModelId::from(v.clone()))
     });
@@ -439,9 +456,22 @@ fn apply_builtin_override(
         |v| v.clone(),
     );
     apply_field_full_replace(&mut agent.skills, &delta.skills, Vec::new(), |v| v.clone());
-    // pi `tools`/`false` clears to the EMPTY allowlist (`[]`, "no tools"), NOT to `None`
-    // ("no restriction") — agents.ts:764 `splitToolList(false ? [] : tools)`.
-    apply_field_full_replace(&mut agent.tools, &delta.tools, Some(Vec::new()), |v| {
+    apply_tools_override(&mut agent.tools, &delta.tools);
+    // pi `extensions`/`false` -> `delete next.extensions` (agents.ts:1282). `None` here means "all
+    // extensions visible", which is the opposite of `Some(vec![])` ("none") — so, unlike `tools`,
+    // the clear value IS `None`.
+    //
+    // Deliberately does NOT touch [`AgentDefinition::extensions_from_default`], in either
+    // direction. Not setting it is the point: an explicit override is not a default. Not CLEARING a
+    // `true` left by `apply_default_extensions` is also deliberate, and needs saying because the
+    // ordering makes it reachable — `apply_default_extensions` runs BEFORE per-agent overrides
+    // (`apply_overrides`, above) and stamps the flag on every agent it fills, so an override that
+    // then replaces the list leaves a merged definition claiming default-provenance for an
+    // override-supplied value. That staleness is upstream's too (`agents.ts:1282` likewise never
+    // clears `extensionsFromDefault`) and is unreachable in practice: the sole consumer,
+    // `management::handlers::editable_base`, reads the pre-override `base_snapshot` whenever an
+    // override applied, never this post-override field.
+    apply_field_full_replace(&mut agent.extensions, &delta.extensions, None, |v| {
         Some(v.clone())
     });
     apply_field_full_replace(
@@ -456,6 +486,10 @@ fn apply_builtin_override(
         None,
         |v| Some(*v),
     );
+    // pi `toolBudget`/`false` -> `delete next.toolBudget` (agents.ts:1285).
+    apply_field_full_replace(&mut agent.tool_budget, &delta.tool_budget, None, |v| {
+        Some(v.clone())
+    });
 
     agent.override_info = Some(AgentOverrideInfo {
         scope,
@@ -512,6 +546,52 @@ fn apply_field_full_replace<T, F>(
     }
 }
 
+/// pi `applyToolsOverride` (`agents.ts:1237-1246`). Deliberately NOT expressed through
+/// [`apply_field_full_replace`]: the four states map to three DIFFERENT non-`Unset` outcomes, and
+/// the middle two are opposites at a security boundary —
+///
+/// - `false` -> `splitToolList([])` -> `Some(vec![])`, the EMPTY allowlist ("no tools at all");
+/// - `"inherit"` -> `delete target.tools` -> `None`, NO allowlist ("the full parent tool surface").
+///
+/// Collapsing them would hand an agent every tool where the operator asked for none. Shared by
+/// both apply paths, exactly as pi shares the one function between `applyBuiltinOverride` and
+/// `applyCustomAgentOverride`. pi additionally deletes/repopulates `mcpDirectTools` alongside;
+/// this crate carries MCP direct tools inside the same list, so the one assignment covers both.
+fn apply_tools_override(
+    target: &mut Option<Vec<super::types::ToolRef>>,
+    delta: &ToolsOverrideField,
+) {
+    match delta {
+        ToolsOverrideField::Unset => {}
+        ToolsOverrideField::ExplicitClear => *target = Some(Vec::new()),
+        ToolsOverrideField::Inherit => *target = None,
+        ToolsOverrideField::Value(tools) => *target = Some(tools.clone()),
+    }
+}
+
+/// pi's `output` override arm (`agents.ts:1259`), adapted to this crate's merged
+/// [`OutputSpec`].
+///
+/// Upstream `output` (a path string) and `outputMode` are two INDEPENDENT `AgentConfig` fields, so
+/// `next.output = override.output` leaves `outputMode` untouched. This crate stores the pair as one
+/// [`OutputSpec`], so a naive whole-struct replace would silently drop an already-resolved
+/// `mode` — a behavioural divergence from pi that no test of `output` alone would catch. Hence the
+/// concrete arm rebuilds the spec around the EXISTING mode, and only the explicit clear (pi's
+/// `delete next.output`) drops the whole thing.
+fn apply_output_override(agent: &mut AgentDefinition, delta: &OverrideField<String>) {
+    match delta {
+        OverrideField::Unset => {}
+        OverrideField::ExplicitClear => agent.output = None,
+        OverrideField::Value(path) => {
+            let mode = agent.output.as_ref().and_then(|spec| spec.mode);
+            agent.output = Some(OutputSpec {
+                path: Some(PathBuf::from(path)),
+                mode,
+            });
+        }
+    }
+}
+
 /// pi `applyCustomAgentOverrides`' per-agent body (`agents.ts:1200-1212`): project override wins over
 /// user override; only ONE is ever applied, with the SETTINGS scope/path (never the agent's own
 /// source). The project branch is gated on the project scope actually existing.
@@ -546,6 +626,27 @@ fn apply_custom_override(
     let base_snapshot = Box::new(agent.clone());
     let mut applied_any = false;
 
+    // pi `description` custom arm (agents.ts:1380-1383): UNCONDITIONAL — no frontmatter gate and
+    // no clear form, unlike every fill below it.
+    if let OverrideField::Value(v) = &delta.description {
+        agent.description = v.clone();
+        applied_any = true;
+    }
+    // pi `fill("output", ["output"], ...)` (agents.ts:1384-1386) — gated, but the concrete arm has
+    // to preserve `mode`, so it cannot go through `apply_field_fill_unset` (which cannot read the
+    // target). Mirrors the `disabled` arm below in hand-rolling the gate.
+    if !agent.present_fields.contains("output") && delta.output.is_present() {
+        apply_output_override(agent, &delta.output);
+        applied_any = true;
+    }
+    applied_any |= apply_field_fill_unset(
+        &mut agent.default_reads,
+        &["defaultReads"],
+        &agent.present_fields,
+        &delta.default_reads,
+        None,
+        |v| Some(v.iter().map(PathBuf::from).collect()),
+    );
     let model_applied = apply_field_fill_unset(
         &mut agent.model,
         &["model"],
@@ -628,13 +729,18 @@ fn apply_custom_override(
         Vec::new(),
         |v| v.clone(),
     );
-    // pi `tools`/`false` clears to the EMPTY allowlist, NOT `None` (agents.ts:900-905).
+    // pi `tools` custom arm (agents.ts:1438-1441): the frontmatter gate is hand-rolled upstream
+    // too, because the four-state apply is a shared function rather than a value assignment.
+    if !agent.present_fields.contains("tools") && delta.tools.is_present() {
+        apply_tools_override(&mut agent.tools, &delta.tools);
+        applied_any = true;
+    }
     applied_any |= apply_field_fill_unset(
-        &mut agent.tools,
-        &["tools"],
+        &mut agent.extensions,
+        &["extensions"],
         &agent.present_fields,
-        &delta.tools,
-        Some(Vec::new()),
+        &delta.extensions,
+        None,
         |v| Some(v.clone()),
     );
     applied_any |= apply_field_fill_unset(
@@ -652,6 +758,14 @@ fn apply_custom_override(
         &delta.completion_guard,
         None,
         |v| Some(*v),
+    );
+    applied_any |= apply_field_fill_unset(
+        &mut agent.tool_budget,
+        &["toolBudget"],
+        &agent.present_fields,
+        &delta.tool_budget,
+        None,
+        |v| Some(v.clone()),
     );
 
     if applied_any {
@@ -709,7 +823,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::discovery::types::{OutputSpec, SubagentSettings, SystemPromptMode, ToolRef};
+    use crate::discovery::types::{
+        OutputSpec, ResolvedToolBudget, SubagentSettings, SystemPromptMode, ToolBudgetBlock, ToolRef,
+    };
     use crate::fork_context::ContextMode;
 
     // Two fixed settings-file paths the two-scope helpers below stamp into provenance, so every
@@ -1362,11 +1478,20 @@ mod tests {
                 // systemPrompt is set but must NOT apply to a custom agent (builtin-only field).
                 system_prompt: OverrideField::Value("should not apply".to_string()),
                 skills: OverrideField::Value(vec!["tdd".to_string()]),
-                tools: OverrideField::Value(vec![ToolRef::Builtin("read".to_string())]),
+                tools: ToolsOverrideField::Value(vec![ToolRef::Builtin("read".to_string())]),
                 subagent_only_extensions: OverrideField::Value(vec![
                     "./tools/child-review.ts".to_string(),
                 ]),
                 completion_guard: OverrideField::Value(false),
+                description: OverrideField::Value("overridden description".to_string()),
+                output: OverrideField::Value("./out/review.md".to_string()),
+                default_reads: OverrideField::Value(vec!["./AGENTS.md".to_string()]),
+                extensions: OverrideField::Value(vec!["./ext/review.ts".to_string()]),
+                tool_budget: OverrideField::Value(ResolvedToolBudget {
+                    hard: 40,
+                    soft: Some(30),
+                    block: ToolBudgetBlock::Names(vec!["read".to_string()]),
+                }),
             },
         ));
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
@@ -1390,7 +1515,258 @@ mod tests {
             vec!["./tools/child-review.ts".to_string()]
         );
         assert_eq!(updated.completion_guard, Some(false));
+        // SUBA-081's five added fields, on the custom (fill-unset) path.
+        assert_eq!(updated.description, "overridden description");
+        assert_eq!(
+            updated.output,
+            Some(OutputSpec {
+                path: Some(PathBuf::from("./out/review.md")),
+                mode: None,
+            })
+        );
+        assert_eq!(updated.default_reads, Some(vec![PathBuf::from("./AGENTS.md")]));
+        assert_eq!(updated.extensions, Some(vec!["./ext/review.ts".to_string()]));
+        assert_eq!(
+            updated.tool_budget,
+            Some(ResolvedToolBudget {
+                hard: 40,
+                soft: Some(30),
+                block: ToolBudgetBlock::Names(vec!["read".to_string()]),
+            })
+        );
         assert!(updated.override_info.is_some());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-081: the five previously-unmodeled override fields, plus `tools: "inherit"`
+    // -----------------------------------------------------------------------------------------
+
+    /// A full delta for the five fields SUBA-081 added, used by the builtin-path tests below.
+    fn suba081_delta() -> AgentOverrideConfig {
+        AgentOverrideConfig {
+            description: OverrideField::Value("from settings".to_string()),
+            output: OverrideField::Value("./out/report.md".to_string()),
+            default_reads: OverrideField::Value(vec!["./docs/spec.md".to_string()]),
+            extensions: OverrideField::Value(vec!["./ext/a.ts".to_string()]),
+            tool_budget: OverrideField::Value(ResolvedToolBudget {
+                hard: 12,
+                soft: None,
+                block: ToolBudgetBlock::Names(vec!["bash".to_string()]),
+            }),
+            ..AgentOverrideConfig::default()
+        }
+    }
+
+    /// The same five fields, each stating pi's `false` explicit-clear.
+    fn suba081_clear_delta() -> AgentOverrideConfig {
+        AgentOverrideConfig {
+            output: OverrideField::ExplicitClear,
+            default_reads: OverrideField::ExplicitClear,
+            extensions: OverrideField::ExplicitClear,
+            tool_budget: OverrideField::ExplicitClear,
+            ..AgentOverrideConfig::default()
+        }
+    }
+
+    #[test]
+    fn builtin_override_applies_the_five_suba081_fields() {
+        let mut merged = HashMap::new();
+        merged.insert(
+            "worker".to_string(),
+            agent("worker", AgentSource::Builtin, "/builtin/worker.md"),
+        );
+        let settings = user_scope(settings_with_override("worker", suba081_delta()));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("worker").expect("present");
+        assert_eq!(updated.description, "from settings");
+        assert_eq!(
+            updated.output,
+            Some(OutputSpec {
+                path: Some(PathBuf::from("./out/report.md")),
+                mode: None,
+            })
+        );
+        assert_eq!(updated.default_reads, Some(vec![PathBuf::from("./docs/spec.md")]));
+        assert_eq!(updated.extensions, Some(vec!["./ext/a.ts".to_string()]));
+        assert_eq!(
+            updated.tool_budget,
+            Some(ResolvedToolBudget {
+                hard: 12,
+                soft: None,
+                block: ToolBudgetBlock::Names(vec!["bash".to_string()]),
+            })
+        );
+    }
+
+    #[test]
+    fn builtin_override_false_clears_the_four_clearable_suba081_fields() {
+        let mut merged = HashMap::new();
+        let mut a = agent("worker", AgentSource::Builtin, "/builtin/worker.md");
+        a.output = Some(OutputSpec {
+            path: Some(PathBuf::from("./own.md")),
+            mode: Some(crate::discovery::types::OutputMode::FileOnly),
+        });
+        a.default_reads = Some(vec![PathBuf::from("./own-read.md")]);
+        a.extensions = Some(vec!["./own-ext.ts".to_string()]);
+        a.tool_budget = Some(ResolvedToolBudget {
+            hard: 5,
+            soft: None,
+            block: ToolBudgetBlock::Names(vec!["read".to_string()]),
+        });
+        merged.insert("worker".to_string(), a);
+
+        let settings = user_scope(settings_with_override("worker", suba081_clear_delta()));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("worker").expect("present");
+        // pi `delete next.<field>` for all four — `None`, never an empty collection.
+        assert_eq!(updated.output, None);
+        assert_eq!(updated.default_reads, None);
+        assert_eq!(updated.extensions, None);
+        assert_eq!(updated.tool_budget, None);
+    }
+
+    #[test]
+    fn output_override_replaces_the_path_and_preserves_the_resolved_mode() {
+        // Upstream `output` and `outputMode` are INDEPENDENT AgentConfig fields (agents.ts:1259-1260),
+        // so overriding the path never disturbs the mode. This crate merges the pair into one
+        // `OutputSpec`, which is exactly where a naive whole-struct replace would silently drop it.
+        let mut merged = HashMap::new();
+        let mut a = agent("worker", AgentSource::Builtin, "/builtin/worker.md");
+        a.output = Some(OutputSpec {
+            path: Some(PathBuf::from("./old.md")),
+            mode: Some(crate::discovery::types::OutputMode::FileAndInline),
+        });
+        merged.insert("worker".to_string(), a);
+
+        let settings = user_scope(settings_with_override(
+            "worker",
+            AgentOverrideConfig {
+                output: OverrideField::Value("./new.md".to_string()),
+                ..AgentOverrideConfig::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged.get("worker").expect("present").output,
+            Some(OutputSpec {
+                path: Some(PathBuf::from("./new.md")),
+                mode: Some(crate::discovery::types::OutputMode::FileAndInline),
+            }),
+            "a concrete `output` override must replace only the path"
+        );
+    }
+
+    #[test]
+    fn tools_inherit_drops_the_allowlist_while_false_empties_it() {
+        // pi `applyToolsOverride` (agents.ts:1237-1246): `"inherit"` deletes the field (no
+        // restriction), `false` sets the EMPTY allowlist (no tools). Opposite outcomes.
+        for (delta, expected, label) in [
+            (ToolsOverrideField::Inherit, None, "inherit"),
+            (ToolsOverrideField::ExplicitClear, Some(Vec::new()), "false"),
+        ] {
+            let mut merged = HashMap::new();
+            let mut a = agent("worker", AgentSource::Builtin, "/builtin/worker.md");
+            a.tools = Some(vec![ToolRef::Builtin("bash".to_string())]);
+            merged.insert("worker".to_string(), a);
+
+            let settings = user_scope(settings_with_override(
+                "worker",
+                AgentOverrideConfig {
+                    tools: delta,
+                    ..AgentOverrideConfig::default()
+                },
+            ));
+            apply_overrides(&mut merged, &settings).expect("apply succeeds");
+            assert_eq!(
+                merged.get("worker").expect("present").tools,
+                expected,
+                "tools: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_override_tools_inherit_is_blocked_by_frontmatter_tools() {
+        // The four-arm apply still goes through the fill-unset gate on the custom path: an agent
+        // that declared `tools:` on disk keeps its own list, `"inherit"` notwithstanding.
+        let mut merged = HashMap::new();
+        let mut a = agent("reviewer", AgentSource::Project, "/proj/reviewer.md");
+        a.tools = Some(vec![ToolRef::Builtin("read".to_string())]);
+        a.present_fields.insert("tools".to_string());
+        merged.insert("reviewer".to_string(), a);
+
+        let settings = project_scope(settings_with_override(
+            "reviewer",
+            AgentOverrideConfig {
+                tools: ToolsOverrideField::Inherit,
+                ..AgentOverrideConfig::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("reviewer").expect("present");
+        assert_eq!(updated.tools, Some(vec![ToolRef::Builtin("read".to_string())]));
+        assert!(
+            updated.override_info.is_none(),
+            "a fully-blocked delta applies nothing, so it records no provenance"
+        );
+    }
+
+    #[test]
+    fn description_false_is_ignored_identically_on_both_apply_paths() {
+        // `description` has no `| false` form upstream, but `OverrideField<String>`'s untagged
+        // Deserialize still reaches `ExplicitClear` for a JSON `false` (the `Value(String)` arm
+        // rejects a bool), so the state IS reachable from a settings file. Built from the real wire
+        // shape rather than the variant, so this also pins that deserialize step.
+        let delta: AgentOverrideConfig =
+            serde_json::from_value(serde_json::json!({ "description": false }))
+                .expect("`description: false` deserializes");
+        assert_eq!(
+            delta.description,
+            OverrideField::ExplicitClear,
+            "a JSON `false` must still reach the clear sentinel — if this ever changes to `Unset`, \
+             the apply sites below are testing nothing"
+        );
+
+        // pi assigns the `false` into a string-typed field (agents.ts:1258/:1380), so there is no
+        // parity target; both paths must IGNORE it rather than blank the text agent selection
+        // depends on, and — the actual defect this pins — must not disagree with each other.
+        for (source, path) in [
+            (AgentSource::Builtin, "/builtin/worker.md"),
+            (AgentSource::Project, "/proj/worker.md"),
+        ] {
+            let mut merged = HashMap::new();
+            merged.insert("worker".to_string(), agent("worker", source, path));
+            let settings = user_scope(settings_with_override("worker", delta.clone()));
+            apply_overrides(&mut merged, &settings).expect("apply succeeds");
+            assert_eq!(
+                merged.get("worker").expect("present").description,
+                "worker description",
+                "`description: false` must leave the description untouched (source: {source:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_override_description_ignores_the_frontmatter_gate() {
+        // pi's custom arm sets `description` unconditionally (agents.ts:1380-1383) — unlike every
+        // other custom-path field, an on-disk `description:` does NOT block it.
+        let mut merged = HashMap::new();
+        let mut a = agent("reviewer", AgentSource::Project, "/proj/reviewer.md");
+        a.present_fields.insert("description".to_string());
+        merged.insert("reviewer".to_string(), a);
+
+        let settings = project_scope(settings_with_override(
+            "reviewer",
+            AgentOverrideConfig {
+                description: OverrideField::Value("settings wins".to_string()),
+                ..AgentOverrideConfig::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged.get("reviewer").expect("present").description,
+            "settings wins"
+        );
     }
 
     // -----------------------------------------------------------------------------------------

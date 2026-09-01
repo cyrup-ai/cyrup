@@ -32,10 +32,10 @@ use std::path::Path;
 
 use cyrup::startup::{
     APP_NAME, CONFIG_DIR_NAME, DistributionMetadata, FirstTimeSetupResult, PACKAGE_NAME,
-    apply_first_time_setup, are_experimental_features_enabled, distribution,
+    apply_first_time_setup, are_experimental_features_enabled_from, distribution,
     first_time_setup_analytics_step, first_time_setup_theme_step, is_official_distribution,
     is_official_distribution_of, parse_analytics_choice, parse_theme_choice,
-    should_run_first_time_setup, should_run_first_time_setup_with,
+    should_run_first_time_setup_with,
 };
 use cyrup::{Cli, resolve_app_mode};
 use cyrup_config::{ConfigDirs, SettingsManager};
@@ -97,23 +97,23 @@ fn returns_false_when_settings_json_already_exists() {
 /// One test owns the process env so nothing here races; no other test in this binary reads it.
 #[test]
 fn experimental_flag_is_strict_one_under_either_name() {
-    let _restore = EnvRestore::capture(&["CYRUP_EXPERIMENTAL", "PI_EXPERIMENTAL"]);
+    // Injected lookups, not process mutation. `set_var` races EVERY concurrent reader of the
+    // environment in this binary — not merely readers of these two keys, because it may reallocate
+    // the whole `environ` array under a concurrent `getenv` for any key at all. With 16 tests here
+    // that condition was never satisfied, whatever the old comment claimed.
+    let unset = |_: &str| None;
+    let pinned = |k: &'static str, v: &'static str| {
+        move |q: &str| (q == k).then(|| v.to_string())
+    };
 
-    set_env("CYRUP_EXPERIMENTAL", None);
-    set_env("PI_EXPERIMENTAL", None);
-    assert!(!are_experimental_features_enabled());
-
-    set_env("PI_EXPERIMENTAL", Some("1"));
-    assert!(are_experimental_features_enabled());
-
-    set_env("PI_EXPERIMENTAL", None);
-    set_env("CYRUP_EXPERIMENTAL", Some("1"));
-    assert!(are_experimental_features_enabled());
+    assert!(!are_experimental_features_enabled_from(&unset));
+    assert!(are_experimental_features_enabled_from(&pinned("PI_EXPERIMENTAL", "1")));
+    assert!(are_experimental_features_enabled_from(&pinned("CYRUP_EXPERIMENTAL", "1")));
 
     for not_one in ["true", "yes", "0", "on", ""] {
-        set_env("CYRUP_EXPERIMENTAL", Some(not_one));
         assert!(
-            !are_experimental_features_enabled(),
+            !are_experimental_features_enabled_from(&|q: &str| (q == "CYRUP_EXPERIMENTAL")
+                .then(|| not_one.to_string())),
             "{not_one:?} must not enable experimental features"
         );
     }
@@ -121,10 +121,8 @@ fn experimental_flag_is_strict_one_under_either_name() {
     // The env-reading wrapper composes the same way as the pure gate.
     let dir = tempfile::tempdir().unwrap();
     let settings_path = dir.path().join("settings.json");
-    set_env("CYRUP_EXPERIMENTAL", Some("1"));
-    assert!(should_run_first_time_setup(&settings_path, false));
-    set_env("CYRUP_EXPERIMENTAL", Some("0"));
-    assert!(!should_run_first_time_setup(&settings_path, false));
+    assert!(should_run_first_time_setup_with(&settings_path, false, true));
+    assert!(!should_run_first_time_setup_with(&settings_path, false, false));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -375,37 +373,6 @@ fn manager_for(dirs: &ConfigDirs) -> SettingsManager {
 fn read_settings(dirs: &ConfigDirs) -> serde_json::Value {
     let raw = std::fs::read_to_string(dirs.settings_path()).unwrap();
     serde_json::from_str(&raw).unwrap()
-}
-
-/// `std::env::set_var` is `unsafe` in Rust 2024 (it is not thread-safe); this binary mutates the env
-/// from exactly one test, and restores it afterwards.
-fn set_env(key: &str, value: Option<&str>) {
-    match value {
-        // SAFETY: single-threaded use — only `experimental_flag_is_strict_one_under_either_name`
-        // touches these variables, and no other test in this binary reads them.
-        Some(v) => unsafe { std::env::set_var(key, v) },
-        None => unsafe { std::env::remove_var(key) },
-    }
-}
-
-struct EnvRestore(Vec<(String, Option<String>)>);
-
-impl EnvRestore {
-    fn capture(keys: &[&str]) -> Self {
-        EnvRestore(
-            keys.iter()
-                .map(|k| ((*k).to_string(), std::env::var(k).ok()))
-                .collect(),
-        )
-    }
-}
-
-impl Drop for EnvRestore {
-    fn drop(&mut self) {
-        for (key, value) in &self.0 {
-            set_env(key, value.as_deref());
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -18,12 +18,13 @@
 //! `#![forbid(unsafe_code)]`, and `CARGO_BIN_EXE_cyrup-subagent-fixture` (only available to
 //! integration tests, never to a library's own `#[cfg(test)]` unit tests) resolves here — exactly
 //! the same two reasons `tests/exec_run_sync_integration.rs` and
-//! `tests/background_spawn_detached_integration.rs` live outside `src/`. The `unsafe` blocks
-//! below (Rust 2024 requires `unsafe` for `std::env::set_var`/`remove_var`) are scoped to exactly
-//! the two calls needed to point `CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT` at the
-//! fixture binary/script for the duration of one test, executed under a process-wide mutex
-//! ([`ENV_MUTATION_LOCK`]) so this file's tests never race each other over that global state even
-//! when `cargo test` runs them concurrently within the same test-binary process.
+//! `tests/background_spawn_detached_integration.rs` live outside `src/`.
+//!
+//! Every test here drives `runner_main::run_with` IN-PROCESS and hands it the scripted fixture as
+//! a `SpawnCommand`, so the file mutates no process-global state, contains no `unsafe`, and needs
+//! no mutex — the tests can no longer race each other over `CYRUP_SUBAGENT_BINARY` because none of
+//! them sets it. The REAL detached runner is unaffected: it is a separate process reached through
+//! a `RunnerConfig` on disk and still resolves its command from the environment it inherited.
 //!
 //! Gated on the `test-fixtures` Cargo feature (matching the `cyrup-subagent-fixture` `[[bin]]`
 //! target's own `required-features` gate, `Cargo.toml`): without that feature the fixture binary
@@ -33,16 +34,17 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
+use cyrup_ext_subagents::paths::Roots;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 
 use cyrup_core::ModelId;
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
 use cyrup_ext_subagents::background::control::{ChainAppendRequest, InterruptRequest};
-use cyrup_ext_subagents::background::runner_main::{RunnerConfig, run};
+use cyrup_ext_subagents::spawn::SpawnCommand;
+use cyrup_ext_subagents::background::runner_main::{RunnerConfig, RunnerOverrides, run_with};
 use cyrup_ext_subagents::background::{RunId, RunMode, RunPaths, RunState, RunStatus, ResultFile};
 use cyrup_ext_subagents::discovery::types::SystemPromptMode;
 use cyrup_ext_subagents::exec::ResolvedAgentPersona;
@@ -88,16 +90,7 @@ fn all_personas() -> BTreeMap<String, ResolvedAgentPersona> {
         .collect()
 }
 
-/// Serializes every test in this file that mutates `CYRUP_SUBAGENT_BINARY`/
-/// `CYRUP_SUBAGENT_FIXTURE_SCRIPT` (process-global state) — `cargo test` runs a test binary's own
-/// `#[test]` functions concurrently by default, so without this lock two tests in this file could
-/// observe or clobber each other's override value mid-run. Mirrors
-/// `background_spawn_detached_integration.rs`'s/`exec_run_sync_integration.rs`'s identical
-/// `ENV_MUTATION_LOCK` convention.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 /// Path to the real, already-built `cyrup-subagent-fixture` binary.
 ///
@@ -108,6 +101,19 @@ const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 /// owning crate's `--features test-fixtures`) and exports `CYRUP_IT_BIN_CYRUP_SUBAGENT_FIXTURE`.
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
+}
+
+/// The scripted fixture as an in-process command for `run_with`.
+///
+/// `run_with` exists precisely so a caller driving the runner IN-PROCESS — which every test here
+/// does — substitutes the binary without moving `CYRUP_SUBAGENT_BINARY` on a process the rest of
+/// this binary's tests share. The REAL detached runner still resolves from its inherited
+/// environment; nothing about that path changes.
+fn fixture_cmd(script_path: &Path) -> SpawnCommand {
+    SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    }
 }
 
 fn write_script(dir: &Path, name: &str, script_json: &serde_json::Value) -> PathBuf {
@@ -161,15 +167,7 @@ async fn run_against_fixture(
     script: &serde_json::Value,
     config: RunnerConfig,
 ) -> (RunStatus, ResultFile) {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let script_path = write_script(dir, "script.json", script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation, mirroring every other integration test in
-    // this crate that substitutes the scripted fixture binary.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let async_root = dir.join("async");
     let results_dir = dir.join("results");
@@ -181,13 +179,11 @@ async fn run_against_fixture(
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
 
-    let result = run(&cfg_path, &run_paths).await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
+    let result = run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
+    ).await;
 
     result.expect("run() itself never returns Err");
 
@@ -302,19 +298,14 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
 async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one() {
     let home = tempfile::tempdir().expect("real tempdir");
 
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    // SAFETY: mutex-serialized, scoped env mutation — same convention as the fixture-binary
-    // override below. `CYRUP_HOME` makes the shared `run_artifact_roots` derivation hermetic.
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
 
     let cwd = home.path().join("project");
     tokio::fs::create_dir_all(&cwd).await.expect("mkdir cwd");
 
     // Orchestrator side: derive the two sibling roots from the ONE shared source of truth and
     // create them (ensureAccessibleDir-equivalent), exactly as `spawn_background_steps` does.
-    let roots = cyrup_ext_subagents::background::run_artifact_roots(&cwd);
+    let roots =
+        cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), &cwd);
     cyrup_ext_subagents::background::ensure_accessible_dir(&roots.async_root)
         .await
         .expect("orchestrator creates async_root");
@@ -394,21 +385,12 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
         "exit_code": 0
     });
     let script_path = write_script(home.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation (the lock is already held above).
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
-    let result = run(&cfg_path, &provisional).await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
+    let result = run_with(
+        &cfg_path,
+        &provisional,
+        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
+    ).await;
     result.expect("run() itself never returns Err");
 
     // BOTH the status.json and the terminal ResultFile must be found in the ORCHESTRATOR's dirs.
@@ -523,24 +505,14 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &config.run_id);
     tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
 
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation, mirroring every other integration test in
-    // this crate that substitutes the scripted fixture binary.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
-    let result = run(&cfg_path, &run_paths).await;
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
-    result.expect("run() itself never returns Err");
+    let result = run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
+    ).await;    result.expect("run() itself never returns Err");
 
     assert!(
         tokio::fs::try_exists(&run_paths.events).await.unwrap_or(false),
@@ -671,7 +643,8 @@ async fn missing_config_file_still_reaches_a_terminal_failed_state() {
 
     let bogus_cfg_path = run_paths.run_dir.join("does-not-exist.json");
 
-    let outcome = run(&bogus_cfg_path, &run_paths).await;
+    // No fixture: this config never loads, so no step is ever dispatched.
+    let outcome = run_with(&bogus_cfg_path, &run_paths, RunnerOverrides::default()).await;
     assert!(outcome.is_ok(), "run() itself never returns Err to its own caller");
 
     let status: RunStatus = serde_json::from_slice(
@@ -699,7 +672,6 @@ async fn missing_config_file_still_reaches_a_terminal_failed_state() {
 /// real window to write the append file concurrently with the runner's own in-flight first step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_request_written_after_start_is_consumed_next_iteration() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     let script = serde_json::json!({
@@ -710,12 +682,6 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation (see module doc).
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
@@ -787,14 +753,12 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
             .expect("write append request");
     });
 
-    let outcome = run(&cfg_path, &run_paths).await;
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
+    ).await;
     append_task.await.expect("append task completes");
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
 
     outcome.expect("run() itself never returns Err");
 
@@ -828,23 +792,20 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
 /// `Paused` run back to `Complete` after the fact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_run_to_paused() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     let script = serde_json::json!({
         "steps": [
-            {"kind": "sleep_ms", "ms": 300},
+            // The child announces it has finished its work by writing the capture file, THEN
+            // lingers briefly. That marker is the anchor the interrupt writer waits on.
             {"kind": "emit", "line": message_end_line("only step done")},
+            {"kind": "write_structured_output", "value": {"reached": "end-of-work"}},
+            {"kind": "sleep_ms", "ms": 300},
         ],
         "exit_code": 0
     });
+    let done_marker = dir.path().join("child-reached-end-of-work.json");
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation (see module doc).
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
@@ -904,8 +865,21 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
     // clearly before (which would legitimately pause the in-flight step) or clearly after (which
     // would just be a stray unconsumed file on an already-terminal run either way).
     let run_paths_for_interrupt = run_paths.clone();
+    let marker_for_interrupt = done_marker.clone();
     let interrupt_task = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(280)).await;
+        // Anchored on the child's OWN progress, not on a wall-clock guess.
+        //
+        // This used to sleep 280ms against a 300ms scripted sleep — a 20ms margin that holds on an
+        // idle machine and inverts under load, at which point the interrupt lands BEFORE the step
+        // finishes, legitimately pauses the run, and fails the `Complete` assertion below. That is
+        // the whole of the flake: a fixed timer cannot track a child that got slower.
+        //
+        // Waiting for the marker keeps the ordering under contention, because the anchor slides
+        // with the child instead of against it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !marker_for_interrupt.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         tokio::fs::create_dir_all(
             run_paths_for_interrupt
                 .control_inbox
@@ -922,14 +896,12 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
         let _ = write_atomic_json(&run_paths_for_interrupt.control_inbox, &request).await;
     });
 
-    let outcome = run(&cfg_path, &run_paths).await;
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
+    ).await;
     interrupt_task.await.expect("interrupt task completes");
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
 
     outcome.expect("run() itself never returns Err");
 
@@ -977,7 +949,6 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
 /// terminal result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processes() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     const NEVER_SPAWNED_MARKER: &str = "THIS-FIXTURE-MUST-NEVER-ACTUALLY-RUN";
@@ -988,15 +959,6 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation (see module doc) — CYRUP_SUBAGENT_BINARY is
-    // deliberately set to a REAL, working fixture here (not a bogus path) so a failure to reach
-    // Complete can only be attributed to the depth guard itself, never to the fixture being
-    // unreachable for an unrelated reason.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
@@ -1048,13 +1010,11 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
 
-    let outcome = run(&cfg_path, &run_paths).await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
+    ).await;
 
     outcome.expect("run() itself never returns Err to its own caller, even on a depth rejection");
 
@@ -1113,7 +1073,6 @@ fn tool_start_line(tool: &str, call_id: &str) -> String {
 /// holding that tool open, and this test polls `status.json` throughout that window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_json_carries_live_current_tool_during_a_run() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     let script = serde_json::json!({
@@ -1125,12 +1084,6 @@ async fn status_json_carries_live_current_tool_during_a_run() {
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation (see module doc).
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
@@ -1185,7 +1138,11 @@ async fn status_json_carries_live_current_tool_during_a_run() {
     let run_handle = {
         let cfg_path = cfg_path.clone();
         let run_paths = run_paths.clone();
-        tokio::spawn(async move { run(&cfg_path, &run_paths).await })
+        tokio::spawn(async move { run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
+    ).await })
     };
 
     let mut saw_current_tool = false;
@@ -1208,12 +1165,6 @@ async fn status_json_carries_live_current_tool_during_a_run() {
     }
 
     let outcome = run_handle.await.expect("run task joins");
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
     outcome.expect("run() itself never returns Err");
 
     assert!(
@@ -1232,7 +1183,6 @@ async fn status_json_carries_live_current_tool_during_a_run() {
 /// signalled and torn down, not waited out), reach `Paused`, and record the step as interrupted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     let script = serde_json::json!({
@@ -1243,12 +1193,6 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation (see module doc).
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
@@ -1317,15 +1261,13 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
     });
 
     let started = std::time::Instant::now();
-    let outcome = run(&cfg_path, &run_paths).await;
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
+    ).await;
     let elapsed = started.elapsed();
     interrupt_task.await.expect("interrupt task completes");
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
     outcome.expect("run() itself never returns Err");
 
     assert!(
@@ -1755,7 +1697,6 @@ async fn an_already_passed_deadline_in_the_config_times_the_run_out_rather_than_
 /// exactly the distinction G77 exists to make observable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     let script = serde_json::json!({
@@ -1766,12 +1707,6 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation (see module doc).
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
@@ -1834,15 +1769,13 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
     });
 
     let started = std::time::Instant::now();
-    let outcome = run(&cfg_path, &run_paths).await;
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
+    ).await;
     let elapsed = started.elapsed();
     stop_task.await.expect("stop task completes");
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
     outcome.expect("run() itself never returns Err");
 
     assert!(

@@ -1,0 +1,37 @@
+# Workspace clippy configuration.
+#
+# `disallowed-methods` is the guard that makes the env-injection work durable: it fails the BUILD
+# rather than the review. Every seam named in the reasons below already exists, so a caller hitting
+# this lint has somewhere to go — it is a redirect, not a wall.
+#
+# # The remaining callers, and why each one is sound
+#
+# There are SIX files with a live `set_var`/`remove_var`, each carrying a file-level
+# `#![allow(clippy::disallowed_methods)]` with its reason stated inline. (An earlier version of this
+# header named only one of them; it was wrong, and the guard was doing its job while the header was
+# not.) The criterion for every exemption is the THREAD, never the binary: `set_var` races any
+# concurrent `getenv` for ANY key, so a mutation is sound only when nothing else in that process is
+# running — a `#[test]`, a `current_thread` runtime, or a mutation completed before any runtime
+# starts. "It is its own binary" is the weaker claim, and it was already wrong once here when test
+# consolidation silently voided it for `verify_redaction`.
+#
+#   crates/cyrup-it/tests/verify_redaction/main.rs
+#       one `#[tokio::test(flavor = "current_thread")]` in its own `[[test]]` target. Subject IS
+#       process-environment inheritance into a real child, so the variable must really be set.
+#   crates/cyrup-tools/tests/bash_env_scrub.rs
+#       one bare `#[tokio::test]`, which is a CURRENT-THREAD runtime — no worker threads exist.
+#   crates/cyrup-tui/tests/share_viewer_url.rs
+#   crates/cyrup-tui/tests/experimental_marker.rs
+#       one `#[test]` each, no threads spawned and no runtime started.
+#   crates/cyrup-tools/tests/shell_interpreter.rs
+#       one `#[test]`. It held two behind a `Mutex` until the sibling that needed no environment at
+#       all moved to `tests/shell_interpreter_literal_absent.rs`; a lock makes a mutation
+#       unobserved, not sound.
+#   crates/cyrup-ext-subagents/src/bin/cyrup_subagent_orchestrator_sim.rs
+#       `#[tokio::main(flavor = "current_thread")]`, pinned for exactly this reason — under the
+#       default flavor its worker threads existed before the mutation and the file's own SAFETY
+#       note was false.
+disallowed-methods = [
+  { path = "std::env::set_var", reason = "mutating the process environment races every concurrent reader (this is why it is `unsafe` in edition 2024). Pass the value instead: `SubagentExtensionConfig::{roots, spawn_command, env_overrides}`, `RunOptions::{spawn_command, child_env}`, `RunnerOverrides`, `paths::Roots::{from_lookup, sandboxed}`, `cyrup_config::paths::cyrup_home_dir_from`, or an `env_overlay` on the child's `Command`" },
+  { path = "std::env::remove_var", reason = "same as `set_var`. To prove a variable ABSENT, inject the lookup: the crate's `&dyn Fn(&str) -> Option<OsString>` seams answer `None` for an unset key, which is what `SubagentExtensionConfig::env_overrides` is for" },
+]

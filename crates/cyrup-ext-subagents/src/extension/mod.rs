@@ -75,7 +75,8 @@ pub use executor::requests::{
 };
 pub use executor::SubagentExecutor;
 pub use host::registration::{
-    is_installed, registration_mode_from_env, resolve_registration_mode, subagent_extension_for,
+    is_installed, is_installed_with, registration_mode_from_env, resolve_registration_mode,
+    subagent_extension_for,
     subagent_extension_for_env, subagent_extension_for_env_with_channels, INSTALL_ENV_VAR,
     RegistrationMode,
 };

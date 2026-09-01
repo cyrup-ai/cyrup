@@ -123,7 +123,18 @@ pub fn supervisor_channel_root() -> PathBuf {
 /// `resolveSupervisorChannelDir` (`:78-80`).
 #[must_use]
 pub fn resolve_supervisor_channel_dir(run_id: &str, agent: &str, child_index: usize) -> PathBuf {
-    supervisor_channel_root().join(format!(
+    resolve_supervisor_channel_dir_in(&supervisor_channel_root(), run_id, agent, child_index)
+}
+
+/// [`resolve_supervisor_channel_dir`] under an explicitly supplied channel root.
+#[must_use]
+pub fn resolve_supervisor_channel_dir_in(
+    root: &Path,
+    run_id: &str,
+    agent: &str,
+    child_index: usize,
+) -> PathBuf {
+    root.join(format!(
         "{}-{}-{child_index}",
         safe_segment(run_id),
         safe_segment(agent)
@@ -601,7 +612,16 @@ pub fn parse_request_file(file: &Path, channel_dir: &Path) -> Option<PendingSupe
 /// root is an empty list, never an error (`:353-356`).
 #[must_use]
 pub fn list_request_files() -> Vec<(PathBuf, PathBuf)> {
-    let root = supervisor_channel_root();
+    list_request_files_in(&supervisor_channel_root())
+}
+
+/// [`list_request_files`] under an explicitly supplied channel root, so a caller holding its own
+/// root (a test with a `TempDir`, or a channel constructed with
+/// [`NativeSupervisorChannel::with_root`]) scans that tree instead of the shared per-user one —
+/// without moving `CYRUP_SUBAGENTS_TEMP_ROOT` on a process every other test shares.
+#[must_use]
+pub fn list_request_files_in(root: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let root = root.to_path_buf();
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
@@ -750,7 +770,12 @@ pub async fn write_reply(pending: &PendingSupervisorRequest, message: &str) -> R
 /// [`STALE_EMPTY_CHANNEL_AGE_MS`]. Opportunistic — a racing writer just gets picked up next pass.
 /// Returns how many were removed.
 pub fn cleanup_stale_empty_supervisor_channels(now: u64) -> usize {
-    let root = supervisor_channel_root();
+    cleanup_stale_empty_supervisor_channels_in(&supervisor_channel_root(), now)
+}
+
+/// [`cleanup_stale_empty_supervisor_channels`] under an explicitly supplied root.
+pub fn cleanup_stale_empty_supervisor_channels_in(root: &Path, now: u64) -> usize {
+    let root = root.to_path_buf();
     let Ok(entries) = std::fs::read_dir(&root) else {
         return 0;
     };
@@ -824,6 +849,9 @@ pub struct NativeSupervisorChannel {
     services: Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>,
     /// The running poll task, so `dispose` can stop it (upstream's `clearInterval`).
     poller: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The channel-directory tree this instance scans. `supervisor_channel_root()` in production;
+    /// a caller-supplied path for a test that owns its own tree.
+    root: PathBuf,
 }
 
 impl std::fmt::Debug for NativeSupervisorChannel {
@@ -842,11 +870,24 @@ impl NativeSupervisorChannel {
     /// A channel with no live host backend bound yet.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_root(supervisor_channel_root())
+    }
+
+    /// A channel scanning an explicitly supplied channel root rather than the shared per-user one.
+    #[must_use]
+    pub fn with_root(root: PathBuf) -> Self {
         Self {
             state: Mutex::new(ChannelState::default()),
             services: Mutex::new(None),
             poller: Mutex::new(None),
+            root,
         }
+    }
+
+    /// The channel-directory tree this instance scans.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Bind (or rebind) the P-1 capability backend requests are injected through and whose
@@ -887,7 +928,7 @@ impl NativeSupervisorChannel {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             refresh_pending(&mut state.pending, Some(session_id.as_str()), now, ask_timeout);
 
-            for (channel_dir, file) in list_request_files() {
+            for (channel_dir, file) in list_request_files_in(&self.root) {
                 if state.seen_files.contains(&file) {
                     continue;
                 }
@@ -940,7 +981,7 @@ impl NativeSupervisorChannel {
         }
         state.last_stale_cleanup_at = now;
         drop(state);
-        cleanup_stale_empty_supervisor_channels(now);
+        cleanup_stale_empty_supervisor_channels_in(&self.root, now);
     }
 
     /// `start` (`:655-661`): one immediate pass, then a [`CHANNEL_POLL_MS`] loop. Idempotent — a
@@ -1765,15 +1806,28 @@ pub fn native_child_client_should_register(agent_dir: &Path) -> bool {
 }
 
 /// `$CYRUP_CODING_AGENT_DIR` (absolute verbatim, else resolved against `cwd`) if set and non-blank,
-/// else `<home>/.cyrup` — byte-identical to `cyrup_intercom::paths::agent_dir_path_from`, which the
-/// dependency edge (`cyrup-intercom` → this crate) forbids importing. Pinned by
-/// `tests::the_agent_dir_resolution_matches_the_intercom_crates_table`.
+/// else `<home>/.cyrup`.
+///
+/// # The home half is no longer a copy
+///
+/// This used to spell out `CYRUP_HOME` -> `HOME` -> `std::env::home_dir` -> `temp_dir` itself,
+/// "byte-identical to `cyrup_intercom::paths::agent_dir_path_from`, which the dependency edge
+/// forbids importing" — two private copies kept in step by a pinning test. Both now call
+/// [`cyrup_config::paths::cyrup_dir_from`], so there is one ladder and the pinning test asserts a
+/// shared implementation rather than a coincidence.
+///
+/// The OVERRIDE half stays local on purpose: `$CYRUP_CODING_AGENT_DIR` here resolves a relative
+/// value against `cwd`, which is `getAgentDirPath`'s contract and is NOT what
+/// [`cyrup_config::paths::cyrup_agent_dir_from`] does (that one `~`-expands against home). Two
+/// genuinely different questions; only the shared one was shared.
 #[must_use]
 pub fn intercom_agent_dir_from(
     env: &dyn Fn(&str) -> Option<String>,
     cwd: Option<PathBuf>,
 ) -> PathBuf {
-    if let Some(configured) = env("CYRUP_CODING_AGENT_DIR").filter(|c| !c.trim().is_empty()) {
+    if let Some(configured) =
+        env(cyrup_config::paths::ENV_CODING_AGENT_DIR).filter(|c| !c.trim().is_empty())
+    {
         let configured = configured.trim().to_string();
         let p = PathBuf::from(&configured);
         return if p.is_absolute() {
@@ -1785,12 +1839,11 @@ pub fn intercom_agent_dir_from(
             }
         };
     }
-    env("CYRUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env("HOME").map(PathBuf::from))
-        .or_else(std::env::home_dir)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".cyrup")
+    // THE home ladder, shared. The adapter exists because this function's `env` seam is
+    // `String`-shaped — it is fed by `SubagentsExtension::env_lookup`, which layers
+    // `SubagentExtensionConfig::env_overrides` over the process environment — while the shared
+    // ladder is `OsString`-shaped so a non-UTF-8 path cannot be dropped to the next rung.
+    cyrup_config::paths::cyrup_dir_from(&|key| env(key).map(std::ffi::OsString::from))
 }
 
 #[cfg(test)]

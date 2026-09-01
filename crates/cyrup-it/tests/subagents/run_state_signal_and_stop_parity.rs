@@ -48,11 +48,11 @@ use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 
 use cyrup_core::{CancelToken, Content, ModelId, Tool, ToolCallId};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
-use cyrup_ext_subagents::background::runner_main::{RunnerConfig, run};
+use cyrup_ext_subagents::background::runner_main::{RunnerConfig, RunnerOverrides, run_with};
 use cyrup_ext_subagents::background::{
     ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus, StepState,
 };
@@ -63,23 +63,20 @@ use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions};
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::fork_context::ForkContext;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 use cyrup_ext_subagents::spawn::nested_events::{
-    NestedEventInput, NestedRunSummary, TEMP_ROOT_ENV, create_nested_route, write_nested_event,
+    NestedEventInput, NestedRunSummary, create_nested_route_in, write_nested_event_in,
 };
 use cyrup_ext_subagents::tui::intercom::{
     DeliveryChannel, IntercomPayload, NoOpClarifyChannel, NoTransportSteerChannel,
     SubagentResultStatus, resolve_single_result_status,
 };
 
-/// Serializes every test in this file that mutates process-global env, matching every sibling
-/// fixture-based integration test in this crate.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
 
 /// One `message_end` NDJSON record on the real child wire shape (`exec/ndjson.rs`).
 fn message_end_line(text: &str) -> String {
@@ -154,8 +151,13 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
+        // SUBA-078: this fixture exercises no reasoning ceiling — `None` is "no ceiling
+        // configured, so the bound is off", matching `runner_main.rs`'s own hop-2 default.
+        thinking_ceiling: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -212,7 +214,6 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
 /// the whole suite stayed green: nothing anywhere read the field off a REAL run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_signal_killed_child_publishes_its_real_process_signal_and_resolves_stopped() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     let child = write_sigkill_child(
@@ -221,25 +222,18 @@ async fn a_signal_killed_child_publishes_its_real_process_signal_and_resolves_st
         &message_end_line("SIGKILL_TEST: the child spoke before it died"),
     );
 
-    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test — Rust 2024
-    // requires `unsafe` for `set_var` because the process environment is shared mutable state.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &child);
-    }
-
     let agent = base_agent_config("fixture-model");
-    let opts = base_run_options(dir.path(), "fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    // This run names its own child instead of moving `CYRUP_SUBAGENT_BINARY` on a process every
+    // other test in this binary shares. `run_sync` is a foreground path, which is what
+    // `spawn_command` reaches.
+    opts.spawn_command = Some(SpawnCommand { binary: child, base_args: Vec::new() });
     let result = tokio::time::timeout(
         Duration::from_secs(20),
         cyrup_ext_subagents::exec::run_sync(&agent, "die by signal", &opts),
     )
     .await
     .expect("run_sync must not hang on a child that kills itself");
-
-    // SAFETY: scoped cleanup inside the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-    }
 
     assert_eq!(
         result.process_signal.as_deref(),
@@ -332,7 +326,6 @@ fn tool_result_text(result: &cyrup_core::ToolResult) -> String {
 /// `DeliveryChannel`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_mode_out_of_band_delivery_reports_a_signal_killed_child_as_stopped() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("real tempdir for the persona + cwd");
     let home_dir = tempfile::tempdir().expect("real tempdir to isolate CYRUP_HOME artifacts");
@@ -344,15 +337,18 @@ async fn single_mode_out_of_band_delivery_reports_a_signal_killed_child_as_stopp
         &message_end_line("SIGKILL_TEST: single-mode child spoke before it died"),
     );
 
-    // SAFETY: scoped, mutex-serialized env mutation for this one test.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &child);
-        std::env::set_var("CYRUP_HOME", home_dir.path());
-    }
-
     let delivery = std::sync::Arc::new(RecordingDeliveryChannel::default());
     let extension = SubagentsExtension::with_channels(
-        SubagentExtensionConfig::default(),
+        // SUBA-083: asserts out-of-band delivery reports a signal-killed child as stopped, which
+        // requires the run to execute and settle in the foreground (pi `config.ts:222-224`).
+        // NOTE: the `action='stop'` site at :490 is a management verb and is deliberately
+        // left alone — it never reaches the launch-mode decision.
+        SubagentExtensionConfig {
+            async_by_default: false,
+            spawn_command: Some(SpawnCommand { binary: child, base_args: Vec::new() }),
+            roots: Roots::sandboxed(home_dir.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
         delivery.clone(),
         std::sync::Arc::new(NoOpClarifyChannel),
@@ -368,12 +364,6 @@ async fn single_mode_out_of_band_delivery_reports_a_signal_killed_child_as_stopp
             Box::new(|_u: cyrup_core::ToolUpdate| {}),
         )
         .await;
-
-    // SAFETY: scoped cleanup inside the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     let received = delivery.received.lock().expect("lock");
     assert_eq!(
@@ -424,18 +414,25 @@ async fn single_mode_out_of_band_delivery_reports_a_signal_killed_child_as_stopp
 /// stoppable async run" would tell the caller their id was wrong when it was merely out of scope.
 #[tokio::test]
 async fn stopping_a_nested_run_gets_pis_own_scope_refusal_not_the_not_found_text() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let temp_root = dir.path().join("subagents-temp");
     std::fs::create_dir_all(&temp_root).expect("mkdir temp root");
 
-    // SAFETY: scoped, mutex-serialized env mutation — the nested-events registry is rooted at
-    // `CYRUP_SUBAGENTS_TEMP_ROOT`, so this isolates the projection to this test's own tree.
-    unsafe {
-        std::env::set_var(TEMP_ROOT_ENV, &temp_root);
-    }
-
-    let route = create_nested_route("nestroot0001").expect("mint a nested route");
+    // The route carries absolute `event_sink`/`control_inbox` paths, so naming the root here
+    // scopes the whole projection to this test's own tree — no `CYRUP_SUBAGENTS_TEMP_ROOT`.
+    //
+    // Derived FROM the roots the extension is given, rather than assembled alongside them: the
+    // whole point of handing the executor a resolved `Roots` is that the tree the test writes into
+    // and the tree the executor scans cannot be two different arithmetic expressions that happen
+    // to agree today.
+    let roots = Roots::sandboxed(&temp_root);
+    let events_root = roots.nested_events();
+    std::fs::create_dir_all(&events_root).expect("mkdir nested events root");
+    // The tool's own nested lookup must scan the SAME tree this route is minted in, or the stop
+    // path cannot see the run it is meant to refuse — which is exactly how this test caught the
+    // gap when only the route side was scoped.
+    std::fs::create_dir_all(&events_root).expect("mkdir events root");
+    let route = create_nested_route_in(&events_root, "nestroot0001").expect("mint a nested route");
     let mut child = NestedRunSummary {
         id: "nestedkid001".to_string(),
         parent_run_id: route.root_run_id.clone(),
@@ -476,7 +473,8 @@ async fn stopping_a_nested_run_gets_pis_own_scope_refusal_not_the_not_found_text
         children: None,
     };
     child.pid = None;
-    write_nested_event(
+    write_nested_event_in(
+        &events_root,
         &route,
         &NestedEventInput {
             event_type: "subagent.nested.started".to_string(),
@@ -489,7 +487,7 @@ async fn stopping_a_nested_run_gets_pis_own_scope_refusal_not_the_not_found_text
     .expect("publish the nested-started record");
 
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        SubagentExtensionConfig { roots: roots.clone(), ..SubagentExtensionConfig::default() },
         dir.path().to_path_buf(),
     );
     let tool = extension.subagent_tool();
@@ -515,11 +513,6 @@ async fn stopping_a_nested_run_gets_pis_own_scope_refusal_not_the_not_found_text
         )
         .await
         .expect_err("an unknown id is not stoppable either");
-
-    // SAFETY: scoped cleanup inside the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(TEMP_ROOT_ENV);
-    }
 
     assert!(
         nested_err
@@ -607,7 +600,6 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
 /// a long sleep so the control watcher is guaranteed to observe both files while a step is live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     let script = serde_json::json!({
@@ -684,19 +676,19 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
     .expect("plant the stop request");
 
     let fixture = crate::support::bins::subagent_fixture();
-    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
-    let outcome = run(&cfg_path, &run_paths).await;
-
-    // SAFETY: scoped cleanup inside the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides {
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            }),
+            ..Default::default()
+            },
+    )
+    .await;
     outcome.expect("run() itself never returns Err");
 
     let status: RunStatus = serde_json::from_slice(
@@ -786,7 +778,6 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
 /// `completed`. This asserts each link of the chain on one real run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejected_acceptance_ledger_outranks_a_clean_exit_code_in_the_single_result_status() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     let script = serde_json::json!({
@@ -798,15 +789,12 @@ async fn a_rejected_acceptance_ledger_outranks_a_clean_exit_code_in_the_single_r
     let script_path = dir.path().join("plain-prose-script.json");
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
 
-    let fixture = crate::support::bins::subagent_fixture();
-    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
-
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    opts.spawn_command = Some(SpawnCommand {
+        binary: crate::support::bins::subagent_fixture(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     // The point of the test: NO explicit contract, so the heuristic one applies exactly as it does
     // for any ordinary persona that declares no acceptance policy.
     opts.acceptance = None;
@@ -817,12 +805,6 @@ async fn a_rejected_acceptance_ledger_outranks_a_clean_exit_code_in_the_single_r
     )
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
-
-    // SAFETY: scoped cleanup inside the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(
         result.exit_code, 0,

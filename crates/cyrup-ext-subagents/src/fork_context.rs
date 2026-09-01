@@ -25,6 +25,12 @@
 //!    fork-context resolution that produces no path is, by definition, not usable and MUST fail
 //!    hard rather than silently downgrading to fresh context.
 //!
+//!    SUBA-079 narrows the scope of that rule, without weakening it: it governs an EXPLICIT
+//!    `context: "fork"` — a caller who asked for a branch by name gets an error, never a different
+//!    answer. An INHERITED preference (an agent's `defaultContext: fork`, or
+//!    `subagents.defaultSubagentContext`) is not a demand, and downgrades to `Fresh` when no branch
+//!    can be cut; see [`resolve_effective_context`].
+//!
 //! Lineage provenance (R-SA-143) requires no additional code in this module:
 //! `create_branched_session` itself records `parentSession` on the forked child's header
 //! (`manager.rs:276-283`) whenever branching a persisted parent, which is the only case this
@@ -56,6 +62,60 @@ pub enum ContextMode {
     Fork,
 }
 
+/// pi's `params.context` value set (`extension/schemas.ts:319-322` @v0.57.0:
+/// `enum: ["fresh", "fork", "profile"]`).
+///
+/// DISTINCT from [`ContextMode`], and deliberately so: `Profile` is a policy DIRECTIVE that selects
+/// a mode per agent, not a mode a run can be in. `ContextMode` is the RESOLVED outcome — it lands in
+/// [`ForkContext::mode`], `management::helpers::context_str`, the TUI's `[fork]` badge and the
+/// frontmatter writer, none of which could render `Profile` meaningfully. Upstream keeps the same
+/// split: the schema value is a three-variant string while `ContextMode` stays two-variant, and
+/// `contextForAgent` returns the latter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextRequest {
+    /// Explicit `context: "fresh"` — strict, overrides every default.
+    Fresh,
+    /// Explicit `context: "fork"` — strict. Fails hard when no branch can be cut, rather than
+    /// silently running fresh: the caller asked for a branch by name.
+    Fork,
+    /// `context: "profile"` — require each requested agent's own declared `defaultContext`, and
+    /// fail loudly when one has none. Ignores both the config rung and the availability test.
+    Profile,
+}
+
+impl From<ContextMode> for ContextRequest {
+    /// A already-RESOLVED mode used as an explicit request — the shape a recipe's own
+    /// `context: fresh|fork` or the flat `/run` surface supplies. There is no inverse: `Profile`
+    /// is a directive, not a mode.
+    fn from(mode: ContextMode) -> Self {
+        match mode {
+            ContextMode::Fresh => Self::Fresh,
+            ContextMode::Fork => Self::Fork,
+        }
+    }
+}
+
+/// pi `canPreferForkFromSnapshot` (`shared/fork-context.ts:95-101` @v0.57.0): can an IMPLICIT
+/// `defaultContext: fork` actually create a branch right now?
+///
+/// All THREE conditions must hold — a parent session file, a leaf to branch from, and the file
+/// genuinely existing on disk. Upstream wraps the `existsSync` in a `try`/`catch` returning false;
+/// [`Path::exists`] already folds an I/O error into `false`, so the arms coincide.
+///
+/// Consulted ONLY on the implicit path. An explicit `context: "fork"` never asks — see
+/// [`resolve_effective_context`].
+#[must_use]
+pub fn can_prefer_fork_from_snapshot(
+    parent_session_file: Option<&Path>,
+    leaf_id: Option<&EntryId>,
+) -> bool {
+    let (Some(path), Some(_leaf)) = (parent_session_file, leaf_id) else {
+        return false;
+    };
+    path.exists()
+}
+
 /// Resolve one call site's (possibly omitted) `context` request against the target agent's own
 /// persona-level `defaultContext` (func-SA §4.1 `AgentDefinition::default_context`; DI-SA-3,
 /// R-SA-138/R-SA-111).
@@ -71,20 +131,86 @@ pub enum ContextMode {
 /// `agent_default_context` argument, is what makes that independence hold: there is no shared,
 /// batch-wide state here at all — each call is a pure function of its own two arguments only.
 ///
+/// pi `resolveSubagentLaunchContext` (`shared/fork-context.ts:79-84` @v0.57.0) folded together with
+/// `resolveAgentDefaultContextPolicy`'s `profile` branch (`subagent-executor.ts:2521-2545`).
+///
 /// Precedence, highest to lowest:
-/// 1. `call_site_context` — an explicit `context` on the task/step itself (e.g. `SingleStepSpec::
-///    context`) always wins when present.
-/// 2. `agent_default_context` — the resolved agent's own `AgentDefinition::default_context`
-///    frontmatter field, consulted only when (1) is `None`.
-/// 3. [`ContextMode::default`] (`Fresh`) — when neither is present.
-#[must_use]
+/// 1. An EXPLICIT call-site `Fresh`/`Fork` — returned verbatim, and deliberately STRICT: an explicit
+///    `Fork` against an unpersisted parent still fails hard downstream in
+///    [`ForkContextResolver::resolve`], because the caller asked for a branch by name and silently
+///    running fresh would answer a different question.
+/// 2. [`ContextRequest::Profile`] — the agent's own `default_context`, REQUIRED. Ignores the config
+///    rung AND the availability test alike (pi's schema: *"profile ignores config
+///    defaultSubagentContext"*), so a profile-declared `fork` against an unpersisted parent still
+///    fails hard. It is the one request shape this function never downgrades.
+/// 3. `config_default` — `subagents.defaultSubagentContext`. **It OUTRANKS the agent's own
+///    default**, unlike every other settings rung in this crate (`turnBudget`, `permissions`,
+///    `timeoutMs` all go caller > agent > config). Upstream inverts it deliberately:
+///    `defaultSubagentContext: "fresh"` exists precisely to overrule agents that declare fork.
+/// 4. `agent_default_context`.
+/// 5. [`ContextMode::default`] (`Fresh`).
+///
+/// Rungs 3-5 are the IMPLICIT path, where a `Fork` is a PREFERENCE rather than a demand: it
+/// downgrades to `Fresh` when `can_prefer_fork` is false. That split is the point of this function —
+/// an agent author's `defaultContext: fork` must never turn a working launch into a failed one just
+/// because the parent session has not persisted yet.
+///
+/// Per-task independence (DI-SA-3) is unchanged: this is a pure function of its own arguments only,
+/// so a batch MUST call it once per task with that task's own agent default, never once for the
+/// whole batch.
+///
+/// # Errors
+///
+/// [`SubagentError::Management`] carrying pi's verbatim
+/// `context: "profile" requires agent '<name>' to declare defaultContext.` when a `Profile` request
+/// names an agent that declared none.
 pub fn resolve_effective_context(
-    call_site_context: Option<ContextMode>,
+    call_site_context: Option<ContextRequest>,
+    agent_name: &str,
     agent_default_context: Option<ContextMode>,
-) -> ContextMode {
-    call_site_context
-        .or(agent_default_context)
-        .unwrap_or_default()
+    config_default: Option<ContextMode>,
+    can_prefer_fork: bool,
+) -> Result<ContextMode, SubagentError> {
+    match call_site_context {
+        Some(ContextRequest::Fresh) => return Ok(ContextMode::Fresh),
+        Some(ContextRequest::Fork) => return Ok(ContextMode::Fork),
+        Some(ContextRequest::Profile) => {
+            return agent_default_context.ok_or_else(|| {
+                SubagentError::Management(format!(
+                    "context: \"profile\" requires agent '{agent_name}' to declare defaultContext."
+                ))
+            });
+        }
+        Option::None => {}
+    }
+    // pi `defaultSubagentContext ?? agentDefaultContext ?? "fresh"` — config FIRST.
+    let preferred = config_default.or(agent_default_context).unwrap_or_default();
+    Ok(if preferred == ContextMode::Fork && can_prefer_fork {
+        ContextMode::Fork
+    } else {
+        ContextMode::Fresh
+    })
+}
+
+/// pi `validateConfig`'s `defaultSubagentContext` gate (`extension/config.ts:140-142` @v0.57.0).
+///
+/// Unlike `subagents.timeoutMs` (SUBA-077), which silently degrades, upstream THROWS here — so this
+/// errors rather than ignoring. Carried raw on [`crate::registration::SubagentExtensionConfig`] and
+/// validated here, at the point of use, so a malformed value produces upstream's own message instead
+/// of failing the whole config's deserialization.
+///
+/// # Errors
+///
+/// `config.defaultSubagentContext must be "fresh" or "fork"` for anything other than those two.
+pub fn resolve_default_subagent_context(
+    raw: Option<&serde_json::Value>,
+) -> Result<Option<ContextMode>, String> {
+    match raw.and_then(serde_json::Value::as_str) {
+        Option::None if raw.is_none() => Ok(Option::None),
+        Some("fresh") => Ok(Some(ContextMode::Fresh)),
+        Some("fork") => Ok(Some(ContextMode::Fork)),
+        _ => Err("config.defaultSubagentContext must be \"fresh\" or \"fork\"".to_string()),
+    }
 }
 
 /// The resolved outcome of a fork-context request: either `Fresh` (no session file), or `Fork`
@@ -410,6 +536,16 @@ impl ForkContextResolver {
         }
     }
 
+    /// pi `canPreferFork(sessionManager)` (`shared/fork-context.ts:88-94` @v0.57.0): may an IMPLICIT
+    /// `defaultContext: fork` cut a branch right now?
+    ///
+    /// Reads the same three facts [`Self::resolve`]'s fail-hard checks read, off the same live
+    /// handle, and delegates the decision to [`can_prefer_fork_from_snapshot`].
+    pub async fn can_prefer_fork(&self) -> bool {
+        let guard = self.manager.lock().await;
+        can_prefer_fork_from_snapshot(guard.session_file(), guard.leaf_id())
+    }
+
     /// Resolve one batch-step's requested context mode into a concrete [`ForkContext`].
     ///
     /// Fails fast (R-SA-137/DI-SA-2): NEVER falls back to `Fresh` when `Fork` was requested and
@@ -571,67 +707,177 @@ mod tests {
     // resolve_effective_context: A-SA-5 (context independence, DI-SA-3, R-SA-138/R-SA-111)
     // ---------------------------------------------------------------------------------------
 
-    #[test]
-    fn resolve_effective_context_prefers_an_explicit_call_site_value_over_the_agent_default() {
-        assert_eq!(
-            resolve_effective_context(Some(ContextMode::Fork), Some(ContextMode::Fresh)),
-            ContextMode::Fork,
-            "an explicit call-site context must win even when it disagrees with the agent's own default"
-        );
+    /// `SubagentError` is not `PartialEq`, so the ladder's `Ok` side is unwrapped for comparison.
+    /// Every call here is expected to resolve; the error arm has its own test.
+    fn resolved(outcome: Result<ContextMode, SubagentError>) -> ContextMode {
+        outcome.expect("this ladder resolves without error")
     }
 
+    /// Rung 1: an EXPLICIT call-site value wins over every default, and is returned verbatim —
+    /// including a `Fork` that the availability test would have downgraded. Explicit stays strict.
     #[test]
-    fn resolve_effective_context_falls_back_to_the_agent_default_when_call_site_omits_it() {
+    fn an_explicit_call_site_value_wins_over_every_default_and_stays_strict() {
         assert_eq!(
-            resolve_effective_context(None, Some(ContextMode::Fork)),
-            ContextMode::Fork
+            resolved(resolve_effective_context(
+                Some(ContextRequest::Fork),
+                "worker",
+                Some(ContextMode::Fresh),
+                Some(ContextMode::Fresh),
+                false, // no branch can be cut...
+            )),
+            ContextMode::Fork, // ...and an EXPLICIT fork is still Fork; `resolve` fails it later.
         );
         assert_eq!(
-            resolve_effective_context(None, Some(ContextMode::Fresh)),
+            resolved(resolve_effective_context(
+                Some(ContextRequest::Fresh),
+                "worker",
+                Some(ContextMode::Fork),
+                Some(ContextMode::Fork),
+                true,
+            )),
             ContextMode::Fresh
         );
     }
 
+    /// SUBA-079's headline: an INHERITED `fork` preference is a preference, not a demand. With no
+    /// branch available it downgrades to `Fresh` and the launch proceeds, where it used to abort.
     #[test]
-    fn resolve_effective_context_defaults_to_fresh_when_neither_is_present() {
-        assert_eq!(resolve_effective_context(None, None), ContextMode::Fresh);
+    fn an_inherited_fork_preference_downgrades_to_fresh_when_no_branch_can_be_cut() {
+        assert_eq!(
+            resolved(resolve_effective_context(None, "worker", Some(ContextMode::Fork), None, false)),
+            ContextMode::Fresh,
+            "an agent author's `defaultContext: fork` must never turn a working launch into a \
+             failed one"
+        );
+        assert_eq!(
+            resolved(resolve_effective_context(None, "worker", Some(ContextMode::Fork), None, true)),
+            ContextMode::Fork,
+            "...and with a persisted parent and a leaf, it forks as asked"
+        );
     }
 
-    /// A-SA-5, the exact scenario: in one parallel/batch call with `context` omitted at every call
-    /// site, a sibling task whose agent persona defaults to `fresh` and a sibling task whose agent
-    /// persona defaults to `fork` each resolve independently — resolving one MUST NOT be
-    /// influenced by, or leak into, resolving the other. Modeled here as two independent calls
-    /// into the same pure function (exactly how a real batch-builder is required to invoke it: once
-    /// per task, never once for the whole batch) sharing no state whatsoever between them, which is
-    /// what makes cross-sibling leakage structurally impossible rather than merely untested.
+    /// Rung 3 OUTRANKS rung 4 — the opposite of every other settings rung in this crate.
+    /// `defaultSubagentContext: "fresh"` exists precisely to overrule agents that declare fork.
+    #[test]
+    fn the_config_default_outranks_the_agents_own_default() {
+        assert_eq!(
+            resolved(resolve_effective_context(
+                None,
+                "worker",
+                Some(ContextMode::Fork),
+                Some(ContextMode::Fresh),
+                true,
+            )),
+            ContextMode::Fresh,
+            "config `fresh` must overrule an agent declaring fork, even with a branch available"
+        );
+        assert_eq!(
+            resolved(resolve_effective_context(None, "worker", None, Some(ContextMode::Fork), true)),
+            ContextMode::Fork,
+            "config `fork` applies to an agent that declares nothing"
+        );
+    }
+
+    #[test]
+    fn nothing_configured_anywhere_resolves_to_fresh() {
+        assert_eq!(
+            resolved(resolve_effective_context(None, "worker", None, None, true)),
+            ContextMode::Fresh
+        );
+    }
+
+    /// `profile` requires the agent's own declaration, ignores the config rung, and — alone among
+    /// the request shapes — is never downgraded by the availability test.
+    #[test]
+    fn profile_requires_the_agents_own_default_and_ignores_both_the_config_rung_and_availability() {
+        let err = resolve_effective_context(
+            Some(ContextRequest::Profile),
+            "reviewer",
+            None,
+            Some(ContextMode::Fork),
+            true,
+        )
+        .expect_err("an agent with no declared defaultContext must fail loudly");
+        assert_eq!(
+            err.to_string(),
+            "context: \"profile\" requires agent 'reviewer' to declare defaultContext."
+        );
+
+        assert_eq!(
+            resolved(resolve_effective_context(
+                Some(ContextRequest::Profile),
+                "worker",
+                Some(ContextMode::Fork),
+                Some(ContextMode::Fresh), // ignored
+                false,                    // ignored
+            )),
+            ContextMode::Fork,
+            "profile takes the agent's declaration verbatim, and does not downgrade it"
+        );
+    }
+
+    /// A-SA-5 (DI-SA-3): in one batch with `context` omitted everywhere, siblings resolve
+    /// independently — this is a pure function of its own arguments, so leakage is structurally
+    /// impossible rather than merely untested.
     #[test]
     fn resolve_effective_context_resolves_each_sibling_in_one_batch_independently() {
-        // Sibling A: agent persona's own default_context is Fresh, call site omits context.
-        let sibling_a_agent_default = Some(ContextMode::Fresh);
-        // Sibling B: agent persona's own default_context is Fork, call site omits context.
-        let sibling_b_agent_default = Some(ContextMode::Fork);
+        let a = resolved(resolve_effective_context(None, "a", Some(ContextMode::Fresh), None, true));
+        let b = resolved(resolve_effective_context(None, "b", Some(ContextMode::Fork), None, true));
+        assert_eq!(a, ContextMode::Fresh);
+        assert_eq!(b, ContextMode::Fork);
 
-        let resolved_a = resolve_effective_context(None, sibling_a_agent_default);
-        let resolved_b = resolve_effective_context(None, sibling_b_agent_default);
-
+        // Order independence: resolving B first yields the identical pair.
         assert_eq!(
-            resolved_a,
-            ContextMode::Fresh,
-            "sibling A's own persona default (fresh) must be what it resolves to"
+            resolved(resolve_effective_context(None, "b", Some(ContextMode::Fork), None, true)),
+            ContextMode::Fork
         );
         assert_eq!(
-            resolved_b,
-            ContextMode::Fork,
-            "sibling B's own persona default (fork) must be what it resolves to, unaffected by \
-             sibling A ever having been resolved to fresh in the same batch"
+            resolved(resolve_effective_context(None, "a", Some(ContextMode::Fresh), None, true)),
+            ContextMode::Fresh
         );
+    }
 
-        // Order independence: resolving B before A must produce the identical pair of outcomes —
-        // proof there is no hidden shared/mutable state a call ordering could leak through.
-        let resolved_b_first = resolve_effective_context(None, sibling_b_agent_default);
-        let resolved_a_second = resolve_effective_context(None, sibling_a_agent_default);
-        assert_eq!(resolved_b_first, ContextMode::Fork);
-        assert_eq!(resolved_a_second, ContextMode::Fresh);
+    /// pi `canPreferForkFromSnapshot` — all THREE conditions.
+    #[test]
+    fn can_prefer_fork_needs_a_file_a_leaf_and_the_file_to_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("session.jsonl");
+        std::fs::write(&real, "{}\n").expect("seed");
+        let leaf = EntryId::from("abc12345");
+
+        assert!(can_prefer_fork_from_snapshot(Some(&real), Some(&leaf)));
+        assert!(!can_prefer_fork_from_snapshot(Option::None, Some(&leaf)), "no session file");
+        assert!(!can_prefer_fork_from_snapshot(Some(&real), Option::None), "no leaf to branch from");
+        assert!(
+            !can_prefer_fork_from_snapshot(Some(&dir.path().join("missing.jsonl")), Some(&leaf)),
+            "a path that does not exist is not a branchable parent"
+        );
+    }
+
+    /// pi `validateConfig` (`extension/config.ts:140-142`) THROWS here rather than ignoring.
+    #[test]
+    fn the_config_default_accepts_only_fresh_or_fork() {
+        assert_eq!(resolve_default_subagent_context(Option::None), Ok(Option::None));
+        assert_eq!(
+            resolve_default_subagent_context(Some(&serde_json::json!("fresh"))),
+            Ok(Some(ContextMode::Fresh))
+        );
+        assert_eq!(
+            resolve_default_subagent_context(Some(&serde_json::json!("fork"))),
+            Ok(Some(ContextMode::Fork))
+        );
+        for bad in [
+            serde_json::json!("profile"),
+            serde_json::json!("nonsense"),
+            serde_json::json!(3),
+            serde_json::json!(serde_json::Value::Null),
+        ] {
+            assert_eq!(
+                resolve_default_subagent_context(Some(&bad)),
+                Err("config.defaultSubagentContext must be \"fresh\" or \"fork\"".to_string()),
+                "{bad} must be refused"
+            );
+        }
     }
 
     /// A real, persisted parent session (tempdir-backed, on-disk JSONL — never mocked) branches

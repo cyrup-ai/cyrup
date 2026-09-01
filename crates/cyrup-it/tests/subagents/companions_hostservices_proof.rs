@@ -30,14 +30,19 @@ use std::time::{Duration, Instant};
 
 use cyrup_core::{AssistantMessage, Content, Message, StopReason, Usage};
 use cyrup_ext::host::HostServices;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::{ResultFile, RunId, RunMode, RunState};
 use cyrup_ext_subagents::extension::SubagentExecutor;
 use cyrup_ext_subagents::fork_context::ContextMode;
 use cyrup_session::{NewSessionOpts, SessionLayout, SessionManager};
 
-/// Serializes the two proofs, which both mutate `CYRUP_HOME`/`HOME` (process-global env). A tokio
-/// mutex so the guard can be held across `.await` in a multi-threaded test.
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The sandbox root for one test, handed to the executor as `SubagentExtensionConfig::roots`.
+fn sandboxed(home: &std::path::Path) -> cyrup_ext_subagents::registration::SubagentExtensionConfig {
+    cyrup_ext_subagents::registration::SubagentExtensionConfig {
+        roots: Roots::sandboxed(home),
+        ..Default::default()
+    }
+}
 
 fn assistant(s: &str) -> Message {
     Message::Assistant(AssistantMessage {
@@ -89,19 +94,13 @@ fn create_persisted_session(cwd: &std::path::Path, layout: &SessionLayout, marke
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_branches_from_the_real_session_file_handle_not_the_mtime_heuristic() {
-    let _guard = ENV_LOCK.lock().await;
 
     let home = tempfile::tempdir().expect("home tempdir");
     let cwd_dir = tempfile::tempdir().expect("cwd tempdir");
     let cwd = cwd_dir.path();
 
-    // `fork_resolver` derives its layout root from `dirs_home()` = `$CYRUP_HOME`; point it at a
-    // hermetic tempdir so the branch (and continue_recent's discovery) stay isolated.
-    // SAFETY: scoped, mutex-serialized env mutation (Rust 2024 requires `unsafe` for set/remove_var).
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
-
+    // `fork_resolver` derives its layout root from the executor's own `roots`; point that at
+    // a hermetic tempdir so the branch (and continue_recent's discovery) stay isolated.
     let sessions_root = home.path().join(".cyrup").join("sessions");
     let layout = SessionLayout::new(sessions_root, cwd.to_path_buf());
 
@@ -113,7 +112,7 @@ async fn fork_branches_from_the_real_session_file_handle_not_the_mtime_heuristic
     assert_ne!(id_a, id_b, "the two sessions must be distinct");
 
     // Bind a HostServices whose session_file() is the OLDER session A, then resolve a fork.
-    let executor = SubagentExecutor::new();
+    let executor = SubagentExecutor::with_config(sandboxed(home.path()));
     executor.set_host_services(Arc::new(SessionFileServices { session_file: file_a.clone() }));
 
     let fork = executor
@@ -128,11 +127,6 @@ async fn fork_branches_from_the_real_session_file_handle_not_the_mtime_heuristic
     // `create_branched_session` records the parent's provenance on the branch header (the parent's
     // own session file, whose name embeds the parent session id) — pi lineage (R-SA-143).
     let parent = reopened.header().parent_session.clone().expect("branch records its parent");
-
-    // SAFETY: scoped cleanup under the same held env lock.
-    unsafe {
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     assert!(
         parent.contains(&id_a),
@@ -189,20 +183,17 @@ fn completed_result(run_id: &str) -> ResultFile {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_completion_injects_a_turn_triggering_message_on_the_real_host_services() {
-    let _guard = ENV_LOCK.lock().await;
 
     let home = tempfile::tempdir().expect("home tempdir");
     let cwd_dir = tempfile::tempdir().expect("cwd tempdir");
     let cwd = cwd_dir.path();
-    // Hermetic results-dir root (`run_artifact_roots` derives it from `$CYRUP_HOME`).
-    // SAFETY: scoped, mutex-serialized env mutation.
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
+    // Hermetic results-dir root, named directly rather than moved through process env.
 
     // A completing background run writes its terminal ResultFile into ResultsDir (the runner's last
     // act, R-SA-077) — dropped BEFORE the watcher installs so the watcher's prime scan delivers it.
-    let results_dir = cyrup_ext_subagents::background::run_artifact_roots(cwd).results_dir;
+    let results_dir =
+        cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd)
+            .results_dir;
     tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
     let result_path = results_dir.join("run-notify-e.json");
     cyrup_ext_subagents::background::atomic::write_atomic_json(&result_path, &completed_result("runproofe000000e"))
@@ -214,7 +205,7 @@ async fn background_completion_injects_a_turn_triggering_message_on_the_real_hos
     // which derives the live `HostServicesCompletionSink` (NOT the stderr LoggingCompletionSink)
     // BECAUSE a host handle is present, and primes-scans the already-on-disk result.
     let services = Arc::new(RecordingInjectServices::default());
-    let executor = SubagentExecutor::new();
+    let executor = SubagentExecutor::with_config(sandboxed(home.path()));
     executor.set_host_services(services.clone());
     executor.install_completion_watcher(cwd).await;
 
@@ -225,18 +216,9 @@ async fn background_completion_injects_a_turn_triggering_message_on_the_real_hos
             break;
         }
         if Instant::now() >= deadline {
-            // SAFETY: scoped cleanup under the held env lock before panicking.
-            unsafe {
-                std::env::remove_var("CYRUP_HOME");
-            }
             panic!("inject_message never fired: the completion did not reach the live host services");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    // SAFETY: scoped cleanup under the held env lock.
-    unsafe {
-        std::env::remove_var("CYRUP_HOME");
     }
 
     let calls = services.calls.lock().expect("lock");

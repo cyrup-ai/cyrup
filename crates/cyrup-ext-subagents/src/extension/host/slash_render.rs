@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 use crate::error::SubagentError;
 use crate::exec::ResolvedAgentPersona;
-use crate::fork_context::{resolve_effective_context, ContextMode, ForkContextResolver};
+use crate::fork_context::{
+    resolve_effective_context, ContextMode, ContextRequest, ForkContextResolver,
+};
 use crate::spawn::chain_graph::{GroupStepResult, RunnerStep, SingleStepSpec, StepResult};
 
 /// Every agent name a [`RunnerStep`] graph will dispatch, in walk order — a single step's own
@@ -119,7 +121,10 @@ pub(crate) fn describe_chain(graph: &[RunnerStep]) -> String {
 /// failure aborts the whole batch rather than leaving earlier children already running.
 pub(crate) async fn apply_fork_contexts(
     resolver: &ForkContextResolver,
-    call_site_context: Option<ContextMode>,
+    call_site_context: Option<ContextRequest>,
+    // SUBA-079 — the resolved `subagents.defaultSubagentContext` rung, validated by the caller
+    // (the only side holding the live extension config).
+    config_default: Option<ContextMode>,
     personas: &BTreeMap<String, ResolvedAgentPersona>,
     mut graph: Vec<RunnerStep>,
 ) -> Result<(Vec<RunnerStep>, Option<PathBuf>), SubagentError> {
@@ -131,6 +136,7 @@ pub(crate) async fn apply_fork_contexts(
                 resolve_step_fork_context(
                     resolver,
                     call_site_context,
+                    config_default,
                     personas,
                     spec,
                     &mut flat_index,
@@ -143,6 +149,7 @@ pub(crate) async fn apply_fork_contexts(
                     resolve_step_fork_context(
                         resolver,
                         call_site_context,
+                        config_default,
                         personas,
                         spec,
                         &mut flat_index,
@@ -155,6 +162,7 @@ pub(crate) async fn apply_fork_contexts(
                 resolve_step_fork_context(
                     resolver,
                     call_site_context,
+                    config_default,
                     personas,
                     &mut dynamic.template,
                     &mut flat_index,
@@ -171,13 +179,15 @@ pub(crate) async fn apply_fork_contexts(
     Ok((graph, first_session_file))
 }
 
-/// Resolve one step's effective context (per-step explicit > call-site > persona default > `Fresh`)
+/// Resolve one step's effective context (per-step explicit > call-site > config default > persona
+/// default > `Fresh`)
 /// and, when it resolves to `Fork` and the step has no explicit session file yet, mint its own
 /// per-`*flat_index*` branch off `resolver`. Always advances `*flat_index*` by one so sibling steps
 /// never share an index (and therefore never a branch). See [`apply_fork_contexts`].
 async fn resolve_step_fork_context(
     resolver: &ForkContextResolver,
-    call_site_context: Option<ContextMode>,
+    call_site_context: Option<ContextRequest>,
+    config_default: Option<ContextMode>,
     personas: &BTreeMap<String, ResolvedAgentPersona>,
     spec: &mut SingleStepSpec,
     flat_index: &mut u32,
@@ -186,10 +196,28 @@ async fn resolve_step_fork_context(
     let index = *flat_index;
     *flat_index += 1;
 
-    // Precedence: a step's OWN explicit `context` wins; else the call-site `context`; else this
-    // step's agent's persona `default_context`; else `Fresh` (`resolve_effective_context`).
+    // Precedence: a step's OWN explicit `context` wins outright; else the full ladder.
+    //
+    // SUBA-079: a step's `context` is already a RESOLVED [`ContextMode`], so it short-circuits
+    // ahead of the policy rather than being widened into a request — an explicit per-step mode is
+    // strict for the same reason an explicit call-site one is.
     let persona_default = personas.get(&spec.agent).and_then(|p| p.default_context);
-    let effective = resolve_effective_context(spec.context.or(call_site_context), persona_default);
+    let effective = match spec.context {
+        Some(mode) => mode,
+        Option::None => {
+            let can_prefer_fork = match call_site_context {
+                Option::None => resolver.can_prefer_fork().await,
+                Some(_) => false,
+            };
+            resolve_effective_context(
+                call_site_context,
+                &spec.agent,
+                persona_default,
+                config_default,
+                can_prefer_fork,
+            )?
+        }
+    };
     spec.context = Some(effective);
 
     if effective == ContextMode::Fork {
@@ -469,7 +497,7 @@ mod tests {
         ];
 
         // call_site_context = None (omitted).
-        let (graph, first_session) = apply_fork_contexts(&resolver, None, &personas, graph)
+        let (graph, first_session) = apply_fork_contexts(&resolver, None, None, &personas, graph)
             .await
             .expect("fork contexts resolve against a persisted parent");
 
@@ -521,7 +549,7 @@ mod tests {
         });
 
         let (graph, _first) =
-            apply_fork_contexts(&resolver, Some(ContextMode::Fork), &personas, vec![group])
+            apply_fork_contexts(&resolver, Some(ContextRequest::Fork), None, &personas, vec![group])
                 .await
                 .expect("both parallel fork tasks resolve");
 

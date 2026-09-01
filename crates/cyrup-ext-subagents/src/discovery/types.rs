@@ -378,6 +378,135 @@ where
     }
 }
 
+/// Deserialize-only sentinel that accepts EXCLUSIVELY the JSON string `"inherit"` — the third,
+/// `tools`-only shape in pi's `tools?: string[] | false | "inherit"` (`agents.ts:98`). Kept a
+/// distinct type (rather than a bare string compare) so the `untagged` helper in
+/// [`ToolsOverrideField`]'s `Deserialize` can discriminate it from a genuine tool-name string
+/// without any tool list ever being able to masquerade as it.
+struct ToolsInheritSentinel;
+
+impl<'de> serde::Deserialize<'de> for ToolsInheritSentinel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct InheritOnly;
+
+        impl serde::de::Visitor<'_> for InheritOnly {
+            type Value = ToolsInheritSentinel;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the literal string `\"inherit\"` (a tools inherit sentinel)")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<ToolsInheritSentinel, E>
+            where
+                E: serde::de::Error,
+            {
+                if v == TOOLS_OVERRIDE_INHERIT {
+                    Ok(ToolsInheritSentinel)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(v), &self))
+                }
+            }
+        }
+
+        deserializer.deserialize_str(InheritOnly)
+    }
+}
+
+/// The literal settings value that requests "drop the tool restriction entirely" — pi's
+/// `"inherit"` arm of `tools?: string[] | false | "inherit"` (`agents.ts:98`), consumed by
+/// `applyToolsOverride` (`agents.ts:1237-1246`).
+pub const TOOLS_OVERRIDE_INHERIT: &str = "inherit";
+
+/// FOUR-state override delta for the one pi override field that has a third non-`Unset` shape:
+/// `tools?: string[] | false | "inherit"` (`agents.ts:98`). It cannot be an
+/// [`OverrideField<Vec<ToolRef>>`], because pi's `applyToolsOverride` (`agents.ts:1237-1246`)
+/// gives its three stated shapes three DIFFERENT outcomes, and the middle two are opposites:
+///
+/// - `["a","b"]` -> `tools = Some([a, b])` — replace the allowlist.
+/// - `false` -> `splitToolList([])` -> `tools = Some([])` — the EMPTY allowlist, i.e. "this agent
+///   may call no tools at all". A restriction, not the absence of one.
+/// - `"inherit"` -> `delete target.tools` -> `tools = None` — NO restriction: the child sees the
+///   parent's full tool surface.
+///
+/// Collapsing `"inherit"` into the clear sentinel would therefore invert a security boundary
+/// (open the full tool surface where the operator asked for none, or vice versa), so the two stay
+/// separate variants. Before this type existed, `tools: "inherit"` was not merely mis-applied — it
+/// failed the whole settings read with [`crate::error::SubagentError::MalformedSettings`], because
+/// a JSON string deserializes as neither `Vec<ToolRef>` nor the `false`-only clear sentinel.
+///
+/// pi's `mcpDirectTools` companion (deleted alongside `tools` on `"inherit"`, repopulated by
+/// `splitToolList` otherwise) has no separate field here: this crate carries MCP direct tools
+/// INSIDE the same list as [`ToolRef::Mcp`], so one field covers both.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum ToolsOverrideField {
+    /// The delta says nothing about `tools`; leave the agent's own resolved list untouched.
+    #[default]
+    Unset,
+    /// pi `false`: reset to the EMPTY allowlist (`Some(vec![])`, "no tools"), NOT to `None`.
+    ExplicitClear,
+    /// pi `"inherit"`: drop the restriction entirely (`None`, "no allowlist to enforce").
+    Inherit,
+    /// pi `string[]`: replace the allowlist with exactly these tools.
+    Value(Vec<ToolRef>),
+}
+
+impl ToolsOverrideField {
+    /// True unless this delta is `Unset` — mirrors [`OverrideField::is_present`], including its
+    /// role in `merge.rs`'s fill-unset walk and in [`AgentOverrideConfig::is_empty`].
+    pub fn is_present(&self) -> bool {
+        !matches!(self, ToolsOverrideField::Unset)
+    }
+
+    /// True iff this delta is `Unset` — the `#[serde(skip_serializing_if)]` predicate, mirroring
+    /// [`OverrideField::is_unset`].
+    pub fn is_unset(&self) -> bool {
+        matches!(self, ToolsOverrideField::Unset)
+    }
+}
+
+impl serde::Serialize for ToolsOverrideField {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            // Never reached for an [`AgentOverrideConfig::tools`] (it is
+            // `skip_serializing_if = "ToolsOverrideField::is_unset"`); `null` is the
+            // least-surprising fallback should any other serializer reach it directly.
+            ToolsOverrideField::Unset => serializer.serialize_none(),
+            ToolsOverrideField::ExplicitClear => serializer.serialize_bool(false),
+            ToolsOverrideField::Inherit => serializer.serialize_str(TOOLS_OVERRIDE_INHERIT),
+            ToolsOverrideField::Value(v) => v.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ToolsOverrideField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Order mirrors [`OverrideField`]'s: the concrete list FIRST, then the two scalar
+        // sentinels, neither of which a JSON array can ever satisfy.
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Value(Vec<ToolRef>),
+            Clear(OverrideClearSentinel),
+            Inherit(ToolsInheritSentinel),
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw::Value(v) => Ok(ToolsOverrideField::Value(v)),
+            Raw::Clear(OverrideClearSentinel) => Ok(ToolsOverrideField::ExplicitClear),
+            Raw::Inherit(ToolsInheritSentinel) => Ok(ToolsOverrideField::Inherit),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Override provenance / settings shapes (R-SA-009..012, §4.1)
 // ---------------------------------------------------------------------------------------------
@@ -409,19 +538,53 @@ pub struct AgentOverrideInfo {
 
 /// Per-field three-state override delta for one agent name, as read from
 /// `subagents.agentOverrides.<name>` in `cyrup-config`'s layered, untyped settings map (func-SA
-/// §4.1). **This is a field-for-field port of pi's `BuiltinAgentOverrideConfig`
-/// (`agents.ts:82-100`)** — every field below is exactly one pi override field, and pi has no
-/// others:
+/// §4.1). Every field below is exactly one field of pi's `BuiltinAgentOverrideConfig`
+/// (`agents.ts:80-103`), under the same JSON key.
+///
+/// **This is NOT the complete set.** pi declares 22 override keys; the 18 fields below model 18 of
+/// them, and 4 are unmodeled. An earlier revision of this doc claimed field-for-field completeness —
+/// it was wrong, and the claim is retracted rather than softened, because "pi has no others" is
+/// exactly the sentence that stops a reader from checking. Keep the arithmetic here honest: a wrong
+/// census misleads in the same way the completeness claim did.
+///
+/// THREE of the four are unmodeled because this crate's [`AgentDefinition`] has no field for them to
+/// land in, and modeling them anyway would produce a settings key that parses and is then silently
+/// dropped — which, for an override delta, is indistinguishable from the setting not working at all:
+///
+/// - `defaultProvider?: string | false` — pi `AgentConfig.modelProvider`; no counterpart here
+///   (this crate resolves a provider from the [`cyrup_core::ModelId`] itself).
+/// - `fast?: boolean` — pi `AgentConfig.fast`; no counterpart here.
+/// - `acceptanceRole?: AcceptanceRole | false` — pi `AgentConfig.acceptanceRole`; no counterpart
+///   here (acceptance roles are resolved by `exec/acceptance/`, not carried on the definition).
+///
+/// The FOURTH, `outputMode?: OutputMode`, is a different case: it IS representable — this crate
+/// merges pi's independent `output` (a path string) and `outputMode` fields into a single
+/// [`OutputSpec`], so its target is [`OutputSpec::mode`] — and is unmodeled only because it fell
+/// outside the scope that added the other five. Note the consequence for [`Self::output`], which is
+/// handled in `merge.rs`: a concrete `output` override replaces the PATH and must PRESERVE any
+/// already-resolved `mode`, because upstream those are two independent fields and overriding one
+/// never touches the other.
+///
+/// Shapes:
 ///
 /// - pi's `string | false` / `string[] | false` / `AgentDefaultContext | false` fields
 ///   (`model`/`fallbackModels`/`thinking`/`defaultContext`/`skills`/`tools`/
 ///   `subagentOnlyExtensions`) are three-state [`OverrideField<T>`] where a JSON `false`
 ///   deserializes to [`OverrideField::ExplicitClear`] (pi's explicit "reset this field" sentinel).
 /// - pi's plain `boolean` / `SystemPromptMode` / `string` fields (no `| false`:
-///   `systemPromptMode`/`inheritProjectContext`/`inheritSkills`/`disabled`/`systemPrompt`/
-///   `completionGuard`) are [`OverrideField<T>`] that only ever carry
-///   [`OverrideField::Value`]/[`OverrideField::Unset`] (a JSON `false` for a `bool`-typed field is
-///   a real `Value(false)`, never a clear).
+///   `description`/`systemPromptMode`/`inheritProjectContext`/`inheritSkills`/`disabled`/
+///   `systemPrompt`/`completionGuard`) are also [`OverrideField<T>`]. What a JSON `false` means for
+///   them depends on `T`, and the two cases differ — the untagged `Deserialize` below tries
+///   `Value(T)` first and only falls through to the clear sentinel when that arm rejects the input:
+///   - `T = bool` (`inheritProjectContext`/`inheritSkills`/`disabled`/`completionGuard`): the
+///     `Value` arm ACCEPTS `false`, so it is a real `Value(false)` and never a clear. This is the
+///     case the port has always relied on.
+///   - `T = String` / `SystemPromptMode` (`description`/`systemPrompt`/`systemPromptMode`): the
+///     `Value` arm REJECTS a bool, so a JSON `false` DOES reach the sentinel and yields
+///     [`OverrideField::ExplicitClear`] — a state pi has no meaning for on these keys. It is
+///     therefore reachable from a settings file and each apply site must decide what to do with it
+///     rather than fall into a default. `merge.rs` ignores it for `description` (blanking the text
+///     the parent model selects on would be the worse failure) and both apply sites agree.
 ///
 /// **Not present:** pi deliberately has NO `maxSubagentDepth` settings override — an agent's
 /// `maxSubagentDepth` is a frontmatter / `config.json` concern only, resolved by
@@ -430,6 +593,28 @@ pub struct AgentOverrideInfo {
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentOverrideConfig {
+    /// pi `description?: string` (`agents.ts:81`) — a plain string with NO `| false` clear form.
+    /// Replaces [`AgentDefinition::description`], the text the parent model reads when choosing an
+    /// agent, which is why an operator needs to be able to retune it from settings without editing
+    /// a packaged agent file.
+    ///
+    /// `Unset` and `Value` are the only MEANINGFUL states, but [`OverrideField::ExplicitClear`] is
+    /// still REACHABLE: `OverrideField<String>`'s untagged `Deserialize` falls through to the clear
+    /// sentinel for a JSON `false` because the `Value(String)` arm rejects a bool. pi assigns that
+    /// `false` straight into a string-typed field (`agents.ts:1258`), so there is no parity target
+    /// to copy; both apply sites in `merge.rs` therefore IGNORE the clear, leaving the agent's own
+    /// description intact rather than blanking the text agent selection depends on.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub description: OverrideField<String>,
+    /// pi `output?: string | false` (`agents.ts:82`) — the default output PATH. Lands in
+    /// [`AgentDefinition::output`]'s [`OutputSpec::path`]; a clear drops the whole spec. Carried as
+    /// a `String` (not a `PathBuf`) because that is the on-disk JSON shape; `merge.rs` converts.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub output: OverrideField<String>,
+    /// pi `defaultReads?: string[] | false` (`agents.ts:84`) — the pre-declared read-context
+    /// default. Lands in [`AgentDefinition::default_reads`]; `merge.rs` converts to `PathBuf`s.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub default_reads: OverrideField<Vec<String>>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub model: OverrideField<String>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
@@ -466,21 +651,49 @@ pub struct AgentOverrideConfig {
     /// JSON `false` to clear it.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub skills: OverrideField<Vec<String>>,
+    /// pi `tools?: string[] | false | "inherit"` (`agents.ts:98`) — the ONLY override field with a
+    /// fourth state, hence [`ToolsOverrideField`] rather than [`OverrideField`]. See that type for
+    /// why `false` and `"inherit"` must not be collapsed.
+    #[serde(skip_serializing_if = "ToolsOverrideField::is_unset")]
+    pub tools: ToolsOverrideField,
+    /// pi `extensions?: string[] | false` (`agents.ts:99`) — the extension allowlist. Lands in
+    /// [`AgentDefinition::extensions`], where `None` means "all extensions visible" and
+    /// `Some(vec![])` means "none"; a clear restores `None`, matching pi's `delete next.extensions`
+    /// (`agents.ts:1282`).
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
-    pub tools: OverrideField<Vec<ToolRef>>,
-    /// pi `subagentOnlyExtensions?: string[] | false` (`agents.ts:97`) — child-only extension
+    pub extensions: OverrideField<Vec<String>>,
+    /// pi `subagentOnlyExtensions?: string[] | false` (`agents.ts:100`) — child-only extension
     /// paths, or a JSON `false` to clear them.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub subagent_only_extensions: OverrideField<Vec<String>>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub completion_guard: OverrideField<bool>,
+    /// pi `toolBudget?: ToolBudgetConfig | false` (`agents.ts:102`) — the per-agent tool-call
+    /// budget, or a JSON `false` to clear it.
+    ///
+    /// `skip_deserializing` on purpose. [`ResolvedToolBudget`]'s own contract is that every
+    /// instance satisfies `hard >= 1`, `soft >= 1`, `soft <= hard` and a non-empty `block` — an
+    /// invariant that holds only because the type is produced EXCLUSIVELY by
+    /// [`crate::exec::tool_budget::validate_tool_budget_config`]. Letting serde derive this field
+    /// would let a settings file mint a `ResolvedToolBudget` with `hard: 0` straight from user
+    /// input, breaking that invariant for every downstream reader that trusts it. So, exactly as
+    /// [`SubagentSettings::model_scope`] and [`SubagentSettings::max_thinking`] already do, the
+    /// field is populated in one place only —
+    /// [`crate::discovery::parse_subagent_settings`] — which runs the real validator and turns a
+    /// rejection into a discovery-aborting [`crate::error::SubagentError::MalformedSettings`]
+    /// (R-SA-009) rather than a silently dropped budget.
+    #[serde(skip_deserializing, skip_serializing_if = "OverrideField::is_unset")]
+    pub tool_budget: OverrideField<ResolvedToolBudget>,
 }
 
 impl AgentOverrideConfig {
     /// True iff every field in this delta is `Unset` — an override entry that, once parsed,
     /// turned out to say nothing (distinct from the entry being entirely absent from settings).
     pub fn is_empty(&self) -> bool {
-        !(self.model.is_present()
+        !(self.description.is_present()
+            || self.output.is_present()
+            || self.default_reads.is_present()
+            || self.model.is_present()
             || self.fallback_models.is_present()
             || self.thinking.is_present()
             || self.system_prompt_mode.is_present()
@@ -491,8 +704,10 @@ impl AgentOverrideConfig {
             || self.system_prompt.is_present()
             || self.skills.is_present()
             || self.tools.is_present()
+            || self.extensions.is_present()
             || self.subagent_only_extensions.is_present()
-            || self.completion_guard.is_present())
+            || self.completion_guard.is_present()
+            || self.tool_budget.is_present())
     }
 }
 
@@ -538,6 +753,19 @@ pub struct SubagentSettings {
     /// which is the correct default (enforcement off).
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+    /// SUBA-078 — pi's `subagents.maxThinking` (`agents.ts:169`) — the reasoning-level UPPER BOUND
+    /// for every subagent under this cwd (`crate::exec::thinking_ceiling`).
+    ///
+    /// `skip_deserializing` for the same reason [`Self::model_scope`] has it: pi validates this key
+    /// with its own parser whose diagnostic is part of R-SA-009's MUST-abort contract
+    /// (`agents.ts:1090-1096`), so it is populated by [`crate::discovery::parse_subagent_settings`]
+    /// from the raw [`serde_json::Value`] rather than by serde's derive, which would report a
+    /// generic type error instead of upstream's message.
+    ///
+    /// Settings-only by design: this is deliberately NOT a field on [`AgentDefinition`], so an
+    /// agent file can never author its own ceiling (see `exec::thinking_ceiling`'s module doc).
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub max_thinking: Option<String>,
 }
 
 /// The user- and project-scope [`SubagentSettings`] pair, each with its own on-disk
@@ -584,6 +812,15 @@ impl LayeredOverrideSettings {
     #[must_use]
     pub fn model_scope(&self) -> Option<crate::exec::model_scope::ModelScopeConfig> {
         self.project.model_scope.clone().or_else(|| self.user.model_scope.clone())
+    }
+
+    /// SUBA-078 — the effective `subagents.maxThinking` ceiling for this cwd, pi
+    /// `resolveSubagentMaxThinking` (`agents.ts:1190-1197`): project wins outright when present,
+    /// else user, else no ceiling and the bound is off. Same project-beats-user rule as
+    /// [`Self::model_scope`].
+    #[must_use]
+    pub fn max_thinking(&self) -> Option<String> {
+        self.project.max_thinking.clone().or_else(|| self.user.max_thinking.clone())
     }
 }
 
@@ -1231,7 +1468,7 @@ mod tests {
         let implementer = settings.overrides.get("implementer").expect("implementer override");
         assert_eq!(
             implementer.tools,
-            OverrideField::Value(vec![
+            ToolsOverrideField::Value(vec![
                 ToolRef::Builtin("bash".to_string()),
                 ToolRef::Mcp("xcodebuild_list_sims".to_string()),
             ])

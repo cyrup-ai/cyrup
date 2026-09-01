@@ -148,6 +148,7 @@ impl Tool for WaitTool {
             &self.cwd,
             enabled,
             self.executor.current_session_id(),
+            &self.executor.config_snapshot().await.roots,
         )
         // SUBA-034: subscribe this wait to the orchestrator's completion bus, so a result observed
         // by THIS process's watcher releases the wait immediately rather than one poll interval

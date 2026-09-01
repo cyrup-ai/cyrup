@@ -26,6 +26,17 @@ impl CacheRetention {
 /// fallback (documented; R-07-028). This is the ONLY place process env is read.
 #[derive(Clone, Debug, Default)]
 pub struct EnvVars {
+    /// The RESOLVED home directory — [`crate::paths::cyrup_home_dir_from`]'s full ladder
+    /// (`CYRUP_HOME` -> `HOME` -> OS home), run once here at the crate's single env touchpoint.
+    ///
+    /// This rung was absent from this type until now, and its absence is the whole of the
+    /// divergence it closes: five other crates hand-rolled a `CYRUP_HOME` ladder precisely because
+    /// the type that owns layout resolution did not carry one. `None` when nothing answers, which
+    /// [`ConfigDirs::resolve`] turns into an error rather than a silent `/tmp`.
+    pub home: Option<PathBuf>,
+    /// The ENVIRONMENT tier of the agent-dir override, already `~`-expanded against [`Self::home`]
+    /// ([`crate::paths::cyrup_agent_dir_from`]). `None` when no key is set, so the CLI tier and the
+    /// `<home>/.cyrup/agent` default still layer above and below it in [`ConfigDirs::resolve`].
     pub agent_dir: Option<PathBuf>,
     pub session_dir: Option<PathBuf>,
     pub package_dir: Option<PathBuf>,
@@ -58,7 +69,7 @@ fn truthy(s: &str) -> bool {
 impl EnvVars {
     /// Reads the process environment once.
     pub fn from_process() -> Self {
-        Self::from_lookup(|key| std::env::var(key).ok())
+        Self::from_lookup(|key| std::env::var_os(key))
     }
 
     /// The whole env mapping, driven by an arbitrary key lookup.
@@ -68,16 +79,32 @@ impl EnvVars {
     /// environment is not writable from here at all — and would race sibling tests in the same
     /// binary if it were. `get` returning `Some("")` is a **set but empty** variable, which is a
     /// meaningful third state for `telemetry` (DRIFT-050).
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+    pub fn from_lookup(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
+        // The one lookup, in the one shape the shared ladders take. `OsString` because these
+        // answers become paths and a `String` seam drops a non-UTF-8 value to the next rung; the
+        // non-path fields below convert with `to_string_lossy`, which is what they already got.
+        let lookup: crate::paths::EnvLookup<'_> = &|key: &str| get(key);
+        let text = |key: &str| get(key).map(|v| v.to_string_lossy().into_owned());
         // Pi's `first_env` shape: first key that is set to a NON-EMPTY value.
-        let first = |keys: &[&str]| keys.iter().find_map(|k| get(k).filter(|v| !v.is_empty()));
+        let first = |keys: &[&str]| keys.iter().find_map(|k| text(k).filter(|v| !v.is_empty()));
+        // THE home ladder, run once. Every dir override below expands its `~` against THIS home
+        // rather than an ambient one — see `paths::cyrup_dir_override_from` for the divergence
+        // that closes.
+        let home = crate::paths::cyrup_home_dir_from(lookup);
         // Pi normalizes every dir env var as it reads it — `getAgentDir()` is
         // `if (envDir) { return expandTildePath(envDir); }` (config.ts:515-521 @v0.83.0) and
         // `getPackageDir()` the same for `PI_PACKAGE_DIR` (`:367-372`); the session-dir env tier is
         // `expandTildePath(envSessionDir)` at main.ts:625-628. `expandTildePath` IS `normalizePath`
         // (config.ts:498-500). CFG-036.
-        let path = |keys: &[&str]| first(keys).map(|raw| crate::paths::normalize_path_buf(&raw));
+        let path =
+            |keys: &[&str]| crate::paths::cyrup_dir_override_from(keys, home.as_deref(), lookup);
+        // Resolved before the struct literal so the `path` closure's borrow of `home` ends before
+        // `home` itself is moved into the field.
+        let agent_dir = path(&crate::paths::ENV_AGENT_DIR_KEYS);
+        let session_dir = path(&["CYRUP_SESSION_DIR", "PI_CODING_AGENT_SESSION_DIR"]);
+        let package_dir = path(&["CYRUP_PACKAGE_DIR", "PI_PACKAGE_DIR"]);
         Self {
+            home,
             // CFG-076 — upstream has exactly ONE agent-dir env name, `PI_CODING_AGENT_DIR`, and
             // pi core, `pi-intercom` (`broker/paths.ts:27-38`, asserted at `broker/paths.test.ts:25`)
             // and `pi-subagents` (`src/shared/utils.ts:96`, `src/agents/agents.ts:1886`) all read
@@ -90,13 +117,9 @@ impl EnvVars {
             // set, core lands on the same directory the siblings do. The short name stays FIRST so
             // the documented spelling wins when both are set. `PI_CODING_AGENT_DIR` remains last as
             // the migration fallback (R-07-028).
-            agent_dir: path(&[
-                "CYRUP_AGENT_DIR",
-                "CYRUP_CODING_AGENT_DIR",
-                "PI_CODING_AGENT_DIR",
-            ]),
-            session_dir: path(&["CYRUP_SESSION_DIR", "PI_CODING_AGENT_SESSION_DIR"]),
-            package_dir: path(&["CYRUP_PACKAGE_DIR", "PI_PACKAGE_DIR"]),
+            agent_dir,
+            session_dir,
+            package_dir,
             offline: first(&["CYRUP_OFFLINE", "PI_OFFLINE"])
                 .as_deref()
                 .is_some_and(truthy),
@@ -112,7 +135,7 @@ impl EnvVars {
             // (DRIFT-050).
             telemetry: ["CYRUP_TELEMETRY", "PI_TELEMETRY"]
                 .iter()
-                .find_map(|k| get(k))
+                .find_map(|k| text(k))
                 .as_deref()
                 .map(truthy),
             cache_retention: first(&["CYRUP_CACHE_RETENTION", "PI_CACHE_RETENTION"])
@@ -175,16 +198,30 @@ impl ConfigDirs {
     /// Resolve the directory layout. A missing home falls back to the current dir rather than
     /// panicking (R-00-009).
     pub fn resolve(cli: &CliConfigOverrides, env: &EnvVars) -> Result<Self, ConfigError> {
-        let home = directories::BaseDirs::new()
-            .map(|b| b.home_dir().to_path_buf())
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        // THE home ladder (`CYRUP_HOME` -> `HOME` -> OS home) was already run once by
+        // `EnvVars::from_lookup`, this crate's single env touchpoint. This is the BINARY terminal
+        // for it: a `cyrup` that cannot locate home refuses rather than silently laying its layout
+        // down in a temp directory. `cyrup_ext_subagents::paths::home_dir` takes the other terminal
+        // for the opposite and equally correct reason — a library must not panic.
+        let home = env
+            .home
+            .clone()
             .ok_or_else(|| ConfigError::Dir("could not determine home directory".to_string()))?;
 
         // Pi normalizes the CLI tier too — `parsed.sessionDir ? normalizePath(parsed.sessionDir)`
         // (main.ts:625-626 @v0.83.0) — so a quoted `--session-dir ~/sessions`, or one supplied from
         // a config file or CI variable where no shell expanded it, resolves under `$HOME` instead
         // of creating a directory literally named `~`. CFG-036.
-        let normalize_cli = |p: &PathBuf| crate::paths::normalize_path_buf(&p.to_string_lossy());
+        //
+        // Anchored on the home resolved ABOVE, not on `paths::ambient_home`: with a `CYRUP_HOME`
+        // set, a `~/…` flag and a `~/…` env override must land in the same tree as everything else
+        // this function derives.
+        let normalize_cli = |p: &PathBuf| {
+            PathBuf::from(crate::paths::normalize_path_with_home(
+                &p.to_string_lossy(),
+                Some(&home),
+            ))
+        };
 
         let agent_dir = cli
             .agent_dir
@@ -351,7 +388,21 @@ impl ConfigDirs {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{CliConfigOverrides, ConfigDirs, EnvVars};
+    use std::ffi::OsString;
     use std::path::PathBuf;
+
+    /// An environment that names its home explicitly.
+    ///
+    /// `EnvVars::default()` is the empty environment, and in an empty environment there is no home
+    /// — [`ConfigDirs::resolve`] now says so with an error rather than quietly consulting the
+    /// developer's real one. Every layout test below is about path ARITHMETIC, so it states the
+    /// home it wants and gets the same answer on every machine.
+    fn env_rooted_at(home: &str) -> EnvVars {
+        EnvVars { home: Some(PathBuf::from(home)), ..Default::default() }
+    }
+
+    /// The fixed home every layout test in this module resolves against.
+    const FIXTURE_HOME: &str = "/fixture-home";
 
     #[test]
     fn resolve_captures_real_home_distinct_from_agent_dir() {
@@ -359,12 +410,13 @@ mod tests {
         // package-manager.ts:217; `getAgentDir` = `join(homedir(), CONFIG_DIR_NAME, "agent")`,
         // config.ts:520) rather than discarding it. With no env/CLI agent-dir override the agent dir
         // defaults to `<home>/.cyrup/agent`, so `home` is a strict ancestor and must differ.
-        let env = EnvVars::default();
+        let env = env_rooted_at(FIXTURE_HOME);
         let cli = CliConfigOverrides {
             cwd: Some(PathBuf::from("/")),
             ..Default::default()
         };
         let dirs = ConfigDirs::resolve(&cli, &env).unwrap();
+        assert_eq!(dirs.home, PathBuf::from(FIXTURE_HOME));
         assert_eq!(dirs.agent_dir, dirs.home.join(".cyrup").join("agent"));
         assert_ne!(dirs.home, dirs.agent_dir);
         assert!(dirs.agent_dir.starts_with(&dirs.home));
@@ -379,27 +431,27 @@ mod tests {
     #[test]
     fn both_spellings_of_the_agent_dir_env_reach_the_core_resolver() {
         let long = EnvVars::from_lookup(|k| {
-            (k == "CYRUP_CODING_AGENT_DIR").then(|| "/opt/long".to_string())
+            (k == "CYRUP_CODING_AGENT_DIR").then(|| OsString::from("/opt/long"))
         });
         assert_eq!(long.agent_dir, Some(PathBuf::from("/opt/long")));
 
         let short =
-            EnvVars::from_lookup(|k| (k == "CYRUP_AGENT_DIR").then(|| "/opt/short".to_string()));
+            EnvVars::from_lookup(|k| (k == "CYRUP_AGENT_DIR").then(|| OsString::from("/opt/short")));
         assert_eq!(short.agent_dir, Some(PathBuf::from("/opt/short")));
 
         // The documented spelling wins when both are set, and the `PI_` migration fallback stays
         // last.
         let both = EnvVars::from_lookup(|k| match k {
-            "CYRUP_AGENT_DIR" => Some("/opt/short".to_string()),
-            "CYRUP_CODING_AGENT_DIR" => Some("/opt/long".to_string()),
-            "PI_CODING_AGENT_DIR" => Some("/opt/legacy".to_string()),
+            "CYRUP_AGENT_DIR" => Some(OsString::from("/opt/short")),
+            "CYRUP_CODING_AGENT_DIR" => Some(OsString::from("/opt/long")),
+            "PI_CODING_AGENT_DIR" => Some(OsString::from("/opt/legacy")),
             _ => None,
         });
         assert_eq!(both.agent_dir, Some(PathBuf::from("/opt/short")));
 
         let legacy = EnvVars::from_lookup(|k| match k {
-            "CYRUP_CODING_AGENT_DIR" => Some("/opt/long".to_string()),
-            "PI_CODING_AGENT_DIR" => Some("/opt/legacy".to_string()),
+            "CYRUP_CODING_AGENT_DIR" => Some(OsString::from("/opt/long")),
+            "PI_CODING_AGENT_DIR" => Some(OsString::from("/opt/legacy")),
             _ => None,
         });
         assert_eq!(legacy.agent_dir, Some(PathBuf::from("/opt/long")));
@@ -412,12 +464,14 @@ mod tests {
     /// survived into the resolved layout as a literal directory component.
     #[test]
     fn tilde_and_file_url_dirs_are_normalized_on_the_env_and_cli_tiers() {
-        let home = super::super::paths::normalize_path("~");
-        let home = PathBuf::from(&home);
+        let home = PathBuf::from(FIXTURE_HOME);
 
+        // The env tier arrives already expanded — `EnvVars::from_lookup` runs
+        // `paths::cyrup_dir_override_from` against the home it resolved, so a `~` never reaches
+        // this struct. Written expanded here for the same reason.
         let env = EnvVars {
-            agent_dir: Some(PathBuf::from(super::super::paths::normalize_path("~/alt"))),
-            ..Default::default()
+            agent_dir: Some(home.join("alt")),
+            ..env_rooted_at(FIXTURE_HOME)
         };
         let cli = CliConfigOverrides {
             cwd: Some(PathBuf::from("/")),
@@ -432,7 +486,7 @@ mod tests {
             package_dir: Some(PathBuf::from("file:///abs/packages")),
             ..Default::default()
         };
-        let dirs = ConfigDirs::resolve(&cli, &EnvVars::default()).unwrap();
+        let dirs = ConfigDirs::resolve(&cli, &env_rooted_at(FIXTURE_HOME)).unwrap();
         assert_eq!(dirs.session_dir, home.join("sessions"));
         assert!(dirs.session_dir_explicit);
         assert_eq!(dirs.package_dir, PathBuf::from("/abs/packages"));
@@ -444,7 +498,7 @@ mod tests {
     /// argument slot as the flag (main.ts:630), which selects the literal (not cwd-encoded) layout.
     #[test]
     fn settings_session_dir_overrides_the_default_and_is_explicit() {
-        let env = EnvVars::default();
+        let env = env_rooted_at(FIXTURE_HOME);
         let cli = CliConfigOverrides {
             cwd: Some(PathBuf::from("/")),
             ..Default::default()
@@ -464,7 +518,7 @@ mod tests {
     /// `sessionDir ? … : getDefaultSessionDir(cwd)` (session-manager.ts:1538).
     #[test]
     fn settings_session_dir_yields_to_cli_env_and_ignores_blanks() {
-        let env = EnvVars::default();
+        let env = env_rooted_at(FIXTURE_HOME);
         let cli = CliConfigOverrides {
             cwd: Some(PathBuf::from("/")),
             session_dir: Some(PathBuf::from("/flag/sessions")),
@@ -518,14 +572,15 @@ mod flag_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod telemetry_tristate_tests {
+    use std::ffi::OsString;
     use super::{CliConfigOverrides, EnvVars};
     use crate::policy::NetworkPolicy;
     use crate::settings::{EffectiveSettings, Settings};
 
     fn env_with(pairs: &[(&str, &str)]) -> EnvVars {
-        let owned: Vec<(String, String)> = pairs
+        let owned: Vec<(String, OsString)> = pairs
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|(k, v)| ((*k).to_string(), OsString::from(*v)))
             .collect();
         EnvVars::from_lookup(move |key| {
             owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())

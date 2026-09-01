@@ -1351,6 +1351,7 @@ dependencies = [
  "blake3",
  "bytes",
  "cyrup-agent",
+ "cyrup-config",
  "cyrup-core",
  "cyrup-provider",
  "cyrup-session",
@@ -1430,6 +1431,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "cyrup-config",
  "cyrup-core",
  "cyrup-ext",
  "cyrup-ext-subagents",

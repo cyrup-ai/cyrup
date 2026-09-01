@@ -398,8 +398,8 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     }));
     props.insert("context".to_string(), serde_json::json!({
         "type": "string",
-        "enum": ["fresh", "fork"],
-        "description": "'fresh' or 'fork' to branch from parent session. Explicit context overrides every child in the invocation. If omitted, each requested agent uses its own defaultContext; agents without defaultContext: 'fork' run fresh."
+        "enum": ["fresh", "fork", "profile"],
+        "description": "'fresh' or 'fork' to branch from parent session, or 'profile' to require the selected agent's declared defaultContext. Explicit fresh/fork overrides every child; profile ignores config defaultSubagentContext and fails when an agent has no defaultContext. If omitted, config defaultSubagentContext wins over each agent defaultContext; implicit fork needs a persisted parent session and leaf, else fresh."
     }));
     props.insert("chainDir".to_string(), serde_json::json!({ "type": "string", "description": "Persistent chain artifact directory; defaults to user-scoped temp storage." }));
     props.insert("async".to_string(), serde_json::json!({ "type": "boolean", "description": "Run in background (default: false, or per config)" }));
@@ -736,9 +736,12 @@ mod tests {
         }
         assert_eq!(props["action"]["type"], serde_json::json!("string"));
 
-        // context fresh/fork enum.
+        // SUBA-079 / pi `extension/schemas.ts:319-322` @v0.57.0 — three values, `profile` included.
         assert_eq!(props["context"]["type"], serde_json::json!("string"));
-        assert_eq!(props["context"]["enum"], serde_json::json!(["fresh", "fork"]));
+        assert_eq!(
+            props["context"]["enum"],
+            serde_json::json!(["fresh", "fork", "profile"])
+        );
 
         // Top-level numeric bounds pi pins.
         assert_eq!(props["concurrency"]["minimum"], serde_json::json!(1));

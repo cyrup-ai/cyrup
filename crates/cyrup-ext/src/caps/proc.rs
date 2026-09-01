@@ -205,10 +205,10 @@ fn interpolate_dollar_env(value: &str, lookup: impl Fn(&str) -> Option<String>) 
 /// lookup, a fallback this does not replicate since no realistic MCP-server-launching environment
 /// leaves `HOME` unset).
 fn host_home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
-        .map(PathBuf::from)
+    // THE home ladder, shared: `CYRUP_HOME` -> `HOME` -> the OS home. The `CYRUP_HOME` rung is new
+    // here and is the point — this resolver read `HOME` -> `USERPROFILE` only, so a sandbox that
+    // moved every other tree left `~`-expansion in this one pointing at the real home.
+    cyrup_config::paths::cyrup_home_dir_from(&|key| std::env::var_os(key))
 }
 
 /// Interpolate + tilde-expand a config-supplied path — a direct Rust port of Pi's

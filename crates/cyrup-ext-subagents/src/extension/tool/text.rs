@@ -365,7 +365,7 @@ mod tests {
     use super::*;
     use crate::extension::executor::SubagentExecutor;
     use crate::extension::executor::notices::ForegroundControlEntry;
-    use crate::extension::executor::paths::default_async_root;
+    use crate::extension::executor::paths::default_async_root_in;
     use crate::extension::testsupport::dispatch_tool;
     use crate::extension::testsupport::scoped_tool;
     use crate::extension::testsupport::seed_running_run;
@@ -856,7 +856,7 @@ mod tests {
         // `steerAsyncRun:3580` — the id DOES resolve (its run directory exists) but the run has
         // neither a status nor a result file, so there is nothing live to steer. This is the case
         // the message quoted below actually describes, and the only one it should ever cover.
-        let hollow = default_async_root(dir.path()).join("hollowrun0001");
+        let hollow = default_async_root_in(&crate::paths::Roots::from_env(), dir.path()).join("hollowrun0001");
         std::fs::create_dir_all(&hollow).expect("mkdir hollow run dir");
         let no_dir = dispatch_tool(
             &tool,

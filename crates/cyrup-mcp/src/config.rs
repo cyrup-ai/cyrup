@@ -1652,16 +1652,16 @@ pub fn normalize_lexical(path: &Path) -> PathBuf {
     if out.as_os_str().is_empty() { PathBuf::from(".") } else { out }
 }
 
-/// `os.homedir()`, with the same `CYRUP_HOME`-first override every other in-tree copy uses
-/// (`cyrup_ext_subagents::background::home_dir`). The override is what makes the six-source ladder
-/// testable: a test that points `CYRUP_HOME` at a `TempDir` moves `~/.config/mcp/mcp.json`,
-/// `~/.agents/…` and all seven import families with it.
+/// `os.homedir()` — the workspace's one home ladder
+/// ([`cyrup_config::paths::cyrup_home_dir_from`]), with this module's terminal.
+///
+/// The `CYRUP_HOME` rung is what makes the six-source ladder testable: a test that points it at a
+/// `TempDir` moves `~/.config/mcp/mcp.json`, `~/.agents/…` and all seven import families with it.
+/// It used to be spelled out here as one of five private copies; it is shared now, so this
+/// resolver and `cyrup_config::ConfigDirs` cannot answer differently.
 #[must_use]
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("CYRUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+    cyrup_config::paths::cyrup_home_dir_from(&|key| std::env::var_os(key))
         .unwrap_or_else(std::env::temp_dir)
 }
 

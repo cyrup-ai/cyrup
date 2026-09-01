@@ -7,7 +7,9 @@
 //! Upstream's `getAgentDir()` (`agent-dir.ts:10`) reads `PI_CODING_AGENT_DIR` (trimmed, with `~`
 //! expansion) and defaults to `join(homedir(), ".pi", "agent")`. cyrup already resolves the same
 //! concept, better: `cyrup_config::ConfigDirs::agent_dir` is a `PathBuf` **field** populated by
-//! `ConfigDirs::resolve` from the CLI flag, then `$CYRUP_AGENT_DIR` / `$PI_CODING_AGENT_DIR`, then
+//! `ConfigDirs::resolve` from the CLI flag, then the shared agent-dir ladder
+//! (`cyrup_config::paths::ENV_AGENT_DIR_KEYS` — `$CYRUP_AGENT_DIR`, `$CYRUP_CODING_AGENT_DIR`,
+//! `$PI_CODING_AGENT_DIR`), then
 //! `<home>/.cyrup/agent`. So [`McpDirs`] takes that resolved path as a constructor argument —
 //! exactly the way `cyrup_ext_subagents::extension::subagent_extension_for_env` takes it — and adds
 //! only the *filenames* hanging off it.
@@ -66,10 +68,11 @@
 //! against the functions below rather than against constants copied out of them, so the two cannot
 //! drift apart without a test failing.
 //!
-//! One residue is named rather than hidden: [`home_dir`] here is `$HOME`, the reader's is
-//! `CYRUP_HOME` → `HOME`, so a `cwd` beginning with `~` hashes differently under a `CYRUP_HOME` that
-//! is not `HOME`. That is MCP-139's agent-dir axis 3, whose fix is a single shared resolver
-//! spanning this crate, `cyrup_ext`'s `npx_resolver` and that reader.
+//! That residue is CLOSED. [`home_dir`] here and the in-tree reader both call
+//! [`cyrup_config::paths::cyrup_home_dir_from`], so a `cwd` beginning with `~` hashes identically
+//! under any `CYRUP_HOME`. This was MCP-139's agent-dir axis 3, whose fix its own note specified as
+//! *"a single shared resolver spanning this crate, `cyrup_ext`'s `npx_resolver` and that reader"* —
+//! that resolver now exists in `cyrup-config`, and all three call it.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -267,20 +270,25 @@ pub fn agents_global_configs(home: &Path) -> [PathBuf; 2] {
 /// is a bare `fn` pointer with nowhere to carry state, and it exists precisely so
 /// `is_server_cache_valid` stays a two-argument predicate.
 ///
-/// `$HOME` first, then `$USERPROFILE`, then empty — which is what node does on each platform, minus
-/// the `getpwuid` fallback that has no `std` equivalent and that a process without `$HOME` would
-/// need. An empty home only matters for a `cwd` that starts with `~`, and there it yields the
-/// remainder unrooted rather than a wrong absolute path.
+/// The workspace's one home ladder ([`cyrup_config::paths::cyrup_home_dir_from`]) — `CYRUP_HOME`
+/// -> `HOME` -> the OS home — with this module's own terminal.
 ///
-/// **This is not the home the in-tree reader uses.** `mcp_direct_tools::home_dir` is
-/// `CYRUP_HOME` → `HOME` → tempdir, so the two differ exactly when `CYRUP_HOME` is set to something
-/// other than `HOME` — MCP-139's agent-dir axis 3, whose fix is the single shared resolver that
-/// unit specifies and that lives outside this crate.
+/// The empty terminal is deliberate and stays: an empty home only matters for a `cwd` that starts
+/// with `~`, and there it yields the remainder unrooted rather than a wrong absolute path. That is
+/// this module's answer to "no home resolvable"; the ladder returns `Option` precisely so each
+/// caller can give its own (`ConfigDirs::resolve` errors, `cyrup_ext_subagents` falls to
+/// `temp_dir`).
+///
+/// # This closes MCP-139's agent-dir axis 3
+///
+/// This resolver used to read `$HOME` -> `$USERPROFILE` -> empty with **no `CYRUP_HOME` rung**,
+/// and its own doc said so: *"This is not the home the in-tree reader uses… the two differ exactly
+/// when `CYRUP_HOME` is set to something other than `HOME` — MCP-139's agent-dir axis 3, whose fix
+/// is the single shared resolver that unit specifies and that lives outside this crate."* That
+/// resolver now exists, in `cyrup-config`, and this is it.
 #[must_use]
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map_or_else(PathBuf::new, PathBuf::from)
+    cyrup_config::paths::cyrup_home_dir_from(&|key| std::env::var_os(key)).unwrap_or_default()
 }
 
 /// `agent-dir.ts`'s `~` expansion, reproduced exactly because it is *not* the same as a shell's:

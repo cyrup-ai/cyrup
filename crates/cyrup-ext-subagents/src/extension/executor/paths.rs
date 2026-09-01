@@ -11,17 +11,23 @@ use crate::exec::{AgentConfig, RunOptions, SingleResult};
 use crate::fork_context::ContextMode;
 
 // C7: both roots come from the ONE shared derivation in `background/mod.rs`
-// ([`crate::background::run_artifact_roots`]) so the orchestrator and the detached runner can never
-// derive divergent results dirs again. These stay as thin, named wrappers because
-// `default_async_root`/`default_results_dir` are already the vocabulary every executor call site
-// reads in terms of — `resume_tracking` in `executor::status`, `run_doctor` in `executor::reports`,
-// and the depth-guard tests in `executor::{chain, foreground, paths}`.
-pub(crate) fn default_async_root(cwd: &Path) -> PathBuf {
-    crate::background::run_artifact_roots(cwd).async_root
+// ([`crate::background::run_artifact_roots_in`]) so the orchestrator and the detached runner can
+// never derive divergent results dirs again. `default_async_root_in`/`default_results_dir_in` are
+// the vocabulary every executor call site reads in terms of — `resume_tracking` in
+// `executor::status`, `run_doctor` in `executor::reports`, and the depth-guard tests in
+// `executor::{chain, foreground, paths}`. There is deliberately NO zero-argument form: every caller
+// states its roots explicitly, so none can silently bypass `config.roots` — and since a `&Roots` is
+// a resolved value, not an `Option`, there is no longer a "or go read the environment" arm for a
+// caller to reach by accident.
+/// The default async root under already-resolved roots (`SubagentExtensionConfig::roots`).
+pub(crate) fn default_async_root_in(roots: &crate::paths::Roots, cwd: &Path) -> PathBuf {
+    crate::background::run_artifact_roots_in(roots, cwd).async_root
 }
 
-pub(crate) fn default_results_dir(cwd: &Path) -> PathBuf {
-    crate::background::run_artifact_roots(cwd).results_dir
+/// The default results dir under the same roots, the sibling of [`default_async_root_in`] — both
+/// must take the SAME `roots`, or the pair straddles two trees.
+pub(crate) fn default_results_dir_in(roots: &crate::paths::Roots, cwd: &Path) -> PathBuf {
+    crate::background::run_artifact_roots_in(roots, cwd).results_dir
 }
 
 /// The directory a just-spawned background run owns — the SAME arithmetic
@@ -50,25 +56,34 @@ pub(crate) fn default_results_dir(cwd: &Path) -> PathBuf {
 /// just spawned the run, so it resolves to the identical directory (including the nested-route
 /// subtree when this process inherited one). `None` only when the roots cannot be resolved at all,
 /// in which case the key is omitted rather than guessed at.
-fn async_dir_for_run(cwd: &Path, run_id: &RunId) -> Option<PathBuf> {
+fn async_dir_for_run(
+    cwd: &Path,
+    run_id: &RunId,
+    roots: &crate::paths::Roots,
+) -> Option<PathBuf> {
     let inherited = crate::spawn::nested_events::resolve_inherited_nested_route_from_env(|key| {
         std::env::var(key).ok()
     });
     let (async_root, results_dir) =
-        resolve_background_storage_roots(cwd, inherited.as_ref()).ok()?;
+        resolve_background_storage_roots(cwd, inherited.as_ref(), roots).ok()?;
     Some(RunPaths::for_run(&async_root, &results_dir, run_id).run_dir)
 }
 
 /// pi's `details` for a confirmed async launch — `{ mode, runId, results: [], asyncId, asyncDir }`
 /// (`runs/background/async-execution.ts:1191` and `:1563` @v0.43.0), shared by all three async
 /// arms so the `asyncDir` key can never again be present on one and missing on another.
-pub(crate) fn async_launch_details(mode: &str, run_id: &RunId, cwd: &Path) -> serde_json::Value {
+pub(crate) fn async_launch_details(
+    mode: &str,
+    run_id: &RunId,
+    cwd: &Path,
+    roots: &crate::paths::Roots,
+) -> serde_json::Value {
     let mut details = serde_json::Map::new();
     details.insert("mode".to_string(), serde_json::Value::String(mode.to_string()));
     details.insert("runId".to_string(), serde_json::Value::String(run_id.as_str().to_string()));
     details.insert("results".to_string(), serde_json::Value::Array(Vec::new()));
     details.insert("asyncId".to_string(), serde_json::Value::String(run_id.as_str().to_string()));
-    if let Some(dir) = async_dir_for_run(cwd, run_id) {
+    if let Some(dir) = async_dir_for_run(cwd, run_id, roots) {
         details.insert(
             "asyncDir".to_string(),
             serde_json::Value::String(dir.to_string_lossy().into_owned()),
@@ -91,15 +106,18 @@ pub(crate) fn async_launch_details(mode: &str, run_id: &RunId, cwd: &Path) -> se
 pub(crate) fn resolve_background_storage_roots(
     cwd: &Path,
     nested_route: Option<&crate::spawn::nested_events::NestedRoute>,
+    roots: &crate::paths::Roots,
 ) -> Result<(PathBuf, PathBuf), SubagentError> {
     match nested_route {
+        // A nested route addresses the ROOT run's tree, which is already an absolute location
+        // derived from that run's id — the run-scratch root does not apply to it.
         Some(route) => Ok((
             crate::spawn::nested_events::nested_async_root(&route.root_run_id)?,
             crate::spawn::nested_events::nested_results_dir(&route.root_run_id)?,
         )),
         None => {
             let crate::background::RunArtifactRoots { async_root, results_dir } =
-                crate::background::run_artifact_roots(cwd);
+                crate::background::run_artifact_roots_in(roots, cwd);
             Ok((async_root, results_dir))
         }
     }
@@ -428,6 +446,7 @@ mod tests {
 
     use super::*;
     use crate::background::RunMode;
+    use crate::fork_context::ContextRequest;
     use crate::background::RunState;
     use crate::background::atomic::write_atomic_json;
     use crate::discovery::AgentDiscoveryConfig;
@@ -469,7 +488,7 @@ mod tests {
                 cwd: dir.path(),
                 agent_name: "worker",
                 task: "do something",
-                context: Some(ContextMode::Fresh),
+                context: Some(ContextRequest::Fresh),
                 model_override: None,
                 agent_scope: AgentReadScope::Both,
                 acceptance: None,
@@ -491,7 +510,7 @@ mod tests {
             "expected R-SA-025's OutputPathRequired, got: {err:?}"
         );
         assert!(
-            !default_async_root(dir.path()).exists(),
+            !default_async_root_in(&crate::paths::Roots::from_env(), dir.path()).exists(),
             "the refusal must land BEFORE any run directory is created"
         );
     }
@@ -521,7 +540,7 @@ mod tests {
                 cwd: dir.path(),
                 agent_name: "ghost",
                 task: "do something",
-                context: Some(ContextMode::Fresh),
+                context: Some(ContextRequest::Fresh),
                 model_override: None,
                 agent_scope: AgentReadScope::Both,
                 acceptance: None,
@@ -545,11 +564,11 @@ mod tests {
         // results directory `spawn_background` would otherwise create via `create_dir_all` (both
         // strictly after the depth check in program order) may exist.
         assert!(
-            !default_async_root(dir.path()).exists(),
+            !default_async_root_in(&crate::paths::Roots::from_env(), dir.path()).exists(),
             "the async-run root must never be created for a depth-blocked background dispatch"
         );
         assert!(
-            !default_results_dir(dir.path()).exists(),
+            !default_results_dir_in(&crate::paths::Roots::from_env(), dir.path()).exists(),
             "the results directory must never be created for a depth-blocked background dispatch"
         );
     }
@@ -566,8 +585,8 @@ mod tests {
     async fn resume_tracking_skips_terminal_runs_and_seeds_the_events_cursor_at_eof() {
         let executor = SubagentExecutor::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let async_root = default_async_root(dir.path());
-        let results_dir = default_results_dir(dir.path());
+        let async_root = default_async_root_in(&crate::paths::Roots::from_env(), dir.path());
+        let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), dir.path());
 
         // A still-running run: real live pid (this test process itself) so reconciliation leaves
         // it Running, plus a non-empty events.jsonl whose EXISTING bytes must never be re-tailed.
@@ -644,7 +663,7 @@ mod tests {
             .expect("create_nested_route should succeed");
 
         let (nested_async, nested_results) =
-            resolve_background_storage_roots(dir.path(), Some(&route))
+            resolve_background_storage_roots(dir.path(), Some(&route), &crate::paths::Roots::from_env())
                 .expect("nested rerouting must succeed for a valid route");
         assert!(
             nested_async.ends_with("root-parity-test-async-exec"),
@@ -662,10 +681,10 @@ mod tests {
              {nested_results:?}"
         );
 
-        let (default_async, default_results) = resolve_background_storage_roots(dir.path(), None)
+        let (default_async, default_results) = resolve_background_storage_roots(dir.path(), None, &crate::paths::Roots::from_env())
             .expect("the non-nested default derivation must still succeed");
-        assert_eq!(default_async, default_async_root(dir.path()));
-        assert_eq!(default_results, default_results_dir(dir.path()));
+        assert_eq!(default_async, default_async_root_in(&crate::paths::Roots::from_env(), dir.path()));
+        assert_eq!(default_results, default_results_dir_in(&crate::paths::Roots::from_env(), dir.path()));
         assert_ne!(
             nested_async, default_async,
             "a nested run must never land in the same shared per-cwd async root as a top-level run"
@@ -741,8 +760,8 @@ mod tests {
             matches!(err, SubagentError::DepthExceeded { current: 0, max: 0 }),
             "got: {err:?}"
         );
-        assert!(!default_async_root(dir.path()).exists());
-        assert!(!default_results_dir(dir.path()).exists());
+        assert!(!default_async_root_in(&crate::paths::Roots::from_env(), dir.path()).exists());
+        assert!(!default_results_dir_in(&crate::paths::Roots::from_env(), dir.path()).exists());
     }
 
     // NOTE: `teardown_session_stops_the_tracker_and_clears_the_parent_session_anchor` (and its
@@ -839,8 +858,8 @@ mod tests {
 
         // Display-only: nothing was terminated, and the record still says what it said.
         let paths = RunPaths::for_run(
-            &default_async_root(dir.path()),
-            &default_results_dir(dir.path()),
+            &default_async_root_in(&crate::paths::Roots::from_env(), dir.path()),
+            &default_results_dir_in(&crate::paths::Roots::from_env(), dir.path()),
             &RunId::from_token("run0orphan00".to_string()),
         );
         let persisted: crate::background::RunStatus =
@@ -889,8 +908,8 @@ mod tests {
         );
 
         // pi `:24-30` — a run directory exists but carries no readable `status.json`.
-        let async_root = default_async_root(dir.path());
-        let results_dir = default_results_dir(dir.path());
+        let async_root = default_async_root_in(&crate::paths::Roots::from_env(), dir.path());
+        let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), dir.path());
         let bare = RunPaths::for_run(&async_root, &results_dir, &RunId::from_token("run0bare0000".to_string()));
         std::fs::create_dir_all(&bare.run_dir).expect("mkdir bare run dir");
         assert_eq!(
@@ -933,7 +952,7 @@ mod tests {
     fn an_async_launch_reports_the_run_directory_it_spawned_into() {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = crate::background::RunId::from_token("bgrun000042");
-        let details = async_launch_details("single", &run_id, dir.path());
+        let details = async_launch_details("single", &run_id, dir.path(), &crate::paths::Roots::from_env());
         assert_eq!(details.get("mode").and_then(|v| v.as_str()), Some("single"));
         assert_eq!(details.get("runId").and_then(|v| v.as_str()), Some("bgrun000042"));
         assert_eq!(details.get("asyncId").and_then(|v| v.as_str()), Some("bgrun000042"));
@@ -947,8 +966,8 @@ mod tests {
         .is_none()
         {
             let expected = RunPaths::for_run(
-                &default_async_root(dir.path()),
-                &default_results_dir(dir.path()),
+                &default_async_root_in(&crate::paths::Roots::from_env(), dir.path()),
+                &default_results_dir_in(&crate::paths::Roots::from_env(), dir.path()),
                 &run_id,
             )
             .run_dir;
@@ -984,7 +1003,7 @@ mod tests {
         .expect("a task-bearing launch binds a mission");
 
         let run_id = crate::background::RunId::from_token("bgrun000043");
-        let details = async_launch_details("single", &run_id, dir.path());
+        let details = async_launch_details("single", &run_id, dir.path(), &crate::paths::Roots::from_env());
         let async_dir = PathBuf::from(
             details.get("asyncDir").and_then(|v| v.as_str()).expect("asyncDir is reported"),
         );
@@ -1052,8 +1071,8 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let async_root = default_async_root(dir.path());
-        let results_dir = default_results_dir(dir.path());
+        let async_root = default_async_root_in(&crate::paths::Roots::from_env(), dir.path());
+        let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), dir.path());
         let run_id = RunId::from_token("run00042");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
@@ -1123,8 +1142,8 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let async_root = default_async_root(dir.path());
-        let results_dir = default_results_dir(dir.path());
+        let async_root = default_async_root_in(&crate::paths::Roots::from_env(), dir.path());
+        let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), dir.path());
         let run_id = RunId::from_token("run00099");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
@@ -1206,8 +1225,8 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let async_root = default_async_root(dir.path());
-        let results_dir = default_results_dir(dir.path());
+        let async_root = default_async_root_in(&crate::paths::Roots::from_env(), dir.path());
+        let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), dir.path());
         let run_id = RunId::from_token("run0nopid");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
@@ -1276,8 +1295,8 @@ mod tests {
         // The source run's storage lives under `request_dir`'s own async root (resume looks it up
         // via the REQUEST cwd, matching pi's fixed-but-here-cwd-scoped async/results roots) — only
         // the run's OWN recorded `cwd` field (set by `finish_run`) points back at `orig_dir`.
-        let async_root = default_async_root(request_dir.path());
-        let results_dir = default_results_dir(request_dir.path());
+        let async_root = default_async_root_in(&crate::paths::Roots::from_env(), request_dir.path());
+        let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), request_dir.path());
         let run_id = RunId::from_token("run0revive");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");

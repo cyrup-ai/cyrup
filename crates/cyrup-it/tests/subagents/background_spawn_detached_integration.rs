@@ -8,9 +8,9 @@
 //! No mocking anywhere in this file (this codebase's standing convention, restated in this
 //! crate's own task brief and already established by `tests/exec_run_sync_integration.rs`): every
 //! test below spawns the REAL `cyrup-subagent-fixture` binary as a genuine OS subprocess via
-//! `CYRUP_SUBAGENT_BINARY` (R-SA-045 tier 1's documented override escape hatch, which
-//! `spawn_detached_runner`'s internal call to `spawn::resolve_spawn_command()` honors identically
-//! to the foreground spawn path), and verifies liveness/process-group/stdio-redirection/argv
+//! an explicit `SpawnCommand` handed to `spawn_detached_runner_with_command` (the injectable core
+//! of `spawn_detached_runner`; the `CYRUP_SUBAGENT_BINARY` ladder it wraps is proved separately by
+//! `spawn::resolve_spawn_command_from`'s own unit tests), and verifies liveness/process-group/stdio-redirection/argv
 //! purely via independent OS-level probes (`kill -0`, `ps`, reading the real redirected log
 //! files) — never via this crate's own bookkeeping.
 //!
@@ -19,11 +19,7 @@
 //! `#![forbid(unsafe_code)]`, and `CARGO_BIN_EXE_cyrup-subagent-fixture` (only available to
 //! integration tests, never to a library's own `#[cfg(test)]` unit tests) resolves here — exactly
 //! the same two reasons `tests/exec_run_sync_integration.rs` lives outside `src/`. The `unsafe`
-//! blocks below (Rust 2024 requires `unsafe` for `std::env::set_var`/`remove_var`) are scoped to
-//! exactly the two calls needed to point `CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT`
-//! at the fixture binary/script for the duration of one test, executed under a process-wide mutex
-//! ([`ENV_MUTATION_LOCK`]) so this file's tests never race each other over that global state even
-//! when `cargo test` runs them concurrently within the same test-binary process.
+//! file mutates no process-global state, so it contains no `unsafe` and needs no mutex.
 //!
 //! Gated on the `test-fixtures` Cargo feature (matching the `cyrup-subagent-fixture` `[[bin]]`
 //! target's own `required-features` gate, `Cargo.toml`): without that feature the fixture binary
@@ -41,18 +37,24 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 
-use cyrup_ext_subagents::background::spawn_detached::spawn_detached_runner;
+use cyrup_ext_subagents::background::spawn_detached::spawn_detached_runner_with_command;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 
-/// Serializes every test in this file that mutates `CYRUP_SUBAGENT_BINARY`/
-/// `CYRUP_SUBAGENT_FIXTURE_SCRIPT` (process-global state) — `cargo test` runs a test binary's own
-/// `#[test]` functions concurrently by default, so without this lock two tests in this file could
-/// observe or clobber each other's override value mid-run. Mirrors
-/// `exec_run_sync_integration.rs`'s identical `ENV_MUTATION_LOCK` convention.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
+/// The scripted fixture as an explicit command for `spawn_detached_runner_with_command`.
+///
+/// The injectable core exists for exactly this: substituting the binary WITHOUT moving
+/// `CYRUP_SUBAGENT_BINARY` on a process every other test in this binary shares. That variable's own
+/// resolution ladder is proved by `spawn::resolve_spawn_command_from`'s unit tests, which drive it
+/// through an injected lookup — so nothing is lost by not exercising it a second time here.
+fn fixture_cmd(script_path: &std::path::Path) -> SpawnCommand {
+    SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    }
+}
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
+
 const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 /// Path to the real, already-built `cyrup-subagent-fixture` binary.
@@ -140,7 +142,6 @@ fn kill_pid_for_cleanup(pid: u32) {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_detached_runner_process_keeps_running_independent_of_this_process() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // A script that sleeps far longer than this test needs to complete its own assertions — if
@@ -155,12 +156,6 @@ async fn spawned_detached_runner_process_keeps_running_independent_of_this_proce
     });
     let script_path = write_script(dir.path(), "script.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let cfg_path = dir.path().join("runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
@@ -168,13 +163,15 @@ async fn spawned_detached_runner_process_keeps_running_independent_of_this_proce
     let stderr_log = dir.path().join("runner.stderr.log");
 
     let started = tokio::time::Instant::now();
-    let spawn_result = spawn_detached_runner(&cfg_path, &stdout_log, &stderr_log);
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
+    let spawn_result = spawn_detached_runner_with_command(
+        &fixture_cmd(&script_path),
+        &cfg_path,
+        &stdout_log,
+        &stderr_log,
+        // The SAME overlay `spawn_detached_runner` builds — this substitutes the binary, not the
+        // parent-anchor plumbing, and one test below asserts the child inherits that anchor.
+        &cyrup_ext_subagents::background::parent_anchor::detached_runner_env_overlay(),
+    );
 
     let pid = spawn_result.expect("detached spawn succeeds");
 
@@ -215,28 +212,25 @@ async fn spawned_detached_runner_process_keeps_running_independent_of_this_proce
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn detached_runner_gets_its_own_process_group() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let script = serde_json::json!({"steps": [{"kind": "sleep_ms", "ms": 2000}], "exit_code": 0});
     let script_path = write_script(dir.path(), "script.json", &script);
 
-    let fixture = fixture_binary_path();
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let cfg_path = dir.path().join("runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
     let stdout_log = dir.path().join("runner.stdout.log");
     let stderr_log = dir.path().join("runner.stderr.log");
 
-    let spawn_result = spawn_detached_runner(&cfg_path, &stdout_log, &stderr_log);
-
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
+    let spawn_result = spawn_detached_runner_with_command(
+        &fixture_cmd(&script_path),
+        &cfg_path,
+        &stdout_log,
+        &stderr_log,
+        // The SAME overlay `spawn_detached_runner` builds — this substitutes the binary, not the
+        // parent-anchor plumbing, and one test below asserts the child inherits that anchor.
+        &cyrup_ext_subagents::background::parent_anchor::detached_runner_env_overlay(),
+    );
 
     let pid = spawn_result.expect("detached spawn succeeds");
 
@@ -277,7 +271,6 @@ async fn detached_runner_gets_its_own_process_group() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stdio_is_redirected_to_the_given_log_files_not_inherited() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let script = serde_json::json!({
         "steps": [
@@ -287,23 +280,21 @@ async fn stdio_is_redirected_to_the_given_log_files_not_inherited() {
     });
     let script_path = write_script(dir.path(), "script.json", &script);
 
-    let fixture = fixture_binary_path();
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let cfg_path = dir.path().join("runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
     let stdout_log = dir.path().join("runner.stdout.log");
     let stderr_log = dir.path().join("runner.stderr.log");
 
-    let spawn_result = spawn_detached_runner(&cfg_path, &stdout_log, &stderr_log);
-
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
+    let spawn_result = spawn_detached_runner_with_command(
+        &fixture_cmd(&script_path),
+        &cfg_path,
+        &stdout_log,
+        &stderr_log,
+        // The SAME overlay `spawn_detached_runner` builds — this substitutes the binary, not the
+        // parent-anchor plumbing, and one test below asserts the child inherits that anchor.
+        &cyrup_ext_subagents::background::parent_anchor::detached_runner_env_overlay(),
+    );
 
     let pid = spawn_result.expect("detached spawn succeeds");
 
@@ -333,28 +324,25 @@ async fn stdio_is_redirected_to_the_given_log_files_not_inherited() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn passes_the_subcommand_and_config_flag_with_the_exact_path() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let script = serde_json::json!({"echo_argv": true, "exit_code": 0});
     let script_path = write_script(dir.path(), "script.json", &script);
 
-    let fixture = fixture_binary_path();
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let cfg_path = dir.path().join("a-particular-runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
     let stdout_log = dir.path().join("runner.stdout.log");
     let stderr_log = dir.path().join("runner.stderr.log");
 
-    let spawn_result = spawn_detached_runner(&cfg_path, &stdout_log, &stderr_log);
-
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
+    let spawn_result = spawn_detached_runner_with_command(
+        &fixture_cmd(&script_path),
+        &cfg_path,
+        &stdout_log,
+        &stderr_log,
+        // The SAME overlay `spawn_detached_runner` builds — this substitutes the binary, not the
+        // parent-anchor plumbing, and one test below asserts the child inherits that anchor.
+        &cyrup_ext_subagents::background::parent_anchor::detached_runner_env_overlay(),
+    );
 
     let pid = spawn_result.expect("detached spawn succeeds");
 
@@ -397,7 +385,6 @@ async fn passes_the_subcommand_and_config_flag_with_the_exact_path() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_quickly_exiting_detached_child_eventually_disappears_on_its_own() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let script = serde_json::json!({
         "steps": [{"kind": "emit", "line": "{\"type\":\"unknown\",\"done\":true}"}],
@@ -405,26 +392,31 @@ async fn a_quickly_exiting_detached_child_eventually_disappears_on_its_own() {
     });
     let script_path = write_script(dir.path(), "script.json", &script);
 
-    let fixture = fixture_binary_path();
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let cfg_path = dir.path().join("runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
     let stdout_log = dir.path().join("runner.stdout.log");
     let stderr_log = dir.path().join("runner.stderr.log");
 
-    let spawn_result = spawn_detached_runner(&cfg_path, &stdout_log, &stderr_log);
-
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
+    let spawn_result = spawn_detached_runner_with_command(
+        &fixture_cmd(&script_path),
+        &cfg_path,
+        &stdout_log,
+        &stderr_log,
+        // The SAME overlay `spawn_detached_runner` builds — this substitutes the binary, not the
+        // parent-anchor plumbing, and one test below asserts the child inherits that anchor.
+        &cyrup_ext_subagents::background::parent_anchor::detached_runner_env_overlay(),
+    );
 
     let pid = spawn_result.expect("detached spawn succeeds");
-    assert!(pid_is_alive(pid), "must be alive right after spawn");
+    assert!(pid > 0, "a confirmed spawn reports a real pid: {pid}");
+
+    // NOT asserted here: that the child is still alive. This fixture emits one line and exits 0,
+    // so it is designed to be gone almost immediately — under CPU contention it can exit before
+    // the next statement in this test runs, and an `assert!(pid_is_alive(pid))` at this point then
+    // fails for the one reason that is not a defect. It was a race this test could only ever lose
+    // and never needed to win: a child that has ALREADY exited satisfies "eventually disappears"
+    // trivially, which is the property below and the whole subject of this test.
 
     // Give the fast fixture generous time to exit and (on most Unix systems, since this test
     // process IS its real parent) be reaped. This deadline is intentionally generous (well beyond
@@ -548,7 +540,6 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // A script the grandchild detached runner's own spawned child (the scripted fixture) will
@@ -623,7 +614,6 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     let runner_stdout_log = run_paths.runner_stdout_log.clone();
     let runner_stderr_log = run_paths.runner_stderr_log.clone();
 
-    let fixture = fixture_binary_path();
 
     // Spawn the orchestrator-sim as a REAL, separate OS process (not a tokio::process::Command
     // held inside this test's own async task, so this test's own process is genuinely the OS
@@ -636,7 +626,7 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
         // NOT CYRUP_SUBAGENT_BINARY here: orchestrator-sim manages that env var itself (pointing
         // hop-1 back at its own binary so the detached child lands in runner mode) — see that
         // binary's own module doc for the CYRUP_SUBAGENT_STEP_BINARY relay this crosses.
-        .env("CYRUP_SUBAGENT_STEP_BINARY", &fixture)
+        .env("CYRUP_SUBAGENT_STEP_BINARY", fixture_binary_path())
         .env(FIXTURE_SCRIPT_ENV_VAR, &script_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -761,7 +751,6 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // Two steps: the first sleeps long enough to give this test a generous, contention-tolerant
@@ -777,7 +766,6 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
 
     let run_id = RunId::from_token("interruptrun00000000000000001");
     let async_root = dir.path().join("async");
@@ -847,7 +835,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
         .arg("__subagent-runner")
         .arg("--config")
         .arg(&cfg_path)
-        .env("CYRUP_SUBAGENT_STEP_BINARY", &fixture)
+        .env("CYRUP_SUBAGENT_STEP_BINARY", fixture_binary_path())
         .env(FIXTURE_SCRIPT_ENV_VAR, &script_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -979,7 +967,6 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn detached_runner_process_inherits_the_published_parent_session_anchor() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // Sleep long enough that `/proc/<pid>/environ` is still readable when this test probes it.
@@ -989,12 +976,6 @@ async fn detached_runner_process_inherits_the_published_parent_session_anchor() 
     });
     let script_path = write_script(dir.path(), "script.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let cfg_path = dir.path().join("runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
@@ -1004,14 +985,16 @@ async fn detached_runner_process_inherits_the_published_parent_session_anchor() 
     // The register is process-global; it is mutated only here, under the same lock that guards
     // this file's env mutations, and cleared before the lock is released.
     cyrup_ext_subagents::publish_parent_session_anchor("session-perm001-e2e");
-    let spawn_result = spawn_detached_runner(&cfg_path, &stdout_log, &stderr_log);
+    let spawn_result = spawn_detached_runner_with_command(
+        &fixture_cmd(&script_path),
+        &cfg_path,
+        &stdout_log,
+        &stderr_log,
+        // The SAME overlay `spawn_detached_runner` builds — this substitutes the binary, not the
+        // parent-anchor plumbing, and one test below asserts the child inherits that anchor.
+        &cyrup_ext_subagents::background::parent_anchor::detached_runner_env_overlay(),
+    );
     cyrup_ext_subagents::clear_parent_session_anchor();
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
 
     let pid = spawn_result.expect("detached spawn succeeds");
 

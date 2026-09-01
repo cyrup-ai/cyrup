@@ -415,6 +415,12 @@ pub struct RunOptions {
     /// its `model_override` is known to be in scope (or the scope is not armed). `None` = no
     /// policy configured.
     pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+    /// SUBA-078 — the effective `subagents.maxThinking` ceiling for this run (pi's
+    /// `options.thinkingCeiling`, `runs/foreground/execution.ts:382`), already intersected with
+    /// whatever this process itself inherited. `None` = no ceiling, so the bound is off.
+    ///
+    /// A REFUSAL bound, not a clamp: see [`crate::error::SubagentError::ThinkingCeilingViolation`].
+    pub thinking_ceiling: Option<String>,
     /// Explicit acceptance-contract override for this task (func-SA §4.2 `acceptance`); `None`
     /// defers to [`AcceptanceContract::heuristic_default`] (R-SA-023).
     pub acceptance: Option<AcceptanceContract>,
@@ -568,6 +574,41 @@ pub struct RunOptions {
     /// text. `None` means unbudgeted, which is every run that does not ask for one: upstream has no
     /// default usage budget any more than it has a default turn budget.
     pub usage_budget: Option<crate::exec::usage_budget::UsageBudgetConfig>,
+    /// The `cyrup` binary this run's child re-execs, injected rather than resolved from the
+    /// process environment. `None` means "nothing beyond what the environment says", so
+    /// [`crate::spawn::resolve_spawn_command`] answers and R-SA-045's three-tier priority is
+    /// unchanged — exactly the shape `thinking_ceiling` above already uses.
+    ///
+    /// This crate is `#![forbid(unsafe_code)]` and the 2024 edition made `std::env::set_var`
+    /// `unsafe`, so nothing here may move the process environment to point a run at a different
+    /// binary. Supplying the command per-run is how a caller (an integration test wiring a
+    /// scripted fixture, say) redirects ONE run without disturbing any other run in the process.
+    /// [`crate::exec::spawn_plan`] also copies an injected binary into the child's
+    /// `env_overlay`, so a grandchild that resolves its own command from its inherited
+    /// environment still finds it.
+    pub spawn_command: Option<crate::spawn::SpawnCommand>,
+
+    /// Extra entries for the CHILD's environment — the foreground twin of
+    /// `background::parent_anchor::detached_runner_env_overlay_with`.
+    ///
+    /// This is R2 tier 2 for the in-process spawn path: where a variable IS the mechanism (a child
+    /// discovering a broker socket through `CYRUP_CODING_AGENT_DIR`, say), it belongs on the
+    /// child's `Command`, never on this process. Layered onto `SpawnSpec::env_overlay`.
+    ///
+    /// Applied FIRST, so the crate's own identity, depth and child-role entries overwrite it. A
+    /// caller may add to the child's environment; it may not rewrite the invariants that decide
+    /// what the child is allowed to do.
+    ///
+    /// # Zero production callers, and why it keeps its place
+    ///
+    /// Every production spawn passes an empty map; `spawn_plan` layers the real values on top. It
+    /// stays because it is R2 tier 2 in its purest form: a value that must reach a CHILD goes on
+    /// the CHILD's `Command`, never on this process's environment — which is the one mechanism
+    /// `std::env`'s own documentation endorses for a multi-threaded program. A test whose subject
+    /// is what a child inherits has no other sound way to say it.
+    ///
+    /// It costs production no parameter and defaults to empty.
+    pub child_env: std::collections::HashMap<String, String>,
 }
 
 /// A live per-line sink installed via [`RunOptions::live_events`]: [`crate::exec::run_sync`]'s per-attempt driver

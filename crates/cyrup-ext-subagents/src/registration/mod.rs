@@ -79,6 +79,11 @@ pub mod prompt_workflows;
 pub struct SubagentExtensionConfig {
     /// When `true`, a `subagent` tool call / slash command with no explicit `--bg`/foreground
     /// choice defaults to background (async) execution rather than foreground.
+    ///
+    /// **An OMITTED `asyncByDefault` key backgrounds** — pi `resolveAsyncByDefault`
+    /// (`config.ts:222-224`) is `config.asyncByDefault !== false`, so only the literal `false`
+    /// opts out. See this field's seed in [`SubagentExtensionConfig::default`]; a plain `bool`
+    /// reproduces pi's tri-state exactly because absent and `true` both mean background.
     pub async_by_default: bool,
     /// When `true`, forces every **top-level** (directly orchestrator-invoked, not nested) run to
     /// async execution regardless of `async_by_default` or an inline per-call override — a
@@ -117,6 +122,125 @@ pub struct SubagentExtensionConfig {
     /// own computed default (owned by `exec`/`background`, not this type).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_session_dir: Option<PathBuf>,
+    /// In-process override for the binary this extension's runs re-exec, mirroring
+    /// [`crate::exec::agent_config::RunOptions::spawn_command`]. `None` — the only value a
+    /// deserialized config can ever hold — means "resolve from the environment", so every
+    /// installed configuration behaves exactly as it did before this field existed.
+    ///
+    /// `#[serde(skip)]` is load-bearing twice over. [`crate::spawn::SpawnCommand`] derives no
+    /// serde impls, and more importantly a value read out of `config.json` that could repoint
+    /// WHICH EXECUTABLE a subagent spawns would be a genuine hazard: this override exists for a
+    /// caller that already holds the process (an integration test wiring a scripted fixture, say),
+    /// never for a file the process merely reads.
+    ///
+    /// # What this reaches, and what it does not
+    ///
+    /// Two paths honour it, both in THIS process:
+    ///
+    /// - the foreground single run, carried into its `RunOptions` by
+    ///   [`crate::extension::SubagentExecutor`]'s prologue alongside the
+    ///   `turn_budget`/`permission_rules` it already resolves from the same config snapshot; and
+    /// - foreground chain and parallel steps, whose walk takes its OWN snapshot of this config
+    ///   and hands the value to `ExecSingleStepExecutor::foreground`. The two paths resolve it
+    ///   independently; neither feeds the other.
+    ///
+    /// **No detached or background spawn honours it** — `spawn_background_steps` and
+    /// `spawn_detached_runner` alike. Those children are separate processes that resolve their own
+    /// command through [`crate::spawn::resolve_spawn_command`] against the environment they
+    /// inherited, and the `RunnerConfig` driving them crosses that boundary as JSON, which carries
+    /// no [`crate::spawn::SpawnCommand`]. Setting this field for such a run is inert: to redirect a
+    /// detached child, set [`crate::spawn::SUBAGENT_BINARY_ENV_VAR`] (and, for leading argv,
+    /// [`crate::spawn::SUBAGENT_BINARY_ARGS_ENV_VAR`]) in the environment it will inherit.
+    ///
+    /// # Zero production callers, and why it keeps its place
+    ///
+    /// Production redirects a child through [`crate::spawn::SUBAGENT_BINARY_ENV_VAR`]. This exists
+    /// so an in-process caller need not move that variable on a process every concurrent test
+    /// shares — which is the mutation this crate cannot make at all
+    /// (`#![forbid(unsafe_code)]` plus edition 2024's `unsafe set_var`). It costs production no
+    /// parameter, defaults to `None`, and is `#[serde(skip)]`.
+    #[serde(skip)]
+    pub spawn_command: Option<crate::spawn::SpawnCommand>,
+
+    /// Where this extension's runs resolve paths: home, agent dir, and the two independent
+    /// scratch roots ([`crate::paths::Roots`]).
+    ///
+    /// # Not an `Option`, and that is the point
+    ///
+    /// This replaced `home_root: Option<PathBuf>`, which was not a resolved root but a DEFERRED
+    /// one: `None` meant "go read the environment", in the callee, four separate times. That is how
+    /// this crate came to hold ladders that disagreed while `paths`' own module doc claimed there
+    /// was one, and it is why the deferred form could not be tested — no test ever exercised the
+    /// `None` arm, because every test supplied a root. A resolved value cannot drift from itself.
+    ///
+    /// # What it reaches, and what it does not
+    ///
+    /// Reaches every path this crate derives: the run-artifact roots
+    /// (`background::run_artifact_roots_in` and the `default_async_root_in` /
+    /// `default_results_dir_in` / `resolve_background_storage_roots` helpers every executor call
+    /// site goes through), the user-scope discovery roots, the wait tool's own resolution, and the
+    /// nested-events tree.
+    ///
+    /// **A detached run IS governed by it — the roots cross, the resolver does not.**
+    /// `spawn_background_steps` resolves both roots in THIS process and hands them to the runner as
+    /// absolute paths in `RunnerConfig::async_root`/`results_dir`, so the child writes where this
+    /// value says without re-deriving them. Anything the child derives for ITSELF still comes from
+    /// its own environment, which is why `detached_runner_env_overlay_with` puts `CYRUP_HOME` on
+    /// the child's `Command` — the tier-2 mechanism, set on the child, never on this process.
+    ///
+    /// It does NOT reach the `~`-expansion sites that anchor a USER-supplied path against the real
+    /// home on purpose, nor any other crate's resolver.
+    ///
+    /// [`Default`] is [`crate::paths::Roots::from_env`], so a deserialized `config.json` behaves
+    /// exactly as it did before this field existed. `crates/cyrup/src/subagent_config.rs` sets it
+    /// explicitly at startup from the layout the binary already resolved, which is the production
+    /// path.
+    ///
+    /// `#[serde(skip)]` for the reason [`Self::spawn_command`] carries it: a `config.json` able to
+    /// relocate where a run writes its artifacts is a hazard, and this value exists for a caller
+    /// that already holds the process.
+    #[serde(skip)]
+    pub roots: crate::paths::Roots,
+
+    /// Pinned answers for the environment lookups this extension routes through an injectable
+    /// resolver — the `&dyn Fn(&str) -> Option<String>` convention 26 functions in this crate
+    /// already take.
+    ///
+    /// `Some(value)` answers that value; **`None` answers "unset"**, which is the case that makes
+    /// this field earn its place: a caller that must prove a gate's behaviour has to be able to
+    /// SCRUB an ambient variable, not merely set its own. `CYRUP_INTERCOM` is the live example —
+    /// it is a documented product opt-in exported on developer machines and CI runners, and
+    /// `intercom_supervisor_channel_available` reads it at `init` time, so a value inherited from
+    /// the surrounding shell silently changes which tools get registered.
+    ///
+    /// This is the in-process twin of the `env_overlay` handed to a DETACHED child
+    /// (`detached_runner_env_overlay_with`): both are "a map applied over the inherited
+    /// environment", one for a child's `Command` and one for this process's own resolvers. Neither
+    /// mutates anything global, which is why no `unsafe` is involved on either side.
+    ///
+    /// It shadows lookups ONLY where a resolver takes the injected closure. A direct
+    /// `std::env::var` elsewhere is unaffected — deliberately: this is an injection point, not a
+    /// process-wide environment shim.
+    ///
+    /// `#[serde(skip)]` for the reason [`Self::spawn_command`] and [`Self::roots`] carry it: a
+    /// `config.json` able to rewrite what the process believes its environment says is a hazard.
+    ///
+    /// # Zero production callers, and why it keeps its place
+    ///
+    /// Nothing in the shipped binary sets this. It stays because it is the only mechanism that can
+    /// answer **unset**, and proving a gate's behaviour against an ambient product opt-in requires
+    /// exactly that: `CYRUP_INTERCOM` is exported on developer machines and CI runners, so a value
+    /// inherited from the surrounding shell silently changes which tools get registered. No
+    /// `Command::env` reaches an in-process resolver, and no set-only helper can scrub.
+    ///
+    /// The cost this crate's constraint actually names is what production code has to READ. This
+    /// field adds no parameter to any production signature, defaults to empty, and is
+    /// `#[serde(skip)]`, so a reader who never sets it never encounters it. That is the distinction
+    /// from the `home_root` this struct used to carry, which put an `Option<&Path>` into 19
+    /// production signatures and left four environment reads alive behind it.
+    #[serde(skip)]
+    pub env_overrides: std::collections::BTreeMap<String, Option<String>>,
+
     /// Base directory single-run (non-chain, non-parallel) output artifacts are written under,
     /// when no more specific output path is resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,6 +366,19 @@ pub struct SubagentExtensionConfig {
     /// — named rather than linked, because `extension::tool` is a private module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<serde_json::Value>,
+    /// SUBA-079 — pi `config.defaultSubagentContext` (`extension/config.ts:140-142` @v0.57.0): the
+    /// global fork/fresh preference for every subagent launch that does not name one explicitly.
+    ///
+    /// **It OUTRANKS each agent's own `defaultContext`**, unlike every other settings rung here —
+    /// `"fresh"` exists precisely to overrule agents that declare `defaultContext: fork`. See
+    /// [`crate::fork_context::resolve_effective_context`] for the full ladder.
+    ///
+    /// Carried RAW like [`Self::turn_budget`], and validated at use by
+    /// `fork_context::resolve_default_subagent_context`. Unlike [`Self::timeout_ms`], upstream
+    /// THROWS for an invalid value rather than ignoring it, so validation here is loud — but doing
+    /// it at USE keeps a malformed value from failing this whole struct's deserialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_subagent_context: Option<serde_json::Value>,
     /// SUBA-025 — pi `ExtensionConfig.toolDescriptionMode?: ToolDescriptionMode`, read at
     /// `extension/index.ts:458` (@v0.34.0) / `:540` (@v0.43.0) as
     /// `description: buildSubagentToolDescription(config)`.
@@ -294,7 +431,14 @@ impl Default for SubagentExtensionConfig {
     /// Tier 5 of R-SA-133: the hardcoded extension defaults every other tier layers on top of.
     fn default() -> Self {
         Self {
-            async_by_default: false,
+            // pi `resolveAsyncByDefault` (`config.ts:222-224`): `config.asyncByDefault !== false`
+            // — an ABSENT key means TRUE, so a stock install with no `config.json` backgrounds.
+            // A plain `bool` seeded `true` reproduces that tri-state exactly: absent -> this
+            // default, `false` -> false, `true` -> true. Upstream publishes the opt-out in its own
+            // module header (`index.ts:9`) and in the `async` param description (`schemas.ts:324`);
+            // seeding this `false` made that documented opt-out a no-op, because the port already
+            // behaved as if it had been set.
+            async_by_default: true,
             force_top_level_async: false,
             global_concurrency_limit: 20,
             max_subagent_spawns_per_session: 40,
@@ -303,6 +447,9 @@ impl Default for SubagentExtensionConfig {
             chain: None,
             proactive_skill_subagents: None,
             default_session_dir: None,
+            spawn_command: None,
+            roots: crate::paths::Roots::from_env(),
+            env_overrides: std::collections::BTreeMap::new(),
             single_run_output_base_dir: None,
             max_subagent_depth: 2,
             worktree_base_dir: None,
@@ -318,6 +465,7 @@ impl Default for SubagentExtensionConfig {
             authority_policy: None,
             turn_budget: None,
             timeout_ms: None,
+            default_subagent_context: None,
             // SUBA-025 — pi's `mode === undefined => "full"` (`tool-description.ts:106`).
             tool_description_mode: None,
             permissions: None,
@@ -1040,7 +1188,12 @@ mod tests {
     #[test]
     fn subagent_extension_config_default_matches_func_sa_4_7_constants() {
         let cfg = SubagentExtensionConfig::default();
-        assert!(!cfg.async_by_default);
+        // NOT a func-SA §4.7 constant like the numbers below it — this one is pi parity:
+        // `resolveAsyncByDefault` (`config.ts:222-224`) is `!== false`, so an absent key is TRUE.
+        assert!(
+            cfg.async_by_default,
+            "an absent `asyncByDefault` must background (pi `config.ts:222-224`)"
+        );
         assert!(!cfg.force_top_level_async);
         assert_eq!(cfg.global_concurrency_limit, 20);
         assert_eq!(cfg.max_subagent_spawns_per_session, 40);
@@ -1250,6 +1403,7 @@ mod tests {
             default_extensions: None,
             disable_builtins: Some(true),
             disable_thinking: Some(true),
+                    max_thinking: None,
         };
         let view = SubagentsSettingsView::from_subagent_settings(&settings);
         assert!(view.disable_builtins);

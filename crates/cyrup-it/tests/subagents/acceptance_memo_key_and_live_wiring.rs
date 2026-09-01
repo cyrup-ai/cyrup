@@ -41,39 +41,26 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use tokio::sync::Mutex;
 
 use cyrup_core::{CancelToken, Content, ModelId, Tool, ToolCallId};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::artifacts::project_artifacts_dir;
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
-use cyrup_ext_subagents::background::runner_main::{RunnerConfig, run};
+use cyrup_ext_subagents::background::runner_main::{RunnerConfig, RunnerOverrides, run_with};
 use cyrup_ext_subagents::background::{RunId, RunMode, RunPaths};
 use cyrup_ext_subagents::discovery::types::SystemPromptMode;
 use cyrup_ext_subagents::exec::ResolvedAgentPersona;
 use cyrup_ext_subagents::exec::acceptance::model;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 
 // ------------------------------------------------------------------------------------------------
 // Fixtures
 // ------------------------------------------------------------------------------------------------
 
-/// Serializes every test in this file, not only the ones that mutate process-global env
-/// (`CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT`/`CYRUP_HOME`).
-///
-/// The wider scope is REQUIRED here, and it is a property of the code under test rather than
-/// tidiness: a memo cache key includes `envHash`, a sha256 over the WHOLE effective environment
-/// (`acceptance.ts:1089` — `{ ...process.env, ...command.env }`), so any concurrent `set_var` in
-/// this same process changes the key between two calls that must agree on it. Every test below
-/// either asserts that two calls DO share a key or that they do not, so all of them are
-/// env-sensitive; the four fixture tests at the end are exactly the concurrent mutators. Running
-/// them unserialized turned the key tests into load-dependent flakes that passed alone and failed
-/// under a full `--workspace` run.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -176,8 +163,6 @@ fn memo_artifacts(artifacts_dir: &Path) -> Vec<PathBuf> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_cache_key_covers_the_repo_relative_cwd() {
     // The whole file is serialized on this: `envHash` makes every cache key a function of the
-    // process environment, which the fixture tests below mutate. See [`ENV_MUTATION_LOCK`].
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     // `cwdRelative: workspaceState.cwdRelative` (`acceptance.ts:1093`). The same command text run
     // from two directories of the SAME repository is two different verifications — `cargo test` in
     // `crates/a` proves nothing about `crates/b` — so they must not share a memo.
@@ -235,8 +220,6 @@ async fn the_cache_key_covers_the_repo_relative_cwd() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_cache_key_covers_the_declared_timeout() {
     // The whole file is serialized on this: `envHash` makes every cache key a function of the
-    // process environment, which the fixture tests below mutate. See [`ENV_MUTATION_LOCK`].
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     // `timeoutMs: command.timeoutMs ?? 120_000` (`acceptance.ts:1090,1097`). A command re-declared
     // with a tighter bound is a different verification: replaying a result recorded under a
     // 120 s budget would report `passed` for a command the author has since said must finish in 5 s.
@@ -278,8 +261,6 @@ async fn the_cache_key_covers_the_declared_timeout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_cache_key_covers_allow_failure_so_a_replay_cannot_change_the_verdict() {
     // The whole file is serialized on this: `envHash` makes every cache key a function of the
-    // process environment, which the fixture tests below mutate. See [`ENV_MUTATION_LOCK`].
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     // `allowFailure: command.allowFailure === true` (`acceptance.ts:1098`). This term is
     // BEHAVIOUR-CHANGING, not bookkeeping: `allowFailure` is exactly what turns a nonzero exit from
     // `failed` (which rejects the whole run, `acceptance.ts:1297`) into `allowed-failure` (which
@@ -343,8 +324,6 @@ async fn the_cache_key_covers_allow_failure_so_a_replay_cannot_change_the_verdic
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_memo_hit_reports_the_current_criterion_id_not_the_recorded_one() {
     // The whole file is serialized on this: `envHash` makes every cache key a function of the
-    // process environment, which the fixture tests below mutate. See [`ENV_MUTATION_LOCK`].
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     // `id` is NOT part of the cache key (`acceptance.ts:1091-1101` lists nine terms and `id` is not
     // among them), so renaming a verify command's id and leaving its text alone is a memo HIT — and
     // the replay must announce itself under the CURRENT id (`id: command.id`, `:1106`). Replaying
@@ -383,8 +362,6 @@ async fn a_memo_hit_reports_the_current_criterion_id_not_the_recorded_one() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_memo_hit_re_stamps_command_and_cwd_over_whatever_the_artifact_recorded() {
     // The whole file is serialized on this: `envHash` makes every cache key a function of the
-    // process environment, which the fixture tests below mutate. See [`ENV_MUTATION_LOCK`].
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     // The other two thirds of `{ ...cached.result, id, command: command.command, cwd, … }`
     // (`acceptance.ts:1106`). `command` and `cwd` ARE key terms, so the only way to observe the
     // re-stamp is to make the ARTIFACT disagree with the key it is filed under — which is exactly
@@ -443,8 +420,6 @@ async fn a_memo_hit_re_stamps_command_and_cwd_over_whatever_the_artifact_recorde
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_sensitive_key_pattern_requires_the_left_boundary_too() {
     // The whole file is serialized on this: `envHash` makes every cache key a function of the
-    // process environment, which the fixture tests below mutate. See [`ENV_MUTATION_LOCK`].
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     // `/(?:^|_)(?:TOKEN|SECRET|…)(?:_|$)/i` — the LEFT `(?:^|_)` is a separate condition from the
     // right one, and the sibling file's negatives (`TOKENIZER`, `PASSAGE`, `AUTHORITY`, `SESSIONS`,
     // `APIKEY`) every one of them fails on the RIGHT side, so deleting the left check leaves that
@@ -598,7 +573,6 @@ fn tool_result_text(result: &cyrup_core::ToolResult) -> String {
 /// written — which is exactly what the `artifacts: false` half of this pair asserts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_subagent_tools_single_run_memoizes_its_verify_commands_under_the_run_artifacts_dir() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("tempdir for the fixture persona + cwd");
     let home_dir = tempfile::tempdir().expect("tempdir to isolate CYRUP_HOME artifacts");
@@ -617,12 +591,6 @@ async fn the_subagent_tools_single_run_memoizes_its_verify_commands_under_the_ru
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
 
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-        std::env::set_var("CYRUP_HOME", home_dir.path());
-    }
 
     // `project_artifacts_dir`, NOT `temp_artifacts_dir`: `ArtifactDirPreference::default()` is
     // `Project` — pi's `DEFAULT_ARTIFACT_CONFIG.dir = "project"` (`src/shared/types.ts:1796-1798`
@@ -633,7 +601,22 @@ async fn the_subagent_tools_single_run_memoizes_its_verify_commands_under_the_ru
     // run would not have written to even with artifacts enabled.
     let art_dir = project_artifacts_dir(work_dir.path());
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        // SUBA-083: asserts verify-command execution counts under the run artifacts dir — only a
+        // completed foreground run memoizes (pi `config.ts:222-224`).
+        SubagentExtensionConfig {
+            // Named here rather than exported; these runs settle in the FOREGROUND, which is the
+            // path `spawn_command` reaches.
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
+            }),
+            roots: Roots::sandboxed(home_dir.path()),
+            async_by_default: false,
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
     );
     let result = extension
@@ -649,13 +632,6 @@ async fn the_subagent_tools_single_run_memoizes_its_verify_commands_under_the_ru
             Box::new(|_u: cyrup_core::ToolUpdate| {}),
         )
         .await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     let result = result.expect("the run must COMPLETE, not be refused at dispatch");
     let text = tool_result_text(&result);
@@ -707,7 +683,6 @@ async fn the_subagent_tools_single_run_memoizes_its_verify_commands_under_the_ru
 /// recorded anywhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn artifacts_false_disarms_verify_memoization_along_with_the_quadruple() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("tempdir");
     let home_dir = tempfile::tempdir().expect("tempdir for CYRUP_HOME");
@@ -724,12 +699,6 @@ async fn artifacts_false_disarms_verify_memoization_along_with_the_quadruple() {
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
 
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-        std::env::set_var("CYRUP_HOME", home_dir.path());
-    }
 
     // `project_artifacts_dir`, NOT `temp_artifacts_dir`: `ArtifactDirPreference::default()` is
     // `Project` — pi's `DEFAULT_ARTIFACT_CONFIG.dir = "project"` (`src/shared/types.ts:1796-1798`
@@ -740,7 +709,21 @@ async fn artifacts_false_disarms_verify_memoization_along_with_the_quadruple() {
     // run would not have written to even with artifacts enabled.
     let art_dir = project_artifacts_dir(work_dir.path());
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        // SUBA-083: asserts `artifacts: false` disarms verify memoization on a completed run.
+        SubagentExtensionConfig {
+            // Named here rather than exported; these runs settle in the FOREGROUND, which is the
+            // path `spawn_command` reaches.
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
+            }),
+            roots: Roots::sandboxed(home_dir.path()),
+            async_by_default: false,
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
     );
     let result = extension
@@ -757,13 +740,6 @@ async fn artifacts_false_disarms_verify_memoization_along_with_the_quadruple() {
             Box::new(|_u: cyrup_core::ToolUpdate| {}),
         )
         .await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     result.expect("the run must COMPLETE");
 
@@ -878,11 +854,6 @@ async fn run_hop2(dir: &Path, config: RunnerConfig) {
     let script_path = dir.join("script.json");
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — the caller holds `ENV_MUTATION_LOCK`.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let async_root = dir.join("async");
     let results_dir = dir.join("results");
@@ -893,13 +864,19 @@ async fn run_hop2(dir: &Path, config: RunnerConfig) {
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
 
-    let outcome = run(&cfg_path, &run_paths).await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
+    // Driving the runner IN-PROCESS, so the fixture is handed down directly.
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides {
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            }),
+            ..Default::default()
+            },
+    )
+    .await;
     outcome.expect("run() itself never returns Err");
 }
 
@@ -913,7 +890,6 @@ async fn run_hop2(dir: &Path, config: RunnerConfig) {
 /// `artifacts_dir` disarms it — pi's own two-term gate (`subagent-runner.ts:1192`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_background_hop_memoizes_its_steps_verify_commands() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let dir = tempfile::tempdir().expect("tempdir");
     init_repo(dir.path());
@@ -955,7 +931,6 @@ async fn the_background_hop_memoizes_its_steps_verify_commands() {
 /// (`RunnerConfig::artifacts_dir`'s own doc), which must leave verify memoization off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_background_hop_writes_no_memo_when_the_run_disabled_artifacts() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let dir = tempfile::tempdir().expect("tempdir");
     init_repo(dir.path());
@@ -1006,7 +981,6 @@ async fn the_background_hop_writes_no_memo_when_the_run_disabled_artifacts() {
 /// told not to use.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_background_hop_writes_no_memo_when_the_config_is_disabled_despite_a_real_dir() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let dir = tempfile::tempdir().expect("tempdir");
     init_repo(dir.path());

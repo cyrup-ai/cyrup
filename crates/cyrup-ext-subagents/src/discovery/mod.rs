@@ -86,7 +86,7 @@ use chains::{ChainScanResult, scan_chain_scopes};
 use management::{AgentVisibility, ChainVisibility};
 use types::{
     AgentDefinition, AgentReadScope, AgentSource, ChainDefinition, ChainDiscoveryDiagnostic,
-    LayeredOverrideSettings, SubagentSettings,
+    LayeredOverrideSettings, OverrideField, SubagentSettings,
 };
 
 /// Directory segment reserved for skill bundling (R-SA-007), excluded from agent-file discovery
@@ -701,7 +701,75 @@ pub fn parse_subagent_settings(
     // the setting had no effect anywhere (SUBA-003).
     settings.model_scope = crate::exec::model_scope::parse_model_scope_config(value.get("modelScope"))
         .map_err(SubagentError::MalformedSettings)?;
+    // SUBA-078 / pi `agents.ts:1090-1096`: presence-gated, and the inner `parseThinkingLevel`
+    // failure is SWALLOWED and replaced by this outer message — so the observable text is only ever
+    // the one below. Note its Oxford `or max`, which differs from `parse_thinking_level`'s own
+    // `…, xhigh, max.`; the two strings are not interchangeable.
+    if let Some(raw) = value.get("maxThinking") {
+        settings.max_thinking = Some(
+            crate::exec::thinking_ceiling::parse_thinking_level(raw.as_str(), "subagents.maxThinking")
+                .map_err(|_| {
+                    // The file path upstream interpolates is not in scope here — this function
+                    // takes only the raw `subagents` value — so this matches its SIBLING
+                    // `validate_default_thinking`, which drops the path for the same reason.
+                    SubagentError::MalformedSettings(
+                        "invalid 'maxThinking'; expected one of off, minimal, low, medium, high, \
+                         xhigh, or max"
+                            .to_string(),
+                    )
+                })?,
+        );
+    }
+    populate_override_tool_budgets(&mut settings, value)?;
     Ok(settings)
+}
+
+/// pi `toolBudget?: ToolBudgetConfig | false` on a per-agent override entry (`agents.ts:102`,
+/// applied at `agents.ts:1285`/`agents.ts:1456`).
+///
+/// [`types::AgentOverrideConfig::tool_budget`] is `skip_deserializing`, so this is the ONLY place
+/// it is ever populated — for the same reason `modelScope` above is: a
+/// [`crate::discovery::types::ResolvedToolBudget`] must come from the real validator, never
+/// straight from user input, or its `hard >= 1` / `soft <= hard` / non-empty-`block` invariant is
+/// a lie for every downstream reader. A rejection ABORTS discovery (R-SA-009) carrying pi's own
+/// message verbatim, with the offending settings key named so the line is findable.
+///
+/// The three shapes, matching pi's `if (override.toolBudget !== undefined)` gate:
+/// absent -> [`OverrideField::Unset`]; `false` -> [`OverrideField::ExplicitClear`]; an object ->
+/// [`OverrideField::Value`] once validated. Any other shape — including `null`, `true`, a number,
+/// a string, or an object the validator rejects — is malformed and aborts.
+fn populate_override_tool_budgets(
+    settings: &mut SubagentSettings,
+    value: &serde_json::Value,
+) -> Result<(), SubagentError> {
+    let Some(entries) = value.get("agentOverrides").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (name, entry) in entries {
+        let Some(raw) = entry.get("toolBudget") else {
+            continue;
+        };
+        // An entry present in the raw JSON but missing from the typed map cannot happen (serde
+        // built the map from this same object), but skipping rather than indexing keeps this
+        // total.
+        let Some(delta) = settings.overrides.get_mut(name) else {
+            continue;
+        };
+        if raw == &serde_json::Value::Bool(false) {
+            delta.tool_budget = OverrideField::ExplicitClear;
+            continue;
+        }
+        let label = format!("subagents.agentOverrides.{name}.toolBudget");
+        let resolved = crate::exec::tool_budget::validate_tool_budget_config(Some(raw), &label)
+            .map_err(SubagentError::MalformedSettings)?;
+        delta.tool_budget = match resolved {
+            // `raw` is `Some`, so the validator's `Ok(None)` ("nothing supplied") arm is
+            // unreachable here; treat it as "said nothing" rather than inventing a budget.
+            Some(budget) => OverrideField::Value(budget),
+            None => OverrideField::Unset,
+        };
+    }
+    Ok(())
 }
 
 
@@ -870,6 +938,9 @@ fn resolve_layered_subagent_settings(
         // pi `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1738`) — the same
         // project-wins-outright rule [`LayeredOverrideSettings::model_scope`] applies.
         model_scope: project.model_scope.or(user.model_scope),
+        // SUBA-078 / pi `resolveSubagentMaxThinking` (`agents.ts:1190-1197`) — project-wins-outright,
+        // the same rule every other settings key above follows.
+        max_thinking: project.max_thinking.or(user.max_thinking),
     }
 }
 
@@ -1188,6 +1259,10 @@ pub struct AgentDiscoveryResult {
     /// own returned `modelScope`, `agents.ts:1738/1446`): project scope wins over user, `None` =
     /// no policy configured, so model-scope enforcement is off.
     pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+    /// SUBA-078 — the effective `subagents.maxThinking` ceiling for this discovery's cwd (pi
+    /// stamps the same value onto every agent via `applySubagentMaxThinking`, `agents.ts:1199`).
+    /// `None` = no ceiling configured, so the bound is off.
+    pub max_thinking: Option<String>,
 }
 
 /// The **raw, unmerged** four-tier agent scan — the shape pi's `discoverAgentsAll` hands back as
@@ -1282,6 +1357,10 @@ fn run_discovery(
         // — the effective policy travels WITH the discovery result so an execution path that
         // already discovered the agent does not have to re-read settings to learn the scope.
         model_scope: cfg.override_settings.model_scope(),
+        // SUBA-078: the ceiling travels WITH the discovery result for the same reason `model_scope`
+        // does — an execution path that already discovered the agent must not have to re-read
+        // settings to learn its bound.
+        max_thinking: cfg.override_settings.max_thinking(),
     })
 }
 
@@ -1862,6 +1941,65 @@ mod tests {
         assert!(matches!(result, Err(SubagentError::MalformedSettings(_))));
     }
 
+    /// SUBA-078 / pi `agents.ts:1090-1096`: `maxThinking` is presence-gated and a bad value ABORTS
+    /// discovery (R-SA-009). Upstream's OUTER message is the observable one — note its Oxford
+    /// `or max`, which differs from `parse_thinking_level`'s own `…, xhigh, max.`
+    #[test]
+    fn parse_subagent_settings_validates_max_thinking() {
+        let settings = parse_subagent_settings(Some(&serde_json::json!({ "maxThinking": "low" })))
+            .expect("a recognized level is valid");
+        assert_eq!(settings.max_thinking.as_deref(), Some("low"));
+
+        for bad in [
+            serde_json::json!({ "maxThinking": "nope" }),
+            serde_json::json!({ "maxThinking": 3 }),
+            serde_json::json!({ "maxThinking": serde_json::Value::Null }),
+        ] {
+            let err = parse_subagent_settings(Some(&bad)).expect_err("must abort discovery");
+            assert!(
+                matches!(err, SubagentError::MalformedSettings(_)),
+                "a bad maxThinking must abort discovery, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("invalid 'maxThinking'") && msg.contains("xhigh, or max"),
+                "the Oxford `or max` is upstream's and distinguishes this message: {msg}"
+            );
+        }
+
+        // An ABSENT key is simply no ceiling — not an error, and not the tightest bound.
+        let settings = parse_subagent_settings(Some(&serde_json::json!({}))).expect("valid");
+        assert_eq!(settings.max_thinking, None);
+    }
+
+    /// SUBA-078 / pi `resolveSubagentMaxThinking` (`agents.ts:1190-1197`): project wins OUTRIGHT.
+    #[test]
+    fn max_thinking_resolves_project_over_user() {
+        let user = SubagentSettings {
+            max_thinking: Some("high".to_string()),
+            ..SubagentSettings::default()
+        };
+        let project = SubagentSettings {
+            max_thinking: Some("low".to_string()),
+            ..SubagentSettings::default()
+        };
+        let layered = crate::discovery::types::LayeredOverrideSettings {
+            user: user.clone(),
+            project,
+            ..Default::default()
+        };
+        assert_eq!(layered.max_thinking().as_deref(), Some("low"));
+
+        // ...and falls back to user when the project sets none. Note this is project-wins-outright,
+        // NOT "the lower of the two": a project may deliberately RAISE the user's ceiling.
+        let layered = crate::discovery::types::LayeredOverrideSettings {
+            user,
+            project: SubagentSettings::default(),
+            ..Default::default()
+        };
+        assert_eq!(layered.max_thinking().as_deref(), Some("high"));
+    }
+
     #[test]
     fn parse_subagent_settings_rejects_empty_default_model() {
         // pi `agent-overrides.test.ts:215-229`: an empty `defaultModel` is malformed.
@@ -1881,6 +2019,150 @@ mod tests {
             reviewer.model,
             crate::discovery::types::OverrideField::Value("openai/gpt-5.4".to_string())
         );
+    }
+
+    /// SUBA-081. Before the five added fields and [`types::ToolsOverrideField`], a settings file
+    /// written against real pi silently lost six override keys and HARD-FAILED on a seventh
+    /// (`tools: "inherit"`, which deserializes as neither a tool list nor the `false` clear
+    /// sentinel, aborting the whole read with `MalformedSettings`). Every key pi declares in
+    /// `BuiltinAgentOverrideConfig` (`agents.ts:80-103`) is present here.
+    #[test]
+    fn parse_subagent_settings_accepts_every_pi_override_key() {
+        let raw = serde_json::json!({
+            "agentOverrides": {
+                "reviewer": {
+                    "description": "reviews things",
+                    "output": "./out/review.md",
+                    "outputMode": "file-only",
+                    "defaultReads": ["./AGENTS.md"],
+                    "model": "openai/gpt-5",
+                    "defaultProvider": "openai",
+                    "fallbackModels": ["anthropic/claude-sonnet-4"],
+                    "fast": true,
+                    "thinking": "high",
+                    "systemPromptMode": "append",
+                    "inheritProjectContext": true,
+                    "inheritSkills": false,
+                    "defaultContext": "fork",
+                    "acceptanceRole": "reviewer",
+                    "disabled": false,
+                    "systemPrompt": "be terse",
+                    "skills": ["tdd"],
+                    "tools": "inherit",
+                    "extensions": ["./ext/a.ts"],
+                    "subagentOnlyExtensions": ["./ext/child.ts"],
+                    "completionGuard": false,
+                    "toolBudget": { "hard": 20, "soft": 10, "block": "*" }
+                }
+            }
+        });
+        let settings = parse_subagent_settings(Some(&raw)).expect("all 22 pi override keys load");
+        let reviewer = settings.overrides.get("reviewer").expect("reviewer override");
+
+        assert_eq!(
+            reviewer.description,
+            OverrideField::Value("reviews things".to_string())
+        );
+        assert_eq!(
+            reviewer.output,
+            OverrideField::Value("./out/review.md".to_string())
+        );
+        assert_eq!(
+            reviewer.default_reads,
+            OverrideField::Value(vec!["./AGENTS.md".to_string()])
+        );
+        assert_eq!(
+            reviewer.extensions,
+            OverrideField::Value(vec!["./ext/a.ts".to_string()])
+        );
+        assert_eq!(
+            reviewer.tool_budget,
+            OverrideField::Value(types::ResolvedToolBudget {
+                hard: 20,
+                soft: Some(10),
+                block: types::ToolBudgetBlock::All(types::AllToolsMarker),
+            }),
+            "toolBudget is skip_deserializing and must be filled in by the real validator"
+        );
+        assert_eq!(
+            reviewer.tools,
+            types::ToolsOverrideField::Inherit,
+            "`tools: \"inherit\"` must LOAD (it used to abort the whole read) and be its own state"
+        );
+    }
+
+    /// The `false` explicit-clear shape of the four clearable SUBA-081 keys, and the `false`
+    /// shape of `toolBudget` specifically — which, being `skip_deserializing`, is the one that
+    /// could not have worked without the validator hook in `parse_subagent_settings`.
+    #[test]
+    fn parse_subagent_settings_reads_false_clears_for_suba081_fields() {
+        let raw = serde_json::json!({
+            "agentOverrides": {
+                "reviewer": {
+                    "output": false,
+                    "defaultReads": false,
+                    "extensions": false,
+                    "toolBudget": false,
+                    "tools": false
+                }
+            }
+        });
+        let settings = parse_subagent_settings(Some(&raw)).expect("clears load");
+        let reviewer = settings.overrides.get("reviewer").expect("reviewer override");
+        assert_eq!(reviewer.output, OverrideField::ExplicitClear);
+        assert_eq!(reviewer.default_reads, OverrideField::ExplicitClear);
+        assert_eq!(reviewer.extensions, OverrideField::ExplicitClear);
+        assert_eq!(reviewer.tool_budget, OverrideField::ExplicitClear);
+        assert_eq!(
+            reviewer.tools,
+            types::ToolsOverrideField::ExplicitClear,
+            "`tools: false` stays the empty-allowlist clear, NOT the inherit state"
+        );
+    }
+
+    /// SUBA-075/077's `INHERIT_MODEL_SENTINEL` is a REQUEST carried at spawn time, never a
+    /// settings-override shape: pi's `model?: string | false` has no `"inherit"` arm
+    /// (`agents.ts:85`), so `model: "inherit"` must keep deserializing as the literal model VALUE.
+    /// Only `tools` gained a fourth state.
+    #[test]
+    fn parse_subagent_settings_keeps_model_inherit_as_a_plain_value() {
+        let raw = serde_json::json!({
+            "agentOverrides": { "reviewer": { "model": "inherit" } }
+        });
+        let settings = parse_subagent_settings(Some(&raw)).expect("loads");
+        assert_eq!(
+            settings.overrides.get("reviewer").expect("reviewer").model,
+            OverrideField::Value("inherit".to_string())
+        );
+    }
+
+    /// R-SA-009: a `toolBudget` the real validator rejects ABORTS discovery, carrying pi's own
+    /// message and naming the settings key. Without the `parse_subagent_settings` hook this value
+    /// would either be dropped silently or mint a `ResolvedToolBudget` violating its own
+    /// `hard >= 1` invariant.
+    #[test]
+    fn parse_subagent_settings_rejects_a_malformed_override_tool_budget() {
+        for bad in [
+            serde_json::json!({ "hard": 0 }),
+            serde_json::json!({ "soft": 3 }),
+            serde_json::json!({ "hard": 5, "soft": 9 }),
+            serde_json::json!("nope"),
+            serde_json::json!(null),
+            serde_json::json!(true),
+        ] {
+            let raw = serde_json::json!({
+                "agentOverrides": { "reviewer": { "toolBudget": bad } }
+            });
+            let err = parse_subagent_settings(Some(&raw)).expect_err("malformed toolBudget aborts");
+            assert!(
+                matches!(err, SubagentError::MalformedSettings(_)),
+                "expected MalformedSettings, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("subagents.agentOverrides.reviewer.toolBudget"),
+                "the message must name the offending key: {err}"
+            );
+        }
     }
 
     #[test]

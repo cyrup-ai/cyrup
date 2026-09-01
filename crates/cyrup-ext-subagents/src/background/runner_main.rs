@@ -520,6 +520,52 @@ pub async fn read_and_delete_config(
 /// diagnostic and choose its own process exit code; it carries NO information this function's own
 /// on-disk writes have not already durably recorded.
 pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), SubagentError> {
+    run_with(config_path, run_paths, RunnerOverrides::default()).await
+}
+
+/// What a caller driving the runner IN-PROCESS may decide for it.
+///
+/// A struct rather than a parameter list because both fields answer the same question — "which
+/// ambient input does this run use instead of the process's" — and the set is open: the previous
+/// shape would have grown a third positional argument the moment the cascade needed its root.
+///
+/// Every field `None` is byte-for-byte the real detached runner's behaviour.
+#[derive(Debug, Default, Clone)]
+pub struct RunnerOverrides {
+    /// The binary each dispatched step execs. `None` resolves from the inherited environment.
+    pub spawn_command: Option<crate::spawn::SpawnCommand>,
+    /// The filesystem roots this run resolves against, including the one the cascade reads
+    /// mid-run. `None` resolves from the process environment.
+    pub roots: Option<crate::paths::Roots>,
+    /// Extra entries for each dispatched step's CHILD environment, layered exactly as
+    /// [`crate::exec::RunOptions::child_env`] is.
+    ///
+    /// Completes the set: without it a caller driving the runner in-process could name the binary
+    /// and the roots but not reach the child's own environment, which is where a fixture's
+    /// out-of-band capture path lives.
+    pub child_env: std::collections::HashMap<String, String>,
+}
+
+/// [`run`] with the step-dispatch binary supplied in-process.
+///
+/// The REAL detached runner is its own process reached through a `RunnerConfig` on disk, so it has
+/// no in-process caller to hand anything down — that is why [`run`] passes `None` and why
+/// `RunnerConfig` deliberately carries no such field (a config file able to redirect which binary
+/// executes is a hazard, the same reason `SubagentExtensionConfig::spawn_command` is
+/// `#[serde(skip)]`).
+///
+/// A caller driving this function IN-PROCESS, however, *is* the runner, and for it the injection is
+/// both possible and correct: it substitutes the scripted fixture binary without moving
+/// `CYRUP_SUBAGENT_BINARY` on a process every other concurrent test shares.
+pub async fn run_with(
+    config_path: &Path,
+    run_paths: &RunPaths,
+    overrides: RunnerOverrides,
+) -> Result<(), SubagentError> {
+    let RunnerOverrides { spawn_command, roots, child_env } = overrides;
+    // Resolved ONCE here, then carried: the cascade's own read is mid-run, and re-deriving it there
+    // is what used to force a caller to move `CYRUP_SUBAGENTS_TEMP_ROOT` on the whole process.
+    let roots = roots.unwrap_or_else(crate::paths::Roots::from_env);
     let Some(config) = load_runner_config(config_path, run_paths).await else {
         return Ok(());
     };
@@ -590,6 +636,9 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
     // The step loop itself, all failure modes funneled to a single Result the tail below always
     // routes through `finish_run`.
     let loop_outcome = run_inner(
+        &roots,
+        &child_env,
+        spawn_command.as_ref(),
         &config,
         run_paths,
         &shared_status,
@@ -1283,7 +1332,13 @@ fn spawn_telemetry_task(
 /// a `SingleResult` with a nonzero `exit_code` and the loop continues to the next step exactly as
 /// R-SA-052's chain-walk semantics dictate (a chain does not abort on one step's failure unless
 /// the group itself is `fail_fast`, which `walk_chain`/`run_bounded` already enforce internally).
+// One over the limit, from the in-process `spawn_command` hand-down `run_with` needs; the
+// alternative is a parameter struct that exists only to satisfy the lint.
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
+    roots: &crate::paths::Roots,
+    child_env: &std::collections::HashMap<String, String>,
+    spawn_command: Option<&crate::spawn::SpawnCommand>,
     config: &RunnerConfig,
     run_paths: &RunPaths,
     status: &SharedStatus,
@@ -1304,6 +1359,8 @@ async fn run_inner(
     // with the step it belongs to (pi's `statusPayload.currentStep`, `subagent-runner.ts:1434`).
     let current_flat_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (executor, ctx) = build_chain_context(
+        child_env,
+        spawn_command,
         config,
         run_paths,
         flags,
@@ -1314,6 +1371,7 @@ async fn run_inner(
     );
 
     let mut io = TurnLoopIo {
+        roots,
         config,
         run_paths,
         status,
@@ -1420,6 +1478,9 @@ async fn run_inner(
 /// writer, and the three control-inbox flags. Grouped into one struct purely so each helper takes
 /// a readable argument list instead of five threaded parameters — no helper stores it.
 struct TurnLoopIo<'a> {
+    /// The roots this run resolves against, so the terminal-flag checks and the step settler all
+    /// read ONE resolution rather than each re-deriving it from the environment mid-run.
+    roots: &'a crate::paths::Roots,
     config: &'a RunnerConfig,
     run_paths: &'a RunPaths,
     status: &'a SharedStatus,
@@ -1468,7 +1529,11 @@ fn ensure_depth_available(depth: &DepthEnvelope) -> Result<(), SubagentError> {
 /// Build the two values every dispatched step is driven through: the [`SingleStepExecutor`] that
 /// carries this run's depth envelope, interrupt token, resolved personas and per-step policy into
 /// each spawned child, and the [`ChainRunContext`] `walk_chain` resolves each step against.
+// As `run_inner` above: one over, for the same threaded value.
+#[allow(clippy::too_many_arguments)]
 fn build_chain_context(
+    child_env: &std::collections::HashMap<String, String>,
+    spawn_command: Option<&crate::spawn::SpawnCommand>,
     config: &RunnerConfig,
     run_paths: &RunPaths,
     flags: &ControlFlags,
@@ -1485,6 +1550,12 @@ fn build_chain_context(
     // group's fanned-out children share one map rather than cloning it per child.
     let resolved_agents = Arc::new(config.resolved_agents.clone());
     let executor: Arc<dyn SingleStepExecutor> = Arc::new(ExecSingleStepExecutor {
+        // `None` on the REAL detached hop-2 runner: it reaches its steps through a `RunnerConfig`
+        // written to disk as JSON, so nothing in-process can be handed down and these steps resolve
+        // their command from the environment they inherited, exactly as before. `Some` only when a
+        // caller drives `run_with` in-process and therefore IS the runner.
+        spawn_command: spawn_command.cloned(),
+        child_env: child_env.clone(),
         depth,
         interrupted: Arc::clone(&flags.interrupted),
         interrupt_cancel: interrupt_cancel.clone(),
@@ -1620,7 +1691,7 @@ async fn check_stop_flag(
             // pi `stopNestedAsyncDescendants()` (`subagent-runner.ts:2984`) — stop the whole
             // subtree, not just this run, or every background run this one spawned keeps going
             // detached and unreachable after the user asked for it to stop.
-            cascade_to_descendants(config, events, cascade::CascadeVerb::Stop).await;
+            cascade_to_descendants(io.roots, config, events, cascade::CascadeVerb::Stop).await;
             promote_interrupted_results_to_stopped(results, &message);
             return Ok(Some(LoopOutcome::Stopped {
                 results: std::mem::take(results),
@@ -1667,7 +1738,7 @@ async fn check_timeout_flag(
                 .await
                 .map_err(SubagentError::Spawn)?;
             // Fail the whole subtree, not just this run — see `background::cascade`.
-            cascade_to_descendants(config, events, cascade::CascadeVerb::Timeout).await;
+            cascade_to_descendants(io.roots, config, events, cascade::CascadeVerb::Timeout).await;
             return Ok(Some(LoopOutcome::TimedOut {
                 results: std::mem::take(results),
                 message,
@@ -1726,7 +1797,7 @@ async fn check_interrupt_flag(
             let _ = request; // consumed; contents already reflected via status/event log.
             // R-SA-084 stops THIS run; without the cascade every background run this one
             // spawned would keep running, detached and unreachable — see `background::cascade`.
-            cascade_to_descendants(config, events, cascade::CascadeVerb::Interrupt).await;
+            cascade_to_descendants(io.roots, config, events, cascade::CascadeVerb::Interrupt).await;
             return Ok(Some(LoopOutcome::Interrupted {
                 results: std::mem::take(results),
             }));
@@ -1965,7 +2036,7 @@ async fn settle_step_result(
         // Consume the interrupt request file (idempotent) so it is not left dangling on the run
         // dir, then end the run `Paused` — the child was already torn down mid-flight.
         let _ = control::consume_interrupt_request(run_paths).await;
-        cascade_to_descendants(config, events, cascade::CascadeVerb::Interrupt).await;
+        cascade_to_descendants(io.roots, config, events, cascade::CascadeVerb::Interrupt).await;
         return Ok(StepDisposition::Finish(LoopOutcome::Interrupted {
             results: std::mem::take(results),
         }));
@@ -1991,7 +2062,7 @@ async fn settle_step_result(
         write_shared_status(run_paths, status)
             .await
             .map_err(SubagentError::Spawn)?;
-        cascade_to_descendants(config, events, cascade::CascadeVerb::Timeout).await;
+        cascade_to_descendants(io.roots, config, events, cascade::CascadeVerb::Timeout).await;
         return Ok(StepDisposition::Finish(LoopOutcome::TimedOut {
             results: std::mem::take(results),
             message,
@@ -2149,6 +2220,7 @@ fn mark_remaining_stopped(status: &mut RunStatus, from_index: usize, total: usiz
 /// common case (a leaf background run), so the cascade costs nothing on the path that does not
 /// need it.
 async fn cascade_to_descendants(
+    roots: &crate::paths::Roots,
     config: &RunnerConfig,
     events: &mut Option<BoundedJsonlWriter>,
     verb: cascade::CascadeVerb,
@@ -2156,7 +2228,8 @@ async fn cascade_to_descendants(
     let Some(route) = config.nested_route.as_ref() else {
         return;
     };
-    let report = cascade::cascade_to_nested_async_descendants(route, verb).await;
+    let report =
+        cascade::cascade_to_nested_async_descendants(roots, route, verb).await;
     for failure in report.failures {
         let mut payload = serde_json::json!({
             "runId": config.run_id.as_str(),
@@ -2390,6 +2463,15 @@ pub(crate) struct ExecSingleStepExecutor {
     /// down mid-flight via `exec::run_sync`'s own `opts.interrupt` race, not merely noticed between
     /// steps. For a foreground executor (no control-inbox watcher) this token is never cancelled.
     pub(crate) interrupt_cancel: cyrup_core::CancelToken,
+    /// In-process binary override applied to every step this executor dispatches, mirroring
+    /// [`RunOptions::spawn_command`]. `Some` only on the FOREGROUND chain/parallel walk, which is
+    /// constructed where the extension config is in hand; `None` on the background and detached
+    /// paths, whose steps resolve their command from the environment they inherited exactly as
+    /// before — `RunnerConfig` crosses a process boundary as JSON and carries no such value.
+    pub(crate) spawn_command: Option<crate::spawn::SpawnCommand>,
+    /// Caller-supplied additions to each dispatched step's child environment
+    /// ([`RunnerOverrides::child_env`]). Empty on the real detached runner.
+    pub(crate) child_env: std::collections::HashMap<String, String>,
     /// The flat index of the step currently being dispatched, published here just before each
     /// dispatch so the live-telemetry [`RunOptions::live_events`] sink can tag every child NDJSON
     /// line with the step it belongs to (pi's `statusPayload.currentStep`/per-step fold,
@@ -2558,9 +2640,13 @@ impl ExecSingleStepExecutor {
         run_id: Option<RunId>,
         inherited_session_model: Option<cyrup_core::ModelId>,
         model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+        spawn_command: Option<crate::spawn::SpawnCommand>,
     ) -> Self {
         Self {
             depth,
+            spawn_command,
+            // A foreground executor's child env comes from its own `RunOptions`, not from here.
+            child_env: std::collections::HashMap::new(),
             interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resolved_agents,
             // A foreground executor has no control-inbox watcher, so this token is never cancelled;
@@ -2864,6 +2950,8 @@ impl ExecSingleStepExecutor {
             }
         });
         RunOptions {
+            spawn_command: self.spawn_command.clone(),
+            child_env: self.child_env.clone(),
             // SUBA-021 — the RUN-level usage budget applied per step, exactly as `turn_budget`
             // below is (pi applies one `AsyncExecutionParams.usageBudget` across the whole run
             // rather than giving each step a fresh one).
@@ -2905,6 +2993,10 @@ impl ExecSingleStepExecutor {
             reads: None,
             structured_output_schema: step.structured_output_schema.clone(),
             model_override,
+            // SUBA-078: hop 2 does not re-read settings — its ceiling arrives through the
+            // `CYRUP_SUBAGENT_THINKING_CEILING` env var hop 1 wrote, and `run_sync` folds that
+            // inherited value in. `None` here is "nothing beyond what the environment says".
+            thinking_ceiling: None,
             preferred_provider: None,
             available_models,
             cancel: ctx.cancel.clone(),
@@ -3774,6 +3866,8 @@ mod tests {
 
         // The executor built for THIS run, exactly as `run` builds it.
         let executor = ExecSingleStepExecutor {
+            spawn_command: None,
+            child_env: std::collections::HashMap::new(),
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
@@ -3827,6 +3921,7 @@ mod tests {
                 max_depth: 5,
             },
             Arc::new(BTreeMap::new()),
+            None,
             None,
             None,
             None,
@@ -4033,6 +4128,8 @@ mod tests {
         // The executor carries an EMPTY persona map — exactly the state that must NOT dispatch a
         // placeholder.
         let executor = ExecSingleStepExecutor {
+            spawn_command: None,
+            child_env: std::collections::HashMap::new(),
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,

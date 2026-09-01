@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use cyrup_ext::{ExtMode, ExtensionHost, HostConfig};
 use cyrup_ext_subagents::extension::{RegistrationMode, SubagentsExtension};
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use serde_json::{json, Value};
 
@@ -43,6 +44,11 @@ fn scoped_config(root: &std::path::Path) -> SubagentExtensionConfig {
             ),
             ..Default::default()
         }),
+        // SUBA-083: needed for the launch in `a_real_tool_result_renders_through_the_settled_branch`:
+        // SETTLED is the foreground branch, and a backgrounded call would render the
+        // async-start branch instead (pi `config.ts:222-224`). The `draw()` tests are
+        // unaffected either way — rendering is a pure function of the payload.
+        async_by_default: false,
         ..Default::default()
     }
 }
@@ -320,17 +326,16 @@ async fn a_real_tool_result_renders_through_the_settled_branch() {
     });
     let script_path = dir.path().join("fixture-script.json");
     std::fs::write(&script_path, script.to_string()).unwrap();
-    // SAFETY: this is the only test in this file that touches these vars.
-    unsafe {
-        std::env::set_var(
-            "CYRUP_SUBAGENT_BINARY",
-            crate::support::bins::subagent_fixture(),
-        );
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
+    // The fixture named for THIS extension rather than moved into the process environment every
+    // concurrently-running test in this binary shares.
+    let mut config = scoped_config(dir.path());
+    config.spawn_command = Some(SpawnCommand {
+        binary: crate::support::bins::subagent_fixture(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        scoped_config(dir.path()),
+        config,
         dir.path().to_path_buf(),
     );
     let tool_result = ext
@@ -343,11 +348,6 @@ async fn a_real_tool_result_renders_through_the_settled_branch() {
         )
         .await
         .expect("the tool call succeeds");
-
-    unsafe {
-        std::env::remove_var("CYRUP_SUBAGENT_BINARY");
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     let details = tool_result.details.clone().expect("a settled single run carries details");
     assert_eq!(

@@ -178,6 +178,14 @@ path              = "tests/subagents/main.rs"
 required-features = ["it"]
 
 [[test]]
+# Its own target because its single test mutates this process's environment to prove the INHERITED
+# credential branch, and `unsafe { set_var }` is only sound with no concurrent reader — which is
+# true here exactly because this binary holds one test. See the file's own module doc.
+name              = "verify_redaction"
+path              = "tests/verify_redaction/main.rs"
+required-features = ["it"]
+
+[[test]]
 name              = "intercom"
 path              = "tests/intercom/main.rs"
 required-features = ["it"]

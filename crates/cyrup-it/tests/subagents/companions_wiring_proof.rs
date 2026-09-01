@@ -27,10 +27,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex as AsyncMutex;
 
 use cyrup_core::{CancelToken, Content, ModelId, Tool, ToolCallId};
 use cyrup_ext_subagents::background::RunId;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
@@ -59,15 +59,13 @@ fn scoped_config(root: &std::path::Path) -> SubagentExtensionConfig {
             ),
             ..Default::default()
         }),
+        // SUBA-083: these proofs assert the parent-session anchor inside the REAL child's env, which
+        // requires the run to execute to completion in the foreground (pi `config.ts:222-224`).
+        async_by_default: false,
         ..Default::default()
     }
 }
 
-/// Serializes every test mutating `CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT` (global).
-static ENV_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
-
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -77,29 +75,6 @@ fn write_script(dir: &Path, name: &str, script: &serde_json::Value) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, script.to_string()).expect("write fixture script");
     path
-}
-
-/// RAII guard installing the fixture-binary + script env for one test.
-struct FixtureEnvGuard;
-impl FixtureEnvGuard {
-    fn install(script_path: &Path) -> Self {
-        let fixture = fixture_binary_path();
-        // SAFETY: scoped, mutex-serialized env mutation (Rust 2024 requires `unsafe` for set_var).
-        unsafe {
-            std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-            std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, script_path);
-        }
-        Self
-    }
-}
-impl Drop for FixtureEnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `install`.
-        unsafe {
-            std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-            std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        }
-    }
 }
 
 fn message_end_line(text: &str) -> String {
@@ -143,8 +118,13 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
+        // SUBA-078: this fixture exercises no reasoning ceiling — `None` is "no ceiling
+        // configured, so the bound is off", matching `runner_main.rs`'s own hop-2 default.
+        thinking_ceiling: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -201,7 +181,6 @@ fn read_attempt_tee(child_cwd: &Path) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_session_anchor_is_emitted_into_the_real_child_subprocess_env() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // The fixture echoes back each requested env var it observes as one NDJSON line into its stdout
@@ -221,11 +200,16 @@ async fn parent_session_anchor_is_emitted_into_the_real_child_subprocess_env() {
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "anchor.json", &script);
-    let _env = FixtureEnvGuard::install(&script_path);
 
     let anchor = "orchestrator-session-2f9a11";
     let agent = base_agent_config("fixture-model"); // persona name = "worker" (see helper)
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process environment every
+    // concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     // The EXPLICIT anchor the root orchestrator captures from `HostServices::session_id()` at
     // SessionStart and threads through `RunOptions.parent_session_id` (extension.rs) → the spawn env.
     opts.parent_session_id = Some(anchor.to_string());
@@ -302,7 +286,6 @@ impl ClarifyChannel for RecordingClarifyChannel {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_contact_supervisor_block_fires_clarify_and_marks_the_attempt_detached() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // The child emits a BLOCKING contact_supervisor ask (`need_decision`), then finishes its turn.
@@ -321,7 +304,6 @@ async fn child_contact_supervisor_block_fires_clarify_and_marks_the_attempt_deta
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "clarify.json", &script);
-    let _env = FixtureEnvGuard::install(&script_path);
 
     // The executor's single-slot AskLock backed by a REAL (recording) ClarifyChannel — exactly what
     // `with_channels` wires from the intercom companion's broker channel in production.
@@ -330,6 +312,12 @@ async fn child_contact_supervisor_block_fires_clarify_and_marks_the_attempt_deta
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process environment every
+    // concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.clarify = Some(ClarifyDispatch {
         lock,
         session_key: "orchestrator-session".to_string(),
@@ -402,7 +390,6 @@ fn write_fixture_persona(cwd: &Path, local_name: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grouped_result_is_delivered_out_of_band_and_the_inline_receipt_is_reduced() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("tempdir");
     write_fixture_persona(work_dir.path(), "worker");
 
@@ -418,7 +405,6 @@ async fn grouped_result_is_delivered_out_of_band_and_the_inline_receipt_is_reduc
         "exit_code": 0
     });
     let script_path = write_script(work_dir.path(), "delivery.json", &script);
-    let _env = FixtureEnvGuard::install(&script_path);
 
     // Build the extension with the REAL (confirming) DeliveryChannel — exactly what `with_channels`
     // threads from the intercom companion in production.
@@ -428,8 +414,13 @@ async fn grouped_result_is_delivered_out_of_band_and_the_inline_receipt_is_reduc
     // This proof exercises only the delivery leg; the steer leg (R-SA-086 live-child follow-up) is
     // the no-transport default, which never fires in this out-of-band-delivery scenario.
     let steer: Arc<dyn SteerChannel> = Arc::new(NoTransportSteerChannel);
+    let mut ext_config = scoped_config(work_dir.path());
+    ext_config.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     let ext = SubagentsExtension::with_channels(
-        scoped_config(work_dir.path()),
+        ext_config,
         work_dir.path().to_path_buf(),
         delivery,
         clarify,

@@ -169,18 +169,41 @@ struct FixtureScript {
 }
 
 const SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
+
+/// Leading-argv form of [`SCRIPT_ENV_VAR`], delivered through `SpawnCommand::base_args` and
+/// therefore reaching this process without anyone moving process-global state that every
+/// concurrently-running test in a single `--test` binary shares. Preferred over the variable when
+/// both are present: a flag is aimed at ONE run, whereas an inherited variable is whatever the
+/// parent last set. `base_args` survives a re-exec hop (`CYRUP_SUBAGENT_BINARY_ARGS`), so a
+/// grandchild receives the flag too.
+const SCRIPT_ARGV_FLAG: &str = "--fixture-script";
 const ECHO_ARGV_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_ECHO_ARGV";
 const ECHO_ENV_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_ECHO_ENV";
 
-/// Load the fixture's script: `CYRUP_SUBAGENT_FIXTURE_SCRIPT`'s file contents, parsed as
-/// [`FixtureScript`] JSON, falling back to [`FixtureScript::default`] (optionally augmented by
-/// the `CYRUP_SUBAGENT_FIXTURE_ECHO_ARGV`/`CYRUP_SUBAGENT_FIXTURE_ECHO_ENV` convenience env vars)
-/// on any missing-file/read-error/parse-error path — this function never panics and never exits
+/// The `--fixture-script <path>` leading argv pair, if present. Mirrors the `windows(2)` flag/
+/// value scan [`emit_argv_echo`] already uses, rather than introducing a second argv idiom.
+fn script_path_from_argv() -> Option<std::ffi::OsString> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    args.windows(2).find_map(|pair| {
+        let [flag, path] = pair else { return None };
+        (flag == SCRIPT_ARGV_FLAG).then(|| std::ffi::OsString::from(path))
+    })
+}
+
+/// Load the fixture's script: the file named by [`SCRIPT_ARGV_FLAG`] if it was passed, else by
+/// `CYRUP_SUBAGENT_FIXTURE_SCRIPT`, parsed as [`FixtureScript`] JSON. Argv wins because it is
+/// aimed at this one run, while the variable is whatever the parent process last set — the
+/// distinction that lets concurrent tests in one binary stop clobbering each other.
+///
+/// Falls back to [`FixtureScript::default`] (optionally augmented by the
+/// `CYRUP_SUBAGENT_FIXTURE_ECHO_ARGV`/`CYRUP_SUBAGENT_FIXTURE_ECHO_ENV` convenience env vars) on
+/// any missing-file/read-error/parse-error path — this function never panics and never exits
 /// non-zero itself; a malformed script degrades to "do the minimum" rather than aborting the
 /// fixture process in a way that would itself look like a signal-escalation-worthy hang to a test
 /// harness driving it.
 fn load_script() -> FixtureScript {
-    let Some(script_path) = std::env::var_os(SCRIPT_ENV_VAR) else {
+    let Some(script_path) = script_path_from_argv().or_else(|| std::env::var_os(SCRIPT_ENV_VAR))
+    else {
         return default_script_from_env_fallback();
     };
     let Ok(contents) = std::fs::read_to_string(&script_path) else {

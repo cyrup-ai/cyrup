@@ -8,6 +8,18 @@
 //! child script as if it described the current session. A cyrup subagent run is a real re-exec of
 //! the `cyrup` binary, so the inheritance path is real, not hypothetical.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, unsafe_code)]
+// Exempt from the workspace `disallowed-methods` guard, and not convertible: `env_remove` unsets
+// keys the child would otherwise INHERIT, so the stale values have to be genuinely inherited for
+// this to prove anything. `ShellTool` offers no seam to fake a parent environment — its `env` is
+// additive over the real one — so injecting would test the additive half, not the scrub.
+//
+// SOUNDNESS: the criterion is the THREAD, not the binary. `set_var` races any concurrent `getenv`
+// for any key, so the condition is that nothing else in this process is running. The single test
+// below is a bare `#[tokio::test]`, which is tokio's CURRENT-THREAD runtime — it spawns no worker
+// threads — and the mutations all happen before the tool is invoked. (An earlier note here said
+// "the only `#[test]` in this binary" and argued from child-spawn ordering; the attribute is
+// `#[tokio::test]`, and child-spawn ordering is not the criterion. The flavor is.)
+#![allow(clippy::disallowed_methods)]
 
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink};
 use cyrup_tools::config::BashOpts;
@@ -52,7 +64,8 @@ async fn run(opts: BashOpts, command: &str) -> String {
 }
 
 /// Both halves live in ONE test so the process environment is mutated from a single thread: this
-/// is the only `#[test]` in this binary, and every `set_var` happens before any child is spawned.
+/// is the only test in this binary, and `#[tokio::test]` without a `flavor` is tokio's
+/// CURRENT-THREAD runtime, so no worker thread exists to race the mutations.
 ///
 /// Part 1 — every session-metadata key is deleted from the child environment before anything is
 /// set, so a value the harness process itself inherited can never leak into a `bash` child, with
@@ -62,7 +75,10 @@ async fn run(opts: BashOpts, command: &str) -> String {
 /// (`bash.ts:156`, `docs/extensions.md:2122`).
 #[tokio::test]
 async fn session_metadata_is_scrubbed_and_hooks_can_delete() {
-    // SAFETY: single-threaded with respect to the environment — see the doc comment above.
+    // SAFETY: the criterion is the THREAD — `set_var` races any concurrent `getenv` for ANY key,
+    // not merely a reader of one of these. This is the only test in the binary and a bare
+    // `#[tokio::test]` is tokio's CURRENT-THREAD runtime, which spawns no worker threads, so
+    // nothing in this process runs concurrently with the mutations below.
     unsafe {
         std::env::set_var("CYRUP_SESSION_ID", "stale-cyrup-session");
         std::env::set_var("CYRUP_SESSION_FILE", "/stale/cyrup.jsonl");

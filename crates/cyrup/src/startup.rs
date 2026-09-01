@@ -75,12 +75,19 @@ pub fn is_official_distribution() -> bool {
 
 /// Port of `areExperimentalFeaturesEnabled` (experimental.ts): `*_EXPERIMENTAL=1`.
 pub fn are_experimental_features_enabled() -> bool {
-    std::env::var("CYRUP_EXPERIMENTAL")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-        || std::env::var("PI_EXPERIMENTAL")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+    are_experimental_features_enabled_from(&|k| std::env::var(k).ok())
+}
+
+/// [`are_experimental_features_enabled`] over an injected lookup.
+///
+/// The gate is strict-`"1"` under EITHER name, and that is what a caller wants to pin: proving it
+/// by exporting `CYRUP_EXPERIMENTAL` means mutating the process environment, which races every
+/// concurrent reader in the same binary — not just readers of these two keys, because `set_var` can
+/// reallocate the whole `environ` array under a concurrent `getenv` for any key at all.
+#[must_use]
+pub fn are_experimental_features_enabled_from(get: &dyn Fn(&str) -> Option<String>) -> bool {
+    get("CYRUP_EXPERIMENTAL").is_some_and(|v| v == "1")
+        || get("PI_EXPERIMENTAL").is_some_and(|v| v == "1")
 }
 
 /// Port of `shouldRunFirstTimeSetup` (startup-ui.ts:115-133): official distribution AND experimental

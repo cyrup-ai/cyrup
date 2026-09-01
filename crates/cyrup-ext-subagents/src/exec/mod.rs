@@ -50,6 +50,8 @@ pub mod tool_call_summary;
 pub mod tool_budget;
 pub mod turn_budget;
 pub mod capability_ceiling;
+/// SUBA-078 — the `subagents.maxThinking` reasoning-level ceiling.
+pub mod thinking_ceiling;
 pub mod permissions;
 pub mod usage_budget;
 pub mod spawn_budget;
@@ -315,6 +317,51 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         let error =
             "no candidate model available for this subagent run (empty fallback ladder)".to_string();
         return pre_spawn_failure(agent, task, error);
+    }
+
+    // Step 2b (SUBA-078) — the `subagents.maxThinking` ceiling, folded once and then asserted over
+    // the WHOLE ladder (pi `execution.ts:1711-1714` then `:1845-1851` @v0.57.0).
+    //
+    // Folding intersects the discovered/caller ceiling with whatever THIS process inherited through
+    // `CYRUP_SUBAGENT_THINKING_CEILING`, taking the lowest — which is what makes the bound monotonic
+    // as the tree deepens. It is also how the detached hop-2 runner gets its ceiling at all: that
+    // path re-reads no settings and passes `RunOptions::thinking_ceiling = None`, so the env is its
+    // only source.
+    //
+    // The assertion sweeps EVERY candidate before the ladder starts and refuses the whole run if
+    // any one exceeds — upstream's shape, and deliberately NOT the per-attempt skip or the
+    // warn-only treatment `model_scope` gives an out-of-scope fallback (`exec/model_scope.rs`). A
+    // ceiling has no warn tier: silently running a shallower model, or silently dropping the rung
+    // the operator's bound excluded, would both hide the misconfiguration.
+    // Fail-CLOSED on BOTH steps: a malformed inherited ceiling, and an unrankable level in the
+    // fold itself, are each an error rather than "unbounded".
+    let folded = crate::exec::thinking_ceiling::inherited_thinking_ceiling().and_then(|inherited| {
+        crate::exec::thinking_ceiling::intersect_thinking_ceilings(&[
+            opts.thinking_ceiling.as_deref(),
+            inherited.as_deref(),
+        ])
+    });
+    let thinking_ceiling = match folded {
+        Ok(ceiling) => ceiling,
+        Err(error) => return pre_spawn_failure(agent, task, error),
+    };
+    if let Some(ceiling) = thinking_ceiling.as_deref() {
+        for candidate in &candidates {
+            let model_arg = crate::exec::spawn_plan::apply_thinking_suffix(
+                Some(candidate.as_str()),
+                agent.thinking.as_deref(),
+                false,
+            );
+            if let Err(error) = crate::exec::thinking_ceiling::assert_thinking_within_ceiling(
+                model_arg.as_deref(),
+                agent.thinking.as_deref(),
+                Some(ceiling),
+                Some(agent.name.as_str()),
+                opts.run_id.as_ref().map(crate::background::RunId::as_str),
+            ) {
+                return pre_spawn_failure(agent, task, error);
+            }
+        }
     }
 
     let setup = match prepare_ladder(agent, task, opts).await {
@@ -1694,6 +1741,112 @@ mod tests {
         assert!(result.attempted_models.is_empty());
     }
 
+
+    // ---- SUBA-078: the maxThinking ceiling refuses the RUN, before any child spawns ----
+
+    /// pi `execution.ts:1845-1851` @v0.57.0. A level above the ceiling REFUSES — it is not clamped
+    /// to the ceiling and the run is not attempted at a lower level, because silently running
+    /// shallower than the agent asked would hide the misconfiguration.
+    #[tokio::test]
+    async fn a_thinking_level_above_the_ceiling_refuses_the_run_before_any_spawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.thinking = Some("xhigh".to_string());
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.thinking_ceiling = Some("low".to_string());
+
+        let result = run_sync(&agent, "do something", &opts).await;
+        assert_eq!(result.exit_code, 1);
+        assert!(
+            result.attempted_models.is_empty(),
+            "the refusal must precede the ladder — no model may be attempted: {result:?}"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("Thinking level 'xhigh' exceeds configured maximum 'low'")
+                && error.contains("for agent 'worker'"),
+            "pi's verbatim message, naming the agent: {error}"
+        );
+    }
+
+    /// The sweep covers the WHOLE ladder, not just the primary: a fallback rung that would exceed
+    /// refuses the entire run rather than being skipped. Deliberately unlike `model_scope`, which
+    /// only WARNS for an out-of-scope fallback (`exec/model_scope.rs`) — a ceiling has no warn tier.
+    #[tokio::test]
+    async fn a_fallback_candidate_above_the_ceiling_refuses_the_whole_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The PRIMARY is clean; only the fallback carries a level above the bound.
+        let agent = sample_agent_config("m1", &["m2:xhigh"]);
+        let mut opts = base_opts(dir.path(), &["m1", "m2:xhigh"]);
+        opts.thinking_ceiling = Some("low".to_string());
+
+        let result = run_sync(&agent, "do something", &opts).await;
+        assert_eq!(result.exit_code, 1);
+        assert!(
+            result.attempted_models.is_empty(),
+            "an offending FALLBACK must refuse before the ladder starts, not be skipped: {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("exceeds configured maximum 'low'"),
+            "{result:?}"
+        );
+    }
+
+    /// SUBA-078 rework: an unrankable ceiling REFUSES the run rather than running it unbounded.
+    ///
+    /// `RunOptions::thinking_ceiling` is a public `Option<String>` on a public module, so an
+    /// embedder can set a level this crate cannot rank. Before the fix the fold silently dropped
+    /// it, the assert saw no ceiling, and the run proceeded with no bound at all — a configured
+    /// ceiling vanishing without a word, which is the one outcome the whole module exists to
+    /// prevent.
+    #[tokio::test]
+    async fn an_unrankable_ceiling_refuses_the_run_rather_than_running_it_unbounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.thinking = Some("xhigh".to_string());
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.thinking_ceiling = Some("garbage".to_string());
+
+        let result = run_sync(&agent, "do something", &opts).await;
+        assert_eq!(result.exit_code, 1);
+        assert!(
+            result.attempted_models.is_empty(),
+            "an unusable bound must refuse before the ladder, not be ignored: {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Invalid thinking level comparison;"),
+            "{result:?}"
+        );
+    }
+
+    /// Fail-CLOSED at the run seam too: an unreadable inherited ceiling refuses rather than
+    /// degrading to "unbounded".
+    #[tokio::test]
+    async fn a_ceiling_at_or_below_the_bound_does_not_refuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.thinking = Some("low".to_string());
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.thinking_ceiling = Some("low".to_string());
+
+        let result = run_sync(&agent, "do something", &opts).await;
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("exceeds configured maximum"),
+            "a level AT the ceiling is within it: {result:?}"
+        );
+    }
 
     // ---- plan_batch: eager whole-batch fork-context resolution (R-SA-137) ----
 

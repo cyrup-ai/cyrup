@@ -17,7 +17,6 @@ use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::{
     builtin_agents_dir, enumerate_installed_packages, unreachable_session_manager,
 };
-use crate::paths::home_dir;
 
 impl SubagentExecutor {
 
@@ -53,8 +52,11 @@ impl SubagentExecutor {
     /// layering — cyrup-config's DI-11 trust decision has no injection point into this extension
     /// today, so this crate never silently trusts a project's installed packages). Global-scope
     /// packages are always enumerated (trust-independent, matching `cyrup-resources`' own gate).
-    pub(crate) fn discovery_dirs_config(cwd: &Path) -> Result<AgentDiscoveryConfig, SubagentError> {
-        let home = home_dir();
+    pub(crate) fn discovery_dirs_config(
+        cwd: &Path,
+        roots: &crate::paths::Roots,
+    ) -> Result<AgentDiscoveryConfig, SubagentError> {
+        let home = roots.home().to_path_buf();
         let global_dir = home.join(".cyrup");
         // Upward project-root search — pi `findConfiguredProjectRoot` (`agents.ts:657-672`), which is
         // what `resolveNearestProjectAgentDirs`/`resolveNearestProjectChainDirs`/
@@ -108,9 +110,16 @@ impl SubagentExecutor {
     /// exists but cannot be read, does not parse, is not a JSON object, or carries a malformed
     /// `subagents.*` field — the malformed-settings MUST-abort contract this crate's discovery
     /// callers rely on.
-    pub(crate) fn discovery_config(cwd: &Path) -> Result<AgentDiscoveryConfig, SubagentError> {
-        let mut cfg = Self::discovery_dirs_config(cwd)?;
-        let user_settings = home_dir().join(".cyrup").join("agents").join("settings.json");
+    pub(crate) fn discovery_config(
+        cwd: &Path,
+        roots: &crate::paths::Roots,
+    ) -> Result<AgentDiscoveryConfig, SubagentError> {
+        let mut cfg = Self::discovery_dirs_config(cwd, roots)?;
+        let user_settings = roots
+            .home()
+            .join(".cyrup")
+            .join("agents")
+            .join("settings.json");
         // pi `getProjectAgentSettingsPath` (`agents.ts:678-681`) keys the project settings file on
         // `findConfiguredProjectRoot(cwd)` — the SAME root the project agent/chain dirs came from —
         // not on the bare cwd. Keying it on `cwd` meant a session started in a subdirectory read a
@@ -143,8 +152,9 @@ impl SubagentExecutor {
         cwd: &Path,
         name: &str,
         scope: AgentReadScope,
+        roots: &crate::paths::Roots,
     ) -> Result<AgentDefinition, SubagentError> {
-        self.resolve_agent_with_model_scope(cwd, name, scope).map(|(agent, _)| agent)
+        self.resolve_agent_with_model_scope(cwd, name, scope, roots).map(|(agent, _, _)| agent)
     }
 
     /// [`Self::resolve_agent`] plus the effective `subagents.modelScope` policy this cwd's settings
@@ -159,15 +169,22 @@ impl SubagentExecutor {
     /// Same as [`Self::resolve_agent`]: [`SubagentError::AgentNotFound`], or a discovery-time
     /// [`SubagentError::MalformedSettings`] — which now also covers a malformed `modelScope` block
     /// (R-SA-009's MUST-abort, rather than silently ignoring an unenforceable policy).
+    /// SUBA-078: also returns the effective `subagents.maxThinking` ceiling, which travels on the
+    /// SAME discovery result and is needed at the same seam. Deliberately returned here rather than
+    /// stamped onto the [`AgentDefinition`] (which is upstream's mechanism): a value that never
+    /// appears on the agent struct cannot be authored in frontmatter by an agent raising its own
+    /// ceiling, and cannot be round-tripped into an agent file by the management serializer.
     pub fn resolve_agent_with_model_scope(
         &self,
         cwd: &Path,
         name: &str,
         scope: AgentReadScope,
-    ) -> Result<(AgentDefinition, Option<ModelScopeConfig>), SubagentError> {
-        let cfg = Self::discovery_config(cwd)?;
+        roots: &crate::paths::Roots,
+    ) -> Result<(AgentDefinition, Option<ModelScopeConfig>, Option<String>), SubagentError> {
+        let cfg = Self::discovery_config(cwd, roots)?;
         let result = discover_agents(&cfg, Some(scope))?;
         let model_scope = result.model_scope.clone();
+        let max_thinking = result.max_thinking.clone();
         // pi v0.43.0 routes EVERY execution-path agent lookup through `resolveAgentName`
         // (`subagent-executor.ts:1675-1680`'s `canonicalizeAgentName`, `preflight.ts:228`), so the
         // requested string may be an alias. It is name-first — a real agent named `x` always beats
@@ -184,7 +201,7 @@ impl SubagentExecutor {
                 return Err(SubagentError::AgentNotFound(name.to_string()));
             }
         };
-        Ok((agent, model_scope))
+        Ok((agent, model_scope, max_thinking))
     }
 
     /// The effective `subagents.modelScope` policy for `cwd` on its own (SUBA-003), without
@@ -200,8 +217,11 @@ impl SubagentExecutor {
     /// Propagates [`SubagentError::MalformedSettings`] (R-SA-009) when either scope's settings file
     /// is unreadable/unparseable or carries a malformed `subagents.*` field — including a malformed
     /// `modelScope` block, which MUST abort rather than degrade to unenforced.
-    pub fn resolve_model_scope(cwd: &Path) -> Result<Option<ModelScopeConfig>, SubagentError> {
-        Ok(Self::discovery_config(cwd)?.override_settings.model_scope())
+    pub fn resolve_model_scope(
+        cwd: &Path,
+        roots: &crate::paths::Roots,
+    ) -> Result<Option<ModelScopeConfig>, SubagentError> {
+        Ok(Self::discovery_config(cwd, roots)?.override_settings.model_scope())
     }
 
     /// Plan-time persona map (T0.1's C13 root-cause seam): resolve every DISTINCT agent named across
@@ -233,13 +253,14 @@ impl SubagentExecutor {
         cwd: &Path,
         agent_names: impl IntoIterator<Item = String>,
         scope: AgentReadScope,
+        roots: &crate::paths::Roots,
     ) -> Result<BTreeMap<String, ResolvedAgentPersona>, SubagentError> {
         let mut personas: BTreeMap<String, ResolvedAgentPersona> = BTreeMap::new();
         for name in agent_names {
             if personas.contains_key(&name) {
                 continue;
             }
-            let agent = self.resolve_agent(cwd, &name, scope)?;
+            let agent = self.resolve_agent(cwd, &name, scope, roots)?;
             personas.insert(name, crate::exec::resolve_step_agent_config(&agent));
         }
         Ok(personas)
@@ -263,8 +284,12 @@ impl SubagentExecutor {
     /// silently pick the WRONG session when a cwd has multiple sessions. The heuristic remains ONLY
     /// as the fallback for `None` (no host handle — the SDK-embedder / headless path), and for the
     /// (rare) case where the supplied session file cannot be opened.
-    pub(crate) fn fork_resolver(cwd: &Path, session_file: Option<&Path>) -> ForkContextResolver {
-        let sessions_root = home_dir().join(".cyrup").join("sessions");
+    pub(crate) fn fork_resolver(
+        cwd: &Path,
+        session_file: Option<&Path>,
+        roots: &crate::paths::Roots,
+    ) -> ForkContextResolver {
+        let sessions_root = roots.home().join(".cyrup").join("sessions");
         let layout = cyrup_session::SessionLayout::new(sessions_root.clone(), cwd.to_path_buf());
         // Blocker #4: prefer the real live-orchestrator session file (P-1) over the mtime heuristic.
         if let Some(path) = session_file
@@ -307,6 +332,20 @@ impl SubagentExecutor {
         ForkContextResolver::new(Arc::new(AsyncMutex::new(manager)), layout)
     }
 
+    /// SUBA-079 / pi `canPreferFork(ctx.sessionManager)` (`shared/fork-context.ts:88` @v0.57.0):
+    /// may an IMPLICIT `defaultContext: fork` cut a branch right now?
+    ///
+    /// Opens the parent session to read its leaf, exactly as [`Self::fork_resolver`]'s own consumer
+    /// does moments later. Consulted ONLY when the call site named no explicit context, so the
+    /// extra open happens only on launches where an implicit fork is genuinely in play.
+    pub(crate) async fn can_prefer_fork(&self, cwd: &Path) -> bool {
+        let session_file = self.host_services().and_then(|s| s.session_file());
+        let roots = self.config_snapshot().await.roots;
+        Self::fork_resolver(cwd, session_file.as_deref(), &roots)
+            .can_prefer_fork()
+            .await
+    }
+
     /// Resolve one task's requested [`ContextMode`] into a concrete [`ForkContext`] (R-SA-137,
     /// fail-hard per DI-SA-2 — never silently downgrades to `Fresh`).
     ///
@@ -328,7 +367,8 @@ impl SubagentExecutor {
     ) -> Result<ForkContext, SubagentError> {
         // Blocker #4: branch from the REAL live-orchestrator session file (P-1), not the mtime guess.
         let session_file = self.host_services().and_then(|s| s.session_file());
-        let resolver = Self::fork_resolver(cwd, session_file.as_deref());
+        let roots = self.config_snapshot().await.roots;
+        let resolver = Self::fork_resolver(cwd, session_file.as_deref(), &roots);
         resolver.resolve(requested, 0, force_thinking_off).await
     }
 }
@@ -339,7 +379,33 @@ mod tests {
 
     use super::*;
     use crate::extension::testsupport::seed_scope_fixture;
+    use crate::fork_context::ContextRequest;
     use cyrup_core::ModelId;
+
+    /// SUBA-079: the executor-level wiring of pi `canPreferFork`. A cwd with no session at all
+    /// cannot host a branch, so an INHERITED `defaultContext: fork` must resolve to `Fresh` and the
+    /// launch must proceed — the headline behaviour of this item, which used to abort instead.
+    #[tokio::test]
+    async fn can_prefer_fork_is_false_when_there_is_no_persisted_parent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        assert!(
+            !executor.can_prefer_fork(dir.path()).await,
+            "no session file and no leaf => no branch can be cut"
+        );
+        // ...and that is exactly what downgrades the inherited preference.
+        assert_eq!(
+            crate::fork_context::resolve_effective_context(
+                Option::None,
+                "worker",
+                Some(ContextMode::Fork),
+                Option::None,
+                executor.can_prefer_fork(dir.path()).await,
+            )
+            .expect("an inherited preference never errors"),
+            ContextMode::Fresh
+        );
+    }
 
     // -----------------------------------------------------------------------------------------
     // G97 — alias resolution on the LIVE execution path
@@ -362,14 +428,14 @@ mod tests {
             ("develop", "worker"),
         ] {
             let agent = executor
-                .resolve_agent(dir.path(), alias, AgentReadScope::Both)
+                .resolve_agent(dir.path(), alias, AgentReadScope::Both, &crate::paths::Roots::from_env())
                 .unwrap_or_else(|e| panic!("alias {alias:?} must resolve: {e}"));
             assert_eq!(agent.name, canonical, "alias {alias:?} resolved to the wrong agent");
         }
         // The canonical names still resolve to themselves.
         assert_eq!(
             executor
-                .resolve_agent(dir.path(), "oracle", AgentReadScope::Both)
+                .resolve_agent(dir.path(), "oracle", AgentReadScope::Both, &crate::paths::Roots::from_env())
                 .expect("oracle resolves")
                 .name,
             "oracle"
@@ -399,14 +465,14 @@ mod tests {
         // the fixtures failing to be discovered at all.
         assert_eq!(
             executor
-                .resolve_agent(dir.path(), "seer", AgentReadScope::Both)
+                .resolve_agent(dir.path(), "seer", AgentReadScope::Both, &crate::paths::Roots::from_env())
                 .expect("seer resolves by name")
                 .name,
             "seer"
         );
 
         let err = executor
-            .resolve_agent(dir.path(), "prophet", AgentReadScope::Both)
+            .resolve_agent(dir.path(), "prophet", AgentReadScope::Both, &crate::paths::Roots::from_env())
             .expect_err("an ambiguous alias must refuse");
         assert_eq!(err.to_string(), "Ambiguous agent alias 'prophet': augur, seer");
         assert!(
@@ -420,7 +486,7 @@ mod tests {
         let executor = SubagentExecutor::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
-            .resolve_agent(dir.path(), "no-such-agent", AgentReadScope::Both)
+            .resolve_agent(dir.path(), "no-such-agent", AgentReadScope::Both, &crate::paths::Roots::from_env())
             .expect_err("unknown agent must error");
         assert!(matches!(err, SubagentError::AgentNotFound(_)));
     }
@@ -443,7 +509,7 @@ mod tests {
                 dir.path(),
                 "scoped",
                 "t",
-                Some(ContextMode::Fresh),
+                Some(ContextRequest::Fresh),
                 Some(ModelId::from("openai/gpt-5-nano:max")),
                 None,
             )
@@ -458,7 +524,7 @@ mod tests {
 
         // The mirror case is asserted at the decision boundary rather than through `run_foreground`,
         // because an ALLOWED model proceeds to a real subprocess spawn (this crate never fakes that).
-        let scope = SubagentExecutor::resolve_model_scope(dir.path())
+        let scope = SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env())
             .expect("settings parse")
             .expect("a modelScope block is configured");
         let mut available = Vec::new();
@@ -484,7 +550,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         seed_scope_fixture(dir.path(), "scoped", None);
         assert_eq!(
-            SubagentExecutor::resolve_model_scope(dir.path()).expect("settings parse"),
+            SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env()).expect("settings parse"),
             None,
             "no settings block means no policy — enforcement stays off"
         );
@@ -541,7 +607,7 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             seed_scope_fixture(dir.path(), "scoped", Some(json));
-            let err = SubagentExecutor::resolve_model_scope(dir.path())
+            let err = SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env())
                 .expect_err(&format!("{label} must abort, not silently disarm the policy"));
             assert!(
                 matches!(err, SubagentError::MalformedSettings(_)),
@@ -560,7 +626,7 @@ mod tests {
             "scoped",
             Some(r#"{"subagents":{"modelScope":{"enforce":true,"allow":["  anthropic/*  "]}}}"#),
         );
-        let scope = SubagentExecutor::resolve_model_scope(dir.path())
+        let scope = SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env())
             .expect("settings parse")
             .expect("the configured block must be read, not dropped");
         assert_eq!(scope.enforce, Some(true));

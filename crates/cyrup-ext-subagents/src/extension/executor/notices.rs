@@ -8,7 +8,7 @@ use cyrup_core::CancelToken;
 
 use crate::background::RunId;
 use crate::extension::executor::SubagentExecutor;
-use crate::extension::executor::paths::{default_async_root, default_results_dir};
+use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
 use crate::extension::tool::mission::MissionSyncCompletionObserver;
 
 /// One live foreground run's control surface (pi `SubagentState.foregroundControls`'s per-entry
@@ -382,7 +382,8 @@ impl SubagentExecutor {
     /// create the results dir or attach the watch degrades to "no completion notifications this
     /// session" rather than failing session start.
     pub async fn install_completion_watcher(&self, cwd: &Path) {
-        let results_dir = default_results_dir(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let results_dir = default_results_dir_in(&roots, cwd);
         if crate::background::ensure_accessible_dir(&results_dir).await.is_err() {
             return;
         }
@@ -400,7 +401,7 @@ impl SubagentExecutor {
                 // observed — including in a LATER process than the one that launched it, which is
                 // the whole reason the binding file exists.
                 Arc::new(MissionSyncCompletionObserver {
-                    async_root: default_async_root(cwd),
+                    async_root: default_async_root_in(&roots, cwd),
                 }),
                 // SUBA-034: the wake-up every in-flight `wait` is selecting on.
                 Arc::new(self.completion_bus.clone()),

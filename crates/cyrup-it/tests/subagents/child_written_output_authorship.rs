@@ -23,9 +23,9 @@
 //! (the same run, with the report delivered through the child's own successful `write` call,
 //! reaches `attested`).
 //!
-//! Separate compilation unit from `lib.rs`, so NOT bound by that crate's `#![forbid(unsafe_code)]`;
-//! the `unsafe` env mutation (Rust 2024 requires it for `std::env::set_var`/`remove_var`) is scoped
-//! and serialized under [`ENV_MUTATION_LOCK`], exactly like every other integration test here.
+//! Mutates no process environment: the fixture binary and its script are named per-run through
+//! `RunOptions::spawn_command`, so this file needs no `unsafe` and no lock. Every file in this
+//! `--test` target shares ONE process, so a global set here would be a global set for all of them.
 //!
 //! Gated on `test-fixtures` (the `cyrup-subagent-fixture` `[[bin]]`'s own `required-features`
 //! gate): without it the fixture is never built and this file compiles to an empty, passing test
@@ -41,10 +41,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::AcceptanceStatus;
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
@@ -52,10 +52,7 @@ use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult, run_sync}
 use cyrup_ext_subagents::fork_context::ForkContext;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 /// The artifact the child authors: prose plus the fenced `acceptance-report` block the inferred
 /// `attested` contract asks for.
@@ -109,8 +106,13 @@ fn agent_config(name: &str) -> AgentConfig {
 /// therefore genuinely requires an `acceptance-report` block from somewhere.
 fn run_options(cwd: &Path, output_path: &Path) -> RunOptions {
     RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
+        // SUBA-078: this fixture exercises no reasoning ceiling — `None` is "no ceiling
+        // configured, so the bound is off", matching `runner_main.rs`'s own hop-2 default.
+        thinking_ceiling: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -204,30 +206,25 @@ async fn run_fixture(dir: &Path, output_path: &Path, lines: Vec<String>) -> Sing
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
     let fixture = fixture_binary_path();
 
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc. Every caller
-    // holds `ENV_MUTATION_LOCK` for the whole call.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
+    // This run names its own binary and script rather than moving process-global state that
+    // every concurrently-running test in this binary shares. `base_args` reaches the child's argv
+    // and, via `CYRUP_SUBAGENT_BINARY_ARGS`, any grandchild that re-execs.
+    let mut opts = run_options(dir, output_path);
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture,
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
 
-    let result = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(20),
         run_sync(
             &agent_config("researcher"),
             "Investigate the flake and report what you find",
-            &run_options(dir, output_path),
+            &opts,
         ),
     )
     .await
-    .expect("run_sync must not hang against a fast, well-behaved fixture child");
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
-    result
+    .expect("run_sync must not hang against a fast, well-behaved fixture child")
 }
 
 /// Negative control: the same receipt prose, with NO write call in the transcript, has no
@@ -235,7 +232,6 @@ async fn run_fixture(dir: &Path, output_path: &Path, lines: Vec<String>) -> Sing
 /// below would pass even if the gate simply stopped requiring a report.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_receipt_with_no_child_write_has_no_report_and_is_rejected() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let output_path = dir.path().join("review.md");
 
@@ -263,7 +259,6 @@ async fn a_receipt_with_no_child_write_has_no_report_and_is_rejected() {
 /// which is exactly what `extractChildWrittenOutput` does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_report_inside_the_childs_own_successful_write_satisfies_the_gate() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let output_path = dir.path().join("review.md");
 
@@ -296,7 +291,6 @@ async fn the_report_inside_the_childs_own_successful_write_satisfies_the_gate() 
 /// with `isError: true` on the result — the one bit that differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_write_result_does_not_supply_the_report() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let output_path = dir.path().join("review.md");
 
@@ -327,7 +321,6 @@ async fn a_failed_write_result_does_not_supply_the_report() {
 /// comparison is what keeps a child's unrelated scratch file out of the acceptance evidence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_to_another_path_does_not_supply_the_report() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
     let output_path = dir.path().join("review.md");
     let other_path = dir.path().join("scratch.md");

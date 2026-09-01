@@ -43,16 +43,12 @@ use std::time::{Duration, Instant};
 
 use cyrup_core::{CancelToken, Tool, ToolCallId};
 use cyrup_ext::host::HostServices;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 
-/// Serializes every test in this file — all of them mutate process-global env
-/// (`CYRUP_SUBAGENT_BINARY`, `CYRUP_SUBAGENT_FIXTURE_SCRIPT`, `CYRUP_HOME`), exactly like every
-/// sibling integration test here. A tokio mutex so the guard can be held across `.await`.
-static ENV_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 /// pi `SUBAGENT_CONTROL_MESSAGE_TYPE` (`extension/control-notices.ts:5`).
 const CONTROL_NOTICE_CUSTOM_TYPE: &str = "subagent_control_notice";
@@ -212,18 +208,29 @@ async fn run_single_with_control_and_debounce(
     std::fs::write(&script_path, idle_then_answer_script().to_string()).expect("write script");
 
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one call (Rust 2024
-    // requires `unsafe` for `set_var`; this integration file is a separate compilation unit from
-    // the crate's `#![forbid(unsafe_code)]` lib, exactly like every sibling test).
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-        std::env::set_var("CYRUP_HOME", home_dir.path());
-    }
 
     let services = Arc::new(RecordingHostServices::default());
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        // SUBA-083: asserts the notice pipeline's real attention event (agent/reason), which only a
+        // settled foreground run emits (pi `config.ts:222-224`).
+        //
+        // This call names its own binary, script and home root instead of moving three
+        // process-global vars that every concurrently-running test in this binary shares.
+        // `async_by_default: false` keeps the run in the FOREGROUND, which is the path
+        // `spawn_command` reaches — a detached child would re-resolve its own binary from the
+        // environment and this injection would be inert.
+        SubagentExtensionConfig {
+            async_by_default: false,
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
+            }),
+            roots: Roots::sandboxed(home_dir.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
     );
     // The P-1 binding + the SessionStart anchor capture, in the order production performs them.
@@ -253,13 +260,6 @@ async fn run_single_with_control_and_debounce(
 
     // The sink's injection is fire-and-forget through `spawn_blocking`; give it a bounded window.
     let notices = services.await_control_notice(Duration::from_secs(2)).await;
-
-    // SAFETY: scoped cleanup under the same held env lock.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     let result = result.expect("the run must COMPLETE, not be refused at dispatch");
     Outcome {
@@ -310,7 +310,6 @@ fn control_events(details: &serde_json::Value) -> Vec<serde_json::Value> {
 ///   `None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_single_call_carrying_control_fires_the_real_notice_pipeline() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let outcome =
         run_single_with_control(Some(serde_json::json!({ "needsAttentionAfterMs": 1 }))).await;
@@ -379,7 +378,6 @@ async fn a_single_call_carrying_control_fires_the_real_notice_pipeline() {
 /// thing that can turn the notice on is the per-call override actually taking effect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_same_run_without_control_raises_nothing_and_injects_nothing() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let outcome = run_single_with_control(None).await;
 
@@ -405,7 +403,6 @@ async fn the_same_run_without_control_raises_nothing_and_injects_nothing() {
 /// still produced a transcript notice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_channels_without_event_raises_the_event_but_delivers_no_transcript_notice() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let outcome = run_single_with_control(Some(serde_json::json!({
         "needsAttentionAfterMs": 1,
@@ -436,7 +433,6 @@ async fn notify_channels_without_event_raises_the_event_but_delivers_no_transcri
 /// than `notifyChannels` and the two must not be conflated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_on_without_needs_attention_suppresses_the_raise_itself() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let outcome = run_single_with_control(Some(serde_json::json!({
         "needsAttentionAfterMs": 1,
@@ -488,7 +484,6 @@ async fn notify_on_without_needs_attention_suppresses_the_raise_itself() {
 /// `live_runs`. Deterministic loss is a behaviour; a race is a bug.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_notice_still_debouncing_when_the_child_exits_is_dropped_exactly_as_pi_drops_it() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let outcome = run_single_with_control_and_debounce(
         Some(serde_json::json!({ "needsAttentionAfterMs": 1 })),
@@ -517,7 +512,6 @@ async fn a_notice_still_debouncing_when_the_child_exits_is_dropped_exactly_as_pi
 /// `ResolvedControlConfig.enabled`, checked at the top of every raise path).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_enabled_false_disables_every_raise_path_for_the_run() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let outcome = run_single_with_control(Some(serde_json::json!({
         "enabled": false,

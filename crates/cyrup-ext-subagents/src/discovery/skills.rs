@@ -97,13 +97,14 @@ struct SkillDiscoveryDirs {
 }
 
 impl SkillDiscoveryDirs {
-    /// Production roots, derived from `CYRUP_HOME`/`HOME` exactly like `extension.rs::dirs_home`
-    /// (kept as this module's own small copy per the crate's per-module-private-helper convention).
+    /// Production roots, derived from the crate's home ladder ([`crate::paths::home_dir`]).
+    ///
+    /// This was a byte-identical private copy of that ladder, justified as a
+    /// per-module-private-helper; the copy has been removed so the two cannot drift. Its previous
+    /// doc pointed at `extension.rs::dirs_home` — a function that no longer exists anywhere in the
+    /// crate.
     fn from_env() -> Self {
-        let home = std::env::var_os("CYRUP_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-            .unwrap_or_else(std::env::temp_dir);
+        let home = crate::paths::home_dir();
         Self {
             global_dir: home.join(".cyrup"),
             user_agents_dir: Some(home.join(".agents")),

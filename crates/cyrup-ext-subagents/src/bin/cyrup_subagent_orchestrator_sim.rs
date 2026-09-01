@@ -65,6 +65,35 @@
 //! path; runner mode reads it and reassigns `CYRUP_SUBAGENT_BINARY` to that value before calling
 //! [`run`], so the step's own child spawn resolves to the real fixture, not back to this binary.
 
+// Exempt from the workspace `clippy.toml` `disallowed-methods` guard, and deliberately not
+// converted.
+//
+// This binary re-execs ITSELF across two hops (orchestrator -> detached runner -> that runner's own
+// per-step children), and each hop re-derives its command through `resolve_spawn_command` from the
+// environment it inherited. Seeding that environment once, here, is what makes the chain work: an
+// in-process hand-down reaches the hop it is given to and not the one after it.
+//
+// The conversion was attempted (`run_with` in runner mode, `spawn_detached_runner_with_command`
+// plus `CYRUP_SUBAGENT_BINARY` on the child's `env_overlay` for the detached hop) and reverted. Be
+// precise about why, because the first reading was wrong: `background_spawn_detached_integration`
+// failed during those trials, but that suite is LOAD-SENSITIVE — it polls real detached pids — and
+// the reverted code failed the same way once under the same background CPU contention, then passed
+// 8/8 when the machine was quiet. The trials therefore do NOT show the conversion regressed
+// anything, and no causal claim should be read into them.
+//
+// It stays unconverted on the merits instead: it is a `test-fixtures`-gated fixture rather than
+// shipped code, and threading a value through a self-re-exec chain buys no safety while adding a
+// failure mode at the hop it cannot reach.
+//
+// The soundness argument, corrected. This block used to claim the mutation was "single-threaded,
+// before any tokio or spawn work begins, so no concurrent reader exists" while `main` was a bare
+// `#[tokio::main]` — a MULTI-THREAD runtime whose workers exist before the future is polled. The
+// claim was false as written. It is true now because the runtime is pinned to `current_thread`
+// (see `main`), which spawns no workers: the mutation runs on the only thread in the process.
+// That is the THREAD criterion, which is the one that matters — `set_var` races any concurrent
+// `getenv` for any key, so "it is its own binary" would never have been sufficient here.
+#![allow(clippy::disallowed_methods)]
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -73,7 +102,15 @@ use cyrup_ext_subagents::background::runner_main::run;
 
 const SUBAGENT_RUNNER_SUBCOMMAND: &str = "__subagent-runner";
 
-#[tokio::main]
+// A CURRENT-THREAD runtime, and that is load-bearing rather than a style choice.
+//
+// Both `set_var` calls below carry a SAFETY note claiming no other thread exists yet. Under a bare
+// `#[tokio::main]` that claim was FALSE: the default flavor is multi-thread, and its worker threads
+// are spawned before the future is ever polled, so several threads were already running when the
+// mutation happened. `current_thread` spawns none, which makes the claim true instead of merely
+// written. Neither mode needs the extra threads — `run_runner_mode` awaits a single `run(...)` to
+// completion and `run_orchestrator_mode` is synchronous.
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -90,9 +127,15 @@ async fn run_runner_mode(args: &[String]) {
     // Relay CYRUP_SUBAGENT_STEP_BINARY (the real scripted-fixture path, set by the calling test)
     // into CYRUP_SUBAGENT_BINARY (what `resolve_spawn_command` inside `run()`'s own per-step
     // child spawn actually reads) — see this file's module doc for why this avoids a
-    // self-reference loop. SAFETY: single-threaded at this point (before any spawn/tokio work in
-    // this process begins), no concurrent readers of this env var exist yet.
+    // self-reference loop.
     if let Ok(step_binary) = std::env::var("CYRUP_SUBAGENT_STEP_BINARY") {
+        // SAFETY: the criterion is the THREAD, and it covers ANY key. `set_var` races any
+        // concurrent `getenv` in the process, so "no other reader of THIS variable" would not be
+        // sufficient even if it were true. What makes this sound is that `main` is pinned to
+        // `#[tokio::main(flavor = "current_thread")]`, which spawns NO worker threads — the
+        // runtime is already constructed and this future is already being polled, so "before any
+        // tokio work begins" would be false; the point is that the only thread in the process is
+        // this one, and nothing has been spawned off it yet.
         unsafe {
             std::env::set_var("CYRUP_SUBAGENT_BINARY", step_binary);
         }
@@ -162,9 +205,11 @@ fn run_orchestrator_mode(args: &[String]) {
 
     // Point CYRUP_SUBAGENT_BINARY at THIS binary's own resolved path so the detached child this
     // process spawns re-execs itself and lands in runner mode above — see this file's module doc
-    // for why a real `cyrup` binary cannot be used here. SAFETY: single-threaded at this point
-    // (before any spawn/tokio work begins), no concurrent readers of this env var exist yet.
+    // for why a real `cyrup` binary cannot be used here.
     if let Ok(self_path) = std::env::current_exe() {
+        // SAFETY: as in `run_runner_mode` — the criterion is the THREAD and it covers ANY key, and
+        // what satisfies it is `#[tokio::main(flavor = "current_thread")]` spawning no workers.
+        // This arm is a synchronous `fn`, so the mutation also precedes the only spawn it makes.
         unsafe {
             std::env::set_var("CYRUP_SUBAGENT_BINARY", self_path);
         }

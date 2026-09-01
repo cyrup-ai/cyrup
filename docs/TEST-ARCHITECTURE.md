@@ -547,6 +547,25 @@ or benchmark code"*, so it would break the 224 files moving into `src/`. Zero fi
 keep it that way.
 
 ### R2 — No `std::env::set_var` / `remove_var` in test code.
+>
+> **DELIVERED, with one correction to the plan below.** Tiers 1 and 2 absorbed every case; **tier 3
+> was never built and is not needed.** Its premise — that some tests are irreducible and need a
+> shared `unsafe` guard in `cyrup-test-support` — did not survive contact: every candidate,
+> including the ones whose variables genuinely ARE the mechanism under test, reduced to tier 1 or 2
+> once the crate's existing injectable seams were used rather than assumed absent. Scrubbing an
+> ambient variable, which looked like the irreducible case, is just `None` from an injected lookup.
+> **Both `#![forbid(unsafe_code)]` declarations stand unchanged.**
+>
+> What replaced tier 3 is a `clippy.toml` `disallowed-methods` guard whose reasons name the seams
+> that exist (`SubagentExtensionConfig::{spawn_command, home_root, env_overrides}`,
+> `RunOptions::{spawn_command, child_env}`, `RunnerOverrides`, `paths::Roots`, `env_overlay`), plus
+> four written exemptions. Those four are not debt: each proves the thin env-READING wrapper is
+> wired to the right variable NAME, or needs real inheritance, which no injected test can cover.
+> Total injection everywhere would leave the env-reading layer itself untested.
+>
+> The nextest `env-mutating` group is retained but **attached to nothing**: no multi-test binary
+> mutates the environment any more. Detaching it from `binary(subagents)` cut that suite from
+> **61.8s to 15.9s**.
 
 `set_var`/`remove_var` became `unsafe` in edition 2024 (Rust 1.85.0;
 [edition-guide](https://doc.rust-lang.org/edition-guide/rust-2024/newly-unsafe-functions.html)) and
@@ -1163,8 +1182,8 @@ Writing a new test?
 | Nested `cargo build` invocations per suite run | 24 | 1 |
 | `env!("CARGO_BIN_EXE_…")` sites | 51 | 0 (5 build.rs constants) |
 | `fixture_component()` definitions | 22 | 0 (1 build.rs) |
-| Per-file env mutexes | 33 | 1 + a nextest test group |
-| `std::env::set_var` call sites in tests | 45 | 0 |
+| Per-file env mutexes | 33 | **1** (`cyrup-tools/tests/shell_interpreter.rs`) — no nextest group needed |
+| `std::env::set_var` call sites in tests | 45 | **15, in 3 files**, each exempted in writing — see below |
 | Duplicated helper definitions | ~250 | 0 |
 | Merge gate | `cargo test --workspace` | `cargo nextest run --workspace && cargo test --workspace --doc` |
 | Deliberate suite | — | `cargo nextest run -p cyrup-it --features it,wasm-host` |

@@ -5,7 +5,7 @@ use cyrup_core::ToolError;
 
 use crate::discovery::types::AgentReadScope;
 use crate::exec::SingleResult;
-use crate::fork_context::ContextMode;
+use crate::fork_context::ContextRequest;
 use crate::registration::SubagentExtensionConfig;
 use crate::extension::tool::text::BLANK_ACTION_REFUSAL;
 
@@ -414,11 +414,22 @@ impl SubagentToolParams {
     /// `subagent-executor.ts:1875-1891`) rather than being forced to `Fresh` — the collapse-to-`Fresh`
     /// that the pre-Tier-2 `context_mode` did. Any non-`"fork"` explicit string still resolves to
     /// `Some(Fresh)` (pi treats only the literal `"fork"` as fork).
-    pub(crate) fn context_override(&self) -> Option<ContextMode> {
+    /// SUBA-079 / pi `resolveAgentDefaultContextPolicy` (`subagent-executor.ts:2521,2552`
+    /// @v0.57.0), which matches `params.context` EXACTLY: `profile` first, then `fresh`/`fork`, and
+    /// anything else falls through to the IMPLICIT defaults path — i.e. behaves as if the key were
+    /// absent, NOT as an explicit `fresh`.
+    ///
+    /// This used to collapse every non-`fork` string to `Some(ContextRequest::Fresh)`, a faithful port
+    /// of pi's `resolveSubagentContext` (`fork-context.ts:58`) but of the wrong function for this
+    /// seam. That collapse suppressed the agent's own `defaultContext` for an unrecognized value,
+    /// and — once `profile` became legal — would have turned it into an explicit `Fresh`, silently
+    /// defeating the whole directive.
+    pub(crate) fn context_override(&self) -> Option<ContextRequest> {
         match self.context.as_deref() {
-            None => None,
-            Some("fork") => Some(ContextMode::Fork),
-            Some(_) => Some(ContextMode::Fresh),
+            Some("fresh") => Some(ContextRequest::Fresh),
+            Some("fork") => Some(ContextRequest::Fork),
+            Some("profile") => Some(ContextRequest::Profile),
+            None | Some(_) => Option::None,
         }
     }
 
@@ -544,6 +555,43 @@ mod tests {
 
     use super::*;
     use crate::extension::testsupport::scoped_tool;
+
+    /// SUBA-079 / pi `resolveAgentDefaultContextPolicy` (`subagent-executor.ts:2521,2552`
+    /// @v0.57.0) matches `params.context` EXACTLY. Two arms matter beyond the obvious:
+    ///
+    /// `profile` must NOT collapse to an explicit `fresh` — that is what this function used to do
+    /// to every non-`fork` string, and it would take the strict path and suppress both the agent
+    /// default and the config rung, silently defeating the directive.
+    ///
+    /// An UNRECOGNIZED value behaves as ABSENT, falling through to the defaults ladder, because
+    /// upstream tests `=== "profile"` then `=== "fresh" || === "fork"` and otherwise does not take
+    /// the explicit branch at all.
+    #[test]
+    fn context_override_maps_each_value_exactly_and_treats_garbage_as_absent() {
+        let parse = |value: serde_json::Value| -> Option<ContextRequest> {
+            let params: SubagentToolParams =
+                serde_json::from_value(serde_json::json!({ "agent": "w", "task": "t", "context": value }))
+                    .expect("params parse");
+            params.context_override()
+        };
+        assert_eq!(parse(serde_json::json!("fresh")), Some(ContextRequest::Fresh));
+        assert_eq!(parse(serde_json::json!("fork")), Some(ContextRequest::Fork));
+        assert_eq!(
+            parse(serde_json::json!("profile")),
+            Some(ContextRequest::Profile),
+            "`profile` is its own directive, NOT an explicit fresh"
+        );
+        assert_eq!(
+            parse(serde_json::json!("nonsense")),
+            Option::None,
+            "an unrecognized value takes the defaults ladder, exactly as an omitted one does"
+        );
+
+        let omitted: SubagentToolParams =
+            serde_json::from_value(serde_json::json!({ "agent": "w", "task": "t" }))
+                .expect("params parse");
+        assert_eq!(omitted.context_override(), Option::None);
+    }
 
     // ---------------------------------------------------------------------------------------
     // SUBA-077 — the foreground wall-clock deadline ladder
@@ -780,7 +828,7 @@ mod tests {
         .expect("single shape parses permissively (unknown keys ignored)");
         assert_eq!(single.agent.as_deref(), Some("worker"));
         assert!(single.is_background(&SubagentExtensionConfig::default(), 0));
-        assert!(matches!(single.context_override(), Some(ContextMode::Fork)));
+        assert!(matches!(single.context_override(), Some(ContextRequest::Fork)));
         assert!(single.provided_keys().contains(&"model"));
         assert!(!single.provided_keys().contains(&"unknownFutureKey"));
 
@@ -835,9 +883,22 @@ mod tests {
             omitted.is_background(&async_by_default_cfg, 0),
             "an omitted `async` must default to config.asyncByDefault"
         );
+        // SUBA-083. This used to express the foreground direction as `::default()`, which named a
+        // config value it did not set — so when the seed was corrected to pi's `!== false`, the
+        // assertion silently meant the opposite of its own message. Both directions are bound
+        // explicitly now, so neither depends on which way the seed happens to fall.
+        let foreground_cfg = SubagentExtensionConfig {
+            async_by_default: false,
+            ..SubagentExtensionConfig::default()
+        };
         assert!(
-            !omitted.is_background(&SubagentExtensionConfig::default(), 0),
-            "asyncByDefault: false (the default) must still leave an omitted `async` foreground"
+            !omitted.is_background(&foreground_cfg, 0),
+            "an explicit `asyncByDefault: false` must force an omitted `async` foreground — pi's \
+             documented opt-out (`index.ts:9`), which a `false` SEED made unreachable"
+        );
+        assert!(
+            omitted.is_background(&SubagentExtensionConfig::default(), 0),
+            "an ABSENT `asyncByDefault` must background (pi `config.ts:222-224`, `!== false`)"
         );
 
         // An explicit `async: false` still wins over `asyncByDefault: true` (only an OMITTED value

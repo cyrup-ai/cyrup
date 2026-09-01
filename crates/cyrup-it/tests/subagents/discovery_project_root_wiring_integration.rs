@@ -39,8 +39,8 @@
 //! assertion lands on a refusal or a resolution that happens strictly before any subprocess would.
 //!
 //! Separate compilation unit from `lib.rs`, so NOT bound by that crate's `#![forbid(unsafe_code)]`;
-//! the `unsafe` env mutation (Rust 2024 requires it for `std::env::set_var`/`remove_var`) is scoped
-//! and serialized under [`ENV_MUTATION_LOCK`], exactly like every other integration test here.
+//! the user-scope root is supplied as `SubagentExtensionConfig::roots` rather than exported, so
+//! this file mutates no process-global state and needs no lock.
 
 #![allow(
     clippy::unwrap_used,
@@ -51,54 +51,40 @@
 
 use std::path::Path;
 
-use tokio::sync::Mutex as AsyncMutex;
 
 use cyrup_core::{CancelToken, Tool, ToolCallId};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::discovery::types::AgentReadScope;
 use cyrup_ext_subagents::error::SubagentError;
 use cyrup_ext_subagents::extension::{SubagentExecutor, SubagentsExtension};
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
-/// Serializes every test in this file that overrides the process-global env (`CYRUP_HOME`, and the
-/// extra-agent-dirs escape hatch a developer machine may already have exported) — this crate's
-/// standing integration-test convention.
-static ENV_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
-
 const EXTRA_DIRS_ENV_VAR: &str = "CYRUP_SUBAGENT_EXTRA_AGENT_DIRS";
 
-/// Point `dirs_home()` at an empty tempdir for the duration of one test so the USER-scope
-/// `settings.json` / `~/.cyrup/agents` of the developer or CI machine can never contribute, and drop
-/// `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS` so no ambient extra dir joins the User tier.
+/// An empty user-scope root for one test, so the USER-scope `settings.json` / `~/.cyrup/agents` of
+/// the developer or CI machine can never contribute. Passed to `resolve_agent` as `roots`
+/// rather than exported, so nothing process-global moves and no lock is needed.
+///
+/// `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS` is asserted-absent rather than cleared: it is a developer
+/// escape hatch, and a test that silently deleted it could mask an ambient value instead of
+/// reporting it. If it IS set, this test cannot be hermetic and says so.
 struct HomeSandbox {
-    _home: tempfile::TempDir,
-    previous_extra_dirs: Option<std::ffi::OsString>,
+    home: tempfile::TempDir,
 }
 
 impl HomeSandbox {
     fn enter() -> Self {
-        let home = tempfile::tempdir().expect("home tempdir");
-        let previous_extra_dirs = std::env::var_os(EXTRA_DIRS_ENV_VAR);
-        // SAFETY: this file is a separate compilation unit from the crate's
-        // `#![forbid(unsafe_code)]` `src/lib.rs` (see the module doc); the mutation is scoped to one
-        // test and serialized by `ENV_MUTATION_LOCK`.
-        unsafe {
-            std::env::set_var("CYRUP_HOME", home.path());
-            std::env::remove_var(EXTRA_DIRS_ENV_VAR);
-        }
-        Self { _home: home, previous_extra_dirs }
+        assert!(
+            std::env::var_os(EXTRA_DIRS_ENV_VAR).is_none(),
+            "{EXTRA_DIRS_ENV_VAR} is set in this environment; it would add an ambient dir to the \
+             User tier and make this test's discovery result non-hermetic. Unset it to run this \
+             suite."
+        );
+        Self { home: tempfile::tempdir().expect("home tempdir") }
     }
-}
 
-impl Drop for HomeSandbox {
-    fn drop(&mut self) {
-        // SAFETY: same scoped, mutex-held critical section as `enter`.
-        unsafe {
-            std::env::remove_var("CYRUP_HOME");
-            match self.previous_extra_dirs.take() {
-                Some(previous) => std::env::set_var(EXTRA_DIRS_ENV_VAR, previous),
-                None => std::env::remove_var(EXTRA_DIRS_ENV_VAR),
-            }
-        }
+    fn path(&self) -> &Path {
+        self.home.path()
     }
 }
 
@@ -158,8 +144,7 @@ fn build_two_candidate_repo(tmp: &Path, repo_root_settings: &str) -> std::path::
 /// settings file is keyed on `cwd`.
 #[tokio::test]
 async fn git_root_resolution_moves_both_the_agent_dirs_and_the_settings_file() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    let _sandbox = HomeSandbox::enter();
+    let sandbox = HomeSandbox::enter();
     let tmp = tempfile::tempdir().expect("tempdir");
     let app = build_two_candidate_repo(
         tmp.path(),
@@ -169,14 +154,14 @@ async fn git_root_resolution_moves_both_the_agent_dirs_and_the_settings_file() {
 
     // Half A — the READ DIRS came from the git root: its agent is visible...
     let repo_agent = executor
-        .resolve_agent(&app, "repo-agent", AgentReadScope::Both)
+        .resolve_agent(&app, "repo-agent", AgentReadScope::Both, &Roots::sandboxed(sandbox.path()))
         .expect("the repo-root project agent must be discoverable from the nested cwd");
     assert_eq!(repo_agent.name, "repo-agent");
 
     // ...and the nearest candidate's own agent dir is NOT scanned at all, which is what proves the
     // root MOVED rather than merely widened.
     let missed = executor
-        .resolve_agent(&app, "app-agent", AgentReadScope::Both)
+        .resolve_agent(&app, "app-agent", AgentReadScope::Both, &Roots::sandboxed(sandbox.path()))
         .expect_err("git-root resolution must stop scanning the nearest candidate's agent dir");
     assert!(
         matches!(missed, SubagentError::AgentNotFound(_)),
@@ -202,8 +187,7 @@ async fn git_root_resolution_moves_both_the_agent_dirs_and_the_settings_file() {
 /// negative direction: a `settings.json` at a non-selected candidate must not leak in.
 #[tokio::test]
 async fn nearest_resolution_pins_both_the_agent_dirs_and_the_settings_file_at_the_nested_root() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    let _sandbox = HomeSandbox::enter();
+    let sandbox = HomeSandbox::enter();
     let tmp = tempfile::tempdir().expect("tempdir");
     let app = build_two_candidate_repo(
         tmp.path(),
@@ -212,12 +196,12 @@ async fn nearest_resolution_pins_both_the_agent_dirs_and_the_settings_file_at_th
     let executor = SubagentExecutor::new();
 
     let app_agent = executor
-        .resolve_agent(&app, "app-agent", AgentReadScope::Both)
+        .resolve_agent(&app, "app-agent", AgentReadScope::Both, &Roots::sandboxed(sandbox.path()))
         .expect("the nearest candidate's own agent must be discoverable");
     assert_eq!(app_agent.name, "app-agent");
 
     let missed = executor
-        .resolve_agent(&app, "repo-agent", AgentReadScope::Both)
+        .resolve_agent(&app, "repo-agent", AgentReadScope::Both, &Roots::sandboxed(sandbox.path()))
         .expect_err("nearest resolution must not reach out to the repository root's agents");
     assert!(
         matches!(missed, SubagentError::AgentNotFound(_)),
@@ -241,9 +225,14 @@ fn write_ambiguous_alias_pair(cwd: &Path) {
     write_agent(&agents, "augur", "aliases: prophet\n");
 }
 
-async fn dispatch(cwd: &Path, params: serde_json::Value) -> Result<(), String> {
-    let extension =
-        SubagentsExtension::with_config_and_cwd(SubagentExtensionConfig::default(), cwd.to_path_buf());
+async fn dispatch(cwd: &Path, home: &Path, params: serde_json::Value) -> Result<(), String> {
+    let extension = SubagentsExtension::with_config_and_cwd(
+        SubagentExtensionConfig {
+            roots: Roots::sandboxed(home),
+            ..SubagentExtensionConfig::default()
+        },
+        cwd.to_path_buf(),
+    );
     extension
         .subagent_tool()
         .execute(
@@ -267,14 +256,11 @@ async fn dispatch(cwd: &Path, params: serde_json::Value) -> Result<(), String> {
 /// previously left every test in the crate green.
 #[tokio::test]
 async fn an_ambiguous_alias_in_a_task_list_aborts_the_live_tool_dispatch_with_its_location() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    let _sandbox = HomeSandbox::enter();
+    let sandbox = HomeSandbox::enter();
     let cwd = tempfile::tempdir().expect("tempdir");
     write_ambiguous_alias_pair(cwd.path());
 
-    let err = dispatch(
-        cwd.path(),
-        serde_json::json!({
+    let err = dispatch(cwd.path(), sandbox.path(), serde_json::json!({
             "tasks": [
                 { "agent": "seer", "task": "a" },
                 { "agent": "prophet", "task": "b" }
@@ -294,14 +280,11 @@ async fn an_ambiguous_alias_in_a_task_list_aborts_the_live_tool_dispatch_with_it
 /// expression only `canonicalize_execution_params` produces.
 #[tokio::test]
 async fn an_ambiguous_alias_in_a_chain_parallel_step_aborts_the_live_tool_dispatch() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    let _sandbox = HomeSandbox::enter();
+    let sandbox = HomeSandbox::enter();
     let cwd = tempfile::tempdir().expect("tempdir");
     write_ambiguous_alias_pair(cwd.path());
 
-    let err = dispatch(
-        cwd.path(),
-        serde_json::json!({
+    let err = dispatch(cwd.path(), sandbox.path(), serde_json::json!({
             "chain": [
                 { "agent": "seer", "task": "first" },
                 { "parallel": [
@@ -325,14 +308,11 @@ async fn an_ambiguous_alias_in_a_chain_parallel_step_aborts_the_live_tool_dispat
 /// suffix cannot be made unconditional.
 #[tokio::test]
 async fn an_ambiguous_top_level_alias_aborts_the_live_tool_dispatch_without_a_location() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    let _sandbox = HomeSandbox::enter();
+    let sandbox = HomeSandbox::enter();
     let cwd = tempfile::tempdir().expect("tempdir");
     write_ambiguous_alias_pair(cwd.path());
 
-    let err = dispatch(
-        cwd.path(),
-        serde_json::json!({ "agent": "prophet", "task": "decide" }),
+    let err = dispatch(cwd.path(), sandbox.path(), serde_json::json!({ "agent": "prophet", "task": "decide" }),
     )
     .await
     .expect_err("an ambiguous alias must abort the dispatch");

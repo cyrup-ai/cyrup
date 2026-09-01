@@ -17,17 +17,12 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
 
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_test_support::harness::{create_harness_with_extensions, HarnessOptions};
 use cyrup_test_support::response::FauxResponse;
-
-/// `SubagentsExtension::init` (`RegistrationMode::Full`) runs its T6 startup housekeeping —
-/// async/results root creation under `CYRUP_HOME` — at `init()` time, so every test here sandboxes
-/// that process-global var and serializes on this lock, mirroring every sibling integration file.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn tool_starts(events: &[cyrup_session_svc::AgentSessionEvent]) -> Vec<&str> {
     events
@@ -67,19 +62,17 @@ fn tool_ends(
 /// a duplicate of the blocking-behavior unit tests in `background::wait`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_wait_tool_is_registered_and_dispatches_on_a_real_session() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let home = tempfile::tempdir().expect("home tempdir");
     let work_dir = tempfile::tempdir().expect("work tempdir");
-    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test, mirroring
-    // every sibling `tests/*_integration.rs` file in this crate (Rust 2024 requires `unsafe` for
-    // `set_var`; this file is a separate compilation unit from the crate's `#![forbid(unsafe_code)]`
-    // `lib.rs`).
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
 
+    // This run names its own root rather than moving process-global state every other test in
+    // this binary shares: `roots` reaches the wait tool's own root resolution
+    // (`WaitDeps::for_cwd`) through the config the extension already carries.
     let extension = Arc::new(SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        SubagentExtensionConfig {
+            roots: Roots::sandboxed(home.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
     ));
 
@@ -95,11 +88,6 @@ async fn the_wait_tool_is_registered_and_dispatches_on_a_real_session() {
     .expect("harness builds a real session with the subagents extension loaded");
 
     let events = harness.run("wait for the background subagents").await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     let events = events.expect("the turn completes without a transport/session-level error");
 
@@ -136,27 +124,19 @@ async fn a_fanout_child_does_not_get_the_wait_tool() {
     use cyrup_ext::native::{InitApi, NativeExtension};
     use cyrup_ext_subagents::extension::RegistrationMode;
 
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let home = tempfile::tempdir().expect("home tempdir");
     let work_dir = tempfile::tempdir().expect("work tempdir");
-    // SAFETY: as above — scoped, mutex-serialized, restored below.
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
 
     let child = SubagentsExtension::with_mode(
-        SubagentExtensionConfig::default(),
+        SubagentExtensionConfig {
+            roots: Roots::sandboxed(home.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
         RegistrationMode::ChildSafe,
     );
     let mut api = InitApi::new();
-    let init = child.init(&mut api).await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var("CYRUP_HOME");
-    }
-    init.expect("child-safe init succeeds");
+    child.init(&mut api).await.expect("child-safe init succeeds");
 
     assert!(
         !api.subscriptions().contains(cyrup_ext::EventKind::SessionStart),

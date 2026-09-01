@@ -21,18 +21,33 @@
 //! swallowed, so a hand-edited typo is discoverable) and this function still falls back to the
 //! default rather than aborting startup over one malformed optional file.
 
-use std::path::Path;
 
+use cyrup_config::ConfigDirs;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
 /// Load the SubAgents extension's `config.json` (R-SA-133 tier 3) from
-/// `<agent_dir>/subagents/config.json`, or fall back to
+/// `<dirs.agent_dir>/subagents/config.json`, or fall back to
 /// [`SubagentExtensionConfig::default`] (tier 5) when the file is absent or fails to parse.
+///
+/// # This is where the extension's roots are decided
+///
+/// Takes the whole [`ConfigDirs`] rather than just the agent dir because it sets
+/// `SubagentExtensionConfig::roots` on every return path, anchored on the layout the binary has
+/// already resolved. That is the point of the field: one resolution, in the startup phase that
+/// owns layout, instead of four resolvers re-deriving it from the environment deep inside the
+/// crate — where they could, and did, answer differently from each other.
 #[must_use]
-pub fn load_subagent_extension_config(agent_dir: &Path) -> SubagentExtensionConfig {
-    let path = agent_dir.join("subagents").join("config.json");
+pub fn load_subagent_extension_config(dirs: &ConfigDirs) -> SubagentExtensionConfig {
+    // Every `return` below goes through this, so a config file that is absent, unparseable or
+    // missions-invalid still gets the SAME roots a good one would.
+    let rooted = || SubagentExtensionConfig {
+        roots: Roots::from_config_dirs(dirs),
+        ..SubagentExtensionConfig::default()
+    };
+    let path = dirs.agent_dir.join("subagents").join("config.json");
     let Ok(bytes) = std::fs::read(&path) else {
-        return SubagentExtensionConfig::default();
+        return rooted();
     };
     // pi `readConfigForUpdate` (`pi-subagents/src/extension/config.ts:15-28`) runs
     // `validateMissionStoreConfig(config.missions)` on the RAW parsed JSON before the typed view
@@ -47,7 +62,7 @@ pub fn load_subagent_extension_config(agent_dir: &Path) -> SubagentExtensionConf
                     "cyrup: warning: {} has an invalid missions block ({message}); using defaults",
                     path.display()
                 );
-                return SubagentExtensionConfig::default();
+                return rooted();
             }
         }
         Err(_) => {
@@ -55,13 +70,16 @@ pub fn load_subagent_extension_config(agent_dir: &Path) -> SubagentExtensionConf
         }
     }
     match serde_json::from_slice::<SubagentExtensionConfig>(&bytes) {
-        Ok(cfg) => cfg,
+        // `roots` is `#[serde(skip)]`, so a parsed config carries `Default`'s env-derived value.
+        // Overwrite it with the binary's own layout: a `config.json` must not be able to decide
+        // where a run writes, and the two must not be able to disagree.
+        Ok(cfg) => SubagentExtensionConfig { roots: Roots::from_config_dirs(dirs), ..cfg },
         Err(err) => {
             eprintln!(
                 "cyrup: warning: {} is not valid subagents config JSON ({err}); using defaults",
                 path.display()
             );
-            SubagentExtensionConfig::default()
+            rooted()
         }
     }
 }
@@ -77,11 +95,32 @@ mod tests {
 
     use super::*;
 
+    /// The layout the binary would have resolved, rooted at a `TempDir`.
+    fn dirs_at(dir: &std::path::Path) -> ConfigDirs {
+        ConfigDirs {
+            agent_dir: dir.to_path_buf(),
+            session_dir: dir.join("sessions"),
+            session_dir_explicit: false,
+            package_dir: dir.join("packages"),
+            cwd: dir.to_path_buf(),
+            home: dir.to_path_buf(),
+        }
+    }
+
+    /// What every fall-back path in the loader must produce: the hardcoded defaults, carrying the
+    /// roots the BINARY resolved rather than `Default`'s process-derived ones. Asserting against
+    /// this (rather than a bare `SubagentExtensionConfig::default()`) is what proves the roots are
+    /// set on the absent-file, unparseable and missions-invalid paths too, not just the happy one.
+    fn defaults_for(dirs: &ConfigDirs) -> SubagentExtensionConfig {
+        SubagentExtensionConfig { roots: Roots::from_config_dirs(dirs), ..Default::default() }
+    }
+
     #[test]
     fn absent_config_json_yields_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cfg = load_subagent_extension_config(dir.path());
-        assert_eq!(cfg, SubagentExtensionConfig::default());
+        let dirs = dirs_at(dir.path());
+        let cfg = load_subagent_extension_config(&dirs);
+        assert_eq!(cfg, defaults_for(&dirs));
     }
 
     #[test]
@@ -90,8 +129,9 @@ mod tests {
         let subagents_dir = dir.path().join("subagents");
         std::fs::create_dir_all(&subagents_dir).expect("mkdir");
         std::fs::write(subagents_dir.join("config.json"), "not json at all").expect("write");
-        let cfg = load_subagent_extension_config(dir.path());
-        assert_eq!(cfg, SubagentExtensionConfig::default());
+        let dirs = dirs_at(dir.path());
+        let cfg = load_subagent_extension_config(&dirs);
+        assert_eq!(cfg, defaults_for(&dirs));
     }
 
     #[test]
@@ -106,10 +146,8 @@ mod tests {
         .expect("write");
         // pi `validateMissionStoreConfig` refuses the whole block; this loader's warn-and-default
         // convention then discards the file rather than honoring a half-understood config.
-        assert_eq!(
-            load_subagent_extension_config(dir.path()),
-            SubagentExtensionConfig::default()
-        );
+        let dirs = dirs_at(dir.path());
+        assert_eq!(load_subagent_extension_config(&dirs), defaults_for(&dirs));
     }
 
     #[test]
@@ -122,7 +160,7 @@ mod tests {
             r#"{"missions": {"enabled": false, "retainTerminal": 12}}"#,
         )
         .expect("write");
-        let cfg = load_subagent_extension_config(dir.path());
+        let cfg = load_subagent_extension_config(&dirs_at(dir.path()));
         let missions = cfg.missions.expect("missions block");
         assert_eq!(missions.enabled, Some(false));
         assert_eq!(missions.retain_terminal, Some(12));
@@ -138,7 +176,7 @@ mod tests {
             r#"{"maxSubagentDepth": 5}"#,
         )
         .expect("write");
-        let cfg = load_subagent_extension_config(dir.path());
+        let cfg = load_subagent_extension_config(&dirs_at(dir.path()));
         assert_eq!(cfg.max_subagent_depth, 5);
         assert_eq!(
             cfg.global_concurrency_limit,
@@ -167,7 +205,7 @@ mod tests {
         )
         .expect("write");
 
-        let cfg = load_subagent_extension_config(dir.path());
+        let cfg = load_subagent_extension_config(&dirs_at(dir.path()));
 
         // The unrelated settings survive — this is the whole point.
         assert_eq!(

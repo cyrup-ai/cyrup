@@ -268,6 +268,7 @@ pub(crate) fn filter_dominated(candidates: Vec<RankedCandidate>) -> Vec<RankedCa
 pub(crate) async fn render_profile_check_report(
     name: &str,
     profile: &crate::registration::profiles::NamedProfile,
+    spawn: Option<&crate::spawn::SpawnCommand>,
 ) -> String {
     // pi's `entries` (profiles.ts:639-641) walks ONLY `agentOverrides`, never `defaultModel`.
     let mut refs: Vec<(String, String)> = Vec::new();
@@ -302,7 +303,7 @@ pub(crate) async fn render_profile_check_report(
         let probe = match probe_cache.get(&probe_id) {
             Some(cached) => cached.clone(),
             None => {
-                let result = probe_model(&probe_id).await;
+                let result = probe_model(&probe_id, spawn).await;
                 probe_cache.insert(probe_id.clone(), result.clone());
                 result
             }

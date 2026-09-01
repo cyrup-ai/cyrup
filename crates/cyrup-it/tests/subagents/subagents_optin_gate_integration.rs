@@ -15,45 +15,38 @@
 
 use cyrup_ext::EventKind;
 use cyrup_ext::native::InitApi;
-use cyrup_ext_subagents::extension::{INSTALL_ENV_VAR, is_installed, subagent_extension_for_env};
+use cyrup_ext_subagents::extension::{is_installed_with, subagent_extension_for};
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
-/// Serializes the process-global env mutation this file performs (a tokio mutex so the guard is held
-/// across the async `init` await), matching this crate's established env-mutation test convention.
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-const CHILD_ENV: &str = "CYRUP_SUBAGENT_CHILD";
-const FANOUT_CHILD_ENV: &str = "CYRUP_SUBAGENT_FANOUT_CHILD";
 
 #[tokio::test]
 async fn cyrup_subagents_env_opts_a_top_level_session_into_the_full_surface() {
-    let _guard = ENV_LOCK.lock().await;
 
     // Empty dirs: NO on-disk config anywhere, so the ONLY install signal under test is the env var.
     let agent_dir = tempfile::tempdir().expect("agent dir");
     let cwd = tempfile::tempdir().expect("cwd");
 
-    // SAFETY: scoped, mutex-serialized env mutation (Rust 2024 requires `unsafe` for set/remove_var);
-    // a `tests/*.rs` file is a separate compilation unit not bound by the library's
-    // `#![forbid(unsafe_code)]`. Force TOP-LEVEL by clearing the two child flags (so this process
-    // resolves to `Full`, not `ChildSafe`), then opt in via `CYRUP_SUBAGENTS=1`.
-    unsafe {
-        std::env::remove_var(CHILD_ENV);
-        std::env::remove_var(FANOUT_CHILD_ENV);
-        std::env::set_var(INSTALL_ENV_VAR, "1");
-    }
+    // The install signal is INJECTED, not exported: `is_installed_with` takes the same lookup the
+    // production path uses, so this still proves the `CYRUP_SUBAGENTS` branch — while the
+    // top-level-vs-child decision is stated as arguments rather than by clearing two more
+    // process-global flags. Nothing here races a concurrent reader of the environment.
+    let opted_in = |_: &str| Some("1".to_string());
+    let not_opted_in = |_: &str| None;
 
     // (b) `CYRUP_SUBAGENTS=1` marks a config-less installation as installed...
     assert!(
-        is_installed(agent_dir.path(), cwd.path()),
+        is_installed_with(&opted_in, agent_dir.path(), cwd.path()),
         "CYRUP_SUBAGENTS=1 marks a config-less installation as installed"
     );
     // ...and a top-level session attaches the FULL orchestrator surface (SessionStart housekeeping,
     // which a `ChildSafe` surface never installs — so this asserts Full specifically).
-    let ext = subagent_extension_for_env(
-        agent_dir.path(),
+    let ext = subagent_extension_for(
         SubagentExtensionConfig::default(),
         cwd.path().to_path_buf(),
+        /* child */ false,
+        /* fanout_authorized */ false,
+        /* installed */ true,
     )
     .expect("an opted-in top-level session attaches the subagents extension");
     let mut api = InitApi::new();
@@ -63,21 +56,19 @@ async fn cyrup_subagents_env_opts_a_top_level_session_into_the_full_surface() {
         "the attached surface is the FULL orchestrator (installs the SessionStart housekeeping)"
     );
 
-    // Default OFF: clear the opt-in and, with no config file anywhere, the SAME top-level session
-    // attaches NOTHING.
-    // SAFETY: as above.
-    unsafe {
-        std::env::remove_var(INSTALL_ENV_VAR);
-    }
+    // Default OFF: without the opt-in, and with no config file anywhere, the SAME top-level
+    // session attaches NOTHING.
     assert!(
-        !is_installed(agent_dir.path(), cwd.path()),
+        !is_installed_with(&not_opted_in, agent_dir.path(), cwd.path()),
         "with no env and no config file, a config-less installation is NOT installed (default OFF)"
     );
     assert!(
-        subagent_extension_for_env(
-            agent_dir.path(),
+        subagent_extension_for(
             SubagentExtensionConfig::default(),
             cwd.path().to_path_buf(),
+            /* child */ false,
+            /* fanout_authorized */ false,
+            /* installed */ false,
         )
         .is_none(),
         "a top-level session that has not opted in attaches nothing"

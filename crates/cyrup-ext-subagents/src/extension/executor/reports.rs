@@ -33,14 +33,15 @@ impl SubagentExecutor {
     /// `default_session_dir`, which in turn wins over the literal `"not configured"` (pi
     /// `formatConfiguredSessionDir`, doctor.ts:108-116).
     pub async fn run_doctor(&self, cwd: &Path, requested_session_dir: Option<&str>) -> String {
-        let roots = crate::background::run_artifact_roots(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let artifact_roots = crate::background::run_artifact_roots_in(&roots, cwd);
 
         // pi wraps discovery in `lineFromCheck` (doctor.ts:65-71,131-153): a discovery failure (e.g.
         // R-SA-009's malformed-settings abort) must render `- agents/chains: failed — <err>` in the
         // Discovery block below, never a fabricated zero-count success — so the `Result` is
         // propagated all the way to `build_doctor_report`, never collapsed here.
         let discovery_result: Result<crate::discovery::AgentDiscoveryResult, String> =
-            match Self::discovery_config(cwd) {
+            match Self::discovery_config(cwd, &roots) {
                 Ok(discovery_config) => crate::discovery::discover_agents_all(&discovery_config)
                     .map_err(|err| err.to_string()),
                 Err(err) => Err(err.to_string()),
@@ -96,8 +97,8 @@ impl SubagentExecutor {
             current_session_id: session_id,
             session_error,
             temp_root_dir: crate::background::temp_root_dir(),
-            async_runs_dir: roots.async_root,
-            results_dir: roots.results_dir,
+            async_runs_dir: artifact_roots.async_root,
+            results_dir: artifact_roots.results_dir,
             chain_runs_dir: crate::artifacts::chain_runs_dir(cwd),
             discovered: discovery_result.as_ref().map_err(|err| err.as_str()),
         };
@@ -188,8 +189,14 @@ impl SubagentExecutor {
         // Both fall-backs are best-effort here (this surface reports, it does not run anything), so a
         // malformed `settings.json` OR a malformed `projectRootResolution` degrades to the bare
         // default config rather than aborting the whole report.
-        let cfg = Self::discovery_config(cwd)
-            .or_else(|_| Self::discovery_dirs_config(cwd))
+        // `Roots::from_env()`: this method and its callers (`slash_models`) are synchronous, so
+        // the async config cell is out of reach here. That is exactly today's behaviour — resolve
+        // from the process environment — and it is why `SubagentExtensionConfig::roots`' doc does
+        // not claim to reach the models report. Threading it means making this surface async,
+        // which is its own change.
+        let env_roots = crate::paths::Roots::from_env();
+        let cfg = Self::discovery_config(cwd, &env_roots)
+            .or_else(|_| Self::discovery_dirs_config(cwd, &env_roots))
             .unwrap_or_default();
         let default_model_scope = resolve_default_model_scope(&cfg.override_settings);
         let discovered = match crate::discovery::discover_agents_all(&cfg) {

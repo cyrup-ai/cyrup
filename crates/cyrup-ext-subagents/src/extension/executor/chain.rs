@@ -12,7 +12,7 @@ use crate::discovery::discover_agents;
 use crate::discovery::types::AgentReadScope;
 use crate::error::SubagentError;
 use crate::exec::ResolvedAgentPersona;
-use crate::fork_context::ContextMode;
+use crate::fork_context::ContextRequest;
 use crate::spawn::chain_graph::{
     walk_chain, ChainRunContext, GroupStepResult, OutputRegistry, RunnerStep, SingleStepExecutor,
     StepResult,
@@ -143,7 +143,11 @@ impl SubagentExecutor {
             self.remembered_parent_model(),
             // SUBA-003: the cwd's `subagents.modelScope` policy, so a foreground chain/parallel
             // step's own `model:` is policed exactly as a single run's `model` is.
-            Self::resolve_model_scope(cwd)?,
+            Self::resolve_model_scope(cwd, &cfg.roots)?,
+            // The extension config's in-process binary override, from the same snapshot this
+            // function already took. `None` for every ordinary configuration, which leaves each
+            // step resolving its command from the environment as before.
+            cfg.spawn_command.clone(),
         )
         // SUBA-N05 (pi `controlConfig: input.controlConfig` on every per-step `runSync`,
         // `chain-execution.ts:322,491,733` @v0.34.0): the extension-level `subagents.control`
@@ -224,7 +228,7 @@ impl SubagentExecutor {
         cwd: &Path,
         graph: Vec<RunnerStep>,
         mode: RunMode,
-        context: Option<ContextMode>,
+        context: Option<ContextRequest>,
         background: bool,
         task: Option<String>,
         cancel: CancelToken,
@@ -327,7 +331,12 @@ impl SubagentExecutor {
         // an unresolvable agent fails here, before any child is spawned, matching pi's `/chain`//
         // `/parallel` name check).
         let resolved_agents =
-            self.resolve_plan_personas(cwd, plan_step_agent_names(&graph), AgentReadScope::Both)?;
+            self.resolve_plan_personas(
+                cwd,
+                plan_step_agent_names(&graph),
+                AgentReadScope::Both,
+                &cfg.roots,
+            )?;
         // Fork default-mode + per-index branch (Tier-2, R-SA-137/R-SA-138, pi
         // `resolveAgentDefaultContextPolicy` + `preflightForkSessionsForStaticTasks`): resolve EACH
         // step's effective context independently (an omitted call-site `context` defers to THAT
@@ -338,9 +347,15 @@ impl SubagentExecutor {
         // Blocker #4: branch every forking step from the REAL live-orchestrator session file (P-1),
         // not the continue_recent(cwd) mtime heuristic.
         let session_file = self.host_services().and_then(|s| s.session_file());
-        let resolver = Self::fork_resolver(cwd, session_file.as_deref());
+        let resolver = Self::fork_resolver(cwd, session_file.as_deref(), &cfg.roots);
+        // SUBA-079: the `subagents.defaultSubagentContext` rung, validated here — this is the only
+        // side of the graph path holding the live extension config.
+        let config_default = crate::fork_context::resolve_default_subagent_context(
+            self.config_snapshot().await.default_subagent_context.as_ref(),
+        )
+        .map_err(SubagentError::Management)?;
         let (graph, first_session_file) =
-            apply_fork_contexts(&resolver, context, &resolved_agents, graph).await?;
+            apply_fork_contexts(&resolver, context, config_default, &resolved_agents, graph).await?;
 
         if background {
             let run_id = self
@@ -436,8 +451,9 @@ impl SubagentExecutor {
         &self,
         cwd: &Path,
         name: &str,
+        roots: &crate::paths::Roots,
     ) -> Result<crate::discovery::types::ChainDefinition, SubagentError> {
-        let cfg = Self::discovery_config(cwd)?;
+        let cfg = Self::discovery_config(cwd, roots)?;
         let result = discover_agents(&cfg, None)?;
         // Cross-scope run precedence Project > User > Package > Builtin (pi `discoverSavedChains`
         // last-wins map, slash-commands.ts:172-177 @v0.34.0) — NOT a naive first-match, which incorrectly let a

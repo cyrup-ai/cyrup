@@ -17,20 +17,18 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::Mutex as AsyncMutex;
 
 use cyrup_core::{CancelToken, ToolUpdate, ToolUpdateSink};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::RunMode;
 use cyrup_ext_subagents::discovery::types::AgentReadScope;
 use cyrup_ext_subagents::extension::{
     ForegroundRunRequest, SingleRunOverrides, SubagentExecutor,
 };
+use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::tui::events::{LiveProgressStatus, SubagentUpdatePayload};
 
-/// Serializes every test in this file that mutates process-global env (`CYRUP_SUBAGENT_BINARY`,
-/// `CYRUP_SUBAGENT_FIXTURE_SCRIPT`, `CYRUP_HOME`) so `cargo test`'s concurrent execution never lets
-/// two tests clobber each other's overrides mid-run.
-static ENV_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 /// Path to the real, already-built `cyrup-subagent-fixture` binary.
 ///
@@ -49,7 +47,6 @@ fn emit(line: String) -> serde_json::Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreground_run_streams_live_progress_through_on_update() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
 
@@ -104,14 +101,6 @@ async fn foreground_run_streams_live_progress_through_on_update() {
     std::fs::write(&script_path, script.to_string()).expect("write script");
 
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's `ENV_MUTATION_LOCK` doc.
-    unsafe {
-        std::env::set_var("CYRUP_SUBAGENT_BINARY", &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-        // Isolate user-scope discovery from the developer's real `~/.cyrup` (`dirs_home` honors
-        // `CYRUP_HOME` ahead of `HOME`) so this test never depends on machine-local settings.
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
 
     // The host sink: capture every `ToolUpdate` the run streams.
     let updates: Arc<Mutex<Vec<ToolUpdate>>> = Arc::new(Mutex::new(Vec::new()));
@@ -122,7 +111,17 @@ async fn foreground_run_streams_live_progress_through_on_update() {
         }
     });
 
-    let executor = SubagentExecutor::new();
+    // This run names its own binary, script and home root instead of moving three process-global
+    // vars every concurrently-running test in this binary shares. `run_foreground_streaming` is a
+    // FOREGROUND path, which is what `spawn_command` reaches.
+    let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
+        spawn_command: Some(SpawnCommand {
+            binary: fixture,
+            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        }),
+        roots: Roots::sandboxed(home.path()),
+        ..SubagentExtensionConfig::default()
+    });
     let (result, _run_id) = tokio::time::timeout(
         Duration::from_secs(15),
         executor.run_foreground_streaming(
@@ -144,13 +143,6 @@ async fn foreground_run_streams_live_progress_through_on_update() {
     .await
     .expect("streaming foreground run must not hang against a fast fixture child")
     .expect("run_foreground_streaming resolves the persona and completes");
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var("CYRUP_SUBAGENT_BINARY");
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     assert_eq!(result.exit_code, 0, "the scripted fixture run must exit 0: {result:?}");
 
@@ -229,7 +221,6 @@ async fn foreground_run_streams_live_progress_through_on_update() {
 /// (or the 15s outer timeout would trip) against the pre-fix code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreground_run_honors_an_already_cancelled_host_token() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
 
@@ -257,12 +248,6 @@ async fn foreground_run_honors_an_already_cancelled_host_token() {
     std::fs::write(&script_path, script.to_string()).expect("write script");
 
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's `ENV_MUTATION_LOCK` doc.
-    unsafe {
-        std::env::set_var("CYRUP_SUBAGENT_BINARY", &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
 
     let on_update: ToolUpdateSink = Box::new(|_u: ToolUpdate| {});
 
@@ -271,7 +256,17 @@ async fn foreground_run_honors_an_already_cancelled_host_token() {
     let cancel = CancelToken::new();
     cancel.cancel();
 
-    let executor = SubagentExecutor::new();
+    // This run names its own binary, script and home root instead of moving three process-global
+    // vars every concurrently-running test in this binary shares. `run_foreground_streaming` is a
+    // FOREGROUND path, which is what `spawn_command` reaches.
+    let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
+        spawn_command: Some(SpawnCommand {
+            binary: fixture,
+            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        }),
+        roots: Roots::sandboxed(home.path()),
+        ..SubagentExtensionConfig::default()
+    });
     let started = std::time::Instant::now();
     let (result, _run_id) = tokio::time::timeout(
         Duration::from_secs(15),
@@ -295,13 +290,6 @@ async fn foreground_run_honors_an_already_cancelled_host_token() {
     .expect("an honored cancel must settle the run long before the 15s outer timeout")
     .expect("a cancelled run still resolves to a terminal SingleResult, not an Err");
     let elapsed = started.elapsed();
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var("CYRUP_SUBAGENT_BINARY");
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     assert!(
         elapsed < Duration::from_secs(5),

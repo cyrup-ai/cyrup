@@ -43,10 +43,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::sync::Mutex as AsyncMutex;
 
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::child_protocol::MAX_CHILD_STDERR_BYTES;
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
@@ -55,11 +55,6 @@ use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult};
 use cyrup_ext_subagents::fork_context::ForkContext;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 
-/// Serializes every test mutating `CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT` (global).
-static ENV_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
-
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -69,29 +64,6 @@ fn write_script(dir: &Path, name: &str, script: &serde_json::Value) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, script.to_string()).expect("write fixture script");
     path
-}
-
-/// RAII guard installing the fixture-binary + script env for one test.
-struct FixtureEnvGuard;
-impl FixtureEnvGuard {
-    fn install(script_path: &Path) -> Self {
-        let fixture = fixture_binary_path();
-        // SAFETY: scoped, mutex-serialized env mutation (Rust 2024 requires `unsafe` for set_var).
-        unsafe {
-            std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-            std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, script_path);
-        }
-        Self
-    }
-}
-impl Drop for FixtureEnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `install`.
-        unsafe {
-            std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-            std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        }
-    }
 }
 
 fn base_agent_config(model: &str) -> AgentConfig {
@@ -122,10 +94,25 @@ fn base_agent_config(model: &str) -> AgentConfig {
     }
 }
 
+/// The fixture binary plus its script, named for ONE run rather than moved into the process
+/// environment that every concurrently-running test in this binary shares. `base_args` reaches
+/// the child's argv and, via `CYRUP_SUBAGENT_BINARY_ARGS`, any grandchild that re-execs.
+fn fixture_spawn_command(script_path: &Path) -> SpawnCommand {
+    SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    }
+}
+
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
+        // SUBA-078: this fixture exercises no reasoning ceiling — `None` is "no ceiling
+        // configured, so the bound is off", matching `runner_main.rs`'s own hop-2 default.
+        thinking_ceiling: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -179,9 +166,9 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
 /// so the only way to reach it is a parent waiting on an exit that can never come.
 async fn run_fixture(dir: &Path, script: &serde_json::Value, name: &str) -> SingleResult {
     let script_path = write_script(dir, name, script);
-    let _env = FixtureEnvGuard::install(&script_path);
     let agent = base_agent_config("fixture-model");
-    let opts = base_run_options(dir, "fixture-model");
+    let mut opts = base_run_options(dir, "fixture-model");
+    opts.spawn_command = Some(fixture_spawn_command(&script_path));
     tokio::time::timeout(
         Duration::from_secs(60),
         cyrup_ext_subagents::exec::run_sync(&agent, "do the thing", &opts),
@@ -209,7 +196,6 @@ async fn run_fixture(dir: &Path, script: &serde_json::Value, name: &str) -> Sing
 /// the jam".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_child_writing_more_stderr_than_the_pipe_buffer_does_not_deadlock_the_parent() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     const PAD_BYTES: usize = 200 * 1024;
@@ -259,7 +245,6 @@ async fn a_child_writing_more_stderr_than_the_pipe_buffer_does_not_deadlock_the_
 /// the total is over the tail bound — both bounds are engaged at once, and only the tail may win.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_over_limit_stderr_line_surfaces_its_tail_not_a_truncation() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     const TAIL_MARKER: &str = " ::panicked at 'index out of bounds'";

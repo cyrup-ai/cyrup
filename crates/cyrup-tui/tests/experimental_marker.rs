@@ -19,9 +19,24 @@
 //! launched. `AppState::new` now answers the predicate, which is the port of upstream reading
 //! `process.env` inside `render()`.
 //!
-//! **This file mutates the process environment**, so it is its own test binary with ONE `#[test]`:
-//! `std::env::set_var` is process-global and Rust 2024 makes it `unsafe` precisely because a
-//! sibling test running on another thread would see the change.
+//! # Soundness: the criterion is the THREAD, not the binary
+//!
+//! `std::env::set_var` is `unsafe` in Rust 2024 because it races ANY concurrent `getenv` in the
+//! process — not only a reader looking for the same key, and not only a sibling *test*. So the
+//! condition is that nothing else in this process is running: this file holds exactly one
+//! `#[test]`, which spawns no threads and starts no runtime.
+//!
+//! "It is its own test binary" is the weaker claim and it is not sufficient on its own — a binary
+//! can hold two tests, and this workspace has already had one where consolidation silently voided
+//! that argument. If a second test is ever added here, this mutation stops being sound, and no
+//! lock fixes it.
+
+// The workspace `clippy.toml` disallows process-env mutation; this file is one of the few places it
+// is correct. Its whole subject is the thin env-READING wrapper over an injectable core
+// (`experimental_features_enabled_from`), and that wrapper is exactly what an injected test cannot cover: a typo in the variable
+// NAME inside it would pass every `_from` test in the workspace. One real-environment proof per
+// wrapper, in a binary that holds one test, is the cheapest way to close that gap.
+#![allow(clippy::disallowed_methods)]
 
 use cyrup_tui::{experimental_features_enabled, experimental_features_enabled_from, App, UiTheme};
 use ratatui::backend::TestBackend;
@@ -29,7 +44,11 @@ use ratatui::backend::TestBackend;
 /// Set (or clear) an env var. Sound here because this binary runs exactly one test, single-threaded
 /// with respect to any other reader of these two variables.
 fn set_env(key: &str, value: Option<&str>) {
-    // SAFETY: single-test binary; no other thread reads or writes the environment concurrently.
+    // SAFETY: the criterion is the THREAD, not the binary. `set_var` races any concurrent `getenv`
+    // for ANY key — not merely a reader of this one — so it is sound only when nothing else in the
+    // process is running. This binary holds one `#[test]`, which spawns no threads and starts no
+    // runtime, so no other thread exists to race it. Adding a second test here re-creates the
+    // race, and no lock fixes it.
     unsafe {
         match value {
             Some(v) => std::env::set_var(key, v),
