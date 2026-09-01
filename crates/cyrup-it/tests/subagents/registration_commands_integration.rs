@@ -19,7 +19,7 @@
 //! Lives in `tests/` (a separate compilation unit from this crate's own `lib.rs`) for the same
 //! reason every other fixture-based integration test in this crate does: these tests need to
 //! mutate `CYRUP_HOME`/`CYRUP_SUBAGENT_BINARY` (process-global state) via
-//! `std::env::set_var`/`remove_var`, which Rust 2024 requires `unsafe` for — a `#[cfg(test)]`
+//! (historically) `std::env::set_var`/`remove_var`, which Rust 2024 requires `unsafe` for — a `#[cfg(test)]`
 //! module inside `src/` cannot do this because this crate's own `#![forbid(unsafe_code)]`
 //! (`src/lib.rs`) applies even to its own test code (a HARD forbid, unlike `deny`, cannot be
 //! locally `#[allow(...)]`-ed away).
@@ -31,77 +31,37 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 
-use tokio::sync::Mutex;
 
 use cyrup_ext::native::{ExtMode, HostCtx, NativeExtension};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::profiles::{load_profile, NamedProfile};
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 
-/// Serializes every test in this file that mutates `CYRUP_HOME`/`CYRUP_SUBAGENT_BINARY`
-/// (process-global state) — mirrors every fixture-based integration test in this crate's
-/// identical `ENV_MUTATION_LOCK` convention.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const CYRUP_HOME_ENV_VAR: &str = "CYRUP_HOME";
-const SUBAGENT_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
 
 /// RAII guard installing `CYRUP_HOME` at a temp dir for the life of one test.
-struct CyrupHomeGuard {
-    _dir: tempfile::TempDir,
-}
-
-impl CyrupHomeGuard {
-    fn install() -> (Self, PathBuf) {
-        let dir = tempfile::tempdir().expect("real tempdir");
-        let path = dir.path().to_path_buf();
-        // SAFETY: scoped, mutex-serialized env mutation for the duration of one test — this file
-        // is a separate compilation unit from this crate's own `#![forbid(unsafe_code)]` `lib.rs`.
-        unsafe {
-            std::env::set_var(CYRUP_HOME_ENV_VAR, &path);
-        }
-        (Self { _dir: dir }, path)
-    }
-}
-
-impl Drop for CyrupHomeGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `install`'s own safety comment.
-        unsafe {
-            std::env::remove_var(CYRUP_HOME_ENV_VAR);
-        }
-    }
-}
-
-/// RAII guard pointing `resolve_spawn_command`'s tier-1 `CYRUP_SUBAGENT_BINARY` override
-/// (R-SA-045) at the scripted-NDJSON `cyrup-subagent-fixture` test-double (arch-SA §11) for the
-/// life of one test, so every `probe_model` call this test's `execute_command` dispatch triggers
-/// spawns that deterministic, network-free real child process — with NO
-/// `CYRUP_SUBAGENT_FIXTURE_SCRIPT` set, the fixture degrades to its documented no-script default
-/// (emit nothing, exit 0 immediately), which `probe_model_with` classifies as `ProbeStatus::Ok`
-/// ("Probe succeeded.") exactly like pi's own test suite's canned `{code: 0, stdout: "OK"}` stub
-/// exec result (`profiles.test.ts`).
-struct FixtureBinaryGuard;
-
-impl FixtureBinaryGuard {
-    fn install() -> Self {
-        let fixture = crate::support::bins::subagent_fixture();
-        // SAFETY: see `CyrupHomeGuard::install`'s identical safety comment.
-        unsafe {
-            std::env::set_var(SUBAGENT_BINARY_ENV_VAR, &fixture);
-        }
-        Self
-    }
-}
-
-impl Drop for FixtureBinaryGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `CyrupHomeGuard::install`'s identical safety comment.
-        unsafe {
-            std::env::remove_var(SUBAGENT_BINARY_ENV_VAR);
-        }
+/// The config one test runs under: its own `CYRUP_HOME` root, and
+/// `resolve_spawn_command`'s tier-1 override pointed at the scripted-NDJSON
+/// `cyrup-subagent-fixture` test-double (arch-SA §11), so every `probe_model` call this test's
+/// `execute_command` dispatch triggers spawns that deterministic, network-free real child.
+///
+/// With NO `--fixture-script` argv the fixture degrades to its documented no-script default (emit
+/// nothing, exit 0 immediately), which `probe_model_with` classifies as `ProbeStatus::Ok` ("Probe
+/// succeeded.") — exactly like pi's own suite's canned `{code: 0, stdout: "OK"}` stub result
+/// (`profiles.test.ts`).
+///
+/// Both were RAII env guards; neither moves process-global state now, so no lock is needed.
+fn sandboxed_config(home: &std::path::Path) -> SubagentExtensionConfig {
+    SubagentExtensionConfig {
+        roots: Roots::sandboxed(home),
+        spawn_command: Some(SpawnCommand {
+            binary: crate::support::bins::subagent_fixture(),
+            base_args: Vec::new(),
+        }),
+        ..SubagentExtensionConfig::default()
     }
 }
 
@@ -131,10 +91,9 @@ async fn subagents_models_command_reports_the_runtime_builtin_model_mapping() {
     // pi `/subagents-models` (slash-commands.ts:802-823 -> `handleModels`) reports the RUNTIME
     // builtin-agent -> model mapping, NOT a dump of the static provider catalog. This asserts the
     // mapping's header/shape and that it no longer dumps the catalog.
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        sandboxed_config(work_dir.path()),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -165,10 +124,9 @@ async fn subagents_models_command_reports_the_runtime_builtin_model_mapping() {
 
 #[tokio::test]
 async fn subagents_models_command_rejects_more_than_one_positional_token() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        sandboxed_config(work_dir.path()),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -190,13 +148,12 @@ async fn subagents_models_command_rejects_more_than_one_positional_token() {
 
 #[tokio::test]
 async fn subagents_refresh_provider_models_writes_a_real_catalog_cache_file() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    let (_home_guard, home) = CyrupHomeGuard::install();
-    let _fixture_guard = FixtureBinaryGuard::install();
+    let home_dir = tempfile::tempdir().expect("home tempdir");
+    let home = home_dir.path().to_path_buf();
 
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        sandboxed_config(&home),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -237,10 +194,9 @@ async fn subagents_refresh_provider_models_writes_a_real_catalog_cache_file() {
 
 #[tokio::test]
 async fn subagents_refresh_provider_models_rejects_unsafe_provider_names() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        sandboxed_config(work_dir.path()),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -262,13 +218,12 @@ async fn subagents_refresh_provider_models_rejects_unsafe_provider_names() {
 
 #[tokio::test]
 async fn subagents_generate_profiles_writes_two_real_loadable_profiles() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    let (_home_guard, home) = CyrupHomeGuard::install();
-    let _fixture_guard = FixtureBinaryGuard::install();
+    let home_dir = tempfile::tempdir().expect("home tempdir");
+    let home = home_dir.path().to_path_buf();
 
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        sandboxed_config(&home),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -300,9 +255,8 @@ async fn subagents_generate_profiles_writes_two_real_loadable_profiles() {
 
 #[tokio::test]
 async fn subagents_check_profile_cross_references_the_real_model_registry() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    let (_home_guard, home) = CyrupHomeGuard::install();
-    let _fixture_guard = FixtureBinaryGuard::install();
+    let home_dir = tempfile::tempdir().expect("home tempdir");
+    let home = home_dir.path().to_path_buf();
 
     let profiles_dir = home.join(".cyrup").join("subagents").join("profiles");
     tokio::fs::create_dir_all(&profiles_dir).await.expect("mkdir profiles dir");
@@ -341,6 +295,8 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
             disable_thinking: None,
             // SUBA-003 added this field; a profile declares no model-scope policy of its own.
             model_scope: None,
+            // SUBA-078 added this field; a profile declares no reasoning ceiling of its own.
+            max_thinking: None,
         },
     };
     tokio::fs::write(profiles_dir.join("mixed.json"), serde_json::to_vec_pretty(&profile).expect("serialize"))
@@ -368,6 +324,8 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
             disable_thinking: None,
             // SUBA-003 added this field; a profile declares no model-scope policy of its own.
             model_scope: None,
+            // SUBA-078 added this field; a profile declares no reasoning ceiling of its own.
+            max_thinking: None,
         },
     };
     tokio::fs::write(
@@ -379,7 +337,7 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
 
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        sandboxed_config(&home),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -411,12 +369,11 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
 
 #[tokio::test]
 async fn subagents_check_profile_errors_for_a_nonexistent_profile() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    let (_home_guard, _home) = CyrupHomeGuard::install();
+    let home_dir = tempfile::tempdir().expect("home tempdir");
 
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        sandboxed_config(home_dir.path()),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -450,10 +407,9 @@ async fn subagents_check_profile_errors_for_a_nonexistent_profile() {
 /// extension never registered. Before the removal all four of these returned real, rendered output.
 #[tokio::test]
 async fn subagents_companions_is_no_longer_a_registered_command() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        sandboxed_config(work_dir.path()),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());

@@ -292,10 +292,241 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+// =================================================================================================
+// The workspace's ONE home ladder and ONE agent-directory ladder
+// =================================================================================================
+//
+// Before these, eight resolvers across five crates answered "where is home" and five answered
+// "where is the agent dir", with different key sets and different rungs. Two of them
+// (`cyrup_intercom::paths` and `cyrup_ext_subagents::native_supervisor`) were byte-identical by
+// intent, the second documented as "pinned byte-identical … across a dependency edge that forbids
+// importing it" — the shared answer had nowhere to live, because the crate that owns layout
+// resolution carried neither ladder. It does now.
+
+/// The environment, supplied rather than read — the shape every ladder below takes.
+///
+/// `OsString` rather than `String` because these answers become paths: a `String`-shaped lookup
+/// silently drops a non-UTF-8 value to the next rung, which is a different ladder from the one
+/// documented. The `_from` shape (rather than reading `std::env` here) is what lets a test drive
+/// every rung: `std::env::set_var` is `unsafe` under Rust 2024 and this crate is
+/// `#![forbid(unsafe_code)]`, so the process environment is not writable from here at all — and
+/// would race sibling tests in the same binary if it were.
+pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<std::ffi::OsString>;
+
+/// The root every cyrup path resolves against.
+///
+/// Nothing in this workspace sets it outside tests, where it is the sandbox lever that keeps a
+/// run's artifacts out of the developer's real home.
+pub const ENV_HOME: &str = "CYRUP_HOME";
+
+/// The agent-directory override, in precedence order.
+///
+/// CFG-076: upstream has exactly ONE name, `PI_CODING_AGENT_DIR`. cyrup's rename split it — core
+/// took the short `CYRUP_AGENT_DIR` (what `--help` advertises) while `cyrup-intercom` and
+/// `cyrup-ext-subagents`' supervisor took the mechanical long form `CYRUP_CODING_AGENT_DIR`.
+/// Reading all three from ONE place is what actually restores upstream's one-name-one-tree
+/// property. Before this constant, `cyrup-config` read all three while four other resolvers read
+/// subsets, so a `CYRUP_CODING_AGENT_DIR` moved the binary's layout and left
+/// `cyrup-ext-subagents`' agent memory, run history, settings, prompts and sessions behind in the
+/// un-relocated tree (MCP-139 gap 1, "the agent-dir consolidation did not happen").
+pub const ENV_AGENT_DIR_KEYS: [&str; 3] =
+    ["CYRUP_AGENT_DIR", ENV_CODING_AGENT_DIR, "PI_CODING_AGENT_DIR"];
+
+/// The sibling-port spelling of the agent-dir override, named on its own because two resolvers
+/// read it OUTSIDE the ladder above and must spell it identically:
+/// `cyrup_intercom::paths::agent_dir_path_from` and
+/// `cyrup_ext_subagents::native_supervisor::intercom_agent_dir_from` implement pi's
+/// `getAgentDirPath`, whose override resolves a RELATIVE value against `cwd` rather than
+/// `~`-expanding it against home. That is a genuinely different question from
+/// [`cyrup_agent_dir_from`]'s, so those two keep their own branch — but not their own string.
+pub const ENV_CODING_AGENT_DIR: &str = "CYRUP_CODING_AGENT_DIR";
+
+/// A set-but-blank variable is treated as unset.
+///
+/// Load-bearing rather than defensive: `PathBuf::from("")` is the RELATIVE empty path, so a blank
+/// `CYRUP_HOME` taken verbatim would root every derived tree at the process working directory.
+/// A non-UTF-8 value can never be blank in this sense and passes through.
+pub(crate) fn non_blank(value: std::ffi::OsString) -> Option<std::ffi::OsString> {
+    if value.to_str().is_some_and(|s| s.trim().is_empty()) {
+        return None;
+    }
+    Some(value)
+}
+
+/// **THE home ladder**: `CYRUP_HOME` -> `HOME` -> the OS home directory.
+///
+/// Returns `Option` rather than picking a terminal, because the two terminals in this workspace are
+/// both correct and neither is shared: a BINARY that cannot locate home should refuse
+/// ([`crate::ConfigDirs::resolve`] turns `None` into an error), while a LIBRARY must not panic
+/// (`cyrup_ext_subagents::paths::home_dir` falls to [`std::env::temp_dir`]). Callers choose; the
+/// ladder does not choose for them.
+///
+/// `HOME` precedes the OS home because that is what four of the five pre-existing resolvers did,
+/// what pi's `getHomeDir()` does, and what [`crate::ConfigDirs::home`]'s own doc already claimed
+/// (*"`process.env.HOME || homedir()`"*) while its code had the two the other way round — a
+/// difference observable only on Windows, where `HOME` is usually unset and the two agree anyway.
+#[must_use]
+pub fn cyrup_home_dir_from(env: EnvLookup<'_>) -> Option<PathBuf> {
+    cyrup_home_override_from(env).or_else(ambient_home)
+}
+
+/// The ENVIRONMENT rungs of the home ladder alone — `CYRUP_HOME` -> `HOME` — without the OS-home
+/// terminal.
+///
+/// For a caller that carries its own OS-home seam and must keep it reachable.
+/// `cyrup_intercom::paths::agent_dir_path_from` is the live example: it takes `home_dir` as a
+/// parameter precisely so its resolution table is provable without touching process state, and
+/// calling [`cyrup_home_dir_from`] there would let [`ambient_home`] answer first and leave that
+/// parameter dead — which is an ambient read smuggled back into a function written to have none.
+#[must_use]
+pub fn cyrup_home_override_from(env: EnvLookup<'_>) -> Option<PathBuf> {
+    env(ENV_HOME)
+        .and_then(non_blank)
+        .or_else(|| env("HOME").and_then(non_blank))
+        .map(PathBuf::from)
+}
+
+/// `<home>/.cyrup` — the directory `cyrup-intercom` and `cyrup-ext-subagents`' supervisor each
+/// derived through their own private copy of the home ladder.
+///
+/// Takes the library terminal ([`std::env::temp_dir`]) because both callers are libraries.
+#[must_use]
+pub fn cyrup_dir_from(env: EnvLookup<'_>) -> PathBuf {
+    cyrup_home_dir_from(env)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".cyrup")
+}
+
+/// The ENVIRONMENT tier of a directory override: the first non-blank key, `~`-expanded against
+/// `home`. `None` when no key is set, so a caller with further tiers (a CLI flag, a default) can
+/// layer them itself.
+///
+/// `home` is a parameter and is never read here. That is deliberate, and it closes a real
+/// divergence: the two pre-existing implementations expanded a `~/…` override against *different*
+/// homes — `cyrup_ext_subagents::paths::resolve_agent_dir` against its own (`CYRUP_HOME`-aware)
+/// home, and `ConfigDirs` through [`normalize_path_buf`], which anchors on [`ambient_home`] and
+/// never consults `CYRUP_HOME`. With both an agent-dir override and a home override set, the two
+/// landed in different directories.
+#[must_use]
+pub fn cyrup_dir_override_from(
+    keys: &[&str],
+    home: Option<&std::path::Path>,
+    env: EnvLookup<'_>,
+) -> Option<PathBuf> {
+    keys.iter()
+        .find_map(|key| env(key).and_then(non_blank))
+        .map(|value| expand_against_home(&value, home))
+}
+
+/// **THE agent-dir ladder**: [`cyrup_dir_override_from`] over [`ENV_AGENT_DIR_KEYS`], else
+/// `<home>/.cyrup/agent`.
+#[must_use]
+pub fn cyrup_agent_dir_from(home: &std::path::Path, env: EnvLookup<'_>) -> PathBuf {
+    cyrup_dir_override_from(&ENV_AGENT_DIR_KEYS, Some(home), env)
+        .unwrap_or_else(|| home.join(".cyrup").join("agent"))
+}
+
+/// [`normalize_path_with_home`] for a value that may not be UTF-8.
+///
+/// A non-UTF-8 path cannot carry a leading `~` this would expand, so it passes through verbatim
+/// rather than being flattened by a lossy conversion.
+fn expand_against_home(value: &std::ffi::OsStr, home: Option<&std::path::Path>) -> PathBuf {
+    value.to_str().map_or_else(
+        || PathBuf::from(value),
+        |s| PathBuf::from(normalize_path_with_home(s, home)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    // =============================================================================================
+    // The shared ladders
+    // =============================================================================================
+
+    /// A fixed environment table. Nothing here writes the process environment: `set_var` is
+    /// `unsafe` under Rust 2024, this crate is `#![forbid(unsafe_code)]`, and the whole reason the
+    /// ladders take a lookup is so every rung is provable without it.
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let owned: Vec<(String, std::ffi::OsString)> =
+            pairs.iter().map(|(k, v)| ((*k).to_string(), std::ffi::OsString::from(*v))).collect();
+        move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    /// `CYRUP_HOME` -> `HOME` -> OS home, in that order, with blanks treated as unset.
+    #[test]
+    fn the_home_ladder_is_one_ladder() {
+        let lookup = env(&[("CYRUP_HOME", "/sandbox"), ("HOME", "/real")]);
+        assert_eq!(super::cyrup_home_dir_from(&lookup), Some(PathBuf::from("/sandbox")));
+
+        let lookup = env(&[("HOME", "/real")]);
+        assert_eq!(super::cyrup_home_dir_from(&lookup), Some(PathBuf::from("/real")));
+
+        // A set-but-blank value is UNSET. `PathBuf::from("")` is the relative empty path, so
+        // honouring it would root every derived tree at the process working directory.
+        let lookup = env(&[("CYRUP_HOME", "   "), ("HOME", "/real")]);
+        assert_eq!(super::cyrup_home_dir_from(&lookup), Some(PathBuf::from("/real")));
+
+        // Nothing set: the ladder declines rather than picking a terminal. That is what lets
+        // `ConfigDirs::resolve` error while `cyrup_ext_subagents` falls to a temp dir.
+        assert_eq!(super::cyrup_home_dir_from(&env(&[])), super::ambient_home());
+    }
+
+    /// MCP-139 gap 1 — CFG-076's "whichever spelling is set, core lands on the same directory the
+    /// siblings do" is only true if ONE resolver reads all three names. It was not: `cyrup-config`
+    /// read three, `cyrup_ext_subagents::paths::resolve_agent_dir` and
+    /// `cyrup_ext::npx_resolver::agent_dir` read two (missing the middle one), and
+    /// `cyrup-intercom` read one. Setting `CYRUP_CODING_AGENT_DIR` therefore moved the binary's
+    /// layout and left agent memory, run history, settings, prompts and sessions behind.
+    #[test]
+    fn every_agent_dir_spelling_reaches_the_one_ladder() {
+        let home = PathBuf::from("/home/u");
+        for key in super::ENV_AGENT_DIR_KEYS {
+            assert_eq!(
+                super::cyrup_agent_dir_from(&home, &env(&[(key, "/opt/agent")])),
+                PathBuf::from("/opt/agent"),
+                "{key} must move the agent dir"
+            );
+        }
+        // Documented precedence: short name, then the sibling spelling, then the `PI_` fallback.
+        let all = env(&[
+            ("CYRUP_AGENT_DIR", "/short"),
+            ("CYRUP_CODING_AGENT_DIR", "/long"),
+            ("PI_CODING_AGENT_DIR", "/legacy"),
+        ]);
+        assert_eq!(super::cyrup_agent_dir_from(&home, &all), PathBuf::from("/short"));
+        // Unset: `<home>/.cyrup/agent`.
+        assert_eq!(
+            super::cyrup_agent_dir_from(&home, &env(&[])),
+            home.join(".cyrup").join("agent")
+        );
+    }
+
+    /// The tilde anchor. `resolve_agent_dir` expanded `~/…` against its own (`CYRUP_HOME`-aware)
+    /// home while `ConfigDirs` expanded it through `normalize_path_buf`, which anchors on
+    /// `ambient_home()` and never consults `CYRUP_HOME` — so with both overrides set the two
+    /// landed in different directories. `home` is a parameter here, which is what closes that.
+    #[test]
+    fn a_tilde_agent_dir_anchors_on_the_supplied_home_not_an_ambient_one() {
+        let sandbox = PathBuf::from("/sandbox");
+        let lookup = env(&[("CYRUP_AGENT_DIR", "~/agents")]);
+        assert_eq!(super::cyrup_agent_dir_from(&sandbox, &lookup), sandbox.join("agents"));
+        assert_eq!(
+            super::cyrup_agent_dir_from(Path::new("/other"), &lookup),
+            PathBuf::from("/other/agents"),
+            "the same override resolves against whichever home it is given, and nothing else"
+        );
+    }
+
+    /// `<home>/.cyrup` — the answer `cyrup-intercom` and `cyrup-ext-subagents`' supervisor each
+    /// derived through a private copy of the home ladder, kept in step by a pinning test.
+    #[test]
+    fn the_cyrup_dir_hangs_off_the_same_home() {
+        let lookup = env(&[("CYRUP_HOME", "/sandbox"), ("HOME", "/real")]);
+        assert_eq!(super::cyrup_dir_from(&lookup), PathBuf::from("/sandbox/.cyrup"));
+    }
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn expands_bare_tilde_and_tilde_slash_against_the_supplied_home() {

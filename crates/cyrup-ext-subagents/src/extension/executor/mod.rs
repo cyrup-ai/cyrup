@@ -187,6 +187,16 @@ impl SubagentExecutor {
         Self { completion_sink_override: Some(sink), ..Self::new() }
     }
 
+    /// Construct an executor that starts from `config` rather than
+    /// [`SubagentExtensionConfig::default`]. [`Self::new`] leaves a caller able to build this type
+    /// but not to configure it — the extension itself reaches past that through the `pub(crate)`
+    /// [`Self::config_cell`], which no other crate can use. This is that seam, public: the same
+    /// `with_*` shape [`Self::with_completion_sink`] already establishes.
+    #[must_use]
+    pub fn with_config(config: SubagentExtensionConfig) -> Self {
+        Self { config: Arc::new(AsyncMutex::new(config)), ..Self::new() }
+    }
+
     /// Late-bind the live capability backend (P-1). Called by
     /// [`cyrup_ext::native::NativeExtension::set_host_services`] (which the builder invokes via
     /// `load_native_with_services` BEFORE `init`) so the `SessionStart` handler, the fork-context

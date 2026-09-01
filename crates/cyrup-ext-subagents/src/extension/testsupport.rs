@@ -19,8 +19,8 @@ use crate::background::RunMode;
 use crate::background::RunPaths;
 use crate::background::RunState;
 use crate::background::StepState;
-use crate::extension::executor::paths::default_async_root;
-use crate::extension::executor::paths::default_results_dir;
+use crate::extension::executor::paths::default_async_root_in;
+use crate::extension::executor::paths::default_results_dir_in;
 use cyrup_core::CancelToken;
 use cyrup_core::ToolCallId;
 use cyrup_core::ToolError;
@@ -104,8 +104,8 @@ impl cyrup_ext::host::HostServices for FixedSessionHost {
 /// `(Running, None)`, so before this change such a run stayed in `/subagents-fleet` and in
 /// `{action:"status"}` forever with no supported way to clear it.
 pub(crate) fn seed_orphaned_run(cwd: &Path, run_id: &str, session: Option<&str>, pid: Option<u32>) -> RunPaths {
-    let async_root = default_async_root(cwd);
-    let results_dir = default_results_dir(cwd);
+    let async_root = default_async_root_in(&crate::paths::Roots::from_env(), cwd);
+    let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), cwd);
     let id = RunId::from_token(run_id.to_string());
     let paths = RunPaths::for_run(&async_root, &results_dir, &id);
     std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
@@ -130,8 +130,8 @@ pub(crate) fn seed_orphaned_run(cwd: &Path, run_id: &str, session: Option<&str>,
 /// user types `subagent({ action: "status" | "steer", … })`, so every test built on it drives the
 /// same code path a live run does.
 pub(crate) fn seed_running_run(cwd: &Path, run_id: &str, agents: &[&str]) -> RunPaths {
-    let async_root = default_async_root(cwd);
-    let results_dir = default_results_dir(cwd);
+    let async_root = default_async_root_in(&crate::paths::Roots::from_env(), cwd);
+    let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), cwd);
     let id = RunId::from_token(run_id.to_string());
     let paths = RunPaths::for_run(&async_root, &results_dir, &id);
     std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");

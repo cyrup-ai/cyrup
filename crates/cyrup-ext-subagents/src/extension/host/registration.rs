@@ -78,9 +78,10 @@ const PROJECT_SUBDIR: &str = ".cyrup";
 
 /// Truthy-env test, identical to the two sibling companions' own `env_truthy`
 /// (`cyrup_intercom` / `cyrup_permission_system`): `1`/`true`/`on`/`yes` (trimmed) are truthy.
-fn env_truthy(name: &str) -> bool {
+/// [`env_truthy`] over an injected lookup.
+fn env_truthy_with(get: &dyn Fn(&str) -> Option<String>, name: &str) -> bool {
     matches!(
-        std::env::var(name).ok().as_deref().map(str::trim),
+        get(name).as_deref().map(str::trim),
         Some("1") | Some("true") | Some("on") | Some("yes")
     )
 }
@@ -96,7 +97,22 @@ fn env_truthy(name: &str) -> bool {
 /// parent spawned it, so the child needs the restricted surface regardless).
 #[must_use]
 pub fn is_installed(agent_dir: &Path, cwd: &Path) -> bool {
-    if env_truthy(INSTALL_ENV_VAR) {
+    is_installed_with(&|k| std::env::var(k).ok(), agent_dir, cwd)
+}
+
+/// [`is_installed`] over an injected environment lookup.
+///
+/// The `CYRUP_SUBAGENTS` branch is the half a caller usually wants to pin, and pinning it here
+/// costs nothing: the file-presence half below is unchanged, so a test proves the real precedence
+/// (env first, then either config file) without moving a process-global variable that every
+/// concurrent reader of the environment races.
+#[must_use]
+pub fn is_installed_with(
+    get: &dyn Fn(&str) -> Option<String>,
+    agent_dir: &Path,
+    cwd: &Path,
+) -> bool {
+    if env_truthy_with(get, INSTALL_ENV_VAR) {
         return true;
     }
     [
@@ -259,35 +275,36 @@ mod tests {
     fn is_installed_reads_the_config_file_signals() {
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
-        // `is_installed` ORs the `CYRUP_SUBAGENTS` env signal with the config-file signals, so
-        // account for whatever this process's ambient env already is (e.g. a developer/CI shell with
-        // `CYRUP_SUBAGENTS=1` set workspace-wide) rather than assuming it is unset — this crate is
-        // `#![forbid(unsafe_code)]`, so a `src/` test cannot sandbox the process env via
-        // `set_var`/`remove_var` to force the "no env" case (the env branch itself is exercised,
-        // fully sandboxed, by `tests/subagents_optin_gate_integration.rs`).
-        let env_opted_in = env_truthy(INSTALL_ENV_VAR);
+        // `is_installed` ORs the `CYRUP_SUBAGENTS` env signal with the config-file signals. This
+        // used to read the AMBIENT value and assert the result merely matched it, which could not
+        // fail either way — a developer shell with `CYRUP_SUBAGENTS=1` made every case below
+        // vacuously true. `is_installed_with` pins the env half instead, so the file signals are
+        // what is actually under test, with no `set_var` and no dependence on the caller's shell.
+        let unset = |_: &str| None;
 
-        // Neither file present → installed iff the ambient env already opted in.
-        assert_eq!(is_installed(agent.path(), cwd.path()), env_opted_in);
+        // Neither file present, env not opted in → not installed.
+        assert!(!is_installed_with(&unset, agent.path(), cwd.path()));
+
+        // Env opted in on its own is sufficient, with no file present at all.
+        assert!(is_installed_with(&|_| Some("1".to_string()), agent.path(), cwd.path()));
 
         // User-scope tier-3 config present → installed regardless of env.
         let user_cfg = agent.path().join("subagents");
         std::fs::create_dir_all(&user_cfg).expect("mkdir user subagents");
         std::fs::write(user_cfg.join("config.json"), "{}").expect("write user config");
-        assert!(is_installed(agent.path(), cwd.path()));
+        assert!(is_installed_with(&unset, agent.path(), cwd.path()));
 
-        // Project-scope config present (with a FRESH agent dir that has no user config) → installed
-        // iff the ambient env already opted in, until the project config is written.
+        // Project-scope config present (with a FRESH agent dir that has no user config) → NOT
+        // installed until the project config is written.
         let agent2 = tempfile::tempdir().expect("agent dir 2");
-        assert_eq!(
-            is_installed(agent2.path(), cwd.path()),
-            env_opted_in,
+        assert!(
+            !is_installed_with(&unset, agent2.path(), cwd.path()),
             "sanity: agent2 has no user config yet"
         );
         let proj_cfg = cwd.path().join(".cyrup").join("subagents");
         std::fs::create_dir_all(&proj_cfg).expect("mkdir project subagents");
         std::fs::write(proj_cfg.join("config.json"), "{}").expect("write project config");
-        assert!(is_installed(agent2.path(), cwd.path()));
+        assert!(is_installed_with(&unset, agent2.path(), cwd.path()));
     }
 
     /// The composed install gate ([`gate_on_install`]) in isolation: a top-level `Full` survives ONLY

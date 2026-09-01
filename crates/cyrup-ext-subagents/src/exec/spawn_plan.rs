@@ -58,7 +58,12 @@ pub struct AttemptSpawnPlan {
 /// `off` — a value cyrup-core's closed on-only
 /// `ThinkingLevel` enum cannot itself represent, but which the string-level suffix check must still
 /// recognize so a model id that already ends `:off` is never double-suffixed.
-const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// SUBA-078: `pub(crate)` so [`crate::exec::thinking_ceiling`] ranks levels against the EXACT list
+/// [`split_known_thinking_suffix`] recognizes. Aliasing rather than copying is what makes the two
+/// structurally unable to disagree — a level one accepted and the other did not would slip the
+/// ceiling. Same rule as [`INHERIT_PROJECT_CONTEXT_ENV`]'s aliasing to its reader's declaration.
+pub(crate) const THINKING_LEVELS: [&str; 7] =
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// Child env flag: whether the subagent inherits the parent's project-context files
 /// (`AGENTS.md`/`CLAUDE.md`) — pi `PI_SUBAGENT_INHERIT_PROJECT_CONTEXT` (`runs/shared/pi-args.ts:215` @v0.34.0).
@@ -348,7 +353,12 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         )));
     }
 
-    let command = crate::spawn::resolve_spawn_command();
+    // An injected command wins; `None` falls back to the environment, leaving R-SA-045's
+    // three-tier priority exactly as it was for every caller that supplies nothing.
+    let command = opts
+        .spawn_command
+        .clone()
+        .unwrap_or_else(crate::spawn::resolve_spawn_command);
 
     // T4 (pi `applyThinkingSuffix`): the per-attempt model id, suffixed with the agent's frontmatter
     // reasoning level (`:high` etc.) unless it already carries a recognized `:<level>` suffix.
@@ -364,6 +374,30 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         thinking_override.is_some(),
     )
     .unwrap_or_else(|| model.as_str().to_string());
+
+    // SUBA-078 / pi `execution.ts:322` @v0.57.0: the ceiling is asserted once more HERE, on the
+    // exact id this attempt will launch with, immediately before the args are built. `run_sync`
+    // already swept the whole ladder, but this attempt's `model_arg` can carry a thinking OVERRIDE
+    // the sweep never saw (a sanitized fork's `:off`, SUBA-075), so this is the last point at which
+    // what the child is really about to be told can still be checked.
+    //
+    // Re-intersected with the inherited env rather than trusting `opts` alone — pi's `pi-args.ts`
+    // does the same at `:875-877` instead of relying on its caller's value.
+    let inherited_ceiling = crate::exec::thinking_ceiling::inherited_thinking_ceiling()
+        .map_err(SubagentError::ThinkingCeilingViolation)?;
+    let thinking_ceiling = crate::exec::thinking_ceiling::intersect_thinking_ceilings(&[
+        opts.thinking_ceiling.as_deref(),
+        inherited_ceiling.as_deref(),
+    ])
+    .map_err(SubagentError::ThinkingCeilingViolation)?;
+    crate::exec::thinking_ceiling::assert_thinking_within_ceiling(
+        Some(model_arg.as_str()),
+        thinking_override.or(agent.thinking.as_deref()),
+        thinking_ceiling.as_deref(),
+        Some(agent.name.as_str()),
+        opts.run_id.as_ref().map(crate::background::RunId::as_str),
+    )
+    .map_err(SubagentError::ThinkingCeilingViolation)?;
 
     let mut args: Vec<String> = vec![
         "--print".to_string(),
@@ -452,6 +486,32 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         &tools.effective_mcp_tools,
         &mut env_overlay,
     );
+
+    // An injected binary must reach the child's ENVIRONMENT as well as its argv. A child that
+    // spawns a grandchild of its own resolves that grandchild's command through
+    // `resolve_spawn_command()`, which reads the environment it inherited — the orchestrator-sim
+    // relay (`bin/cyrup_subagent_orchestrator_sim.rs`) depends on exactly that. Seeding the
+    // overlay keeps the relay working while this process's own environment stays untouched,
+    // which the `#![forbid(unsafe_code)]` crate could not do by setting the variable itself.
+    if opts.spawn_command.is_some() {
+        env_overlay.insert(
+            crate::spawn::SUBAGENT_BINARY_ENV_VAR.to_string(),
+            command.binary.display().to_string(),
+        );
+        // BOTH halves, ALWAYS — including an empty `base_args`, which encodes as `[]`.
+        // `env_overlay` is additive and `env_clear()` is never called anywhere in this crate
+        // (`spawn/mod.rs:198`/`:445`/`:523`), so omitting a variable does NOT unset it: the child
+        // would inherit whatever this process happens to carry. Skipping the insert here would
+        // therefore pair a freshly injected binary with a STALE inherited args value — one
+        // command's binary wearing another's leading argv, which is the very half-a-command
+        // failure this variable exists to prevent.
+        //
+        // `if let Ok` rather than `expect`: a `Vec<String>` always serializes, but the workspace
+        // forbids `unwrap`/`expect`.
+        if let Ok(encoded) = serde_json::to_string(&command.base_args) {
+            env_overlay.insert(crate::spawn::SUBAGENT_BINARY_ARGS_ENV_VAR.to_string(), encoded);
+        }
+    }
 
     let cwd = opts.cwd.clone();
 
@@ -920,7 +980,10 @@ fn env_identity_and_depth(
     ceiling_allowed_tools: Option<&Vec<String>>,
     ceiling_deny_extensions: bool,
 ) -> std::collections::HashMap<String, String> {
-    let mut env_overlay = crate::spawn::depth::to_env_overlay(&depth);
+    // Caller-supplied child entries first: everything this function adds below is a crate
+    // invariant (identity, depth, child role) and must win over them.
+    let mut env_overlay = opts.child_env.clone();
+    env_overlay.extend(crate::spawn::depth::to_env_overlay(&depth));
     // PERM-001 / pi `augmentChildEnv` (`runs/shared/pi-args.ts:329-330`): the child-ROLE pair, written on EVERY
     // spawn. This is the process about to BE a subagent child, so it must say so — see
     // [`crate::spawn::nested_events::child_role_env`] for the three subsystems that read it, chiefly
@@ -1247,6 +1310,25 @@ fn env_orchestration(
         env_overlay.insert(
             crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV.to_string(),
             encoded,
+        );
+    }
+
+    // SUBA-078 — the thinking ceiling crosses the same boundary, for the same reason (pi
+    // `pi-args.ts:875-879` @v0.57.0). Re-intersected with what this process itself inherited, so a
+    // grandchild is bound by the LOWEST of everything above it and can only ever tighten. Absent
+    // ceiling => no var, so an unbounded run does not inherit a stale bound from the parent's
+    // environment — the overlay only ever adds.
+    let inherited = crate::exec::thinking_ceiling::inherited_thinking_ceiling()
+        .map_err(SubagentError::ThinkingCeilingViolation)?;
+    let resolved = crate::exec::thinking_ceiling::intersect_thinking_ceilings(&[
+        opts.thinking_ceiling.as_deref(),
+        inherited.as_deref(),
+    ])
+    .map_err(SubagentError::ThinkingCeilingViolation)?;
+    if let Some(ceiling) = resolved {
+        env_overlay.insert(
+            crate::exec::thinking_ceiling::THINKING_CEILING_ENV.to_string(),
+            ceiling,
         );
     }
     Ok(())
@@ -1731,6 +1813,96 @@ mod tests {
             Some(&MCP_DIRECT_TOOLS_NONE_SENTINEL.to_string()),
             "denyExtensions must empty the RAW MCP_DIRECT_TOOLS env too, not just --tools; \
              overlay was {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
+    /// An injected command must reach the child's ENVIRONMENT, not just its argv: a child that
+    /// spawns a grandchild resolves that grandchild's command from what it inherited, so both
+    /// halves have to travel or the wrapper is rebuilt without its leading argv one hop down.
+    #[test]
+    fn an_injected_spawn_command_seeds_both_halves_into_the_child_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.spawn_command = Some(crate::spawn::SpawnCommand {
+            binary: dir.path().join("wrapper-shim"),
+            base_args: vec!["--launch".to_string(), "a b".to_string()],
+        });
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let agent = sample_agent_config("m1", &[]);
+
+        let plan = build_attempt_spawn_plan(
+            &agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+        )
+        .expect("plan builds");
+
+        assert_eq!(
+            plan.spec.env_overlay.get(crate::spawn::SUBAGENT_BINARY_ENV_VAR),
+            Some(&dir.path().join("wrapper-shim").display().to_string()),
+            "the binary half must travel; overlay was {:?}",
+            plan.spec.env_overlay
+        );
+        assert_eq!(
+            plan.spec.env_overlay.get(crate::spawn::SUBAGENT_BINARY_ARGS_ENV_VAR),
+            Some(&r#"["--launch","a b"]"#.to_string()),
+            "the args half must travel as JSON so an entry containing a space survives; overlay \
+             was {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
+    /// The regression this file's QA caught: an injected command with an EMPTY `base_args` must
+    /// still WRITE the args variable, as `[]`. `env_overlay` is additive and `env_clear()` is
+    /// never called, so omitting it would leave the child inheriting whatever this process
+    /// carries — pairing a freshly injected binary with a stale inherited argv, which is exactly
+    /// the half-a-command failure the variable exists to prevent.
+    #[test]
+    fn an_injected_command_with_no_base_args_still_writes_an_empty_args_var() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.spawn_command = Some(crate::spawn::SpawnCommand {
+            binary: dir.path().join("bare-binary"),
+            base_args: Vec::new(),
+        });
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let agent = sample_agent_config("m1", &[]);
+
+        let plan = build_attempt_spawn_plan(
+            &agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+        )
+        .expect("plan builds");
+
+        assert_eq!(
+            plan.spec.env_overlay.get(crate::spawn::SUBAGENT_BINARY_ARGS_ENV_VAR),
+            Some(&"[]".to_string()),
+            "an injected command must be authoritative over BOTH halves: writing `[]` is what \
+             stops a stale inherited args value from attaching to the injected binary; overlay \
+             was {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
+    /// The uninjected path is the whole installed base: it must add neither variable, so a run
+    /// that supplies no command resolves exactly as it did before this seam existed.
+    #[test]
+    fn no_injected_spawn_command_seeds_neither_env_var() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let agent = sample_agent_config("m1", &[]);
+
+        let plan = build_attempt_spawn_plan(
+            &agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+        )
+        .expect("plan builds");
+
+        assert!(
+            !plan.spec.env_overlay.contains_key(crate::spawn::SUBAGENT_BINARY_ENV_VAR)
+                && !plan
+                    .spec
+                    .env_overlay
+                    .contains_key(crate::spawn::SUBAGENT_BINARY_ARGS_ENV_VAR),
+            "an uninjected run must add neither variable; overlay was {:?}",
             plan.spec.env_overlay
         );
     }
@@ -4283,6 +4455,59 @@ mod tests {
     /// (`runs/shared/pi-args.ts:238-252` @v0.57.0). The third argument exists for exactly one
     /// caller: a sanitized fork's thinking override, which must REPLACE a level the id already
     /// names rather than defer to it.
+    /// SUBA-078 / pi `pi-args.ts:875-879` @v0.57.0: the resolved thinking ceiling crosses the
+    /// process boundary, which is what lets a nested subtree inherit it. An ABSENT ceiling writes
+    /// NO variable, so an unbounded run can never pick up a stale bound from the parent process's
+    /// own environment — the overlay only ever adds.
+    #[test]
+    fn the_thinking_ceiling_crosses_the_spawn_boundary_only_when_one_is_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.thinking_ceiling = Some("low".to_string());
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        assert_eq!(
+            plan.spec
+                .env_overlay
+                .get(crate::exec::thinking_ceiling::THINKING_CEILING_ENV)
+                .map(String::as_str),
+            Some("low"),
+            "the child must inherit the bound; overlay was {:?}",
+            plan.spec.env_overlay
+        );
+
+        let opts = base_opts(dir.path(), &["m1"]);
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(crate::exec::thinking_ceiling::THINKING_CEILING_ENV),
+            "no ceiling => no variable: {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
     #[test]
     fn apply_thinking_suffix_replaces_an_existing_level_only_when_licensed_to() {
         assert_eq!(

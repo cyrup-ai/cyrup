@@ -77,6 +77,24 @@ const STDERR_PUMP_CHUNK_BYTES: usize = 8 * 1024;
 /// (R-SA-045 tier 1). Mirrors pi-subagents' `PI_SUBAGENT_PI_BINARY`.
 pub const SUBAGENT_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
 
+/// Companion to [`SUBAGENT_BINARY_ENV_VAR`], carrying that binary's [`SpawnCommand::base_args`]
+/// as a **JSON array of strings**, so the environment tier can express a WHOLE [`SpawnCommand`]
+/// rather than half of one. Without it a child that re-execs from its inherited environment
+/// rebuilds the override binary with its required leading argv silently dropped — the case
+/// [`SpawnCommand::base_args`] is documented as existing for (a platform wrapper such as a
+/// Windows launcher shim) is invoked correctly at hop 1 and wrongly at every hop after it.
+///
+/// JSON rather than a separator: an argv entry may contain spaces, commas, quotes or newlines, so
+/// no delimiter is safe, and a NUL delimiter is impossible — POSIX `environ` holds NUL-terminated
+/// strings and [`std::process::Command`] fails the spawn on an interior NUL. This is the only
+/// structured payload among this crate's env vars; the rest carry a scalar or a comma-joined list
+/// of names (`MCP_DIRECT_TOOLS`).
+///
+/// Read ONLY when [`SUBAGENT_BINARY_ENV_VAR`] is set and non-blank: tiers 2 and 3 resolve this
+/// crate's own binary, which by construction needs no leading argv, so honouring a stray value
+/// there would let the environment inject argv into an ordinary production run.
+pub const SUBAGENT_BINARY_ARGS_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY_ARGS";
+
 /// The literal fallback executable name (R-SA-045 tier 3), resolved via `PATH` by the OS/`tokio`
 /// when `current_exe()` itself fails.
 const FALLBACK_BINARY_NAME: &str = "cyrup";
@@ -130,7 +148,12 @@ fn resolve_spawn_command_from(
     {
         return SpawnCommand {
             binary: PathBuf::from(bin),
-            base_args: Vec::new(),
+            // Absent, empty and unparseable all mean "no leading argv" — the behaviour before
+            // this var existed — so this branch still cannot fail and the never-fails contract
+            // documented above holds.
+            base_args: env_lookup(SUBAGENT_BINARY_ARGS_ENV_VAR)
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+                .unwrap_or_default(),
         };
     }
     if let Ok(exe) = current_exe() {
@@ -1046,6 +1069,88 @@ mod tests {
             Err(std::io::Error::other("current_exe unavailable"))
         });
         assert_eq!(resolved.binary, PathBuf::from(FALLBACK_BINARY_NAME));
+    }
+
+    #[test]
+    fn resolve_spawn_command_carries_base_args_from_the_companion_var() {
+        let vars = StdHashMap::from([
+            (SUBAGENT_BINARY_ENV_VAR, "/opt/wrapper/shim"),
+            (SUBAGENT_BINARY_ARGS_ENV_VAR, r#"["--launch","a b","x,y","say \"hi\""]"#),
+        ]);
+        let resolved = resolve_spawn_command_from(lookup_from(vars), || {
+            Ok(PathBuf::from("/should/not/be/used"))
+        });
+        assert_eq!(resolved.binary, PathBuf::from("/opt/wrapper/shim"));
+        assert_eq!(
+            resolved.base_args,
+            vec![
+                "--launch".to_string(),
+                "a b".to_string(),
+                "x,y".to_string(),
+                "say \"hi\"".to_string(),
+            ],
+            "an argv entry may contain spaces, commas and quotes, and every one must survive the \
+             round trip — the whole reason this var is JSON rather than a delimited list"
+        );
+    }
+
+    #[test]
+    fn resolve_spawn_command_degrades_malformed_base_args_to_none() {
+        for raw in [
+            "not json at all",
+            r#"{"not":"an array"}"#,
+            "[1,2,3]",
+            "",
+            "[\"unterminated",
+        ] {
+            let vars = StdHashMap::from([
+                (SUBAGENT_BINARY_ENV_VAR, "/opt/scripted/fake-cyrup"),
+                (SUBAGENT_BINARY_ARGS_ENV_VAR, raw),
+            ]);
+            let resolved = resolve_spawn_command_from(lookup_from(vars), || {
+                Ok(PathBuf::from("/should/not/be/used"))
+            });
+            assert_eq!(
+                resolved.binary,
+                PathBuf::from("/opt/scripted/fake-cyrup"),
+                "a malformed args value must not disturb the binary tier: {raw:?}"
+            );
+            assert!(
+                resolved.base_args.is_empty(),
+                "malformed args must degrade to no leading argv, never panic or error: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_spawn_command_ignores_base_args_without_a_binary_override() {
+        let vars = StdHashMap::from([(SUBAGENT_BINARY_ARGS_ENV_VAR, r#"["--injected"]"#)]);
+        let resolved = resolve_spawn_command_from(lookup_from(vars), || {
+            Ok(PathBuf::from("/resolved/via/current-exe"))
+        });
+        assert_eq!(resolved.binary, PathBuf::from("/resolved/via/current-exe"));
+        assert!(
+            resolved.base_args.is_empty(),
+            "tiers 2 and 3 resolve this crate's own binary, which by construction needs no \
+             leading argv, so a stray args var must never inject argv into an ordinary run"
+        );
+    }
+
+    #[test]
+    fn resolve_spawn_command_ignores_base_args_when_the_binary_override_is_blank() {
+        let vars = StdHashMap::from([
+            (SUBAGENT_BINARY_ENV_VAR, "   "),
+            (SUBAGENT_BINARY_ARGS_ENV_VAR, r#"["--injected"]"#),
+        ]);
+        let resolved = resolve_spawn_command_from(lookup_from(vars), || {
+            Ok(PathBuf::from("/resolved/via/current-exe"))
+        });
+        assert_eq!(resolved.binary, PathBuf::from("/resolved/via/current-exe"));
+        assert!(
+            resolved.base_args.is_empty(),
+            "a blank binary override falls through to tier 2, so its companion args must fall \
+             through with it rather than attaching to the crate's own binary"
+        );
     }
 
     #[test]

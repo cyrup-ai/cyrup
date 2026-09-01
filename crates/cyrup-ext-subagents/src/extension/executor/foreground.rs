@@ -10,7 +10,8 @@ use crate::error::SubagentError;
 use crate::exec::{AgentConfig, RunOptions, SingleResult};
 use crate::exec::fallback::resolve_model_inheritance;
 use crate::fork_context::{
-    forked_child_requires_thinking_off, resolve_effective_context, ContextMode, ForkContext,
+    forked_child_requires_thinking_off, resolve_effective_context, ContextMode, ContextRequest,
+    ForkContext,
 };
 use crate::registration::SubagentExtensionConfig;
 use crate::spawn::depth::{resolve_effective_depth, DepthEnvelope};
@@ -53,6 +54,9 @@ struct ResolvedRunAgent {
     /// SUBA-003's `subagents.modelScope` policy, carried on so the fallback ladder's own
     /// out-of-scope entries warn.
     model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+    /// SUBA-078's `subagents.maxThinking` ceiling, from the same discovery pass. Unlike
+    /// `model_scope` this one REFUSES rather than warns for a fallback candidate.
+    max_thinking: Option<String>,
     /// R-SA-038's availability set, already widened by the explicit override and any inherited
     /// parent-session model.
     available_models: Vec<ModelId>,
@@ -106,7 +110,12 @@ struct ForegroundRunOptionsInput<'a> {
     /// in hand.
     turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
     permission_rules: Option<crate::watchdog::permission_arbiter::PermissionRules>,
+    /// The extension config's in-process binary override, resolved from the same snapshot as
+    /// `turn_budget`/`permission_rules` above. `None` leaves the run resolving its command from
+    /// the environment, which is every installed configuration.
+    spawn_command: Option<crate::spawn::SpawnCommand>,
     model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+    max_thinking: Option<String>,
     available_models: Vec<ModelId>,
     effective_override: crate::exec::fallback::ModelOverride,
     fork_context: ForkContext,
@@ -157,7 +166,7 @@ impl SubagentExecutor {
         cwd: &Path,
         agent_name: &str,
         task: &str,
-        context: Option<ContextMode>,
+        context: Option<ContextRequest>,
         model_override: Option<ModelId>,
         timeout_ms: Option<u64>,
     ) -> Result<SingleResult, SubagentError> {
@@ -245,6 +254,7 @@ impl SubagentExecutor {
             turn_budget,
             permission_rules,
             model_scope,
+            max_thinking,
             available_models,
             effective_override,
         } = self.resolve_run_agent(&req, &cfg, depth).await?;
@@ -272,7 +282,9 @@ impl SubagentExecutor {
             agent: &agent,
             turn_budget,
             permission_rules,
+            spawn_command: cfg.spawn_command.clone(),
             model_scope,
+            max_thinking,
             available_models,
             effective_override,
             fork_context,
@@ -346,12 +358,33 @@ impl SubagentExecutor {
         cfg: &SubagentExtensionConfig,
         depth: DepthEnvelope,
     ) -> Result<ResolvedRunAgent, SubagentError> {
-        let (agent, model_scope) =
-            self.resolve_agent_with_model_scope(req.cwd, req.agent_name, req.agent_scope)?;
+        let (agent, model_scope, max_thinking) =
+            self.resolve_agent_with_model_scope(
+                req.cwd,
+                req.agent_name,
+                req.agent_scope,
+                &cfg.roots,
+            )?;
         // Fork default-mode (Tier-2, pi `resolveAgentDefaultContextPolicy`): an OMITTED call-site
-        // `context` (`None`) falls back to THIS agent's own `default_context` rather than being forced
-        // to `Fresh`; an explicit call-site value still wins (`resolve_effective_context`).
-        let effective_context = resolve_effective_context(req.context, agent.default_context);
+        // `context` (`None`) takes the defaults ladder rather than being forced to `Fresh`; an
+        // explicit call-site value still wins (`resolve_effective_context`).
+        //
+        // SUBA-079: the availability test is consulted only when nothing explicit was named, so the
+        // extra session open it costs happens only where an implicit fork is actually in play.
+        let can_prefer_fork = match req.context {
+            Option::None => self.can_prefer_fork(req.cwd).await,
+            Some(_) => false,
+        };
+        let effective_context = resolve_effective_context(
+            req.context,
+            req.agent_name,
+            agent.default_context,
+            crate::fork_context::resolve_default_subagent_context(
+                cfg.default_subagent_context.as_ref(),
+            )
+            .map_err(SubagentError::Management)?,
+            can_prefer_fork,
+        )?;
         // SUBA-075 / pi `prepareForkThinking` (`runs/foreground/subagent-executor.ts:5858-5885`
         // @v0.57.0): decide, BEFORE the branch is cut, whether this child's model needs the
         // sanitized fork to run with reasoning disabled. Upstream reaches the same decision through
@@ -480,6 +513,7 @@ impl SubagentExecutor {
             turn_budget,
             permission_rules,
             model_scope,
+            max_thinking,
             available_models,
             effective_override,
         })
@@ -617,11 +651,13 @@ impl SubagentExecutor {
             overrides,
             cwd,
             timeout_ms,
+            spawn_command,
             cancel,
             agent,
             turn_budget,
             permission_rules,
             model_scope,
+            max_thinking,
             available_models,
             effective_override,
             fork_context,
@@ -636,6 +672,8 @@ impl SubagentExecutor {
             art_dir,
         } = input;
         RunOptions {
+            spawn_command,
+            child_env: std::collections::HashMap::new(),
             // SUBA-021 — pi `config.usageBudget` (`subagent-runner.ts:172`), the caller's single
             // rung. The terminal check lives at `run_sync`'s settle (`exec/mod.rs`).
             usage_budget: overrides.usage_budget,
@@ -672,6 +710,10 @@ impl SubagentExecutor {
             // `run_sync` so the fallback ladder's own out-of-scope entries warn (pi
             // `execution.ts:1069`).
             model_scope,
+            // SUBA-078: the DISCOVERED ceiling. `run_sync` intersects it with whatever this
+            // process itself inherited via the env, so the bound can only tighten as the tree
+            // deepens.
+            thinking_ceiling: max_thinking,
             preferred_provider: None,
             available_models,
             // pi `execute(id, params, signal, ...)` threads the host's own `AbortSignal` into the
@@ -1140,7 +1182,7 @@ mod tests {
         let executor = SubagentExecutor::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
-            .run_foreground(dir.path(), "ghost", "do something", Some(ContextMode::Fresh), None, None)
+            .run_foreground(dir.path(), "ghost", "do something", Some(ContextRequest::Fresh), None, None)
             .await
             .expect_err("unresolvable agent must fail before any subprocess spawn");
         assert!(matches!(err, SubagentError::AgentNotFound(_)));
@@ -1168,7 +1210,7 @@ mod tests {
         // exact same "ghost" name as the sibling discovery-failure test isolates this test's
         // assertion to purely WHICH error surfaces first.
         let err = executor
-            .run_foreground(dir.path(), "ghost", "do something", Some(ContextMode::Fresh), None, None)
+            .run_foreground(dir.path(), "ghost", "do something", Some(ContextRequest::Fresh), None, None)
             .await
             .expect_err("a blocked depth ceiling must reject before agent discovery runs");
         assert!(
@@ -1202,7 +1244,7 @@ mod tests {
                 dir.path(),
                 "scoped",
                 "do something",
-                Some(ContextMode::Fresh),
+                Some(ContextRequest::Fresh),
                 Some(ModelId::from("openai/gpt-5-nano")),
                 None,
             )

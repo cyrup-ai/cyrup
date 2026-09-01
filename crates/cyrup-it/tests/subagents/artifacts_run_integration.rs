@@ -17,19 +17,14 @@
 
 use std::path::PathBuf;
 
-use tokio::sync::Mutex;
 
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::artifacts::project_artifacts_dir;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 
-/// Serializes every test that mutates process-global env (`CYRUP_SUBAGENT_BINARY`/
-/// `CYRUP_SUBAGENT_FIXTURE_SCRIPT`/`CYRUP_HOME`) — mirrors every other fixture-based integration test
-/// in this crate.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -81,7 +76,6 @@ fn artifact_file_names(dir: &std::path::Path) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_foreground_run_writes_the_four_artifact_files() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
     let home_dir = tempfile::tempdir().expect("real tempdir to isolate CYRUP_HOME artifacts");
@@ -97,15 +91,6 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
 
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test (Rust 2024
-    // requires `unsafe` for `set_var`/`remove_var`; this integration file is a separate compilation
-    // unit from the crate's `#![forbid(unsafe_code)]` lib, exactly like every sibling test).
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-        // Isolate the scoped-temp artifacts root to this test's own tempdir.
-        std::env::set_var("CYRUP_HOME", home_dir.path());
-    }
 
     // Resolve the exact artifacts directory this run will write into.
     //
@@ -119,8 +104,20 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
     // THESE files land — `work_dir` does.
     let art_dir = project_artifacts_dir(work_dir.path());
 
+    // This run names its own binary, script and home root rather than moving three process-global
+    // vars. `run_foreground` is the path `spawn_command` reaches.
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        SubagentExtensionConfig {
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
+            }),
+            roots: Roots::sandboxed(home_dir.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
     );
     let executor = extension.executor().clone();
@@ -128,13 +125,6 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
     let result = executor
         .run_foreground(work_dir.path(), "worker", "do the trivial thing", None, None, None)
         .await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     let result = result.expect("the foreground run completes without an orchestration-level error");
     assert_eq!(result.exit_code, 0, "the fixture child exits cleanly; error: {:?}", result.error);

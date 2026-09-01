@@ -25,9 +25,9 @@
 //! (`execution.ts:1229`) and an inferred contract is never explicit, so always-inferring changes
 //! provenance, not outcomes.
 //!
-//! Separate compilation unit from `lib.rs`, so NOT bound by that crate's `#![forbid(unsafe_code)]`;
-//! the `unsafe` env mutation (Rust 2024 requires it for `std::env::set_var`/`remove_var`) is scoped
-//! and serialized under [`ENV_MUTATION_LOCK`], exactly like every other integration test here.
+//! Mutates no process environment: the fixture binary and its script are named per-run through
+//! `RunOptions::spawn_command`, so this file needs no `unsafe` and no lock. Every file in this
+//! `--test` target shares ONE process, so a global set here would be a global set for all of them.
 //!
 //! Gated on `test-fixtures` (the `cyrup-subagent-fixture` `[[bin]]`'s own `required-features`
 //! gate): without it the fixture is never built and this file compiles to an empty, passing test
@@ -43,10 +43,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
@@ -54,10 +54,7 @@ use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult, run_sync}
 use cyrup_ext_subagents::fork_context::ForkContext;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -120,8 +117,13 @@ fn agent_config(name: &str) -> AgentConfig {
 /// through `AcceptanceContract::heuristic_default` — pi's `level: "auto"` (`acceptance.ts:127`).
 fn run_options(cwd: &Path) -> RunOptions {
     RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
+        // SUBA-078: this fixture exercises no reasoning ceiling — `None` is "no ceiling
+        // configured, so the bound is off", matching `runner_main.rs`'s own hop-2 default.
+        thinking_ceiling: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -174,26 +176,21 @@ async fn run_fixture(dir: &Path, agent: &str, task: &str, output: &str) -> Singl
     });
     let script_path = write_script(dir, "script.json", &script);
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc. Every caller
-    // holds `ENV_MUTATION_LOCK` for the whole call.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
+    // This run names its own binary and script rather than moving process-global state that
+    // every concurrently-running test in this binary shares. `base_args` reaches the child's argv
+    // and, via `CYRUP_SUBAGENT_BINARY_ARGS`, any grandchild that re-execs.
+    let mut opts = run_options(dir);
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture,
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
 
-    let result = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(20),
-        run_sync(&agent_config(agent), task, &run_options(dir)),
+        run_sync(&agent_config(agent), task, &opts),
     )
     .await
-    .expect("run_sync must not hang against a fast, well-behaved fixture child");
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
-    result
+    .expect("run_sync must not hang against a fast, well-behaved fixture child")
 }
 
 /// The contract itself, with no subprocess involved: pi's read-only-agent branch
@@ -215,7 +212,6 @@ fn a_research_agent_infers_a_real_contract_rather_than_none() {
 /// exit-code correction on `result.acceptance.explicit`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_research_child_with_no_report_is_rejected_on_the_ledger_but_still_exits_clean() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     let result = run_fixture(
@@ -252,7 +248,6 @@ async fn a_research_child_with_no_report_is_rejected_on_the_ledger_but_still_exi
 /// the machine report stripped back off it (pi `stripAcceptanceReport`, `execution.ts:823`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_research_child_that_attests_reaches_attested() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     const PROSE: &str = "The flake is a timing race in the reaper.";

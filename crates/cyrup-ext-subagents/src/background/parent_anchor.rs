@@ -196,9 +196,36 @@ pub fn resolve_parent_session_anchor_from(inherited: Option<String>) -> Option<S
 /// the runner would otherwise have inherited.
 #[must_use]
 pub fn detached_runner_env_overlay() -> BTreeMap<String, String> {
+    detached_runner_env_overlay_in(&crate::paths::Roots::from_env())
+}
+
+/// [`detached_runner_env_overlay`] plus the sandbox root a caller wants the CHILD to resolve
+/// against, as `CYRUP_HOME` in the child's own environment.
+///
+/// This is the detached half of `SubagentExtensionConfig::roots`. A detached runner is a separate
+/// process that re-derives its own paths from the environment it inherited, so the only way to
+/// sandbox it is to put the variable on ITS `Command` — never on this one. That is why the value
+/// travels here as an overlay entry rather than as a config field the child could read: the child
+/// never sees this process's config. It is also R2 tier 2 in its purest form — the value crosses a
+/// process boundary, so it goes on the boundary.
+///
+/// # The variable is set ONLY when the child could not derive these roots itself
+///
+/// [`crate::paths::Roots::child_home_override`] answers that, and its `None` case is load-bearing
+/// rather than an optimisation: `background::temp_root_dir_from` reads `CYRUP_HOME` with **no
+/// `HOME` rung**, so writing the ambient home into every child would move each child's run scratch
+/// out of the OS temp dir and into the user's real `~/.cyrup`.
+#[must_use]
+pub fn detached_runner_env_overlay_in(roots: &crate::paths::Roots) -> BTreeMap<String, String> {
     let mut overlay = BTreeMap::new();
     if let Some(anchor) = resolve_parent_session_anchor() {
         overlay.insert(PARENT_SESSION_ENV_VAR.to_string(), anchor);
+    }
+    if let Some(home) = roots.child_home_override() {
+        overlay.insert(
+            cyrup_config::paths::ENV_HOME.to_string(),
+            home.display().to_string(),
+        );
     }
     overlay
 }

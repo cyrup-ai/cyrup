@@ -92,9 +92,10 @@ use crate::timings;
 ///    not running.
 fn attach_native_extensions(
     mut builder: SessionFactory,
-    agent_dir: &Path,
+    dirs: &ConfigDirs,
     session_cwd: PathBuf,
 ) -> anyhow::Result<SessionFactory> {
+    let agent_dir: &Path = &dirs.agent_dir;
     let intercom_ext = cyrup_intercom::intercom_extension_for_env_concrete(
         agent_dir.to_path_buf(),
         session_cwd.clone(),
@@ -103,7 +104,7 @@ fn attach_native_extensions(
     let subagent_ext = match &intercom_ext {
         Some(ic) => cyrup_ext_subagents::extension::subagent_extension_for_env_with_channels(
             agent_dir,
-            crate::subagent_config::load_subagent_extension_config(agent_dir),
+            crate::subagent_config::load_subagent_extension_config(dirs),
             session_cwd.clone(),
             ic.delivery_channel(),
             ic.clarify_channel(),
@@ -111,7 +112,7 @@ fn attach_native_extensions(
         ),
         None => cyrup_ext_subagents::extension::subagent_extension_for_env(
             agent_dir,
-            crate::subagent_config::load_subagent_extension_config(agent_dir),
+            crate::subagent_config::load_subagent_extension_config(dirs),
             session_cwd.clone(),
         ),
     };
@@ -155,7 +156,6 @@ pub fn build_factory(
     models_json: Arc<ModelFile>,
     trust_prompt: Option<TrustPromptFn>,
 ) -> anyhow::Result<Arc<SessionFactory>> {
-    let agent_dir = dirs.agent_dir.clone();
     let session_cwd = config.cwd.clone();
     let mut builder = SessionFactory::new(provider, config)
         .settings_store(settings_store)
@@ -167,11 +167,7 @@ pub fn build_factory(
     builder = builder.provider_resolver(Arc::new(crate::provider::BuiltinProviderResolver::new(
         models_json,
     )));
-    Ok(Arc::new(attach_native_extensions(
-        builder,
-        &agent_dir,
-        session_cwd,
-    )?))
+    Ok(Arc::new(attach_native_extensions(builder, dirs, session_cwd)?))
 }
 
 /// The per-run, post-build session knobs, and whether pi's modelless hard stop applies to this

@@ -25,6 +25,7 @@
 //! callable spellings at two tree levels and the crate-root, POSIX-only one was the shorter import —
 //! which is how the production session connect path came to hard-code the POSIX arm.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// `intercom/` directory mode (`paths.ts:5` `INTERCOM_DIR_MODE = 0o700`).
@@ -33,7 +34,7 @@ pub const INTERCOM_DIR_MODE: u32 = 0o700;
 pub const INTERCOM_RUNTIME_FILE_MODE: u32 = 0o600;
 
 /// The env var overriding the agent directory (`paths.ts:32`, pi `PI_CODING_AGENT_DIR`).
-pub const ENV_CODING_AGENT_DIR: &str = "CYRUP_CODING_AGENT_DIR";
+pub const ENV_CODING_AGENT_DIR: &str = cyrup_config::paths::ENV_CODING_AGENT_DIR;
 
 /// Resolve the agent directory (`getAgentDirPath`, `paths.ts:27-38`): `$CYRUP_CODING_AGENT_DIR`
 /// (absolute verbatim, else resolved against `cwd`) if set and non-blank, else `<home>/.cyrup`.
@@ -82,9 +83,17 @@ pub fn agent_dir_path_from(
             }
         };
     }
-    let home = env("CYRUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env("HOME").map(PathBuf::from))
+    // THE home ladder, shared with every other crate. This used to be spelled out here, and
+    // `cyrup_ext_subagents::native_supervisor::intercom_agent_dir_from` carried a byte-identical
+    // copy whose doc said it could not import this one "across a dependency edge that forbids
+    // importing it". Both now call `cyrup_config::paths`, which sits below both.
+    //
+    // The ENV rungs only (`cyrup_home_override_from`, not `cyrup_home_dir_from`): `home_dir` is
+    // this function's own OS-homedir seam, mirroring pi's `getAgentDirPath(env, homeDir, cwd)`, and
+    // it exists so the resolution table is provable without touching process state. The full ladder
+    // ends in `ambient_home`, which would answer first and leave that parameter dead — an ambient
+    // read smuggled back into a function written to have none.
+    let home = cyrup_config::paths::cyrup_home_override_from(&|key| env(key).map(OsString::from))
         .or_else(home_dir)
         .unwrap_or_else(std::env::temp_dir);
     home.join(".cyrup")

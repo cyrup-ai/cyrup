@@ -25,6 +25,9 @@ test-fixtures = []
 
 [dependencies]
 cyrup-core = { workspace = true }
+# For `cyrup_config::paths` — the workspace's one home ladder. `cyrup-config` depends only on
+# `cyrup-core` and `cyrup-provider`, so this edge cannot cycle.
+cyrup-config = { workspace = true }
 # ICOM-016 — the extension-state store names each file by the sha256 of its namespace and carries a
 # sha256 of the payload for the torn-write check (`broker/extension-state.ts:46,60`).
 sha2 = { workspace = true }

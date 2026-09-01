@@ -18,27 +18,16 @@
 
 use std::path::{Path, PathBuf};
 
-use tokio::sync::Mutex;
+
 
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult};
 use cyrup_ext::native::{ExtMode, HostCtx, NativeExtension};
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
-/// Serializes every test that mutates `CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT`
-/// (process-global state), mirroring every sibling fixture-based integration test in this crate.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
-
-/// Missions are ON by default, and a task-bearing dispatch auto-creates one
-/// (`missions/lifecycle.rs::prepare_mission_launch`). Its cross-project POINTER INDEX defaults to
-/// `agent_dir()/missions/index` — the developer's real `~/.cyrup/agent/missions/index`, beside
-/// `settings.json`, `models-store.json` and `sessions/` — so a tempdir cwd alone does not isolate
-/// it. `config.missions.globalIndexDir` is the production lever that does, and it is the lever
-/// upstream's own fixtures use (`pi-subagents` `test/unit/mission-lifecycle.test.ts:18`).
-fn scoped_config(root: &std::path::Path) -> SubagentExtensionConfig {
+fn scoped_config(root: &std::path::Path, script_path: &Path) -> SubagentExtensionConfig {
     SubagentExtensionConfig {
         missions: Some(cyrup_ext_subagents::missions::MissionStoreConfig {
             global_index_dir: Some(
@@ -46,6 +35,17 @@ fn scoped_config(root: &std::path::Path) -> SubagentExtensionConfig {
             ),
             ..Default::default()
         }),
+        // The fixture named for THIS extension rather than moved into the process environment
+        // every concurrently-running test in this binary shares. Reaches chain/parallel steps
+        // through `ExecSingleStepExecutor::foreground`, and the child's argv via `base_args`.
+        spawn_command: Some(SpawnCommand {
+            binary: fixture_binary_path(),
+            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        }),
+        // SUBA-083: this suite spawns real children and asserts their completed output, so the
+        // config states its launch mode rather than inheriting it (an absent `asyncByDefault`
+        // backgrounds — pi `config.ts:222-224`).
+        async_by_default: false,
         ..Default::default()
     }
 }
@@ -107,33 +107,6 @@ fn tool_result_text(result: &ToolResult) -> String {
         .join("\n")
 }
 
-/// RAII guard installing `CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT` for one test.
-struct FixtureEnvGuard;
-
-impl FixtureEnvGuard {
-    fn install(script_path: &Path) -> Self {
-        let fixture = fixture_binary_path();
-        // SAFETY: scoped, mutex-serialized env mutation for the duration of one test (Rust 2024
-        // requires `unsafe` for `set_var`/`remove_var`; this is a separate compilation unit from the
-        // crate's `#![forbid(unsafe_code)]` lib), mirroring every sibling fixture-based test.
-        unsafe {
-            std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-            std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, script_path);
-        }
-        Self
-    }
-}
-
-impl Drop for FixtureEnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `install`.
-        unsafe {
-            std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-            std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        }
-    }
-}
-
 fn write_script(dir: &Path, script: &serde_json::Value) -> PathBuf {
     let path = dir.join("fixture-script.json");
     std::fs::write(&path, script.to_string()).expect("write fixture script");
@@ -174,7 +147,6 @@ async fn dispatch_tool(ext: &SubagentsExtension, params: serde_json::Value) -> T
 /// a single shared child, and not cross-contaminated). The `N/M succeeded` summary is pi's own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tool_parallel_tasks_run_n_real_children_with_per_task_outputs() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
 
@@ -186,10 +158,9 @@ async fn tool_parallel_tasks_run_n_real_children_with_per_task_outputs() {
     std::fs::create_dir_all(&cwd_b).expect("mkdir task-b");
 
     let script_path = write_script(work_dir.path(), &echo_argv_script("PARALLEL_OK"));
-    let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        scoped_config(work_dir.path()),
+        scoped_config(work_dir.path(), &script_path),
         work_dir.path().to_path_buf(),
     );
 
@@ -235,15 +206,13 @@ async fn tool_parallel_tasks_run_n_real_children_with_per_task_outputs() {
 /// distinct `=== Task N: worker ===` sections each carrying the child's real fixture output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tool_parallel_count_multiplies_fan_out_into_that_many_real_children() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
 
     let script_path = write_script(work_dir.path(), &echo_argv_script("COUNT_FANOUT_CHILD"));
-    let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        scoped_config(work_dir.path()),
+        scoped_config(work_dir.path(), &script_path),
         work_dir.path().to_path_buf(),
     );
 
@@ -284,14 +253,12 @@ async fn tool_parallel_count_multiplies_fan_out_into_that_many_real_children() {
 /// tee (no `.cyrup-subagent-scratch` was ever created).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_parallel_rejects_duplicate_output_paths_before_any_spawn() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
     let script_path = write_script(work_dir.path(), &echo_argv_script("SHOULD_NOT_RUN"));
-    let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        scoped_config(work_dir.path()),
+        scoped_config(work_dir.path(), &script_path),
         work_dir.path().to_path_buf(),
     );
 
@@ -330,14 +297,12 @@ async fn tool_parallel_rejects_duplicate_output_paths_before_any_spawn() {
 /// tool-driven CHAIN analogue of the slash inline-group `[count]` fan-out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tool_chain_static_parallel_group_count_expands_fan_out() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
     let script_path = write_script(work_dir.path(), &echo_argv_script("CHAIN_GROUP_CHILD"));
-    let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        scoped_config(work_dir.path()),
+        scoped_config(work_dir.path(), &script_path),
         work_dir.path().to_path_buf(),
     );
 
@@ -372,14 +337,12 @@ async fn tool_chain_static_parallel_group_count_expands_fan_out() {
 /// of the availability set and silently dropped, so the child ran the default model).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slash_run_inline_model_override_reaches_the_child() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
     let script_path = write_script(work_dir.path(), &echo_argv_script("RUN_OK"));
-    let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        scoped_config(work_dir.path()),
+        scoped_config(work_dir.path(), &script_path),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -413,14 +376,12 @@ async fn slash_run_inline_model_override_reaches_the_child() {
 /// exercised alongside a sibling task rather than as a lone single-task group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slash_chain_inline_group_count_multiplies_fan_out() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
     let script_path = write_script(work_dir.path(), &echo_argv_script("SLASH_COUNT_CHILD"));
-    let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        scoped_config(work_dir.path()),
+        scoped_config(work_dir.path(), &script_path),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -457,14 +418,12 @@ async fn slash_chain_inline_group_count_multiplies_fan_out() {
 /// step runs in the tool's own cwd, so its tee is read directly there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_chain_step_model_override_reaches_the_child() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
     let script_path = write_script(work_dir.path(), &echo_argv_script("CHAIN_MODEL_OK"));
-    let _env = FixtureEnvGuard::install(&script_path);
 
     let ext = SubagentsExtension::with_config_and_cwd(
-        scoped_config(work_dir.path()),
+        scoped_config(work_dir.path(), &script_path),
         work_dir.path().to_path_buf(),
     );
 

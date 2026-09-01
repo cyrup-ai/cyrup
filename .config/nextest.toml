@@ -45,29 +45,42 @@ leak-timeout = { period = "500ms", result = "fail" }
 # Test groups — cross-PROCESS mutual exclusion, which an in-binary `Mutex` cannot provide.
 #
 # nextest runs each test in its own process, so a shared `static ENV_LOCK` serializes nothing
-# between them. These groups are what actually bound concurrency for tests that touch a global
-# system resource. They apply to the `cyrup-it` seam suite (`cargo nextest run -p cyrup-it
-# --features it`); under the everyday `--workspace` gate those targets are not built at all, so
-# the filters simply match nothing.
+# between them. A group is what actually bounds concurrency for tests touching a global system
+# resource. `broker` is the only one attached today (see `env-mutating` below for why it is not).
+# Filters here apply to the `cyrup-it` seam suite (`cargo nextest run -p cyrup-it --features it`);
+# under the everyday `--workspace` gate those targets are not built at all, so they match nothing.
 # ---------------------------------------------------------------------------------------------
 [test-groups]
-# One at a time, full stop. These tests mutate or depend on process-global state (env vars a child
-# inherits, first-writer-wins statics) where two concurrent processes race each other. It replaces
-# the 33 per-file `static ENV_MUTATION_LOCK`s that became no-ops the moment two files shared a
-# binary.
+# One at a time, full stop. For tests that mutate or depend on process-global state.
+#
+# NOTE: no filter selects this group today, and that is the correct state rather than an oversight.
+# It existed to serialize `binary(subagents)`, whose files each moved `CYRUP_HOME` /
+# `CYRUP_SUBAGENT_BINARY` on the shared process. None of them do any more — every one names what it
+# needs through config (`SubagentExtensionConfig`, `RunOptions`, `RunnerOverrides`, `paths::Roots`)
+# or on the child's own `Command`, and the workspace `clippy.toml` fails the build on a relapse.
+#
+# The group is KEPT, unattached, because the next legitimate process-env mutator should be pinned
+# here rather than have to re-derive why it needs to be. Attach it with a filter naming that
+# binary — never a whole seam suite again, which is what cost this one ~60s of serialized runtime
+# for years after the reason expired.
+#
+# The old filter also carried `or test(/env_/)` as a catch-all for the same shape elsewhere. Dropped
+# deliberately, not overlooked: it bounded nothing real, because process-env mutation only races
+# WITHIN a binary (nextest gives each test its own process), and no multi-test binary in the
+# workspace mutates any more.
+#
+# NO binary in the workspace both mutates the environment and holds more than one test. That was
+# not true while `cyrup-tools/tests/shell_interpreter.rs` held two behind an in-binary `Mutex`, and
+# a note here used to call that lock "the correct tool" — it is not: a lock makes a mutation
+# unobserved rather than sound, and every future test added to such a file has to remember to take
+# it. The sibling test needed no environment at all and moved to its own binary; the lock went with
+# it. Keep the invariant: one mutating test per binary, argued from the THREAD.
 env-mutating = { max-threads = 1 }
 
 # The broker suite spawns real processes bound to real sockets. Not serial — each test owns its own
 # socket under its own TempDir — but bounded, because 18 concurrent brokers plus their children is
 # a lot of live FDs and PIDs for one machine, and a leak here is expensive to diagnose.
 broker = { max-threads = 4 }
-
-[[profile.default.overrides]]
-# `binary(subagents)` is the whole cyrup-ext-subagents seam target: every one of those tests hands
-# `CYRUP_SUBAGENT_*` / `CYRUP_HOME` to a child and several assert on what the child inherited.
-# `test(/env_/)` catches the same shape wherever else it lands.
-filter     = 'binary(subagents) or test(/env_/)'
-test-group = 'env-mutating'
 
 [[profile.default.overrides]]
 filter     = 'binary(intercom)'

@@ -19,6 +19,8 @@ blake3 = "1.8.5"
 
 [dependencies]
 cyrup-core = { workspace = true }
+# For `cyrup_config::paths` — the workspace's one home and agent-dir ladders.
+cyrup-config = { workspace = true }
 cyrup-agent = { workspace = true }
 cyrup-tools = { workspace = true }
 cyrup-provider = { workspace = true }

@@ -329,7 +329,11 @@ impl SubagentsExtension {
         // `--bg` must beat an agent declaring `async: false`, so the default only decides
         // the case where `--bg` was NOT typed.
         let (default_async, default_timeout_ms, _default_turn_budget) =
-            SubagentExecutor::single_agent_launch_defaults(cwd, &parsed.agent);
+            SubagentExecutor::single_agent_launch_defaults(
+                cwd,
+                &parsed.agent,
+                &self.executor.config_snapshot().await.roots,
+            );
         let background = parsed.flags.background || default_async.unwrap_or(false);
         if background {
             let run_id = self
@@ -348,7 +352,8 @@ impl SubagentsExtension {
                     cwd,
                     agent_name: &parsed.agent,
                     task: &parsed.task,
-                    context,
+                    // SUBA-079: an explicit mode from `/run`'s own parse IS an explicit request.
+                    context: context.map(crate::fork_context::ContextRequest::from),
                     model_override: model,
                     agent_scope: AgentReadScope::Both,
                     // pi's own `/run` handler forwards `output`/`outputMode`/`skill`/`model`
@@ -390,7 +395,7 @@ impl SubagentsExtension {
                     cwd,
                     &parsed.agent,
                     &parsed.task,
-                    context,
+                    context.map(crate::fork_context::ContextRequest::from),
                     model,
                     // G98: same agent-level default on the foreground branch — pi applies
                     // it before the async/foreground fork, not inside one arm of it.
@@ -537,7 +542,11 @@ impl SubagentsExtension {
                 max: depth.max_depth,
             });
         }
-        let chain = self.executor.resolve_chain(cwd, &parsed.chain_name)?;
+        let chain = self.executor.resolve_chain(
+            cwd,
+            &parsed.chain_name,
+            &self.executor.config_snapshot().await.roots,
+        )?;
         // The functionality spec's own usage grammar (`/run-chain <chainName> -- <task>`)
         // gives no further detail on how the supplied task text combines with a saved
         // chain's own per-step task text beyond pi-subagents' `mapSavedChainSteps`
@@ -636,7 +645,12 @@ impl SubagentsExtension {
             .map_err(|e| SubagentError::UnsafePathToken(e.message))?;
         let profiles_dir = self.profiles_dir();
         let profile = crate::registration::profiles::load_profile(&profiles_dir, &name)?;
-        Ok(render_profile_check_report(&name, &profile).await)
+        Ok(render_profile_check_report(
+            &name,
+            &profile,
+            self.executor.config_snapshot().await.spawn_command.as_ref(),
+        )
+        .await)
     }
 
     /// /prompt-workflow — run one bundled/user/project `prompts/*.md` recipe (pi
@@ -758,7 +772,7 @@ impl SubagentsExtension {
                     cwd: &effective_cwd,
                     agent_name: &run.agent,
                     task: &run.task,
-                    context: run.context,
+                    context: run.context.map(crate::fork_context::ContextRequest::from),
                     model_override: model,
                     agent_scope: AgentReadScope::Both,
                     acceptance: None,
@@ -794,7 +808,7 @@ impl SubagentsExtension {
                     agent_name: &run.agent,
                     task: &run.task,
                     agent_scope: AgentReadScope::Both,
-                    context: run.context,
+                    context: run.context.map(crate::fork_context::ContextRequest::from),
                     model_override: model,
                     timeout_ms: None,
                     cancel: CancelToken::new(),
@@ -942,7 +956,8 @@ impl SubagentsExtension {
                 cwd,
                 graph,
                 mode,
-                context,
+                // SUBA-079: the slash graph surfaces parse an explicit mode, never `profile`.
+                context.map(crate::fork_context::ContextRequest::from),
                 background,
                 task,
                 CancelToken::new(),

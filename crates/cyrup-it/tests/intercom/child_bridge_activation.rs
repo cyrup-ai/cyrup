@@ -36,7 +36,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex as AsyncMutex;
 
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::background::RunId;
@@ -46,6 +45,7 @@ use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions};
 use cyrup_ext_subagents::fork_context::ForkContext;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 
 use cyrup_intercom::transport::client::{InboundEvent, IntercomClient, SendOptions};
@@ -53,37 +53,27 @@ use cyrup_intercom::transport::protocol::{Message, SessionInfo};
 use cyrup_intercom::transport::spawn::wait_for_broker;
 use crate::common::registration;
 
-/// Serializes the two globally-scoped env mutations (`CYRUP_SUBAGENT_BINARY` +
-/// `CYRUP_CODING_AGENT_DIR`) this test performs so a future sibling test in this binary never races.
-static ENV_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
-
 fn child_fixture_path() -> PathBuf {
     crate::support::bins::intercom_child_fixture()
 }
 
-/// RAII guard installing, for one test, the two process-global env vars the production `run_sync`
-/// child inherits: the fixture binary (`CYRUP_SUBAGENT_BINARY`, `resolve_spawn_command`'s tier-1
-/// override) and the broker's agent dir (`CYRUP_CODING_AGENT_DIR`, how the child discovers the
-/// socket). NEITHER is a child-bridge var — those are set only by the production spawn overlay.
-struct SpawnEnvGuard;
-impl SpawnEnvGuard {
-    fn install(child_binary: &Path, agent_dir: &Path) -> Self {
-        // SAFETY: scoped, mutex-serialized env mutation (Rust 2024 requires `unsafe` for set_var).
-        unsafe {
-            std::env::set_var("CYRUP_SUBAGENT_BINARY", child_binary);
-            std::env::set_var("CYRUP_CODING_AGENT_DIR", agent_dir);
-        }
-        Self
-    }
-}
-impl Drop for SpawnEnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `install`.
-        unsafe {
-            std::env::remove_var("CYRUP_SUBAGENT_BINARY");
-            std::env::remove_var("CYRUP_CODING_AGENT_DIR");
-        }
-    }
+/// The two values the production `run_sync` child needs, supplied per-run instead of exported.
+///
+/// The fixture binary rides on `RunOptions::spawn_command`; the broker's agent dir is a variable
+/// the CHILD reads to find the socket, so it goes on `RunOptions::child_env` — R2 tier 2, set on
+/// the child's `Command` rather than on this process. NEITHER is a child-bridge var; those are set
+/// only by the production spawn overlay.
+fn spawn_env(child_binary: &Path, agent_dir: &Path) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([(
+        "CYRUP_CODING_AGENT_DIR".to_string(),
+        agent_dir.display().to_string(),
+    )])
+    .into_iter()
+    .chain(std::iter::once((
+        "CYRUP_SUBAGENT_BINARY".to_string(),
+        child_binary.display().to_string(),
+    )))
+    .collect()
 }
 
 async fn next_message(
@@ -130,8 +120,13 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
+        // SUBA-078: this fixture exercises no reasoning ceiling — `None` is "no ceiling
+        // configured, so the bound is off", matching `runner_main.rs`'s own hop-2 default.
+        thinking_ceiling: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -190,8 +185,6 @@ fn read_attempt_tee(child_cwd: &Path) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_spawned_child_registers_on_the_broker_and_round_trips_with_its_supervisor() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-
     // A real broker as a genuine child process, pointed at a temp agent dir.
     let agent_dir = tempfile::tempdir().expect("agent tempdir");
     let socket_path = agent_dir.path().join("intercom").join("broker.sock");
@@ -249,10 +242,11 @@ async fn production_spawned_child_registers_on_the_broker_and_round_trips_with_i
     // test writes NONE of the six `CYRUP_SUBAGENT_*` bridge vars — `build_attempt_spawn_plan` does,
     // gated on `orchestrator_intercom_target` + `run_id` (both `Some` below) + a non-empty agent name.
     let work = tempfile::tempdir().expect("work tempdir");
-    let _env = SpawnEnvGuard::install(&child_fixture_path(), agent_dir.path());
 
     let agent = base_agent_config("fixture-model"); // persona name = "worker"
     let mut opts = base_run_options(work.path(), "fixture-model");
+    opts.spawn_command = Some(SpawnCommand { binary: child_fixture_path(), base_args: Vec::new() });
+    opts.child_env = spawn_env(&child_fixture_path(), agent_dir.path());
     opts.orchestrator_intercom_target = Some(orchestrator_target.to_string());
     opts.run_id = Some(RunId::from_token("run-bridge01"));
     opts.child_index = Some(0);

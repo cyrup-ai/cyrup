@@ -46,6 +46,16 @@ pub struct SubagentsExtension {
     /// The child-mode registration surface (T6). Defaults to [`RegistrationMode::Full`] for the root
     /// orchestrator; a fanout-authorized child is built with [`RegistrationMode::ChildSafe`].
     mode: RegistrationMode,
+    /// `SubagentExtensionConfig::env_overrides`, captured at construction. See
+    /// [`Self::env_lookup`].
+    env_overrides: std::collections::BTreeMap<String, Option<String>>,
+    /// `SubagentExtensionConfig::roots`, captured at construction.
+    ///
+    /// The profile/catalog/user-settings paths below resolve on SYNCHRONOUS `&self` methods, which
+    /// cannot reach the executor's async config cell. The value is fixed for the life of the
+    /// extension (it is a resolved layout, not a live-tunable setting), so caching the plain copy
+    /// here is exact rather than a snapshot that could drift.
+    roots: crate::paths::Roots,
     /// The NATIVE supervisor channel (pi `createNativeSupervisorChannel(pi, state)`,
     /// `extension/index.ts:372`). Constructed for every extension and STARTED at `SessionStart`
     /// (`extension/index.ts:757`) in [`RegistrationMode::Full`] only — upstream registers its parent
@@ -169,6 +179,8 @@ impl SubagentsExtension {
         // pi `const fleetViewEnabled = config.fleetView !== false` +
         // `const fleetViewPlacement = resolveFleetViewPlacement(config.fleetViewPlacement)`
         // (`extension/index.ts:333-334`), consumed by the `fleetStatus` construction at `:378-383`.
+        let roots = config.roots.clone();
+        let env_overrides = config.env_overrides.clone();
         let fleet_view_enabled = config.fleet_view;
         let fleet_status = crate::tui::fleet_status::SubagentFleetStatus::new(
             crate::tui::fleet_status::FleetStatusOptions {
@@ -200,6 +212,8 @@ impl SubagentsExtension {
             executor,
             cwd,
             mode,
+            roots,
+            env_overrides,
             supervisor_channel: Arc::new(crate::native_supervisor::NativeSupervisorChannel::new()),
             watchdog,
             fleet_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -278,6 +292,19 @@ impl SubagentsExtension {
     #[must_use]
     pub fn supervisor_channel(&self) -> &Arc<crate::native_supervisor::NativeSupervisorChannel> {
         &self.supervisor_channel
+    }
+
+    /// The environment resolver this extension hands to the crate's injectable
+    /// `&dyn Fn(&str) -> Option<String>` seams: `SubagentExtensionConfig::env_overrides` first
+    /// (where `None` means "unset"), then this process's real environment.
+    ///
+    /// With no overrides configured it is exactly `std::env::var(k).ok()`, which is what every one
+    /// of those call sites passed before this existed.
+    pub(crate) fn env_lookup(&self) -> impl Fn(&str) -> Option<String> + '_ {
+        move |key: &str| match self.env_overrides.get(key) {
+            Some(pinned) => pinned.clone(),
+            None => std::env::var(key).ok(),
+        }
     }
 
     /// The shared executor, exposed so a caller (e.g. a future TUI progress widget, or a test)

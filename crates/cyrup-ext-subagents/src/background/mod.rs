@@ -1318,14 +1318,32 @@ fn real_uid() -> Option<String> {
 /// per-`cwd` roots under the SAME temp root the async/results roots use, rather than re-deriving
 /// (and risking drift from) this one resolution.
 pub(crate) fn temp_root_dir() -> PathBuf {
-    temp_root_dir_from(&|key| std::env::var(key).ok(), std::env::temp_dir())
+    temp_root_dir_from(&|key| std::env::var_os(key), std::env::temp_dir())
 }
 
 /// The pure core of [`temp_root_dir`], with the two ambient inputs — the environment and the OS
 /// temp dir — passed in, so both branches are provable without mutating process-global state.
 /// Follows the crate's existing `native_supervisor::intercom_agent_dir_from` convention.
-fn temp_root_dir_from(env: &dyn Fn(&str) -> Option<String>, os_temp_dir: PathBuf) -> PathBuf {
-    if let Some(sandbox) = env("CYRUP_HOME").filter(|v| !v.trim().is_empty()) {
+///
+/// # The missing `HOME` rung is deliberate — do not route this through `paths::home_dir`
+///
+/// `paths::home_dir` falls `CYRUP_HOME` -> `HOME` -> temp. This resolver stops at `CYRUP_HOME`:
+/// with it unset the answer is a per-user TEMP directory, never `$HOME`. Sharing that ladder would
+/// send this reboot-disposable run scratch into the developer's real home the moment `CYRUP_HOME`
+/// is absent — which is its state everywhere except the sandboxed tests. The blank-string filter is
+/// load-bearing for the same reason: `CYRUP_HOME=""` must fall through, because
+/// `PathBuf::from("").join(".cyrup")` is the RELATIVE path `.cyrup/subagents`, which would root the
+/// whole run-scratch tree at the process working directory.
+pub(crate) fn temp_root_dir_from(
+    env: crate::paths::EnvLookup<'_>,
+    os_temp_dir: PathBuf,
+) -> PathBuf {
+    // The blank filter is the shared one (`cyrup_config::paths` applies the identical rule to every
+    // rung of the home ladder): a set-but-blank value is unset, because `PathBuf::from("")` is the
+    // RELATIVE empty path and would root this whole tree at the process working directory.
+    if let Some(sandbox) = env(cyrup_config::paths::ENV_HOME)
+        .filter(|v| !v.to_str().is_some_and(|s| s.trim().is_empty()))
+    {
         return PathBuf::from(sandbox).join(".cyrup").join("subagents");
     }
     os_temp_dir.join(format!("cyrup-subagents-{}", resolve_temp_scope_id()))
@@ -1369,11 +1387,22 @@ pub struct RunArtifactRoots {
 /// [`ensure_accessible_dir`]'s job).
 #[must_use]
 pub fn run_artifact_roots(cwd: &Path) -> RunArtifactRoots {
-    let home = temp_root_dir();
+    run_artifact_roots_in(&crate::paths::Roots::from_env(), cwd)
+}
+
+/// [`run_artifact_roots`] against already-resolved roots — the same layout, keyed by the same
+/// `cwd`, hanging off [`crate::paths::Roots::run_scratch`].
+///
+/// Takes a resolved value rather than an `Option<&Path>` meaning "or go read the environment": the
+/// optional form put this decision in the callee, where it could be answered differently from the
+/// same decision made two frames up.
+#[must_use]
+pub fn run_artifact_roots_in(roots: &crate::paths::Roots, cwd: &Path) -> RunArtifactRoots {
+    let scratch = roots.run_scratch();
     let key = cwd_key(cwd);
     RunArtifactRoots {
-        async_root: home.join(ASYNC_SUBDIR).join(&key),
-        results_dir: home.join(RESULTS_SUBDIR).join(&key),
+        async_root: scratch.join(ASYNC_SUBDIR).join(&key),
+        results_dir: scratch.join(RESULTS_SUBDIR).join(&key),
     }
 }
 
@@ -3313,7 +3342,7 @@ mod tests {
 
         // Sandbox shape: CYRUP_HOME wins outright and relocates the whole tree.
         let sandbox = temp_root_dir_from(
-            &|k| (k == "CYRUP_HOME").then(|| "/sandbox".to_string()),
+            &|k| (k == "CYRUP_HOME").then(|| std::ffi::OsString::from("/sandbox")),
             os_temp,
         );
         assert_eq!(sandbox, PathBuf::from("/sandbox/.cyrup/subagents"));

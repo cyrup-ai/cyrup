@@ -29,21 +29,17 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 
-use tokio::sync::Mutex;
 
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::tui::intercom::{
     DeliveryChannel, IntercomPayload, NoOpClarifyChannel, NoTransportSteerChannel,
 };
 
-/// Serializes every test that mutates process-global env, mirroring every other fixture-based
-/// integration test in this crate.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -109,7 +105,6 @@ fn tool_result_text(result: &cyrup_core::ToolResult) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_mode_delivers_out_of_band_and_renders_pis_receipt_with_the_real_run_id() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
     let home_dir = tempfile::tempdir().expect("real tempdir to isolate CYRUP_HOME artifacts");
@@ -125,17 +120,24 @@ async fn single_mode_delivers_out_of_band_and_renders_pis_receipt_with_the_real_
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
 
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test, matching
-    // every sibling fixture-based integration test in this crate.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-        std::env::set_var("CYRUP_HOME", home_dir.path());
-    }
 
     let delivery = std::sync::Arc::new(RecordingDeliveryChannel::default());
     let extension = SubagentsExtension::with_channels(
-        SubagentExtensionConfig::default(),
+        // SUBA-083: asserts the receipt's real run id after a SINGLE-mode foreground completion.
+        SubagentExtensionConfig {
+            async_by_default: false,
+            // Named here rather than exported: `async_by_default: false` keeps this FOREGROUND,
+            // which is the path `spawn_command` reaches.
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
+            }),
+            roots: Roots::sandboxed(home_dir.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
         delivery.clone(),
         std::sync::Arc::new(NoOpClarifyChannel),
@@ -151,12 +153,6 @@ async fn single_mode_delivers_out_of_band_and_renders_pis_receipt_with_the_real_
             Box::new(|_u: cyrup_core::ToolUpdate| {}),
         )
         .await;
-
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     let result = result.expect("a confirmed out-of-band delivery must not surface as a tool error");
     let text = tool_result_text(&result);
@@ -230,7 +226,6 @@ async fn single_mode_delivers_out_of_band_and_renders_pis_receipt_with_the_real_
 /// merely "some id that happens to render".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_mode_receipt_cites_the_same_run_id_the_chain_dir_was_created_under() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
     let home_dir = tempfile::tempdir().expect("real tempdir to isolate CYRUP_HOME artifacts");
@@ -246,15 +241,24 @@ async fn parallel_mode_receipt_cites_the_same_run_id_the_chain_dir_was_created_u
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
 
     let fixture = fixture_binary_path();
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-        std::env::set_var("CYRUP_HOME", home_dir.path());
-    }
 
     let delivery = std::sync::Arc::new(RecordingDeliveryChannel::default());
     let extension = SubagentsExtension::with_channels(
-        SubagentExtensionConfig::default(),
+        // SUBA-083: `:278` states it: PARALLEL-mode FOREGROUND completion must deliver exactly once.
+        SubagentExtensionConfig {
+            async_by_default: false,
+            // Named here rather than exported: `async_by_default: false` keeps this FOREGROUND,
+            // which is the path `spawn_command` reaches.
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
+            }),
+            roots: Roots::sandboxed(home_dir.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
         delivery.clone(),
         std::sync::Arc::new(NoOpClarifyChannel),
@@ -304,12 +308,6 @@ async fn parallel_mode_receipt_cites_the_same_run_id_the_chain_dir_was_created_u
     )
     .join(payload.run_id.as_str());
     let chain_dir_exists = chain_dir.is_dir();
-
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     assert!(
         chain_dir_exists,

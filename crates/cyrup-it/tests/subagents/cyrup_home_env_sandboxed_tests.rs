@@ -1,13 +1,15 @@
 //! `CYRUP_HOME`-sandboxed tests relocated out of `src/extension.rs`'s own `#[cfg(test)] mod tests`.
 //!
-//! These tests must override the process-global `CYRUP_HOME` env var so the `Full`-mode
-//! `NativeExtension::init`/`teardown_session` T6 startup housekeeping they drive resolves its
-//! async/results roots under a tempdir instead of the real developer/CI machine's `~/.cyrup`. Since
-//! Rust requires `unsafe` for `std::env::set_var`/`remove_var`, and this crate's `src/lib.rs` is
-//! `#![forbid(unsafe_code)]`, they cannot live inside that crate's own unit-test module — exactly
-//! like every other `tests/*_integration.rs` file in this crate (see e.g.
-//! `extension_end_to_end_smoke.rs`'s identical rationale), this file is a separate compilation unit
-//! NOT subject to that crate-level `forbid`, so the `unsafe` env mutation is legal here.
+//! The `Full`-mode `NativeExtension::init`/`teardown_session` T6 startup housekeeping these tests
+//! drive must resolve its async/results roots under a tempdir rather than the real developer/CI
+//! machine's `~/.cyrup`. That used to require overriding the process-global `CYRUP_HOME`; each test
+//! now hands the root over as `SubagentExtensionConfig::roots` instead, so the file contains no
+//! `unsafe`, no env mutation, and no lock.
+//!
+//! One consequence worth recording: the reason this file lives outside `src/` — that
+//! `set_var`/`remove_var` are `unsafe` and `cyrup-ext-subagents`'s `src/lib.rs` is
+//! `#![forbid(unsafe_code)]` — no longer applies to it. Moving it back is deliberately NOT part of
+//! this change.
 //!
 //! Every item these tests touch (`subagent_extension_for`, `SubagentsExtension`, `SubagentExecutor`,
 //! `SubagentExtensionConfig`, `RunId`, `RunPaths`, `InitApi`, `NativeExtension`) is already `pub`, so
@@ -17,17 +19,23 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Mutex as AsyncMutex;
-
 use cyrup_ext::native::{InitApi, NativeExtension};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::{RunId, RunPaths};
 use cyrup_ext_subagents::extension::{subagent_extension_for, SubagentExecutor, SubagentsExtension};
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
-/// Serializes every test in this file that overrides `CYRUP_HOME` (process-global state) so
-/// `cargo test`'s concurrent execution never lets two such overrides race each other — mirrors this
-/// crate's other integration tests' identical `ENV_MUTATION_LOCK` convention.
-static ENV_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+/// The sandbox root for one test, handed over as `SubagentExtensionConfig::roots`.
+///
+/// `Full`-mode `init()`'s T6 housekeeping resolves its async/results roots through the config this
+/// carries, so no test here needs to move the process-global `CYRUP_HOME` (or serialize on a lock
+/// to do it safely).
+fn sandboxed(home: &std::path::Path) -> SubagentExtensionConfig {
+    SubagentExtensionConfig {
+        roots: Roots::sandboxed(home),
+        ..SubagentExtensionConfig::default()
+    }
+}
 
 /// T6: a `CYRUP_SUBAGENT_CHILD=1` process without fanout authorization must attach NO subagent
 /// extension at all (so its `subagent` tool, slash commands, and watchers are never registered),
@@ -39,27 +47,20 @@ async fn child_env_gate_controls_what_is_registered() {
     // `Full` mode's `init()` now runs the T6 startup housekeeping (async/results root
     // creation) below — sandbox `CYRUP_HOME` to a tempdir for this test's duration so it never
     // touches the real developer/CI machine's `~/.cyrup`.
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let home = tempfile::tempdir().expect("home tempdir");
-    // SAFETY: this file is a separate compilation unit from `cyrup-ext-subagents`'s own
-    // `#![forbid(unsafe_code)]` `src/lib.rs` (see this file's module doc); the mutation is scoped
-    // and mutex-serialized (`ENV_MUTATION_LOCK`).
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
 
     let cwd = std::env::temp_dir();
 
     // Plain child → no extension → no `subagent` tool registered anywhere (regardless of the
     // opt-in `installed` signal — a plain child is never gated on it).
     let disabled =
-        subagent_extension_for(SubagentExtensionConfig::default(), cwd.clone(), true, false, true);
+        subagent_extension_for(sandboxed(home.path()), cwd.clone(), true, false, true);
     assert!(disabled.is_none(), "a plain subagent child registers no subagent surface at all");
 
     // Fanout-authorized child → an extension whose init installs NO lifecycle subscriptions.
     // `installed = false` proves the child-safe surface attaches REGARDLESS of the opt-in gate.
     let child_safe =
-        subagent_extension_for(SubagentExtensionConfig::default(), cwd.clone(), true, true, false)
+        subagent_extension_for(sandboxed(home.path()), cwd.clone(), true, true, false)
             .expect("a fanout-authorized child registers the restricted tool");
     let mut api = InitApi::new();
     child_safe.init(&mut api).await.expect("child-safe init succeeds");
@@ -71,17 +72,12 @@ async fn child_env_gate_controls_what_is_registered() {
 
     // Non-child (root orchestrator) that HAS opted in (`installed = true`) → the full lifecycle
     // surface.
-    let full = subagent_extension_for(SubagentExtensionConfig::default(), cwd, false, false, true)
+    let full = subagent_extension_for(sandboxed(home.path()), cwd, false, false, true)
         .expect("a non-child process registers the full orchestrator extension");
     let mut api = InitApi::new();
     full.init(&mut api).await.expect("full init succeeds");
     assert!(api.subscriptions().contains(cyrup_ext::EventKind::SessionStart));
     assert!(api.subscriptions().contains(cyrup_ext::EventKind::SessionShutdown));
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var("CYRUP_HOME");
-    }
 }
 
 /// The opt-in flip side (requirement (b)/(c) semantics via the pure form): once opted in
@@ -89,18 +85,11 @@ async fn child_env_gate_controls_what_is_registered() {
 /// through `is_installed`), a top-level session attaches the FULL orchestrator surface.
 #[tokio::test]
 async fn top_level_with_optin_attaches_full() {
-    // `Full` mode's `init()` now runs the T6 startup housekeeping — sandbox `CYRUP_HOME` (see
-    // `ENV_MUTATION_LOCK`'s own doc).
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let home = tempfile::tempdir().expect("home tempdir");
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
 
     let cwd = std::env::temp_dir();
     let ext = subagent_extension_for(
-        SubagentExtensionConfig::default(),
+        sandboxed(home.path()),
         cwd,
         /* child */ false,
         /* fanout_authorized */ false,
@@ -113,25 +102,16 @@ async fn top_level_with_optin_attaches_full() {
         api.subscriptions().contains(cyrup_ext::EventKind::SessionStart),
         "the full orchestrator surface installs the SessionStart housekeeping"
     );
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var("CYRUP_HOME");
-    }
 }
 
 #[tokio::test]
 async fn init_registers_the_tool_and_all_thirteen_commands() {
-    // `Full` mode's `init()` now runs the T6 startup housekeeping — sandbox `CYRUP_HOME` (see
-    // `ENV_MUTATION_LOCK`'s own doc).
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let home = tempfile::tempdir().expect("home tempdir");
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
 
-    let ext = SubagentsExtension::new();
+    let ext = SubagentsExtension::with_config_and_cwd(
+        sandboxed(home.path()),
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
     let mut api = InitApi::new();
     ext.init(&mut api).await.expect("init succeeds");
     // InitApi has no public inspector beyond subscriptions in this phase's surface; the real
@@ -139,11 +119,6 @@ async fn init_registers_the_tool_and_all_thirteen_commands() {
     // end-to-end smoke test, which drives `init` through a real `SessionBuilder`.
     assert!(api.subscriptions().contains(cyrup_ext::EventKind::SessionStart));
     assert!(api.subscriptions().contains(cyrup_ext::EventKind::SessionShutdown));
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var("CYRUP_HOME");
-    }
 }
 
 /// A minimal [`cyrup_ext::host::HostServices`] double reporting a fixed session id/name.
@@ -173,17 +148,12 @@ impl cyrup_ext::host::HostServices for FixedSessionHost {
 /// the job as tracked and the anchor would still resolve to the old session's id).
 #[tokio::test]
 async fn teardown_session_stops_the_tracker_and_clears_the_parent_session_anchor() {
-    // `install_completion_watcher` resolves its results dir under `background::temp_root_dir()`,
-    // whose CYRUP_HOME branch exists precisely as this sandbox seam (see `ENV_MUTATION_LOCK`).
-    let _guard = ENV_MUTATION_LOCK.lock().await;
+    // `install_completion_watcher` resolves its results dir through the executor's own config, so
+    // `roots` is what keeps it off the real machine.
     let home = tempfile::tempdir().expect("home tempdir");
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let executor = SubagentExecutor::new();
+    let executor = SubagentExecutor::with_config(sandboxed(home.path()));
 
     // Capture a parent-session anchor, as `on_event(SessionStart)` does at depth 0.
     executor.set_host_services(Arc::new(FixedSessionHost {
@@ -224,9 +194,4 @@ async fn teardown_session_stops_the_tracker_and_clears_the_parent_session_anchor
         !executor.tracker().is_polling().await,
         "the job tracker's poll loop must be stopped on session_shutdown"
     );
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var("CYRUP_HOME");
-    }
 }

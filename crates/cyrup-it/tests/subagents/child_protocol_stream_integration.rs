@@ -27,10 +27,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex as AsyncMutex;
 
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::child_protocol::MAX_CHILD_PENDING_LINE_BYTES;
 use cyrup_ext_subagents::exec::fallback::{
@@ -42,11 +42,6 @@ use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult};
 use cyrup_ext_subagents::fork_context::ForkContext;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 
-/// Serializes every test mutating `CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT` (global).
-static ENV_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
-
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -58,26 +53,13 @@ fn write_script(dir: &Path, name: &str, script: &serde_json::Value) -> PathBuf {
     path
 }
 
-/// RAII guard installing the fixture-binary + script env for one test.
-struct FixtureEnvGuard;
-impl FixtureEnvGuard {
-    fn install(script_path: &Path) -> Self {
-        let fixture = fixture_binary_path();
-        // SAFETY: scoped, mutex-serialized env mutation (Rust 2024 requires `unsafe` for set_var).
-        unsafe {
-            std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-            std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, script_path);
-        }
-        Self
-    }
-}
-impl Drop for FixtureEnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `install`.
-        unsafe {
-            std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-            std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        }
+/// The fixture binary plus its script, named for ONE run instead of moved into the process
+/// environment every concurrently-running test in this binary shares. `base_args` reaches the
+/// child's argv and, through `CYRUP_SUBAGENT_BINARY_ARGS`, any grandchild that re-execs.
+fn fixture_spawn_command(script_path: &Path) -> SpawnCommand {
+    SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
     }
 }
 
@@ -125,8 +107,13 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
+        // SUBA-078: this fixture exercises no reasoning ceiling — `None` is "no ceiling
+        // configured, so the bound is off", matching `runner_main.rs`'s own hop-2 default.
+        thinking_ceiling: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -177,9 +164,9 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
 /// Drive the REAL user action: an orchestrator delegating one task to a subagent.
 async fn run_fixture(dir: &Path, script: &serde_json::Value, name: &str) -> SingleResult {
     let script_path = write_script(dir, name, script);
-    let _env = FixtureEnvGuard::install(&script_path);
     let agent = base_agent_config("fixture-model");
-    let opts = base_run_options(dir, "fixture-model");
+    let mut opts = base_run_options(dir, "fixture-model");
+    opts.spawn_command = Some(fixture_spawn_command(&script_path));
     tokio::time::timeout(
         Duration::from_secs(60),
         cyrup_ext_subagents::exec::run_sync(&agent, "do the thing", &opts),
@@ -201,7 +188,6 @@ async fn run_fixture(dir: &Path, script: &serde_json::Value, name: &str) -> Sing
 /// emits the newline at all — the real hazard — grew it without any bound at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_over_cap_child_line_fails_the_run_with_a_protocol_output_limit() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({
@@ -242,7 +228,6 @@ async fn an_over_cap_child_line_fails_the_run_with_a_protocol_output_limit() {
 /// have failed runs upstream completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_over_cap_turn_end_aggregate_is_projected_and_the_run_still_succeeds() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({
@@ -283,7 +268,6 @@ async fn an_over_cap_turn_end_aggregate_is_projected_and_the_run_still_succeeds(
 /// the delegating tool call simply blocked for the full 30s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_settled_arms_the_final_drain_so_a_settled_but_hanging_child_is_force_drained() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({
@@ -333,7 +317,6 @@ async fn agent_settled_arms_the_final_drain_so_a_settled_but_hanging_child_is_fo
 /// through the signal ladder, the run silently keeping the pre-retry text as its answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_end_with_will_retry_cancels_the_armed_drain_so_the_retry_survives() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({
@@ -365,7 +348,6 @@ async fn agent_end_with_will_retry_cancels_the_armed_drain_so_the_retry_survives
 /// (`execution.ts:1558-1619`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zero_activity_child_exit_relaunches_the_same_model_then_reports_exhaustion() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Nothing on stdout, nothing on stderr, a bare non-zero exit — the shape of a child that never
@@ -420,7 +402,6 @@ async fn a_zero_activity_child_exit_relaunches_the_same_model_then_reports_exhau
 /// genuinely failing model and hide the failure behind a startup story.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_child_that_produced_output_before_failing_is_not_relaunched() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({
@@ -454,7 +435,6 @@ async fn a_child_that_produced_output_before_failing_is_not_relaunched() {
 /// cyrup through the stderr-into-error surfacing (`execution.ts:686`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_child_that_died_with_a_diagnostic_is_not_relaunched() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({

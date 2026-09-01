@@ -115,7 +115,12 @@ async fn custom_package_dir_install_loads_into_assembled_session() {
         package_dir: Some(fx.custom_package_dir.clone()),
         ..Default::default()
     };
-    let dirs = ConfigDirs::resolve(&overrides, &EnvVars::default()).unwrap();
+    // `EnvVars::default()` is the EMPTY environment, and an empty environment names no home —
+    // `ConfigDirs::resolve` says so with an error rather than quietly consulting the developer's
+    // real one. This test is about the `--package-dir` slot, so it states a home and gets the same
+    // answer on every machine.
+    let env = EnvVars { home: Some(fx.agent_dir.clone()), ..EnvVars::default() };
+    let dirs = ConfigDirs::resolve(&overrides, &env).unwrap();
     // Sanity: the resolved package dir is the CUSTOM dir and is genuinely distinct from the default the
     // pre-fix code fell back to — otherwise the test could pass for the wrong reason.
     assert_eq!(dirs.package_dir, fx.custom_package_dir);

@@ -8,13 +8,26 @@
 //! environment, hands them to the verify command's shell by inheritance, and a `curl -v` or a
 //! failing test harness echoes them straight back into the acceptance ledger.
 //!
-//! **This lives in its own test binary on purpose.** Proving the inherited branch requires mutating
-//! this process's environment, and `std::env::set_var` is `unsafe` in Rust 2024 precisely because
-//! it races any concurrent reader of the environment — which is exactly what
-//! `effective_verify_env` and every `Command::spawn` are. A test file is its own binary, so keeping
-//! this the only test in it means there is no concurrent reader to race.
+//! **This is its own `[[test]]` target on purpose, and that is load-bearing.** Proving the
+//! INHERITED branch requires the secret to be in this process's environment: the verify command
+//! declares no env of its own, and `effective_verify_env` feeds only the memo key — the child
+//! actually receives the value through ordinary `Command` inheritance. Injecting a map would prove
+//! the declared-env branch instead, which is a different (already covered) path, so neither R2
+//! tier 1 nor tier 2 reaches this one.
+//!
+//! `std::env::set_var` is `unsafe` in Rust 2024 precisely because it races any concurrent reader,
+//! and a single-test binary is what makes "there is no concurrent reader" TRUE rather than merely
+//! asserted. It briefly was not: consolidation folded this file into `tests/subagents` alongside
+//! ~195 other tests, silently voiding that argument under `cargo test` (nextest's process-per-test
+//! still isolated it). Restoring the dedicated target restores the property the comment claims.
+//! Do not fold it back in.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+// The ONE place in the workspace that may mutate the process environment, and the module doc above
+// is the justification: this test's subject IS inheritance into a real child, so injecting the
+// value would prove a different branch. The exemption is scoped to this single-test target — which
+// is also what makes `unsafe { set_var }` sound here, since there is no concurrent reader.
+#![allow(clippy::disallowed_methods)]
 
 use cyrup_ext_subagents::exec::acceptance::{VerifyCommand, run_verify_commands_memoized};
 
@@ -42,7 +55,9 @@ async fn a_secret_inherited_from_the_process_environment_is_redacted_out_of_the_
     let results =
         run_verify_commands_memoized(std::slice::from_ref(&command), dir.path(), None).await;
 
-    // SAFETY: same critical section, still single-threaded.
+    // SAFETY: the same condition the mutation above states, and it still holds here — one test in
+    // this binary on a `current_thread` runtime, so no other thread exists to race the write. The
+    // criterion is the THREAD and it covers ANY key, not just this one.
     unsafe {
         std::env::remove_var("G80_INHERITED_API_KEY");
     }

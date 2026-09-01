@@ -19,18 +19,15 @@
 
 use std::path::PathBuf;
 
-use tokio::sync::Mutex;
 
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::artifacts::project_artifacts_dir;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 
-/// Serializes every test that mutates process-global env — mirrors every sibling integration test.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -99,7 +96,6 @@ fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 /// with `subagent SINGLE mode does not yet support the following param(s): output, outputMode`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_mode_output_and_output_mode_write_a_file_and_return_a_concise_reference() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
     let home_dir = tempfile::tempdir().expect("real tempdir to isolate CYRUP_HOME artifacts");
@@ -114,17 +110,23 @@ async fn single_mode_output_and_output_mode_write_a_file_and_return_a_concise_re
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
 
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test (Rust 2024
-    // requires `unsafe` for `set_var`; this integration file is a separate compilation unit from
-    // the crate's `#![forbid(unsafe_code)]` lib, exactly like every sibling test).
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-        std::env::set_var("CYRUP_HOME", home_dir.path());
-    }
 
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        // SUBA-083: asserts the written-file reference in the settled tool result (pi `config.ts:222-224`).
+        SubagentExtensionConfig {
+            async_by_default: false,
+            // Named here, not exported: `async_by_default: false` keeps this FOREGROUND, which is
+            // the path `spawn_command` reaches.
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
+            }),
+            roots: Roots::sandboxed(home_dir.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
     );
     let result = extension
@@ -141,13 +143,6 @@ async fn single_mode_output_and_output_mode_write_a_file_and_return_a_concise_re
             Box::new(|_u: cyrup_core::ToolUpdate| {}),
         )
         .await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     let result = result.expect("the run must COMPLETE, not be refused at dispatch");
     let text = tool_result_text(&result);
@@ -209,7 +204,6 @@ async fn single_mode_output_and_output_mode_write_a_file_and_return_a_concise_re
 /// param being accepted and ignored.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_mode_output_without_file_only_still_inlines_the_full_output() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let home_dir = tempfile::tempdir().expect("real tempdir for CYRUP_HOME");
@@ -224,15 +218,23 @@ async fn single_mode_output_without_file_only_still_inlines_the_full_output() {
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
 
     let fixture = fixture_binary_path();
-    // SAFETY: see the sibling test above.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-        std::env::set_var("CYRUP_HOME", home_dir.path());
-    }
 
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        // SUBA-083: asserts the full output inlined in the settled tool result (pi `config.ts:222-224`).
+        SubagentExtensionConfig {
+            async_by_default: false,
+            // Named here, not exported: `async_by_default: false` keeps this FOREGROUND, which is
+            // the path `spawn_command` reaches.
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
+            }),
+            roots: Roots::sandboxed(home_dir.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
     );
     let result = extension
@@ -258,13 +260,6 @@ async fn single_mode_output_without_file_only_still_inlines_the_full_output() {
             Box::new(|_u: cyrup_core::ToolUpdate| {}),
         )
         .await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     let result = result.expect("the run must COMPLETE, not be refused at dispatch");
     let text = tool_result_text(&result);
@@ -348,15 +343,27 @@ async fn run_single_with(
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
 
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see the sibling test above.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-        std::env::set_var("CYRUP_HOME", home_dir.path());
-    }
 
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        // SUBA-083: shared by the timeout tests AND by `an_agent_async_default_backgrounds_a_call_
+        // that_omits_async` (:456). Pinning here is what keeps that test MEANINGFUL: with the
+        // config seed now `true` the call would background regardless, so the assertion could
+        // no longer distinguish the persona's `launch.async` from the config default — it would
+        // pass while proving nothing. `false` restores the contrast it was written to draw.
+        SubagentExtensionConfig {
+            async_by_default: false,
+            // Named here, not exported: `async_by_default: false` keeps this FOREGROUND, which is
+            // the path `spawn_command` reaches.
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
+            }),
+            roots: Roots::sandboxed(home_dir.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
     );
     let mut params = serde_json::json!({ "agent": "slowpoke", "task": "answer slowly" });
@@ -375,13 +382,6 @@ async fn run_single_with(
         )
         .await;
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
-
     match result {
         Ok(r) => tool_result_text(&r),
         Err(e) => format!("{e}"),
@@ -393,7 +393,6 @@ async fn run_single_with(
 /// wiring `timeoutMs:` in an agent file was demoted to `extra_fields` and reached nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_timeout_ms_default_applies_when_the_call_site_omits_it() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let text = run_single_with("timeoutMs: 50\n", serde_json::json!({}), 4000).await;
     assert!(
         text.contains("Subagent timed out after 50ms."),
@@ -405,7 +404,6 @@ async fn an_agent_timeout_ms_default_applies_when_the_call_site_omits_it() {
 /// default. A per-agent default that overrode an explicit argument would be worse than no feature.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_explicit_call_site_timeout_ms_beats_the_agent_default() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let text = run_single_with(
         "timeoutMs: 50\n",
         serde_json::json!({ "timeoutMs": 30000 }),
@@ -426,7 +424,6 @@ async fn an_explicit_call_site_timeout_ms_beats_the_agent_default() {
 /// supplied (`subagent-executor.ts:1937`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_explicit_max_runtime_ms_also_suppresses_the_agent_timeout_default() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let text = run_single_with(
         "timeoutMs: 50\n",
         serde_json::json!({ "maxRuntimeMs": 30000 }),
@@ -442,7 +439,6 @@ async fn an_explicit_max_runtime_ms_also_suppresses_the_agent_timeout_default() 
 /// An agent declaring no launch defaults must behave exactly as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_without_launch_defaults_runs_unbounded_as_before() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let text = run_single_with("", serde_json::json!({}), 50).await;
     assert!(
         text.contains("G98_CHILD_FINISHED"),
@@ -454,7 +450,6 @@ async fn an_agent_without_launch_defaults_runs_unbounded_as_before() {
 /// `async` — observable as pi's detached-launch receipt instead of the child's own output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_async_default_backgrounds_a_call_that_omits_async() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let backgrounded = run_single_with("async: true\n", serde_json::json!({}), 50).await;
     assert!(
         !backgrounded.contains("G98_CHILD_FINISHED"),
@@ -510,26 +505,29 @@ async fn run_slash_run_with(extra_frontmatter: &str, sleep_ms: u64) -> String {
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
 
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see the sibling helper above.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-        std::env::set_var("CYRUP_HOME", home_dir.path());
-    }
 
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        // SUBA-083: same as `run_single_with`: shared by the slash-command timeout test and by
+        // `the_run_slash_command_applies_the_agents_async_default_too` (:558), which needs a
+        // foreground config default for the persona's `launch.async` to be the visible cause.
+        SubagentExtensionConfig {
+            async_by_default: false,
+            // Named here, not exported: `async_by_default: false` keeps this FOREGROUND, which is
+            // the path `spawn_command` reaches.
+            spawn_command: Some(SpawnCommand {
+                binary: fixture,
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
+            }),
+            roots: Roots::sandboxed(home_dir.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
     );
     let ctx = HostCtx::command(ExtMode::Tui, false, work_dir.path().to_path_buf());
     let result = extension.execute_command("run", "slowpoke answer slowly", &ctx).await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     match result {
         Ok(Some(text)) => text,
@@ -542,7 +540,6 @@ async fn run_slash_run_with(extra_frontmatter: &str, sleep_ms: u64) -> String {
 /// The run must be cut off at the agent's own budget, exactly as the tool surface already is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_run_slash_command_applies_the_agents_timeout_default_too() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let text = run_slash_run_with("timeoutMs: 50\n", 4000).await;
     assert!(
         text.contains("Subagent timed out after 50ms."),
@@ -556,7 +553,6 @@ async fn the_run_slash_command_applies_the_agents_timeout_default_too() {
 /// child's own foreground output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_run_slash_command_applies_the_agents_async_default_too() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let text = run_slash_run_with("async: true\n", 50).await;
     assert!(
         text.contains("Background subagent run started"),
@@ -572,7 +568,6 @@ async fn the_run_slash_command_applies_the_agents_async_default_too() {
 /// exactly as `/run` always has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_run_slash_command_without_agent_defaults_is_unchanged() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let text = run_slash_run_with("", 50).await;
     assert!(
         text.contains("G98_CHILD_FINISHED"),

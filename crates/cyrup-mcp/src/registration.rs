@@ -960,12 +960,11 @@ pub fn install_server_hasher(hasher: ServerHasher) -> bool {
 /// # `home`
 ///
 /// `resolveConfigPath(definition.cwd)` expands a leading `~`, so the digest depends on a home
-/// directory. This uses [`crate::dirs::home_dir`] — node's `homedir()`, i.e. `$HOME`. The in-tree
-/// **reader** anchors on `CYRUP_HOME` → `HOME` → tempdir
-/// (`mcp_direct_tools::home_dir`), so the two agree unless `CYRUP_HOME` is set to something other
-/// than `HOME`, and then only for a server whose `cwd` actually starts with `~`. That residue is
-/// the narrow tail of MCP-139's agent-dir axis 3 and closing it needs the one shared resolver that
-/// unit asks for, which lives outside this crate.
+/// directory. This uses [`crate::dirs::home_dir`], which is now the workspace's one ladder
+/// ([`cyrup_config::paths::cyrup_home_dir_from`]) — the same one the in-tree **reader**
+/// (`mcp_direct_tools::home_dir`) resolves through. They agreed only when `CYRUP_HOME` was unset
+/// before; they agree unconditionally now. That was the narrow tail of MCP-139's agent-dir axis 3,
+/// and the shared resolver it asked for is what closes it.
 #[must_use]
 pub fn default_server_hasher(definition: &ServerEntry) -> Option<String> {
     crate::dirs::try_compute_server_hash(

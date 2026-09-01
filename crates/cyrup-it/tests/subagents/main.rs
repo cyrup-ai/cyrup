@@ -32,27 +32,26 @@
 //! 3. Two `#![cfg(unix)]` inner attributes became `#[cfg(unix)]` on the `mod` declarations below,
 //!    which is the same gate expressed at the new nesting level.
 //!
-//! # !! THE ENV-MUTATION CAVEAT — READ BEFORE CHANGING THE RUNNER !!
+//! # Env mutation: one file left, and why
 //!
-//! 33 of these 35 files call `unsafe { std::env::set_var }` on THIS process, and each carries a
-//! SAFETY comment justifying it as "a test file is its own binary". **That justification did not
-//! survive the merge, and it is not repaired by the per-file mutexes.**
+//! This block used to warn that 33 of these files called `unsafe { std::env::set_var }` on THIS
+//! process, each justifying it as "a test file is its own binary" — a justification the merge into
+//! one binary silently voided, and which the per-file mutexes did not repair (33 distinct statics
+//! guarding one shared environment is no mutual exclusion at all).
 //!
-//! These are not children-inherit-the-env tests that could be rewritten onto `Command::env`. The
-//! library reads the variables IN-PROCESS: `src/spawn/mod.rs:160` resolves `CYRUP_SUBAGENT_BINARY`
-//! via `resolve_spawn_command_from(|key| std::env::var(key).ok(), ...)`, and
-//! `src/spawn/nested_events.rs:84` reads `CYRUP_SUBAGENTS_TEMP_ROOT` with `var_os`. There is no
-//! `Command` in the test to hang `.env()` on — the `Command` is built inside the library, from the
-//! parent's environment. The 33 per-file `static ENV_MUTATION_LOCK`/`ENV_LOCK`s were distinct
-//! statics only because each file was a distinct process; merged into this one binary they are 33
-//! different mutexes guarding one shared environment, i.e. no mutual exclusion at all.
+//! That is no longer the shape. Every one of those files now names what it needs explicitly,
+//! through seams the library already had or grew for the purpose:
+//! `SubagentExtensionConfig::{spawn_command, roots, env_overrides}`,
+//! `RunOptions::spawn_command`, `runner_main::run_with`, `spawn_detached_runner_with_command`'s
+//! `env_overlay`, `NativeSupervisorChannel::with_root`, and the `_in`/`_with`/`_from` injected
+//! cores across `nested_events`, `registration` and `paths`. No `unsafe` and no lock is involved.
 //!
-//! **What makes this sound is the RUNNER, not this file.** `cargo nextest` executes each test in
-//! its own process, which restores exactly the isolation each file's SAFETY comment assumes, and
-//! `.config/nextest.toml` additionally pins `binary(subagents)` to the `env-mutating` test group at
-//! `max-threads = 1`. Under `cargo test -p cyrup-it --features it` all 35 modules share ONE process
-//! and one thread pool: the `set_var` calls then race concurrent readers (UB), and tests will
-//! clobber each other's `CYRUP_HOME` / `CYRUP_SUBAGENT_BINARY` / `CYRUP_SUBAGENT_FIXTURE_SCRIPT`.
+//! NOTHING in this binary mutates the process environment any more, so there is no `unsafe` and no
+//! lock left to reason about. The last holdout was `background_cascade_integration`, whose root is
+//! read MID-RUN by the cascade: `paths::Roots` is resolved once in `run_with` and carried on the
+//! per-run `TurnLoopIo` that `check_stop_flag`, `check_timeout_flag`, `check_interrupt_flag` and
+//! `settle_step_result` already share, so that read sees the caller's tree with no signature change
+//! anywhere.
 //!
 //! So for THIS target, `cargo nextest run -p cyrup-it --features it` is the supported invocation
 //! and the plain-`cargo test` fallback is NOT interchangeable with it. Repairing that properly
@@ -97,8 +96,7 @@ mod read_only_acceptance_inference;
 // `unsafe { set_var }` + a real `sh` child; the original file's `#![cfg(unix)]` moved here.
 #[cfg(unix)]
 mod acceptance_memo_key_and_live_wiring;
-#[cfg(unix)]
-mod verify_redaction_inherited_env;
+
 
 // ---- installation: discovery, registration, the opt-in gate, end-to-end attach ----
 mod discovery_project_root_wiring_integration;

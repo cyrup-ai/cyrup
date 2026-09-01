@@ -100,6 +100,21 @@ pub enum SubagentError {
     #[error("{0}")]
     CapabilityCeilingViolation(String),
 
+    /// SUBA-078 — the run's effective reasoning level exceeds the configured `subagents.maxThinking`
+    /// ceiling (pi `assertThinkingWithinCeiling`, `shared/thinking-ceiling.ts:42-55` @v0.57.0), or
+    /// the INHERITED ceiling itself was malformed, so the run was REFUSED before any child spawned.
+    ///
+    /// Carries pi's verbatim text (`Thinking level '<x>' exceeds configured maximum '<y>' for agent
+    /// '<a>' run '<r>'.`) as the whole message.
+    ///
+    /// A REFUSAL, never a clamp. Silently lowering the level would run the agent at a depth it did
+    /// not ask for while reporting success, hiding the misconfiguration — the same reasoning that
+    /// makes [`Self::ModelOutOfScope`] and [`Self::CapabilityCeilingViolation`] fail closed. Note
+    /// the contrast with model SCOPE, which deliberately only WARNS for a fallback-ladder entry
+    /// (`exec/model_scope.rs`): the thinking ceiling has no warn tier upstream.
+    #[error("{0}")]
+    ThinkingCeilingViolation(String),
+
     /// The per-SESSION subagent spawn budget (`subagents.maxSubagentSpawnsPerSession`) would be
     /// exceeded by this dispatch, so the WHOLE call was refused before any child was planned
     /// (SUBA-002; pi `reserveSubagentSpawns`, `runs/foreground/subagent-executor.ts:266-282`).

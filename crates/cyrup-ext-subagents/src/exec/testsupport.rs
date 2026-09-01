@@ -42,12 +42,15 @@ pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig
 
 pub(crate) fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions {
     RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         // SUBA-021: no usage budget on this path (see the field doc).
         usage_budget: None,
         turn_budget: None,
         permission_rules: None,
         enforce_hard_turn_limit: false,
         model_scope: None,
+        thinking_ceiling: None,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
         timeout_ms: None,

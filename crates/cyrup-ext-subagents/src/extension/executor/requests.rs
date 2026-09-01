@@ -9,7 +9,7 @@ use cyrup_core::{CancelToken, ModelId};
 use crate::background::{RunId, RunMode};
 use crate::discovery::types::AgentReadScope;
 use crate::exec::ResolvedAgentPersona;
-use crate::fork_context::ContextMode;
+use crate::fork_context::ContextRequest;
 use crate::spawn::chain_graph::{GroupStepResult, RunnerStep, StepResult};
 
 /// The structured result of [`crate::extension::SubagentExecutor::run_or_background_graph`]: either a detached
@@ -139,8 +139,9 @@ pub struct ForegroundRunRequest<'a> {
     /// The resolved execution-time agent-discovery scope (pi `resolveExecutionAgentScope`,
     /// `subagent-executor.ts:2973`): narrows the User-vs-Project axis when resolving `agent_name`.
     pub agent_scope: AgentReadScope,
-    /// Call-site fork/fresh context; `None` defers to the persona's own `default_context`.
-    pub context: Option<ContextMode>,
+    /// SUBA-079 — the call-site `context` REQUEST (`fresh`/`fork`/`profile`); `None` takes the
+    /// defaults ladder. Distinct from the RESOLVED `ContextMode`; see [`ContextRequest`].
+    pub context: Option<ContextRequest>,
     /// Per-call model override (added to the availability set, R-SA-038); `None` inherits.
     pub model_override: Option<ModelId>,
     /// Foreground timeout budget in milliseconds (pi `timeoutMs`/`maxRuntimeMs`); `None` = none.
@@ -184,8 +185,9 @@ pub struct BackgroundSingleRequest<'a> {
     pub agent_name: &'a str,
     /// The task text handed to the child.
     pub task: &'a str,
-    /// Call-site fork/fresh context; `None` defers to the persona's own `default_context`.
-    pub context: Option<ContextMode>,
+    /// SUBA-079 — the call-site `context` REQUEST (`fresh`/`fork`/`profile`); `None` takes the
+    /// defaults ladder. Distinct from the RESOLVED `ContextMode`; see [`ContextRequest`].
+    pub context: Option<ContextRequest>,
     /// Per-call model override; `None` inherits (pi `async-execution.ts:1290-1295`).
     pub model_override: Option<ModelId>,
     /// The resolved execution-time agent-discovery scope.

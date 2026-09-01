@@ -12,27 +12,19 @@
 //! This file is a separate compilation unit from `cyrup-ext-subagents`'s own `lib.rs` (ordinary
 //! Cargo integration-test placement), so it is NOT bound by that crate's own
 //! `#![forbid(unsafe_code)]` — the one `unsafe` block below (Rust 2024 requires `unsafe` for
-//! `std::env::set_var`/`remove_var`, since process environment is de facto shared mutable state)
-//! is scoped to exactly the two calls needed to point `CYRUP_SUBAGENT_BINARY` at the fixture
-//! binary for the duration of one test, executed under a process-wide mutex
-//! ([`ENV_MUTATION_LOCK`]) so this file's tests never race each other over that global state even
-//! when `cargo test` runs them concurrently within the same test-binary process.
-//!
-//! Gated on the `test-fixtures` Cargo feature (matching the `cyrup-subagent-fixture` `[[bin]]`
-//! target's own `required-features` gate, `Cargo.toml`): without that feature the fixture binary
-//! is never built at all, so this whole file compiles to an empty test list (`cargo test`
-//! reports it as a normal, zero-test pass) rather than every test failing at spawn time with a
-//! confusing "No such file or directory".
+//! Mutates no process environment: each run names its fixture binary and script through
+//! `RunOptions::spawn_command`, so this file needs no `unsafe` and no lock. Every file in
+//! this `--test` target shares ONE process, so a global set here would be global for all.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
@@ -40,13 +32,6 @@ use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, ToolCallSummary};
 use cyrup_ext_subagents::fork_context::ForkContext;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 
-/// Serializes every test in this file that mutates `CYRUP_SUBAGENT_BINARY` (process-global
-/// state) — `cargo test` runs a test binary's own `#[test]` functions concurrently by default, so
-/// without this lock two tests in this file could observe or clobber each other's override value
-/// mid-run.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
-
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
 
 /// Path to the real, already-built `cyrup-subagent-fixture` binary.
 ///
@@ -97,8 +82,13 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &std::path::Path, model: &str) -> RunOptions {
     RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
+        // SUBA-078: this fixture exercises no reasoning ceiling — `None` is "no ceiling
+        // configured, so the bound is off", matching `runner_main.rs`'s own hop-2 default.
+        thinking_ceiling: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -184,7 +174,6 @@ fn tool_execution_end_line(tool_call_id: &str, tool_name: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_end_to_end_against_the_scripted_fixture_extracts_output_and_reaches_checked() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({
@@ -202,15 +191,15 @@ async fn run_sync_end_to_end_against_the_scripted_fixture_extracts_output_and_re
     });
     let script_path = write_script(dir.path(), "script.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.acceptance = Some(AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]));
 
     let result = tokio::time::timeout(
@@ -220,11 +209,6 @@ async fn run_sync_end_to_end_against_the_scripted_fixture_extracts_output_and_re
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(result.exit_code, 0, "clean run must report exit code 0: {result:?}");
     assert_eq!(result.model.as_ref().map(ModelId::as_str), Some("fixture-model"));
@@ -283,7 +267,6 @@ async fn run_sync_end_to_end_against_the_scripted_fixture_extracts_output_and_re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_survives_a_real_child_emitting_more_than_fifty_lines() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let mut steps = vec![serde_json::json!({"kind": "emit", "line": r#"{"type":"agent_start"}"#})];
@@ -300,14 +283,15 @@ async fn run_sync_survives_a_real_child_emitting_more_than_fifty_lines() {
     let script = serde_json::json!({"steps": steps, "exit_code": 0});
     let script_path = write_script(dir.path(), "script-many-lines.json", &script);
 
-    let fixture = fixture_binary_path();
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let agent = base_agent_config("fixture-model");
-    let opts = base_run_options(dir.path(), "fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -316,10 +300,6 @@ async fn run_sync_survives_a_real_child_emitting_more_than_fifty_lines() {
     .await
     .expect("run_sync must not hang draining 80+ lines");
 
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(result.exit_code, 0, "{result:?}");
     assert_eq!(
@@ -335,7 +315,6 @@ async fn run_sync_survives_a_real_child_emitting_more_than_fifty_lines() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_timeout_terminates_the_ladder_without_advancing_to_a_fallback_model() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // A fixture that ignores SIGINT and sleeps far longer than the test's own deadline, so the
@@ -352,15 +331,16 @@ async fn run_sync_timeout_terminates_the_ladder_without_advancing_to_a_fallback_
     });
     let script_path = write_script(dir.path(), "script-hang.json", &script);
 
-    let fixture = fixture_binary_path();
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let mut agent = base_agent_config("primary-model");
     agent.fallback_models = vec![ModelId::from("fallback-model")]; // must NEVER be attempted
     let mut opts = base_run_options(dir.path(), "primary-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
     opts.deadline_at = Some(std::time::Instant::now() + Duration::from_millis(300));
 
@@ -371,10 +351,6 @@ async fn run_sync_timeout_terminates_the_ladder_without_advancing_to_a_fallback_
     .await
     .expect("run_sync itself must return once the real signal escalation confirms termination");
 
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert!(result.timed_out, "expected timed_out: true, got {result:?}");
     assert_eq!(
@@ -396,7 +372,6 @@ async fn run_sync_timeout_terminates_the_ladder_without_advancing_to_a_fallback_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_rejects_a_blocked_depth_without_spawning_the_real_fixture_child() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     const NEVER_SPAWNED_MARKER: &str = "THIS-FIXTURE-MUST-NEVER-ACTUALLY-RUN";
@@ -408,14 +383,6 @@ async fn run_sync_rejects_a_blocked_depth_without_spawning_the_real_fixture_chil
     });
     let script_path = write_script(dir.path(), "script-depth-blocked.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc. Deliberately a
-    // REAL, working fixture (not a bogus path), so this test proves the depth guard is what
-    // prevents the spawn, not merely that a bad binary path would have failed anyway.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let mut agent = base_agent_config("fixture-model");
     // current_depth == max_depth: is_blocked() must be true.
@@ -423,7 +390,13 @@ async fn run_sync_rejects_a_blocked_depth_without_spawning_the_real_fixture_chil
         current_depth: 4,
         max_depth: 4,
     };
-    let opts = base_run_options(dir.path(), "fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
 
     let result = tokio::time::timeout(
         Duration::from_secs(5),
@@ -432,11 +405,6 @@ async fn run_sync_rejects_a_blocked_depth_without_spawning_the_real_fixture_chil
     .await
     .expect("a depth-blocked run_sync call must return near-instantly, never hang");
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(result.exit_code, 1, "a blocked depth attempt must report failure: {result:?}");
     assert!(
@@ -494,7 +462,6 @@ fn sample_structured_output_schema() -> serde_json::Value {
 /// tool call, not a shortcut around it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_validates_a_schema_valid_structured_output_and_populates_the_field() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({
@@ -511,15 +478,15 @@ async fn run_sync_validates_a_schema_valid_structured_output_and_populates_the_f
     });
     let script_path = write_script(dir.path(), "script-structured-valid.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.structured_output_schema = Some(sample_structured_output_schema());
 
     let result = tokio::time::timeout(
@@ -529,11 +496,6 @@ async fn run_sync_validates_a_schema_valid_structured_output_and_populates_the_f
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(result.exit_code, 0, "a schema-valid structured output must not fail the run: {result:?}");
     assert!(result.error.is_none(), "got: {:?}", result.error);
@@ -547,7 +509,6 @@ async fn run_sync_validates_a_schema_valid_structured_output_and_populates_the_f
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // "count" is a string here, not the schema-required integer — this must fail parent-side
@@ -567,14 +528,15 @@ async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run()
     });
     let script_path = write_script(dir.path(), "script-structured-invalid.json", &script);
 
-    let fixture = fixture_binary_path();
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.structured_output_schema = Some(sample_structured_output_schema());
 
     let result = tokio::time::timeout(
@@ -584,10 +546,6 @@ async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run()
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
 
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_ne!(
         result.exit_code, 0,
@@ -618,7 +576,6 @@ async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run()
 /// fallback attempt ends the same way, fails the whole task.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_accepts_a_structured_only_child_that_produced_no_prose_at_all() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // The child calls `structured_output` (writes the capture file) and its ONLY assistant message
@@ -634,16 +591,16 @@ async fn run_sync_accepts_a_structured_only_child_that_produced_no_prose_at_all(
     });
     let script_path = write_script(dir.path(), "script-structured-only.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let mut agent = base_agent_config("primary-model");
     agent.fallback_models = vec![ModelId::from("fallback-model")];
     let mut opts = base_run_options(dir.path(), "primary-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
     opts.structured_output_schema = Some(sample_structured_output_schema());
 
@@ -654,11 +611,6 @@ async fn run_sync_accepts_a_structured_only_child_that_produced_no_prose_at_all(
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(
         result.exit_code, 0,
@@ -684,7 +636,6 @@ async fn run_sync_missing_structured_output_fails_the_run_even_with_prose() {
     // `outputSchema` with NO captured structured value is a HARD failure EVEN WHEN the child
     // produced prose — prose is never an exemption. The child here emits a non-empty prose answer
     // but NO structured-output value at all.
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({
@@ -700,15 +651,15 @@ async fn run_sync_missing_structured_output_fails_the_run_even_with_prose() {
     });
     let script_path = write_script(dir.path(), "script-structured-missing-with-prose.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.structured_output_schema = Some(sample_structured_output_schema());
 
     let result = tokio::time::timeout(
@@ -718,11 +669,6 @@ async fn run_sync_missing_structured_output_fails_the_run_even_with_prose() {
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_ne!(
         result.exit_code, 0,
@@ -785,7 +731,6 @@ fn empty_message_end_line() -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_re_diagnoses_a_trailing_tool_failure_after_a_zero_exit_and_does_not_retry() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // The child EXITS ZERO, but its final activity was a failed `bash` call reporting a non-zero
@@ -802,16 +747,16 @@ async fn run_sync_re_diagnoses_a_trailing_tool_failure_after_a_zero_exit_and_doe
     });
     let script_path = write_script(dir.path(), "script-trailing-error.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let mut agent = base_agent_config("primary-model");
     agent.fallback_models = vec![ModelId::from("fallback-model")]; // must NEVER be attempted
     let mut opts = base_run_options(dir.path(), "primary-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
 
     let result = tokio::time::timeout(
@@ -821,11 +766,6 @@ async fn run_sync_re_diagnoses_a_trailing_tool_failure_after_a_zero_exit_and_doe
     .await
     .expect("run_sync must not hang against a fast fixture child");
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(
         result.exit_code, 127,
@@ -849,7 +789,6 @@ async fn run_sync_re_diagnoses_a_trailing_tool_failure_after_a_zero_exit_and_doe
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_soft_interrupt_returns_a_paused_success_not_an_exit_1_failure() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // A child that starts, then sleeps far longer than the test — the interrupt fires mid-run, and
@@ -865,14 +804,15 @@ async fn run_sync_soft_interrupt_returns_a_paused_success_not_an_exit_1_failure(
     });
     let script_path = write_script(dir.path(), "script-interrupt.json", &script);
 
-    let fixture = fixture_binary_path();
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     let interrupt = CancelToken::new();
     opts.interrupt = interrupt.clone();
 
@@ -893,10 +833,6 @@ async fn run_sync_soft_interrupt_returns_a_paused_success_not_an_exit_1_failure(
     .expect("run_sync must return once the interrupt terminates the child");
     let _ = canceller.await;
 
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(
         result.exit_code, 0,
@@ -922,7 +858,6 @@ async fn run_sync_soft_interrupt_returns_a_paused_success_not_an_exit_1_failure(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_empty_output_is_a_retryable_failure_that_advances_the_fallback_ladder() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Every attempt (the single static script is reused for both models) emits a clean terminal
@@ -940,15 +875,16 @@ async fn run_sync_empty_output_is_a_retryable_failure_that_advances_the_fallback
     });
     let script_path = write_script(dir.path(), "script-empty-output.json", &script);
 
-    let fixture = fixture_binary_path();
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let mut agent = base_agent_config("primary-model");
     agent.fallback_models = vec![ModelId::from("fallback-model")];
     let mut opts = base_run_options(dir.path(), "primary-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
 
     let result = tokio::time::timeout(
@@ -958,10 +894,6 @@ async fn run_sync_empty_output_is_a_retryable_failure_that_advances_the_fallback
     .await
     .expect("run_sync must not hang against fast fixture children");
 
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(
         result.attempted_models.len(),
@@ -990,7 +922,6 @@ async fn run_sync_empty_output_is_a_retryable_failure_that_advances_the_fallback
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_empty_output_with_a_declared_schema_but_no_structured_value_is_retryable() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // pi `execution.ts:786`: the empty-output gate is
@@ -1010,16 +941,16 @@ async fn run_sync_empty_output_with_a_declared_schema_but_no_structured_value_is
     });
     let script_path = write_script(dir.path(), "script-empty-structured.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let mut agent = base_agent_config("primary-model");
     agent.fallback_models = vec![ModelId::from("fallback-model")];
     let mut opts = base_run_options(dir.path(), "primary-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
     opts.structured_output_schema = Some(sample_structured_output_schema());
 
@@ -1030,11 +961,6 @@ async fn run_sync_empty_output_with_a_declared_schema_but_no_structured_value_is
     .await
     .expect("run_sync must not hang against fast fixture children");
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(
         result.attempted_models.len(),
@@ -1066,7 +992,6 @@ async fn run_sync_empty_output_with_a_declared_schema_but_no_structured_value_is
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_timeout_yields_a_rejected_acceptance_ledger_and_a_timeout_message() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({
@@ -1079,15 +1004,15 @@ async fn run_sync_timeout_yields_a_rejected_acceptance_ledger_and_a_timeout_mess
     });
     let script_path = write_script(dir.path(), "script-timeout-ledger.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     // A contract that REQUIRES acceptance (Checked) — so a timed-out run is `rejected`, not
     // `not-required`. Both the nominal budget (for the message) and the wall-clock deadline are set.
     opts.acceptance = Some(AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]));
@@ -1101,10 +1026,6 @@ async fn run_sync_timeout_yields_a_rejected_acceptance_ledger_and_a_timeout_mess
     .await
     .expect("run_sync must return once the real signal escalation confirms termination");
 
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert!(result.timed_out, "expected timed_out: true, got {result:?}");
     assert_ne!(result.exit_code, 0, "a timed-out run must fail: {result:?}");
@@ -1144,7 +1065,6 @@ async fn run_sync_timeout_yields_a_rejected_acceptance_ledger_and_a_timeout_mess
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_sync_surfaces_a_failed_childs_stderr_into_the_result_error() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     const STDERR_DETAIL: &str = "fatal: the child could not open the workspace";
@@ -1158,16 +1078,16 @@ async fn run_sync_surfaces_a_failed_childs_stderr_into_the_result_error() {
     });
     let script_path = write_script(dir.path(), "script-stderr.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let agent = base_agent_config("fixture-model");
     // Single model, no fallback — the failure must not advance a ladder; assert on the one attempt.
-    let opts = base_run_options(dir.path(), "fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -1176,10 +1096,6 @@ async fn run_sync_surfaces_a_failed_childs_stderr_into_the_result_error() {
     .await
     .expect("run_sync must not hang against a fast, non-zero-exit fixture child");
 
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_ne!(result.exit_code, 0, "the child exited non-zero: {result:?}");
     let error = result
@@ -1235,37 +1151,29 @@ async fn run_progress_fixture(
     include_progress: Option<bool>,
 ) -> cyrup_ext_subagents::exec::SingleResult {
     let script_path = write_script(dir, script_name, &progress_script());
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc. Every caller
-    // below holds `ENV_MUTATION_LOCK` for the whole call.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir, "fixture-model");
+    // The fixture named for THIS run rather than moved into the process environment every
+    // concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.include_progress = include_progress;
     // A stable child index + skill list, so the snapshot's launch-context fields are assertable
     // rather than all-default (pi seeds `progress.index`/`progress.skills` at construction,
     // `runs/foreground/execution.ts:259,263` @v0.34.0).
     opts.child_index = Some(3);
-    let result = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(10),
         cyrup_ext_subagents::exec::run_sync(&agent, "chatty task", &opts),
     )
     .await
-    .expect("run_sync must not hang against a fast, well-behaved fixture child");
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
-    result
+    .expect("run_sync must not hang against a fast, well-behaved fixture child")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn include_progress_true_returns_a_compacted_pi_shaped_snapshot() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let result = run_progress_fixture(dir.path(), "script-progress-on.json", Some(true)).await;
 
@@ -1326,7 +1234,6 @@ async fn include_progress_true_returns_a_compacted_pi_shaped_snapshot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn include_progress_omitted_or_false_is_byte_identical_to_the_pre_flag_result() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // R-SA-043 compaction is the DEFAULT and `includeProgress` is precisely its opt-out, so both
@@ -1377,7 +1284,6 @@ async fn include_progress_omitted_or_false_is_byte_identical_to_the_pre_flag_res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn include_progress_on_an_interrupt_paused_run_keeps_pis_uncompacted_running_snapshot() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // pi leaves an interrupt-paused run's progress at `"running"` (`execution.ts:828`, returning at
@@ -1398,15 +1304,15 @@ async fn include_progress_on_an_interrupt_paused_run_keeps_pis_uncompacted_runni
     let script = serde_json::json!({ "steps": steps, "exit_code": 0 });
     let script_path = write_script(dir.path(), "script-progress-interrupt.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.include_progress = Some(true);
     let interrupt = CancelToken::new();
     opts.interrupt = interrupt.clone();
@@ -1426,11 +1332,6 @@ async fn include_progress_on_an_interrupt_paused_run_keeps_pis_uncompacted_runni
     .expect("run_sync must return once the interrupt terminates the child");
     let _ = canceller.await;
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert!(result.interrupted, "the run must be interrupt-paused: {result:?}");
     let progress = result
@@ -1503,7 +1404,6 @@ fn working_message_end_line(text: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_turn_budget_wraps_up_at_max_turns_and_aborts_the_child_after_the_grace_turn() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Four working turns are scripted, then a long sleep. With maxTurns 2 / graceTurns 1 the
@@ -1523,15 +1423,15 @@ async fn a_turn_budget_wraps_up_at_max_turns_and_aborts_the_child_after_the_grac
     });
     let script_path = write_script(dir.path(), "turn-budget.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.turn_budget = Some(cyrup_ext_subagents::exec::turn_budget::ResolvedTurnBudget {
         max_turns: 2,
         grace_turns: 1,
@@ -1544,11 +1444,6 @@ async fn a_turn_budget_wraps_up_at_max_turns_and_aborts_the_child_after_the_grac
     .await
     .expect("the turn-budget abort must end the run well inside the child's 30s sleep");
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     // pi `result.turnBudgetExceeded = true` + `turnBudgetState(budget, turnCount, true)`
     // (`execution.ts:737-739`).
@@ -1604,7 +1499,6 @@ async fn a_turn_budget_wraps_up_at_max_turns_and_aborts_the_child_after_the_grac
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_child_that_finishes_inside_its_turn_budget_is_untouched() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     // ADVERSARIAL, and the reason this test exists next to the one above: the SAME budget must be
@@ -1620,15 +1514,15 @@ async fn a_child_that_finishes_inside_its_turn_budget_is_untouched() {
     });
     let script_path = write_script(dir.path(), "within-budget.json", &script);
 
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
+    // The fixture named for THIS run rather than moved into the process
+    // environment every concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     opts.turn_budget = Some(cyrup_ext_subagents::exec::turn_budget::ResolvedTurnBudget {
         max_turns: 2,
         grace_turns: 1,
@@ -1641,11 +1535,6 @@ async fn a_child_that_finishes_inside_its_turn_budget_is_untouched() {
     .await
     .expect("run_sync must not hang");
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(result.exit_code, 0, "an in-budget run is untouched: {result:?}");
     assert!(!result.turn_budget_exceeded);

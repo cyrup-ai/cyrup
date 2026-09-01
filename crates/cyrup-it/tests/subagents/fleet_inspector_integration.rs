@@ -31,6 +31,7 @@ use cyrup_ext::HostServices;
 use cyrup_ext::event::HostEvent;
 use cyrup_ext::host::{WidgetEffect, WidgetPlacement};
 use cyrup_ext::native::{ExtMode, HostCtx, NativeExtension};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::tui::fleet_status::FLEET_STATUS_WIDGET_KEY;
@@ -166,33 +167,24 @@ fn write_status_json(
     .expect("write status.json");
 }
 
-fn extension(cwd: &std::path::Path) -> SubagentsExtension {
-    SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
-        cwd.to_path_buf(),
-    )
+fn extension(cwd: &std::path::Path, home: &std::path::Path) -> SubagentsExtension {
+    extension_with(cwd, home, SubagentExtensionConfig::default())
 }
 
-fn extension_with(cwd: &std::path::Path, config: SubagentExtensionConfig) -> SubagentsExtension {
+fn extension_with(
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+    mut config: SubagentExtensionConfig,
+) -> SubagentsExtension {
+    config.roots = Roots::sandboxed(home);
     SubagentsExtension::with_config_and_cwd(config, cwd.to_path_buf())
 }
 
-/// Serializes the `$CYRUP_HOME` mutation below; every test in this binary shares one process.
-/// A `tokio::sync::Mutex` rather than a `std` one because the guard is deliberately held across
-/// the `.await`s in each test body — that is the point of the lock — and a `std` guard held across
-/// an await is a real hazard clippy is right to flag.
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Point `background::run_artifact_roots` at a hermetic root for the duration of one test.
-/// Returns the guard + the tempdir, both of which must stay alive for the test's body.
-async fn hermetic_home() -> (tokio::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
-    let guard = ENV_LOCK.lock().await;
-    let home = tempfile::tempdir().expect("home tempdir");
-    // SAFETY: scoped, mutex-serialized env mutation (Rust 2024 requires `unsafe` for set_var).
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
-    (guard, home)
+/// A hermetic root for one test, handed to the extension as `SubagentExtensionConfig::roots`
+/// and to `run_artifact_roots_in` directly. No lock and no `set_var`: this run names its own
+/// root instead of moving state every other test in this binary shares.
+fn sandbox_home() -> tempfile::TempDir {
+    tempfile::tempdir().expect("home tempdir")
 }
 
 // =================================================================================================
@@ -201,9 +193,9 @@ async fn hermetic_home() -> (tokio::sync::MutexGuard<'static, ()>, tempfile::Tem
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subagents_fleet_without_a_ui_renders_upstreams_text_fallback() {
-    let (_env, _home) = hermetic_home().await;
+    let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
-    let ext = extension(dir.path());
+    let ext = extension(dir.path(), home.path());
     let ctx = HostCtx::command(ExtMode::Print, false, dir.path().to_path_buf());
 
     let out = ext
@@ -226,9 +218,9 @@ async fn subagents_fleet_without_a_ui_renders_upstreams_text_fallback() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subagents_fleet_with_a_ui_renders_the_interactive_inspector_frame() {
-    let (_env, _home) = hermetic_home().await;
+    let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
-    let ext = extension(dir.path());
+    let ext = extension(dir.path(), home.path());
     let host = std::sync::Arc::new(OverlayHostServices::new(100, 32, Vec::new()));
     ext.executor().set_host_services(host.clone());
     let ctx = HostCtx::command(ExtMode::Tui, true, dir.path().to_path_buf());
@@ -261,15 +253,15 @@ async fn subagents_fleet_with_a_ui_renders_the_interactive_inspector_frame() {
 /// inspector rendered at its `32`-row default no matter how tall the terminal was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_hosted_inspector_sizes_its_body_from_the_hosts_reported_rows() {
-    let (_env, _home) = hermetic_home().await;
+    let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
     let cwd = dir.path();
-    let roots = cyrup_ext_subagents::background::run_artifact_roots(cwd);
+    let roots = cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
     write_status_json(&roots.async_root, "fleetrun001", "historian", Some(TEST_SESSION_ID));
 
     let mut heights = Vec::new();
     for rows in [24usize, 60usize] {
-        let ext = extension(cwd);
+        let ext = extension(cwd, home.path());
         let host = std::sync::Arc::new(OverlayHostServices::new(100, rows, Vec::new()));
         ext.executor().set_host_services(host.clone());
         let ctx = HostCtx::command(ExtMode::Tui, true, cwd.to_path_buf());
@@ -287,15 +279,15 @@ async fn the_hosted_inspector_sizes_its_body_from_the_hosts_reported_rows() {
 /// that used to have no caller.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keystrokes_move_the_selection_and_escape_closes_the_hosted_inspector() {
-    let (_env, _home) = hermetic_home().await;
+    let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
     let cwd = dir.path();
-    let roots = cyrup_ext_subagents::background::run_artifact_roots(cwd);
+    let roots = cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
     write_status_json(&roots.async_root, "fleetrun001", "historian", Some(TEST_SESSION_ID));
     write_status_json(&roots.async_root, "fleetrun002", "archivist", Some(TEST_SESSION_ID));
 
     use cyrup_ext::{OverlayKey, OverlayKeyCode, OverlayOutcome};
-    let ext = extension(cwd);
+    let ext = extension(cwd, home.path());
     let host = std::sync::Arc::new(OverlayHostServices::new(
         100,
         32,
@@ -342,9 +334,9 @@ fn the_registered_description_is_the_v0_43_0_text() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_fleet_status_widget_is_published_and_cleared_through_live_host_services() {
-    let (_env, _home) = hermetic_home().await;
+    let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
-    let ext = extension(dir.path());
+    let ext = extension(dir.path(), home.path());
     let services = std::sync::Arc::new(RecordingWidgetServices::default());
     ext.set_host_services(services.clone());
 
@@ -382,17 +374,17 @@ async fn the_fleet_status_widget_is_published_and_cleared_through_live_host_serv
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_real_status_json_under_the_async_root_becomes_a_roster_row() {
-    let (_env, _home) = hermetic_home().await;
+    let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
     let cwd = dir.path();
 
     // Write the exact record the detached hop-2 runner writes: `<async_root>/<run-id>/status.json`,
     // stamped with THIS session — pi's `listAsyncRuns({ sessionId })` filter (`async-status.ts:432`)
     // compares that field against the caller's session and drops everything else.
-    let roots = cyrup_ext_subagents::background::run_artifact_roots(cwd);
+    let roots = cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
     write_status_json(&roots.async_root, "fleetrun001", "historian", Some(TEST_SESSION_ID));
 
-    let ext = extension(cwd);
+    let ext = extension(cwd, home.path());
     let host = std::sync::Arc::new(OverlayHostServices::new(100, 32, Vec::new()));
     ext.executor().set_host_services(host.clone());
     let ctx = HostCtx::command(ExtMode::Tui, true, cwd.to_path_buf());
@@ -424,15 +416,15 @@ async fn a_real_status_json_under_the_async_root_becomes_a_roster_row() {
 /// every session in the project had ever launched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_history_scan_keeps_only_this_sessions_runs() {
-    let (_env, _home) = hermetic_home().await;
+    let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
     let cwd = dir.path();
-    let roots = cyrup_ext_subagents::background::run_artifact_roots(cwd);
+    let roots = cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
     write_status_json(&roots.async_root, "runmine0001", "mine", Some(TEST_SESSION_ID));
     write_status_json(&roots.async_root, "runtheirs01", "theirs", Some("another-session"));
     write_status_json(&roots.async_root, "runnosess01", "untagged", None);
 
-    let ext = extension(cwd);
+    let ext = extension(cwd, home.path());
     let host = std::sync::Arc::new(OverlayHostServices::new(100, 32, Vec::new()));
     ext.executor().set_host_services(host.clone());
     let ctx = HostCtx::command(ExtMode::Tui, true, cwd.to_path_buf());
@@ -461,10 +453,10 @@ async fn the_history_scan_keeps_only_this_sessions_runs() {
 /// not even the shutdown clear reaches the host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fleet_view_false_publishes_no_widget_at_all() {
-    let (_env, _home) = hermetic_home().await;
+    let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
     let config = SubagentExtensionConfig { fleet_view: false, ..SubagentExtensionConfig::default() };
-    let ext = extension_with(dir.path(), config);
+    let ext = extension_with(dir.path(), home.path(), config);
     let services = std::sync::Arc::new(RecordingWidgetServices::default());
     ext.set_host_services(services.clone());
     let ctx = HostCtx::event(ExtMode::Tui, true, dir.path().to_path_buf());

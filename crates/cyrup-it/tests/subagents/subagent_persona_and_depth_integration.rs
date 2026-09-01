@@ -12,8 +12,8 @@
 //! inherited `CYRUP_SUBAGENT_DEPTH`/`_MAX_DEPTH` (T0.3) directly observable.
 //!
 //! Separate compilation unit from `lib.rs`, so NOT bound by that crate's `#![forbid(unsafe_code)]`;
-//! the `unsafe` env mutation (Rust 2024 requires it for `std::env::set_var`/`remove_var`) is scoped
-//! and serialized under [`ENV_MUTATION_LOCK`], exactly like every other integration test here.
+//! every fixture is handed down explicitly (`run_with`, `SubagentExtensionConfig::spawn_command`),
+//! so this file mutates no process-global state and needs no lock.
 //!
 //! Gated on `test-fixtures` (the `cyrup-subagent-fixture` `[[bin]]`'s own `required-features` gate):
 //! without it the fixture is never built and this file compiles to an empty, passing test list.
@@ -24,11 +24,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
-use cyrup_ext_subagents::background::runner_main::{RunnerConfig, run};
+use cyrup_ext_subagents::spawn::SpawnCommand;
+use cyrup_ext_subagents::background::runner_main::{RunnerConfig, RunnerOverrides, run_with};
 use cyrup_ext_subagents::background::{
     ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus, run_artifact_roots,
 };
@@ -43,10 +43,7 @@ use cyrup_ext_subagents::registration::{DynamicFanoutConfig, ExtensionChainConfi
 use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -117,7 +114,6 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_its_prompt_and_tools() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // The fixture echoes its own argv back as NDJSON so this test can read exactly what the child
@@ -130,12 +126,6 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     const REVIEWER_SYSTEM_PROMPT: &str = "You are the REVIEWER persona. Be rigorous.";
     // The plan-time resolved persona for `reviewer` — Append mode (so the system prompt is composed
@@ -217,13 +207,19 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
 
-    let outcome = run(&cfg_path, &run_paths).await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        // Driving the runner IN-PROCESS, so the fixture is handed down rather than exported.
+        RunnerOverrides {
+            spawn_command: Some(SpawnCommand {
+                binary: fixture_binary_path(),
+                base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
     outcome.expect("run() itself never returns Err");
 
     // The load-bearing proof: the child was actually spawned with the REAL reviewer persona.
@@ -304,7 +300,6 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
 
 #[tokio::test]
 async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // The fixture echoes its argv (including the composed prompt/task) so the test can read exactly
@@ -317,12 +312,6 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     // A Replace-mode persona with an empty system prompt so the child's task text is the raw
     // (substituted) step task — no appended prompt to obscure the marker.
@@ -399,13 +388,19 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
 
-    let outcome = run(&cfg_path, &run_paths).await;
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
-    outcome.expect("run() itself never returns Err");
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        // Driving the runner IN-PROCESS, so the fixture is handed down rather than exported.
+        RunnerOverrides {
+            spawn_command: Some(SpawnCommand {
+                binary: fixture_binary_path(),
+                base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            }),
+            ..Default::default()
+        },
+    )
+    .await;    outcome.expect("run() itself never returns Err");
 
     let tee = read_attempt_tee(dir.path());
     assert!(!tee.is_empty(), "a tee must exist — the child actually spawned");
@@ -429,8 +424,13 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         turn_budget: None,
         permission_rules: None,
+        // SUBA-078: this fixture exercises no reasoning ceiling — `None` is "no ceiling
+        // configured, so the bound is off", matching `runner_main.rs`'s own hop-2 default.
+        thinking_ceiling: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -502,7 +502,6 @@ fn depth_echo_agent(model: &str, depth: DepthEnvelope, max_subagent_depth: Optio
 }
 
 async fn run_depth_echo_child(dir: &Path, agent: &AgentConfig) -> String {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     // The fixture echoes the two depth env vars it actually inherited back as NDJSON lines.
     let script = serde_json::json!({
         "steps": [
@@ -512,26 +511,18 @@ async fn run_depth_echo_child(dir: &Path, agent: &AgentConfig) -> String {
         "exit_code": 0
     });
     let script_path = write_script(dir, "depth-script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
-    let opts = base_run_options(dir, "fixture-model");
+    let mut opts = base_run_options(dir, "fixture-model");
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         cyrup_ext_subagents::exec::run_sync(agent, "do the work", &opts),
     )
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
     assert_eq!(result.exit_code, 0, "the depth-echo child must exit cleanly: {result:?}");
 
     read_attempt_tee(dir)
@@ -602,7 +593,6 @@ async fn spawned_child_depth_env_applies_the_agents_tightening_only_max() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     const NEVER_SPAWNED_MARKER: &str = "THIS-CHILD-MUST-NEVER-RUN";
@@ -613,13 +603,8 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — a REAL working fixture, so a failure to spawn
-    // is attributable only to the depth guard, not an unreachable binary.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
+    // A REAL working fixture, so a failure to spawn is attributable only to the depth guard,
+    // not an unreachable binary.
 
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert(
@@ -698,13 +683,19 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
 
-    let outcome = run(&cfg_path, &run_paths).await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        // Driving the runner IN-PROCESS, so the fixture is handed down rather than exported.
+        RunnerOverrides {
+            spawn_command: Some(SpawnCommand {
+                binary: fixture_binary_path(),
+                base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
     outcome.expect("run() itself never returns Err, even on a depth rejection");
 
     let status: RunStatus =
@@ -745,7 +736,6 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_reference() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // The fixture child emits one assistant message; it does NOT write the output file itself, so
@@ -757,12 +747,6 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     // A report/summarize persona + task (NOT implementation-mutation shaped, so the acceptance
     // heuristic is NotRequired and the completion guard — also disabled here — never fires): the run
@@ -813,7 +797,13 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
         agent_scope: None,
     };
 
-    let executor = SubagentExecutor::new();
+    let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
+        spawn_command: Some(SpawnCommand {
+            binary: fixture_binary_path(),
+            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        }),
+        ..SubagentExtensionConfig::default()
+    });
     let outcome = executor
         .run_chain_foreground(
             dir.path(),
@@ -825,12 +815,6 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
             None,
         )
         .await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
 
     let (results, _groups) = outcome.expect("the foreground chain walk completes");
     assert_eq!(results.len(), 1, "one step, one result");
@@ -881,7 +865,6 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     let script = serde_json::json!({
@@ -893,12 +876,6 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script-chain-timeout.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let reporter = ResolvedAgentPersona {
         name: "reporter".to_string(),
@@ -945,7 +922,13 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
         agent_scope: None,
     };
 
-    let executor = SubagentExecutor::new();
+    let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
+        spawn_command: Some(SpawnCommand {
+            binary: fixture_binary_path(),
+            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        }),
+        ..SubagentExtensionConfig::default()
+    });
     // The chain-wide `timeout_ms = Some(300)` here is the SAME value `route_chain_mode` resolves
     // from the tool's `timeoutMs`/`maxRuntimeMs` params and threads through
     // `run_or_background_graph` -> `run_chain_foreground` post-fix.
@@ -962,12 +945,6 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
         ),
     )
     .await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
 
     let (results, _groups) = outcome
         .expect(
@@ -1000,19 +977,22 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
 
 #[tokio::test]
 async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_into_runner_config() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // No script file set: the fixture's own env-fallback default (no steps, immediate exit 0) is
     // enough — this test only needs the detached "runner" process to start and exit quickly
     // WITHOUT ever reading `runner-config.json` itself, so the file survives for read-back.
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-    }
-
+    // `SubagentExtensionConfig::spawn_command`, even though this drives `spawn_background_steps`,
+    // a DETACHED hop-1 spawn. This used to require the env var: the child is a separate process
+    // that re-resolves its own command, and the config seam did not reach it. It does now —
+    // `spawn_background_steps` hands the resolved command to
+    // `spawn_detached_runner_with_command`, so the value crosses as the command actually executed
+    // rather than as something the child re-derives.
     let cfg = SubagentExtensionConfig {
+        spawn_command: Some(SpawnCommand {
+            binary: fixture_binary_path(),
+            base_args: Vec::new(),
+        }),
         chain: Some(ExtensionChainConfig {
             dynamic_fanout: Some(DynamicFanoutConfig { max_items: Some(7) }),
         }),
@@ -1070,11 +1050,6 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
         )
         .await
         .expect("spawn_background_steps confirms the detached hop-1 spawn");
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-    }
 
     // Reconstruct the SAME run-dir path `spawn_background_steps` wrote `runner-config.json` under
     // (C7 shared roots — no inherited nested-route env is set in this test process, so this is the
@@ -1163,12 +1138,6 @@ async fn run_chain_step_with_acceptance(
         "exit_code": 0
     });
     let script_path = write_script(dir, "script.json", &script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
 
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("builder".to_string(), acceptance_persona("builder"));
@@ -1176,7 +1145,13 @@ async fn run_chain_step_with_acceptance(
     let mut step = single_step("builder", "Fix the failing parser.");
     step.acceptance = Some(acceptance);
 
-    let outcome = SubagentExecutor::new()
+    let outcome = SubagentExecutor::with_config(SubagentExtensionConfig {
+        spawn_command: Some(SpawnCommand {
+            binary: fixture_binary_path(),
+            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        }),
+        ..SubagentExtensionConfig::default()
+    })
         .run_chain_foreground(
             dir,
             vec![RunnerStep::SingleStep(step)],
@@ -1188,12 +1163,6 @@ async fn run_chain_step_with_acceptance(
         )
         .await;
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
-
     let (results, _groups) = outcome.expect("the foreground chain walk completes");
     assert_eq!(results.len(), 1, "one step, one result");
     (results[0].success, results[0].error.clone())
@@ -1201,7 +1170,6 @@ async fn run_chain_step_with_acceptance(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_chain_step_acceptance_contract_with_a_failing_verify_command_fails_the_step() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // `level: "verified"` REQUIRES a real, executed, exit-0 `verify[]` command (DI-SA-5) — this one
@@ -1235,7 +1203,6 @@ async fn a_chain_step_acceptance_contract_with_a_failing_verify_command_fails_th
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_chain_step_acceptance_contract_with_a_passing_verify_command_still_succeeds() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // The positive control for the test above: the SAME contract shape, with a command that really
@@ -1258,7 +1225,6 @@ async fn a_chain_step_acceptance_contract_with_a_passing_verify_command_still_su
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_chain_step_with_an_invalid_acceptance_policy_fails_the_step_rather_than_running_ungated() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // A policy that reaches the runner already malformed (the tool boundary refuses these up front,

@@ -17,8 +17,8 @@
 //! they cover the whole path, and neither leans on the other's layer.
 //!
 //! Separate compilation unit from `lib.rs`, so NOT bound by that crate's `#![forbid(unsafe_code)]`;
-//! the `unsafe` env mutation (Rust 2024 requires it for `std::env::set_var`/`remove_var`) is scoped
-//! and serialized under [`ENV_MUTATION_LOCK`], exactly like every other integration test here.
+//! Mutates no process environment: the fixture is named per run through
+//! `SubagentExtensionConfig::spawn_command`, so this file needs no `unsafe` and no lock.
 //!
 //! Gated on `test-fixtures` (the `cyrup-subagent-fixture` `[[bin]]`'s own `required-features`
 //! gate): without it the fixture is never built and this file compiles to an empty, passing test
@@ -34,18 +34,15 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use tokio::sync::Mutex;
 
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::SystemPromptMode;
+use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::ResolvedAgentPersona;
 use cyrup_ext_subagents::extension::SubagentExecutor;
 use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec, StepResult};
 
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
-
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -126,18 +123,20 @@ fn step(output_path: Option<&str>) -> SingleStepSpec {
 /// Run one chain step against the real fixture child and return its `StepResult`.
 async fn run_one_step(dir: &Path, script: &serde_json::Value, output_path: Option<&str>) -> StepResult {
     let script_path = write_script(dir, "script.json", script);
-    let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc. Every caller
-    // holds `ENV_MUTATION_LOCK` for the whole call.
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-    }
+    // The fixture named for THIS executor rather than moved into the process environment every
+    // concurrently-running test in this binary shares.
+    let config = SubagentExtensionConfig {
+        spawn_command: Some(SpawnCommand {
+            binary: fixture_binary_path(),
+            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        }),
+        ..SubagentExtensionConfig::default()
+    };
 
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("reporter".to_string(), reporter_persona());
 
-    let outcome = SubagentExecutor::new()
+    let outcome = SubagentExecutor::with_config(config)
         .run_chain_foreground(
             dir,
             vec![RunnerStep::SingleStep(step(output_path))],
@@ -149,11 +148,6 @@ async fn run_one_step(dir: &Path, script: &serde_json::Value, output_path: Optio
         )
         .await;
 
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-    }
 
     let (results, _groups) = outcome.expect("the foreground chain walk completes");
     assert_eq!(results.len(), 1, "one step, one result");
@@ -170,7 +164,6 @@ async fn run_one_step(dir: &Path, script: &serde_json::Value, output_path: Optio
 /// indistinguishable from an ordinary failure in a `{outputs.<collect.as>}` record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_real_child_exit_code_survives_onto_the_step_result() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     let script = serde_json::json!({
@@ -197,7 +190,6 @@ async fn a_real_child_exit_code_survives_onto_the_step_result() {
 /// the path existed only folded into the prose of the delivered `final_output`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_saved_output_path_reaches_the_step_result_as_a_bare_path() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("real tempdir");
 
     const REPORT_BODY: &str = "the analyzed report body";

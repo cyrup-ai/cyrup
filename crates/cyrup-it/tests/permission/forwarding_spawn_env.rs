@@ -161,8 +161,13 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         runner: None, // SUBA-074: the native child, as before
     };
     let opts = RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
+        // SUBA-078: this fixture exercises no reasoning ceiling — `None` is "no ceiling
+        // configured, so the bound is off", matching `runner_main.rs`'s own hop-2 default.
+        thinking_ceiling: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL tool param (`extension/schemas.ts:324`
         // @v0.52.0) threaded to the runner as `usageBudget?: UsageBudgetConfig`
         // (`runs/background/subagent-runner.ts:193`) — upstream has no default budget, so a call

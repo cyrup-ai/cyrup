@@ -75,21 +75,24 @@ impl NativeExtension for SubagentsExtension {
                 // `cleanup_all_artifact_dirs` are pi's own once-per-load sweeps (`extension/index.ts:329,339`),
                 // NOT a per-`session_start` concern — moved here so they run exactly once per process
                 // load rather than re-running (redundantly, if harmlessly throttled) on every session.
-                let roots = crate::background::run_artifact_roots(&self.cwd);
-                crate::background::ensure_accessible_dir(&roots.async_root)
+                let artifact_roots = crate::background::run_artifact_roots_in(
+                    &self.executor.config_snapshot().await.roots,
+                    &self.cwd,
+                );
+                crate::background::ensure_accessible_dir(&artifact_roots.async_root)
                     .await
                     .map_err(|e| {
                         ExtError::Component(format!(
                             "subagents: async root {} is not accessible: {e}",
-                            roots.async_root.display()
+                            artifact_roots.async_root.display()
                         ))
                     })?;
-                crate::background::ensure_accessible_dir(&roots.results_dir)
+                crate::background::ensure_accessible_dir(&artifact_roots.results_dir)
                     .await
                     .map_err(|e| {
                         ExtError::Component(format!(
                             "subagents: results dir {} is not accessible: {e}",
-                            roots.results_dir.display()
+                            artifact_roots.results_dir.display()
                         ))
                     })?;
                 crate::artifacts::cleanup_old_chain_dirs(&self.cwd);
@@ -180,10 +183,15 @@ impl NativeExtension for SubagentsExtension {
                 // predates the native channel reaches for; on an orchestrator that never installed
                 // intercom — precisely the one this channel exists for — that name resolved to no
                 // tool at all.
+                // Both gates read the environment through the crate's injectable resolver, so
+                // `config.env_overrides` can pin (or scrub) what they see without this process
+                // mutating anything global. With no overrides this is byte-for-byte the previous
+                // `std::env::var(k).ok()`.
+                let env = self.env_lookup();
                 if crate::native_supervisor::native_intercom_alias_should_register(
-                    &|k| std::env::var(k).ok(),
+                    &env,
                     &crate::native_supervisor::intercom_agent_dir_from(
-                        &|k| std::env::var(k).ok(),
+                        &env,
                         Some(self.cwd.clone()),
                     ),
                 ) {

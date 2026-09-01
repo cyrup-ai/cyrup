@@ -40,7 +40,7 @@
 use std::path::PathBuf;
 
 use crate::spawn::nested_events::{
-    NestedRoute, NestedRunSummary, project_nested_events, resolve_nested_async_dir,
+    NestedRoute, NestedRunSummary, project_nested_events_in, resolve_nested_async_dir_in,
 };
 
 use super::control;
@@ -150,8 +150,12 @@ fn is_live_state(state: &str) -> bool {
 /// handed a control-request write at an attacker-chosen path. The nested-event sink is written by
 /// descendant processes, so its contents are exactly the kind of input `validate_contains_root`
 /// exists for.
-fn target_dir(root_run_id: &str, run: &NestedRunSummary) -> Option<PathBuf> {
-    resolve_nested_async_dir(root_run_id, run)
+fn target_dir(
+    nested_runs_root: &std::path::Path,
+    root_run_id: &str,
+    run: &NestedRunSummary,
+) -> Option<PathBuf> {
+    resolve_nested_async_dir_in(nested_runs_root, root_run_id, run)
 }
 
 /// Deliver `verb` to every live nested async descendant reachable through `route`.
@@ -161,12 +165,13 @@ fn target_dir(root_run_id: &str, run: &NestedRunSummary) -> Option<PathBuf> {
 /// so the caller can log it and carry on. An interrupt must not be downgraded into a failed run
 /// because one grandchild was already gone.
 pub async fn cascade_to_nested_async_descendants(
+    roots: &crate::paths::Roots,
     route: &NestedRoute,
     verb: CascadeVerb,
 ) -> CascadeReport {
     let mut report = CascadeReport::default();
 
-    let registry = match project_nested_events(route) {
+    let registry = match project_nested_events_in(&roots.nested_events(), route) {
         Ok(registry) => registry,
         Err(err) => {
             report.failures.push(CascadeFailure {
@@ -184,7 +189,7 @@ pub async fn cascade_to_nested_async_descendants(
         if !is_live_state(&run.state) {
             continue;
         }
-        let Some(dir) = target_dir(&route.root_run_id, &run) else {
+        let Some(dir) = target_dir(&roots.nested_runs(), &route.root_run_id, &run) else {
             continue;
         };
         // `pid` is projected as i64 from the descendant's own status record; a non-positive value

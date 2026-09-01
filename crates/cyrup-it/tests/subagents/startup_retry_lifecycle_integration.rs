@@ -32,9 +32,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex as AsyncMutex;
 
 use cyrup_core::{CancelToken, ModelId};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::child_protocol::MAX_CHILD_PENDING_LINE_BYTES;
@@ -46,12 +46,10 @@ use cyrup_ext_subagents::exec::output::{INTERRUPTED_FINAL_OUTPUT, OutputCap};
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult};
 use cyrup_ext_subagents::fork_context::ForkContext;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
+use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 
-/// Serializes every test mutating `CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT` (global).
-static ENV_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -61,29 +59,6 @@ fn write_script(dir: &Path, name: &str, script: &serde_json::Value) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, script.to_string()).expect("write fixture script");
     path
-}
-
-/// RAII guard installing the fixture-binary + script env for one test.
-struct FixtureEnvGuard;
-impl FixtureEnvGuard {
-    fn install(script_path: &Path) -> Self {
-        let fixture = fixture_binary_path();
-        // SAFETY: scoped, mutex-serialized env mutation (Rust 2024 requires `unsafe` for set_var).
-        unsafe {
-            std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-            std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, script_path);
-        }
-        Self
-    }
-}
-impl Drop for FixtureEnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `install`.
-        unsafe {
-            std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-            std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        }
-    }
 }
 
 fn message_end_line(text: &str) -> String {
@@ -147,8 +122,13 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        spawn_command: None,
+        child_env: std::collections::HashMap::new(),
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
+        // SUBA-078: this fixture exercises no reasoning ceiling — `None` is "no ceiling
+        // configured, so the bound is off", matching `runner_main.rs`'s own hop-2 default.
+        thinking_ceiling: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -201,10 +181,15 @@ async fn run_fixture_with(
     dir: &Path,
     script: &serde_json::Value,
     name: &str,
-    opts: RunOptions,
+    mut opts: RunOptions,
 ) -> SingleResult {
     let script_path = write_script(dir, name, script);
-    let _env = FixtureEnvGuard::install(&script_path);
+    // This run names its own binary and script rather than moving process-global state every
+    // concurrently-running test in this binary shares.
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+    });
     let agent = base_agent_config("fixture-model");
     tokio::time::timeout(
         Duration::from_secs(60),
@@ -261,7 +246,6 @@ fn zero_activity_script() -> serde_json::Value {
 /// budget and report EXHAUSTION, not cancellation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_during_the_startup_backoff_abandons_the_run_before_relaunching() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let opts = base_run_options(dir.path(), "fixture-model");
@@ -317,7 +301,6 @@ async fn a_cancel_during_the_startup_backoff_abandons_the_run_before_relaunching
 /// the user asked to pause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_interrupt_during_the_startup_backoff_is_a_paused_success_not_a_failure() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let opts = base_run_options(dir.path(), "fixture-model");
@@ -365,7 +348,6 @@ async fn an_interrupt_during_the_startup_backoff_is_a_paused_success_not_a_failu
 /// startupError` as well as `result.error` (`execution.ts:1610-1611`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn with_no_signal_the_backoff_ladder_runs_to_exhaustion_and_reports_it_as_the_output() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let result = run_fixture(dir.path(), &zero_activity_script(), "exhausted.json").await;
@@ -425,7 +407,6 @@ async fn the_startup_retry_note_reaches_the_live_progress_surface_of_the_relaunc
     };
     use cyrup_ext_subagents::tui::events::SubagentUpdatePayload;
 
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
 
@@ -441,13 +422,6 @@ async fn the_startup_retry_note_reaches_the_live_progress_surface_of_the_relaunc
 
     let script_path = write_script(dir.path(), "note-live.json", &zero_activity_script());
     let fixture = fixture_binary_path();
-    // SAFETY: scoped, mutex-serialized env mutation (Rust 2024 requires `unsafe` for set_var).
-    unsafe {
-        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
-        // Isolate user-scope discovery from the developer's real `~/.cyrup`.
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
 
     let updates: Arc<Mutex<Vec<ToolUpdate>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_updates = Arc::clone(&updates);
@@ -457,7 +431,14 @@ async fn the_startup_retry_note_reaches_the_live_progress_surface_of_the_relaunc
         }
     });
 
-    let executor = SubagentExecutor::new();
+    let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
+        spawn_command: Some(SpawnCommand {
+            binary: fixture,
+            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        }),
+        roots: Roots::sandboxed(home.path()),
+        ..SubagentExtensionConfig::default()
+    });
     let streamed = tokio::time::timeout(
         Duration::from_secs(60),
         executor.run_foreground_streaming(
@@ -476,13 +457,6 @@ async fn the_startup_retry_note_reaches_the_live_progress_surface_of_the_relaunc
         ),
     )
     .await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        std::env::remove_var("CYRUP_HOME");
-    }
     streamed
         .expect("the streaming run must not hang")
         .expect("run_foreground_streaming resolves the persona and completes");
@@ -542,7 +516,6 @@ async fn the_startup_retry_note_reaches_the_live_progress_surface_of_the_relaunc
 /// assistant error is downstream noise from the same event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_protocol_limit_outranks_a_trailing_assistant_error() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({
@@ -578,7 +551,6 @@ async fn a_protocol_limit_outranks_a_trailing_assistant_error() {
 /// implementation that ignores assistant errors altogether.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_trailing_assistant_error_is_reported_when_nothing_outranks_it() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({
@@ -615,7 +587,6 @@ async fn a_trailing_assistant_error_is_reported_when_nothing_outranks_it() {
 /// `agent_settled` at all, so a terminal assistant stop is the only thing that can arm the window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_terminal_assistant_stop_arms_the_drain_so_a_hanging_child_is_force_drained() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
 
     let script = serde_json::json!({

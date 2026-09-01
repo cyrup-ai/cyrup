@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use crate::background::atomic::write_atomic_json;
 use crate::error::SubagentError;
-use crate::paths::home_dir;
 use crate::extension::host::SubagentsExtension;
 use crate::extension::models::registry_models;
 use crate::extension::models::classify::{
@@ -28,7 +27,7 @@ impl SubagentsExtension {
     /// `/subagents-doctor`'s freshness check observes that a refresh genuinely ran.
     fn provider_catalog_cache_path(&self, cwd: &Path) -> PathBuf {
         let _ = cwd;
-        home_dir()
+        self.home()
             .join(".cyrup")
             .join("subagents")
             .join("provider-catalog-cache.json")
@@ -89,7 +88,11 @@ impl SubagentsExtension {
         for m in &matches {
             let full_id = format!("{}/{}", m.provider.as_str(), m.id.as_str());
             let classification = classify_model(m, &ctx);
-            let probe = probe_model(&full_id).await;
+            let probe = probe_model(
+                &full_id,
+                self.executor().config_snapshot().await.spawn_command.as_ref(),
+            )
+            .await;
             models.push(crate::registration::profiles::ProviderCatalogModel {
                 id: m.id.as_str().to_string(),
                 full_id,
@@ -248,8 +251,17 @@ impl SubagentsExtension {
         ))
     }
 
+    /// This extension's resolved home — one of the four roots in `SubagentExtensionConfig::roots`.
+    ///
+    /// No `unwrap_or_else(home_dir)` fallback any more: the roots are resolved once, at
+    /// construction, so there is no "or go read the environment" arm left to answer differently
+    /// from the one the rest of this extension used.
+    pub(crate) fn home(&self) -> PathBuf {
+        self.roots.home().to_path_buf()
+    }
+
     pub(crate) fn profiles_dir(&self) -> PathBuf {
-        home_dir().join(".cyrup").join("subagents").join("profiles")
+        self.home().join(".cyrup").join("subagents").join("profiles")
     }
 
     /// The user-scope `settings.json` the extension's discovery reads its `subagents.*` layer back
@@ -258,7 +270,7 @@ impl SubagentsExtension {
     /// here so the next discovery pass picks it up, exactly as pi's `applySubagentProfile` writes to
     /// the same `getUserSettingsPath()` its discovery reads.
     fn user_settings_path(&self) -> PathBuf {
-        home_dir()
+        self.home()
             .join(".cyrup")
             .join("agents")
             .join("settings.json")

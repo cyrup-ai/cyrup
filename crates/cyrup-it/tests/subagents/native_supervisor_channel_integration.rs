@@ -25,8 +25,10 @@
 //!   is never adopted, and the child-side native `contact_supervisor` registers exactly when
 //!   `cyrup-intercom` will not be supplying its own.
 //!
-//! Env-mutating (`CYRUP_SUBAGENTS_TEMP_ROOT`, `CYRUP_CODING_AGENT_DIR`) and therefore a separate
-//! compilation unit: `src/lib.rs` is `#![forbid(unsafe_code)]` and `std::env::set_var` is `unsafe`
+//! Every root and every environment answer this file needs is supplied EXPLICITLY —
+//! `NativeSupervisorChannel::with_root`, `resolve_supervisor_channel_dir_in`, and
+//! `SubagentExtensionConfig::{roots, env_overrides}` — so it mutates no process-global state,
+//! contains no `unsafe`, and needs no lock.
 //! under edition 2024 — the same rationale every other `tests/*_integration.rs` file here carries.
 
 #![allow(
@@ -36,97 +38,25 @@
     clippy::panic
 )]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::Mutex as AsyncMutex;
 
 use cyrup_core::{CancelToken, Tool, ToolCallId};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::native_supervisor::{
     self, ChildChannelMetadata, NativeSupervisorChannel, SubagentSupervisorTool, SupervisorReason,
 };
 
-/// Serializes the whole file's env mutation. `tokio::sync::Mutex` (not `std`), because every test
-/// here holds it across `.await` points — a `std` guard held across an await is what
-/// `clippy::await_holding_lock` refuses.
-static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 /// Point the shared subagents temp root at a private tempdir for the duration of a test, so the
-/// supervisor-channel root never touches a developer/CI machine's real `/tmp/cyrup-subagents`.
-struct TempRootGuard {
-    _dir: tempfile::TempDir,
-    previous: Option<String>,
-}
-
-impl TempRootGuard {
-    fn install() -> (Self, PathBuf) {
-        let dir = tempfile::tempdir().expect("real tempdir");
-        let path = dir.path().to_path_buf();
-        let previous = std::env::var("CYRUP_SUBAGENTS_TEMP_ROOT").ok();
-        // SAFETY: every test in this file holds `ENV_LOCK` for the whole of its critical section, so
-        // no other thread in this process observes a torn env.
-        unsafe {
-            std::env::set_var("CYRUP_SUBAGENTS_TEMP_ROOT", &path);
-        }
-        (Self { _dir: dir, previous }, path)
-    }
-}
-
-impl Drop for TempRootGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `install`.
-        unsafe {
-            match &self.previous {
-                Some(v) => std::env::set_var("CYRUP_SUBAGENTS_TEMP_ROOT", v),
-                None => std::env::remove_var("CYRUP_SUBAGENTS_TEMP_ROOT"),
-            }
-        }
-    }
-}
-
-/// Save / set-or-remove / restore one env var for the duration of a test.
+/// A channel-directory tree owned by one test.
 ///
-/// Exists because this file's harness-driven test is the only one here that drives the parent
-/// `intercom`-alias gate through the REAL `std::env::var` closure (`src/extension.rs:9286`) rather
-/// than an injected `get`. Any var that gate reads must therefore be pinned to the value the test
-/// claims, not inherited from whatever the developer or CI runner happens to export.
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<String>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let previous = std::env::var(key).ok();
-        // SAFETY: every test in this file holds `ENV_LOCK` for the whole of its critical section, so
-        // no other thread in this process observes a torn env.
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-
-    fn remove(key: &'static str) -> Self {
-        let previous = std::env::var(key).ok();
-        // SAFETY: see `set`.
-        unsafe {
-            std::env::remove_var(key);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `set`. Restores the PRIOR value rather than blindly removing, so a developer
-        // env that legitimately sets these is left exactly as it was found.
-        unsafe {
-            match &self.previous {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+/// `NativeSupervisorChannel::with_root` and `resolve_supervisor_channel_dir_in` take this
+/// explicitly, so no test here moves `CYRUP_SUBAGENTS_TEMP_ROOT` on a process the rest of the
+/// binary shares — which also means there is nothing to restore and no lock to hold.
+fn channel_root() -> tempfile::TempDir {
+    tempfile::tempdir().expect("real tempdir")
 }
 
 /// A live-capability backend stand-in exposing exactly the two seams the channel uses:
@@ -214,14 +144,13 @@ async fn call_tool(tool: &SubagentSupervisorTool, args: serde_json::Value) -> St
 /// `pending`, or a request file the reply did not delete, would re-inject on every 500 ms tick.
 #[tokio::test]
 async fn a_blocking_child_request_is_surfaced_answered_and_then_never_re_surfaced() {
-    let _guard = ENV_LOCK.lock().await;
-    let (_temp, _root) = TempRootGuard::install();
+    let root_dir = channel_root();
 
     let services = Arc::new(RecordingServices {
         session_id: "session-parent-1".to_string(),
         ..Default::default()
     });
-    let channel = Arc::new(NativeSupervisorChannel::new());
+    let channel = Arc::new(NativeSupervisorChannel::with_root(root_dir.path().to_path_buf()));
     channel.bind_services(services.clone());
     let tool = SubagentSupervisorTool::new(channel.clone());
 
@@ -232,7 +161,7 @@ async fn a_blocking_child_request_is_surfaced_answered_and_then_never_re_surface
     assert!(status.contains("Pending replies: 0."), "got: {status}");
 
     // --- the child writes a BLOCKING request into its own channel directory ---
-    let channel_dir = native_supervisor::resolve_supervisor_channel_dir("run-XYZ", "reviewer", 2);
+    let channel_dir = native_supervisor::resolve_supervisor_channel_dir_in(root_dir.path(), "run-XYZ", "reviewer", 2);
     native_supervisor::ensure_supervisor_channel_dir(&channel_dir).expect("channel dirs");
     let metadata = child_metadata(&channel_dir, "session-parent-1");
 
@@ -325,17 +254,16 @@ async fn a_blocking_child_request_is_surfaced_answered_and_then_never_re_surface
 /// progress update would sit forever in `pending`, poisoning the single-pending `reply` shorthand.
 #[tokio::test]
 async fn a_progress_update_is_surfaced_but_never_becomes_pending() {
-    let _guard = ENV_LOCK.lock().await;
-    let (_temp, _root) = TempRootGuard::install();
+    let root_dir = channel_root();
 
     let services = Arc::new(RecordingServices {
         session_id: "session-parent-1".to_string(),
         ..Default::default()
     });
-    let channel = Arc::new(NativeSupervisorChannel::new());
+    let channel = Arc::new(NativeSupervisorChannel::with_root(root_dir.path().to_path_buf()));
     channel.bind_services(services.clone());
 
-    let channel_dir = native_supervisor::resolve_supervisor_channel_dir("run-A", "worker", 0);
+    let channel_dir = native_supervisor::resolve_supervisor_channel_dir_in(root_dir.path(), "run-A", "worker", 0);
     native_supervisor::ensure_supervisor_channel_dir(&channel_dir).expect("channel dirs");
     let metadata = child_metadata(&channel_dir, "session-parent-1");
     let (request, reply) = native_supervisor::send_supervisor_request(
@@ -378,17 +306,16 @@ async fn a_progress_update_is_surfaced_but_never_becomes_pending() {
 /// each surface — and be able to answer — the other's children.
 #[tokio::test]
 async fn a_request_from_another_orchestrator_session_is_never_adopted() {
-    let _guard = ENV_LOCK.lock().await;
-    let (_temp, _root) = TempRootGuard::install();
+    let root_dir = channel_root();
 
     let services = Arc::new(RecordingServices {
         session_id: "session-parent-1".to_string(),
         ..Default::default()
     });
-    let channel = Arc::new(NativeSupervisorChannel::new());
+    let channel = Arc::new(NativeSupervisorChannel::with_root(root_dir.path().to_path_buf()));
     channel.bind_services(services.clone());
 
-    let channel_dir = native_supervisor::resolve_supervisor_channel_dir("run-B", "worker", 0);
+    let channel_dir = native_supervisor::resolve_supervisor_channel_dir_in(root_dir.path(), "run-B", "worker", 0);
     native_supervisor::ensure_supervisor_channel_dir(&channel_dir).expect("channel dirs");
     // Keyed to a session this orchestrator is not.
     let metadata = child_metadata(&channel_dir, "session-SOMEONE-ELSE");
@@ -427,10 +354,9 @@ async fn a_request_from_another_orchestrator_session_is_never_adopted() {
 /// "unsupported", which is what tells the model to use `contact_supervisor` from the child instead.
 #[tokio::test]
 async fn send_and_ask_are_refused_with_the_upstream_text_and_unknown_actions_are_rejected() {
-    let _guard = ENV_LOCK.lock().await;
-    let (_temp, _root) = TempRootGuard::install();
+    let root_dir = channel_root();
 
-    let channel = Arc::new(NativeSupervisorChannel::new());
+    let channel = Arc::new(NativeSupervisorChannel::with_root(root_dir.path().to_path_buf()));
     channel.bind_services(Arc::new(RecordingServices {
         session_id: "session-parent-1".to_string(),
         ..Default::default()
@@ -497,19 +423,18 @@ async fn send_and_ask_are_refused_with_the_upstream_text_and_unknown_actions_are
 /// matches both must refuse too — answering the wrong blocked child is worse than answering none.
 #[tokio::test]
 async fn an_ambiguous_reply_is_refused_rather_than_guessed() {
-    let _guard = ENV_LOCK.lock().await;
-    let (_temp, _root) = TempRootGuard::install();
+    let root_dir = channel_root();
 
     let services = Arc::new(RecordingServices {
         session_id: "session-parent-1".to_string(),
         ..Default::default()
     });
-    let channel = Arc::new(NativeSupervisorChannel::new());
+    let channel = Arc::new(NativeSupervisorChannel::with_root(root_dir.path().to_path_buf()));
     channel.bind_services(services);
 
     let mut children = Vec::new();
     for index in 0..2usize {
-        let dir = native_supervisor::resolve_supervisor_channel_dir("run-C", "worker", index);
+        let dir = native_supervisor::resolve_supervisor_channel_dir_in(root_dir.path(), "run-C", "worker", index);
         native_supervisor::ensure_supervisor_channel_dir(&dir).expect("channel dirs");
         let mut metadata = child_metadata(&dir, "session-parent-1");
         metadata.run_id = "run-C".to_string();
@@ -595,8 +520,6 @@ async fn the_supervisor_tool_is_registered_and_dispatches_on_a_real_session() {
     use cyrup_test_support::harness::{create_harness_with_extensions, HarnessOptions};
     use cyrup_test_support::response::FauxResponse;
 
-    let _guard = ENV_LOCK.lock().await;
-    let (_root_guard, _root) = TempRootGuard::install();
     let home = tempfile::tempdir().expect("home tempdir");
     let work_dir = tempfile::tempdir().expect("work tempdir");
     // Pin EVERY env var the alias gate reads, because this test asserts on a precondition it must
@@ -610,12 +533,23 @@ async fn the_supervisor_tool_is_registered_and_dispatches_on_a_real_session() {
     // `CYRUP_HOME`, so an ambient value would silently defeat the tempdir isolation below.
     // The guards must be installed BEFORE the extension is constructed: `SubagentsExtension::init`
     // is what reads the env.
-    let _intercom = EnvVarGuard::remove("CYRUP_INTERCOM");
-    let _agent_dir = EnvVarGuard::remove("CYRUP_CODING_AGENT_DIR");
-    let _home = EnvVarGuard::set("CYRUP_HOME", home.path());
-
+    // Pinned on the CONFIG, not on the process. Both gates read through the crate's injectable
+    // `&dyn Fn(&str) -> Option<String>` resolver, so `None` ("unset") scrubs an ambient value just
+    // as effectively as `remove_var` did — and nothing global moves, so no lock and no `unsafe`.
     let extension = Arc::new(SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        SubagentExtensionConfig {
+            env_overrides: [
+                ("CYRUP_INTERCOM".to_string(), None),
+                ("CYRUP_CODING_AGENT_DIR".to_string(), None),
+                (
+                    "CYRUP_HOME".to_string(),
+                    Some(home.path().display().to_string()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
     ));
 
@@ -639,9 +573,8 @@ async fn the_supervisor_tool_is_registered_and_dispatches_on_a_real_session() {
 
     let events = harness.run("check the supervisor channel").await;
 
-    // Teardown is `EnvVarGuard::drop`, which RESTORES the prior value. The manual
-    // `remove_var("CYRUP_HOME")` that used to sit here was unbalanced: it deleted the var outright
-    // rather than putting back what the process started with.
+    // No teardown: nothing process-global was ever changed, so there is nothing to restore and
+    // no way for this test to leak state into a sibling.
     let events = events.expect("the turn completes without a transport/session-level error");
 
     let starts: Vec<&str> = events
@@ -699,33 +632,25 @@ async fn a_fanout_child_registers_no_supervisor_tool() {
     use cyrup_ext_subagents::extension::{RegistrationMode, SubagentsExtension};
     use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
-    let _guard = ENV_LOCK.lock().await;
     let home = tempfile::tempdir().expect("home tempdir");
     let work_dir = tempfile::tempdir().expect("work tempdir");
-    // SAFETY: scoped, `ENV_LOCK`-serialized.
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
+    let sandboxed = || SubagentExtensionConfig {
+        roots: Roots::sandboxed(home.path()),
+        ..SubagentExtensionConfig::default()
+    };
 
     let child = SubagentsExtension::with_mode(
-        SubagentExtensionConfig::default(),
+        sandboxed(),
         work_dir.path().to_path_buf(),
         RegistrationMode::ChildSafe,
     );
     let mut child_api = InitApi::new();
     let child_init = child.init(&mut child_api).await;
 
-    let full = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
-        work_dir.path().to_path_buf(),
-    );
+    let full = SubagentsExtension::with_config_and_cwd(sandboxed(), work_dir.path().to_path_buf());
     let mut full_api = InitApi::new();
     let full_init = full.init(&mut full_api).await;
 
-    // SAFETY: scoped cleanup under the same lock-held critical section.
-    unsafe {
-        std::env::remove_var("CYRUP_HOME");
-    }
     child_init.expect("child-safe init succeeds");
     full_init.expect("full init succeeds");
 
@@ -765,8 +690,8 @@ async fn a_fanout_child_registers_no_supervisor_tool() {
 async fn a_child_that_declared_intercom_gets_both_native_supervisor_tools() {
     use cyrup_ext::native::InitApi;
 
-    let _guard = ENV_LOCK.lock().await;
-    let (_root_guard, root) = TempRootGuard::install();
+    let root_dir = channel_root();
+    let root = root_dir.path().to_path_buf();
     // An agent dir with NO intercom config and no `CYRUP_INTERCOM`: the orchestrator never
     // installed intercom, so the native channel is this child's only supervisor route.
     let agent_dir = tempfile::tempdir().expect("agent dir");
@@ -843,8 +768,8 @@ async fn a_child_that_declared_intercom_gets_both_native_supervisor_tools() {
 /// `contact_supervisor`: four serviced actions and one verbatim refusal.
 #[tokio::test]
 async fn the_child_intercom_fallback_services_pis_four_actions_and_refuses_the_rest() {
-    let _guard = ENV_LOCK.lock().await;
-    let (_root_guard, root) = TempRootGuard::install();
+    let root_dir = channel_root();
+    let root = root_dir.path().to_path_buf();
     let channel_dir = root.join("supervisor-channels").join("run-f-reviewer-0");
     native_supervisor::ensure_supervisor_channel_dir(&channel_dir).expect("channel dirs");
     let tool =

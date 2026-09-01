@@ -204,8 +204,13 @@ impl WaitDeps {
     /// caller supplies the live session id (pi `deps.state.currentSessionId`); pass `None` only
     /// when there genuinely is no session identity.
     #[must_use]
-    pub fn for_cwd(cwd: &std::path::Path, enabled: bool, session_id: Option<String>) -> Self {
-        let roots = super::run_artifact_roots(cwd);
+    pub fn for_cwd(
+        cwd: &std::path::Path,
+        enabled: bool,
+        session_id: Option<String>,
+        roots: &crate::paths::Roots,
+    ) -> Self {
+        let roots = super::run_artifact_roots_in(roots, cwd);
         Self {
             async_root: roots.async_root,
             results_dir: roots.results_dir,

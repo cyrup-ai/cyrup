@@ -21,21 +21,15 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 
 use cyrup_ext::native::{ExtMode, HostCtx, NativeExtension};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::RunState;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 
-/// Serializes every test in this file that mutates `CYRUP_SUBAGENT_BINARY`/
-/// `CYRUP_SUBAGENT_FIXTURE_SCRIPT`/`CYRUP_HOME` (process-global state), mirroring every other
-/// fixture-based integration test in this crate's identical `ENV_MUTATION_LOCK` convention.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
-const FIXTURE_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
-const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
-const CYRUP_HOME_ENV_VAR: &str = "CYRUP_HOME";
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -114,30 +108,21 @@ fn single_step(agent: &str, task: &str) -> cyrup_ext_subagents::discovery::types
 /// one test, mirroring every sibling fixture-based integration test's identical setup/teardown —
 /// factored into a guard here (rather than repeated inline blocks) since this file drives several
 /// independent scripted scenarios.
-struct FixtureEnvGuard;
-
-impl FixtureEnvGuard {
-    fn install(script_path: &Path) -> Self {
-        let fixture = fixture_binary_path();
-        // SAFETY: scoped, mutex-serialized env mutation for the duration of one test, mirroring
-        // every other fixture-based integration test in this crate (Rust 2024 requires `unsafe`
-        // for `std::env::set_var`/`remove_var`; this file is a separate compilation unit from this
-        // crate's own `#![forbid(unsafe_code)]` `lib.rs`).
-        unsafe {
-            std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
-            std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, script_path);
-        }
-        Self
-    }
-}
-
-impl Drop for FixtureEnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `install`'s own safety comment.
-        unsafe {
-            std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
-            std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
-        }
+/// The config one scenario runs under: the scripted fixture as this extension's own
+/// `spawn_command`, and optionally a sandbox `roots`.
+///
+/// These slash commands dispatch FOREGROUND runs, which is the path `spawn_command` reaches — a
+/// detached child would re-resolve its binary from the environment and the injection would be
+/// inert. Replaces a `FixtureEnvGuard` whose only job was setting and restoring two env vars every
+/// other test in this binary shares.
+fn fixture_config(script_path: &Path, home: Option<&Path>) -> SubagentExtensionConfig {
+    SubagentExtensionConfig {
+        spawn_command: Some(SpawnCommand {
+            binary: fixture_binary_path(),
+            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        }),
+        roots: home.map_or_else(Roots::from_env, Roots::sandboxed),
+        ..SubagentExtensionConfig::default()
     }
 }
 
@@ -156,7 +141,6 @@ fn command_ctx(cwd: &Path) -> HostCtx {
 /// (not a stub echoing the command back).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chain_command_runs_every_step_through_a_real_child_process_in_order() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "researcher");
@@ -170,10 +154,8 @@ async fn chain_command_runs_every_step_through_a_real_child_process_in_order() {
     });
     let script_path = work_dir.path().join("fixture-script.json");
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
-    let _env = FixtureEnvGuard::install(&script_path);
-
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        fixture_config(&script_path, None),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -227,7 +209,6 @@ async fn chain_command_runs_every_step_through_a_real_child_process_in_order() {
 /// capability (no `cyrup`-shaped, `__subagent-runner`-aware binary is built by this crate).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chain_command_with_bg_flag_spawns_a_real_tracked_detached_process() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let cyrup_home = tempfile::tempdir().expect("real tempdir for CYRUP_HOME");
@@ -241,14 +222,8 @@ async fn chain_command_with_bg_flag_spawns_a_real_tracked_detached_process() {
     });
     let script_path = work_dir.path().join("fixture-script.json");
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
-    let _env = FixtureEnvGuard::install(&script_path);
-    // SAFETY: scoped under the same mutex-held critical section as the fixture-binary env vars.
-    unsafe {
-        std::env::set_var(CYRUP_HOME_ENV_VAR, cyrup_home.path());
-    }
-
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        fixture_config(&script_path, Some(cyrup_home.path())),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -321,11 +296,6 @@ async fn chain_command_with_bg_flag_spawns_a_real_tracked_detached_process() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var(CYRUP_HOME_ENV_VAR);
-    }
 }
 
 // =====================================================================================================
@@ -337,7 +307,6 @@ async fn chain_command_with_bg_flag_spawns_a_real_tracked_detached_process() {
 /// layer: every step's own output is present, in input order, regardless of completion order).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_command_fans_out_over_real_child_processes() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
@@ -350,10 +319,8 @@ async fn parallel_command_fans_out_over_real_child_processes() {
     });
     let script_path = work_dir.path().join("fixture-script.json");
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
-    let _env = FixtureEnvGuard::install(&script_path);
-
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        fixture_config(&script_path, None),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -399,7 +366,6 @@ async fn parallel_command_fans_out_over_real_child_processes() {
 /// through the same real chain-walker `/chain` itself uses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_chain_command_resolves_a_saved_chain_through_real_discovery_and_executes_it() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
 
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
@@ -417,10 +383,8 @@ async fn run_chain_command_resolves_a_saved_chain_through_real_discovery_and_exe
     });
     let script_path = work_dir.path().join("fixture-script.json");
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
-    let _env = FixtureEnvGuard::install(&script_path);
-
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        fixture_config(&script_path, None),
         work_dir.path().to_path_buf(),
     );
     let ctx = command_ctx(work_dir.path());
@@ -447,7 +411,6 @@ async fn run_chain_command_resolves_a_saved_chain_through_real_discovery_and_exe
 /// whatever name was typed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_chain_command_against_an_unknown_chain_name_fails_before_any_subprocess_spawn() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     // Deliberately no fixture chain written, and no `CYRUP_SUBAGENT_BINARY` override configured —
     // if this path somehow attempted a real spawn it would fail loudly (no fixture configured),

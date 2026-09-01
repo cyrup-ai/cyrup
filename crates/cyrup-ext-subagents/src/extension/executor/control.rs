@@ -10,7 +10,7 @@ use crate::error::SubagentError;
 use crate::fork_context::ContextMode;
 use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 use crate::extension::executor::SubagentExecutor;
-use crate::extension::executor::paths::{default_async_root, default_results_dir};
+use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
 use crate::extension::executor::requests::BackgroundStepsSpec;
 use crate::extension::tool::text::{
     dismiss_not_running_refusal, STEER_ACK_POLL_INTERVAL, STEER_ACK_TIMEOUT,
@@ -29,8 +29,9 @@ impl SubagentExecutor {
     /// Returns `Err` if no interrupt-capable run is found, if the target is not Running (R-SA-079),
     /// or if the underlying delivery fails.
     pub async fn control_interrupt(&self, cwd: &Path, target: Option<&str>) -> Result<String, String> {
-        let async_root = default_async_root(cwd);
-        let results_dir = default_results_dir(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let async_root = default_async_root_in(&roots, cwd);
+        let results_dir = default_results_dir_in(&roots, cwd);
         let run_id = match target {
             Some(explicit) => explicit.to_string(),
             None => {
@@ -126,8 +127,9 @@ impl SubagentExecutor {
         if target.is_none() && dir.is_none() {
             return Err("action='stop' requires id or dir.".to_string());
         }
-        let async_root = default_async_root(cwd);
-        let results_dir = default_results_dir(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let async_root = default_async_root_in(&roots, cwd);
+        let results_dir = default_results_dir_in(&roots, cwd);
 
         // pi `:4795-4797`, in pi's own order: `resolveSubagentRunId` classifies the selector first,
         // and the `nested` and `foreground` kinds each get their OWN sentence before anything
@@ -139,7 +141,7 @@ impl SubagentExecutor {
         {
             // pi `:4796`: the selector named a run nested inside another run's subtree. Real id,
             // wrong scope — never reported as a missing async run.
-            if self.resolves_to_nested_run(id) {
+            if self.resolves_to_nested_run(id).await {
                 return Err(STOP_NESTED_RUN_REFUSAL.to_string());
             }
             // pi `:4797`: a live FOREGROUND run is refused with its own sentence pointing at
@@ -250,8 +252,9 @@ impl SubagentExecutor {
         let Some(target) = target.filter(|id| !id.trim().is_empty()) else {
             return Err("action='dismiss' requires id.".to_string());
         };
-        let async_root = default_async_root(cwd);
-        let results_dir = default_results_dir(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let async_root = default_async_root_in(&roots, cwd);
+        let results_dir = default_results_dir_in(&roots, cwd);
 
         // pi `:5877-5883` (`resolveSubagentRunId`) then `:18-22` (`!asyncDir`). A selector that
         // resolves to no async run at all is upstream's "no disk status" case, so it gets that
@@ -370,8 +373,9 @@ impl SubagentExecutor {
     /// exactly what upstream's own `scheduledStopTargets` `catch { return []; }` produces for a
     /// runtime with no schedule store.
     pub async fn format_stop_targets(&self, cwd: &Path) -> Result<String, String> {
-        let async_root = default_async_root(cwd);
-        let results_dir = default_results_dir(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let async_root = default_async_root_in(&roots, cwd);
+        let results_dir = default_results_dir_in(&roots, cwd);
         let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
             .await
             .map_err(|e| e.to_string())?;
@@ -461,8 +465,9 @@ impl SubagentExecutor {
         if target.is_none() && dir.is_none() {
             return Err("action='steer' requires id or dir.".to_string());
         }
-        let async_root = default_async_root(cwd);
-        let results_dir = default_results_dir(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let async_root = default_async_root_in(&roots, cwd);
+        let results_dir = default_results_dir_in(&roots, cwd);
         let (status, paths) = match (target, dir) {
             (Some(id), None) => {
                 // pi classifies an id-addressed selector with `resolveSubagentRunId` BEFORE it
@@ -640,8 +645,9 @@ impl SubagentExecutor {
         let Some(run_id) = target else {
             return Err("action='resume' requires id.".to_string());
         };
-        let async_root = default_async_root(cwd);
-        let results_dir = default_results_dir(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let async_root = default_async_root_in(&roots, cwd);
+        let results_dir = default_results_dir_in(&roots, cwd);
         match control::resume(&async_root, &results_dir, run_id, index).await {
             Ok(ResumeOutcome::SteerRunning { step_index }) => {
                 // pi (`subagent-executor.ts:848-878`): interrupt the live child, then DELIVER the
@@ -772,8 +778,9 @@ impl SubagentExecutor {
         session_file: &Path,
         follow_up: &str,
     ) -> Result<String, SubagentError> {
-        let async_root = default_async_root(cwd);
-        let results_dir = default_results_dir(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let async_root = default_async_root_in(&roots, cwd);
+        let results_dir = default_results_dir_in(&roots, cwd);
         let source_paths = RunPaths::for_run(
             &async_root,
             &results_dir,
@@ -796,7 +803,12 @@ impl SubagentExecutor {
         // originally invoked from.
         let effective_cwd = status.cwd.clone().unwrap_or_else(|| cwd.to_path_buf());
         let resolved_agents =
-            self.resolve_plan_personas(&effective_cwd, [agent.clone()], AgentReadScope::Both)?;
+            self.resolve_plan_personas(
+                &effective_cwd,
+                [agent.clone()],
+                AgentReadScope::Both,
+                &roots,
+            )?;
         let revived_task =
             Self::build_revived_async_task(source_run_id, &agent, session_file, follow_up);
         let step = SingleStepSpec {
@@ -929,6 +941,7 @@ impl SubagentExecutor {
         target: Option<&str>,
         chain: &[serde_json::Value],
     ) -> Result<String, String> {
+        let roots = self.config_snapshot().await.roots;
         let Some(run_id) = target else {
             return Err("action='append-step' requires id.".to_string());
         };
@@ -952,7 +965,7 @@ impl SubagentExecutor {
             .map(str::to_string);
         // pi validates every appended agent exists before enqueuing (`buildAsyncRunnerSteps` errors
         // on an unknown agent name); resolve it via real discovery for the same fail-fast behavior.
-        self.resolve_agent(cwd, agent, AgentReadScope::Both)
+        self.resolve_agent(cwd, agent, AgentReadScope::Both, &roots)
             .map_err(|e| format!("Cannot append step to run '{run_id}': {e}"))?;
         let step = SingleStepSpec {
             skills: None,
@@ -974,8 +987,9 @@ impl SubagentExecutor {
             context: None,
             agent_scope: None,
         };
-        let async_root = default_async_root(cwd);
-        let results_dir = default_results_dir(cwd);
+        let roots = self.config_snapshot().await.roots;
+        let async_root = default_async_root_in(&roots, cwd);
+        let results_dir = default_results_dir_in(&roots, cwd);
         match control::append_step(
             &async_root,
             &results_dir,

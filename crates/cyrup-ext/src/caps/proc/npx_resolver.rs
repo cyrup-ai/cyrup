@@ -667,30 +667,16 @@ fn get_npm_cache_dir() -> Option<PathBuf> {
 }
 
 /// The on-disk resolution cache path. `npx-resolver.ts:369-371` `getNpxCachePath` ->
-/// `getAgentPath("mcp-npx-cache.json")` -> `agent-dir.ts`'s `getAgentDir()`. Ported directly
-/// (rather than depending on `cyrup-config::Paths`, which needs full CLI+env layering to
-/// construct) using the SAME dual env-var convention `cyrup-config/src/env.rs:68` already
-/// establishes workspace-wide (`CYRUP_AGENT_DIR`, falling back to the Pi-compatible
-/// `PI_CODING_AGENT_DIR`), defaulting to `~/.cyrup/agent` (`cyrup-config/src/env.rs:143`).
+/// `getAgentPath("mcp-npx-cache.json")` -> `agent-dir.ts`'s `getAgentDir()`.
+///
+/// Resolved through [`cyrup_config::paths::cyrup_agent_dir_from`], the workspace's one agent-dir
+/// ladder. This was a hand-rolled port reading `CYRUP_AGENT_DIR` -> `PI_CODING_AGENT_DIR`, missing
+/// `CYRUP_CODING_AGENT_DIR` — the spelling `cyrup-intercom` and `cyrup-ext-subagents` use, which
+/// `cyrup-config` has read since CFG-076. Setting it therefore moved the binary's layout and left
+/// this cache behind in the old tree. That is MCP-139 gap 1, and sharing the ladder is its fix.
 fn agent_dir() -> PathBuf {
-    let configured = std::env::var("CYRUP_AGENT_DIR")
-        .ok()
-        .or_else(|| std::env::var("PI_CODING_AGENT_DIR").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let Some(configured) = configured else {
-        return super::host_home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".cyrup").join("agent");
-    };
-    if configured == "~" {
-        return super::host_home_dir().unwrap_or_else(|| PathBuf::from(configured));
-    }
-    if let Some(rest) = configured.strip_prefix("~/").or_else(|| configured.strip_prefix("~\\"))
-        && let Some(home) = super::host_home_dir()
-    {
-        return home.join(rest);
-    }
-    PathBuf::from(configured)
+    let home = super::host_home_dir().unwrap_or_else(|| PathBuf::from("."));
+    cyrup_config::paths::cyrup_agent_dir_from(&home, &|key| std::env::var_os(key))
 }
 
 fn npx_cache_path() -> PathBuf {

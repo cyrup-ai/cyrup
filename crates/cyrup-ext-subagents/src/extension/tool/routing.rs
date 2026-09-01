@@ -9,7 +9,7 @@ use crate::background::{RunId, RunMode};
 use crate::discovery::discover_agents;
 use crate::exec::SingleResult;
 use crate::exec::acceptance::lower_acceptance_input as parse_single_acceptance;
-use crate::fork_context::ContextMode;
+use crate::fork_context::{ContextMode, ContextRequest};
 use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec, StepResult};
 use crate::spawn::depth::resolve_effective_depth;
 use crate::watchdog::register_main::{watchdog_config_dirs, watchdog_model_info};
@@ -50,7 +50,7 @@ struct SingleBackgroundDispatch<'a> {
     cwd: &'a Path,
     agent: &'a str,
     task: &'a str,
-    context: Option<ContextMode>,
+    context: Option<ContextRequest>,
     model: Option<ModelId>,
     /// SUBA-041's override bundle, borrowed: hop 2 clones what it needs out of it.
     overrides: &'a SingleRunOverrides,
@@ -65,7 +65,7 @@ impl SubagentTool {
     /// "none"`). Discovery failures degrade to an empty list rather than propagating — this string
     /// is diagnostic-only context on an already-erroring path, never itself the primary failure.
     pub(crate) async fn discovered_agent_names_joined(&self, cwd: &Path) -> String {
-        let names: Vec<String> = SubagentExecutor::discovery_config(cwd)
+        let names: Vec<String> = SubagentExecutor::discovery_config(cwd, &self.executor.config_snapshot().await.roots)
             .and_then(|cfg| discover_agents(&cfg, None))
             .map(|result| result.agents.into_iter().map(|a| a.name).collect())
             .unwrap_or_default();
@@ -111,7 +111,7 @@ impl SubagentTool {
         // discovery and surfaces the real error (a malformed `settings.json` MUST abort, R-SA-009,
         // and it will — one call later, with its own message). Degrading to "no canonicalization"
         // keeps this step from turning one error into two different ones.
-        let Ok(agents) = SubagentExecutor::discovery_config(cwd)
+        let Ok(agents) = SubagentExecutor::discovery_config(cwd, &self.executor.config_snapshot().await.roots)
             // Same scope the mode arms resolve under (pi canonicalizes against the very
             // `discoverAgents(effectiveCwd, scope)` result the executor then uses,
             // `subagent-executor.ts:4921-4923`), so an alias can never resolve here to an agent the
@@ -310,7 +310,11 @@ impl SubagentTool {
         // independent entry point that never reaches this dispatcher — applies the same defaults.
         // Only the fill-unset-only APPLICATION rules stay here, where the "was it supplied?"
         // question can actually be asked of this call's params.
-        let launch_defaults = SubagentExecutor::single_agent_launch_defaults(cwd, agent);
+        let launch_defaults = SubagentExecutor::single_agent_launch_defaults(
+            cwd,
+            agent,
+            &self.executor.config_snapshot().await.roots,
+        );
 
         // pi resolves `effectiveAsync` against the live config's `asyncByDefault`/
         // `forceTopLevelAsync` and this call's own depth (`applyForceTopLevelAsyncOverride`,
@@ -612,7 +616,12 @@ impl SubagentTool {
             content: vec![cyrup_core::Content::text(format_async_started_message(&format!(
                 "Async: {agent} [{run_id}]"
             )))],
-            details: Some(async_launch_details("single", &run_id, cwd)),
+            details: Some(async_launch_details(
+                "single",
+                &run_id,
+                cwd,
+                &self.executor.config_snapshot().await.roots,
+            )),
             terminate: false,
             ..Default::default()
         })
@@ -630,7 +639,7 @@ impl SubagentTool {
         result: SingleResult,
         run_id: RunId,
         agent: &str,
-        context: Option<ContextMode>,
+        context: Option<ContextRequest>,
         include_progress: Option<bool>,
     ) -> Result<ToolResult, ToolError> {
         let display_output = result.final_output.clone().unwrap_or_default();
@@ -655,7 +664,7 @@ impl SubagentTool {
             // the context from the CALL-SITE `params.context`, and only for `"fork"` — never from
             // the resolved per-persona default: `const context = params.context === "fork" ?
             // "fork" : "fresh";` (`:1894`). Mirror that exactly.
-            let details_context = if context == Some(ContextMode::Fork) {
+            let details_context = if context == Some(ContextRequest::Fork) {
                 ContextMode::Fork
             } else {
                 ContextMode::Fresh
@@ -1163,7 +1172,7 @@ impl SubagentTool {
                 "Action '{action}' is not available from child-safe subagent fanout mode."
             )));
         }
-        let cfg = SubagentExecutor::discovery_config(cwd).map_err(|e| ToolError::new(e.to_string()))?;
+        let cfg = SubagentExecutor::discovery_config(cwd, &self.executor.config_snapshot().await.roots).map_err(|e| ToolError::new(e.to_string()))?;
         // The live parent session model (pi `ctx.model`), so a `models` action routed through the
         // management layer renders the real inherited model rather than `(unavailable)`. Bound to a
         // local so the borrowed `&str` in `ManagementRequest` outlives the call.
@@ -1498,7 +1507,12 @@ impl SubagentTool {
                     agents.join("+")
                 )))],
                 // `asyncDir` per `async-execution.ts:1191` — see [`async_dir_for_run`].
-                details: Some(async_launch_details("parallel", &run_id, cwd)),
+                details: Some(async_launch_details(
+                    "parallel",
+                    &run_id,
+                    cwd,
+                    &self.executor.config_snapshot().await.roots,
+                )),
                 terminate: false,
                 ..Default::default()
             }),
@@ -1654,7 +1668,12 @@ impl SubagentTool {
                     "Async chain: {chain_desc} [{run_id}]"
                 )))],
                 // `asyncDir` per `async-execution.ts:1191` — see [`async_dir_for_run`].
-                details: Some(async_launch_details("chain", &run_id, cwd)),
+                details: Some(async_launch_details(
+                    "chain",
+                    &run_id,
+                    cwd,
+                    &self.executor.config_snapshot().await.roots,
+                )),
                 terminate: false,
                 ..Default::default()
             }),

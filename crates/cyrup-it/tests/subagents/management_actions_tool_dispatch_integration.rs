@@ -17,17 +17,12 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
 
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_test_support::harness::{HarnessOptions, create_harness_with_extensions};
 use cyrup_test_support::response::FauxResponse;
-
-/// `SubagentsExtension::init` runs T6 startup housekeeping under `CYRUP_HOME`, and this test's whole
-/// point is that the user-scope agent dir and `settings.json` resolve under a tempdir rather than
-/// the real developer/CI home. Serialized like every sibling integration file.
-static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn tool_results(
     events: &[cyrup_session_svc::AgentSessionEvent],
@@ -48,7 +43,6 @@ fn tool_results(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_model_can_disable_then_enable_an_agent_through_the_live_subagent_tool() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let home = tempfile::tempdir().expect("home tempdir");
     let work_dir = tempfile::tempdir().expect("work tempdir");
 
@@ -64,14 +58,14 @@ async fn a_model_can_disable_then_enable_an_agent_through_the_live_subagent_tool
     let user_settings = user_agents.join("settings.json");
     assert!(!user_settings.exists(), "precondition: no settings file yet");
 
-    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test; this file is
-    // a separate compilation unit from the crate's `#![forbid(unsafe_code)]` `lib.rs`.
-    unsafe {
-        std::env::set_var("CYRUP_HOME", home.path());
-    }
-
+    // This run names its own root: `roots` reaches the user-scope discovery roots and the
+    // user `settings.json` path through `SubagentExecutor::discovery_config`, which the management
+    // action's own dispatch resolves against.
     let extension = Arc::new(SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        SubagentExtensionConfig {
+            roots: Roots::sandboxed(home.path()),
+            ..SubagentExtensionConfig::default()
+        },
         work_dir.path().to_path_buf(),
     ));
 
@@ -94,11 +88,6 @@ async fn a_model_can_disable_then_enable_an_agent_through_the_live_subagent_tool
     .expect("harness builds a real session with the subagents extension loaded");
 
     let events = harness.run("turn probe off and back on").await;
-
-    // SAFETY: scoped cleanup under the same mutex-held critical section.
-    unsafe {
-        std::env::remove_var("CYRUP_HOME");
-    }
 
     let events = events.expect("the turn completes without a transport/session-level error");
     let results = tool_results(&events);

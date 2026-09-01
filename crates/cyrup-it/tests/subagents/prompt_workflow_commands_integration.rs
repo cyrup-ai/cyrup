@@ -21,29 +21,33 @@ use std::sync::Arc;
 use cyrup_core::CancelToken;
 use cyrup_ext::{ExtMode, ExtensionHost, HostConfig};
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
-/// Serializes the tests that mutate `CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT`
-/// (process-global state), the same `ENV_MUTATION_LOCK` convention every other fixture-based
-/// integration test in this crate uses. Without it two concurrent fixture tests read each other's
-/// script and one of them sees a child that produced no output.
 // MIGRATION: the original `#[cfg(feature = "test-fixtures")]` here named
 // cyrup-ext-subagents' own bin-gating feature. In cyrup-it that spelling names THIS crate's
 // features, where no `test-fixtures` exists — so this item would have compiled OUT and the
 // test would have passed vacuously. build.rs always builds the fixture binaries, so the gate
 // is now a build-script postcondition. See this target's main.rs.
-static ENV_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Load the subagents extension into a real [`ExtensionHost`] rooted at `cwd` — the same
 /// `load_native` call `cyrup-session-svc`'s builder makes, which runs the extension's real `init`.
-async fn host_at(cwd: &Path) -> Arc<ExtensionHost> {
+async fn host_at(cwd: &Path, fixture_script: Option<&Path>) -> Arc<ExtensionHost> {
     let host = Arc::new(ExtensionHost::new(HostConfig {
         mode: ExtMode::Tui,
         has_ui: true,
         cwd: cwd.to_path_buf(),
     }));
+    // The fixture, when this test needs one, is named for THIS extension rather than moved into
+    // the process environment every concurrently-running test in this binary shares.
+    let config = SubagentExtensionConfig {
+        spawn_command: fixture_script.map(|script| SpawnCommand {
+            binary: crate::support::bins::subagent_fixture(),
+            base_args: vec!["--fixture-script".to_string(), script.display().to_string()],
+        }),
+        ..SubagentExtensionConfig::default()
+    };
     host.load_native(Arc::new(SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig::default(),
+        config,
         cwd.to_path_buf(),
     )))
     .await
@@ -66,7 +70,7 @@ async fn slash(host: &ExtensionHost, name: &str, args: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn both_prompt_commands_are_registered_with_the_host() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host_at(dir.path()).await;
+    let host = host_at(dir.path(), None).await;
     let names = host.native_command_names();
     assert!(
         names.iter().any(|n| n == "prompt-workflow"),
@@ -83,7 +87,7 @@ async fn both_prompt_commands_are_registered_with_the_host() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prompt_workflow_list_names_every_bundled_recipe() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host_at(dir.path()).await;
+    let host = host_at(dir.path(), None).await;
 
     let output = slash(&host, "prompt-workflow", "list").await;
     assert!(output.starts_with("Prompt workflows:"), "got: {output}");
@@ -131,7 +135,7 @@ async fn a_project_recipe_is_listed_and_shadows_the_bundled_one() {
     )
     .unwrap();
 
-    let host = host_at(dir.path()).await;
+    let host = host_at(dir.path(), None).await;
     let output = slash(&host, "prompt-workflow", "list").await;
     assert!(
         output.contains("- parallel-review: PROJECT REVIEW RECIPE"),
@@ -148,7 +152,7 @@ async fn a_project_recipe_is_listed_and_shadows_the_bundled_one() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_recipe_name_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host_at(dir.path()).await;
+    let host = host_at(dir.path(), None).await;
     let output = slash(&host, "prompt-workflow", "no-such-recipe").await;
     assert!(
         output.contains("Unknown prompt workflow: no-such-recipe"),
@@ -167,7 +171,7 @@ async fn an_unknown_recipe_name_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_prompts_refuses_a_chain_containing_an_unknown_recipe() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host_at(dir.path()).await;
+    let host = host_at(dir.path(), None).await;
     let output = slash(&host, "chain-prompts", "parallel-research -> no-such -- do it").await;
     assert!(
         output.contains("Unknown prompt workflow: no-such"),
@@ -190,7 +194,6 @@ async fn chain_prompts_refuses_a_chain_containing_an_unknown_recipe() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_recipe_runs_through_a_real_child_process() {
 
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
 
     // The persona the recipe names, discovered through the real project-scope pipeline.
@@ -229,20 +232,9 @@ async fn a_recipe_runs_through_a_real_child_process() {
     let script_path = dir.path().join("fixture-script.json");
     std::fs::write(&script_path, script.to_string()).unwrap();
 
-    // SAFETY: single-threaded env mutation before any child spawn in this test; this file's other
-    // tests never read these vars.
-    unsafe {
-        std::env::set_var("CYRUP_SUBAGENT_BINARY", crate::support::bins::subagent_fixture());
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
-
-    let host = host_at(dir.path()).await;
+    let host = host_at(dir.path(), Some(&script_path)).await;
     let output = slash(&host, "prompt-workflow", "fixture-flow the backlog").await;
 
-    unsafe {
-        std::env::remove_var("CYRUP_SUBAGENT_BINARY");
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert!(
         output.contains("RECIPE_CHILD_RAN"),
@@ -261,7 +253,6 @@ async fn a_recipe_runs_through_a_real_child_process() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chain_prompts_runs_every_recipe_as_one_native_chain() {
 
-    let _guard = ENV_MUTATION_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let agents = dir.path().join(".cyrup").join("agents");
     std::fs::create_dir_all(&agents).unwrap();
@@ -301,18 +292,9 @@ async fn chain_prompts_runs_every_recipe_as_one_native_chain() {
     std::fs::write(&script_path, script.to_string()).unwrap();
 
     // SAFETY: as above.
-    unsafe {
-        std::env::set_var("CYRUP_SUBAGENT_BINARY", crate::support::bins::subagent_fixture());
-        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
-    }
-
-    let host = host_at(dir.path()).await;
+    let host = host_at(dir.path(), Some(&script_path)).await;
     let output = slash(&host, "chain-prompts", "flow-a -> flow-b -- the backlog").await;
 
-    unsafe {
-        std::env::remove_var("CYRUP_SUBAGENT_BINARY");
-        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
-    }
 
     assert_eq!(
         output.matches("CHAINED_RECIPE_RAN").count(),
