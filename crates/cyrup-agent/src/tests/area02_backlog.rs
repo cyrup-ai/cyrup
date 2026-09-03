@@ -17,6 +17,7 @@ use crate::{
 };
 use crate::{EventSubscriber, PendingQueue};
 use cyrup_core::{
+    TerminateHint,
     AssistantMessage, CancelToken, Content, ModelRef, ModelThinkingLevel, ProviderId, RunCancel,
     StopReason, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
 };
@@ -108,7 +109,7 @@ impl Tool for OkTool {
     ) -> Result<ToolResult, ToolError> {
         Ok(ToolResult {
             content: vec![Content::text("ok")],
-            terminate: self.terminate,
+            terminate: TerminateHint::from_guest_bool(self.terminate),
             ..Default::default()
         })
     }
@@ -141,7 +142,7 @@ impl Tool for BurstTool {
             on_update(ToolUpdate {
                 content: vec![Content::text(format!("step-{i}"))],
                 details: None,
-                terminate: None,
+                terminate: TerminateHint::Unspecified,
             });
         }
         Ok(ToolResult { content: vec![Content::text("done")], ..Default::default() })
@@ -283,9 +284,9 @@ impl Hooks for BlockWith {
         &self,
         _ctx: BeforeToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<BeforeOutcome, HookError> {
+    ) -> BeforeOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(BeforeOutcome::Block { reason: self.reason.clone(), terminate: self.terminate })
+        BeforeOutcome::Block { reason: self.reason.clone(), terminate: TerminateHint::from_guest_bool(self.terminate) }
     }
 }
 
@@ -431,11 +432,10 @@ async fn agent015_022_blocked_terminate_survives_an_abort_that_leaves_a_slot_unp
 fn empty_state() -> StateInner {
     StateInner {
         system_prompt: String::new(),
-        model: model_ref(),
+        model: Some(model_ref()),
         thinking_level: ModelThinkingLevel::Off,
         tools: Vec::new(),
         messages: Vec::new(),
-        is_streaming: false,
         streaming_message: None,
         pending_tool_calls: std::collections::HashSet::new(),
         error_message: None,

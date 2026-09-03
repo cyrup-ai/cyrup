@@ -233,7 +233,10 @@ impl AgentSession {
         // (`_runAgentPrompt(appMessage)`); `deliverAs` takes precedence, exactly as in
         // `send_custom_message`/`inject_message`.
         let trigger_turn = opts.get("triggerTurn").and_then(Value::as_bool).unwrap_or(false);
-        if trigger_turn && deliver_as.is_none() && !self.is_streaming().await {
+        // AGENT-030 — pi's `sendMessage` tests `this.isStreaming`, the session latch
+        // `_isAgentRunActive` (agent-session.ts:900-901, :1477-1483): a trigger-turn message landing
+        // in the post-`agent_end` gap steers the active loop rather than starting a second run.
+        if trigger_turn && deliver_as.is_none() && !self.is_run_active() {
             let msg = AgentMessage::Custom {
                 kind: custom_type,
                 payload: content,

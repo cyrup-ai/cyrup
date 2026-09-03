@@ -2,6 +2,7 @@
 //! runs before the ask tier — the registry / unknown-tool block, the skill-read bypass and the
 //! external-directory guard.
 
+use cyrup_core::TerminateHint;
 use serde_json::{Value, json};
 
 use cyrup_ext::{HookOutcome, HostCtx};
@@ -71,7 +72,7 @@ impl PermissionSystemExtension {
     ) -> HookOutcome {
         let normalized = tool_name.trim();
         if normalized.is_empty() {
-            return HookOutcome::Block { reason: Some(gate::format_missing_tool_name_reason()), terminate: false };
+            return HookOutcome::Block { reason: Some(gate::format_missing_tool_name_reason()), terminate: TerminateHint::Unspecified };
         }
         let agent_name = self.agent_name.as_deref();
 
@@ -86,7 +87,7 @@ impl PermissionSystemExtension {
         // unknown-tool allowlist.
         let registered = self.registered_tool_names().unwrap_or_default();
         if let Some(reason) = gate::check_requested_tool_registration(normalized, &registered) {
-            return HookOutcome::Block { reason: Some(reason), terminate: false };
+            return HookOutcome::Block { reason: Some(reason), terminate: TerminateHint::Unspecified };
         }
 
         // pi `index.ts:2305-2309`: anchor a path-bearing input's resource resolution to the SESSION
@@ -144,7 +145,7 @@ impl PermissionSystemExtension {
                     }),
                 );
                 self.logger.flush();
-                HookOutcome::Block { reason: Some(gate::format_deny_reason(&check, agent_name)), terminate: false }
+                HookOutcome::Block { reason: Some(gate::format_deny_reason(&check, agent_name)), terminate: TerminateHint::Unspecified }
             }
             PermissionState::Allow => HookOutcome::Noop,
             PermissionState::Ask => self.resolve_ask(call_id, input, &check, ctx).await,
@@ -217,7 +218,7 @@ impl PermissionSystemExtension {
                     );
                     return Some(HookOutcome::Block {
                         reason: Some(skill::format_skill_path_deny_reason(&read_skill, agent_name)),
-                        terminate: false,
+                        terminate: TerminateHint::Unspecified,
                     });
                 }
                 PermissionState::Ask => {
@@ -257,7 +258,7 @@ impl PermissionSystemExtension {
                             );
                             return Some(HookOutcome::Block {
                                 reason: Some(skill::skill_ask_unavailable_reason()),
-                                terminate: false,
+                                terminate: TerminateHint::Unspecified,
                             });
                         }
                         AskOutcome::Decided(d) if !d.approved => {
@@ -265,7 +266,7 @@ impl PermissionSystemExtension {
                                 reason: Some(skill::format_skill_user_denied_reason(
                                     d.denial_reason.as_deref(),
                                 )),
-                                terminate: false,
+                                terminate: TerminateHint::Unspecified,
                             });
                         }
                         AskOutcome::Decided(_) => {}
@@ -318,7 +319,7 @@ impl PermissionSystemExtension {
                     reason: Some(gate::format_external_directory_deny_reason(
                         tool_name, path, cwd, agent_name,
                     )),
-                    terminate: false,
+                    terminate: TerminateHint::Unspecified,
                 })
             }
             PermissionState::Ask => {
@@ -358,7 +359,7 @@ impl PermissionSystemExtension {
                         );
                         Some(HookOutcome::Block {
                             reason: Some(gate::format_external_directory_unavailable_reason(path)),
-                            terminate: false,
+                            terminate: TerminateHint::Unspecified,
                         })
                     }
                     AskOutcome::Decided(d) if !d.approved => Some(HookOutcome::Block {
@@ -367,7 +368,7 @@ impl PermissionSystemExtension {
                             path,
                             d.denial_reason.as_deref(),
                         )),
-                        terminate: false,
+                        terminate: TerminateHint::Unspecified,
                     }),
                     AskOutcome::Decided(d) => {
                         // pi `persistPatternApprovalDecision` (`:2391`): an approved-Always persists an

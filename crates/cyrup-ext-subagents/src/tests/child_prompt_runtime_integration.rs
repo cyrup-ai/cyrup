@@ -441,6 +441,6 @@ async fn the_registered_structured_output_tool_advertises_rewritten_local_refs()
         )
         .await
         .expect("a conforming value is captured");
-    assert!(result.terminate);
+    assert!(result.terminate.requested());
     assert!(output_path.exists());
 }

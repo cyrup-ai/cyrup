@@ -139,10 +139,8 @@ impl AgentSession {
 
     /// Drop the trailing assistant message from the agent transcript (used by retry/overflow paths).
     pub(super) async fn drop_trailing_assistant(&self) {
-        let mut msgs = self.agent.snapshot().await.messages;
-        if matches!(msgs.last(), Some(AgentMessage::Assistant(_))) {
-            msgs.pop();
-            self.agent.set_messages(msgs).await;
-        }
+        // One locked edit under the same lock the reducer uses. The only `Err` is `RunActive`,
+        // which cannot occur here — every caller runs inside the session's `is_run_active()` gate.
+        let _ = self.agent.pop_trailing_assistant_if(|_| true);
     }
 }

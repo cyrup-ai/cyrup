@@ -37,8 +37,8 @@ pub use facade::Subscription;
 pub use lifecycle::RunHandle;
 pub use prompt::PromptInput;
 
-// `crate::agent::{EntryStart, RunCtx}` — the paths `crate::loop_fn` imports; keep them resolving.
-pub(crate) use run::{EntryStart, RunCtx};
+// `crate::agent::{RunEntry, RunCtx, …}` — the paths `crate::loop_fn` imports; keep them resolving.
+pub(crate) use run::{PromptSource, ResumePoint, RunBaseline, RunCtx, RunEntry, RunShared};
 
 use crate::hooks::Hooks;
 use crate::queue::{PendingQueue, ToolExecution};
@@ -63,7 +63,7 @@ pub struct Agent {
     stream_fn: Arc<dyn StreamFn>,
     key_resolver: Option<Arc<dyn ApiKeyResolver>>,
     cancel_slot: Arc<Mutex<Option<RunCancel>>>,
-    /// The SINGLE run-in-flight latch (R-02-045..048). `start_run` claims it with an atomic
+    /// The SINGLE run-in-flight latch (R-02-045..048). `claim_and_snapshot` claims it with an atomic
     /// compare-and-set (`watch::Sender::send_if_modified`), [`lifecycle::SettlementGuard`] releases it, and
     /// both [`Agent::wait_for_idle`] and [`Agent::is_running`] read it — so "the waiter observed
     /// idle" and "a new run may start" are the same fact, never two facts written in sequence.

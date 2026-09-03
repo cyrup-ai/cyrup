@@ -10,6 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, Message, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_permission_system::PermissionSystemExtension;
@@ -56,7 +57,7 @@ impl Tool for RecordingBash {
         let command =
             params.get("command").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
         self.executed.lock().unwrap_or_else(|e| e.into_inner()).push(command);
-        Ok(ToolResult { content: vec![Content::text("EXECUTED")], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text("EXECUTED")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 

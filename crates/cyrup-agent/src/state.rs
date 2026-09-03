@@ -87,11 +87,13 @@ pub struct GenerationConfig {
 /// `Agent` setters; the state lock is never held across a subscriber `await`.
 pub(crate) struct StateInner {
     pub system_prompt: String,
-    pub model: ModelRef,
+    /// `None` is pi's `Model | undefined` — a credential-less session's agent has NO model until
+    /// `/model` selects one (agent-session.ts:890-892). Resolved to a `ModelRef` or
+    /// `AgentError::NoModelSelected` at run start; never a sentinel address.
+    pub model: Option<ModelRef>,
     pub thinking_level: ModelThinkingLevel,
     pub tools: Vec<Arc<dyn Tool>>,
     pub messages: Vec<AgentMessage>,
-    pub is_streaming: bool,
     pub streaming_message: Option<AgentMessage>,
     pub pending_tool_calls: HashSet<ToolCallId>,
     pub error_message: Option<String>,
@@ -114,14 +116,17 @@ pub(crate) struct StateInner {
 }
 
 impl StateInner {
-    pub(crate) fn snapshot(&self) -> AgentStateSnapshot {
+    /// `is_streaming` is the run latch — the ONE run-in-flight fact (pi `AgentState.isStreaming`,
+    /// set/cleared around `runWithLifecycle`, agent.ts:498/:530) — read by the caller from
+    /// `running_rx`, because the latch lives on `Agent`, not here.
+    pub(crate) fn snapshot(&self, is_streaming: bool) -> AgentStateSnapshot {
         AgentStateSnapshot {
             system_prompt: self.system_prompt.clone(),
             model: self.model.clone(),
             thinking_level: self.thinking_level,
             messages: self.messages.clone(),
             tool_count: self.tools.len(),
-            is_streaming: self.is_streaming,
+            is_streaming,
             streaming_message: self.streaming_message.clone(),
             pending_tool_calls: self.pending_tool_calls.iter().cloned().collect(),
             error_message: self.error_message.clone(),
@@ -135,10 +140,11 @@ impl StateInner {
 #[derive(Clone, Debug)]
 pub struct AgentStateSnapshot {
     pub system_prompt: String,
-    pub model: ModelRef,
+    pub model: Option<ModelRef>,
     pub thinking_level: ModelThinkingLevel,
     pub messages: Vec<AgentMessage>,
     pub tool_count: usize,
+    /// Whether a run is in flight — sourced from the agent's run latch, never a second flag.
     pub is_streaming: bool,
     pub streaming_message: Option<AgentMessage>,
     pub pending_tool_calls: Vec<ToolCallId>,

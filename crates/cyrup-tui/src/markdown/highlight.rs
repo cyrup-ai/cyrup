@@ -360,13 +360,11 @@ impl HighlightState {
         let mut rows = cursor.rows.clone();
         if rows.len() < max_rows {
             let mut tail_parse = cursor.parse.clone();
-            match highlight_one(tail, &mut tail_parse, ss, theme) {
-                Some(line) => rows.push(line),
-                // The tail is parsed on a CLONE, so a fault here does not poison the cursor: its
-                // state is still exactly the state after `stable`. Keep it — the tail is re-parsed
-                // every frame anyway, and the next delta may well parse cleanly.
-                None => return None,
-            }
+            // The tail is parsed on a CLONE, so a fault here (the `?` returning `None`) does not
+            // poison the cursor: its state is still exactly the state after `stable`. Keep it — the
+            // tail is re-parsed every frame anyway, and the next delta may well parse cleanly.
+            let line = highlight_one(tail, &mut tail_parse, ss, theme)?;
+            rows.push(line);
         }
         rows.truncate(max_rows);
         Some(rows)

@@ -25,6 +25,7 @@
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, Message, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_permission_system::PermissionSystemExtension;
@@ -74,7 +75,7 @@ impl Tool for RecordingBash {
         Ok(ToolResult {
             content: vec![Content::text("EXECUTED")],
             details: None,
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }

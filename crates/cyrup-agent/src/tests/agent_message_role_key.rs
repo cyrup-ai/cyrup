@@ -113,7 +113,7 @@ fn an_app_message_round_trips_its_pi_wire_object() {
     let AgentMessage::App { ref role, .. } = msg else {
         panic!("a merged role must land in App, got {msg:?}");
     };
-    assert_eq!(role, "compactionSummary");
+    assert_eq!(*role, crate::AppRole::CompactionSummary);
     let raw = serde_json::to_string(&msg).unwrap();
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&raw).unwrap(),

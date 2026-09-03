@@ -8,6 +8,7 @@
 use crate::error::HookError;
 use crate::event::{AgentMessage, ToolResultMessage};
 use cyrup_core::{
+    TerminateHint,
     AssistantMessage, CancelToken, Content, Message, ModelRef, ModelThinkingLevel, Tool, ToolCall,
     ToolCallId, Usage,
 };
@@ -45,7 +46,12 @@ pub struct BeforeToolCall<'a> {
     pub context: AgentContextView<'a>,
 }
 
-/// Outcome of [`Hooks::before_tool_call`] (func-02 R-02-021).
+/// Outcome of [`Hooks::before_tool_call`] (func-02 R-02-021). Every variant is an EXPECTED per-call
+/// outcome: none of them aborts the run. pi's `beforeToolCall` returns `BeforeToolCallResult |
+/// undefined` (`packages/agent/src/types.ts:61-69`, `:277`), and a throw is caught per call
+/// (`agent-loop.ts:657-662` @v0.83.0) into an error tool result — which is why [`Self::Failed`]
+/// is a variant here and not a `Result::Err`: the four run-aborting hooks keep `Result`, and the
+/// signature now says which is which.
 pub enum BeforeOutcome {
     Proceed,
     Block {
@@ -58,9 +64,14 @@ pub enum BeforeOutcome {
         /// `if (beforeResult.terminate === true) { result.terminate = true; }` before returning it,
         /// so the blocked result participates in `shouldTerminateToolBatch` (`agent-loop.ts:582-584`).
         ///
-        /// `false` is pi's `undefined`/`false` — the blocked result carries no `terminate` at all.
-        terminate: bool,
+        /// [`TerminateHint::Unspecified`] is pi's `undefined` — the blocked result carries no
+        /// `terminate` key at all.
+        terminate: TerminateHint,
     },
+    /// The hook itself failed. The loop degrades exactly as for a pi `beforeToolCall` throw: an
+    /// error tool result carrying the error's own text (`createErrorToolResult(error.message)`,
+    /// `agent-loop.ts:657-662`), no `terminate`, no abort check first (func-02 R-02-050).
+    Failed(HookError),
 }
 
 /// Per-call context for [`Hooks::after_tool_call`].
@@ -79,9 +90,10 @@ pub struct AfterToolCall<'a> {
     pub usage: Option<&'a Usage>,
     pub is_error: bool,
     /// The early-termination hint the tool set, if any (Pi `AfterToolCallContext.result.terminate`
-    /// → `AgentToolResult.terminate?`, types.ts:354-368). `None` is pi's `undefined` — the tool did
-    /// not express an opinion, which is distinct from an explicit `false` (AGENT-009).
-    pub terminate: Option<bool>,
+    /// → `AgentToolResult.terminate?`, types.ts:354-368). [`TerminateHint::Unspecified`] is pi's
+    /// `undefined` — the tool did not express an opinion, which is distinct from an explicit
+    /// [`TerminateHint::Continue`] (AGENT-009).
+    pub terminate: TerminateHint,
     /// The assistant message that requested this tool call (Pi `assistantMessage`, types.ts:102).
     pub assistant_message: &'a AssistantMessage,
     /// The raw tool-call block from `assistant_message.content` (Pi `toolCall`, types.ts:104).
@@ -106,7 +118,25 @@ pub struct AfterOverride {
     /// `content`, `details`, or `usage`").
     pub usage: Option<Usage>,
     pub is_error: Option<bool>,
-    pub terminate: Option<bool>,
+    /// `None` = the hook has no opinion and the tool's own hint stands (pi
+    /// `afterResult.terminate ?? result.terminate`, agent-loop.ts:739). `Some(hint)` replaces it —
+    /// including `Some(TerminateHint::Unspecified)`, which CLEARS a hint the tool set. That is the
+    /// distinction a plain `Option<bool>` could not draw.
+    pub terminate: Option<TerminateHint>,
+}
+
+/// Outcome of [`Hooks::after_tool_call`] (func-02 R-02-025). pi's `afterToolCall` returns
+/// `AfterToolCallResult | undefined` (`types.ts:84-93`, `:292`) and a throw is caught per call
+/// (`agent-loop.ts:747-750`) — three outcomes, all expected, none run-aborting.
+pub enum AfterOutcome {
+    /// `undefined` upstream: the tool's own result stands.
+    Keep,
+    /// Replace-not-merge per field (`afterResult.x ?? result.x`, `agent-loop.ts:738-745`).
+    Override(AfterOverride),
+    /// The hook itself failed: the WHOLE result becomes an error result carrying the error's own
+    /// text, with `usage` and `added_tool_names` dropped and `terminate` cleared
+    /// (`createErrorToolResult(error.message)`, `agent-loop.ts:747-750`; R-02-050).
+    Failed(HookError),
 }
 
 /// Post-turn context for [`Hooks::prepare_next_turn`] and [`Hooks::should_stop_after_turn`] (Pi
@@ -225,22 +255,16 @@ pub trait Hooks: Send + Sync {
         Ok(msgs)
     }
 
-    /// After validation, before execute (func-02 R-02-021).
-    async fn before_tool_call(
-        &self,
-        _ctx: BeforeToolCall<'_>,
-        _cancel: CancelToken,
-    ) -> Result<BeforeOutcome, HookError> {
-        Ok(BeforeOutcome::Proceed)
+    /// After validation, before execute (func-02 R-02-021). Cannot abort the run — every outcome,
+    /// [`BeforeOutcome::Failed`] included, is a per-call result (func-02 R-02-050).
+    async fn before_tool_call(&self, _ctx: BeforeToolCall<'_>, _cancel: CancelToken) -> BeforeOutcome {
+        BeforeOutcome::Proceed
     }
 
-    /// After execute, before `tool_execution_end` (func-02 R-02-025).
-    async fn after_tool_call(
-        &self,
-        _ctx: AfterToolCall<'_>,
-        _cancel: CancelToken,
-    ) -> Result<Option<AfterOverride>, HookError> {
-        Ok(None)
+    /// After execute, before `tool_execution_end` (func-02 R-02-025). Cannot abort the run — every
+    /// outcome, [`AfterOutcome::Failed`] included, is a per-call result (func-02 R-02-050).
+    async fn after_tool_call(&self, _ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
+        AfterOutcome::Keep
     }
 
     /// After `turn_end`, before `should_stop_after_turn` (Pi `prepareNextTurn`, agent-loop.ts:226).

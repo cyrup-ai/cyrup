@@ -12,7 +12,8 @@ pub mod contact_supervisor;
 pub mod intercom;
 pub(crate) mod render;
 
-use cyrup_core::{Content, ToolResult};
+use cyrup_core::{
+    TerminateHint,Content, ToolResult};
 
 /// Build a plain-text [`ToolResult`] carrying pi's **empty** `details: {}`.
 ///
@@ -36,7 +37,7 @@ pub(crate) fn detailed_result(text: impl Into<String>, details: serde_json::Valu
     ToolResult {
         content: vec![Content::text(text.into())],
         details: Some(details),
-        terminate: false,
+        terminate: TerminateHint::Unspecified,
         ..Default::default()
     }
 }

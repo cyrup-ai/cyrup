@@ -1,6 +1,7 @@
 //! The run context — one run's working state, owned by the run task, plus the plumbing every
 //! phase of the loop shares: event emission, the failure path, queue polls, tool lookup.
 
+mod assistant_stream;
 mod stream;
 mod tools;
 mod turn;
@@ -9,6 +10,7 @@ use super::message::errored_assistant;
 use super::util::{lock, panic_message};
 use super::HeaderFn;
 use crate::event::{AgentEvent, AgentMessage};
+use crate::error::{AgentError, ContinueSurface};
 use crate::hooks::Hooks;
 use crate::queue::{PendingQueue, ToolExecution};
 use crate::state::{reduce, GenerationConfig, StateInner};
@@ -18,9 +20,72 @@ use cyrup_core::{ModelRef, ModelThinkingLevel, RunCancel, SessionId, StopReason,
 use futures::future::FutureExt;
 use std::sync::{Arc, Mutex};
 
-pub(crate) enum EntryStart {
-    Prompt(Vec<AgentMessage>),
-    Continue,
+/// Where a `RunEntry::Prompt`'s messages came from. Only a steering drain skips the loop's first
+/// steering poll (pi `skipInitialSteeringPoll`, agent.ts:351,440-446), so that the SECOND queued
+/// steering message is not jammed into the same turn as the drained prompt.
+pub(crate) enum PromptSource {
+    Fresh,
+    SteeringDrain,
+    FollowUpDrain,
+}
+
+/// How a run starts. `Continue` cannot be built without a [`ResumePoint`] — the proof that the
+/// transcript may be resumed without a new message — so the precondition has one home and cannot
+/// be skipped.
+pub(crate) enum RunEntry {
+    Prompt { messages: Vec<AgentMessage>, source: PromptSource },
+    Continue(ResumePoint),
+}
+
+impl RunEntry {
+    pub(crate) fn skip_initial_steering_poll(&self) -> bool {
+        matches!(self, RunEntry::Prompt { source: PromptSource::SteeringDrain, .. })
+    }
+}
+
+/// Proof that a transcript may be resumed without a new message: non-empty, and not ending in an
+/// assistant message (the provider would otherwise reject the request). Zero-sized, private
+/// field, ONE constructor — the single home of a rule that used to be written out three times.
+pub(crate) struct ResumePoint(());
+
+impl ResumePoint {
+    pub(crate) fn check(
+        messages: &[AgentMessage],
+        surface: ContinueSurface,
+    ) -> Result<Self, AgentError> {
+        if messages.is_empty() {
+            return Err(AgentError::NoMessages(surface));
+        }
+        if messages.last().is_some_and(|m| m.is_assistant()) {
+            return Err(AgentError::ContinueFromAssistant);
+        }
+        Ok(ResumePoint(()))
+    }
+}
+
+/// Handles that live for the whole run — cloned out of [`super::Agent`] (or built by
+/// `crate::loop_fn`) exactly once per run.
+pub(crate) struct RunShared {
+    pub state: Arc<Mutex<StateInner>>,
+    pub subscribers: Arc<Mutex<Vec<Arc<dyn EventSubscriber>>>>,
+    pub steering: Arc<Mutex<PendingQueue>>,
+    pub follow_up: Arc<Mutex<PendingQueue>>,
+    pub hooks: Arc<dyn Hooks>,
+    pub stream_fn: Arc<dyn StreamFn>,
+    pub key_resolver: Option<Arc<dyn ApiKeyResolver>>,
+    pub tool_execution: ToolExecution,
+    pub session_id: Option<SessionId>,
+}
+
+/// The run-start `.slice()` baseline — pi `createContextSnapshot` — taken under the state lock,
+/// after the run latch is claimed, so it is the transcript the run actually uses.
+pub(crate) struct RunBaseline {
+    pub system_prompt: String,
+    pub model: ModelRef,
+    pub thinking_level: ModelThinkingLevel,
+    pub gen_config: GenerationConfig,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub messages: Vec<AgentMessage>,
 }
 
 /// A run-aborting failure travelling up to [`RunCtx::run`], which converts it into Pi's
@@ -84,28 +149,22 @@ pub(crate) struct RunCtx {
 }
 
 impl RunCtx {
-    /// Assemble a run context from already-built shared handles. Used by [`super::Agent::start_run`] and by
+    /// Assemble a run context from already-built shared handles. Used by [`super::Agent::spawn_run`] and by
     /// the low-level free-function loop (`crate::loop_fn`) so both drive the identical, tested loop.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        state: Arc<Mutex<StateInner>>,
-        subscribers: Arc<Mutex<Vec<Arc<dyn EventSubscriber>>>>,
-        steering: Arc<Mutex<PendingQueue>>,
-        follow_up: Arc<Mutex<PendingQueue>>,
-        hooks: Arc<dyn Hooks>,
-        stream_fn: Arc<dyn StreamFn>,
-        key_resolver: Option<Arc<dyn ApiKeyResolver>>,
-        tool_execution: ToolExecution,
-        session_id: Option<SessionId>,
-        system_prompt: String,
-        model: ModelRef,
-        thinking_level: ModelThinkingLevel,
-        gen_config: GenerationConfig,
-        tools: Vec<Arc<dyn Tool>>,
-        messages: Vec<AgentMessage>,
-        cancel: RunCancel,
-        skip_initial_steering_poll: bool,
-    ) -> Self {
+    pub(crate) fn new(shared: RunShared, baseline: RunBaseline, cancel: RunCancel) -> Self {
+        let RunShared {
+            state,
+            subscribers,
+            steering,
+            follow_up,
+            hooks,
+            stream_fn,
+            key_resolver,
+            tool_execution,
+            session_id,
+        } = shared;
+        let RunBaseline { system_prompt, model, thinking_level, gen_config, tools, messages } =
+            baseline;
         Self {
             state,
             subscribers,
@@ -128,13 +187,12 @@ impl RunCtx {
             // this vector downstream is a pointer copy.
             messages: messages.into_iter().map(Arc::new).collect(),
             turn_index: 0,
-            skip_initial_steering_poll,
+            // Derived from the entry in `run`, never supplied by a caller.
+            skip_initial_steering_poll: false,
             header_fn: None,
         }
     }
 
-    /// Install the per-turn header resolver on an assembled context (AGENT-029). Kept off
-    /// [`Self::new`]'s already-long parameter list; `crate::loop_fn` leaves it unset.
     pub(crate) fn with_header_fn(mut self, f: Option<Arc<HeaderFn>>) -> Self {
         self.header_fn = f;
         self
@@ -196,7 +254,7 @@ impl RunCtx {
     /// `error.message`) followed by `message_start` → `message_end` → `turn_end` (with NO tool
     /// results) → `agent_end` carrying `[failureMessage]` and nothing else (agent.ts:508-511).
     ///
-    /// The post-unwind twin of this path lives at [`super::Agent::start_run`]'s `catch_unwind` arm, which must
+    /// The post-unwind twin of this path lives at [`super::Agent::spawn_run`]'s `catch_unwind` arm, which must
     /// synthesize the same quartet through [`super::lifecycle::emit_standalone`] because its `RunCtx` is already gone;
     /// here the live `RunCtx` is intact, so emission goes through the ordinary [`RunCtx::emit`] and
     /// the reducer records `error_message`/`stop_reason` exactly as it does for a streamed message.
@@ -207,8 +265,9 @@ impl RunCtx {
     /// `catch_unwind` twin settles the same single-element vector.
     async fn emit_run_failure(&mut self, error_message: String) {
         // Pi reads `this._state.model` (agent.ts:500-502) — the agent's state model, not the loop's
-        // possibly-overridden running baseline.
-        let model = { lock(&self.state).model.clone() };
+        // possibly-overridden running baseline; `self.model` is the fallback for a model cleared
+        // mid-run.
+        let model = { lock(&self.state).model.clone() }.unwrap_or_else(|| self.model.clone());
         // Pi `stopReason: aborted ? "aborted" : "error"` (agent.ts:504).
         let stop_reason =
             if self.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
@@ -247,7 +306,9 @@ impl RunCtx {
     /// on any thrown value, hand it to `handleRunFailure` (`:489-490`). Every in-loop failure
     /// (`transformContext`/`convertToLlm`, the two post-turn hooks, a throwing listener) reaches
     /// this one catch, which is why they all share [`RunFailure`].
-    pub(crate) async fn run(&mut self, entry: EntryStart) -> Vec<AgentMessage> {
+    pub(crate) async fn run(&mut self, entry: RunEntry) -> Vec<AgentMessage> {
+        // The only place the flag is set: a property of the entry, so it cannot disagree with it.
+        self.skip_initial_steering_poll = entry.skip_initial_steering_poll();
         if let Err(RunFailure(msg)) = self.run_entry(entry).await {
             self.emit_run_failure(msg).await;
         }
@@ -259,10 +320,10 @@ impl RunCtx {
             .collect()
     }
 
-    async fn run_entry(&mut self, entry: EntryStart) -> Result<(), RunFailure> {
+    async fn run_entry(&mut self, entry: RunEntry) -> Result<(), RunFailure> {
         self.emit(AgentEvent::AgentStart).await?;
         match entry {
-            EntryStart::Prompt(prompts) => {
+            RunEntry::Prompt { messages: prompts, .. } => {
                 self.emit(AgentEvent::TurnStart).await?;
                 for p in prompts {
                     self.emit(AgentEvent::MessageStart { message: p.clone() }).await?;
@@ -276,7 +337,7 @@ impl RunCtx {
                 }
                 self.run_loop(true).await
             }
-            EntryStart::Continue => {
+            RunEntry::Continue(_) => {
                 self.emit(AgentEvent::TurnStart).await?;
                 self.run_loop(true).await
             }

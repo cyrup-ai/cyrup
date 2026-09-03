@@ -3724,7 +3724,7 @@ impl ConfigContext {
     /// preview *and* in the write. That is upstream, and it is why the preview of a first-time
     /// import shows two changes rather than one.
     ///
-    /// Called by [`crate::panel_host::SetupCallbacks::preview_imports`], from inside the setup
+    /// Called by [`crate::ui::SetupPanelCallbacks::preview_imports`], from inside the setup
     /// panel's `render` on every frame.
     #[must_use]
     pub fn preview_compatibility_imports(&self, import_kinds: &[ImportKind]) -> ConfigWritePreview {
@@ -3746,7 +3746,7 @@ impl ConfigContext {
     /// call does not touch the file's mtime. That matters because the onboarding path calls it on
     /// every start.
     ///
-    /// Called by [`crate::panel_host::SetupCallbacks::adopt_imports`] and by `cyrup mcp init` in
+    /// Called by [`crate::ui::SetupPanelCallbacks::adopt_imports`] and by `cyrup mcp init` in
     /// the `cyrup` binary.
     pub fn ensure_compatibility_imports(
         &self,
@@ -3781,7 +3781,7 @@ impl ConfigContext {
 
     /// `previewStarterProjectConfig(cwd)` — the `{ "mcpServers": {} }` scaffold's preview.
     ///
-    /// Called by [`crate::panel_host::SetupCallbacks::preview_starter_project`].
+    /// Called by [`crate::ui::SetupPanelCallbacks::preview_starter_project`].
     /// Set `settings.hostConfigDiscovery = "on"` in the adapter-owned global file
     /// ([`Self::user_path`]) — MCP-049's second writer.
     ///
@@ -3831,7 +3831,7 @@ impl ConfigContext {
     /// there. Upstream does not merge here and neither does this: the caller is the setup panel,
     /// which only offers the action when the file does not exist.
     ///
-    /// Called by [`crate::panel_host::SetupCallbacks::scaffold_project_config`].
+    /// Called by [`crate::ui::SetupPanelCallbacks::scaffold_project_config`].
     pub fn write_starter_project_config(&self) -> McpResult<PathBuf> {
         let target = self.project_path();
         write_raw_config_object(&target, &starter_raw())?;

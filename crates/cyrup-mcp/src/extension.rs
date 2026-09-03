@@ -1442,9 +1442,9 @@ impl McpExtension {
     /// # The `canRenderPanel` probe is made twice, on purpose
     ///
     /// Upstream gates on `hasUI && mode === "tui"` and then calls `ctx.ui.custom`. Here the mode
-    /// test and the host's own capability answer are separate facts: [`ExtMode`] says what kind of
+    /// test and the host's own capability answer are separate facts: [`ExtMode`](cyrup_ext::native::ExtMode) says what kind of
     /// session this is, and `HostServices::open_overlay` says whether anything took the overlay.
-    /// A host can report [`ExtMode::Tui`] and still decline — nothing guarantees a renderer is
+    /// A host can report [`ExtMode::Tui`](cyrup_ext::native::ExtMode::Tui) and still decline — nothing guarantees a renderer is
     /// attached — so both are checked and both raise the same refusal. Checking only the second
     /// would work but would open, and immediately tear down, a panel in a mode upstream never
     /// offers it in.
@@ -1462,9 +1462,9 @@ impl McpExtension {
     /// Under [`crate::ui::PanelOptions::auth_only`] the panel runs the flow itself through
     /// [`crate::ui::McpPanelCallbacks::authenticate`] — the same `authenticate_server` the named
     /// form calls. So both the authenticated and the dismissed outcome map to
-    /// [`Picked::Dismissed`]: by the time the overlay closes the work is done, and returning
-    /// [`Picked::Server`] would make the caller run a second flow against a server that just
-    /// finished one. `openMcpAuthPanel` returns `{ configChanged: false }` unconditionally for the
+    /// [`Picked::Handled`]: by the time the overlay closes the work is done, and handing a picked
+    /// server back (a variant this enum deliberately lacks) would make the caller run a second
+    /// flow against a server that just finished one. `openMcpAuthPanel` returns `{ configChanged: false }` unconditionally for the
     /// same reason.
     async fn pick_oauth_server(
         &self,
@@ -2185,6 +2185,7 @@ impl NativeExtension for McpExtension {
                     details: None,
                     is_error: Some(true),
                     usage: None,
+                    terminate: None,
                 })
             }
             _ => HookOutcome::Noop,

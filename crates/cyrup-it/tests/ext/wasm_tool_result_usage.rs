@@ -53,6 +53,7 @@ async fn the_live_guest_reads_and_patches_the_re_signed_tool_result_usage() {
                 details: None,
                 is_error: false,
                 usage: Some(probe_usage()),
+                terminate: cyrup_core::TerminateHint::Unspecified,
             },
             &cancel,
         )
@@ -94,6 +95,7 @@ async fn the_live_guest_reads_and_patches_the_re_signed_tool_result_usage() {
                 details: None,
                 is_error: false,
                 usage: None,
+                terminate: cyrup_core::TerminateHint::Unspecified,
             },
             &cancel,
         )

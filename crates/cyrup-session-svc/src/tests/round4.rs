@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cyrup_core::{Content, ExtensionId, StopReason, Tool, ToolError, ToolResult, ToolUpdateSink};
+use cyrup_core::{
+    TerminateHint,Content, ExtensionId, StopReason, Tool, ToolError, ToolResult, ToolUpdateSink};
 use cyrup_ext::{
     EventKind, ExtError, HandledValue, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension,
 };
@@ -246,7 +247,7 @@ impl Tool for BlockTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.gate.notified().await;
-        Ok(ToolResult { content: vec![Content::text("released")], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text("released")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 

@@ -51,3 +51,4 @@ mod settings_resolve;
 mod summarization_retry_events;
 mod tool_usage_extension_seam;
 mod transport_setting;
+mod type_driven_boundaries;

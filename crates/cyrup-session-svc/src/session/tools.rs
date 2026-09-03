@@ -137,9 +137,11 @@ impl AgentSession {
     /// this.agent.state.model` (`agent-session.ts:537` @v0.83.0) and `thinkingLevel:
     /// this.agent.state.thinkingLevel` (`:538`) — not the session's mirrors, and stamps them AFTER
     /// the `...previousSnapshot` spread so the session out-votes an extension override.
+    /// `None` (a modelless agent) leaves `TurnUpdate.model` unset, so the running loop keeps its
+    /// own baseline — a run cannot be in flight without one anyway.
     pub(crate) async fn next_turn_model_baseline(
         &self,
-    ) -> (ModelRef, cyrup_core::ModelThinkingLevel) {
+    ) -> (Option<ModelRef>, cyrup_core::ModelThinkingLevel) {
         let snap = self.agent.snapshot().await;
         (snap.model, snap.thinking_level)
     }

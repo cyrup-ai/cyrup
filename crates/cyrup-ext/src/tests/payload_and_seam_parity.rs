@@ -10,7 +10,8 @@ use crate::{
     InitApi, NativeExtension, Reduced, Subscriptions, ToolDescriptor,
 };
 use cyrup_agent::AgentEvent;
-use cyrup_core::{CancelToken, ExtensionId};
+use cyrup_core::{
+    TerminateHint,CancelToken, ExtensionId};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -184,7 +185,7 @@ async fn a_blocking_handler_can_hint_terminate_and_it_survives_the_reduction() {
             _ev: &HostEvent,
             _cancel: &CancelToken,
         ) -> Result<HookOutcome, ExtError> {
-            Ok(HookOutcome::Block { reason: Some("denied by policy".into()), terminate: true })
+            Ok(HookOutcome::Block { reason: Some("denied by policy".into()), terminate: TerminateHint::Terminate })
         }
     }
 
@@ -196,7 +197,7 @@ async fn a_blocking_handler_can_hint_terminate_and_it_survives_the_reduction() {
     match dispatcher.dispatch_block_mutate(ev, &CancelToken::new()).await {
         Reduced::Blocked { reason, terminate, .. } => {
             assert_eq!(reason.as_deref(), Some("denied by policy"));
-            assert!(terminate, "pi's terminate hint must survive to the agent, which applies the \
+            assert!(terminate.requested(), "pi's terminate hint must survive to the agent, which applies the \
                                 every()-rule (agent-loop.ts:583 @v0.84.1)");
         }
         other => panic!("expected Blocked, got {other:?}"),

@@ -127,10 +127,9 @@ mod x13_live_bash_tests {
         let payload = msgs
             .iter()
             .find_map(|m| match m {
-                cyrup_agent::AgentMessage::Custom { kind, payload, .. }
-                    if kind == "bashExecution" =>
+                cyrup_agent::AgentMessage::App { role: cyrup_agent::AppRole::BashExecution, payload, .. } =>
                 {
-                    Some(payload.clone())
+                    Some(serde_json::Value::Object(payload.clone()))
                 }
                 _ => None,
             })

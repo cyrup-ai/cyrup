@@ -16,6 +16,7 @@ use crate::{
     StreamFn, ToolResultMessage, TurnUpdate,
 };
 use cyrup_core::{
+    TerminateHint,
     AssistantMessage, CancelToken, Content, EventStream, Message, ModelRef, Tool, ToolCallId,
     ToolError, ToolResult, ToolUpdateSink,
 };
@@ -303,7 +304,7 @@ impl Tool for EchoTool {
         Ok(ToolResult {
             content: vec![Content::text(format!("echo:{params}"))],
             details: None,
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }

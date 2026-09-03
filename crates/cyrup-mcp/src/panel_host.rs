@@ -1,16 +1,16 @@
 //! `buildMcpPanelCallbacks` + `openMcpSetup`'s callback object — the adapter between the `/mcp`
 //! dispatcher and the two panels (MCP-387, MCP-392).
 //!
-//! [`crate::ui`] declares [`McpPanelCallbacks`] and [`SetupPanelCallbacks`] and derives no state of
+//! [`crate::ui`] declares [`crate::ui::McpPanelCallbacks`] and [`crate::ui::SetupPanelCallbacks`] and derives no state of
 //! its own; [`crate::commands`] owns the switch. This module is the layer between them: it reads
 //! [`McpState`]'s connection map, the credential store and the config ladder, and it is the only
 //! place in the crate that answers a panel's questions.
 //!
 //! # Why the callbacks hold a `Weak` and not the extension
 //!
-//! Both async members of [`McpPanelCallbacks`] return `BoxFuture<'static, _>`, so nothing here can
+//! Both async members of [`crate::ui::McpPanelCallbacks`] return `BoxFuture<'static, _>`, so nothing here can
 //! borrow. Each object therefore owns its inputs — an `Arc<McpState>`, a cloned
-//! [`cyrup_ext::HostCtx`], the resolved [`McpDirs`] — plus a
+//! [`cyrup_ext::HostCtx`], the resolved [`crate::dirs::McpDirs`] — plus a
 //! [`std::sync::Weak`] back to the extension, upgraded per call. Strong would be a cycle: the
 //! command arm that built the callbacks is blocked on the panel that holds them, so a strong handle
 //! would keep the extension alive for exactly as long as the object it owns. This is the same shape

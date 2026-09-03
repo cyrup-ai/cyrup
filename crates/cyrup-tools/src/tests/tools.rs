@@ -1380,7 +1380,6 @@ impl Tool for EchoRead {
         Ok(ToolResult {
             content: vec![Content::text("overridden read")],
             details: None,
-            terminate: false,
             ..Default::default()
         })
     }

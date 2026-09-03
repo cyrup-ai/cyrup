@@ -7,7 +7,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cyrup_core::{Content, EntryId, ExtensionId, Message, StopReason};
+use cyrup_core::{
+    TerminateHint,Content, EntryId, ExtensionId, Message, StopReason};
 use cyrup_ext::{
     EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
 };
@@ -250,7 +251,7 @@ impl NativeExtension for TreeVeto {
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
             HostEvent::SessionBeforeTree { .. } => {
-                HookOutcome::Block { reason: Some("vetoed".into()), terminate: false }
+                HookOutcome::Block { reason: Some("vetoed".into()), terminate: TerminateHint::Unspecified }
             }
             _ => HookOutcome::Noop,
         }

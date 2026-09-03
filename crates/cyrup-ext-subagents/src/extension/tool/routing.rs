@@ -3,7 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{CancelToken, ModelId, ToolError, ToolResult, ToolUpdateSink};
+use cyrup_core::{
+    TerminateHint,CancelToken, ModelId, ToolError, ToolResult, ToolUpdateSink};
 
 use crate::background::{RunId, RunMode};
 use crate::discovery::discover_agents;
@@ -622,7 +623,7 @@ impl SubagentTool {
                 cwd,
                 &self.executor.config_snapshot().await.roots,
             )),
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }
@@ -700,7 +701,7 @@ impl SubagentTool {
                      first. After the child exits, start a fresh follow-up if needed."
                 ))],
                 details,
-                terminate: false,
+                terminate: TerminateHint::Unspecified,
                 ..Default::default()
             });
         }
@@ -712,7 +713,7 @@ impl SubagentTool {
                     "Run paused after interrupt ({agent}). Waiting for explicit next action."
                 ))],
                 details,
-                terminate: false,
+                terminate: TerminateHint::Unspecified,
                 ..Default::default()
             });
         }
@@ -738,7 +739,7 @@ impl SubagentTool {
         Ok(ToolResult {
             content: vec![cyrup_core::Content::text(text)],
             details,
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }
@@ -797,7 +798,7 @@ impl SubagentTool {
                 Ok(ToolResult {
                     content: vec![cyrup_core::Content::text(receipt)],
                     details: reduced_details,
-                    terminate: false,
+                    terminate: TerminateHint::Unspecified,
                     ..Default::default()
                 })
             });
@@ -826,7 +827,7 @@ impl SubagentTool {
                 Ok(ToolResult {
                     content: vec![cyrup_core::Content::text(report)],
                     details: None,
-                    terminate: false,
+                    terminate: TerminateHint::Unspecified,
                     ..Default::default()
                 })
             }
@@ -841,7 +842,7 @@ impl SubagentTool {
                     crate::registration::guide::read_subagent_guide(p.topic.as_deref()),
                 )],
                 details: None,
-                terminate: false,
+                terminate: TerminateHint::Unspecified,
                 ..Default::default()
             }),
             // `models` is the runtime builtin-agent -> model mapping (pi `handleModels`), the SAME
@@ -852,7 +853,7 @@ impl SubagentTool {
                 Ok(ToolResult {
                     content: vec![cyrup_core::Content::text(report)],
                     details: None,
-                    terminate: false,
+                    terminate: TerminateHint::Unspecified,
                     ..Default::default()
                 })
             }
@@ -915,7 +916,7 @@ impl SubagentTool {
                 Ok(ToolResult {
                     content: vec![cyrup_core::Content::text(outcome.text)],
                     details: Some(outcome.details),
-                    terminate: false,
+                    terminate: TerminateHint::Unspecified,
                     ..Default::default()
                 })
             }
@@ -1041,7 +1042,7 @@ impl SubagentTool {
                     "results": [],
                     "spawnBudget": preview,
                 })),
-                terminate: false,
+                terminate: TerminateHint::Unspecified,
                 ..Default::default()
             });
         }
@@ -1078,7 +1079,7 @@ impl SubagentTool {
                 "results": [],
                 "spawnBudget": granted,
             })),
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }
@@ -1137,7 +1138,7 @@ impl SubagentTool {
         Ok(ToolResult {
             content: vec![cyrup_core::Content::text(result.text)],
             details: None,
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }
@@ -1223,7 +1224,7 @@ impl SubagentTool {
             Ok(outcome) if !outcome.is_error => Ok(ToolResult {
                 content: vec![cyrup_core::Content::text(outcome.text)],
                 details: Some(serde_json::json!({ "mode": "management", "results": [] })),
-                terminate: false,
+                terminate: TerminateHint::Unspecified,
                 ..Default::default()
             }),
             Ok(outcome) => Err(ToolError::new(outcome.text)),
@@ -1278,7 +1279,7 @@ impl SubagentTool {
                         return Ok(ToolResult {
                             content: vec![cyrup_core::Content::text(auth::declined_message(action))],
                             details: Some(serde_json::json!({ "mode": "management" })),
-                            terminate: false,
+                            terminate: TerminateHint::Unspecified,
                             ..Default::default()
                         });
                     }
@@ -1403,7 +1404,7 @@ impl SubagentTool {
             Ok(text) => Ok(ToolResult {
                 content: vec![cyrup_core::Content::text(text)],
                 details: Some(serde_json::json!({ "mode": "management" })),
-                terminate: false,
+                terminate: TerminateHint::Unspecified,
                 ..Default::default()
             }),
             Err(message) => Err(ToolError::new(message)),
@@ -1513,7 +1514,7 @@ impl SubagentTool {
                     cwd,
                     &self.executor.config_snapshot().await.roots,
                 )),
-                terminate: false,
+                terminate: TerminateHint::Unspecified,
                 ..Default::default()
             }),
             GraphRunOutcome::Foreground { run_id, groups, .. } => {
@@ -1579,7 +1580,7 @@ impl SubagentTool {
                 Ok(ToolResult {
                     content: vec![cyrup_core::Content::text(summary)],
                     details: Some(details),
-                    terminate: false,
+                    terminate: TerminateHint::Unspecified,
                     ..Default::default()
                 })
             }
@@ -1674,7 +1675,7 @@ impl SubagentTool {
                     cwd,
                     &self.executor.config_snapshot().await.roots,
                 )),
-                terminate: false,
+                terminate: TerminateHint::Unspecified,
                 ..Default::default()
             }),
             GraphRunOutcome::Foreground {
@@ -1743,7 +1744,7 @@ impl SubagentTool {
                 Ok(ToolResult {
                     content: vec![cyrup_core::Content::text(text)],
                     details: Some(details),
-                    terminate: false,
+                    terminate: TerminateHint::Unspecified,
                     ..Default::default()
                 })
             }

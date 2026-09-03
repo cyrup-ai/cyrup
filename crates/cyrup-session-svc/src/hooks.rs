@@ -8,10 +8,11 @@
 use std::sync::Arc;
 
 use cyrup_agent::{
-    AfterOverride, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall, HookError, Hooks,
+    AfterOutcome, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall, HookError, Hooks,
     PostTurn, TurnUpdate,
 };
-use cyrup_core::{CancelToken, Message};
+use cyrup_core::{
+    TerminateHint,CancelToken, Message};
 use cyrup_tools::{PermissionPolicy, PolicyDecision};
 
 /// The placeholder text Pi substitutes for a blocked image (sdk.ts:270).
@@ -26,7 +27,8 @@ const BLOCKED_IMAGE_TEXT: &str = "Image reading is disabled.";
 /// ([`cyrup_agent::default_convert_to_llm`]), which is why the coding-agent roles could not live in
 /// the transcript at all: anything that entered would silently vanish from the request.
 ///
-/// The three [`AgentMessage::App`] roles are rendered by handing the stored pi wire object back to
+/// The three [`AgentMessage::App`] roles (closed over [`cyrup_agent::AppRole`]) are rendered by
+/// handing the stored pi wire object back to
 /// `cyrup-session`, whose `push_llm` IS this crate's other copy of the same upstream switch — so the
 /// transcript-seeded path and the `build_context()` path cannot drift. `custom` is rendered by
 /// [`cyrup_session::agent_message::custom_to_message`], pi's `case "custom"` (`:162-168`): before
@@ -53,34 +55,16 @@ pub(crate) fn coding_agent_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Mes
                 added_tool_names: t.added_tool_names.clone(),
                 timestamp: t.timestamp,
             }),
-            // `kind` is OVERLOADED on this arm and both meanings have to be honoured here.
-            //
-            // For an extension message it is pi's `customType` and `payload` is pi's `content`, so
-            // `case "custom"` (`messages.ts:162-168` @v0.83.0) applies. But `record_bash_result`
-            // (`session.rs`) also appends a LIVE `!` execution as `Custom { kind: "bashExecution",
-            // payload: <the whole BashExecutionMessage object> }` — pi has a first-class
-            // `bashExecution` ROLE there, and the session file already treats that `customType` as
-            // the role (`append_custom_message("bashExecution", …)` reloads as
-            // `Raw::BashExecution`). Rendering such a message through `custom_to_message` would hit
-            // its stringify catch-all and inject the raw JSON object as a user turn — and, worse,
-            // would ignore `excludeFromContext`, so a `!!` command's output would reach the model
-            // on the live turn. pi's `case "bashExecution"` returns `undefined` for exactly that
-            // message (`:152-156`).
-            //
-            // So a `kind` naming one of pi's declaration-merged roles is reconstituted into its pi
-            // wire object and rendered by the SAME `push_llm` the `App` arm below uses — the two
-            // paths cannot disagree, which they did until this was added: after a compaction
-            // re-seed the same execution arrives as `App { role: "bashExecution" }` and IS dropped.
-            AgentMessage::Custom { kind, payload, timestamp, .. } => {
-                match app_role_payload(kind, payload, *timestamp)
-                    .and_then(|v| serde_json::from_value::<Raw>(v).ok())
-                {
-                    Some(raw) => raw.push_llm(&mut out),
-                    None => out.push(cyrup_session::agent_message::custom_to_message(
-                        payload,
-                        timestamp.unwrap_or(0),
-                    )),
-                }
+            // pi's `case "custom"` (`messages.ts:162-168` @v0.83.0): `kind` is the extension's
+            // `customType` and `payload` is pi's `content`. Nothing else ever lands here — a `!`
+            // execution is an `App { role: AppRole::BashExecution, .. }` from the moment it is
+            // recorded (`session/bash.rs`), the same variant the compaction re-seed produces, so
+            // the two paths cannot disagree.
+            AgentMessage::Custom { payload, timestamp, .. } => {
+                out.push(cyrup_session::agent_message::custom_to_message(
+                    payload,
+                    timestamp.unwrap_or(0),
+                ));
             }
             // A payload this crate wrote and cannot read back would be a bug, not user data, so
             // the `Err` arm skips exactly this message — pi's `default:` case
@@ -95,31 +79,6 @@ pub(crate) fn coding_agent_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Mes
         }
     }
     out
-}
-
-/// Rebuild the pi wire object for an [`AgentMessage::Custom`] whose `kind` is in fact one of pi's
-/// declaration-merged ROLES rather than a `customType` — see the `Custom` arm above.
-///
-/// Returns `None` for a genuine `custom` message, which is every `kind` outside
-/// [`cyrup_agent::APP_MESSAGE_ROLES`]. The `role` key is injected because cyrup's producer stores
-/// only the body, and `timestamp` is filled from the transcript entry when the body has none (all
-/// three target structs carry `#[serde(default)] timestamp`).
-fn app_role_payload(
-    kind: &str,
-    payload: &serde_json::Value,
-    timestamp: Option<i64>,
-) -> Option<serde_json::Value> {
-    if !cyrup_agent::APP_MESSAGE_ROLES.contains(&kind) {
-        return None;
-    }
-    let serde_json::Value::Object(mut obj) = payload.clone() else {
-        return None;
-    };
-    obj.insert("role".to_string(), serde_json::Value::String(kind.to_string()));
-    if let (None, Some(ts)) = (obj.get("timestamp"), timestamp) {
-        obj.insert("timestamp".to_string(), serde_json::Value::from(ts));
-    }
-    Some(serde_json::Value::Object(obj))
 }
 
 /// The composed hooks handed to the agent (permission gate → extension hooks).
@@ -232,7 +191,7 @@ impl Hooks for PolicyHooks {
         &self,
         ctx: BeforeToolCall<'_>,
         cancel: CancelToken,
-    ) -> Result<BeforeOutcome, HookError> {
+    ) -> BeforeOutcome {
         // 1. Opt-in permission policy (empty policy ⇒ always Proceed, the YOLO default R-12-001).
         match self.policy.evaluate(ctx.tool_name, ctx.args) {
             PolicyDecision::Proceed => {}
@@ -241,12 +200,12 @@ impl Hooks for PolicyHooks {
             // hint; that flag belongs to an extension's `BeforeToolCallResult.terminate`
             // (`packages/agent/src/types.ts:61-69` @v0.84.1) and the permission gate never sets it.
             PolicyDecision::Block { reason } => {
-                return Ok(BeforeOutcome::Block { reason: Some(reason), terminate: false });
+                return BeforeOutcome::Block { reason: Some(reason), terminate: TerminateHint::Unspecified };
             }
             PolicyDecision::Confirm { reason } => {
                 if !self.has_ui {
                     // No UI to prompt: block-by-default (R-12-009).
-                    return Ok(BeforeOutcome::Block { reason: Some(reason), terminate: false });
+                    return BeforeOutcome::Block { reason: Some(reason), terminate: TerminateHint::Unspecified };
                 }
                 // With UI the front-end resolves confirmation; absent a wired confirm hook we
                 // proceed (the interactive front-end owns the prompt — arch-10/12).
@@ -260,7 +219,7 @@ impl Hooks for PolicyHooks {
         &self,
         ctx: AfterToolCall<'_>,
         cancel: CancelToken,
-    ) -> Result<Option<AfterOverride>, HookError> {
+    ) -> AfterOutcome {
         self.inner.after_tool_call(ctx, cancel).await
     }
 
@@ -317,7 +276,7 @@ impl Hooks for PolicyHooks {
         // emitted its events. Stamped AFTER the inner hook for the same reason pi puts them after
         // the spread: the session out-votes an extension override on all three.
         let (model, thinking_level) = session.next_turn_model_baseline().await;
-        update.model = Some(model);
+        update.model = model;
         update.thinking_level = Some(thinking_level);
         Ok(Some(update))
     }

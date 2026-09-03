@@ -6,7 +6,7 @@
 
 use std::sync::atomic::Ordering;
 
-use cyrup_agent::AgentMessage;
+use cyrup_agent::{AgentMessage, AppRole};
 use cyrup_core::CancelToken;
 use cyrup_ext::{HostEvent, Reduced};
 use cyrup_tools::ShellConfig;
@@ -218,14 +218,23 @@ impl AgentSession {
     /// tool_use/tool_result ordering and flushed after the turn.
     pub async fn record_bash_result(&self, command: &str, result: &BashResult, options: BashOptions) {
         let payload = bash_message_payload(command, result, options.exclude_from_context);
-        let msg = AgentMessage::Custom {
-            kind: "bashExecution".to_string(),
-            payload: payload.clone(),
-            // A `!`-execution is rendered from its payload; pi attaches no `details` to it.
-            details: None,
-            timestamp: Some(now_ms()),
+        // The transcript message is the full pi wire object — `role` and `timestamp` included —
+        // which is exactly what a compaction re-seed produces for the same execution via
+        // `raw_message_to_agent`, so the live and resumed messages are one variant, one shape.
+        // The persisted entry (`append_bash_message` below) keeps the BARE payload: the session
+        // store supplies `custom_type` and `timestamp` itself, and its bytes must not change.
+        let serde_json::Value::Object(mut wire) = payload.clone() else {
+            // Unreachable: `bash_message_payload` always builds an object.
+            return;
         };
-        if self.is_streaming().await {
+        wire.insert("role".to_string(), serde_json::Value::from(AppRole::BashExecution.as_str()));
+        wire.insert("timestamp".to_string(), serde_json::Value::from(now_ms()));
+        let msg = AgentMessage::App { role: AppRole::BashExecution, payload: wire };
+        // AGENT-030 — pi defers on `this.isStreaming`, the session latch `_isAgentRunActive`
+        // (agent-session.ts:900-901, :3007: "If agent is streaming, defer adding to avoid breaking
+        // tool_use/tool_result ordering"), so a result landing in the post-`agent_end` gap waits for
+        // the WHOLE loop's `flush_pending_bash_messages` (`run.rs`), pi's `finally`.
+        if self.is_run_active() {
             Self::lock(&self.pending_bash).push(msg);
             return;
         }
@@ -268,18 +277,21 @@ impl AgentSession {
     pub async fn flush_pending_bash_messages(&self) {
         let pending: Vec<AgentMessage> = std::mem::take(&mut *Self::lock(&self.pending_bash));
         for msg in pending {
-            if let AgentMessage::Custom { payload, .. } = &msg {
-                let payload = payload.clone();
-                self.append_bash_message(msg, &payload).await;
+            if let AgentMessage::App { payload, .. } = &msg {
+                let mut bare = payload.clone();
+                bare.remove("role");
+                bare.remove("timestamp");
+                let bare = serde_json::Value::Object(bare);
+                self.append_bash_message(msg, &bare).await;
             }
         }
     }
 
     /// Append a bash message to the agent transcript + persist it durably.
     async fn append_bash_message(&self, msg: AgentMessage, payload: &serde_json::Value) {
-        let mut msgs = self.agent.snapshot().await.messages;
-        msgs.push(msg);
-        self.agent.set_messages(msgs).await;
+        // One locked edit. Reached only after the run has settled (`flush_pending_bash_messages`)
+        // or when not streaming (`record_bash_result`), so `RunActive` cannot occur.
+        let _ = self.agent.edit_transcript(|m| m.push(msg));
         let _ = self
             .manager
             .lock()

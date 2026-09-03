@@ -42,7 +42,7 @@ impl RunCtx {
                 // `turn_end` event, so build the handle ONCE and clone the pointer. Wrapping at
                 // each use (`Arc::new(asst.clone())`) allocates a fresh `Arc` and deep-copies the
                 // message into it, which defeats the sharing at the moment it is created.
-                let asst = Arc::new(self.stream_assistant().await?);
+                let asst = self.stream_assistant().await?;
                 // Pi's `streamAssistantResponse` leaves the final assistant message in the loop's
                 // working copy (`currentContext.messages`, agent-loop.ts:346/348/361/363); mirror that
                 // before tool execution / the post-turn hooks read the context.

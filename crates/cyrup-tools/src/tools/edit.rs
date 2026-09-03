@@ -360,7 +360,6 @@ impl Tool for EditTool {
                 first_changed_line,
             })
             .ok(),
-            terminate: false,
             ..Default::default()
         })
     }

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cyrup_core::{
+    TerminateHint,
     AssistantMessage, Content, StopReason, Tool, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_provider::faux::{
@@ -90,7 +91,7 @@ impl Tool for EchoTool {
         _cancel: cyrup_core::CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("echo")], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text("echo")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 
@@ -184,7 +185,7 @@ async fn execute_bash_records_result_and_persists() {
     // The bash result landed in the agent transcript (not streaming) as a bashExecution message.
     let msgs = session.agent_messages().await;
     assert!(
-        msgs.iter().any(|m| matches!(m, cyrup_agent::AgentMessage::Custom { kind, .. } if kind == "bashExecution")),
+        msgs.iter().any(|m| matches!(m, cyrup_agent::AgentMessage::App { role: cyrup_agent::AppRole::BashExecution, .. })),
         "bash result recorded in transcript"
     );
     // abort_bash is idempotent when nothing runs.
@@ -360,8 +361,8 @@ async fn execute_bash_sanitizes_real_ansi_and_cr_from_a_live_child() {
     let bash_msg = msgs
         .iter()
         .find_map(|m| match m {
-            cyrup_agent::AgentMessage::Custom { kind, payload, .. } if kind == "bashExecution" => {
-                Some(payload.clone())
+            cyrup_agent::AgentMessage::App { role: cyrup_agent::AppRole::BashExecution, payload, .. } => {
+                Some(serde_json::Value::Object(payload.clone()))
             }
             _ => None,
         })
@@ -398,8 +399,8 @@ async fn execute_bash_applies_shell_command_prefix_setting() {
     let bash_msg = msgs
         .iter()
         .find_map(|m| match m {
-            cyrup_agent::AgentMessage::Custom { kind, payload, .. } if kind == "bashExecution" => {
-                Some(payload.clone())
+            cyrup_agent::AgentMessage::App { role: cyrup_agent::AppRole::BashExecution, payload, .. } => {
+                Some(serde_json::Value::Object(payload.clone()))
             }
             _ => None,
         })
@@ -527,8 +528,8 @@ async fn execute_bash_truncates_and_spills_large_real_output() {
     let bash_msg = msgs
         .iter()
         .find_map(|m| match m {
-            cyrup_agent::AgentMessage::Custom { kind, payload, .. } if kind == "bashExecution" => {
-                Some(payload.clone())
+            cyrup_agent::AgentMessage::App { role: cyrup_agent::AppRole::BashExecution, payload, .. } => {
+                Some(serde_json::Value::Object(payload.clone()))
             }
             _ => None,
         })

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use crate::event::HostEvent;
 use cyrup_agent::AgentMessage;
-use cyrup_core::{Content, Message};
+use cyrup_core::{Content, Message, TerminateHint};
 use serde_json::Value;
 
 /// What a single handler contributes (arch-08 §3.3).
@@ -26,9 +26,11 @@ pub enum HookOutcome {
         /// rule lives in the agent, not here, so a single blocking handler setting this does NOT
         /// end the run on its own.
         ///
-        /// `false` is pi's `undefined`/`false`. Ignored on every non-`tool_call` seam, exactly as
-        /// upstream ignores it (no other `*EventResult` declares the field).
-        terminate: bool,
+        /// [`TerminateHint::Unspecified`] is pi's `undefined`. Ignored on every non-`tool_call`
+        /// seam, exactly as upstream ignores it (no other `*EventResult` declares the field). A
+        /// guest's WIT `bool` arrives through [`TerminateHint::from_guest_bool`]: `false` is
+        /// "nothing said", never an explicit `Continue`.
+        terminate: TerminateHint,
     },
     /// `[mutate]` — a typed patch applied to the in-flight value.
     Mutate(EventPatch),
@@ -54,6 +56,12 @@ pub enum EventPatch {
         details: Option<Value>,
         is_error: Option<bool>,
         usage: Option<cyrup_core::Usage>,
+        /// pi `ToolResultEventResult.terminate` folded by `afterResult.terminate ?? result.terminate`
+        /// (agent-loop.ts:739): `None` = the key was absent from the patch and the tool's own hint
+        /// stands; `Some(hint)` replaces it. Decoded from the guest's JSON patch, so a present
+        /// `false` IS [`TerminateHint::Continue`]. Additive: a guest that never sends the key
+        /// changes nothing.
+        terminate: Option<TerminateHint>,
     },
     /// `context`: filter/replace the message list.
     Context { messages: Vec<Arc<AgentMessage>> },
@@ -94,8 +102,8 @@ impl HostEvent {
         match (self, patch) {
             (HostEvent::ToolCall { input, .. }, EventPatch::ToolInput(v)) => *input = v,
             (
-                HostEvent::ToolResult { content, details, is_error, usage, .. },
-                EventPatch::ToolResult { content: c, details: d, is_error: e, usage: u },
+                HostEvent::ToolResult { content, details, is_error, usage, terminate, .. },
+                EventPatch::ToolResult { content: c, details: d, is_error: e, usage: u, terminate: t },
             ) => {
                 if let Some(c) = c {
                     *content = c;
@@ -110,6 +118,10 @@ impl HostEvent {
                 // current value, a present one REPLACES it in full (no deep merge, types.ts:70-78).
                 if u.is_some() {
                     *usage = u;
+                }
+                // Replace-not-merge, same shape as `is_error`: an omitted key keeps the tool's hint.
+                if let Some(t) = t {
+                    *terminate = t;
                 }
             }
             (HostEvent::Context { messages }, EventPatch::Context { messages: m }) => *messages = m,
@@ -193,7 +205,7 @@ pub enum Reduced {
     Pass(Box<HostEvent>),
     /// First `Block` wins; carries the reason, the blocking extension id, and (on `tool_call`
     /// only) pi's `ToolCallEventResult.terminate` hint — see [`HookOutcome::Block::terminate`].
-    Blocked { reason: Option<String>, terminate: bool, by: cyrup_core::ExtensionId },
+    Blocked { reason: Option<String>, terminate: TerminateHint, by: cyrup_core::ExtensionId },
     /// An extension fully serviced the action.
     Handled(HandledValue),
 }

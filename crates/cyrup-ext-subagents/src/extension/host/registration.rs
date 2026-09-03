@@ -78,7 +78,7 @@ const PROJECT_SUBDIR: &str = ".cyrup";
 
 /// Truthy-env test, identical to the two sibling companions' own `env_truthy`
 /// (`cyrup_intercom` / `cyrup_permission_system`): `1`/`true`/`on`/`yes` (trimmed) are truthy.
-/// [`env_truthy`] over an injected lookup.
+/// `env_truthy` over an injected lookup.
 fn env_truthy_with(get: &dyn Fn(&str) -> Option<String>, name: &str) -> bool {
     matches!(
         get(name).as_deref().map(str::trim),

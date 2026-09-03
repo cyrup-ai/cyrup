@@ -137,7 +137,6 @@ impl Tool for WriteTool {
             // Pi declares `ToolDefinition<…, undefined>` and returns `details: undefined`
             // (write.ts:223) — it never emits write details. Mirror that with `None`.
             details: None,
-            terminate: false,
             ..Default::default()
         })
     }

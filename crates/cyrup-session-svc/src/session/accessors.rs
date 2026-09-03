@@ -41,7 +41,15 @@ impl AgentSession {
         self.model_fallback_message.as_deref()
     }
 
-    /// Whether a run is currently streaming.
+    /// Whether the AGENT's run is in flight — its run latch, released the moment each individual
+    /// run settles. [CYRUP-DELTA] pi's `get isStreaming()` (agent-session.ts:900-901) returns the
+    /// SESSION latch `_isAgentRunActive`, which also spans the post-run driver loop; that predicate
+    /// is [`Self::is_run_active`], and every routing decision pi makes on its getter uses it. This
+    /// accessor keeps the narrower agent latch because cyrup has ONE session signal where pi has
+    /// two: `driver_tx` is both the run-active latch and the idle latch, so it must drop AFTER
+    /// `fanout.end_run()` (or a `prompt` issued from `wait_for_idle` would register a run-scoped
+    /// stream the previous run's `end_run` then clears) — and SDK / embedding callers assert
+    /// idleness the instant the run-scoped stream ends (`session/run.rs`).
     pub async fn is_streaming(&self) -> bool {
         self.agent.snapshot().await.is_streaming
     }

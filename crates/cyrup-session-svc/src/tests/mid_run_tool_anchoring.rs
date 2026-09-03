@@ -26,7 +26,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use cyrup_core::{CancelToken, Content, StopReason, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
+use cyrup_core::{
+    TerminateHint,CancelToken, Content, StopReason, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use cyrup_provider::faux::{
     faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
 };
@@ -496,7 +497,7 @@ impl cyrup_ext::NativeExtension for DenyByName {
     ) -> cyrup_ext::HookOutcome {
         match ev {
             cyrup_ext::HostEvent::ToolCall { name, .. } if name == self.0 => {
-                cyrup_ext::HookOutcome::Block { reason: Some(format!("{name} denied by extension")), terminate: false }
+                cyrup_ext::HookOutcome::Block { reason: Some(format!("{name} denied by extension")), terminate: TerminateHint::Unspecified }
             }
             _ => cyrup_ext::HookOutcome::Noop,
         }

@@ -70,6 +70,9 @@ pub use handle::Session;
 // is the built-in proxy transport; `ApiKeyResolver` is dynamic per-request key resolution. The
 // override closures transform the discovered [`SkillPointer`]/[`ContextFile`] sets. ----
 pub use cyrup_agent::{stream_proxy, ApiKeyResolver, ProxyStreamFn, ProxyStreamOptions, StreamFn};
+/// Re-exported by name so an SDK user can match the transcript `handle.agent_messages()` returns
+/// without reaching through the `agent` module alias.
+pub use cyrup_agent::{AgentMessage, AppRole};
 pub use cyrup_session_svc::{ContextFile, ContextScope, SkillPointer};
 
 // ---- load-bearing seam types, re-exported so embedders depend only on this crate ----

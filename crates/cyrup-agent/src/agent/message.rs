@@ -3,6 +3,7 @@
 
 use super::util::now_millis;
 use cyrup_core::{
+    TerminateHint,
     ApiId, AssistantMessage, Content, ModelRef, ProviderId, StopReason, ToolCall, ToolUpdate, Usage,
     UNRESOLVED_API,
 };
@@ -76,7 +77,7 @@ pub(super) fn result_value_of(
     details: &Option<Value>,
     usage: Option<&Usage>,
     added_tool_names: &[String],
-    terminate: Option<bool>,
+    terminate: TerminateHint,
 ) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("content".to_string(), serde_json::to_value(content).unwrap_or(Value::Null));
@@ -92,7 +93,7 @@ pub(super) fn result_value_of(
             serde_json::to_value(added_tool_names).unwrap_or(Value::Null),
         );
     }
-    if let Some(t) = terminate {
+    if let Some(t) = terminate.wire() {
         obj.insert("terminate".to_string(), Value::Bool(t));
     }
     Value::Object(obj)
@@ -108,7 +109,7 @@ pub(super) fn update_value(u: &ToolUpdate) -> Value {
     if let Some(d) = &u.details {
         obj.insert("details".to_string(), d.clone());
     }
-    if let Some(t) = u.terminate {
+    if let Some(t) = u.terminate.wire() {
         obj.insert("terminate".to_string(), Value::Bool(t));
     }
     Value::Object(obj)

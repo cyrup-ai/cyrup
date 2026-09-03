@@ -8,10 +8,10 @@ use crate::contract::Reduced;
 use crate::dispatch::Dispatcher;
 use crate::event::HostEvent;
 use cyrup_agent::{
-    AfterOverride, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall, Hooks,
+    AfterOutcome, AfterOverride, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall, Hooks,
 };
 use cyrup_agent::HookError;
-use cyrup_core::CancelToken;
+use cyrup_core::{CancelToken, TerminateHint};
 use std::sync::Arc;
 
 /// The mutating hooks adapter handed to the agent (arch-08 §3.1). Shares the dispatcher with
@@ -34,7 +34,7 @@ impl Hooks for ExtHooks {
         &self,
         ctx: BeforeToolCall<'_>,
         cancel: CancelToken,
-    ) -> Result<BeforeOutcome, HookError> {
+    ) -> BeforeOutcome {
         let ev = HostEvent::ToolCall {
             call_id: ctx.tool_call_id.clone(),
             name: ctx.tool_name.to_string(),
@@ -45,25 +45,25 @@ impl Hooks for ExtHooks {
             // handed to nobody else (`self.cancel.child()`, cyrup-agent/src/agent.rs:1009), so it
             // can only be cancelled by the run root — a cancelled token here means the USER
             // aborted, not that the extension declined. Returning `Proceed` does NOT run the tool:
-            // the agent re-checks the root immediately (`Ok(BeforeOutcome::Proceed) => if
-            // self.cancel.is_cancelled()`, agent.rs:1026-1028) and produces pi's own
+            // the agent re-checks the root immediately (`BeforeOutcome::Block { .. } |
+            // BeforeOutcome::Proceed if self.cancel.is_cancelled()`, tools/preflight.rs) and produces pi's own
             // "Operation aborted" error result (packages/agent/src/agent-loop.ts:629-635
             // @v0.84.1), which is the text the transcript should show.
-            _ if cancel.is_cancelled() => Ok(BeforeOutcome::Proceed),
+            _ if cancel.is_cancelled() => BeforeOutcome::Proceed,
             // EXT-049: `terminate` rides the block through to the finalized error result, where
             // the agent's every()-rule (`shouldTerminateToolBatch`,
             // packages/agent/src/agent-loop.ts:583 @v0.84.1) decides whether the BATCH ends.
             Reduced::Blocked { reason, terminate, .. } => {
-                Ok(BeforeOutcome::Block { reason, terminate })
+                BeforeOutcome::Block { reason, terminate }
             }
             Reduced::Pass(ev) => {
                 if let HostEvent::ToolCall { input, .. } = *ev {
                     *ctx.args = input; // mutated args execute as-is, WITHOUT re-validation (R-02-022)
                 }
-                Ok(BeforeOutcome::Proceed)
+                BeforeOutcome::Proceed
             }
             // Handled (shouldn't happen) => proceed unmodified.
-            _ => Ok(BeforeOutcome::Proceed),
+            _ => BeforeOutcome::Proceed,
         }
     }
 
@@ -73,7 +73,7 @@ impl Hooks for ExtHooks {
         &self,
         ctx: AfterToolCall<'_>,
         cancel: CancelToken,
-    ) -> Result<Option<AfterOverride>, HookError> {
+    ) -> AfterOutcome {
         let orig_content = ctx.content.to_vec();
         let orig_is_error = ctx.is_error;
         let orig_details = ctx.details.cloned();
@@ -82,6 +82,7 @@ impl Hooks for ExtHooks {
         // directions (`runner.emitToolResult({..., usage: result.usage})` then
         // `usage: hookResult.usage`, agent-session.ts:490-516).
         let orig_usage = ctx.usage.cloned();
+        let orig_terminate: TerminateHint = ctx.terminate;
         let ev = HostEvent::ToolResult {
             call_id: ctx.tool_call_id.clone(),
             name: ctx.tool_name.to_string(),
@@ -91,11 +92,13 @@ impl Hooks for ExtHooks {
             details: orig_details.clone(),
             is_error: orig_is_error,
             usage: orig_usage.clone(),
+            terminate: orig_terminate,
         };
         match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
             Reduced::Pass(ev) => {
-                let HostEvent::ToolResult { content, details, is_error, usage, .. } = *ev else {
-                    return Ok(None);
+                let HostEvent::ToolResult { content, details, is_error, usage, terminate, .. } = *ev
+                else {
+                    return AfterOutcome::Keep;
                 };
                 let mut over = AfterOverride::default();
                 let mut changed = false;
@@ -119,10 +122,16 @@ impl Hooks for ExtHooks {
                     over.usage = usage;
                     changed = true;
                 }
-                Ok(if changed { Some(over) } else { None })
+                // A patched hint — including a patch to `Unspecified`, which clears it — is
+                // forwarded as `Some`; `AfterOverride::terminate == None` means "hook had no opinion".
+                if terminate != orig_terminate {
+                    over.terminate = Some(terminate);
+                    changed = true;
+                }
+                if changed { AfterOutcome::Override(over) } else { AfterOutcome::Keep }
             }
             // A block on a result is not meaningful; keep the original.
-            _ => Ok(None),
+            _ => AfterOutcome::Keep,
         }
     }
 

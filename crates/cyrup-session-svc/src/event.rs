@@ -6,7 +6,9 @@
 //! Pi's event-type names; payload fields are camelCase via the embedded agent types.
 
 use std::sync::Arc;
-use cyrup_agent::{AgentEvent, AgentMessage, ToolResultMessage};
+use cyrup_agent::{
+    AgentEvent, AgentMessage, AppRole, ToolResultMessage,
+};
 use cyrup_core::{Content, ToolCallId};
 use cyrup_provider::StreamEvent;
 use cyrup_session::compaction::CompactionReason;
@@ -420,22 +422,39 @@ pub(crate) fn raw_message_to_agent(m: &cyrup_session::agent_message::AgentMessag
     use cyrup_session::agent_message::AgentMessage as Raw;
     match m {
         Raw::Core(core) => core_message_to_agent(core),
-        Raw::Custom(c) => AgentMessage::Custom {
-            kind: c.custom_type.clone(),
-            payload: c.content.clone(),
-            // The persisted entry's `details` survives the resume / compaction re-seed round trip,
-            // so a card drawn on the live turn is drawn identically on `--resume`.
-            details: c.details.clone(),
-            timestamp: Some(c.timestamp),
+        // A `!` execution is persisted as a `custom_message` entry (`append_custom_message(
+        // "bashExecution", …)`), and pi projects that entry back as `createCustomMessage(
+        // entry.customType, …)` on resume (`session-manager.ts:396-400`) — so it arrives here as a
+        // `Raw::Custom` whose `custom_type` is one of the declaration-merged ROLES. Reconstitute its
+        // pi wire object at this one bridge (`role` + the entry's `timestamp`, exactly what the
+        // rendering side used to do at the LLM boundary) so the transcript holds it as the SAME
+        // `App` a live execution or a compaction re-seed produces. `Custom` is then only ever an
+        // extension's `customType`.
+        Raw::Custom(c) => match (AppRole::parse(&c.custom_type), &c.content) {
+            (Some(role), serde_json::Value::Object(content)) => {
+                let mut payload = content.clone();
+                payload.insert("role".to_string(), serde_json::Value::from(role.as_str()));
+                payload
+                    .entry("timestamp".to_string())
+                    .or_insert_with(|| serde_json::Value::from(c.timestamp));
+                AgentMessage::App { role, payload }
+            }
+            _ => AgentMessage::Custom {
+                kind: c.custom_type.clone(),
+                payload: c.content.clone(),
+                // The persisted entry's `details` survives the resume / compaction re-seed round
+                // trip, so a card drawn on the live turn is drawn identically on `--resume`.
+                details: c.details.clone(),
+                timestamp: Some(c.timestamp),
+            },
         },
         // `serde_json::to_value` on the raw union emits pi's exact wire object with `role` first
         // (`cyrup-session/src/agent_message.rs`'s manual `Serialize`), which is precisely what
         // `AgentMessage::App` stores. A non-object is unrepresentable for these three arms.
-        other => match serde_json::to_value(other) {
-            Ok(serde_json::Value::Object(payload)) => AgentMessage::App {
-                role: raw_role_tag(other).to_string(),
-                payload,
-            },
+        other => match (app_role_of(other), serde_json::to_value(other)) {
+            (Some(role), Ok(serde_json::Value::Object(payload))) => {
+                AgentMessage::App { role, payload }
+            }
             // Unreachable: the three arms are structs whose serializer is a map. Degrade to the
             // pre-SESS-043 behaviour (the flattened rendering) rather than lose the turn.
             _ => {
@@ -450,18 +469,19 @@ pub(crate) fn raw_message_to_agent(m: &cyrup_session::agent_message::AgentMessag
     }
 }
 
-/// The pi wire `role` tag of a raw context message (`coding-agent/src/core/messages.ts:30,47,56,63`
-/// @v0.83.0).
-fn raw_role_tag(m: &cyrup_session::agent_message::AgentMessage) -> &'static str {
+/// The app role of a raw context message, iff it is one of the three declaration-merged roles
+/// (`coding-agent/src/core/messages.ts:30,47,56,63` @v0.83.0). `None` for `user` / `assistant` /
+/// `toolResult` / `custom`, which the `Core` and `Custom` arms above have already matched and which
+/// therefore never reach the `App` construction.
+fn app_role_of(m: &cyrup_session::agent_message::AgentMessage) -> Option<AppRole> {
     use cyrup_session::agent_message::MessageRole;
     match m.role() {
-        MessageRole::User => "user",
-        MessageRole::Assistant => "assistant",
-        MessageRole::ToolResult => "toolResult",
-        MessageRole::BashExecution => "bashExecution",
-        MessageRole::Custom => "custom",
-        MessageRole::BranchSummary => "branchSummary",
-        MessageRole::CompactionSummary => "compactionSummary",
+        MessageRole::BashExecution => Some(AppRole::BashExecution),
+        MessageRole::BranchSummary => Some(AppRole::BranchSummary),
+        MessageRole::CompactionSummary => Some(AppRole::CompactionSummary),
+        MessageRole::User | MessageRole::Assistant | MessageRole::ToolResult | MessageRole::Custom => {
+            None
+        }
     }
 }
 

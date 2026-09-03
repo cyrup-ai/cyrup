@@ -2,7 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{ToolError, ToolResult};
+use cyrup_core::{
+    ToolError, ToolResult};
 
 /// The [`crate::background::watch::CompletionObserver`] that runs pi's
 /// `syncMissionFromAsyncCompletion` (`extension/index.ts:655`) for every completed background run.
@@ -384,7 +385,7 @@ mod tests {
             Ok(ToolResult {
                 content: vec![cyrup_core::Content::text("the child's answer")],
                 details: Some(serde_json::json!({"mode": "single", "runId": "r9", "results": []})),
-                terminate: true,
+                terminate: cyrup_core::TerminateHint::Terminate,
                 ..Default::default()
             }),
             Some(&binding),
@@ -402,7 +403,7 @@ mod tests {
             "{details}"
         );
         assert_eq!(details.get("runId").and_then(|v| v.as_str()), Some("r9"));
-        assert!(result.terminate, "every other ToolResult field survives too");
+        assert!(result.terminate.requested(), "every other ToolResult field survives too");
     }
 
     /// pi `:5119-5126`. An EXPLICIT mission's post-launch failure appends the warning as a NEW text
@@ -427,7 +428,7 @@ mod tests {
                     "mode": "single", "runId": "r9",
                     "results": [{"agent": "scout", "exitCode": 0}],
                 })),
-                terminate: true,
+                terminate: cyrup_core::TerminateHint::Terminate,
                 ..Default::default()
             }),
             Some(&binding),
@@ -455,7 +456,7 @@ mod tests {
             "the settled per-child results survive: {details}"
         );
         assert_eq!(details.get("missionWarning").and_then(|v| v.as_str()), Some(warning.as_str()));
-        assert!(result.terminate);
+        assert!(result.terminate.requested());
     }
 
     /// The same post-launch failure on an outcome that was ALREADY an error stays an error, with no

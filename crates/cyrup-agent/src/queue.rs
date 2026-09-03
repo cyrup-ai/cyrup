@@ -11,6 +11,24 @@ pub enum QueueMode {
     All,
 }
 
+/// The two strings pi accepts (`settings-manager.ts:101-102`, `:745-757`; the RPC arm in
+/// `cyrup-modes/src/rpc/types.rs:33-36` emits the same). Strict: anything else is `Err`. The
+/// settings boundary that wants pi's lenient fallback wraps this and says so — see
+/// `cyrup-session-svc`'s `parse_queue_mode`.
+impl std::str::FromStr for QueueMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "all" => Ok(Self::All),
+            "one-at-a-time" => Ok(Self::OneAtATime),
+            other => Err(format!(
+                "unrecognised queue mode {other:?}; expected \"all\" or \"one-at-a-time\""
+            )),
+        }
+    }
+}
+
 /// Global tool-execution preference (func-02 R-02-014). Default `Parallel`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ToolExecution {
@@ -66,7 +84,7 @@ impl PendingQueue {
     /// pi never needs this: `continue()` throws its run-active guard at `agent.ts:351-353` @v0.83.0
     /// **before** `steeringQueue.drain()` at `:361` / `followUpQueue.drain()` at `:367`, and
     /// single-threaded JS makes "check then claim" indivisible. Rust cannot: a run can be claimed
-    /// between [`Agent::is_running`](crate::Agent::is_running) and the latch CAS inside `start_run`,
+    /// between [`Agent::is_running`](crate::Agent::is_running) and the latch CAS inside `claim_and_snapshot`,
     /// so the hoisted guard is only a fast path. The restore is what actually makes the drain
     /// lossless — a rejected continuation leaves both queues exactly as pi leaves them, and the
     /// message is still delivered at the next drain point (`agent-loop.ts:259`/`:263`).
@@ -102,7 +120,7 @@ mod tests {
     }
 
     /// AGENT-020 — the restore half. `drain()` + `push_front()` must be a round trip that leaves the
-    /// queue byte-identical, so a `continue_run` whose `start_run` lost the latch race returns the
+    /// queue byte-identical, so a `continue_run` whose `claim_and_snapshot` lost the latch race returns the
     /// batch exactly where pi's guard-first ordering (`agent.ts:351-353` @v0.83.0) would have left
     /// it — head of the queue, original order, ahead of anything queued since.
     #[test]

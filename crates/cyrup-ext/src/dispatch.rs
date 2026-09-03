@@ -458,7 +458,7 @@ impl Dispatcher {
                             // a handler that returned `{block: true, terminate: true}`
                             // (types.ts:1072-1079 @v0.84.1), and a handler that trapped returned
                             // nothing at all.
-                            terminate: false,
+                            terminate: cyrup_core::TerminateHint::Unspecified,
                             by: ext.id().clone(),
                         };
                     }

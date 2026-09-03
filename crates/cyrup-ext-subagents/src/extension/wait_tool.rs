@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cyrup_core::{CancelToken, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
+use cyrup_core::{
+    TerminateHint,CancelToken, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 
 use crate::extension::executor::SubagentExecutor;
 
@@ -158,7 +159,7 @@ impl Tool for WaitTool {
             Ok(text) => Ok(ToolResult {
                 content: vec![cyrup_core::Content::text(text)],
                 details: Some(serde_json::json!({ "mode": "management" })),
-                terminate: false,
+                terminate: TerminateHint::Unspecified,
                 ..Default::default()
             }),
             Err(message) => Err(ToolError::new(message)),

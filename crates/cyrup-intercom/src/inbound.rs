@@ -238,8 +238,8 @@ pub fn send_incoming_message_at(
     let content = card.content_markdown();
     let details = serde_json::to_value(&card).ok();
     // `{ triggerTurn: true }` vs `{ deliverAs: "steer" }`. cyrup's seam takes the boolean:
-    // `AgentSession::inject_message` routes to `agent.steer(msg)` whenever `is_streaming()`
-    // regardless of the flag (`cyrup-session-svc/src/session.rs:3926-3928`), so a busy session's
+    // `AgentSession::inject_message` routes to `agent.steer(msg)` whenever `is_run_active()`
+    // regardless of the flag (`cyrup-session-svc/src/session/inject.rs`), so a busy session's
     // delivery steers exactly as upstream's `deliverAs: "steer"` does, and the flag only decides
     // whether an IDLE session spawns a run over the message.
     let trigger_turn = delivery == InboundDelivery::Trigger

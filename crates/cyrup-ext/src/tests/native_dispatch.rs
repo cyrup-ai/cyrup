@@ -6,7 +6,8 @@
 use cyrup_agent::{
     AfterToolCall, AgentContextView, AgentEvent, AgentMessage, BeforeOutcome, BeforeToolCall,
 };
-use cyrup_core::{CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult};
+use cyrup_core::{
+    TerminateHint,CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult};
 use crate::{
     CommandDescriptor, EventKind, ExtMode, ExtensionError, ExtensionHost, HookOutcome, HostConfig,
     HostCtx, HostEvent, InitApi, NativeExtension, Reduced,
@@ -98,7 +99,7 @@ async fn a08_1_event_fires_with_payload_notify() {
         .await
         .unwrap();
 
-    let sub = host.subscriber(CancelToken::new());
+    let sub = host.subscriber();
     sub.on_event(&AgentEvent::AgentStart, CancelToken::new()).await;
     sub.on_event(&AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc1".into(),
@@ -160,7 +161,7 @@ async fn a08_1b_turn_index_is_derived_and_resets_per_agent_run() {
         .await
         .unwrap();
 
-    let sub = host.subscriber(CancelToken::new());
+    let sub = host.subscriber();
 
     // Two turns, then a fresh agent run that resets the index, then one more turn. The probe is NOT
     // subscribed to agent_start, but the counter must still reset (the gate runs AFTER the counter).
@@ -216,7 +217,7 @@ impl NativeExtension for BashGate {
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         if let HostEvent::ToolCall { name, .. } = ev
             && name == "bash" {
-                return HookOutcome::Block { reason: Some("bash is not allowed".into()), terminate: false };
+                return HookOutcome::Block { reason: Some("bash is not allowed".into()), terminate: TerminateHint::Unspecified };
             }
         HookOutcome::Noop
     }
@@ -240,10 +241,10 @@ async fn a08_2_tool_call_blocks_bash_with_reason() {
         tool_call: &tc,
         context: empty_view(),
     };
-    let outcome = hooks.before_tool_call(ctx, CancelToken::new()).await.unwrap();
+    let outcome = hooks.before_tool_call(ctx, CancelToken::new()).await;
     match outcome {
         BeforeOutcome::Block { reason, .. } => assert_eq!(reason.as_deref(), Some("bash is not allowed")),
-        BeforeOutcome::Proceed => panic!("expected block"),
+        BeforeOutcome::Proceed | BeforeOutcome::Failed(_) => panic!("expected block"),
     }
 
     // A non-bash tool proceeds untouched.
@@ -259,7 +260,7 @@ async fn a08_2_tool_call_blocks_bash_with_reason() {
         context: empty_view(),
     };
     assert!(matches!(
-        hooks.before_tool_call(ctx2, CancelToken::new()).await.unwrap(),
+        hooks.before_tool_call(ctx2, CancelToken::new()).await,
         BeforeOutcome::Proceed
     ));
 }
@@ -315,7 +316,7 @@ async fn tool_call_mutate_chains_in_load_order() {
         tool_call: &tc,
         context: empty_view(),
     };
-    let out = hooks.before_tool_call(ctx, CancelToken::new()).await.unwrap();
+    let out = hooks.before_tool_call(ctx, CancelToken::new()).await;
     assert!(matches!(out, BeforeOutcome::Proceed));
     assert_eq!(args, json!({"a": "1", "b": "2"}));
 }
@@ -352,6 +353,7 @@ impl NativeExtension for ResultAppender {
                 details: None,
                 is_error: None,
                 usage: None,
+                terminate: None,
             });
         }
         HookOutcome::Noop
@@ -381,13 +383,15 @@ async fn a08_3_tool_result_patch_chains() {
         details: None,
         usage: None,
         is_error: false,
-        terminate: Some(false),
+        terminate: TerminateHint::Continue,
         assistant_message: &msg,
         tool_call: &tc,
         context: empty_view(),
     };
-    let over = hooks.after_tool_call(ctx, CancelToken::new()).await.unwrap();
-    let over = over.expect("expected override");
+    let over = match hooks.after_tool_call(ctx, CancelToken::new()).await {
+        cyrup_agent::AfterOutcome::Override(o) => o,
+        _ => panic!("expected override"),
+    };
     let new = over.content.expect("content patched");
     match &new[0] {
         Content::Text { text, .. } => assert_eq!(text, "base-A-B"),
@@ -419,7 +423,7 @@ impl Tool for FakeRead {
         Ok(ToolResult {
             content: vec![Content::text("EXTENSION-READ")],
             details: None,
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }
@@ -446,7 +450,7 @@ impl Tool for BuiltinRead {
         Ok(ToolResult {
             content: vec![Content::text("BUILTIN-READ")],
             details: None,
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }
@@ -573,7 +577,7 @@ async fn r08_034_subscription_gated_dispatch() {
     assert!(host.dispatcher().no_subscribers(EventKind::ToolExecUpdate));
     assert!(!host.dispatcher().no_subscribers(EventKind::AgentStart));
 
-    let sub = host.subscriber(CancelToken::new());
+    let sub = host.subscriber();
     // High-frequency event with no subscriber: handler not invoked.
     sub.on_event(&AgentEvent::ToolExecutionUpdate {
         tool_call_id: "tc1".into(),
@@ -630,7 +634,7 @@ async fn r08_036_panicking_handler_is_contained() {
     };
     // The panic is caught (host alive) and, on the `tool_call` seam, blocks in its own right
     // (EXT-001) — the chain does not even need to reach the later real gate.
-    let out = hooks.before_tool_call(ctx, CancelToken::new()).await.unwrap();
+    let out = hooks.before_tool_call(ctx, CancelToken::new()).await;
     assert!(matches!(out, BeforeOutcome::Block { .. }));
 }
 
@@ -791,7 +795,7 @@ impl NativeExtension for HumanGateExt {
         // Enter a sanctioned human wait: the dispatch budget is suspended while the guard is held.
         let _human_wait = ctx.begin_human_wait();
         tokio::time::sleep(self.wait).await; // a "slow human" — longer than the budget
-        HookOutcome::Block { reason: Some("human rejected".to_string()), terminate: false }
+        HookOutcome::Block { reason: Some("human rejected".to_string()), terminate: TerminateHint::Unspecified }
     }
 }
 
@@ -811,7 +815,7 @@ impl NativeExtension for SlowNoGateExt {
     }
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         tokio::time::sleep(self.wait).await;
-        HookOutcome::Block { reason: Some("should never be observed (budget-timed-out)".to_string()), terminate: false }
+        HookOutcome::Block { reason: Some("should never be observed (budget-timed-out)".to_string()), terminate: TerminateHint::Unspecified }
     }
 }
 
@@ -947,7 +951,7 @@ async fn ext002_message_end_handler_runs_once_per_finalized_message() {
     .unwrap();
 
     let cancel = CancelToken::new();
-    let sub = host.subscriber(cancel.clone());
+    let sub = host.subscriber();
     let agent_msg = AgentMessage::user_text("hello");
 
     // Seam 1 — the notify subscriber attached at builder.rs (`agent.subscribe(ext_subscriber)`).
@@ -1044,7 +1048,7 @@ async fn ext034_bus_emit_from_an_event_handler_is_delivered_without_a_manual_dra
     host.load_native(Arc::new(BusListener { seen: seen.clone() })).await.unwrap();
     host.load_native(Arc::new(BusEmitterOnEvent { bus: host.bus().clone() })).await.unwrap();
 
-    let sub = host.subscriber(CancelToken::new());
+    let sub = host.subscriber();
     sub.on_event(&AgentEvent::MessageStart { message: AgentMessage::user_text("hi") }, CancelToken::new())
         .await;
 
@@ -1078,7 +1082,7 @@ impl NativeExtension for BusEmitterOnBlock {
     }
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         self.bus.emit("demo:bus".into(), json!({"from": "gate"}));
-        HookOutcome::Block { reason: Some("denied".into()), terminate: false }
+        HookOutcome::Block { reason: Some("denied".into()), terminate: TerminateHint::Unspecified }
     }
 }
 

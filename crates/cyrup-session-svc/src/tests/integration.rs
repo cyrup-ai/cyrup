@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use cyrup_agent::AgentMessage;
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, EntryId, ExtensionId, Message, StopReason, Tool, ToolCallId, ToolError,
     ToolResult, ToolUpdateSink,
 };
@@ -96,7 +97,7 @@ impl Tool for SleeperTool {
     ) -> Result<ToolResult, ToolError> {
         cancel.cancelled().await;
         *self.cancelled.lock().unwrap() = true;
-        Ok(ToolResult { content: vec![Content::text("aborted")], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text("aborted")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 
@@ -310,12 +311,7 @@ fn role_with_toolcall(m: &AgentMessage) -> &'static str {
         AgentMessage::Custom { .. } => "custom",
         // SESS-043 — the pi role tag is carried on the variant, so this reports what pi's
         // `message.role` would.
-        AgentMessage::App { role, .. } => match role.as_str() {
-            "bashExecution" => "bashExecution",
-            "branchSummary" => "branchSummary",
-            "compactionSummary" => "compactionSummary",
-            _ => "app",
-        },
+        AgentMessage::App { role, .. } => role.as_str(),
     }
 }
 

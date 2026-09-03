@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cyrup_core::{
+    TerminateHint,
     Content, ExtensionId, StopReason, Tool, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_ext::{
@@ -288,7 +289,7 @@ impl Tool for BlockTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.gate.notified().await;
-        Ok(ToolResult { content: vec![Content::text("released")], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text("released")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 struct BlockExt {

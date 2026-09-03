@@ -15,6 +15,7 @@ use crate::{
     StreamFn, TurnUpdate,
 };
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, ModelRef, ModelThinkingLevel, StopReason, Tool, ToolCallId, ToolError,
     ToolResult, ToolUpdateSink,
 };
@@ -115,7 +116,7 @@ impl Tool for DescribedTool {
     ) -> Result<ToolResult, ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.seen.lock().unwrap() = Some(params);
-        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 
@@ -140,7 +141,7 @@ impl Tool for TerminateTool {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("bye")], details: None, terminate: true, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text("bye")], details: None, terminate: TerminateHint::Terminate, ..Default::default() })
     }
 }
 
@@ -401,7 +402,7 @@ impl Hooks for InspectHook {
         &self,
         ctx: BeforeToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<BeforeOutcome, HookError> {
+    ) -> BeforeOutcome {
         *self.saw_tool_call_name.lock().unwrap() = Some(ctx.tool_call.name.clone());
         let has_call = ctx
             .assistant_message
@@ -411,7 +412,7 @@ impl Hooks for InspectHook {
         *self.saw_assistant_has_call.lock().unwrap() = has_call;
         *self.saw_system_prompt.lock().unwrap() = Some(ctx.context.system_prompt.to_string());
         *self.saw_tool_count.lock().unwrap() = ctx.context.tools.len();
-        Ok(BeforeOutcome::Proceed)
+        BeforeOutcome::Proceed
     }
 }
 

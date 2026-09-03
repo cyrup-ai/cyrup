@@ -14,6 +14,7 @@ use crate::ops::{ExecSpec, ExitStatus, ProcOps, ShellConfig, shell_env};
 use crate::output::OutputAccumulator;
 use crate::truncate::{TruncOpts, TruncatedBy, Truncation, format_size, truncate_tail};
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
 };
 use std::path::PathBuf;
@@ -367,7 +368,7 @@ impl Tool for ShellTool {
         sink(ToolUpdate {
             content: vec![],
             details: None,
-            terminate: None,
+            terminate: TerminateHint::Unspecified,
         });
 
         // Pi's `resolveTimeoutMs` (bash.ts:85), called at the top of `ops.exec` right after the
@@ -577,7 +578,7 @@ impl Tool for ShellTool {
         sink(ToolUpdate {
             content: vec![Content::text(preview_content)],
             details: details.clone(),
-            terminate: None,
+            terminate: TerminateHint::Unspecified,
         });
 
         match status {
@@ -593,7 +594,6 @@ impl Tool for ShellTool {
                 Ok(ToolResult {
                     content: vec![Content::text(body)],
                     details,
-                    terminate: false,
                     ..Default::default()
                 })
             }
@@ -697,7 +697,7 @@ fn build_stream_update(
     ToolUpdate {
         content: vec![Content::text(preview.content)],
         details,
-        terminate: None,
+        terminate: TerminateHint::Unspecified,
     }
 }
 

@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use cyrup_agent::{Agent, AgentEvent, AgentMessage, EventSubscriber, ProviderStreamFn, StreamFn};
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, ExtensionId, ModelRef, StopReason, Tool, ToolCallId, ToolError,
     ToolResult, ToolUpdateSink,
 };
@@ -73,7 +74,7 @@ impl Tool for TripwireTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.ran.store(true, Ordering::SeqCst);
-        Ok(ToolResult { content: vec![Content::text("executed")], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text("executed")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 
@@ -254,7 +255,7 @@ impl NativeExtension for RunawayGate {
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         // No human-wait guard held ⇒ a cooperative runaway, not a sanctioned human wait (P-3).
         tokio::time::sleep(self.wait).await;
-        HookOutcome::Block { reason: Some("never observed — budget fires first".into()), terminate: false }
+        HookOutcome::Block { reason: Some("never observed — budget fires first".into()), terminate: TerminateHint::Unspecified }
     }
 }
 

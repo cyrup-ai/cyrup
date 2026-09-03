@@ -34,6 +34,8 @@ pub enum BusyEntry {
     /// [`crate::Agent::reset`] (Pi `reset`, `agent.ts:334-336` @v0.84.1 — v0.83.0's `reset()` has
     /// no guard at all, which is the drift AGENT-023 ported).
     Reset,
+    /// [`Agent::edit_transcript`](crate::Agent::edit_transcript) refused mid-run.
+    Edit,
     /// The run latch itself (Pi `runWithLifecycle`, `agent.ts:472-474` @v0.83.0, `:487-489`).
     /// In pi this is unreachable from `prompt`/`continue` because their own guards fire first on a
     /// single thread; in cyrup it is the residual check-then-claim race those guards cannot close.
@@ -54,6 +56,9 @@ impl std::fmt::Display for BusyEntry {
             Self::Reset => "Agent is already processing. Wait for completion before resetting.",
             // agent.ts:473 @v0.83.0 / :488 @v0.84.1.
             Self::Run => "Agent is already processing.",
+            // [CYRUP-DELTA] no pi counterpart — pi edits `this.agent.state.messages` directly from
+            // the session; cyrup's atomic edit is refused mid-run in the same family of texts.
+            Self::Edit => "Agent is already processing. Wait for completion before editing the transcript.",
         })
     }
 }
@@ -97,6 +102,15 @@ pub enum AgentError {
     /// One string on all three of pi's sites (`agent.ts:373` @v0.83.0, `agent-loop.ts:75`, `:132`).
     #[error("Cannot continue from message role: assistant")]
     ContinueFromAssistant,
+    /// A run was requested while the agent has no model (`StateInner.model == None`).
+    /// [CYRUP-DELTA] pi's loop config requires a `Model` (types.ts:141) and its modelless guard
+    /// lives in `AgentSession.prompt` with `formatNoModelSelectedMessage()` — which cyrup carries
+    /// verbatim as `cyrup_session_svc::SessionServiceError::NoModelSelected`, fired BEFORE this.
+    /// This variant is the second line, for paths that bypass the session (a `loop_fn` embedder,
+    /// `continue_run` from an extension control op, a test), so no run can ever stream against
+    /// an empty provider/model address.
+    #[error("No model selected. Select a model before starting a run.")]
+    NoModelSelected,
     #[error("cancelled")]
     Cancelled,
     #[error(transparent)]

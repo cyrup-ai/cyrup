@@ -264,7 +264,6 @@ impl Tool for ReadTool {
                     truncation: Some(t.info),
                 })
                 .ok(),
-                terminate: false,
                 ..Default::default()
             });
         }
@@ -321,7 +320,6 @@ impl Tool for ReadTool {
         Ok(ToolResult {
             content: vec![Content::text(out)],
             details,
-            terminate: false,
             ..Default::default()
         })
     }
@@ -457,7 +455,6 @@ impl ReadTool {
                             },
                         ],
                         details: None,
-                        terminate: false,
                         ..Default::default()
                     })
                 }
@@ -471,7 +468,6 @@ impl ReadTool {
                     Ok(ToolResult {
                         content: vec![Content::text(note)],
                         details: None,
-                        terminate: false,
                         ..Default::default()
                     })
                 }
@@ -500,7 +496,6 @@ impl ReadTool {
             Ok(ToolResult {
                 content: vec![Content::text(note)],
                 details: None,
-                terminate: false,
                 ..Default::default()
             })
         }

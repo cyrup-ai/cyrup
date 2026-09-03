@@ -39,7 +39,8 @@ pub struct ToolResult {
     /// that capability ignore it and use the normal tool list. Empty = absent on the wire.
     pub added_tool_names: Vec<String>,
     /// Hint to stop the loop after this batch (func-02 §7.7); runtime-only, never persisted.
-    pub terminate: bool,
+    /// Three-valued — see [`TerminateHint`] for what each value puts on the wire.
+    pub terminate: TerminateHint,
 }
 
 /// A streamed progress update (func-02 R-02-023). Mirrors Pi's `AgentToolResult` (the
@@ -51,9 +52,66 @@ pub struct ToolUpdate {
     pub content: Vec<Content>,
     pub details: Option<serde_json::Value>,
     /// Optional early-termination hint carried by the partial result (Pi `AgentToolResult.terminate`,
-    /// types.ts:359). `None` omits the field from the emitted update, exactly as Pi omits an
-    /// `undefined` `terminate`.
-    pub terminate: Option<bool>,
+    /// types.ts:359). [`TerminateHint::Unspecified`] omits the field from the emitted update,
+    /// exactly as Pi omits an `undefined` `terminate`.
+    pub terminate: TerminateHint,
+}
+
+/// Pi's `AgentToolResult.terminate?: boolean` (types.ts:354-368) as the three values it actually
+/// has. Replaces the four encodings that used to carry this one fact — `bool`, `Option<bool>`,
+/// `bool`, `Option<bool>` — under which pi's explicit `false` was unrepresentable. The wire key is
+/// emitted iff [`Self::wire`] is `Some`.
+///
+/// There is deliberately no `From<bool>`: an implicit `false → Continue` is exactly the ambiguity
+/// this type removes. The two named constructors say which mapping a call site means.
+///
+/// ```compile_fail
+/// // A bare bool has two possible meanings here; the type refuses to guess.
+/// let _hint: cyrup_core::TerminateHint = true.into();
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminateHint {
+    /// pi `undefined` — key ABSENT on the wire; contributes nothing to the batch fold.
+    #[default]
+    Unspecified,
+    /// pi `true` — key present as `true`; the batch terminates iff every finalized result says this.
+    Terminate,
+    /// pi explicit `false` — key PRESENT as `false`. Representable now; was not before.
+    Continue,
+}
+
+impl TerminateHint {
+    /// Whether this result votes to end the loop after the current batch.
+    pub const fn requested(self) -> bool {
+        matches!(self, Self::Terminate)
+    }
+
+    /// What goes on the wire: `None` = omit the key, `Some(b)` = emit `terminate: b`.
+    pub const fn wire(self) -> Option<bool> {
+        match self {
+            Self::Unspecified => None,
+            Self::Terminate => Some(true),
+            Self::Continue => Some(false),
+        }
+    }
+
+    /// The ONLY sanctioned `bool` → hint mapping, for the WASM host-side conversions of the WIT
+    /// `tool-output.terminate` and `block-result.terminate` records: a guest `false` is "nothing
+    /// said", never an explicit [`Self::Continue`], so the wire it produces (key absent) is
+    /// byte-identical to before this type existed.
+    pub const fn from_guest_bool(b: bool) -> Self {
+        if b { Self::Terminate } else { Self::Unspecified }
+    }
+
+    /// A JSON `Option<bool>` (a tool-update chunk, a guest patch) maps 1:1 — here `Some(false)`
+    /// IS [`Self::Continue`], because JSON can distinguish an absent key from a present `false`.
+    pub const fn from_wire(o: Option<bool>) -> Self {
+        match o {
+            None => Self::Unspecified,
+            Some(true) => Self::Terminate,
+            Some(false) => Self::Continue,
+        }
+    }
 }
 
 /// Sink the runtime hands to a tool to stream progress. The runtime ignores updates after the
@@ -342,5 +400,51 @@ mod tests {
             }
             other => panic!("expected a grammar config, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod terminate_hint_tests {
+    use super::TerminateHint;
+
+    const ALL: [TerminateHint; 3] =
+        [TerminateHint::Unspecified, TerminateHint::Terminate, TerminateHint::Continue];
+
+    /// The wire table is the whole point of the type: `Unspecified` puts NO key on the wire,
+    /// `Terminate` an explicit `true`, `Continue` an explicit `false`.
+    #[test]
+    fn wire_table() {
+        assert_eq!(TerminateHint::Unspecified.wire(), None);
+        assert_eq!(TerminateHint::Terminate.wire(), Some(true));
+        assert_eq!(TerminateHint::Continue.wire(), Some(false));
+    }
+
+    /// `from_wire` is the exact inverse of `wire` on all three values — a JSON `Option<bool>`
+    /// round-trips losslessly, which is what makes pi's explicit `false` representable.
+    #[test]
+    fn wire_round_trips_through_from_wire() {
+        for hint in ALL {
+            assert_eq!(TerminateHint::from_wire(hint.wire()), hint, "{hint:?}");
+        }
+        assert_eq!(TerminateHint::from_wire(Some(false)), TerminateHint::Continue);
+    }
+
+    /// The WIT `bool` mapping is NOT the wire mapping: a guest `false` is "nothing said", so the
+    /// key stays absent exactly as it did before the type existed.
+    #[test]
+    fn guest_bool_false_is_unspecified_not_continue() {
+        assert_eq!(TerminateHint::from_guest_bool(false), TerminateHint::Unspecified);
+        assert_eq!(TerminateHint::from_guest_bool(true), TerminateHint::Terminate);
+        assert_eq!(TerminateHint::from_guest_bool(false).wire(), None);
+    }
+
+    /// Only an explicit `Terminate` votes to end the batch; both other values are a "no" vote.
+    #[test]
+    fn only_terminate_is_requested() {
+        assert!(TerminateHint::Terminate.requested());
+        assert!(!TerminateHint::Continue.requested());
+        assert!(!TerminateHint::Unspecified.requested());
+        assert_eq!(TerminateHint::default(), TerminateHint::Unspecified);
     }
 }
