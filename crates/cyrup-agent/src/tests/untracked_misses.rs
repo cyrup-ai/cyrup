@@ -19,6 +19,7 @@ use crate::{
     StreamFn, TurnUpdate,
 };
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, EventStream, Message, ModelRef, StopReason, Tool, ToolCallId, ToolError,
     ToolResult, ToolUpdate, ToolUpdateSink,
 };
@@ -401,14 +402,14 @@ impl Tool for UpdatingTool {
         on_update(ToolUpdate {
             content: vec![Content::text("step")],
             details: Some(json!({ "k": 1 })),
-            terminate: Some(true),
+            terminate: TerminateHint::Terminate,
         });
         on_update(ToolUpdate {
             content: vec![Content::text("more")],
             details: None,
-            terminate: None,
+            terminate: TerminateHint::Unspecified,
         });
-        Ok(ToolResult { content: vec![Content::text("done")], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text("done")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 

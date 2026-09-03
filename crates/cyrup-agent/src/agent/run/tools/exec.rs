@@ -2,12 +2,12 @@
 //! while events stay in source order, and the sequential runtime that fully processes each call
 //! before starting the next.
 
-use super::{Batch, Finalized, Prep, ToolRuntimeMsg};
+use super::{Batch, Finalized, Prep, PreparedCall, ToolRuntimeMsg};
 use crate::agent::message::update_value;
 use crate::agent::run::{RunCtx, RunFailure};
 use crate::agent::util::panic_message;
 use crate::event::{AgentEvent, AgentMessage};
-use cyrup_core::{AssistantMessage, Tool, ToolCall, ToolCallId, ToolError, ToolUpdate, ToolUpdateSink};
+use cyrup_core::{AssistantMessage, ToolCall, ToolError, ToolUpdate, ToolUpdateSink};
 use futures::future::FutureExt;
 use serde_json::Value;
 use std::future::{poll_fn, Future};
@@ -46,16 +46,7 @@ impl RunCtx {
         // overflow from the UI and the transcript.
         let (tx, mut rx) = mpsc::unbounded_channel::<ToolRuntimeMsg>();
         let mut joinset: JoinSet<()> = JoinSet::new();
-        /// One prepared-but-not-yet-started call — the Rust analogue of Pi's deferred
-        /// `finalizedCalls.push(async () => …)` closure.
-        struct Deferred {
-            source_index: usize,
-            tool: Arc<dyn Tool>,
-            args: Value,
-            call_id: ToolCallId,
-            tool_name: String,
-        }
-        let mut deferred: Vec<Deferred> = Vec::new();
+        let mut deferred: Vec<PreparedCall> = Vec::new();
 
         for (idx, call) in calls.iter().enumerate() {
             self.emit(AgentEvent::ToolExecutionStart {
@@ -64,31 +55,17 @@ impl RunCtx {
                 args: Value::Object((*call.arguments).clone()),
             })
             .await?;
-            match self.prepare(assistant, ctx_messages, call).await {
+            match self.prepare(assistant, ctx_messages, call, idx).await {
                 Prep::Immediate(fin) => {
-                    let mut fin = *fin;
-                    fin.source_index = idx;
-                    self.emit(AgentEvent::ToolExecutionEnd {
-                        tool_call_id: fin.tool_call_id.clone(),
-                        tool_name: fin.tool_name.clone(),
-                        result: fin.result_value.clone(),
-                        is_error: fin.is_error,
-                    })
-                    .await?;
+                    self.emit(fin.end_event()).await?;
                     if let Some(slot) = finalized.get_mut(idx) {
-                        *slot = Some(fin);
+                        *slot = Some(*fin);
                     }
                 }
                 // Prepared only — the body is NOT started here. Pi defers it to the
                 // post-loop `Promise.all` so a later call's `before_tool_call` cannot
                 // still be open while this one runs.
-                Prep::Ready { tool, args } => deferred.push(Deferred {
-                    source_index: idx,
-                    tool,
-                    args,
-                    call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                }),
+                Prep::Ready(prepared) => deferred.push(prepared),
             }
             if self.cancel.is_cancelled() {
                 break;
@@ -104,7 +81,7 @@ impl RunCtx {
         // driven to its first suspension point — which for `write`/`edit` is inside
         // `FileMutationLocks::guard`, so the mutation registrations line up in source order.
         let mut prev_started: Option<oneshot::Receiver<()>> = None;
-        for Deferred { source_index, tool, args, call_id, tool_name } in deferred {
+        for PreparedCall { source_index, tool, args, call_id, tool_name } in deferred {
             let accepting = Arc::new(AtomicBool::new(true));
             let acc2 = accepting.clone();
             let utx = tx.clone();
@@ -216,14 +193,8 @@ impl RunCtx {
                         });
                     let fin =
                         self.finalize(assistant, ctx_messages, &call, source_index, args, outcome).await;
-                    self.emit(AgentEvent::ToolExecutionEnd {
-                        tool_call_id: call_id,
-                        tool_name,
-                        result: fin.result_value.clone(),
-                        is_error: fin.is_error,
-                    })
-                    .await?;
-                    if let Some(slot) = finalized.get_mut(source_index) {
+                    self.emit(fin.end_event()).await?;
+                    if let Some(slot) = finalized.get_mut(fin.source_index()) {
                         *slot = Some(fin);
                     }
                     remaining -= 1;
@@ -242,13 +213,14 @@ impl RunCtx {
         // over its `produced` counter).
         let present: Vec<Finalized> = finalized.into_iter().flatten().collect();
         let all_terminate =
-            !present.is_empty() && present.iter().all(|f| f.terminate == Some(true));
+            !present.is_empty() && present.iter().all(|f| f.terminate().requested());
         let mut tool_results = Vec::new();
         for fin in present {
-            let msg = AgentMessage::ToolResult(fin.message.clone());
+            let message = fin.into_message();
+            let msg = AgentMessage::ToolResult(message.clone());
             self.emit(AgentEvent::MessageStart { message: msg.clone() }).await?;
             self.emit(AgentEvent::MessageEnd { message: msg }).await?;
-            tool_results.push(fin.message);
+            tool_results.push(message);
         }
         Ok(Batch { messages: tool_results, terminate: all_terminate })
     }
@@ -272,13 +244,9 @@ impl RunCtx {
             })
             .await?;
 
-            let fin = match self.prepare(assistant, ctx_messages, call).await {
-                Prep::Immediate(fin) => {
-                    let mut fin = *fin;
-                    fin.source_index = idx;
-                    fin
-                }
-                Prep::Ready { tool, args } => {
+            let fin = match self.prepare(assistant, ctx_messages, call, idx).await {
+                Prep::Immediate(fin) => *fin,
+                Prep::Ready(PreparedCall { source_index, tool, args, .. }) => {
                     // AGENT-003 — UNBOUNDED, same reasoning as the parallel path: pi's only drop
                     // rule is `acceptingUpdates` (`agent-loop.ts:672`/`:680` @v0.83.0).
                     let (utx, mut urx) = mpsc::unbounded_channel::<ToolUpdate>();
@@ -344,24 +312,19 @@ impl RunCtx {
                         })
                         .await?;
                     }
-                    self.finalize(assistant, ctx_messages, call, idx, args, outcome).await
+                    self.finalize(assistant, ctx_messages, call, source_index, args, outcome).await
                 }
             };
 
-            self.emit(AgentEvent::ToolExecutionEnd {
-                tool_call_id: fin.tool_call_id.clone(),
-                tool_name: fin.tool_name.clone(),
-                result: fin.result_value.clone(),
-                is_error: fin.is_error,
-            })
-            .await?;
-            if fin.terminate != Some(true) {
+            self.emit(fin.end_event()).await?;
+            if !fin.terminate().requested() {
                 all_terminate = false;
             }
-            let msg = AgentMessage::ToolResult(fin.message.clone());
+            let message = fin.into_message();
+            let msg = AgentMessage::ToolResult(message.clone());
             self.emit(AgentEvent::MessageStart { message: msg.clone() }).await?;
             self.emit(AgentEvent::MessageEnd { message: msg }).await?;
-            tool_results.push(fin.message);
+            tool_results.push(message);
             produced += 1;
 
             if self.cancel.is_cancelled() {

@@ -20,4 +20,5 @@ mod round2_parity;
 mod settlement_latch;
 mod tool_result_model;
 mod turn_tool_refresh;
+mod type_driven_core;
 mod untracked_misses;

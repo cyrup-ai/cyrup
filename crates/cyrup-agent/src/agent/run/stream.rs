@@ -3,11 +3,11 @@
 //! complete.
 
 use std::sync::Arc;
+use super::assistant_stream::{AssistantStream, Step};
 use super::{RunCtx, RunFailure};
-use crate::agent::message::{empty_assistant, errored_assistant};
 use crate::event::{AgentEvent, AgentMessage};
-use cyrup_core::{AssistantMessage, StopReason};
-use cyrup_provider::{Context, StreamEvent, StreamOptions};
+use cyrup_core::AssistantMessage;
+use cyrup_provider::{Context, StreamOptions};
 use futures::StreamExt;
 
 impl RunCtx {
@@ -26,7 +26,7 @@ impl RunCtx {
     /// hardcode `StopReason::Error` here and let `run_loop` fall through to the ordinary
     /// `Error|Aborted` branch, which emitted `agent_end` carrying the WHOLE run accumulator and
     /// never reported `aborted`.
-    pub(super) async fn stream_assistant(&mut self) -> Result<AssistantMessage, RunFailure> {
+    pub(super) async fn stream_assistant(&mut self) -> Result<Arc<AssistantMessage>, RunFailure> {
         // The running baseline. `prepare_next_turn` overrides are STICKY: a returned
         // model/reasoning/context override is folded into the run's baseline (`self.model`,
         // `self.thinking_level`, and the live `state.messages`) in `run_loop`, so it persists for
@@ -140,113 +140,45 @@ impl RunCtx {
 
         let mut stream = self.stream_fn.stream(&model, &ctx, &opts);
         let cancel_tok = self.cancel.token();
-        let mut started = false;
-        // The structured partial assistant message, kept in lockstep with the provider's per-event
-        // `partial` snapshot (Pi `event.partial`, agent-loop.ts:313-340): distinct text / thinking /
-        // toolCall content blocks (with signatures) and streaming tool-call args — NOT a single
-        // collapsed text block. The provider exposes this via `StreamEvent::partial()` (stream.rs).
-        // The running partial is held as a SHARED handle: refreshing it from each event, and
-        // re-emitting it on `message_update`, were three deep copies of the whole message per
-        // delta (PERF-001).
-        let mut partial = Arc::new(empty_assistant(&model));
-        let mut final_msg: Option<AssistantMessage> = None;
+        let mut acc = AssistantStream::new(&model);
 
-        'consume: loop {
+        let settled = 'consume: loop {
             tokio::select! {
                 biased;
-                _ = cancel_tok.cancelled() => {
-                    if !started {
-                        self.emit(AgentEvent::MessageStart {
-                            message: AgentMessage::Assistant(partial.clone()),
-                        })
-                        .await?;
-                    }
-                    // Pi returns the stream's own `result()` terminal on abort (agent-loop.ts:344),
-                    // which carries the ACCUMULATED partial content with `stopReason:"aborted"` — NOT
-                    // a fresh empty message. Reuse the structured partial we have been tracking and
-                    // only stamp the terminal reason, so a subscriber/transcript sees the streamed
-                    // text/thinking/tool-call blocks rather than `[]`. The terminal's `errorMessage`
-                    // is Pi's uniform abort string `"Request was aborted"` — every provider throws
-                    // `new Error("Request was aborted")` on `signal.aborted` and the catch sets
-                    // `output.errorMessage = error.message` (anthropic-messages.ts:718,733-734; the
-                    // faux provider's `createAbortedMessage` uses the same string, faux.ts:291-297) —
-                    // NOT the bare `"aborted"`.
-                    let mut aborted = (*partial).clone();
-                    aborted.stop_reason = StopReason::Aborted;
-                    aborted.error_message = Some("Request was aborted".to_string());
-                    self.emit(AgentEvent::MessageEnd {
-                        message: AgentMessage::Assistant(Arc::new(aborted.clone())),
-                    })
-                    .await?;
-                    return Ok(aborted);
-                }
+                _ = cancel_tok.cancelled() => break 'consume acc.settle_aborted(),
                 ev = stream.next() => {
-                    let e = match ev {
-                        None => break,
-                        Some(e) => e,
-                    };
-                    // Refresh the structured partial from the event's own snapshot for every
-                    // non-terminal event (Pi assigns `partialMessage = event.partial`).
-                    if let Some(p) = e.partial() {
-                        partial = p.clone();
-                    }
-                    match &e {
-                        StreamEvent::Start { .. } => {
-                            started = true;
-                            self.emit(AgentEvent::MessageStart {
-                                message: AgentMessage::Assistant(partial.clone()),
+                    let Some(e) = ev else { break 'consume acc.settle_eof() };
+                    match acc.on_event(e) {
+                        Step::Start(partial) => self.emit_assistant_start(partial).await?,
+                        Step::Update { partial, event } => {
+                            self.emit(AgentEvent::MessageUpdate {
+                                message: AgentMessage::Assistant(partial),
+                                assistant_message_event: Box::new(event),
                             })
                             .await?;
                         }
-                        // Pi RETURNS from `streamAssistantResponse` immediately on the `done`/`error`
-                        // terminal (agent-loop.ts:342-355): it stops consuming the stream right here.
-                        // Break out of the consume loop so a (non-conforming) post-terminal event can
-                        // neither emit a stray `message_update` nor overwrite the final `partial`.
-                        StreamEvent::Done { message, .. } => {
-                            final_msg = Some((**message).clone());
-                            break 'consume;
-                        }
-                        StreamEvent::Error { error, .. } => {
-                            final_msg = Some((**error).clone());
-                            break 'consume;
-                        }
-                        // Every other event is a content-block start/delta/end (text, thinking, OR
-                        // tool-call): re-emit the refreshed partial on `message_update` (Pi emits
-                        // `message_update` for all nine block events once the partial exists,
-                        // agent-loop.ts:319-340).
-                        _ => {
-                            if started {
-                                self.emit(AgentEvent::MessageUpdate {
-                                    message: AgentMessage::Assistant(partial.clone()),
-                                    assistant_message_event: Box::new(e.clone()),
-                                })
-                                .await?;
-                            }
-                        }
+                        Step::Terminal(terminal) => break 'consume acc.settle(terminal),
+                        Step::Ignore => {}
                     }
                 }
             }
-        }
+        };
 
-        let final_msg = final_msg.unwrap_or_else(|| {
-            errored_assistant(
-                model.provider.clone(),
-                model.model.as_str(),
-                model.api.clone(),
-                StopReason::Error,
-                "stream ended without a terminal event",
-            )
-        });
-        if !started {
-            self.emit(AgentEvent::MessageStart {
-                message: AgentMessage::Assistant(Arc::new(final_msg.clone())),
-            })
-            .await?;
+        // The one emission tail. `settled.start` is `Some` iff the stream never yielded a
+        // `Start` — the exactly-once decision is the accumulator's, not this function's.
+        if let Some(first) = settled.start {
+            self.emit_assistant_start(first).await?;
         }
         self.emit(AgentEvent::MessageEnd {
-            message: AgentMessage::Assistant(Arc::new(final_msg.clone())),
+            message: AgentMessage::Assistant(Arc::clone(&settled.end)),
         })
-            .await?;
-        Ok(final_msg)
+        .await?;
+        Ok(settled.end)
+    }
+
+    /// The one `message_start` site for an assistant message: both the [`Step::Start`] arm and
+    /// the closing tail of `stream_assistant` go through it.
+    async fn emit_assistant_start(&self, message: Arc<AssistantMessage>) -> Result<(), RunFailure> {
+        self.emit(AgentEvent::MessageStart { message: AgentMessage::Assistant(message) }).await
     }
 }

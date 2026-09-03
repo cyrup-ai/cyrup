@@ -20,7 +20,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cyrup_core::{AssistantMessage, ExtensionId, StopReason};
+use cyrup_core::{
+    TerminateHint,AssistantMessage, ExtensionId, StopReason};
 use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
 use cyrup_provider::faux::{
     faux_assistant_message, faux_assistant_message_with, faux_text, FauxConfig, FauxMessageOptions,
@@ -82,7 +83,7 @@ impl NativeExtension for CompactionVetoer {
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
             HostEvent::SessionBeforeCompact { .. } => {
-                HookOutcome::Block { reason: Some("not now".to_string()), terminate: false }
+                HookOutcome::Block { reason: Some("not now".to_string()), terminate: TerminateHint::Unspecified }
             }
             _ => HookOutcome::Noop,
         }

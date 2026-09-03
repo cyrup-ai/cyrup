@@ -576,14 +576,11 @@ impl ExtensionHost {
 
     /// The ordered-awaited, notify-only subscriber handed to the agent (R-02-012/048).
     ///
-    /// EXT-061: `_cancel` is IGNORED, and named so. pi passes the run's signal to each listener at
-    /// the emit (`await listener(event, signal)`, `packages/agent/src/agent.ts:574` @v0.83.0) and
-    /// keeps no subscriber-lifetime token; `ExtSubscriber` correspondingly holds none, and the
-    /// per-event token `EventSubscriber::on_event` receives is what every dispatched handler races
-    /// against. The parameter survives only because the sole caller lives in another crate
-    /// (`cyrup-session-svc/src/builder.rs:1373`); it can be dropped in the same change that
-    /// updates that line.
-    pub fn subscriber(&self, _cancel: CancelToken) -> Arc<dyn EventSubscriber> {
+    /// EXT-061: no cancel token is taken. pi passes the run's signal to each listener at the emit
+    /// (`await listener(event, signal)`, `packages/agent/src/agent.ts:574` @v0.83.0) and keeps no
+    /// subscriber-lifetime token; `ExtSubscriber` correspondingly holds none, and the per-event
+    /// token `EventSubscriber::on_event` receives is what every dispatched handler races against.
+    pub fn subscriber(&self) -> Arc<dyn EventSubscriber> {
         Arc::new(ExtSubscriber::new(self.dispatcher.clone()))
     }
 

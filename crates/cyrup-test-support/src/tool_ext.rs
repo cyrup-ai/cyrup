@@ -14,6 +14,7 @@
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_ext::{ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
@@ -117,7 +118,7 @@ impl Tool for SyntheticTool {
         Ok(ToolResult {
             content: vec![Content::text(self.result_text.clone())],
             details: None,
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }

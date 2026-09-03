@@ -4,7 +4,7 @@
 
 use super::message::errored_assistant;
 use super::prompt::PromptInput;
-use super::run::{EntryStart, RunCtx};
+use super::run::{PromptSource, ResumePoint, RunBaseline, RunCtx, RunEntry, RunShared};
 use super::util::{lock, panic_message};
 use super::Agent;
 use crate::error::{AgentError, BusyEntry, ContinueSurface};
@@ -59,7 +59,7 @@ pub(super) async fn emit_standalone(
 /// it: `wait_for_idle()` releases on `running_tx` going false, so any separate "is a run in flight"
 /// latch cleared AFTERWARDS opens a window in which a caller that has just been woken by this very
 /// send is told the agent is idle and is then rejected with [`AgentError::RunActive`] by
-/// [`Agent::start_run`]. That window is exactly two statements wide but a preemption between them
+/// [`Agent::claim_and_snapshot`]. That window is exactly two statements wide but a preemption between them
 /// (routine under a loaded machine) stretches it to milliseconds — long enough for a woken caller
 /// to run a full `prompt` preflight — which is how a `prompt(); wait_for_idle(); prompt()` sequence
 /// could fail non-deterministically under parallel load.
@@ -81,7 +81,6 @@ impl Drop for SettlementGuard {
     fn drop(&mut self) {
         {
             let mut st = lock(&self.state);
-            st.is_streaming = false;
             // AGENT-018 — pi resets `pendingToolCalls` in `finishRun()`
             // (`packages/agent/src/agent.ts:514-520` @v0.83.0, the clear at `:517`), called from
             // `runWithLifecycle`'s `finally` at `:491-493` — i.e. AFTER every `agent_end` listener
@@ -93,7 +92,7 @@ impl Drop for SettlementGuard {
         }
         *lock(&self.cancel_slot) = None;
         // The ONE settlement write. Everything a waiter can observe about "is a run in flight" is
-        // this channel, so the instant it reads `false` a fresh `start_run` is guaranteed to be
+        // this channel, so the instant it reads `false` a fresh `claim_and_snapshot` is guaranteed to be
         // accepted — there is no second flag left set behind it.
         let _ = self.running_tx.send(false);
         if let Some(tx) = self.result_tx.take() {
@@ -117,7 +116,6 @@ impl Agent {
         {
             let mut st = lock(&self.state);
             st.messages.clear();
-            st.is_streaming = false;
             st.streaming_message = None;
             st.pending_tool_calls.clear();
             st.error_message = None;
@@ -138,21 +136,24 @@ impl Agent {
     /// wait for completion."` — the one string in the family that tells the caller what to do
     /// instead. Pinned upstream by `packages/agent/test/agent.test.ts:508-547` @v0.83.0. As in
     /// [`Self::continue_run`], the check is a FAST PATH only: pi gets check-then-claim atomicity
-    /// from single-threaded JS, so the latch in [`Self::start_run`] stays authoritative and a run
+    /// from single-threaded JS, so the latch in [`Self::claim_and_snapshot`] stays authoritative and a run
     /// claimed between the two yields [`BusyEntry::Run`].
     pub async fn prompt(&self, input: impl Into<PromptInput>) -> Result<RunHandle, AgentError> {
         if self.is_running() {
             return Err(AgentError::RunActive(BusyEntry::Prompt));
         }
         let input = input.into();
-        self.start_run(EntryStart::Prompt(input.messages), false).await
+        let (baseline, guard, cancel) = self.claim_and_snapshot()?;
+        self.spawn_run(
+            RunEntry::Prompt { messages: input.messages, source: PromptSource::Fresh },
+            baseline,
+            guard,
+            cancel,
+        )
     }
 
-    /// Start a prompt from text plus image attachments (Pi `prompt(input, images?)`,
-    /// agent.ts:326,379-383): the images are appended to the user message content after the text.
-    ///
-    /// This is the same upstream method as [`Self::prompt`] — one overload set behind one guard —
-    /// so it carries the identical AGENT-034 fast-path check.
+    /// `prompt` with images attached to the single user message (Pi `prompt(text, images)`,
+    /// agent.ts:352).
     pub async fn prompt_with_images(
         &self,
         text: impl Into<SharedStr>,
@@ -161,77 +162,99 @@ impl Agent {
         if self.is_running() {
             return Err(AgentError::RunActive(BusyEntry::Prompt));
         }
-        self.start_run(EntryStart::Prompt(vec![PromptInput::text_with_images(text, images).into_one()]), false)
-            .await
+        let (baseline, guard, cancel) = self.claim_and_snapshot()?;
+        self.spawn_run(
+            RunEntry::Prompt {
+                messages: vec![PromptInput::text_with_images(text, images).into_one()],
+                source: PromptSource::Fresh,
+            },
+            baseline,
+            guard,
+            cancel,
+        )
     }
 
+    /// Continue the run from the current transcript WITHOUT adding a new message (Pi
+    /// `continue()`, agent.ts:374-410). If the transcript ends in an assistant message, a queued
+    /// steering message (then a queued follow-up) is drained and run as a prompt instead — pi's
+    /// order at `:381-401` — and only if neither is queued does this reject with
+    /// [`AgentError::ContinueFromAssistant`].
+    ///
+    /// Every branch runs against the SAME baseline: the latch is claimed first, then the
+    /// transcript is snapshotted, validated and run, under one lock — see
+    /// [`Self::claim_and_snapshot`]. A rejection after the claim releases the latch through the
+    /// guard's drop, and a requeue-on-failure puts a drained queue back exactly as before.
     pub async fn continue_run(&self) -> Result<RunHandle, AgentError> {
-        // AGENT-020 — pi's run-active guard is the FIRST statement of `continue()`
-        // (`packages/agent/src/agent.ts:351-353` @v0.83.0), ahead of both the "No messages to
-        // continue from" throw at `:355-358` and the two `drain()` calls at `:361`/`:367`. Ordering
-        // it that way is what makes a rejected continuation leave the queues intact. Hoist it here
-        // for the same reason — and note this is only a FAST PATH: pi gets check-then-claim
-        // atomicity from single-threaded JS, Rust does not, so a run can still be claimed between
-        // this read and the latch CAS in `start_run`. The `push_front` restores below are the half
-        // that actually makes the drains lossless.
+        // AGENT-034 — pi's own guard text for this entry point (agent.ts:376-378); a FAST PATH
+        // only, the latch claim below stays authoritative.
         if self.is_running() {
             return Err(AgentError::RunActive(BusyEntry::Continue));
         }
-        let messages = lock(&self.state).messages.clone();
-        if messages.is_empty() {
-            // AGENT-034 — `Agent.continue()` says "No messages to continue from" (agent.ts:357
-            // @v0.83.0 / :368 @v0.84.1); the low-level `agentLoopContinue` says something else
-            // entirely, which is why the variant carries the surface.
+        let (baseline, guard, cancel) = self.claim_and_snapshot()?;
+        if baseline.messages.is_empty() {
+            // `guard` drops here and releases the latch.
             return Err(AgentError::NoMessages(ContinueSurface::Agent));
         }
-        let last_is_assistant = messages.last().map(|m| m.is_assistant()).unwrap_or(false);
+        let last_is_assistant = baseline.messages.last().is_some_and(|m| m.is_assistant());
         if last_is_assistant {
-            // R-02-005: drain steering, else follow-up, treat as a fresh prompt; else error.
-            // A steering-drain continuation skips the loop's FIRST steering poll so a second queued
-            // steering message is not drained a turn too early (Pi `skipInitialSteeringPoll`,
-            // agent.ts:349-352); a follow-up-drain continuation does NOT skip (agent.ts:354-357).
+            // Pi `:381-390`: drain steering first, running it as the prompt with the loop's
+            // first steering poll skipped so the SECOND queued message lands on the next turn.
             let steering = lock(&self.steering).drain();
             if !steering.is_empty() {
-                // Restore on rejection so the drained batch is not dropped on the floor: pi's
-                // guard-first ordering leaves `steeringQueue` untouched when the continuation is
-                // refused, so the message is still delivered at the loop's next steering poll
-                // (`agent-loop.ts:259`). Clone only what the restore needs.
-                return match self.start_run(EntryStart::Prompt(steering.clone()), true).await {
-                    Ok(h) => Ok(h),
-                    Err(e) => {
-                        lock(&self.steering).push_front(steering);
-                        Err(e)
-                    }
+                let entry = RunEntry::Prompt {
+                    messages: steering.clone(),
+                    source: PromptSource::SteeringDrain,
                 };
+                return self.spawn_run(entry, baseline, guard, cancel).inspect_err(|_| {
+                    lock(&self.steering).push_front(steering);
+                });
             }
+            // Pi `:391-401`: then follow-up; with neither queued, the continuation is refused.
             let follow = lock(&self.follow_up).drain();
             if follow.is_empty() {
                 return Err(AgentError::ContinueFromAssistant);
             }
-            return match self.start_run(EntryStart::Prompt(follow.clone()), false).await {
-                Ok(h) => Ok(h),
-                Err(e) => {
-                    lock(&self.follow_up).push_front(follow);
-                    Err(e)
-                }
-            };
+            let entry =
+                RunEntry::Prompt { messages: follow.clone(), source: PromptSource::FollowUpDrain };
+            return self.spawn_run(entry, baseline, guard, cancel).inspect_err(|_| {
+                lock(&self.follow_up).push_front(follow);
+            });
         }
-        self.start_run(EntryStart::Continue, false).await
+        let proof = ResumePoint::check(&baseline.messages, ContinueSurface::Agent)?;
+        self.spawn_run(RunEntry::Continue(proof), baseline, guard, cancel)
     }
 
-    async fn start_run(
-        &self,
-        entry: EntryStart,
-        skip_initial_steering_poll: bool,
-    ) -> Result<RunHandle, AgentError> {
-        // Claim the run-in-flight latch with an atomic compare-and-set on the very channel
-        // `wait_for_idle`/`is_running` observe (Pi's `_isAgentRunActive` guard, agent.ts:398-400 —
-        // single-threaded JS gets this atomicity for free; Rust has to ask for it). `send_if_modified`
-        // runs the closure under the channel's own write lock and notifies receivers only when it
-        // returns `true`, so this both rejects a concurrent second run and publishes "running" in
-        // one indivisible step. Using a SEPARATE bool here (as this did) meant a caller woken by
-        // `SettlementGuard`'s `send(false)` could reach this guard before the guard's next statement
-        // cleared that bool, and get a spurious `RunActive`.
+    /// The handles a run shares with the agent for its whole lifetime.
+    fn shared(&self) -> RunShared {
+        RunShared {
+            state: self.state.clone(),
+            subscribers: self.subscribers.clone(),
+            steering: self.steering.clone(),
+            follow_up: self.follow_up.clone(),
+            hooks: self.hooks.clone(),
+            stream_fn: self.stream_fn.clone(),
+            key_resolver: self.key_resolver.clone(),
+            tool_execution: self.tool_execution,
+            session_id: self.session_id.clone(),
+        }
+    }
+
+    /// Claim the run latch, then — under ONE state lock — take the run-start baseline and
+    /// perform the two run-start writes. The caller validates against the very transcript the
+    /// run will use, and the returned [`SettlementGuard`] releases the latch on drop, so a
+    /// rejection after the claim unwinds exactly as a finished run would.
+    ///
+    /// The latch is an atomic compare-and-set on the very channel `wait_for_idle`/`is_running`
+    /// observe (Pi's `_isAgentRunActive` guard, agent.ts:398-400 — single-threaded JS gets this
+    /// atomicity for free; Rust has to ask for it). `send_if_modified` runs the closure under the
+    /// channel's own write lock and notifies receivers only when it returns `true`, so this both
+    /// rejects a concurrent second run and publishes "running" in one indivisible step.
+    ///
+    /// Why the claim comes FIRST: the two state writes below must never be performed by a caller
+    /// that is about to be rejected, and the snapshot must never be taken before the claim — a
+    /// `set_messages` in that gap would leave the run on a transcript that was validated but is
+    /// no longer the agent's. Claim, then read-validate-write under one lock, closes both.
+    fn claim_and_snapshot(&self) -> Result<(RunBaseline, SettlementGuard, RunCancel), AgentError> {
         let claimed = self.running_tx.send_if_modified(|running| {
             if *running {
                 false
@@ -243,102 +266,94 @@ impl Agent {
         if !claimed {
             // AGENT-034 — pi's own latch guard (`runWithLifecycle`, agent.ts:472-474 @v0.83.0)
             // carries the bare `"Agent is already processing."`; the entry-point-specific texts
-            // belong to the guards in `prompt`/`continue`/`reset`, which on a single JS thread
-            // always fire first. Here they are only a fast path, so this string is reachable —
-            // exactly on the check-then-claim race they cannot close.
+            // belong to the fast-path guards in `prompt`/`continue`/`reset`, which on a single JS
+            // thread always fire first. Here they are only a fast path, so this string is
+            // reachable — exactly on the check-then-claim race they cannot close.
             return Err(AgentError::RunActive(BusyEntry::Run));
         }
         let cancel = RunCancel::new();
         *lock(&self.cancel_slot) = Some(cancel.clone());
+        // Built here, before any state is touched, so every early `Err` below releases the latch,
+        // clears the cancel slot and releases the latch through its drop.
+        let guard = SettlementGuard {
+            state: self.state.clone(),
+            cancel_slot: self.cancel_slot.clone(),
+            running_tx: self.running_tx.clone(),
+            result_tx: None,
+            new_messages: Vec::new(),
+        };
+        let baseline = {
+            let mut st = lock(&self.state);
+            // Resolved FIRST, before the run-start write below, so a modelless agent
+            // performs no state write and — through `guard`'s drop — never holds the latch
+            // after this returns. Checked under the same lock as the snapshot (not before the
+            // claim) for the reason the claim itself comes first: a `set_model(None)` in a
+            // check-then-claim gap would otherwise start a run with no model.
+            let Some(model) = st.model.clone() else {
+                return Err(AgentError::NoModelSelected);
+            };
+            st.error_message = None;
+            // Pi `createContextSnapshot` hands the loop a `.slice()` COPY of `messages`
+            // (agent.ts:424-429); the reducer grows `state.messages` independently.
+            //
+            // `transport` is LIVE state, not a build-time constant: pi reads `this.transport`
+            // when it assembles the loop config at RUN START (`createLoopConfig`, agent.ts:442)
+            // and the `/settings` row mutates that field on the running agent
+            // (`interactive-mode.ts:4215`). Overlaying it here reproduces pi's snapshot semantics
+            // exactly: a `set_transport` between runs takes effect on the next run and never
+            // re-targets an in-flight one.
+            RunBaseline {
+                system_prompt: st.system_prompt.clone(),
+                model,
+                thinking_level: st.thinking_level,
+                gen_config: GenerationConfig { transport: st.transport, ..self.gen_config.clone() },
+                tools: st.tools.clone(),
+                messages: st.messages.clone(),
+            }
+        };
+        Ok((baseline, guard, cancel))
+    }
+
+    /// Build the run context from a claimed latch and its baseline, and spawn the run task. Reads
+    /// no agent state: everything the run needs is in `baseline`, taken under the lock that
+    /// validated it. Infallible — the `Result` exists so a caller's requeue-on-failure reads
+    /// cleanly.
+    fn spawn_run(
+        &self,
+        entry: RunEntry,
+        baseline: RunBaseline,
+        mut guard: SettlementGuard,
+        cancel: RunCancel,
+    ) -> Result<RunHandle, AgentError> {
         // A clone kept for the catch-all failure path so it can distinguish an aborted run from a
         // genuine error after `RunCtx` (which owns the run's `cancel`) has unwound (Pi
         // `handleRunFailure(error, signal.aborted)`, agent.ts:490,496-511).
         let fail_cancel = cancel.clone();
-
-        let (system_prompt, model, thinking_level, tools, messages, transport) = {
-            let mut st = lock(&self.state);
-            st.error_message = None;
-            st.is_streaming = true;
-            // Pi `createContextSnapshot` hands the loop a `.slice()` COPY of `messages`
-            // (agent.ts:424-429); the loop mutates only that copy while the agent's observable
-            // `state.messages` grows independently via the reducer on `message_end`.
-            (
-                st.system_prompt.clone(),
-                st.model.clone(),
-                st.thinking_level,
-                st.tools.clone(),
-                st.messages.clone(),
-                st.transport,
-            )
-        };
-        // `transport` is LIVE state, not a build-time constant: pi reads `this.transport` when it
-        // assembles the loop config at RUN START (`createLoopConfig`, agent.ts:442) and the
-        // `/settings` row mutates that field on the running agent (`interactive-mode.ts:4215`).
-        // Overlaying it here — rather than reading it per-turn inside the loop — reproduces pi's
-        // snapshot semantics exactly: a `set_transport` between runs takes effect on the next run
-        // and never re-targets an in-flight one.
-        let gen_config = GenerationConfig { transport, ..self.gen_config.clone() };
-
-        let mut rc = RunCtx::new(
-            self.state.clone(),
-            self.subscribers.clone(),
-            self.steering.clone(),
-            self.follow_up.clone(),
-            self.hooks.clone(),
-            self.stream_fn.clone(),
-            self.key_resolver.clone(),
-            self.tool_execution,
-            self.session_id.clone(),
-            system_prompt,
-            model,
-            thinking_level,
-            gen_config,
-            tools,
-            messages,
-            cancel,
-            skip_initial_steering_poll,
-        )
-        .with_header_fn(lock(&self.header_fn).clone());
+        let fail_model = baseline.model.clone();
+        let mut rc = RunCtx::new(self.shared(), baseline, cancel)
+            .with_header_fn(lock(&self.header_fn).clone());
 
         let (tx, rx) = oneshot::channel();
-        let state = self.state.clone();
-        let running_tx = self.running_tx.clone();
-        let cancel_slot = self.cancel_slot.clone();
-        // Independent handles for the catch-all failure path (Pi `handleRunFailure`,
-        // agent.ts:496-511): they must outlive the unwound `RunCtx`.
+        guard.result_tx = Some(tx);
+        // The failure twin below emits through the same subscribers and state the run would have.
         let fail_state = self.state.clone();
         let fail_subs = self.subscribers.clone();
 
         tokio::spawn(async move {
-            // The guard settles on scope exit no matter how this task ends (normal return OR an
-            // unwind), so `wait_for_idle()` can never deadlock (func-02 R-02-048).
-            let mut guard = SettlementGuard {
-                state,
-                cancel_slot,
-                running_tx,
-                result_tx: Some(tx),
-                new_messages: Vec::new(),
-            };
-            // Run the loop; if its task UNWINDS (an uncontained panic in a hook/executor), synthesize
-            // Pi's closing sequence — an error assistant message + `message_start/message_end/
-            // turn_end/agent_end` — so subscribers always see a complete, well-formed termination
-            // (Pi `handleRunFailure`, agent.ts:496-511), then settle with that message.
+            // `guard` settles the run on EVERY exit — normal completion, a `RunFailure` the loop
+            // converted into a terminal assistant message, or a panic caught below.
             match std::panic::AssertUnwindSafe(rc.run(entry)).catch_unwind().await {
                 Ok(new) => guard.complete(new),
                 Err(payload) => {
-                    let model = { lock(&fail_state).model.clone() };
-                    // Pi: `stopReason = aborted ? "aborted" : "error"` (agent.ts:504). An aborted run
-                    // that unwinds is reported as aborted, everything else as error.
+                    // Pi reads `this._state.model` (agent.ts:500-502); with `Option` the run's own
+                    // baseline is the fallback for a model cleared mid-run — never an empty address.
+                    let model = { lock(&fail_state).model.clone() }.unwrap_or(fail_model);
                     let aborted = fail_cancel.is_cancelled();
                     let stop_reason =
                         if aborted { StopReason::Aborted } else { StopReason::Error };
-                    // Pi: `errorMessage = error instanceof Error ? error.message : String(error)`
-                    // (agent.ts:505). Rust `catch_unwind` cannot recover an arbitrary error value,
-                    // but a `panic!`/`unwrap` payload is a `&str`/`String` we can downcast to recover
-                    // the real message; otherwise fall back to a generic string.
+                    // Pi `handleRunFailure` synthesizes an errored assistant message and emits the
+                    // full terminal sequence so no subscriber is left mid-turn.
                     let error_message = panic_message(payload.as_ref());
-                    // Pi `handleRunFailure` failure message: one empty text block + `Date.now()`
-                    // (agent.ts:497-506), NOT empty content / a zero timestamp.
                     let failure = errored_assistant(
                         model.provider.clone(),
                         model.model.as_str(),

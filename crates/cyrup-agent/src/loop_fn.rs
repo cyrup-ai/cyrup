@@ -13,7 +13,7 @@
 //! Internally both construct a [`crate::agent::RunCtx`] over the supplied context and drive the
 //! identical, already-tested loop, so behavior is bit-for-bit the same as the high-level agent.
 
-use crate::agent::{EntryStart, RunCtx};
+use crate::agent::{PromptSource, ResumePoint, RunBaseline, RunCtx, RunEntry, RunShared};
 use crate::error::{AgentError, ContinueSurface};
 use crate::event::{AgentEvent, AgentMessage};
 use crate::hooks::{DefaultHooks, Hooks};
@@ -120,11 +120,10 @@ fn build_run_ctx(
     let working_messages = messages.clone();
     let state = Arc::new(Mutex::new(StateInner {
         system_prompt: system_prompt.clone(),
-        model: config.model.clone(),
+        model: Some(config.model.clone()),
         thinking_level: config.thinking_level,
         tools: tools.clone(),
         messages,
-        is_streaming: true,
         streaming_message: None,
         pending_tool_calls: HashSet::new(),
         error_message: None,
@@ -142,25 +141,26 @@ fn build_run_ctx(
     }));
     let subscribers: Arc<Mutex<Vec<Arc<dyn EventSubscriber>>>> =
         Arc::new(Mutex::new(vec![Arc::new(SinkSubscriber(sink))]));
-    RunCtx::new(
+    let shared = RunShared {
         state,
         subscribers,
-        config.steering,
-        config.follow_up,
-        config.hooks,
+        steering: config.steering,
+        follow_up: config.follow_up,
+        hooks: config.hooks,
         stream_fn,
-        config.key_resolver,
-        config.tool_execution,
-        config.session_id,
+        key_resolver: config.key_resolver,
+        tool_execution: config.tool_execution,
+        session_id: config.session_id,
+    };
+    let baseline = RunBaseline {
         system_prompt,
-        config.model,
-        config.thinking_level,
-        config.gen_config,
+        model: config.model,
+        thinking_level: config.thinking_level,
+        gen_config: config.gen_config,
         tools,
-        working_messages,
-        cancel,
-        false,
-    )
+        messages: working_messages,
+    };
+    RunCtx::new(shared, baseline, cancel)
 }
 
 /// Run an agent loop from a NEW set of prompt messages, pushing every event to `sink` and resolving
@@ -175,7 +175,7 @@ pub async fn run_agent_loop(
     stream_fn: Arc<dyn StreamFn>,
 ) -> Vec<AgentMessage> {
     let mut rc = build_run_ctx(context, config, sink, cancel, stream_fn);
-    rc.run(EntryStart::Prompt(prompts)).await
+    rc.run(RunEntry::Prompt { messages: prompts, source: PromptSource::Fresh }).await
 }
 
 /// Continue an agent loop from the current context WITHOUT adding a new message (Pi
@@ -188,19 +188,15 @@ pub async fn run_agent_loop_continue(
     cancel: RunCancel,
     stream_fn: Arc<dyn StreamFn>,
 ) -> Result<Vec<AgentMessage>, AgentError> {
-    if context.messages.is_empty() {
-        // AGENT-034 — the low-level surface has its OWN string, distinct from
-        // `Agent::continue_run`'s: `throw new Error("Cannot continue: no messages in context")`
-        // (`agent-loop.ts:71` in `agentLoopContinue`, `:128` in `runAgentLoopContinue`, identical
-        // offsets at v0.83.0 and v0.84.1). Asserted verbatim by pi's own suite at
-        // `packages/agent/test/agent-loop.test.ts:1368-1385` @v0.83.0.
-        return Err(AgentError::NoMessages(ContinueSurface::Loop));
-    }
-    if context.messages.last().map(|m| m.is_assistant()).unwrap_or(false) {
-        return Err(AgentError::ContinueFromAssistant);
-    }
+    // AGENT-034 — the low-level surface has its OWN string, distinct from
+    // `Agent::continue_run`'s: `throw new Error("Cannot continue: no messages in context")`
+    // (`agent-loop.ts:71` in `agentLoopContinue`, `:128` in `runAgentLoopContinue`, identical
+    // offsets at v0.83.0 and v0.84.1). Asserted verbatim by pi's own suite at
+    // `packages/agent/test/agent-loop.test.ts:1368-1385` @v0.83.0. `ContinueSurface::Loop`
+    // selects that string; the rule itself has one home in `ResumePoint::check`.
+    let proof = ResumePoint::check(&context.messages, ContinueSurface::Loop)?;
     let mut rc = build_run_ctx(context, config, sink, cancel, stream_fn);
-    Ok(rc.run(EntryStart::Continue).await)
+    Ok(rc.run(RunEntry::Continue(proof)).await)
 }
 
 /// A finalizing event stream whose terminal (`agent_end`) resolves to the run's new messages — the
@@ -270,17 +266,9 @@ pub fn agent_loop_continue(
     cancel: RunCancel,
     stream_fn: Arc<dyn StreamFn>,
 ) -> Result<AgentLoopStream, AgentError> {
-    if context.messages.is_empty() {
-        // AGENT-034 — the low-level surface has its OWN string, distinct from
-        // `Agent::continue_run`'s: `throw new Error("Cannot continue: no messages in context")`
-        // (`agent-loop.ts:71` in `agentLoopContinue`, `:128` in `runAgentLoopContinue`, identical
-        // offsets at v0.83.0 and v0.84.1). Asserted verbatim by pi's own suite at
-        // `packages/agent/test/agent-loop.test.ts:1368-1385` @v0.83.0.
-        return Err(AgentError::NoMessages(ContinueSurface::Loop));
-    }
-    if context.messages.last().map(|m| m.is_assistant()).unwrap_or(false) {
-        return Err(AgentError::ContinueFromAssistant);
-    }
+    // Same rule, same string (AGENT-034), checked here so no stream is created on a context that
+    // cannot be resumed; `run_agent_loop_continue` is `pub` and re-checks for its own callers.
+    let _proof = ResumePoint::check(&context.messages, ContinueSurface::Loop)?;
     let (sink, stream) = agent_event_stream();
     let push: Arc<dyn AgentEventSink> = Arc::new(StreamPushSink { sink: sink.clone() });
     tokio::spawn(async move {

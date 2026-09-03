@@ -14,10 +14,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    AfterOverride, AfterToolCall, Agent, AgentEvent, AgentMessage, HookError,
+    AfterOutcome, AfterOverride, AfterToolCall, Agent, AgentEvent, AgentMessage, HookError,
     Hooks, ToolResultMessage,
 };
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, Cost, Message, StopReason, Tool, ToolCallId,
     ToolError, ToolResult, ToolUpdateSink, Usage,
 };
@@ -126,7 +127,7 @@ impl Tool for ReportingTool {
             details: None,
             usage: self.usage.clone(),
             added_tool_names: self.added.clone(),
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
         })
     }
 }
@@ -217,12 +218,12 @@ impl Hooks for UsagePatchHook {
         &self,
         ctx: AfterToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<Option<AfterOverride>, HookError> {
+    ) -> AfterOutcome {
         self.observed.lock().unwrap().push(ctx.usage.cloned());
-        Ok(Some(AfterOverride {
+        AfterOutcome::Override(AfterOverride {
             usage: Some(self.replacement.clone()),
             ..AfterOverride::default()
-        }))
+        })
     }
 }
 
@@ -271,11 +272,11 @@ impl Hooks for ContentOnlyHook {
         &self,
         _ctx: AfterToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<Option<AfterOverride>, HookError> {
-        Ok(Some(AfterOverride {
+    ) -> AfterOutcome {
+        AfterOutcome::Override(AfterOverride {
             content: Some(vec![Content::text("patched")]),
             ..AfterOverride::default()
-        }))
+        })
     }
 }
 
@@ -317,8 +318,8 @@ impl Hooks for ThrowingHook {
         &self,
         _ctx: AfterToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<Option<AfterOverride>, HookError> {
-        Err(HookError::new("boom"))
+    ) -> AfterOutcome {
+        AfterOutcome::Failed(HookError::new("boom"))
     }
 }
 
@@ -589,11 +590,11 @@ impl Hooks for GateLateToolHook {
         &self,
         ctx: crate::BeforeToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<crate::BeforeOutcome, HookError> {
+    ) -> crate::BeforeOutcome {
         if ctx.tool_name == "late" {
-            Ok(crate::BeforeOutcome::Block { reason: Some("denied by policy".into()), terminate: false })
+            crate::BeforeOutcome::Block { reason: Some("denied by policy".into()), terminate: TerminateHint::Unspecified }
         } else {
-            Ok(crate::BeforeOutcome::Proceed)
+            crate::BeforeOutcome::Proceed
         }
     }
 }

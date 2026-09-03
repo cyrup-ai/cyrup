@@ -48,7 +48,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use cyrup_core::{CancelToken, Content, ExecMode, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
+use cyrup_core::{
+    TerminateHint,CancelToken, Content, ExecMode, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 
 /// `NATIVE_INTERCOM_EXTENSION_DIR` (`intercom/intercom-bridge.ts:8`) — the constant the doctor report's
 /// intercom section renders in place of the old on-disk `pi-intercom` extension-directory probe.
@@ -1389,7 +1390,7 @@ fn json_result(text: String, details: serde_json::Value) -> ToolResult {
     ToolResult {
         content: vec![Content::text(text)],
         details: Some(details),
-        terminate: false,
+        terminate: TerminateHint::Unspecified,
         ..Default::default()
     }
 }

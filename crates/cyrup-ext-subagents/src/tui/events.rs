@@ -53,7 +53,8 @@
 
 use std::collections::VecDeque;
 
-use cyrup_core::{Content, ToolUpdate};
+use cyrup_core::{
+    TerminateHint,Content, ToolUpdate};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde::{Deserialize, Serialize};
@@ -664,7 +665,7 @@ impl SubagentUpdatePayload {
     #[must_use]
     pub fn into_tool_update(self, text: String) -> ToolUpdate {
         let details = serde_json::to_value(&self).ok();
-        ToolUpdate { content: vec![Content::text(text)], details, terminate: None }
+        ToolUpdate { content: vec![Content::text(text)], details, terminate: TerminateHint::Unspecified }
     }
 }
 

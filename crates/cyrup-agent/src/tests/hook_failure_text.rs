@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use crate::{
-    AfterOverride, AfterToolCall, Agent, AgentEvent, AgentMessage, BeforeOutcome, BeforeToolCall,
+    AfterOutcome, AfterToolCall, Agent, AgentEvent, AgentMessage, BeforeOutcome, BeforeToolCall,
     HookError, Hooks, ToolResultMessage,
 };
 use cyrup_core::{CancelToken, Content, Message, StopReason};
@@ -60,8 +60,8 @@ impl Hooks for FailingBefore {
         &self,
         _ctx: BeforeToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<BeforeOutcome, HookError> {
-        Err(HookError::new("policy store unreachable: /var/run/gate.sock"))
+    ) -> BeforeOutcome {
+        BeforeOutcome::Failed(HookError::new("policy store unreachable: /var/run/gate.sock"))
     }
 }
 
@@ -105,8 +105,8 @@ impl Hooks for FailingAfter {
         &self,
         _ctx: AfterToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<Option<AfterOverride>, HookError> {
-        Err(HookError::new("redaction pass failed on block 3"))
+    ) -> AfterOutcome {
+        AfterOutcome::Failed(HookError::new("redaction pass failed on block 3"))
     }
 }
 

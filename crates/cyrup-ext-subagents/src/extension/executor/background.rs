@@ -29,7 +29,7 @@ impl SubagentExecutor {
     /// Spawn one subagent task as a detached background run (func-SA §5.4; the tool's `bg: true`
     /// shape). Mints a [`RunId`], eagerly resolves fork-context (R-SA-137's eager whole-batch
     /// rule, degenerate single-task case), writes the one-shot `runner-config.json` handoff file
-    /// (R-SA-073), and spawns hop 1 via [`spawn_detached_runner`] — a genuine SECOND, detached OS
+    /// (R-SA-073), and spawns hop 1 via [`spawn_detached_runner`](crate::background::spawn_detached::spawn_detached_runner) — a genuine SECOND, detached OS
     /// process (`cyrup __subagent-runner --config <path>`) that survives this orchestrator
     /// process's own exit (R-SA-070/071, DI-SA-8). Immediately tracks the new run
     /// ([`crate::background::tracker::JobTracker::track`], R-SA-093) and returns without waiting for the run to complete
@@ -346,7 +346,7 @@ impl SubagentExecutor {
     /// shape, R-SA-129/130) as a detached background run — the general form [`crate::extension::SubagentExecutor::spawn_background`]
     /// itself is a thin single-step wrapper around. Mints a [`RunId`], writes the one-shot
     /// `runner-config.json` handoff file (R-SA-073), and spawns hop 1 via
-    /// [`spawn_detached_runner`] exactly as [`crate::extension::SubagentExecutor::spawn_background`] documents; the caller is
+    /// [`spawn_detached_runner`](crate::background::spawn_detached::spawn_detached_runner) exactly as [`crate::extension::SubagentExecutor::spawn_background`] documents; the caller is
     /// responsible for having already resolved fork-context (R-SA-137's eager whole-batch rule)
     /// and for choosing `session_file` accordingly, since a multi-step chain's fork-context
     /// resolution is a per-call-site concern (a single top-level task fork-resolves once for

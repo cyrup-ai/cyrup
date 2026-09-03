@@ -42,7 +42,7 @@ pub use message::{
 };
 pub use shared_str::SharedStr;
 pub use tool::{
-    ExecMode, Tool, ToolError, ToolRenderKind, ToolResult, ToolUpdate, ToolUpdateSink,
+    ExecMode, Tool, ToolError, ToolRenderKind, TerminateHint, ToolResult, ToolUpdate, ToolUpdateSink,
 };
 
 /// The single streaming primitive used across provider, agent, and tools (arch-00 §3.1).

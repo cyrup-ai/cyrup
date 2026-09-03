@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{Agent, AgentMessage};
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, StopReason, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
@@ -49,7 +50,7 @@ impl Tool for IntTool {
         Ok(ToolResult {
             content: vec![Content::text(format!("got:{params}"))],
             details: None,
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }

@@ -488,10 +488,10 @@ impl AgentSession {
     /// AGENT-030: this — not the agent's per-run streaming flag — is what pi's `get isStreaming()`
     /// returns (`:876-877`) and what `prompt()` consults at `:1159` to route a submission to
     /// `_queueSteer` / `_queueFollowUp` instead of starting a run. cyrup's
-    /// [`Self::is_streaming`] reads `agent.snapshot().is_streaming`, which `SettlementGuard::drop`
-    /// clears the moment each INDIVIDUAL run settles, so a prompt landing in the post-run gap (an
-    /// auto-retry, an auto-compaction, a queued continuation) started a SECOND run that raced
-    /// `drive_run`'s `continue_run()`.
+    /// [`Self::is_streaming`] reads the AGENT's run latch, which releases the moment each
+    /// INDIVIDUAL run settles, so a submission gated on it in the post-run gap (an auto-retry, an
+    /// auto-compaction, a queued continuation) would start a SECOND run that races `drive_run`'s
+    /// `continue_run()` — every routing site therefore reads this predicate.
     ///
     /// The two latches are the exact complement of [`Self::is_idle`]: `driver_tx` covers the whole
     /// post-run loop on a BOUND session, and `agent.is_running()` covers an unbound session, where

@@ -15,7 +15,7 @@ use tokio::sync::watch;
 /// Builder for [`Agent`].
 pub struct AgentBuilder {
     system_prompt: String,
-    model: ModelRef,
+    model: Option<ModelRef>,
     thinking_level: ModelThinkingLevel,
     tools: Vec<Arc<dyn Tool>>,
     messages: Vec<AgentMessage>,
@@ -31,10 +31,10 @@ pub struct AgentBuilder {
 
 impl AgentBuilder {
     #[must_use]
-    pub fn new(model: ModelRef, stream_fn: Arc<dyn StreamFn>) -> Self {
+    pub fn new(stream_fn: Arc<dyn StreamFn>) -> Self {
         Self {
             system_prompt: String::new(),
-            model,
+            model: None,
             thinking_level: ModelThinkingLevel::Off,
             tools: Vec::new(),
             messages: Vec::new(),
@@ -57,6 +57,15 @@ impl AgentBuilder {
     #[must_use]
     pub fn system_prompt(mut self, s: impl Into<String>) -> Self {
         self.system_prompt = s.into();
+        self
+    }
+
+    /// The agent's model. Absent = modelless (pi `Model | undefined`, agent-session.ts:890-892):
+    /// the agent builds and accepts state edits, and `prompt`/`continue_run` return
+    /// [`crate::AgentError::NoModelSelected`] until one is set.
+    #[must_use]
+    pub fn model(mut self, m: ModelRef) -> Self {
+        self.model = Some(m);
         self
     }
 
@@ -246,7 +255,6 @@ impl AgentBuilder {
             thinking_level: self.thinking_level,
             tools: self.tools,
             messages: self.messages,
-            is_streaming: false,
             streaming_message: None,
             pending_tool_calls: HashSet::new(),
             error_message: None,

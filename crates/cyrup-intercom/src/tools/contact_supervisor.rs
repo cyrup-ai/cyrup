@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
+use cyrup_core::{
+    TerminateHint,CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 
 use crate::identity::{ChildMessageKind, ChildOrchestratorMetadata, format_child_orchestrator_message, preferred_supervisor_target};
 use crate::session_state::SharedIntercomState;
@@ -136,7 +137,7 @@ impl ContactSupervisorTool {
                 Ok(ToolResult {
                     content: vec![Content::text(reply)],
                     details: Some(details),
-                    terminate: false,
+                    terminate: TerminateHint::Unspecified,
                     ..Default::default()
                 })
             }

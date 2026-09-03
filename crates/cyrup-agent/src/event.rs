@@ -69,20 +69,50 @@ pub enum AgentMessage {
     /// `convert_to_llm` hook, which is cyrup's `convertToLlm` (`coding-agent/src/core/sdk.ts:301`
     /// @v0.83.0) — so the payload is opaque here and never inspected.
     App {
-        /// The pi `role` discriminant: `bashExecution`, `branchSummary` or `compactionSummary`.
-        role: String,
+        /// The pi `role` discriminant — one of the three [`AppRole`]s, closed.
+        role: AppRole,
         /// The full pi wire object for the message, `role` included.
         payload: serde_json::Map<String, Value>,
     },
 }
 
-/// The three declaration-merged roles [`AgentMessage::App`] carries
+/// The three declaration-merged coding-agent roles [`AgentMessage::App`] carries
 /// (`coding-agent/src/core/messages.ts:68-77` @v0.83.0, minus `custom`, which has its own arm).
+/// Closed: an `App` with any other role is unrepresentable, and deserialization of any OTHER
+/// unknown role still fails exactly as it did before `App` existed — pi's union is closed over the
+/// merged set too, and widening the tolerance would silently swallow a malformed transcript.
 ///
-/// Deserialization of any OTHER unknown role still fails, exactly as it did before `App` existed —
-/// pi's union is closed over the merged set too, and widening the tolerance would silently swallow
-/// a genuinely malformed transcript.
-pub const APP_MESSAGE_ROLES: [&str; 3] = ["bashExecution", "branchSummary", "compactionSummary"];
+/// No `From<String>` / `From<&str>`: [`Self::parse`] is the one fallible door.
+///
+/// ```compile_fail
+/// // An arbitrary string is not a role; only `AppRole::parse` can say whether it is.
+/// let _role: cyrup_agent::AppRole = String::from("bashExecution").into();
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AppRole {
+    BashExecution,
+    BranchSummary,
+    CompactionSummary,
+}
+
+impl AppRole {
+    pub const ALL: [AppRole; 3] =
+        [AppRole::BashExecution, AppRole::BranchSummary, AppRole::CompactionSummary];
+
+    /// The pi `role` tag — the exact wire string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BashExecution => "bashExecution",
+            Self::BranchSummary => "branchSummary",
+            Self::CompactionSummary => "compactionSummary",
+        }
+    }
+
+    /// The deserialize gate. `None` for every other tag, including the four typed roles.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+}
 
 impl serde::Serialize for AgentMessage {
     /// Manual serializer so the `role` discriminant appears EXACTLY ONCE — the same defect, and the
@@ -144,7 +174,7 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
     /// Mirror of [`AgentMessage`]'s serializer. Byte-for-byte the old derive
     /// (`tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase"`) for the four
     /// typed arms, plus SESS-043's [`AgentMessage::App`] fallback for exactly the three
-    /// declaration-merged roles in [`APP_MESSAGE_ROLES`].
+    /// declaration-merged roles in [`AppRole`].
     ///
     /// Written by hand rather than derived because an internally-tagged derive has no way to route
     /// a set of tag values into one catch-all variant. Every other unknown role still errors, and
@@ -175,10 +205,7 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
         }
 
         let v = Value::deserialize(d)?;
-        if let Some(role) = v.get("role").and_then(Value::as_str)
-            && APP_MESSAGE_ROLES.contains(&role)
-        {
-            let role = role.to_string();
+        if let Some(role) = v.get("role").and_then(Value::as_str).and_then(AppRole::parse) {
             let Value::Object(payload) = v else {
                 // Unreachable: `v.get` only yields on an object.
                 return Err(D::Error::custom("agent message must be a JSON object"));

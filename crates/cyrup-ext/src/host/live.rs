@@ -23,8 +23,8 @@ use crate::host::store_state::HostState;
 use crate::native::{CtxTier, ExtMode};
 use crate::registry::{CommandDescriptor, ExecModeWire, ToolDescriptor};
 use cyrup_core::{
-    CancelToken, Content, ExtensionId, Message, Tool, ToolCallId, ToolError, ToolResult,
-    ToolUpdate, ToolUpdateSink,
+    CancelToken, Content, ExtensionId, Message, TerminateHint, Tool, ToolCallId, ToolError,
+    ToolResult, ToolUpdate, ToolUpdateSink,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -1464,7 +1464,7 @@ impl LiveExtension {
                 // `extensions/types.ts:359`, which is `ExtensionContext.compact`'s neighbourhood in
                 // the wrong package; `:359` in the RIGHT package is `details: T`); thread it through
                 // from the guest's update chunk.
-                terminate: chunk.get("terminate").and_then(Value::as_bool),
+                terminate: TerminateHint::from_wire(chunk.get("terminate").and_then(Value::as_bool)),
             });
         }
         let Some(res) = res else {
@@ -1477,7 +1477,15 @@ impl LiveExtension {
                 let details = out
                     .details_json
                     .and_then(|d| serde_json::from_str::<Value>(&d).ok());
-                Ok(ToolResult { content, details, terminate: out.terminate, ..Default::default() })
+                // WIT `tool-output.terminate` is a plain `bool` (world.wit:162) — THE boundary where
+                // the guest's bool becomes a hint. A guest `false` is "nothing said", so the wire
+                // it produces (key absent) is byte-identical to before `TerminateHint` existed.
+                Ok(ToolResult {
+                    content,
+                    details,
+                    terminate: TerminateHint::from_guest_bool(out.terminate),
+                    ..Default::default()
+                })
             }
             Ok(Err(msg)) => Err(ToolError::new(msg)),
             Err(e) => Err(ToolError::new(map_wasm_error(&e).to_string())),
@@ -2055,7 +2063,9 @@ async fn invoke(
         HostEvent::ToolCall { call_id, name, input } => {
             api.call_on_tool_call(store, call_id.as_str(), name, &input.to_string()).await
         }
-        HostEvent::ToolResult { call_id, name, input, content, details, is_error, usage } => {
+        // `terminate` is host-side only: the WIT `on-tool-result` signature is fixed (no ABI
+        // change), so it is not delivered to the guest — see `HostEvent::ToolResult::terminate`.
+        HostEvent::ToolResult { call_id, name, input, content, details, is_error, usage, terminate: _ } => {
             let content_json = serde_json::to_string(content).unwrap_or_else(|_| "[]".into());
             let details_json = details.as_ref().map(|d| d.to_string());
             // Pi `ToolResultEventBase.usage` (types.ts:919-921): absent for every ordinary tool, so
@@ -2253,7 +2263,8 @@ fn decode_outcome(kind: EventKind, wit: wit_types::HookOutcome) -> HookOutcome {
         // EXT-049: `block` is a record now — `{reason, terminate}` — so a guest can express pi's
         // `ToolCallEventResult.terminate` (extensions/types.ts:1072-1079 @v0.84.1).
         wit_types::HookOutcome::Block(b) => {
-            HookOutcome::Block { reason: b.reason, terminate: b.terminate }
+            // WIT `block-result.terminate` is a plain `bool` (world.wit:80) — the other boundary.
+            HookOutcome::Block { reason: b.reason, terminate: TerminateHint::from_guest_bool(b.terminate) }
         }
         wit_types::HookOutcome::Handled(s) => {
             let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
@@ -2289,7 +2300,12 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
                 .get("usage")
                 .cloned()
                 .and_then(|u| serde_json::from_value::<cyrup_core::Usage>(u).ok());
-            Some(EventPatch::ToolResult { content, details, is_error, usage })
+            // Absent key = `None` (no opinion). A present `false` IS `Continue` — JSON can say so.
+            let terminate = v
+                .get("terminate")
+                .and_then(Value::as_bool)
+                .map(|b| TerminateHint::from_wire(Some(b)));
+            Some(EventPatch::ToolResult { content, details, is_error, usage, terminate })
         }
         EventKind::Context => {
             let messages = serde_json::from_value(v).ok()?;

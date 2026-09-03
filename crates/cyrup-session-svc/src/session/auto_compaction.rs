@@ -388,27 +388,21 @@ impl AgentSession {
                 // (`session/run.rs:235-237`) returns `true`, `Agent::continue_run`
                 // (`cyrup-agent/src/agent/lifecycle.rs:209`, `cyrup-agent/src/loop_fn.rs:200`
                 // and `:280`) sees a trailing assistant with both queues empty and returns
-                // `ContinueFromAssistant`, and `drive_run` (`session/run.rs:170`) breaks —
+                // `ContinueFromAssistant`, and `drive_run` (`session/run.rs`) logs it and stops —
                 // overflow recovery compacts and never retries.
                 //
                 // The predicate is pi's exact one — `stopReason === "error" || === "length"` — and
                 // is deliberately NARROWER than [`Self::drop_trailing_assistant`]'s "any trailing
                 // assistant", which would also swallow a legitimately-completed `Stop`/`ToolUse`
-                // turn that the compaction happened to leave last. Do not reuse that helper here.
+                // turn that the compaction happened to leave last. The predicate IS the
+                // narrowness; both go through the same locked `pop_trailing_assistant_if`.
                 if will_retry {
-                    let mut msgs = self.agent.snapshot().await.messages;
-                    let retriable_tail = matches!(
-                        msgs.last(),
-                        Some(AgentMessage::Assistant(a))
-                            if matches!(
-                                a.stop_reason,
-                                cyrup_core::StopReason::Error | cyrup_core::StopReason::Length
-                            )
-                    );
-                    if retriable_tail {
-                        msgs.pop();
-                        self.agent.set_messages(msgs).await;
-                    }
+                    let _ = self.agent.pop_trailing_assistant_if(|a| {
+                        matches!(
+                            a.stop_reason,
+                            cyrup_core::StopReason::Error | cyrup_core::StopReason::Length
+                        )
+                    });
                 }
                 Ok(true)
             }

@@ -13,11 +13,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue, AfterOverride,
+    agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue, AfterOutcome, AfterOverride,
     AfterToolCall, Agent, AgentContext, AgentEvent, AgentEventSink, AgentLoopConfig, AgentMessage,
     Hooks, HookError, PostTurn, StreamFn, TurnUpdate,
 };
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, EventStream, ModelRef, ModelThinkingLevel, RunCancel, StopReason,
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
@@ -142,8 +143,8 @@ impl Hooks for TerminateAndCount {
         &self,
         _ctx: AfterToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<Option<AfterOverride>, HookError> {
-        Ok(Some(AfterOverride { terminate: Some(true), ..Default::default() }))
+    ) -> AfterOutcome {
+        AfterOutcome::Override(AfterOverride { terminate: Some(TerminateHint::Terminate), ..Default::default() })
     }
     async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);

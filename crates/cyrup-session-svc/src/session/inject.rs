@@ -38,7 +38,10 @@ impl AgentSession {
         deliver_as: Option<StreamingBehavior>,
     ) -> Result<PromptAccepted, SessionServiceError> {
         let ui = input.into();
-        if self.is_streaming().await {
+        // AGENT-030 — pi routes on `this.isStreaming`, which IS the session latch
+        // `_isAgentRunActive` (agent-session.ts:900-901, consulted at :1190): a submission landing
+        // in the post-`agent_end` gap queues onto the active loop instead of starting a second run.
+        if self.is_run_active() {
             return match deliver_as {
                 Some(StreamingBehavior::FollowUp) => self.follow_up(ui).await,
                 _ => self.steer(ui).await,
@@ -73,7 +76,10 @@ impl AgentSession {
             Some(DeliverAs::NextTurn) => {
                 Self::lock(&self.pending_next_turn).push(msg);
             }
-            _ if self.is_streaming().await => match deliver_as {
+            // AGENT-030 — pi routes on `this.isStreaming`, the session latch `_isAgentRunActive`
+            // (agent-session.ts:900-901, consulted at :1477): in the post-`agent_end` gap the
+            // message queues onto the active loop instead of being appended between runs.
+            _ if self.is_run_active() => match deliver_as {
                 Some(DeliverAs::FollowUp) => self.agent.follow_up(msg),
                 _ => self.agent.steer(msg),
             },
@@ -124,7 +130,10 @@ impl AgentSession {
             details: details.clone(),
             timestamp: Some(now_ms()),
         };
-        if self.is_streaming().await {
+        // AGENT-030 — pi routes on `this.isStreaming`, the session latch `_isAgentRunActive`
+        // (agent-session.ts:900-901, consulted at :1477/:1485): in the post-`agent_end` gap the
+        // message steers the active loop instead of starting a second run.
+        if self.is_run_active() {
             // Pi: while streaming, queue onto the active run (steer).
             self.agent.steer(msg);
         } else if trigger_turn {

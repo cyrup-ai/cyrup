@@ -9,7 +9,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cyrup_agent::Agent;
 use cyrup_core::{CancelToken, ModelRef, RunCancel, ModelThinkingLevel};
 use cyrup_config::{
     decide_trust_with_extension, has_trust_requiring_resources, AppMode, AuthStore,
@@ -1535,7 +1534,7 @@ impl SessionBuilder {
         // ---- 8. extension host seams (cyrup-ext) — the host itself was built at step 4b ---------
         // (`active_tools` was computed above, ahead of the dynamic-tool registry.)
         let session_cancel = CancelToken::new();
-        let ext_subscriber = ext_host.subscriber(session_cancel.clone());
+        let ext_subscriber = ext_host.subscriber();
         let ext_hooks = ext_host.hooks();
 
         // ---- 9. agent loop: provider + tools + composed hooks + both seams --------------------
@@ -1584,23 +1583,7 @@ impl SessionBuilder {
             Some(f) => f,
             None => provider_swap.clone(),
         };
-        // SEAM-075 — the agent's run baseline. pi's agent holds `Model | undefined`
-        // (`AgentSession.model` is a straight read of `this.agent.state.model`,
-        // agent-session.ts:866-868), so a modelless session builds an agent with no model at all.
-        // `cyrup_agent::StateInner::model` is a non-optional `ModelRef`, so it is seeded with an
-        // EMPTY address here. That value is unreachable while the session is modelless: every path
-        // into `Agent::run` goes through [`AgentSession::prompt`] → `prepare_and_assemble`, which
-        // returns [`SessionServiceError::NoModelSelected`] before touching the agent (pi
-        // agent-session.ts:1178-1180), and the first `/model` overwrites it through
-        // `agent.set_model`. It is NOT a catalog entry and no reader sees it — the `/model` picker,
-        // the footer, `state_view`, the attribution headers and the `CYRUP_*` env all read the
-        // session's `Option<ModelRef>`, which stays `None` until a model is selected.
-        let agent_model = model_ref.clone().unwrap_or_else(|| ModelRef {
-            provider: cyrup_core::ProviderId::from(""),
-            api: None,
-            model: cyrup_core::ModelId::from(""),
-        });
-        let mut agent_builder = Agent::builder(agent_model, agent_stream_fn)
+        let mut agent_builder = cyrup_agent::AgentBuilder::new(agent_stream_fn)
         .system_prompt(system_prompt.clone())
         .thinking_level(thinking)
         .tools(active_tools)
@@ -1617,6 +1600,14 @@ impl SessionBuilder {
         // `StreamFn::stream` call (agent.rs `gen_config.transport`), which is the seam an
         // embedder-supplied `StreamFn` (e.g. `ProxyStreamFn`) and every wire API read from.
         .transport(parse_transport(&eff.transport()));
+        // SEAM-075 — pi's agent holds `Model | undefined` (`AgentSession.model` is a straight read
+        // of `this.agent.state.model`, agent-session.ts:890-892): a modelless session builds an
+        // agent with NO model, and the first `/model` sets it through `agent.set_model`. Every
+        // reader — the `/model` picker, the footer, `state_view`, the attribution headers, the
+        // `CYRUP_*` env — reads the session's `Option<ModelRef>`, which stays `None` until then.
+        if let Some(m) = model_ref.clone() {
+            agent_builder = agent_builder.model(m);
+        }
         if let Some(h) = attribution_headers {
             agent_builder = agent_builder.headers(h);
         }
@@ -1862,9 +1853,20 @@ impl SessionBuilder {
 }
 
 /// Parse the settings `steeringMode`/`followUpMode` string into the agent's [`cyrup_agent::QueueMode`]
-/// (Pi `"all"|"one-at-a-time"`; settings-manager.ts:698-710). Any non-`all` value ⇒ one-at-a-time.
+/// (Pi `"all"|"one-at-a-time"`; settings-manager.ts:745-757). This is the ONE settings boundary:
+/// the strict [`std::str::FromStr`] on `QueueMode` does the parsing, and pi's leniency
+/// (`getSteeringMode()` is `this.settings.steeringMode || "one-at-a-time"`, unvalidated — a
+/// misspelt setting silently behaves as one-at-a-time) is preserved here, but no longer silently:
+/// an unrecognised value is logged once at parse time and falls back to one-at-a-time as pi does.
 pub(crate) fn parse_queue_mode(s: &str) -> cyrup_agent::QueueMode {
-    if s == "all" { cyrup_agent::QueueMode::All } else { cyrup_agent::QueueMode::OneAtATime }
+    s.parse().unwrap_or_else(|e| {
+        tracing::warn!(
+            value = %s,
+            error = %e,
+            "queue mode setting not recognised; using one-at-a-time as pi does"
+        );
+        cyrup_agent::QueueMode::OneAtATime
+    })
 }
 
 /// Parse the settings `transport` string into the provider [`cyrup_provider::Transport`] Pi hands the agent

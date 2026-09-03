@@ -8,7 +8,8 @@ use crate::queue::QueueMode;
 use crate::state::AgentStateSnapshot;
 use crate::stream_fn::StreamFn;
 use crate::subscriber::EventSubscriber;
-use cyrup_core::{CancelToken, ModelRef, ModelThinkingLevel, Tool};
+use crate::error::{AgentError, BusyEntry};
+use cyrup_core::{AssistantMessage, CancelToken, ModelRef, ModelThinkingLevel, Tool};
 use std::sync::{Arc, Mutex};
 
 /// The detach handle [`Agent::subscribe`] returns — cyrup's analogue of the `() => void` closure pi
@@ -41,9 +42,11 @@ impl Subscription {
 }
 
 impl Agent {
+    /// An agent WITH a model. For a modelless agent use [`AgentBuilder::new`] and skip
+    /// [`AgentBuilder::model`].
     #[must_use]
     pub fn builder(model: ModelRef, stream_fn: Arc<dyn StreamFn>) -> AgentBuilder {
-        AgentBuilder::new(model, stream_fn)
+        AgentBuilder::new(stream_fn).model(model)
     }
 
     /// Register a notify-only subscriber (func-02 R-02-012) and return the handle that detaches it
@@ -62,7 +65,9 @@ impl Agent {
     }
 
     pub async fn snapshot(&self) -> AgentStateSnapshot {
-        lock(&self.state).snapshot()
+        // Read the latch, then take the lock — never hold the lock while touching the channel.
+        let running = self.is_running();
+        lock(&self.state).snapshot(running)
     }
 
     // --- scalar/array state setters (R-02-038/044) ---
@@ -70,7 +75,10 @@ impl Agent {
         lock(&self.state).system_prompt = s;
     }
 
-    pub async fn set_model(&self, m: ModelRef) {
+    /// `None` makes the agent modelless: the next `prompt`/`continue_run` returns
+    /// [`AgentError::NoModelSelected`]. A run already in flight keeps its own baseline (pi
+    /// `agent.state.model = next` is likewise a between-turns write, agent-session.ts:1643).
+    pub async fn set_model(&self, m: Option<ModelRef>) {
         lock(&self.state).model = m;
     }
 
@@ -118,6 +126,42 @@ impl Agent {
     /// Copies the top-level Vec (the caller's array is decoupled, R-02-038).
     pub async fn set_messages(&self, msgs: Vec<AgentMessage>) {
         lock(&self.state).messages = msgs;
+    }
+
+    /// Atomic transcript edit under the state lock — the replacement for every
+    /// `snapshot → mutate → set_messages` triplet, which spanned two awaits with no lock and could
+    /// interleave with the reducer. Refused while a run is in flight (the same latch `reset`
+    /// observes), so it can never race the run's own appends.
+    ///
+    /// The AGENT-030 post-run gap — after `agent_end` releases this latch but before the session's
+    /// driver decides whether to continue — is the SESSION's to gate: `is_run_active()` reads
+    /// `driver_tx`, which the agent cannot see. This method is the second line, not the first.
+    pub fn edit_transcript<R>(
+        &self,
+        f: impl FnOnce(&mut Vec<AgentMessage>) -> R,
+    ) -> Result<R, AgentError> {
+        if self.is_running() {
+            return Err(AgentError::RunActive(BusyEntry::Edit));
+        }
+        let mut st = lock(&self.state);
+        Ok(f(&mut st.messages))
+    }
+
+    /// Pop the trailing assistant message iff `pred` holds for it, returning it. The one operation
+    /// both session retry predicates need — "any trailing assistant" and "a trailing
+    /// `Error`/`Length` assistant" — expressed as a predicate rather than as two copies of the pop.
+    pub fn pop_trailing_assistant_if(
+        &self,
+        pred: impl FnOnce(&AssistantMessage) -> bool,
+    ) -> Result<Option<Arc<AssistantMessage>>, AgentError> {
+        self.edit_transcript(|m| match m.last() {
+            Some(AgentMessage::Assistant(a)) if pred(a) => {
+                let a = Arc::clone(a);
+                m.pop();
+                Some(a)
+            }
+            _ => None,
+        })
     }
 
     // --- queues (R-02-034..037) ---

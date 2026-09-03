@@ -234,3 +234,15 @@ async fn selecting_a_model_promotes_a_modelless_session() {
         "with a model installed the no-model gate must no longer fire"
     );
 }
+
+/// CLTR_6 — the agent under a modelless session carries `model: None` (pi `Model | undefined`),
+/// not an empty-address sentinel: the per-turn baseline the session stamps into `TurnUpdate` is
+/// `None`, which the running loop reads as "keep your own baseline".
+#[tokio::test]
+async fn modelless_session_agent_baseline_is_none_not_a_sentinel() {
+    let fx = fixture();
+    let session = SessionBuilder::new(unconfigured(), base_config(&fx)).build().await.unwrap();
+    assert!(session.model().is_none());
+    let (model, _thinking) = session.next_turn_model_baseline().await;
+    assert!(model.is_none(), "no sentinel ModelRef may stand in for a missing model");
+}

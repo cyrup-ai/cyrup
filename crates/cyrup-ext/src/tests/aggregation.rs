@@ -4,7 +4,8 @@
 //! `HostCtx` fields.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
-use cyrup_core::{CancelToken, ExtensionId, Tool, ToolCallId, ToolError, ToolResult};
+use cyrup_core::{
+    TerminateHint,CancelToken, ExtensionId, Tool, ToolCallId, ToolError, ToolResult};
 use crate::{
     EventKind, ExtMode, ExtensionHost, HandledValue, HookOutcome, HostConfig, HostCtx, HostCtxRich,
     InitApi, NativeExtension, ProjectTrustDecision,
@@ -177,7 +178,7 @@ impl Tool for NamedTool {
         _cancel: CancelToken,
         _on_update: cyrup_core::ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 

@@ -1,6 +1,7 @@
 //! The ask tier: the dedup lookup, the human prompt itself (live dialog, forwarded child prompt,
 //! yolo auto-approve or the fail-closed refusal) and the persistence of its answer.
 
+use cyrup_core::TerminateHint;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -253,7 +254,7 @@ impl PermissionSystemExtension {
                     &details,
                     json!({ "source": "tool_call", "resolution": "confirmation_unavailable" }),
                 );
-                return HookOutcome::Block { reason: Some(gate::format_ask_unavailable_reason(check)), terminate: false };
+                return HookOutcome::Block { reason: Some(gate::format_ask_unavailable_reason(check)), terminate: TerminateHint::Unspecified };
             }
         };
 
@@ -295,7 +296,7 @@ impl PermissionSystemExtension {
         if !decision.approved {
             return HookOutcome::Block {
                 reason: Some(gate::format_user_denied_reason(check, decision.denial_reason.as_deref())),
-                terminate: false,
+                terminate: TerminateHint::Unspecified,
             };
         }
         if decision.state == PermissionDecisionState::Always {

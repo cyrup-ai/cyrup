@@ -94,6 +94,7 @@ use async_trait::async_trait;
 use cyrup_agent::AgentMessage;
 use cyrup_core::tool::ExecMode;
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_ext::native::{HostCtx, InitApi, NativeExtension};
@@ -1340,7 +1341,7 @@ impl Tool for StructuredOutputTool {
             details: Some(serde_json::json!({ "path": self.output_path.display().to_string() })),
             usage: None,
             added_tool_names: Vec::new(),
-            terminate: true,
+            terminate: TerminateHint::Terminate,
         })
     }
 }
@@ -1962,7 +1963,7 @@ impl NativeExtension for SubagentPromptRuntime {
                 // pi's `ToolCallEventResult.terminate` is `undefined` on every refusal it emits
                 // (`extensions/types.ts:1072-1079` @v0.84.1); a permission refusal asks for THIS
                 // call to be blocked, not for the batch to end.
-                terminate: false,
+                terminate: TerminateHint::Unspecified,
             };
         }
         match ev {
@@ -2028,7 +2029,7 @@ impl NativeExtension for SubagentPromptRuntime {
                         )),
                         // A budget block exists so the child can FINALIZE with the tools left to
                         // it (`tool-budget.ts`'s `block` list), so it must not hint termination.
-                        terminate: false,
+                        terminate: TerminateHint::Unspecified,
                     };
                 }
                 HookOutcome::Noop
@@ -2060,6 +2061,7 @@ impl NativeExtension for SubagentPromptRuntime {
                     details: None,
                     is_error: None,
                     usage: None,
+                    terminate: None,
                 })
             }
             // pi `:317-321`.
@@ -2339,6 +2341,7 @@ mod tool_budget_runtime_tests {
             details: None,
             is_error: false,
             usage: None,
+            terminate: cyrup_core::TerminateHint::Unspecified,
         }
     }
 
@@ -3098,7 +3101,7 @@ mod tests {
             )
             .await
             .expect("a value conforming to the `$ref`-ed definition is captured");
-        assert!(ok.terminate);
+        assert!(ok.terminate.requested());
         assert!(out.exists(), "the captured value is written for the parent");
     }
 
@@ -3125,7 +3128,7 @@ mod tests {
             .await
             .expect("a schema-conforming value is captured");
 
-        assert!(result.terminate, "capturing the value terminates the step");
+        assert!(result.terminate.requested(), "capturing the value terminates the step");
         // The parent reads this file back; the nested dir must have been created for it.
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();

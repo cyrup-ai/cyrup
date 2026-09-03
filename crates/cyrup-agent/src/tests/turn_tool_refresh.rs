@@ -1,7 +1,7 @@
 //! DRIFT-001, agent-loop half — `TurnUpdate::tools` / `TurnUpdate::system_prompt`.
 //!
 //! The loop snapshots its tool array ONCE at run start (Pi `createContextSnapshot`, agent.ts:424-429
-//! → cyrup `Agent::start_run`), so nothing that happens during a run can change what the model may
+//! → cyrup `Agent::claim_and_snapshot`), so nothing that happens during a run can change what the model may
 //! call. Pi closes that with `_installAgentNextTurnRefresh` (coding-agent/src/core/agent-session.ts:
 //! 519-540), whose `prepareNextTurnWithContext` returns `context: {...previousContext, systemPrompt,
 //! tools: this.agent.state.tools.slice()}` on EVERY turn — `AgentContext` carries `tools`, so a tool

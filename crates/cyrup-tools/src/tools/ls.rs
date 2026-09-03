@@ -213,7 +213,6 @@ impl Tool for LsTool {
             return Ok(ToolResult {
                 content: vec![Content::text("(empty directory)")],
                 details: None,
-                terminate: false,
                 ..Default::default()
             });
         }
@@ -258,7 +257,6 @@ impl Tool for LsTool {
         Ok(ToolResult {
             content: vec![Content::text(text)],
             details,
-            terminate: false,
             ..Default::default()
         })
     }

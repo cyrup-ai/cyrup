@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 use cyrup_agent::{AgentEvent, AgentMessage, ToolResultMessage};
-use cyrup_core::{Content, Message, ToolCallId};
+use cyrup_core::{Content, Message, TerminateHint, ToolCallId};
 use serde_json::Value;
 
 /// A C-like discriminant — one per `HostEvent` arm. Used to index the `Subscriptions` bitset and
@@ -296,6 +296,13 @@ pub enum HostEvent {
         /// types.ts:919-921, upstream `2fd38684`). `None` = absent, which is every ordinary tool.
         /// Observable by a handler and patchable via [`crate::EventPatch::ToolResult::usage`].
         usage: Option<cyrup_core::Usage>,
+        /// The tool's early-termination hint (pi `AgentToolResult.terminate?`). Host-side only:
+        /// the WIT `on-tool-result` call has a fixed signature and does not carry it, so a guest
+        /// cannot OBSERVE it — but a guest CAN set it through
+        /// [`crate::EventPatch::ToolResult::terminate`], and this field is what that patch lands
+        /// on, exactly as pi's `afterResult.terminate ?? result.terminate` does not require the
+        /// hook to have seen the original.
+        terminate: TerminateHint,
     },
     // 5.3 agent & turn — mutating + notify
     Context { messages: Vec<Arc<AgentMessage>> },

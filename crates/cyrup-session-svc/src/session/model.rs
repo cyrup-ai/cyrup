@@ -316,7 +316,7 @@ impl AgentSession {
         model: ModelId,
     ) -> Result<(), SessionServiceError> {
         let model_ref = ModelRef { provider: provider.clone(), api: None, model: model.clone() };
-        self.agent.set_model(model_ref.clone()).await;
+        self.agent.set_model(Some(model_ref.clone())).await;
         *Self::lock(&self.model) = Some(model_ref.clone());
         self.bash_session_env.set_model(provider.to_string(), model.to_string());
         // Same per-request attribution rule as `apply_model_change` (pi `sdk.ts:318-327`). This
@@ -482,7 +482,7 @@ impl AgentSession {
             api: Some(next.api.clone()),
             model: next.id.clone(),
         };
-        self.agent.set_model(model_ref.clone()).await;
+        self.agent.set_model(Some(model_ref.clone())).await;
         *Self::lock(&self.model) = Some(model_ref.clone());
         *Self::lock(&self.compaction_model) = Some(next.clone());
         self.services.host_services.update_model(model_ref, next.context_window, None);

@@ -1,19 +1,19 @@
 //! The run-in-flight latch is ONE fact, not two (func-02 R-02-045..048).
 //!
-//! `Agent::wait_for_idle`/`Agent::is_running` observe a `watch<bool>`; `Agent::start_run` refuses a
+//! `Agent::wait_for_idle`/`Agent::is_running` observe a `watch<bool>`; `Agent::claim_and_snapshot` refuses a
 //! second concurrent run with [`AgentError::RunActive`]. Those two must read and write the SAME
 //! cell, because every caller in the workspace does `wait_for_idle().await` (or polls `is_running`)
 //! and then immediately prompts again — `AgentSession::prompt` on an unbound session propagates the
 //! refusal straight out to the caller as `Agent(RunActive)`.
 //!
 //! Before the fix, `SettlementGuard::drop` published `running_tx.send(false)` and only THEN cleared
-//! a separate `active: Arc<Mutex<bool>>`. A caller woken by that very send could reach `start_run`
+//! a separate `active: Arc<Mutex<bool>>`. A caller woken by that very send could reach `claim_and_snapshot`
 //! inside the two-statement gap and be refused despite the agent reporting itself idle. The gap is
 //! nanoseconds when nothing else is running and milliseconds when the machine is loaded enough to
 //! preempt between the two statements — which is exactly why it surfaced as an intermittent
 //! `prompt 2: Agent(RunActive)` only inside a full parallel workspace test run.
 //!
-//! `start_run` now claims the latch with `watch::Sender::send_if_modified` (a compare-and-set under
+//! `claim_and_snapshot` now claims the latch with `watch::Sender::send_if_modified` (a compare-and-set under
 //! the channel's own write lock) and the guard's `send(false)` is the only release, so an observed
 //! `false` and "a new run may start" are the same fact.
 

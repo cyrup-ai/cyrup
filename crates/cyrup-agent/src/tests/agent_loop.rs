@@ -6,11 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
-    AfterOverride, Agent, AgentEvent, AgentMessage, ApiKeyResolver, BeforeOutcome, BeforeToolCall,
-    Hooks, HookError, StreamFn, ToolExecution,
+    AfterOutcome, AfterOverride, Agent, AgentEvent, AgentMessage, ApiKeyResolver, BeforeOutcome, BeforeToolCall,
+    Hooks, StreamFn, ToolExecution,
 };
 use crate::{AfterToolCall, EventSubscriber};
 use cyrup_core::{
+    TerminateHint,
     CancelToken, Content, EventStream, ExecMode, ModelRef, ProviderId, StopReason, Tool, ToolCallId,
     ToolError, ToolResult, ToolUpdateSink,
 };
@@ -107,7 +108,7 @@ impl Tool for SpanTool {
         }
         let end = Instant::now();
         self.spans.lock().unwrap().push((self.name.clone(), start, end));
-        Ok(ToolResult { content: vec![Content::text(format!("done:{}", self.name))], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text(format!("done:{}", self.name))], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 
@@ -227,7 +228,7 @@ impl Tool for OverlapTool {
         Ok(ToolResult {
             content: vec![Content::text(format!("done:{}", self.name))],
             details: None,
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }
@@ -377,7 +378,7 @@ impl Tool for StartOrderTool {
         Ok(ToolResult {
             content: vec![Content::text("ok")],
             details: None,
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }
@@ -468,8 +469,8 @@ impl Hooks for BlockHook {
         &self,
         _ctx: BeforeToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<BeforeOutcome, HookError> {
-        Ok(BeforeOutcome::Block { reason: Some("nope".into()), terminate: false })
+    ) -> BeforeOutcome {
+        BeforeOutcome::Block { reason: Some("nope".into()), terminate: TerminateHint::Unspecified }
     }
 }
 
@@ -518,8 +519,8 @@ impl Hooks for DetailsHook {
         &self,
         _ctx: AfterToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<Option<AfterOverride>, HookError> {
-        Ok(Some(AfterOverride { details: Some(json!({ "k": "v" })), ..Default::default() }))
+    ) -> AfterOutcome {
+        AfterOutcome::Override(AfterOverride { details: Some(json!({ "k": "v" })), ..Default::default() })
     }
 }
 
@@ -567,12 +568,12 @@ impl Hooks for TerminateHook {
         &self,
         ctx: AfterToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<Option<AfterOverride>, HookError> {
+    ) -> AfterOutcome {
         let terminate = match &self.only {
             None => true,
             Some(name) => ctx.tool_name == name,
         };
-        Ok(Some(AfterOverride { terminate: Some(terminate), ..Default::default() }))
+        AfterOutcome::Override(AfterOverride { terminate: Some(TerminateHint::from_wire(Some(terminate))), ..Default::default() })
     }
 }
 
@@ -1072,7 +1073,7 @@ impl Tool for TripwireTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.executed.store(true, Ordering::SeqCst);
-        Ok(ToolResult { content: vec![Content::text("ran")], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text("ran")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 
@@ -1204,7 +1205,7 @@ impl Tool for RendezvousTool {
         if tokio::time::timeout(Duration::from_secs(5), self.rendezvous.wait()).await.is_ok() {
             self.log.lock().unwrap().push(format!("rendezvous:{}", self.name));
         }
-        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: false, ..Default::default() })
+        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
     }
 }
 
@@ -1222,14 +1223,14 @@ impl Hooks for SlowGateHook {
         &self,
         ctx: BeforeToolCall<'_>,
         _cancel: CancelToken,
-    ) -> Result<BeforeOutcome, HookError> {
+    ) -> BeforeOutcome {
         let name = ctx.tool_name.to_string();
         self.log.lock().unwrap().push(format!("hook_enter:{name}"));
         if name == self.gate {
             tokio::time::sleep(self.delay).await;
         }
         self.log.lock().unwrap().push(format!("hook_exit:{name}"));
-        Ok(BeforeOutcome::Proceed)
+        BeforeOutcome::Proceed
     }
 }
 
@@ -1289,7 +1290,7 @@ async fn agent_002_parallel_defers_execution_until_whole_batch_is_prepared() {
 // (`packages/agent/src/agent.ts:351-353` @v0.83.0), ahead of `steeringQueue.drain()` at `:361` and
 // `followUpQueue.drain()` at `:367`, so a refused continuation leaves both queues untouched and the
 // message is still delivered at the loop's next drain point (`agent-loop.ts:259`/`:263`). cyrup
-// drained FIRST and only then claimed the latch in `start_run`, dropping the drained
+// drained FIRST and only then claimed the latch in `claim_and_snapshot`, dropping the drained
 // `Vec<AgentMessage>` on the floor on `Err(RunActive)` — no error, no log, no retry.
 //
 // The live-terminal repro of 2026-08-13 refuted the filed *Impact* (typing during a stream queues
@@ -1327,7 +1328,7 @@ impl Tool for GateTool {
         Ok(ToolResult {
             content: vec![Content::text("gated")],
             details: None,
-            terminate: false,
+            terminate: TerminateHint::Unspecified,
             ..Default::default()
         })
     }
@@ -1373,7 +1374,7 @@ async fn agent020_rejected_continue_keeps_the_steering_message() {
         rejected.err().map(|e| e.to_string()).unwrap_or_default(),
         "Agent is already processing. Wait for completion before continuing."
     );
-    // RED before the fix: `continue_run` had already drained the queue by the time `start_run`
+    // RED before the fix: `continue_run` had already drained the queue by the time `claim_and_snapshot`
     // rejected it, so the message was gone.
     assert!(
         agent.has_queued_messages(),

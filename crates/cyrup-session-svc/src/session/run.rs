@@ -147,7 +147,14 @@ impl AgentSession {
     /// drives `agent.continue()` for an auto-retry, a threshold/overflow auto-compaction, or an
     /// `agent_end`-queued continuation. Spawned by [`Self::spawn_run`] on a bound session.
     async fn drive_run(self: Arc<Self>, messages: Vec<AgentMessage>) {
-        if let Ok(handle) = self.agent.prompt(messages).await {
+        // The refusal used to be silent (`if let Ok`): a `RunActive`/`Empty` here left the session
+        // with no run, no event, and no log line. It cannot be returned — this is the spawned
+        // driver — so it is logged at the one place that knows it happened.
+        let started = self.agent.prompt(messages).await;
+        if let Err(e) = &started {
+            tracing::warn!(error = %e, "prompt refused inside the run driver");
+        }
+        if let Ok(handle) = started {
             let _ = handle.finished().await;
             // GAP-11: apply the event-tier control ops (set_model / set_thinking_level) a guest queued
             // from `on_message_end` / a mid-turn tool hook / `on_agent_end`. This runs at a STORE-FREE
@@ -167,7 +174,13 @@ impl AgentSession {
                         // Same store-free turn-boundary drain after each continuation settles.
                         self.apply_pending_agent_control().await;
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "continue_run refused after a post-run step said to continue"
+                        );
+                        break;
+                    }
                 }
             }
         }

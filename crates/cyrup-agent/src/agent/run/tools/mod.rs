@@ -3,13 +3,17 @@
 
 mod exec;
 mod finalize;
+mod finalized;
 mod preflight;
+
+use finalized::Finalized;
 
 use super::{RunCtx, RunFailure};
 use crate::event::{AgentEvent, AgentMessage, ToolResultMessage};
 use crate::queue::ToolExecution;
 use cyrup_core::{
-    AssistantMessage, ExecMode, Tool, ToolCall, ToolCallId, ToolError, ToolResult, ToolUpdate,
+    AssistantMessage, ExecMode, TerminateHint, Tool, ToolCall, ToolCallId, ToolError, ToolResult,
+    ToolUpdate,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -23,24 +27,23 @@ enum ToolRuntimeMsg {
     Finished { call_id: ToolCallId, source_index: usize, tool_name: String, outcome: Result<ToolResult, ToolError> },
 }
 
-struct Finalized {
+/// One prepared-but-not-yet-started call — pi's `PreparedToolCall` (`agent-loop.ts:556-561`:
+/// `{ kind: "prepared", toolCall, tool, args }`) plus the index of the call it answers, captured
+/// once at preflight instead of re-derived by each runtime. The Rust analogue of the deferred
+/// `finalizedCalls.push(async () => …)` closure (`:522-533`).
+pub(super) struct PreparedCall {
     source_index: usize,
-    tool_call_id: ToolCallId,
+    tool: Arc<dyn Tool>,
+    args: Value,
+    call_id: ToolCallId,
     tool_name: String,
-    result_value: Value,
-    is_error: bool,
-    /// `AgentToolResult.terminate?` (`packages/agent/src/types.ts:354-368`) — `None` is pi's
-    /// `undefined`, i.e. the key is absent from the emitted `result` and the call does not
-    /// contribute a `true` to `shouldTerminateToolBatch` (`agent-loop.ts:582-584`). AGENT-009.
-    terminate: Option<bool>,
-    message: ToolResultMessage,
 }
 
 enum Prep {
     /// Boxed: `Finalized` embeds a whole `ToolResultMessage` and dwarfs the `Ready` arm, so an
     /// unboxed variant makes every `Prep` (including the common prepared-call case) pay for it.
     Immediate(Box<Finalized>),
-    Ready { tool: Arc<dyn Tool>, args: Value },
+    Ready(PreparedCall),
 }
 
 pub(super) struct Batch {
@@ -82,7 +85,7 @@ impl RunCtx {
     /// `tool_execution_start` → `tool_execution_end` (`isError`) → `message_start` / `message_end`.
     pub(super) async fn fail_truncated_tool_calls(&self, calls: &[ToolCall]) -> Result<Batch, RunFailure> {
         let mut tool_results = Vec::new();
-        for call in calls {
+        for (idx, call) in calls.iter().enumerate() {
             self.emit(AgentEvent::ToolExecutionStart {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
@@ -91,25 +94,21 @@ impl RunCtx {
             .await?;
             let fin = self.immediate_error(
                 call,
+                idx,
                 format!(
                     "Tool call \"{}\" was not executed: the response hit the output token limit, \
                      so its arguments may be truncated. Re-issue the tool call with complete \
                      arguments.",
                     call.name
                 ),
-                false,
+                TerminateHint::Unspecified,
             );
-            self.emit(AgentEvent::ToolExecutionEnd {
-                tool_call_id: fin.tool_call_id.clone(),
-                tool_name: fin.tool_name.clone(),
-                result: fin.result_value.clone(),
-                is_error: fin.is_error,
-            })
-            .await?;
-            let msg = AgentMessage::ToolResult(fin.message.clone());
+            self.emit(fin.end_event()).await?;
+            let message = fin.into_message();
+            let msg = AgentMessage::ToolResult(message.clone());
             self.emit(AgentEvent::MessageStart { message: msg.clone() }).await?;
             self.emit(AgentEvent::MessageEnd { message: msg }).await?;
-            tool_results.push(fin.message);
+            tool_results.push(message);
         }
         // Pi `{ messages, terminate: false }` (agent-loop.ts:404).
         Ok(Batch { messages: tool_results, terminate: false })
