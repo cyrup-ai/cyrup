@@ -553,7 +553,7 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | ~~TUI-N08~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | `tests/image.rs` pins the invented `🖼` placeholder and the rasterize-anyway fallback — **CLOSED 2026-08-14**: sweep 1 — the proposed remedy (annotate + add an `#[ignore]`d companion) was NOT taken: TUI-017 landed in the same pass, so the assertions were retargeted to pi's real `[Image: …]` format outright and the `#[ignore]` is unnecessary. |
 | ~~TUI-N09~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | `extension_dialog_countdown` asserts an exact countdown it cannot control — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-N10 | low | test-defect | S | `bash_overlay`'s two hotkeys tests hard-code the non-macOS `alt` spelling — **fixed this pass** |
-| TUI-N11 | medium | test-defect | S | `m7_inline_formatting_survives_inside_a_table_cell` asserts a property of the ambient `TERM_PROGRAM` — **fixed this pass** |
+| ~~TUI-N11~~ | ~~medium~~ **CLOSED 2026-09-04** | test-defect | S | ~~`m7_inline_formatting_survives_inside_a_table_cell` asserts a property of the ambient `TERM_PROGRAM`~~ — the fix landed in the pass that filed the item ("fixed this pass"), but the severity cell was never struck, so `scripts/count_open_items.py` kept counting it open (its CLOSED-ROW DETECTION reads the severity strike and nothing else). **Settled 2026-09-04 by re-measurement, not by trusting the note.** Both link arms of the test now render through the explicit-capability entry point — `crates/cyrup-tui/src/tests/markdown.rs:2045` `render_markdown_with_hyperlinks(linked, 40, &theme, false)` and `:2071` the capable mirror `(…, true)` — so neither reads `crate::image::hyperlinks_supported()` (`markdown/mod.rs:148`, the ambient path `render_markdown` takes). `cargo nextest run -p cyrup-tui -E 'test(tests::markdown::)'` is **51/51 under all four terminal identities** — `TERM_PROGRAM=ghostty` with `GHOSTTY_RESOURCES_DIR` set, `=vscode`, `=iTerm.app`, and with those vars scrubbed — and the whole crate is 1375/1375. The pin is load-bearing, not decorative: reverting that one arm to the ambient `render_markdown(linked, 40, &theme)` is RED under the ghostty identity (`1 test run: 0 passed, 1 failed`) and green scrubbed, the exact split the item recorded; revert restored. `f061bf35` refreshed the arm's citations to the ADR-0006 target (pi `packages/tui/src/components/markdown.ts:696-707` fallback and `:692-695` OSC-8 @v0.84.4, `packages/tui/test/markdown.test.ts:597-598` @v0.84.4 for upstream's own "Pin to no-hyperlinks…" line) and corrected a drifted in-file cross-reference; no production line changed. |
 | ~~TUI-N12~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | No `setCapabilities` / `resetCapabilitiesCache` seam; only markdown can drive both OSC-8 branches — **CLOSED 2026-08-14**: sweep 1 — the secondary latent hazard ("if any earlier caller latches the lock first that seed is silently discarded for the process") is closed as a consequence: `set_capabilities` replaces rather than first-writer-wins, and `App::detect_image_support` seeds the whole record. |
 | ~~TUI-N13~~ | ~~high~~ **CLOSED 2026-08-14** | test-defect | S | `a_live_bash_run_names_its_spool_file` parses one wrapped line, so it is red wherever `TMPDIR` is long — **fixed this pass** — **CLOSED 2026-08-14**: closed pre-sweep (`a_live_bash_run_names_its_spool_file` parsed one wrapped line, red wherever `TMPDIR` is long). |
 | TUI-S02 | low | not-ported | S | No dead-terminal (EIO/EPIPE/ENOTCONN) emergency exit path (panic-hook half closed) — **not independently re-checked this pass; no `DEAD_TERMINAL_ERROR_CODES`/`emergencyTerminalExit` counterpart turned up in the symbol sweep, left open rather than guessed at.** |
@@ -1711,7 +1711,34 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 
 ## TUI-N11 — `m7_inline_formatting_survives_inside_a_table_cell` asserted a property of the developer's `TERM_PROGRAM`
 
-**Kind** test-defect · **Severity** medium · **Effort** S · **Confidence** confirmed · **Status** fixed this pass
+**Kind** test-defect · **Severity** ~~medium~~ · **Effort** S · **Confidence** confirmed · **Status** **CLOSED 2026-09-04**
+
+> **CLOSED 2026-09-04 — the fix was real; only the bookkeeping was open.** The `## Open items` row said
+> "fixed this pass" while leaving `medium` unstruck, and `scripts/count_open_items.py` decides closure on the
+> severity strike alone, so the census carried a repaired test as an open medium for three weeks. The row is now
+> struck.
+>
+> **Re-measured at HEAD rather than re-read.** Both link arms render through the explicit-capability entry point —
+> `crates/cyrup-tui/src/tests/markdown.rs:2045` `render_markdown_with_hyperlinks(linked, 40, &theme, false)` and
+> `:2071` the capable mirror — so the test never reaches `crate::image::hyperlinks_supported()`, which is what
+> `render_markdown` resolves the gate from (`crates/cyrup-tui/src/markdown/mod.rs:148`). `cargo nextest run -p
+> cyrup-tui -E 'test(tests::markdown::)'` is 51/51 under `TERM_PROGRAM=ghostty` (+`GHOSTTY_RESOURCES_DIR`),
+> `=vscode`, `=iTerm.app` and with the terminal-identity vars scrubbed; `-p cyrup-tui` as a whole is 1375/1375.
+> **Counterfactual, so the pin is not taken on faith:** reverting that one arm to `render_markdown(linked, 40,
+> &theme)` gives `1 test run: 0 passed, 1 failed` under the ghostty identity and stays green scrubbed — the split
+> the item described. Revert restored; the only committed change is `f061bf35`, comments.
+>
+> **Upstream re-read at the ADR-0006 target (pi v0.84.4), and the citations refreshed to it.** The gate and its two
+> arms are byte-identical to the v0.83.0 text this item was written against; only the offsets moved, because the
+> `link` case starts at `markdown.ts:689` @v0.84.4 against `:537` @v0.83.0 — fallback ` (url)` suffix `:696-707`
+> (was `:544-554`), OSC-8 branch `:692-695` (was `:540-543`). Upstream's own pin, quoted in the test, is unchanged
+> too: `packages/tui/test/markdown.test.ts:597-598` @v0.84.4 (`:469-470` @v0.83.0), "Pin to no-hyperlinks so width
+> checks work on plain text without OSC 8 sequences." `f061bf35` also fixed a drifted in-file cross-reference (the
+> convention note is at `tests/markdown.rs:181-183`, not `:132-134`).
+>
+> **The structural half is not this row's.** `set_capabilities` / `reset_capabilities_cache` — the seam TUI-N12
+> asked for — now exist over the whole `TerminalCapabilities` record (`crates/cyrup-tui/src/image.rs:661-707`), and
+> TUI-N12 is closed separately. Nothing of TUI-N11 remains open.
 
 **cyrup** — `crates/cyrup-tui/src/tests/markdown.rs:1496` and `:1505` rendered the link mirror arm through `render_markdown`, which resolves the OSC-8 gate from `crate::image::hyperlinks_supported()` (`crates/cyrup-tui/src/image.rs:450-452`) — a write-once `OnceLock` sniff of the ambient environment. `:1501` then demanded the row contain `doc (https://ex.com)`, a string that by design cannot exist when the terminal is hyperlink-capable (`src/markdown.rs:1105` gates the suffix on `!self.hyperlinks`). Measured: with `TERM_PROGRAM=ghostty` + `GHOSTTY_RESOURCES_DIR` set (`image.rs:516` → `hyperlinks: true`) the target was 47 passed / 1 failed; with those five vars unset, 48 passed / 0 failed; forcing `TERM_PROGRAM=vscode` reproduced the identical panic. The red therefore fired on ghostty, kitty, iTerm2, WezTerm, Warp, vscode, alacritty, Windows Terminal and forwarding tmux, and hid only on an unidentified terminal — which is why it had been recorded as an unexplained failure.
 
