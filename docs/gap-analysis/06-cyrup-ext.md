@@ -251,7 +251,7 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 | ~~EXT-035~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | NativeExtension can register only 5 of the 11 WIT registration surfaces — **CLOSED 2026-08-14**: sweep 1 + 2 — the InitApi surfaces landed in sweep 1; sweep 2 added the missing `NativeExtension::execute_shortcut(&self, key, ctx)` (native.rs:326 had been referencing a method that did not exist) and rewrote `ExtensionHost::run_shortcut` as ONE ungated function resolving the owner from the registry and trying `self.native` before `self.live`, dropping the `#[cfg(feature="wasm-host")]` gate and its unconditionally-failing `#[cfg(not(...))]` twin. **Strike the item's "5 of 11" framing — it is 11 of 11 with a firing path.** |
 | ~~EXT-038~~ | ~~medium~~ **CLOSED 2026-08-15 — residual verified gone** | parity-bug | S | ext-tools.get-all-tools returns only extension tools and drops promptGuidelines and sourceInfo — **PARTIALLY CLOSED 2026-08-14**: sweep 2 — `HostServices::all_tools() -> Option<Vec<Value>>` added; `ext_tools::get_all_tools` prefers it and keeps `registry.tool_info()` as the no-session fallback. `tool_info()` itself gained `promptGuidelines` (readable now that the EXT-007 blocker is refuted) and `sourceInfo` in pi's `{path, source, scope, origin}` shape. **RESIDUAL (area 08): the `LiveHostServices::all_tools` impl off the dynamic tool registry, so built-ins appear.** Mechanism note filed below: pi's `ToolInfo` has NO `source` field, and cyrup's `registry.tool_info()` emits a cyrup-invented `source: "extension"\|"guest"` discriminator — the WASM-vs-native tier leaking into a guest-facing introspection API, which pi's one-extension-kind model has no word for. Left in place rather than removing a key an unknown consumer might read, but it is an unlabelled cyrup-original on a parity surface and should either get a CYRUP-DELTA or go. **2026-08-15: RESIDUAL CLOSED.** `LiveHostServices::all_tools` exists (`cyrup-session-svc/src/host_services.rs:1734+`) off the dynamic tool registry, so built-ins appear, in pi's five-key `ToolInfo` shape with a CYRUP-DELTA recording the one remaining divergence (name-sorted rows vs pi's registration order, because the registry is a `BTreeMap`). Pinned by `all_tools_reports_the_whole_merged_registry_in_pis_toolinfo_shape`. The mechanism note about the invented `source` key was resolved separately by EXT-060 (deleted). |
 | EXT-039 | medium — **PARTIALLY CLOSED 2026-08-14** | not-ported | M | Extension shortcuts bypass the reserved-keybinding refusal, emit no conflict diagnostics, and lose to built-ins — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — the registry half is done (`resolve_shortcuts`, `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS`, `shortcut_diagnostics`), re-verified at HEAD in sweep 2. **PRECEDENCE CLAIM REWRITTEN:** the Fix said two extensions on the same key should stop "silently collapsing" — but pi is LAST-wins there (`extensionShortcuts.set(normalizedKey, shortcut)` runs unconditionally after the warning, runner.ts:530-536, whose text is literally "Using ${shortcut.extensionPath}"). Only the DIAGNOSTIC was missing. And pi gates in `getShortcuts` against the resolved keybindings, not in `registerShortcut`. **RESIDUAL (area 07): call `resolve_shortcuts`, invert `app/input.rs:81-93`, thread `shortcut_diagnostics` into `startup_diagnostics.extensions`.** |
-| EXT-041 | medium | parity-bug | M | Replayed tool calls and results lose their extension renderer — **2026-08-14, still open**: sweep 2 — not reached (cyrup-tui). |
+| EXT-041 | medium — **PARTIALLY CLOSED 2026-09-04** | parity-bug | M | Replayed tool calls and results lose their extension renderer — **PARTIALLY CLOSED 2026-09-04 in `a0134787`: the TOOL surface, which is the whole of this item's title, is done.** `App::replay_items_with_extensions` (`crates/cyrup-tui/src/app/session_bind.rs`) now pre-resolves, beside the custom-message lookup it already had, every replayed assistant `toolCall` through the new `extension_render_tool_call` and every `toolResult` through `extension_render_tool_result` (`crates/cyrup-tui/src/app/extension_render.rs`; `extension_render`'s two live tool arms delegate to the same pair, so live and replay share one implementation), stores the flattened text in `ReplayRenders` keyed by TOOL-CALL id, and the walk reads `rendered.tool_calls[call.id]` / `rendered.tool_results[tool_call_id]` into the two slots that were literal `None`; `tool_result_payload` builds the `{content, details}` value once so the extension and the built-in renderer see the same payload. Upstream at the latest tag: `renderSessionItems` builds a `ToolExecutionComponent` for every replayed `toolCall` with `this.getRegisteredToolDefinition(content.name)` (`interactive-mode.ts:3725-3741` @v0.84.4, identical logic to the `:3374-3389` @v0.83.0 this item cited), files it by `content.id` (`:3760`) and matches the result by `toolCallId` (`:3770-3775`); `tool-execution.ts:84-101` prefers the extension's `renderCall`/`renderResult`, `:307-308` hands `renderResult` `{content, details}`, `:290-294`/`:316-321` fall back to the built-in on a throw. **Tests** (red-before verified by running them at HEAD — 2 of 3 failed with zero `EXTCALL` rows and the built-in `$ …` header on screen; the mirror passed, pinning the unchanged path): `crates/cyrup-tui/src/tests/extension_renderers.rs` `a_replayed_tool_call_and_result_still_reach_their_registered_renderer`, `a_replayed_unclaimed_tool_keeps_its_builtin_rendering`, `each_replayed_tool_row_gets_the_output_of_its_own_call` (two calls of one claimed tool, results replayed in the OPPOSITE order — pins id routing, not name or arrival order). **RESIDUAL, open (low): replayed custom ENTRIES** — the Fix's last sentence and EXT-012's hand-off. Not a rendering seam: `KnownEntry::Custom` never enters the replay stream at all — `ReplayItem` is documented as pi's `RenderSessionItem` "minus its `custom` entry variant" (`crates/cyrup-session-svc/src/session/types.rs`) and `push_as_raw` (`crates/cyrup-session/src/context.rs`) has no arm for it — so `has_entry_renderer`/`render_entry` have nothing to be asked for. pi replays them: `renderSessionEntries` `if (entry.type === "custom") return [entry]` (`:3799-3801` @v0.84.4) → `addCustomEntryToChat` (`:3718`, body `:3570-3592`). One shipped consumer loses its card on `/resume`: `crates/cyrup-intercom/src/extension.rs:481` registers an entry renderer for the inbound-message type. Rated low because that surface carries notifications, not the conversation's substance; the fix is a `ReplayItem::CustomEntry` producer in session-svc (area 08 seam) plus one TUI arm. |
 | ~~EXT-043~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | The project_trust event carries no cwd — **CLOSED 2026-08-14**: sweep 1 — the extension-boundary halves are area 06's; the session-svc PRODUCERS (session.rs:2691/:2545/:2956/:3337, runtime.rs:480/:526/:568/:706) landed concurrently in area 08 with matching shapes, derived independently from pi. |
 | ~~EXT-044~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | ctx.cwd is unreachable from a WASM guest — **CLOSED 2026-08-14**: sweep 1. |
 | ~~EXT-047~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | ui.set-widget drops pi's widget key and placement — **CLOSED 2026-08-14**: sweep 2 — CLOSED AT BOTH ENDS, derived independently in two areas in one pass. Area 06 re-signed the WIT import to `set-widget: func(key, content-json: option<string>, opts-json: string)` in both `world.wit` copies, added `WidgetPlacement`/`WidgetEffect` to `host/services.rs`, and gave the SDK `Ui::set_widget(key, lines, placement)` plus `Ui::clear_widget(key)` for pi's `content: undefined`. Area 08 landed the `UiEffect::SetWidget` carrier, the `extension_ui_effect_json` projection onto pi's `widgetKey`/`widgetLines`/`widgetPlacement`, and the TUI keyed map — see SEAM-011/SEAM-028. `set_widget_carries_pis_three_fields_and_no_widget_blob` (cyrup-modes) is no longer `#[ignore]`d. **This is the second time (after EXT-015/042/043/046) two areas fitted the two ends of one seam without coordination — evidence the pi-derivation discipline is working.** |
@@ -691,6 +691,83 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 ## EXT-041 — Replayed tool calls and results lose their extension renderer
 
 **Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** high
+
+> **PARTIALLY CLOSED 2026-09-04** in `a0134787` — the TOOL surface (this item's title) is closed;
+> the custom-ENTRY half named in the Fix's last sentence is the residual, below. Everything after
+> this block is the filing text and describes HEAD as it was before that commit.
+>
+> **What landed.** `App::replay_items_with_extensions`
+> (`crates/cyrup-tui/src/app/session_bind.rs`) now runs ONE pre-pass over the replay messages that
+> resolves all three surfaces: the custom-message renderer it already resolved, plus — new — every
+> assistant `toolCall` block through `extension_render_tool_call` and every `toolResult` message
+> through `extension_render_tool_result`. Both helpers live in
+> `crates/cyrup-tui/src/app/extension_render.rs` beside `extension_render_message`, with the same
+> `has_tool_renderer` sync pre-check, the same spawn + `EXTENSION_RENDER_TIMEOUT` bounded wait, and
+> the same fault-to-`None` collapse the live tool arms had; `extension_render`'s
+> `ToolExecutionStart`/`ToolExecutionEnd` arms now delegate to them, so live and replay share one
+> implementation rather than two. The pre-pass stores the flattened text in a private
+> `ReplayRenders { messages, tool_calls, tool_results }` — the tool maps keyed by TOOL-CALL id, which
+> is how pi files the component (`renderedPendingTools.set(content.id, component)`) and how the
+> result finds it back — and `replay_session_rendered` reads `rendered.tool_calls[call.id]` /
+> `rendered.tool_results[tool_call_id]` into the two slots the filing text shows as literal `None`.
+> `tool_result_payload` builds the `{content, details}` value once, so the extension renderer sees
+> exactly what the built-in renderer sees — which is also what pi hands `renderResult`
+> (`tool-execution.ts:307-308`).
+>
+> **Upstream, re-read at v0.84.4** (`packages/coding-agent/src/modes/interactive/`):
+> `interactive-mode.ts:3725-3741` (`renderSessionItems`, `new ToolExecutionComponent(content.name,
+> content.id, content.arguments, …, this.getRegisteredToolDefinition(content.name), …)` for every
+> replayed `toolCall`), `:3760` (`renderedPendingTools.set(content.id, component)`), `:3770-3775`
+> (`renderedPendingTools.get(message.toolCallId)` → `component.updateResult(message)`); the live
+> twin is `:3340-3351` (`tool_execution_start`) and `:3373` (`tool_execution_end`).
+> `components/tool-execution.ts:84-101` (`getCallRenderer`/`getResultRenderer` prefer
+> `toolDefinition.renderCall ?? builtInToolDefinition.renderCall`), `:290-294` / `:316-321` (a
+> throwing renderer falls back to the built-in shell). **Tag-to-tag:** the arm this item cited at
+> v0.83.0 (`:3374-3389`, `getRegisteredToolDefinition(content.name)` at `:3384`,
+> `renderedPendingTools.set` at `:3404`, `.get(message.toolCallId)` at `:3414`) is the same logic
+> at v0.84.4; only line numbers moved. Ported at the latest tag per ADR-0006.
+>
+> **Design decision (recorded in the commit body):** `ReplayRenders` is a plain grouping of the
+> three maps handed from the async pre-pass to the sync walk, and `tool_result_payload` a pure
+> function — no newtype/typestate/enum, because there is no invariant to encode: an absent key IS
+> the legitimate built-in-framing outcome pi produces when `getCallRenderer()` resolves to the
+> built-in definition. Rejected: three loose `HashMap` parameters (same semantics, worse
+> signature); carrying `Rendered` in the tool maps (a tool row is a string surface — the live fold
+> flattens with `into_text()` at the push, and `Live` would advertise a tier the row cannot draw);
+> resolving inside the sync walk (impossible — the guest call is async, the X11 reason the message
+> pre-pass exists); keying by message index + call position (pi keys by `content.id`, and results
+> can replay out of order).
+>
+> **Tests** — `crates/cyrup-tui/src/tests/extension_renderers.rs`, red-before established by
+> running them at HEAD before the change (2 of 3 failed: `assert_eq!(calls.len(), 2)` saw 0
+> `EXTCALL` rows and the built-in `$ …` header drew; the unclaimed-tool mirror passed, as it must):
+> `a_replayed_tool_call_and_result_still_reach_their_registered_renderer` (extension header and
+> body on screen, built-in header and body absent), `a_replayed_unclaimed_tool_keeps_its_builtin_rendering`
+> (a tool nobody claimed still draws `read src/main.rs:10-14`, no renderer consulted),
+> `each_replayed_tool_row_gets_the_output_of_its_own_call` (two `bash` calls in one turn with
+> results replayed in the OPPOSITE order; each row shows its own call's byte counts — id routing,
+> not name or arrival order). `cargo nextest run -p cyrup-tui` 1347 passed; clippy `-D warnings`
+> clean apart from the pre-existing `input_reader.rs:443` `redundant_closure` committed in
+> `3e69ea2a` (outside this item, area 07); rustdoc `-D warnings` clean; `cargo check -p cyrup`
+> (the production caller, `crates/cyrup/src/interactive.rs`) clean. **Falsification:** load an
+> extension with `register_tool_renderer(T)`, replay a session containing a `T` call, and find the
+> built-in framing instead of the renderer's text — the first test above is that observation.
+>
+> **RESIDUAL, open (low) — replayed custom ENTRIES.** The Fix's last sentence ("do the same for
+> replayed custom entries via `has_entry_renderer`/`render_entry`") and EXT-012's hand-off. It is
+> NOT a rendering seam: `KnownEntry::Custom` never enters the replay stream — `ReplayItem` is
+> documented as pi's `RenderSessionItem` "minus its `custom` entry variant"
+> (`crates/cyrup-session-svc/src/session/types.rs`, `pub enum ReplayItem`) and `push_as_raw`
+> (`crates/cyrup-session/src/context.rs`) has no arm for `KnownEntry::Custom` — so there is nothing
+> for the TUI to ask a renderer about. pi does replay them: `renderSessionEntries` `if (entry.type
+> === "custom") return [entry]` (`interactive-mode.ts:3799-3801` @v0.84.4) → `renderSessionItems`
+> `addCustomEntryToChat(item)` (`:3718`, body `:3570-3592`). One shipped consumer loses its card on
+> `/resume`: `crates/cyrup-intercom/src/extension.rs:481` registers an entry renderer for the
+> inbound-message type. Rated low because that surface carries notifications, not the
+> conversation's substance. Fix: a `ReplayItem::CustomEntry` producer in `AgentSession::replay_items`
+> (area 08 seam, with the compaction-admission rule `build_context_agent_messages_tagged` applies to
+> messages) plus one arm in `replay_session_rendered` calling `extension_render_entry` — the live
+> `EntryAppended` arm in `events_fold.rs` is the template.
 
 **cyrup** — `replay_session_with_extensions` (`crates/cyrup-tui/src/app/session_bind.rs:145-167`) resolves a renderer **only** for custom messages: `let AgentMessage::Custom(c) = message else { continue };` at `:155`. The tool arms of `replay_session_rendered` (`:172`), the walk it delegates to at `:166`, pass no rendered payload at all — `push_tool_start_rendered(…, None)` at `:210-215` and `push_tool_end_rendered(…, None)` at `:240-246`. The plumbing exists and is used on the live path (`extension_render` routes tool calls and results through `ExtensionHost::render_tool_call`/`render_tool_result`, `crates/cyrup-ext/src/facade.rs:701-731`); the replay walk simply never asks. Both production callers hit it (`crates/cyrup/src/main.rs:2073`, `app/run_arms.rs:266`).
 
