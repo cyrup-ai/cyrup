@@ -2,9 +2,9 @@
 
 > **Status** — ~~OPEN~~ **CLOSED 2026-09-04, cyrup `7791b26a`.** **Kind** `port-bug` · **Severity** medium · **Effort** S.
 > Landed exactly as §3 prescribes, with the resolution given a name: `crate::background::attempt_scratch_dir(cwd)`
-> (`background/mod.rs:1470`; pure core `attempt_scratch_dir_in(&Roots, cwd)` at `:1478`, leaf
-> `SCRATCH_SUBDIR = "scratch"` at `:1214`) → `<Roots::run_scratch>/scratch/<cwd_key>`; the one call
-> site is `exec/mod.rs:818` (`prepare_ladder`). Upstream anchors re-read at **v0.64.0** (ADR-0006
+> (`background/mod.rs:1493`; pure core `attempt_scratch_dir_in(&Roots, cwd)` at `:1501`, leaf
+> `SCRATCH_SUBDIR = "scratch"` at `:1237`) → `<Roots::run_scratch>/scratch/<cwd_key>`; the one call
+> site is `exec/mod.rs:827` (`prepare_ladder`). Upstream anchors re-read at **v0.64.0** (ADR-0006
 > parity target; the v0.43.0 anchors below remain correct for the baseline): per-spawn scratch
 > `mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"))` at `src/runs/shared/pi-args.ts:787`/`:802`/
 > `:826`/`:841`/`:855`, `cleanupTempDir` at `:1052-1059`, `TEMP_ROOT_DIR` at `src/shared/types.ts:2689-2691`

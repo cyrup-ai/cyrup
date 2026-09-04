@@ -105,12 +105,14 @@ corrections are applied and recorded at the item.
 | ~~SUBA-084~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / runtime registry | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0) **and ported at `dee8b9d0`**: `RuntimeAgentRegistry`, `AgentSource::Runtime` at source rank 4, the three collision checks, merge inside `run_discovery`, clear on `SessionShutdown`, public `register_agent`. Effort was M, not the filed L; the v0.64.0 event bridge is a recorded residual |
 | ~~SUBA-085~~ | ~~high~~ **CLOSED 2026-09-04** | S | missions | `mission.resolve-decision` ported at `5e3aa1c8` — the seventh verb, the store transition, and upstream's open-decision status gate; the goal driver moves past a resolved decision, pinned by test |
 | ~~SUBA-086~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / diagnostics | **Promoted out of `## Carried` 2026-09-04** (both sides read; three corrections to the filed text recorded in the section) **and ported at `275c1f85`**: `AgentDiscoveryDiagnostic`, `parse_agent_file_checked`, `find_blocking_agent_diagnostic`, rendered by `list`/`get`/`models`/doctor and enforced at both delegation seams |
-| ~~SUBA-087~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | M | background control / child-scoped stop | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; one filing error corrected) **and ported at `2d9d0d0a`**: `childId` on the tool, `control/stop-requests/` queue with `targetIndex`/`childId`, `child_identity`/`child_stop` modules, the runner stops ONE step and keeps the run alive with pi's events and texts. Residual: a `ParallelGroup`/`DynamicGroup`'s members are one step to cyrup's status, so a `tasks[]` fan-out's members are not individually addressable |
-| ~~SUBA-088~~ | ~~medium~~ **CLOSED 2026-09-04** | M | config / discovery / model ladder | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; two citation corrections and one impact correction) **and ported at `ba24e5e5`**: `subagents.defaultProvider` + per-agent `agentOverrides.<name>.defaultProvider` parse with upstream's messages, `AgentDefinition::model_provider` stamped per `applySubagentDefaultModel`, the ladder takes `agent.model_provider ?? parent-session provider` and QUALIFIES a bare id to `provider/id` on the child's `--model`, the `models` report resolves per agent. Residuals (low): v0.64.0's `providerOverrides` and the discovery-cache provider key are not ported; a qualified id the provider does not offer fails in the child rather than at the parent |
+| ~~SUBA-087~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | M | background control / child-scoped stop | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; one filing error corrected) **and ported at `2d9d0d0a`**: `childId` on the tool, `control/stop-requests/` queue with `targetIndex`/`childId`, `child_identity`/`child_stop` modules, the runner stops ONE step and keeps the run alive with pi's events and texts. **Review fix `6cf2cb9f`:** the stop-request file name draws a v7 uuid, so same-millisecond requests drain in write order (the review reproduced a 1-in-25 order flake in this row's tests). Residual: a `ParallelGroup`/`DynamicGroup`'s members are one step to cyrup's status, so a `tasks[]` fan-out's members are not individually addressable — **filed as `SUBA-093` (medium)** |
+| ~~SUBA-088~~ | ~~medium~~ **CLOSED 2026-09-04** | M | config / discovery / model ladder | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; two citation corrections and one impact correction) **and ported at `ba24e5e5`**: `subagents.defaultProvider` + per-agent `agentOverrides.<name>.defaultProvider` parse with upstream's messages, `AgentDefinition::model_provider` stamped per `applySubagentDefaultModel`, the ladder takes `agent.model_provider ?? parent-session provider` and QUALIFIES a bare id to `provider/id` on the child's `--model`, the `models` report resolves per agent. Residuals (low): v0.64.0's `providerOverrides` and the discovery-cache provider key are not ported; a bare id that only ANOTHER provider offers is qualified onto the agent's/parent's provider and fails in the child, where upstream's registry-preferred `resolveExactIdMatches` would resolve it to that provider (upstream throws at the parent only when NO provider offers the id) — corrected wording, review 2026-09-04 |
 | ~~SUBA-089~~ | ~~medium~~ **CLOSED 2026-09-04** | S | model-fallback ladder (foreground + background) | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.47.1, v0.57.0 and v0.64.0; confirmed exactly as filed, one correction: the filing's "retryable patterns present and correct" missed that the same upstream commit added the `connection` + whitespace + `error`/`reset`/`closed`/`aborted` pattern) **and ported at `cde2ddfc`**: `is_retryable_model_failure_attempt` is the ladder's sole retry gate — `tool_count > 0` never re-dispatches, the two empty-output sentinels, the no-activity clause, and per-message `errorMessage` corroboration over the new `AttemptSignal::message_errors`; the connection pattern lands with it. Residual (low): cyrup never emits the v0.64.0 terminal-stopReason sentinel it now recognises |
-| ~~SUBA-090~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | S | background completion notify / `display` | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.43.0, v0.57.0 and v0.64.0; confirmed exactly as filed — predicate verbatim at all three tags, `scheduleOrigin` clause the only tag-to-tag change) **and ported at `79ee7eff`**: `completion_notice_display(ClassifiedOutcome)` is pi's `notify.ts:402` predicate reduced to its one cyrup-reachable clause (`status !== "completed"`), `format_completion_message` computes `display` from the same `classify_outcome` that picks the header word, the false "Always `true`" doc is gone, `trigger_turn` stays `true` (no `triggerTurn:false` input exists). **Residual (medium, area 08/03 seam, not this crate):** on the trigger-turn path `session-svc inject.rs:125-160` drops `display` (`AgentMessage::Custom` has no such field) so the hidden notice still renders on screen; the grouped `formatGroupedCompletion` form stays with `SUBA-017` |
+| ~~SUBA-090~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | S | background completion notify / `display` | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.43.0, v0.57.0 and v0.64.0; confirmed exactly as filed — predicate verbatim at all three tags, `scheduleOrigin` clause the only tag-to-tag change) **and ported at `79ee7eff`**: `completion_notice_display(ClassifiedOutcome)` is pi's `notify.ts:402` predicate reduced to its one cyrup-reachable clause (`status !== "completed"`), `format_completion_message` computes `display` from the same `classify_outcome` that picks the header word, the false "Always `true`" doc is gone, `trigger_turn` stays `true` (no `triggerTurn:false` input exists). **Residual (medium, area 08/03 seam, not this crate):** on the trigger-turn path `session-svc inject.rs:125-160` drops `display` (`AgentMessage::Custom` has no such field) so the hidden notice still renders on screen — **filed as `SUBA-094` (medium)**; the grouped `formatGroupedCompletion` form stays with `SUBA-017` |
 | ~~SUBA-091~~ | ~~medium~~ **CLOSED 2026-09-04** | S | fleet inspector / transcript containment | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0 plus the upstream landing commit `9ceb5650`; confirmed exactly as filed, line drift only) **and ported at `681f6255`**: `FleetState::trusted_session_roots` is pi's `state.trustedSessionRoots` (`index.ts:895-898`: `defaultSessionDir` tilde-expanded + resolved, then the parent's subagent session root, deduped), seeded by `SubagentExecutor::fleet_state` through the pure `paths::trusted_session_roots`, and `async_detail` passes `unique_paths(state.trusted_session_roots)` where the literal `&[]` was, so the session-JSONL tail renders in the detail pane; the containment gate is unchanged. Residuals (low): pi's `trustedSessionFiles`/`trustedSessionFileRoot` rung and `trackedJob?.sessionRoot` are not carried; `subagent status`'s cyrup-original root triple differs from pi's `trustedSessionRootsForStatus` |
 | ~~SUBA-092~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / agent schema | `excludeTools:`/`allowNestedSubagents:` ported at `247ff97b` — frontmatter, settings-override, serializer, and the spawn-plan tool subtraction / nested-fanout grant. v0.64.0's cross-field custom-override precedence change (`31562d76`) is a recorded residual, not this row |
+| SUBA-093 | medium | M | background status model / child-scoped stop | `SUBA-087`'s residual, filed as its own item 2026-09-04: a `ParallelGroup`/`DynamicGroup` is ONE entry in `RunStatus::steps`, so a `tasks[]` fan-out's members have no live per-child status and a child-scoped `stop` can only stop the whole group; upstream flattens members into `steps[]` (`flatIndex`) |
+| SUBA-094 | medium | M | completion notify / session-svc inject seam | `SUBA-090`'s residual, filed as its own item 2026-09-04 — **FIX SITE `crates/cyrup-session-svc` + `crates/cyrup-agent` (areas 08/03)**: `inject_message` drops `display` on the trigger-turn path (`AgentMessage::Custom` has no such field), so a `display: false` completion notice still renders |
 
 > **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
 > eleven items counted "confirmed, schedulable" above, **nine are now closed and one is
@@ -148,6 +150,20 @@ corrections are applied and recorded at the item.
 > (`247ff97b`), **`SUBA-082`** (`5a4ae4ed`), **`SUBA-084`** (`dee8b9d0`), **`SUBA-086`** (`275c1f85`).
 > Per ADR-0006 every port targets **v0.64.0**; where a row was filed at v0.57.0 the section says what
 > v0.64.0 changed and whether the port took it.
+
+> **REVIEW FIXES 2026-09-04, `6cf2cb9f` (code) — the batch-2 review of the five carried-medium ports
+> blocked on one defect and returned four ledger corrections, all landed here.** Blocking:
+> `SUBA-087`'s stop-request tests were order-flaky (reproduced 1-in-25) because two requests written
+> in one millisecond tie on the file name's `ts` prefix and a random v4 uuid decided the drain
+> order — fixed at the source (`control::stop_request_file_name` now draws `Uuid::now_v7()` from the
+> crate's monotonic shared context, so a `ts` tie drains in write order; pinned by
+> `control::tests::same_millisecond_stop_requests_drain_in_write_order`, 24 same-`ts` requests, red
+> under v4 by construction). Ledger: `SUBA-088`'s residual (3) overstated upstream's failure mode
+> (corrected in the row and the section); the two PARTIALLY CLOSED rows (`SUBA-087`, `SUBA-090`)
+> each carried a MEDIUM residual that `scripts/count_open_items.py` could not see (struck id ⇒
+> closed) — each residual is now its own open row, **`SUBA-093`** and **`SUBA-094`**, so the census
+> counts them; `route_child_stop_requests` no longer swallows a failed `status.json` write after an
+> accepted child stop (`tracing::warn`). Item count: 23 ids, `SUBA-072`…`SUBA-094`.
 >
 > **Three rows left `## Carried — NOT adversarially verified` this pass.** `SUBA-082`, `SUBA-084` and
 > `SUBA-086` were first held to the confirmed bar — every upstream line each filing quoted was re-read
@@ -1514,7 +1530,9 @@ passes at `2d9d0d0a`; crate 2696/2696 via `cargo nextest run -p cyrup-ext-subage
 `control.rs` `stop_child_id_is_validated_with_upstreams_message`,
 `stop_requests_are_queued_per_file_drained_oldest_first_and_split_by_scope`,
 `stop_with_a_child_id_resolves_gates_and_targets_the_request` (+ the pre-existing stop tests moved to
-the queue); `routing_tests.rs` `stop_with_child_id_reaches_control_stop_and_writes_a_targeted_request`,
+the queue), and from the review fix `6cf2cb9f` `same_millisecond_stop_requests_drain_in_write_order`
+(24 same-`ts` child requests drain in write order; fails under the v4 name with probability
+1 − 1/24!); `routing_tests.rs` `stop_with_child_id_reaches_control_stop_and_writes_a_targeted_request`,
 `stop_refuses_a_child_that_is_not_pending_or_running_with_upstreams_text` (verbatim sentence),
 `stop_reports_an_unknown_child_with_upstreams_not_found_text`; `runner_main.rs`
 `child_scoped_stop_requests_are_routed_to_one_step_and_never_the_whole_run`; `schema.rs` `childId`
@@ -1536,10 +1554,11 @@ answer `Stop requested for child step:1 in async run <id>.`, write ONE file unde
 write nothing; a plain `stop` must still end the run `Stopped`. Any of those failing reopens the row.
 
 **Residuals — recorded, not closed by this row.** (1) **medium — the filing's headline scenario is
-not delivered:** a `ParallelGroup`/`DynamicGroup` is ONE entry in `RunStatus::steps`
-(`runner_main.rs:1153-1164`) and its members reach `parallel_groups` only after the group settles
-(`record_step_outcome`, `:2347-2382`), so a `tasks[]` fan-out's members have no live per-child
-status to resolve against and `step:0` stops the WHOLE group. Upstream flattens members into
+not delivered — FILED AS `SUBA-093` 2026-09-04 (review fix `6cf2cb9f`):** a `ParallelGroup`/`DynamicGroup`
+is ONE entry in `RunStatus::steps` (`pending_step_status_for`, `runner_main.rs:1159-1170` at HEAD)
+and its members reach `parallel_groups` only after the group settles (`record_step_outcome`,
+`:2550-2602`), so a `tasks[]` fan-out's members have no live per-child status to resolve against
+and `step:0` stops the WHOLE group. Upstream flattens members into
 `steps[]` (one `flatIndex` each). Closing it means live per-member status entries (the telemetry
 pump, steer targeting, the transcript index and `output-<i>.log` all key on the same top-level
 index), which is a status-model change beyond this row; the identity scheme here already follows
@@ -1551,7 +1570,25 @@ breaks the chain on any non-zero step (`subagent-runner.ts:5267`) — pre-existi
 failure path, unchanged here. (5) The whole-run `stop` request is now queue-backed; an OLDER parent
 writing the legacy `control/stop.json` is still honoured (read on every drain), but a NEWER parent
 stopping an older runner is not (that runner reads only `stop.json`) — a one-release skew accepted
-as upstream accepted it.
+as upstream accepted it. (6) **test determinism — FIXED at `6cf2cb9f` (review 2026-09-04):**
+`stop_request_file_name` named a request `<ts:013>-<v4 uuid>.json`, so two requests written in one
+millisecond tied on `ts` and the random uuid decided the name sort that `consumeStopRequestPayloads`'
+stable `ts` sort then preserved (`control-channel.ts:190-192`, `:597`, `:612` @v0.64.0 — upstream's
+`randomUUID()` has the same nondeterminism in production); the review reproduced it as a 1-in-25
+failure of the `[1, 2]` order assertions in `stop_with_a_child_id_resolves_gates_and_targets_the_request`
+and `runner_main`'s `child_scoped_stop_requests_are_routed_to_one_step_and_never_the_whole_run`
+(`SUBA-090` residual 3 had already observed it). The fix is at the source, not the fixtures: the
+name now draws `uuid::Uuid::now_v7()` from the uuid crate's shared monotonic `ContextV7` (counter
+within a millisecond, timestamp bumped on wrap), whose hyphenated hex string is time-then-counter
+ordered, so a `ts` tie drains in WRITE order within one process — `[CYRUP-DELTA]` in uuid version
+only (collision-freedom is unchanged; two parents in two processes still tie arbitrarily, as
+upstream). Rejected: distinct `ts` in the fixtures (hides the same coin toss from the one production
+path that writes twice in a millisecond, `ancestor-stop`'s cascade) and a sequence prefix in the
+name (would change the on-disk shape a pi parent reads). Pinned by
+`control::tests::same_millisecond_stop_requests_drain_in_write_order`; the four stop-request tests
+looped 60× clean after the fix. Same commit: `route_child_stop_requests` reports a failed
+`status.json` write after an accepted child stop with `tracing::warn` instead of `let _ =`
+(pi's `writeStatusPayload` at `subagent-runner.ts:2988` is likewise best-effort, but silent).
 
 ---
 
@@ -1688,10 +1725,19 @@ reopens the row.
 (`selectProviderOverrides`, `agents.ts:1231-1240`): per-provider override maps selected by the
 parent's provider are not modeled; the key is dropped by serde as before. (2) **low —
 `preferredModelProvider` in the discovery cache key** (`:2425-2428`): cyrup's discovery is not cached
-by provider; irrelevant until (1) lands. (3) **low — a qualified `provider/id` whose provider does not
-offer the id** fails in the CHILD (`Unknown model …` from its own registry) where upstream throws
-`Unknown subagent model '<id>' in the active Pi model registry.` at the PARENT before spawning — the
-consequence of qualifying without a registry; closing it means resolving the ladder against
+by provider; irrelevant until (1) lands. (3) **low — a bare id is qualified UNCONDITIONALLY, where upstream
+only PREFERS the provider** (wording corrected by the 2026-09-04 review): `qualify_model_candidate`
+rewrites a bare `<id>` to `<agent.model_provider ?? parent provider>/<id>` with no registry in hand,
+whereas `resolveExactIdMatches` (`runs/shared/model-fallback.ts:115-126` @v0.64.0) takes the
+preferred provider's exact-id match IF it exists and otherwise falls back to the UNIQUE exact-id
+match across the whole registry (`exactMatches.length === 1`), throwing `Unknown subagent model
+'<id>' in the active Pi model registry.` at the parent only when NO provider offers the id. So the
+observable divergence is narrower than "fails in the child instead of at the parent": when exactly
+one OTHER provider offers the bare id, upstream resolves to that provider and cyrup forces the
+preferred one, which then fails in the CHILD (`Unknown model …` from its own registry); when no
+provider offers it both fail, upstream at the parent and cyrup in the child. Not a regression
+against pre-port cyrup (the child resolved a bare id against its default provider,
+`crates/cyrup/src/provider.rs` `select_provider`); closing it means resolving the ladder against
 `HostServices` models on the launch path. (4) `AgentModelSourceInfo.defaultProvider` (`:126`) is not
 carried — cyrup's provenance is a `Copy` enum and upstream has no consumer of the field. (5) The
 `formatAgentCapabilitiesLine` list line (`agent-management.ts:727-745`, `${modelProvider}/${model}`
@@ -1911,7 +1957,8 @@ ordering flake in `SUBA-087`'s stop-request tests (residual 3).
 reach it with `display == true`. Either failing reopens the row.
 
 **Residuals — recorded, not closed by this row.** (1) **medium — the trigger-turn seam drops
-`display` (area 08 session-svc / area 03 session, not this crate):**
+`display` (area 08 session-svc / area 03 session, not this crate) — FILED AS `SUBA-094` 2026-09-04
+so the census counts it:**
 `crates/cyrup-session-svc/src/session/inject.rs:125-160` `inject_message(content, custom_type,
 display, details, trigger_turn)` consults `display` ONLY in the idle, non-trigger-turn branch
 (`append_custom_message(&kind, .., display, details)`); with `trigger_turn = true` it builds
@@ -1928,7 +1975,9 @@ in-baseline, not-ported); the `display` predicate is now independent of it, as t
 / `background::control::tests::stop_with_a_child_id_resolves_gates_and_targets_the_request` fails
 intermittently with two stop requests read back in the opposite order
 (`[(Some(2), "step:2", "c"), (Some(1), "step:1", "b")]` vs the expected `1, 2`); each passes
-alone and in the `background::` group. Directory-order dependence, not this row.
+alone and in the `background::` group. Directory-order dependence, not this row — diagnosed and
+FIXED at `6cf2cb9f` (same-millisecond `ts` tie decided by a v4 uuid; now v7), see `SUBA-087`
+residual (6).
 
 ---
 
@@ -2054,7 +2103,7 @@ Checks at `681f6255`: `cargo fmt --all -- --check`, `cargo clippy -p cyrup-ext-s
 --all-targets -- -D warnings` — clean (both re-run by this ledger pass); the landing commit
 additionally reports `RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-ext-subagents --no-deps` clean
 and `cargo nextest run -p cyrup-ext-subagents --no-fail-fast` 2723/2724, the one failure
-`SUBA-087`'s pre-existing ordering flake (`SUBA-090` residual 3), untouched file, passes alone.
+`SUBA-087`'s pre-existing ordering flake (`SUBA-090` residual 3; fixed at `6cf2cb9f`), untouched file, passes alone.
 
 **Falsification** — with `subagents.defaultSessionDir` configured and a background run whose
 `status.json` records a `sessionFile` under it but has no `output-<i>.log` and an empty
@@ -2248,6 +2297,83 @@ spawn without `bash` in its allowlist and with every other builtin tool present;
 **Relation to corpus** — New; not covered by `SUBA-072`/`SUBA-073`/`SUBA-081` (checked: none of their
 closure evidence, re-read for this pass, mentions `excludeTools` or `allowNestedSubagents`). Distinct
 from area 09's `SUBA-006`/`SUBA-014`, which are about the *existing* `tools:` allowlist mechanism.
+
+---
+
+## SUBA-093 — A child-scoped `stop` cannot address a `ParallelGroup`/`DynamicGroup` member: cyrup's status model has ONE step per group, upstream flattens members into `steps[]`
+
+> **Filed 2026-09-04 from `SUBA-087`'s residual (1)** (review fix `6cf2cb9f`), so the residual is a
+> counted row rather than prose inside a closed one. It is the filing's headline scenario for
+> `SUBA-087` (`subagent({action:"stop", id, childId})` against a `tasks[]` fan-out); everything else
+> in that row landed.
+
+**Kind** port limitation (status model) · **Severity** medium · **Effort** M · **Confidence** confirmed
+(both sides read for `SUBA-087` at v0.57.0 and v0.64.0; cyrup re-read at HEAD).
+
+**cyrup** — `crates/cyrup-ext-subagents/src/background/runner_main.rs` `pending_step_status_for`
+(`:1159-1170`): a `RunnerStep::ParallelGroup` becomes ONE `StepStatus` labelled
+`<parallel:N tasks>`; its members' per-child detail reaches `RunStatus::parallel_groups` only when
+the group settles (`record_step_outcome`, `:2550-2602`). `background/child_identity.rs` resolves a
+`childId` against `RunStatus::steps` by index/agent/workflow key, so `step:<i>` for a group index
+targets the group's single entry and `route_child_stop_requests` (`runner_main.rs`) fires the ONE
+stop handle registered for that top-level index — the whole group is torn down. The telemetry pump,
+steer targeting, the transcript index and `output-<i>.log` all key on the same top-level index.
+
+**upstream** — `src/runs/background/subagent-runner.ts` @v0.64.0: every member of a parallel group
+is its own flat step (`flatIndex` on the step context, `:1294`; used as the `stepIndex`/`childIndex`
+of every event and file it produces, `:1472-1508`, `:1709`, `:1746`, `:1762`, `:1829`), so
+`markChildStopRequested` (`:2979-2991`) and `stopChildStep` (`:3015-3031`) address one member and
+`registerStepStop` fires only that member's handle.
+
+**Impact** — the one scenario the `SUBA-087` filing led with is still not deliverable: a parent that
+wants ONE member of a fan-out gone must stop the whole group (or the run).
+
+**Fix** — live per-member status entries: flatten group members into `RunStatus::steps` at
+declaration (one entry per member with a group tag), key the pump/steer/transcript/output-log paths
+on the flat index, and register each member's stop handle under it. The identity scheme in
+`child_identity.rs` already follows upstream's flat index once that lands. Status-model change with
+consumers in `tui/` and `cyrup-it`; not a one-row edit.
+
+**Verify** — `subagent({action:"stop", id, childId:"step:1"})` against a running 3-task `tasks[]`
+group must tear down member 1 only, the other two completing with their own outputs; today the
+call resolves the group entry and stops all three.
+
+---
+
+## SUBA-094 — A `display: false` completion notice still renders: the session-svc trigger-turn injection drops `display` because `AgentMessage::Custom` cannot carry it
+
+> **Filed 2026-09-04 from `SUBA-090`'s residual (1)** (review fix `6cf2cb9f`), so the residual is a
+> counted row rather than prose inside a closed one. **FIX SITE `crates/cyrup-session-svc` and
+> `crates/cyrup-agent` (areas 08 / 03), not this crate** — filed here so the enumeration is not
+> lost; the area-08 ledger agent may re-home it.
+
+**Kind** port-bug (cross-crate seam) · **Severity** medium · **Effort** M · **Confidence** confirmed
+(both sides read for `SUBA-090` at v0.43.0, v0.57.0 and v0.64.0; cyrup re-read at HEAD).
+
+**cyrup** — `crates/cyrup-ext-subagents` now computes `display` per pi's predicate
+(`SUBA-090`, `79ee7eff`: `completion_notice_display` = `outcome != Completed`) and hands it to
+`inject_message(content, custom_type, display, details, trigger_turn)` with `trigger_turn = true`.
+`crates/cyrup-session-svc/src/session/inject.rs:117-160` consults `display` ONLY in the idle,
+non-trigger-turn branch (`append_custom_message(&kind, .., display, details)`); on the trigger-turn
+path it builds `AgentMessage::Custom { kind, payload, details, timestamp }`
+(`crates/cyrup-agent/src/event.rs:39-51` — no `display` field) and `spawn_run`s over it, so the TUI
+renders the notice from `message_end` regardless.
+
+**upstream** — `src/runs/background/notify.ts` @v0.64.0: `display` computed at `:402`
+(`details.some(d => d.source === "foreground" || d.status !== "completed" || d.scheduleOrigin !==
+undefined)`) and passed on the `sendMessage` call at `:408` together with `triggerTurn` (`:603-617`
+default `true`); pi's `sendMessage({customType, content, display, triggerTurn})` honours `display:
+false` on a triggering message — the model sees the notice, the screen does not.
+
+**Impact** — every plain successful background completion is still drawn on screen; the `SUBA-090`
+fix is inert at the one surface a user sees.
+
+**Fix** — carry `display` with the Custom message: an `Option<bool>`/`bool` on
+`AgentMessage::Custom`, threaded by `inject.rs`'s trigger-turn branch and honoured by the TUI
+renderer (`cyrup-tui/src/app/extension_render.rs` reads the message off `message_end`).
+
+**Verify** — a background run that completes cleanly must reach the model (next turn sees the
+notice) and NOT be drawn on screen; a failed one must be drawn. Today both are drawn.
 
 ---
 
