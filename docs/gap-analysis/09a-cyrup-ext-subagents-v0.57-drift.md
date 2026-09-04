@@ -108,6 +108,7 @@ corrections are applied and recorded at the item.
 | ~~SUBA-087~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | M | background control / child-scoped stop | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; one filing error corrected) **and ported at `2d9d0d0a`**: `childId` on the tool, `control/stop-requests/` queue with `targetIndex`/`childId`, `child_identity`/`child_stop` modules, the runner stops ONE step and keeps the run alive with pi's events and texts. Residual: a `ParallelGroup`/`DynamicGroup`'s members are one step to cyrup's status, so a `tasks[]` fan-out's members are not individually addressable |
 | ~~SUBA-088~~ | ~~medium~~ **CLOSED 2026-09-04** | M | config / discovery / model ladder | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; two citation corrections and one impact correction) **and ported at `ba24e5e5`**: `subagents.defaultProvider` + per-agent `agentOverrides.<name>.defaultProvider` parse with upstream's messages, `AgentDefinition::model_provider` stamped per `applySubagentDefaultModel`, the ladder takes `agent.model_provider ?? parent-session provider` and QUALIFIES a bare id to `provider/id` on the child's `--model`, the `models` report resolves per agent. Residuals (low): v0.64.0's `providerOverrides` and the discovery-cache provider key are not ported; a qualified id the provider does not offer fails in the child rather than at the parent |
 | ~~SUBA-089~~ | ~~medium~~ **CLOSED 2026-09-04** | S | model-fallback ladder (foreground + background) | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.47.1, v0.57.0 and v0.64.0; confirmed exactly as filed, one correction: the filing's "retryable patterns present and correct" missed that the same upstream commit added the `connection` + whitespace + `error`/`reset`/`closed`/`aborted` pattern) **and ported at `cde2ddfc`**: `is_retryable_model_failure_attempt` is the ladder's sole retry gate — `tool_count > 0` never re-dispatches, the two empty-output sentinels, the no-activity clause, and per-message `errorMessage` corroboration over the new `AttemptSignal::message_errors`; the connection pattern lands with it. Residual (low): cyrup never emits the v0.64.0 terminal-stopReason sentinel it now recognises |
+| ~~SUBA-090~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | S | background completion notify / `display` | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.43.0, v0.57.0 and v0.64.0; confirmed exactly as filed — predicate verbatim at all three tags, `scheduleOrigin` clause the only tag-to-tag change) **and ported at `79ee7eff`**: `completion_notice_display(ClassifiedOutcome)` is pi's `notify.ts:402` predicate reduced to its one cyrup-reachable clause (`status !== "completed"`), `format_completion_message` computes `display` from the same `classify_outcome` that picks the header word, the false "Always `true`" doc is gone, `trigger_turn` stays `true` (no `triggerTurn:false` input exists). **Residual (medium, area 08/03 seam, not this crate):** on the trigger-turn path `session-svc inject.rs:125-160` drops `display` (`AgentMessage::Custom` has no such field) so the hidden notice still renders on screen; the grouped `formatGroupedCompletion` form stays with `SUBA-017` |
 | ~~SUBA-092~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / agent schema | `excludeTools:`/`allowNestedSubagents:` ported at `247ff97b` — frontmatter, settings-override, serializer, and the spawn-plan tool subtraction / nested-fanout grant. v0.64.0's cross-field custom-override precedence change (`31562d76`) is a recorded residual, not this row |
 
 > **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
@@ -188,15 +189,16 @@ corrections are applied and recorded at the item.
 >   from the base commit's own files). Every implementer hit it and reverted the churn by hand.
 >   Repo-level decision, ownerless.
 
-Carried-but-unverified (`## Carried — NOT adversarially verified`): **two rows, both medium** —
-`SUBA-090`, `SUBA-091`. (The three highs that sat here,
+Carried-but-unverified (`## Carried — NOT adversarially verified`): **one row, medium** —
+`SUBA-091`. (The three highs that sat here,
 `SUBA-082`/`SUBA-084`/`SUBA-086`, were promoted and closed on 2026-09-04 — see the blockquote
 above; `SUBA-087` was promoted, confirmed and PARTIALLY CLOSED on 2026-09-04 at `2d9d0d0a` — see
 `## ~~SUBA-087~~`; `SUBA-088` was promoted, confirmed and CLOSED on 2026-09-04 at `ba24e5e5` — see
 `## ~~SUBA-088~~`; `SUBA-089` was promoted, confirmed and CLOSED on 2026-09-04 at `cde2ddfc` — see
-`## ~~SUBA-089~~`.) All were re-checked port-side at cyrup HEAD `2571969` this pass: every zero-hit
-grep this file recorded for them still returns zero hits — none of the 210 commits since baseline
-`4fb5e40` touched any of these symbols/behaviours. The two remaining are left exactly as filed,
+`## ~~SUBA-089~~`; `SUBA-090` was promoted, confirmed and PARTIALLY CLOSED on 2026-09-04 at
+`79ee7eff` — see `## ~~SUBA-090~~`.) All were re-checked port-side at cyrup HEAD `2571969` this
+pass: every zero-hit grep this file recorded for them still returns zero hits — none of the 210
+commits since baseline `4fb5e40` touched any of these symbols/behaviours. The one remaining is left exactly as filed,
 still held to the lower evidence standard the section header states (upstream line numbers not
 re-verified) — no pass has yet re-read `git show v0.57.0:<path>` for any of them, only the cyrup
 side.
@@ -1824,6 +1826,108 @@ row's scope. (3) **text-only —** the crate evaluates patterns per line, so `co
 (whitespace run containing a newline) does not match where JS `\s+` would; the same pre-existing
 limitation applies to `rate\s*limit`, and no producer emits either shape.
 
+## ~~SUBA-090~~ — ~~medium~~ **PARTIALLY CLOSED 2026-09-04** — Completion notices are always rendered: the port hardcodes `display: true` where upstream hides a plain successful background completion and groups a batch
+
+> **PROMOTED OUT OF `## Carried — NOT adversarially verified`, CONFIRMED EXACTLY AS FILED, AND
+> PARTIALLY CLOSED 2026-09-04 — landing commit `79ee7eff` (code), parent `48b4e8fb`.** Upstream
+> re-read with `git show` at v0.43.0, v0.57.0 and v0.64.0. Every filed upstream line resolves:
+> `v0.57.0:src/runs/background/notify.ts:239` carries the predicate verbatim and `:241-247` the
+> `pi.sendMessage({customType: "subagent-notify", content, display}, {triggerTurn: items.some((item)
+> => item.triggerTurn)})`; `v0.43.0:notify.ts:173` is the same expression without the
+> `scheduleOrigin` clause (in-baseline, window exact); `v0.57.0:notify.ts:379` /
+> `v0.64.0:notify.ts:605` `triggerTurn: result.triggerTurn !== false` per completion;
+> `v0.57.0:notify.ts:211-226` / `v0.64.0:notify.ts:376-393` `formatGroupedCompletion`. **No
+> correction to the filing.** **Port-side at `48b4e8fb`, before the change:** `watch.rs:780-781`
+> `display: true, trigger_turn: true,` (the filing's `:745-746` moved under the workspace rustfmt
+> pass), no branch on outcome or source in `format_completion_message`, the struct doc at `:610-625`
+> still asserting *"Always `true` (pi's `display: true`)"*; `rg 'Background tasks completed|
+> format_grouped_completion|schedule' crates/cyrup-ext-subagents/src/background/{watch,mod}.rs` → 0.
+> **v0.57.0 → v0.64.0:** no change to the predicate or the send; `:402`/`:404-410` are the same
+> lines re-numbered. Severity `medium` stands; effort S was exact. Port target v0.64.0. **Why
+> PARTIAL, not CLOSED:** the crate now emits the right `display`, but the consumer seam outside the
+> crate drops it on the trigger-turn path (residual 1 below) — a fix that is correct and necessary
+> in this crate and not, by itself, sufficient to keep the notice off the screen.
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed (2026-09-04, three tags)
+**Subsystem** background completion notify / `display`
+**Window** in-baseline (≤ v0.43.0)
+
+**upstream (v0.64.0)** — `src/runs/background/notify.ts:399-412`:
+```ts
+function sendCompletion(pi: Pick<ExtensionAPI, "sendMessage">, items: PendingCompletion[]): boolean {
+	if (items.length === 0) return true;
+	const details = items.map((item) => item.details);
+	const content = details.length === 1 ? formatSingleCompletion(details[0]!) : formatGroupedCompletion(details);
+	const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined);
+	try {
+		pi.sendMessage({ customType: "subagent-notify", content, display }, { triggerTurn: items.some((item) => item.triggerTurn) });
+```
+`:444` `const status = stopped ? "stopped" : paused ? "paused" : result.success ? "completed" :
+"failed"` (the `status` input); `:36-56` `SubagentNotifyDetails { status, source?: "async" |
+"foreground", scheduleOrigin?, … }`; `:605` `triggerTurn: result.triggerTurn !== false`; `:608-616`
+a foreground or non-`completed` completion is emitted at once, a `completed` one goes to the
+batcher. Same at `v0.57.0:notify.ts:235-249` and, minus `scheduleOrigin`, at
+`v0.43.0:notify.ts:169-178`.
+
+**cyrup (at `79ee7eff`)** — `crates/cyrup-ext-subagents/src/background/watch.rs`
+`completion_notice_display(ClassifiedOutcome) -> bool` (`outcome != Completed`): pi's `:402`
+reduced to its one cyrup-reachable clause, with the doc stating that `ResultFile`
+(`background/mod.rs` `ResultFile{id, run_id, agent, mode, state, success, cwd, session_file,
+results}`) carries neither `source` (detached-foreground completions are not ported) nor
+`scheduleOrigin` (durable schedules are not ported), so those clauses are vacuously false here —
+NOT that upstream is unconditional; `format_completion_message` classifies once and feeds the same
+`classify_outcome` result to both the header word and `display`; `CompletionMessage::display` and
+`::trigger_turn` docs rewritten to cite `notify.ts:402`/`:605` @v0.64.0 (`trigger_turn` stays `true`:
+cyrup has no per-result `triggerTurn: false` input, so pi's default is the only reachable value);
+`HostServicesCompletionSink::deliver` forwards the computed `display` to
+`HostServices::inject_message` unchanged (it already did). Design: no new type — a pure predicate
+over the existing `ClassifiedOutcome` enum, kept out of the I/O sink (Functional Core); rejected
+adding dead `source`/`schedule_origin` fields to `ResultFile` with no producer, and the grouped
+form (that is `SUBA-017`'s batcher).
+
+**Tests (fail before / pass after):**
+`background::watch::tests::a_plain_successful_background_completion_is_not_displayed`,
+`…::format_completion_message_reproduces_notify_ts_layout` (now `assert!(!msg.display)` on the
+completed fixture) and
+`…::install_completion_watcher_fires_exactly_one_notify_and_deletes_the_result` (now asserts the
+`display` the sink receives is `false`) — RED run recorded against a stub predicate returning
+`true` (HEAD's behaviour, everything else in place): all three fail with `display == true`; GREEN
+at `79ee7eff`. `…::failed_paused_and_stopped_completions_are_displayed` (failed, `Complete`+
+`success:false`, paused, stopped — all displayed, all still `trigger_turn`) is a regression guard
+that is green at HEAD by construction. `crates/cyrup-it/tests/subagents/companions_hostservices_proof.rs`
+`background_completion_injects_a_turn_triggering_message_on_the_real_host_services` now asserts
+`!display` on the recorded `inject_message` call (fails at `48b4e8fb`: `display == true`); **not
+run in this session** — the `it`-feature target could not be built (ENOSPC, 15 MB free on `/`).
+Checks: `cargo fmt --all -- --check`, `cargo clippy -p cyrup-ext-subagents --all-targets -- -D
+warnings`, `RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-ext-subagents --no-deps` — clean;
+`cargo nextest run -p cyrup-ext-subagents` 2717/2718, the one failure an unrelated pre-existing
+ordering flake in `SUBA-087`'s stop-request tests (residual 3).
+
+**Falsification** — a `ResultFile` with `state: Complete, success: true` must reach
+`HostServices::inject_message` with `display == false` and `trigger_turn == true`; any of
+`Failed`, `Complete`+`success: false`, `Paused`, `Stopped` (or a child with `stopped: true`) must
+reach it with `display == true`. Either failing reopens the row.
+
+**Residuals — recorded, not closed by this row.** (1) **medium — the trigger-turn seam drops
+`display` (area 08 session-svc / area 03 session, not this crate):**
+`crates/cyrup-session-svc/src/session/inject.rs:125-160` `inject_message(content, custom_type,
+display, details, trigger_turn)` consults `display` ONLY in the idle, non-trigger-turn branch
+(`append_custom_message(&kind, .., display, details)`); with `trigger_turn = true` it builds
+`AgentMessage::Custom{kind, payload, details, timestamp}` (`crates/cyrup-agent/src/event.rs:39-51`
+— no `display` field) and `spawn_run`s over it, so a `display: false` notice is still rendered
+from `message_end`. Until `display` travels with the Custom message through `inject.rs`,
+`AgentMessage::Custom` and the TUI renderer, this crate's fix is inert at the screen. That is the
+gap between PARTIAL and CLOSED, and it is an M-effort cross-crate change. (2) **low — grouped
+form:** `formatGroupedCompletion` (`Background tasks completed (N): **a**, **b**` header + numbered
+blocks) and the `completed`-only batching that feeds it remain `SUBA-017` (completion batching,
+in-baseline, not-ported); the `display` predicate is now independent of it, as the filing said.
+(3) **test-flake, `SUBA-087`'s, observed here:** in the full-crate run one of
+`background::runner_main::tests::child_scoped_stop_requests_are_routed_to_one_step_and_never_the_whole_run`
+/ `background::control::tests::stop_with_a_child_id_resolves_gates_and_targets_the_request` fails
+intermittently with two stop requests read back in the opposite order
+(`[(Some(2), "step:2", "c"), (Some(1), "step:1", "b")]` vs the expected `1, 2`); each passes
+alone and in the `background::` group. Directory-order dependence, not this row.
+
 ---
 
 ## Carried — NOT adversarially verified
@@ -1831,8 +1935,8 @@ limitation applies to `rate\s*limit`, and no producer emits either shape.
 > **2026-09-04: three of the eight rows this section was written for — `SUBA-082`, `SUBA-084`,
 > `SUBA-086` — were held to the confirmed bar, confirmed, ported and CLOSED; each now has a full
 > section in the confirmed set above (in id order) and only a pointer remains here; `SUBA-087`,
-> `SUBA-088` and `SUBA-089` followed the same day. The two below are unchanged and still carried at
-> this section's lower standard.**
+> `SUBA-088`, `SUBA-089` and `SUBA-090` followed the same day. The one below is unchanged and still
+> carried at this section's lower standard.**
 
 > **READ THIS BEFORE ACTING ON ANYTHING IN THIS SECTION.** The refutation pass for this batch was
 > capped at twelve items. The eight items below were produced by the same analyst lenses as the
@@ -1859,43 +1963,7 @@ limitation applies to `rate\s*limit`, and no producer emits either shape.
 
 ### ~~SUBA-089~~ — **PROMOTED AND CLOSED 2026-09-04** — see `## ~~SUBA-089~~` in the confirmed set above (landing commit `cde2ddfc`)
 
-### SUBA-090 — Completion notices are always rendered: the port hardcodes `display: true` where upstream hides a plain successful background completion and groups a batch
-
-**Severity** medium (as filed) · **Effort** S · **Window** in-baseline (≤ v0.43.0)
-
-*Upstream, as filed (unverified):* `src/runs/background/notify.ts:239` —
-`const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined);`
-then `:241-249` `pi.sendMessage({customType: "subagent-notify", content, display}, {triggerTurn: items.some((item) => item.triggerTurn)})`.
-`v0.43.0:notify.ts:173` carries the same expression minus the `scheduleOrigin` clause, so it is
-in-baseline. `:379` shows `triggerTurn: result.triggerTurn !== false` — per-completion, not a
-constant. `:211-242` render a `Background tasks completed (N): …` header plus numbered blocks whenever
-a batch holds more than one completion.
-
-*Port (re-verified at HEAD):* `crates/cyrup-ext-subagents/src/background/watch.rs:741-746` —
-```rust
-CompletionMessage {
-    custom_type: "subagent-notify".to_string(),
-    content: lines.join("\n"),
-    display: true,
-    trigger_turn: true,
-}
-```
-— both literals, with no branch on outcome or source anywhere in `format_completion_message`
-(`:711-747`). **The struct's own doc at `:605-609` asserts** *"Always `true` (pi's `display: true`)"*
-and *"Always `true` (pi's `{ triggerTurn: true }`)"* — a statement about upstream that
-`notify.ts:239` contradicts at both tags. `grep -rn 'Background task'` shows only the singular header,
-never the plural grouped form.
-
-*Behaviour gap:* upstream injects a plain successful background completion as a NON-displayed context
-message that still triggers a turn, rendering the notice only when something needs attention (a
-foreground detach, or a failed/paused/stopped/scheduled outcome). A session that fans out ten
-successful background tasks shows ten notices the port renders and upstream would have kept invisible,
-and the grouped multi-completion form is never rendered at all.
-
-*Relation:* new, and it **partially refutes `SUBA-017`'s framing**: `SUBA-017` (completion batching,
-low) treats grouping as the missing piece, but the load-bearing half is the `display` predicate — a
-two-line fix independent of the batcher. The port's own doc comment asserting upstream uses
-`display: true` unconditionally is the reason no prior pass caught it.
+### ~~SUBA-090~~ — **PROMOTED AND PARTIALLY CLOSED 2026-09-04** — see `## ~~SUBA-090~~` in the confirmed set above (landing commit `79ee7eff`)
 
 ### SUBA-091 — The fleet inspector passes an EMPTY trusted-root list to the transcript reader, so the session-transcript fallback always refuses
 
@@ -2227,7 +2295,7 @@ resolving a cited path. Adopt that as the standing rule for this area.
 **(5) Two in-source comments assert things about upstream that upstream contradicts, and both hid a
 defect.**
 - `background/watch.rs:605-609` says pi uses `display: true` unconditionally; `notify.ts:239`
-  computes it (`SUBA-090`).
+  computes it (`SUBA-090` — comment removed and the predicate ported at `79ee7eff`, 2026-09-04).
 - `discovery/types.rs:411-414` says `AgentOverrideConfig` is *"a field-for-field port … and pi has no
   others"* while pi had four more at the measured baseline and nine more at v0.57.0 (`SUBA-081`).
 
