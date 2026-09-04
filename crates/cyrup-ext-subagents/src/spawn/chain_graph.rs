@@ -164,12 +164,15 @@ pub struct SingleStepSpec {
     /// each child's directory at the DISPATCH site — verbatim for a sequential step
     /// (`subagent-runner.ts:2793`), `<root>/parallel-<taskIdx>` for a parallel member (`:2587-2596`),
     /// `<root>/dynamic-<step>-<item>` for a dynamic one (`:2309`). cyrup's `run_single` is the ONE
-    /// dispatch adapter all three shapes funnel through and it is handed no per-member index it can
-    /// trust (`current_flat_index` is published once per GROUP, so every concurrently-running member
-    /// of a parallel group reads the same value), so deriving the per-child directory there would
-    /// hand two concurrent siblings the same session store. Resolving it per step, parent-side,
-    /// where the layout is actually known, is collision-free by construction — and is the same shape
-    /// [`Self::output_path`] already has for exactly the same reason.
+    /// dispatch adapter all three shapes funnel through; resolving the per-child directory there
+    /// rather than parent-side buys nothing, because parent-side resolution — where the layout is
+    /// actually known — is collision-free by construction, the same shape [`Self::output_path`]
+    /// already has for exactly the same reason.
+    ///
+    /// (Before SUBA-093 this note also said `run_single` was handed no per-member index it could
+    /// trust, because the runner published one flat index per GROUP. That is no longer true —
+    /// [`ChainRunContext::step_slot`] is stamped per member — but it was never the load-bearing
+    /// half of the argument, so the delta stands unchanged.)
     ///
     /// `None` = this step contributes no `sessionDir` term; the child is spawned `--no-session`
     /// unless its own [`Self::session_file`] or the run's
@@ -1321,6 +1324,60 @@ pub struct ChainRunContext {
     /// (Wiring the real config value here is the Tier-6 `chain.dynamicFanout.maxItems` config-key
     /// task; today's foreground/background callers pass `None`.)
     pub dynamic_fanout_max_items: Option<u32>,
+    /// SUBA-093 — the FLAT status slot the dispatch this context is handed to occupies (pi's
+    /// per-step `ctx.flatIndex`, `subagent-runner.ts:1294` @v0.64.0, set per member at each of
+    /// pi's three dispatch sites: `:4245` parallel, `:4640` dynamic, `:5017` sequential).
+    ///
+    /// [`dispatch_group`] re-stamps its clone of this context per fanned-out child, which is the
+    /// ONLY thing that lets a concurrently-running member of a `ParallelGroup` be told apart from
+    /// its siblings by everything that keys on a flat index: the live-telemetry fold, the
+    /// per-child steer inbox/ack/capability paths, the child's intercom presence label, and the
+    /// child-scoped stop handle a `subagent({action:"stop", childId})` fires.
+    ///
+    /// A foreground walk (no `status.json`, no control inbox) leaves this at
+    /// `StepSlot::Exclusive(0)`; nothing on that path reads it.
+    pub step_slot: StepSlot,
+}
+
+/// SUBA-093 — whether one dispatch OWNS its flat status slot or shares it with concurrently
+/// running siblings.
+///
+/// This is a bool-beside-an-index made explicit, and the distinction is load-bearing rather than
+/// cosmetic: a per-child stop handle, a per-child steer inbox and a per-child telemetry fold are
+/// only correct when exactly one live child answers to the index. A `ParallelGroup`'s members each
+/// own their own slot after this item's flatten; a `DynamicGroup`'s members still share the single
+/// slot the group declares, because cyrup does not splice materialized dynamic items into
+/// `RunStatus::steps` the way upstream does (`subagent-runner.ts:4155` @v0.64.0) — see
+/// [`crate::background::flat_index`]'s module docs for why. Consumers that would corrupt a
+/// sibling's state must check [`StepSlot::exclusive_index`] rather than reading the raw index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepSlot {
+    /// This dispatch is the only live child answering to flat index `.0`.
+    Exclusive(usize),
+    /// This dispatch shares flat index `.0` with its concurrently-running siblings.
+    Shared(usize),
+}
+
+impl StepSlot {
+    /// The flat status index either way — what an event's `stepIndex`, `output-<i>.log` and the
+    /// telemetry fold use, all of which are per-index accumulations that tolerate sharing.
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::Exclusive(index) | Self::Shared(index) => index,
+        }
+    }
+
+    /// The flat status index ONLY when this dispatch owns it exclusively — what a per-child stop
+    /// handle keys on, since registering two live children under one index would let a stop aimed
+    /// at either tear down whichever registered last.
+    #[must_use]
+    pub fn exclusive_index(self) -> Option<usize> {
+        match self {
+            Self::Exclusive(index) => Some(index),
+            Self::Shared(_) => None,
+        }
+    }
 }
 
 /// The single dispatch primitive [`walk_chain`] uses to run exactly one [`SingleStepSpec`]
@@ -1532,6 +1589,10 @@ async fn run_parallel_group(
         spec.fail_fast,
         single,
         ctx,
+        // SUBA-093: every member of a static fan-out owns its own flat status slot, because
+        // `flat_index::pending_step_statuses_for` declared one `RunStatus::steps` entry per member
+        // (pi `subagent-runner.ts:2618-2652` @v0.64.0).
+        GroupSlotLayout::PerMember,
     )
     .await;
     let collapsed = group_result.aggregate.clone();
@@ -1689,8 +1750,18 @@ async fn run_dynamic_group(
         // a static parallel step uses. Passing a hardcoded `false` here would leave the
         // validator-accepted `failFast` key (`dynamic-fanout.ts:44`) silently inert and
         // spawn — and pay for — every remaining item after the first failure.
-        let group_result =
-            dispatch_group(expanded, spec.concurrency, spec.fail_fast, single, ctx).await;
+        let group_result = dispatch_group(
+            expanded,
+            spec.concurrency,
+            spec.fail_fast,
+            single,
+            ctx,
+            // SUBA-093 residual: cyrup declares ONE flat slot for a dynamic group and does
+            // not splice materialized items into `RunStatus::steps` the way pi does
+            // (`subagent-runner.ts:4155` @v0.64.0), so its members share that slot.
+            GroupSlotLayout::SharedSlot,
+        )
+        .await;
 
         // Fold the per-child results into the ordered collect-record array (pi
         // `collectDynamicResults`, `dynamic-fanout.ts:263-287` @v0.34.0). Every field
@@ -1945,12 +2016,18 @@ async fn assign_worktree_cwds(
 /// `Clone`, see its own doc comment) is likewise cloned per task — this crate is
 /// `#![forbid(unsafe_code)]`, so an owned, `Clone`-based hand-off across the `tokio::spawn`
 /// boundary is used instead of any raw-pointer/lifetime-erasure trick.
+///
+/// SUBA-093 — `slots` says how the group's members map onto `RunStatus::steps`, and the worker
+/// closure re-stamps its per-child clone of `ctx` accordingly. That per-child stamp is pi's
+/// `{...ctx, flatIndex: fi}` spread at each fan-out dispatch site (`subagent-runner.ts:4245-4253`
+/// @v0.64.0), and it is what makes a concurrently-running member individually addressable.
 async fn dispatch_group(
     steps: Vec<SingleStepSpec>,
     concurrency: u32,
     fail_fast: bool,
     single: &Arc<dyn SingleStepExecutor>,
     ctx: &ChainRunContext,
+    slots: GroupSlotLayout,
 ) -> GroupStepResult {
     let cancel = ctx.cancel.clone();
     let global_limit = ctx.global_limit.clone();
@@ -1963,9 +2040,10 @@ async fn dispatch_group(
         &global_limit,
         fail_fast,
         cancel,
-        move |_index, step: SingleStepSpec| {
+        move |index, step: SingleStepSpec| {
             let single = Arc::clone(&single);
-            let ctx = ctx.clone();
+            let mut ctx = ctx.clone();
+            ctx.step_slot = slots.slot_for(ctx.step_slot, index);
             async move {
                 let resolved_task = step.task.clone();
                 single.run_single(&step, &resolved_task, &ctx).await
@@ -1975,6 +2053,31 @@ async fn dispatch_group(
     .await;
 
     collapse_fan_out(fan_out)
+}
+
+/// SUBA-093 — how one group's members map onto the run's flat `RunStatus::steps` list.
+///
+/// Named by the domain fact rather than by a `bool per_member`: the two arms differ in whether a
+/// member is individually addressable at all, which decides whether a per-child stop handle, steer
+/// inbox and telemetry fold are safe to key on the index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupSlotLayout {
+    /// The group declared one `RunStatus::steps` entry per member (pi's `ParallelGroup` flatten,
+    /// `subagent-runner.ts:2618-2652` @v0.64.0), so member `i` owns `group_base + i`.
+    PerMember,
+    /// The group declared a single entry that every member shares (cyrup's un-spliced
+    /// `DynamicGroup`, a recorded SUBA-093 residual).
+    SharedSlot,
+}
+
+impl GroupSlotLayout {
+    /// The slot member `index` of a group based at `group_slot` runs under.
+    fn slot_for(self, group_slot: StepSlot, index: usize) -> StepSlot {
+        match self {
+            Self::PerMember => StepSlot::Exclusive(group_slot.index() + index),
+            Self::SharedSlot => StepSlot::Shared(group_slot.index()),
+        }
+    }
 }
 
 /// Collapse a [`crate::spawn::parallel::run_bounded`] [`FanOutResult`] into this file's
@@ -2112,6 +2215,7 @@ mod tests {
             original_task: String::new(),
             chain_dir: None,
             dynamic_fanout_max_items: None,
+            step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
         }
     }
 
@@ -2292,6 +2396,115 @@ mod tests {
             .expect("present");
         assert!(step3_pos > p1_pos && step3_pos > p2_pos);
         assert!(calls[0].starts_with("step-1"));
+    }
+
+    // ---- SUBA-093: the flat status slot each dispatch runs under ----
+
+    /// Records the [`StepSlot`] each dispatched step observed on its context, keyed by the task
+    /// text it was dispatched with — the one thing every per-child surface of a background run is
+    /// keyed by (`RunOptions::child_index`, the steer inbox/ack/capability paths, the live
+    /// telemetry tag and the child-scoped stop handle).
+    #[derive(Default)]
+    struct SlotRecordingExecutor {
+        slots: StdMutex<Vec<(String, StepSlot)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SingleStepExecutor for SlotRecordingExecutor {
+        async fn run_single(
+            &self,
+            _step: &SingleStepSpec,
+            resolved_task: &str,
+            ctx: &ChainRunContext,
+        ) -> Result<StepResult, SubagentError> {
+            self.slots
+                .lock()
+                .expect("lock")
+                .push((resolved_task.to_string(), ctx.step_slot));
+            Ok(StepResult::success(Some(String::new()), None))
+        }
+    }
+
+    /// SUBA-093 — every member of a `ParallelGroup` is dispatched under its OWN exclusive flat
+    /// slot, counted up from the group's base (pi's per-member `flatIndex`,
+    /// `subagent-runner.ts:4245` @v0.64.0). Before this item all three members read one index
+    /// published once per group, so a `childId` could only ever address the whole fan-out.
+    #[tokio::test]
+    async fn every_parallel_group_member_is_dispatched_under_its_own_exclusive_flat_slot() {
+        let graph: ChainGraph = vec![RunnerStep::ParallelGroup(ParallelGroupSpec {
+            steps: vec![
+                single_step("worker", "task-a"),
+                single_step("worker", "task-b"),
+                single_step("worker", "task-c"),
+            ],
+            concurrency: 3,
+            fail_fast: false,
+            worktree: false,
+        })];
+        let executor = Arc::new(SlotRecordingExecutor::default());
+        let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
+        // The group's base is 4, as it would be after a chain step and a 3-wide group ahead of it.
+        let ctx = ChainRunContext {
+            step_slot: StepSlot::Exclusive(4),
+            ..run_ctx(CancelToken::new())
+        };
+        let mut registry = OutputRegistry::new();
+
+        walk_chain(&graph, &mut registry, &executor_dyn, &ctx)
+            .await
+            .expect("walk succeeds");
+
+        let mut observed = executor.slots.lock().expect("lock").clone();
+        observed.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            observed,
+            vec![
+                ("task-a".to_string(), StepSlot::Exclusive(4)),
+                ("task-b".to_string(), StepSlot::Exclusive(5)),
+                ("task-c".to_string(), StepSlot::Exclusive(6)),
+            ],
+            "each member owns base+ordinal, exclusively"
+        );
+    }
+
+    /// A `DynamicGroup`'s members still SHARE the single flat slot the group declares (cyrup does
+    /// not splice materialized items into `RunStatus::steps` as pi does at
+    /// `subagent-runner.ts:4155` — a recorded SUBA-093 residual), and the shared slot must say so,
+    /// because a per-child stop handle registered twice under one index is unsafe.
+    #[tokio::test]
+    async fn dynamic_group_members_share_one_slot_and_it_is_marked_shared() {
+        let graph: ChainGraph = vec![RunnerStep::DynamicGroup(dynamic_group(
+            "outputs.plan",
+            single_step("worker", "handle {item}"),
+            "done",
+            4,
+        ))];
+        let executor = Arc::new(SlotRecordingExecutor::default());
+        let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
+        let ctx = run_ctx(CancelToken::new());
+        let mut registry = OutputRegistry::new();
+        registry.register(
+            "plan".to_string(),
+            serde_json::json!([{"id": "one"}, {"id": "two"}]),
+        );
+
+        // `plan` is pre-registered rather than produced by a preceding step, so this test pins the
+        // slot mapping and nothing else.
+        walk_chain(&graph, &mut registry, &executor_dyn, &ctx)
+            .await
+            .expect("walk succeeds");
+
+        let observed = executor.slots.lock().expect("lock").clone();
+        assert_eq!(observed.len(), 2, "two items fanned out");
+        assert!(
+            observed
+                .iter()
+                .all(|(_, slot)| *slot == StepSlot::Shared(0)),
+            "both dynamic members share slot 0 and are marked Shared: {observed:?}"
+        );
+        assert_eq!(StepSlot::Shared(0).exclusive_index(), None);
+        assert_eq!(StepSlot::Exclusive(7).exclusive_index(), Some(7));
+        assert_eq!(StepSlot::Shared(3).index(), 3);
     }
 
     // ---- ParallelGroup delegates to spawn::parallel::run_bounded (the REAL primitive) ----

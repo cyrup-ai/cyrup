@@ -197,6 +197,10 @@ impl SubagentExecutor {
             // — a foreground `DynamicGroup` step whose own `expand.maxItems` is absent falls back to
             // this value instead of always failing materialization.
             dynamic_fanout_max_items,
+            // SUBA-093: the foreground walk publishes no `status.json` and runs no control inbox,
+            // so nothing reads this slot; it exists for the background runner, which re-stamps it
+            // per dispatch.
+            step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
         };
         let mut registry = OutputRegistry::new();
         walk_chain(&graph, &mut registry, &executor, &ctx).await

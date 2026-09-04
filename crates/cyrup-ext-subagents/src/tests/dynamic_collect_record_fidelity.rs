@@ -111,6 +111,7 @@ fn run_ctx() -> ChainRunContext {
         original_task: "Handle everything".to_string(),
         chain_dir: None,
         dynamic_fanout_max_items: None,
+        step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
     }
 }
 

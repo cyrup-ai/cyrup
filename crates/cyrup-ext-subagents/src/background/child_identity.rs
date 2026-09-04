@@ -21,8 +21,11 @@
 //!
 //! `index` here is the index into [`RunStatus::steps`] — the SAME index space cyrup's other
 //! per-child surfaces use (`steer`'s `target_index`, the transcript view's `index`, the runner's
-//! `output-<index>.log`). A `ParallelGroup`/`DynamicGroup` step is one entry in that list, so its
-//! members share one identity; see `SUBA-087`'s residual.
+//! `output-<index>.log`). SUBA-093 made that a FLAT index: a `ParallelGroup` contributes one entry
+//! per MEMBER (`crate::background::flat_index`), so `step:1` of a three-task fan-out names the
+//! second task and stops it alone. A `DynamicGroup` is still one entry whose members share an
+//! identity — cyrup does not splice materialized items into `RunStatus::steps` as upstream does
+//! (`subagent-runner.ts:4155` @v0.64.0); that half is a recorded SUBA-093 residual.
 //!
 //! `resolveAsyncStatusChild`'s `includeNested` option (`:27,34-42`, added between v0.57.0 and
 //! v0.64.0) walks each step's `children: NestedRunSummary[]` for a nested run id. Its only consumer
