@@ -107,6 +107,40 @@ impl<B: Backend> App<B> {
                         _ => AppAction::None,
                     };
                 }
+                // An extension-registered keyboard shortcut (R-08-017; Pi `registerShortcut`) is
+                // resolved FIRST at this tier — ahead of the global `app.*` keymap and therefore
+                // ahead of the editor. That is pi's own order, read off the dispatch site:
+                // `CustomEditor.handleInput` opens with
+                //
+                //     // Check extension-registered shortcuts first
+                //     if (this.onExtensionShortcut?.(data)) { return; }
+                //
+                // (`modes/interactive/components/custom-editor.ts:31-34` @v0.84.4), and only then
+                // tries `app.clipboard.pasteImage`, `app.interrupt`, `app.exit` and the rest of the
+                // action table. EXT-039: cyrup had the two tiers the other way round, so an
+                // extension binding a built-in key registered fine, was listed by `/hotkeys` — and
+                // never fired.
+                //
+                // Inverting is only safe because the RESERVED keys are now refused at the gate:
+                // [`crate::App::install_extension_shortcuts`] installs
+                // `ExtensionHost::resolve_shortcut_specs`'s survivors, and `app.interrupt`,
+                // `app.clear`, `app.exit`, `tui.input.submit`, `tui.select.confirm`/`cancel` and the
+                // rest of `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS`
+                // (`extensions/runner.ts:71-89`) can never reach this map. What an extension CAN
+                // win here is exactly what pi lets it win: a NON-reserved built-in, with a
+                // `[Extension issues]` warning naming both (`runner.ts:568-574`).
+                //
+                // The selector / overlay / loader guards above still come first, matching pi's
+                // component focus: `onExtensionShortcut` hangs off the EDITOR, so a shortcut cannot
+                // preempt a focused picker there either.
+                if let Some((_, spec)) = self
+                    .state
+                    .extension_shortcuts
+                    .iter()
+                    .find(|(k, _)| k.matches(key))
+                {
+                    return AppAction::ExtensionShortcut(spec.id.clone());
+                }
                 // Routing chain: overlay > completion > editor > app (spec/tui/07 §2). A global key is
                 // resolved here, but two context guards defer it to the editor so the chain holds
                 // (audit #4 — the previous unconditional global resolution made Ctrl+D quit and Esc
@@ -151,18 +185,6 @@ impl<B: Backend> App<B> {
                             return self.apply_action(action);
                         }
                     }
-                }
-                // An extension-registered keyboard shortcut (R-08-017; Pi `registerShortcut`) fires at
-                // the global-keymap tier — after the built-in bindings (so an extension can't shadow
-                // `Ctrl+D`/`Esc`) but before the editor (so the key never leaks in as text). The run
-                // loop dispatches the matched key-id to the session's extension host.
-                if let Some((_, spec)) = self
-                    .state
-                    .extension_shortcuts
-                    .iter()
-                    .find(|(k, _)| k.matches(key))
-                {
-                    return AppAction::ExtensionShortcut(spec.id.clone());
                 }
                 match self.state.editor.handle_key(key) {
                     EditorOutcome::Submit(text) => self.dispatch_submission(&text),

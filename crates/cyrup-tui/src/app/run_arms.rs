@@ -334,10 +334,13 @@ impl App<InlineBackend<Stdout>> {
         // answer changes on the swap.
         self.render_project_trust_warning_if_needed(&ctx.session);
         // The swapped-in session owns a fresh extension host; re-source its registered shortcuts
-        // (R-08-017) so a post-swap press still routes. EXT-040: `shortcut_specs()` carries the
-        // description `/hotkeys` renders; `shortcut_keys()` drops it.
-        let shortcuts = ctx.session.services().ext_host.shortcut_specs();
-        self.state.set_extension_shortcuts(shortcuts);
+        // (R-08-017) so a post-swap press still routes. EXT-040: the installed specs carry the
+        // description `/hotkeys` renders; `shortcut_keys()` drops it. EXT-039: they go through the
+        // reserved-key gate, which is why this is `install_extension_shortcuts` and not
+        // `set_extension_shortcuts` — pi re-runs the whole of `setupExtensionShortcuts` on a
+        // session replacement too (`interactive-mode.ts:1981`, `:5990` @v0.84.4).
+        let ext_host = ctx.session.services().ext_host.clone();
+        self.install_extension_shortcuts(&ext_host);
 
         // pi's re-entrancy guard, `interactive-mode.ts:1977-1979`
         // (`if (this.session !== session) return;`): a newer session landed while we awaited above,

@@ -2126,6 +2126,23 @@ impl ExtensionHost {
             .unwrap_or_default()
     }
 
+    /// [`Self::resolve_shortcuts`] in the shape the TUI installs — `(key, description ??
+    /// extension id)` for every shortcut that survived pi's rules, see
+    /// [`crate::ExtensionRegistry::resolve_shortcut_specs`].
+    ///
+    /// This is [`Self::shortcut_specs`]'s gated twin, and the one production callers want: pi
+    /// never hands the raw per-extension map to its editor or to `/hotkeys`, only
+    /// `getShortcuts(this.keybindings.getEffectiveConfig())`
+    /// (`modes/interactive/interactive-mode.ts:2079`, `:6364` @v0.84.4).
+    pub fn resolve_shortcut_specs(
+        &self,
+        resolved_keybindings: &[(String, Vec<String>)],
+    ) -> Vec<(String, Option<String>)> {
+        self.registry
+            .resolve_shortcut_specs(resolved_keybindings)
+            .unwrap_or_default()
+    }
+
     /// Warnings from the last [`Self::resolve_shortcuts`] (pi `getShortcutDiagnostics()`,
     /// `extensions/runner.ts:538-540` @v0.83.0).
     pub fn shortcut_diagnostics(&self) -> Vec<crate::ExtensionConflict> {

@@ -137,13 +137,60 @@ impl<B: Backend> App<B> {
     }
 
     /// Install the extension-registered keyboard shortcuts (R-08-017; delegates to
-    /// [`AppState::set_extension_shortcuts`]). The binary calls this at boot from
-    /// `ExtensionHost::shortcut_keys()`.
+    /// [`AppState::set_extension_shortcuts`]) VERBATIM, with no conflict gate.
+    ///
+    /// Production installs go through [`Self::install_extension_shortcuts`], which is the gated
+    /// form; this one is the raw seam a test (or an embedder with no extension host) drives
+    /// directly, the way pi's own `getShortcuts` tests build a runner and read its map back
+    /// (`test/extensions-runner.test.ts:176-358` @v0.84.4).
     pub fn set_extension_shortcuts(
         &mut self,
         specs: impl IntoIterator<Item = impl Into<ShortcutSpec>>,
     ) {
         self.state.set_extension_shortcuts(specs);
+    }
+
+    /// Every live binding table as upstream's `KeybindingsConfig` — `action id -> key specs`, pi
+    /// `KeybindingsManager.getEffectiveConfig()` (`core/keybindings.ts` @v0.84.4).
+    ///
+    /// pi keeps ONE `KeybindingsManager` over every registered definition, so its config is
+    /// naturally whole; cyrup splits the same ids across a table per focus context, so the whole is
+    /// the concatenation. Order does not matter to the only consumer — EXT-039's gate inverts it
+    /// key-first and lets the RESERVED id win any tie (`extensions/runner.ts:104-106`).
+    ///
+    /// [`crate::keymap::AutocompleteKeymap`] is deliberately absent: upstream has no
+    /// `tui.autocomplete.*` family at all (the popup reuses `tui.select.*` and `tui.input.tab` —
+    /// see [`crate::keymap::AutocompleteAction::from_id`]), so every id it could contribute is
+    /// already contributed by the select and editor maps, and adding it would only duplicate rows.
+    pub fn effective_keybindings(&self) -> Vec<(String, Vec<String>)> {
+        let mut out = self.state.keymap.effective_config();
+        out.extend(self.state.select_keymap.effective_config());
+        out.extend(self.state.tree_keymap.effective_config());
+        out.extend(self.state.session_keymap.effective_config());
+        out.extend(self.state.models_keymap.effective_config());
+        out.extend(self.state.editor.keymap_ref().effective_config());
+        out.extend(self.alt_keymap.effective_config());
+        out
+    }
+
+    /// Resolve an extension host's registered shortcuts against the live keybindings and install
+    /// the survivors — EXT-039, pi `setupExtensionShortcuts`
+    /// (`modes/interactive/interactive-mode.ts:2078-2131` @v0.84.4), whose first statement is
+    /// `const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());`.
+    ///
+    /// This is the gate cyrup had built and never called: `resolve_shortcut_specs` REFUSES a key
+    /// bound to a reserved built-in (Ctrl+C, Enter, …), lets a non-reserved override through with a
+    /// warning, and records both — so a refused key is neither dispatched nor listed by `/hotkeys`,
+    /// instead of being advertised and permanently dead. The warnings are read back with
+    /// `ExtensionHost::shortcut_diagnostics()` and belong in the `[Extension issues]` startup panel
+    /// (`interactive-mode.ts:1884-1886`).
+    ///
+    /// Call it wherever either input changes: at boot after `keybindings.json` is loaded, and after
+    /// a session swap brings a new host.
+    pub fn install_extension_shortcuts(&mut self, host: &cyrup_ext::ExtensionHost) {
+        let effective = self.effective_keybindings();
+        self.state
+            .set_extension_shortcuts(host.resolve_shortcut_specs(&effective));
     }
 
     /// Plumb the `autocompleteMaxVisible` setting (Pi, item #6) into the editor's autocomplete popup

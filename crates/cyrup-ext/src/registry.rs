@@ -960,17 +960,56 @@ impl ExtensionRegistry {
     ///
     /// Returns the resolved `key → owner` map in insertion order. Diagnostics are read back with
     /// [`Self::shortcut_diagnostics`], mirroring `getShortcutDiagnostics()` (`:538-540`).
+    ///
+    /// The rules are unchanged at **v0.84.4** (`runner.ts:544-586`); only the line numbers moved.
     pub fn resolve_shortcuts(
         &self,
         resolved_keybindings: &[(String, Vec<String>)],
     ) -> Result<Vec<(String, ExtensionId)>, ExtError> {
+        Ok(self
+            .resolve_shortcuts_inner(resolved_keybindings)?
+            .into_iter()
+            .map(|(key, owner, _)| (key, owner))
+            .collect())
+    }
+
+    /// [`Self::resolve_shortcuts`] keeping each survivor's DESCRIPTION — the whole of upstream's
+    /// return value, whose element is an `ExtensionShortcut { shortcut, description?, handler,
+    /// extensionPath }` (`extensions/types.ts:1547-1552` @v0.84.4) and not a bare owner id.
+    ///
+    /// This is the form the TUI installs, because pi renders the SAME map in `/hotkeys` — `const
+    /// description = shortcut.description ?? shortcut.extensionPath;`
+    /// (`modes/interactive/interactive-mode.ts:6364-6377` @v0.84.4, over
+    /// `extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig())` at `:6364`) — so a key
+    /// this function refuses is also a key `/hotkeys` cannot advertise. The `?? extensionPath`
+    /// fallback is applied here exactly as [`Self::shortcut_specs`] applies it, i.e. to the
+    /// extension ID, never to the key id itself.
+    pub fn resolve_shortcut_specs(
+        &self,
+        resolved_keybindings: &[(String, Vec<String>)],
+    ) -> Result<Vec<(String, Option<String>)>, ExtError> {
+        Ok(self
+            .resolve_shortcuts_inner(resolved_keybindings)?
+            .into_iter()
+            .map(|(key, owner, desc)| (key, Some(desc.unwrap_or_else(|| owner.to_string()))))
+            .collect())
+    }
+
+    /// The shared body of [`Self::resolve_shortcuts`] and [`Self::resolve_shortcut_specs`]:
+    /// `(normalized key, owner, description)` for every shortcut that survived pi's four rules,
+    /// in insertion order. Split out so the two public shapes cannot drift in their rules or in
+    /// the diagnostics they record.
+    fn resolve_shortcuts_inner(
+        &self,
+        resolved_keybindings: &[(String, Vec<String>)],
+    ) -> Result<Vec<(String, ExtensionId, Option<String>)>, ExtError> {
         let builtin = build_builtin_keybindings(resolved_keybindings);
         let mut g = self.lock_write()?;
         g.shortcut_diagnostics.clear();
-        let mut out: Vec<(String, ExtensionId)> = Vec::new();
+        let mut out: Vec<(String, ExtensionId, Option<String>)> = Vec::new();
         let order = g.shortcut_order.clone();
         for key in order {
-            let Some((owner, _)) = g.shortcuts.get(&key).cloned() else {
+            let Some((owner, description)) = g.shortcuts.get(&key).cloned() else {
                 continue;
             };
             let normalized = key.to_lowercase();
@@ -1007,8 +1046,8 @@ impl ExtensionRegistry {
                 None => {}
             }
             // Rule 4 — extension vs extension: warn, LAST wins (`runner.ts:530-536`).
-            if let Some(pos) = out.iter().position(|(k, _)| *k == normalized)
-                && let Some(existing) = out.get(pos).map(|(_, o)| o.clone())
+            if let Some(pos) = out.iter().position(|(k, _, _)| *k == normalized)
+                && let Some(existing) = out.get(pos).map(|(_, o, _)| o.clone())
             {
                 warn(
                     &mut g,
@@ -1019,7 +1058,7 @@ impl ExtensionRegistry {
                 );
                 out.remove(pos);
             }
-            out.push((normalized, owner));
+            out.push((normalized, owner, description));
         }
         Ok(out)
     }

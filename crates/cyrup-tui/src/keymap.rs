@@ -292,6 +292,40 @@ impl Action {
             _ => None,
         }
     }
+
+    /// The canonical pi binding id — the inverse of [`Action::from_id`], and the key this action
+    /// occupies in upstream's `KeybindingsConfig` (`core/keybindings.ts:63-202`).
+    ///
+    /// EXT-039 needs the map in that direction: pi's extension-shortcut gate consumes
+    /// `this.keybindings.getEffectiveConfig()` — `action id -> keys` — and refuses an extension
+    /// key that collides with a RESERVED id (`extensions/runner.ts:544-586` @v0.84.4). Without an
+    /// id per action cyrup could not name the built-in the extension collides with, so it could
+    /// neither refuse nor warn.
+    pub fn id(self) -> &'static str {
+        match self {
+            Action::Quit => "app.exit",
+            Action::Interrupt => "app.interrupt",
+            Action::Clear => "app.clear",
+            Action::Suspend => "app.suspend",
+            Action::PageUp => "app.pageUp",
+            Action::PageDown => "app.pageDown",
+            Action::ToolsExpand => "app.tools.expand",
+            Action::ExternalEditor => "app.editor.external",
+            Action::ThinkingCycle => "app.thinking.cycle",
+            Action::ModelCycleForward => "app.model.cycleForward",
+            Action::ModelCycleBackward => "app.model.cycleBackward",
+            Action::FollowUp => "app.message.followUp",
+            Action::Dequeue => "app.message.dequeue",
+            Action::ClipboardPasteImage => "app.clipboard.pasteImage",
+            Action::ModelSelect => "app.model.select",
+            Action::ThinkingToggle => "app.thinking.toggle",
+            Action::MessageCopy => "app.message.copy",
+            Action::SessionNew => "app.session.new",
+            Action::SessionTree => "app.session.tree",
+            Action::SessionFork => "app.session.fork",
+            Action::SessionResume => "app.session.resume",
+        }
+    }
 }
 
 /// An editor-level action resolved from a key while the editor owns focus (spec/tui/03 §6.1; the 19
@@ -438,6 +472,45 @@ impl EditorAction {
             _ => return None,
         })
     }
+
+    /// The CANONICAL id of this action — the inverse of [`EditorAction::from_id`], which accepts
+    /// several aliases per action and therefore is not injective. Only the `tui.*` spelling
+    /// (`packages/tui/src/keybindings.ts:9-33` @v0.84.4) is emitted, because this feeds the
+    /// `KeybindingsConfig` EXT-039's reserved-key gate matches against — and the reserved list
+    /// names `tui.input.submit`, `tui.input.copy` and `tui.editor.deleteToLineEnd` in that
+    /// spelling (`extensions/runner.ts:73-89`).
+    pub fn id(self) -> &'static str {
+        use EditorAction as E;
+        match self {
+            E::CursorLeft => "tui.editor.cursorLeft",
+            E::CursorRight => "tui.editor.cursorRight",
+            E::CursorUp => "tui.editor.cursorUp",
+            E::CursorDown => "tui.editor.cursorDown",
+            E::CursorWordLeft => "tui.editor.cursorWordLeft",
+            E::CursorWordRight => "tui.editor.cursorWordRight",
+            E::CursorLineStart => "tui.editor.cursorLineStart",
+            E::CursorLineEnd => "tui.editor.cursorLineEnd",
+            E::DeleteCharBackward => "tui.editor.deleteCharBackward",
+            E::DeleteCharForward => "tui.editor.deleteCharForward",
+            E::DeleteWordBackward => "tui.editor.deleteWordBackward",
+            E::DeleteWordForward => "tui.editor.deleteWordForward",
+            E::DeleteToLineStart => "tui.editor.deleteToLineStart",
+            E::DeleteToLineEnd => "tui.editor.deleteToLineEnd",
+            E::Yank => "tui.editor.yank",
+            E::YankPop => "tui.editor.yankPop",
+            E::Undo => "tui.editor.undo",
+            E::JumpForward => "tui.editor.jumpForward",
+            E::JumpBackward => "tui.editor.jumpBackward",
+            E::PageUp => "tui.editor.pageUp",
+            E::PageDown => "tui.editor.pageDown",
+            E::HistoryPrevious => "tui.editor.historyPrevious",
+            E::HistoryNext => "tui.editor.historyNext",
+            E::NewLine => "tui.input.newLine",
+            E::Submit => "tui.input.submit",
+            E::Tab => "tui.input.tab",
+            E::PassThrough => "tui.input.copy",
+        }
+    }
 }
 
 /// A selector-level action resolved from a key while a selector owns the input slot (spec/tui/05
@@ -471,6 +544,20 @@ impl SelectAction {
             "tui.select.pageUp" => Some(SelectAction::PageUp),
             "tui.select.pageDown" => Some(SelectAction::PageDown),
             _ => None,
+        }
+    }
+
+    /// The canonical `tui.select.*` id — the inverse of [`SelectAction::from_id`]. Two of them
+    /// (`tui.select.confirm`, `tui.select.cancel`) are RESERVED against extension shortcuts
+    /// (`extensions/runner.ts:81-82` @v0.84.4), which is why this map has to reach EXT-039's gate.
+    pub fn id(self) -> &'static str {
+        match self {
+            SelectAction::Up => "tui.select.up",
+            SelectAction::Down => "tui.select.down",
+            SelectAction::Confirm => "tui.select.confirm",
+            SelectAction::Cancel => "tui.select.cancel",
+            SelectAction::PageUp => "tui.select.pageUp",
+            SelectAction::PageDown => "tui.select.pageDown",
         }
     }
 }
@@ -844,6 +931,14 @@ impl Keymap {
             self.set_action(action, keys)
         })
     }
+
+    /// This map's contribution to upstream's `KeybindingsConfig` — the GLOBAL `app.*` table as
+    /// `action id -> key specs` (pi `KeybindingsManager.getEffectiveConfig()`). Joined with
+    /// its siblings by [`crate::App::effective_keybindings`] and consumed by EXT-039's
+    /// extension-shortcut gate; see [`effective_config`].
+    pub fn effective_config(&self) -> Vec<(String, Vec<String>)> {
+        effective_config(&self.bindings, Action::id)
+    }
 }
 
 /// Join the labels of every key bound to one action, `/`-separated — Pi's `formatKeys`, i.e.
@@ -864,6 +959,38 @@ fn join_key_labels<'a>(keys: impl Iterator<Item = &'a Key>) -> Option<String> {
         }
     }
     (!labels.is_empty()).then(|| labels.join("/"))
+}
+
+/// Project one binding table onto upstream's `KeybindingsConfig` shape — `action id -> the key
+/// specs bound to it` — in binding order, each action's keys grouped under its first appearance.
+///
+/// pi holds exactly this object (`core/keybindings.ts:275-287` @v0.84.4) and hands it out as
+/// `KeybindingsManager.getEffectiveConfig()`. EXT-039's gate is its only consumer here:
+/// `getShortcuts(this.keybindings.getEffectiveConfig())`
+/// (`modes/interactive/interactive-mode.ts:2079`, `:6364`) inverts it to `key -> {keybinding,
+/// restrictOverride}` and refuses an extension key that lands on a reserved id.
+///
+/// Keys are emitted as [`Key::label`] strings — the inverse of [`Key::parse`], so the round trip
+/// holds — and the gate lowercases them again on the way in (`extensions/runner.ts:551`), so the
+/// two camelCase labels (`pageUp`/`pageDown`) match an extension's own spelling either way.
+fn effective_config<A: Copy>(
+    bindings: &[(Key, A)],
+    id_of: impl Fn(A) -> &'static str,
+) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for (key, action) in bindings {
+        let id = id_of(*action);
+        let label = key.label();
+        match out.iter_mut().find(|(existing, _)| existing == id) {
+            Some((_, keys)) => {
+                if !keys.contains(&label) {
+                    keys.push(label);
+                }
+            }
+            None => out.push((id.to_string(), vec![label])),
+        }
+    }
+    out
 }
 
 /// The configurable selector binding table (spec/tui/05 §10). Defaults mirror Pi's `tui.select.*`
@@ -953,6 +1080,14 @@ impl SelectKeymap {
         merge_entries(json, SelectAction::from_id, |action, keys| {
             self.set_action(action, keys)
         })
+    }
+
+    /// This map's contribution to upstream's `KeybindingsConfig` — the selector `tui.select.*` table as
+    /// `action id -> key specs` (pi `KeybindingsManager.getEffectiveConfig()`). Joined with
+    /// its siblings by [`crate::App::effective_keybindings`] and consumed by EXT-039's
+    /// extension-shortcut gate; see [`effective_config`].
+    pub fn effective_config(&self) -> Vec<(String, Vec<String>)> {
+        effective_config(&self.bindings, SelectAction::id)
     }
 }
 
@@ -1092,6 +1227,19 @@ impl ModelsAction {
             _ => None,
         }
     }
+
+    /// The canonical `app.models.*` id — the inverse of [`ModelsAction::from_id`], so this table
+    /// can join the `KeybindingsConfig` EXT-039's gate is resolved against.
+    pub fn id(self) -> &'static str {
+        match self {
+            ModelsAction::ReorderUp => "app.models.reorderUp",
+            ModelsAction::ReorderDown => "app.models.reorderDown",
+            ModelsAction::EnableAll => "app.models.enableAll",
+            ModelsAction::ClearAll => "app.models.clearAll",
+            ModelsAction::ToggleProvider => "app.models.toggleProvider",
+            ModelsAction::Save => "app.models.save",
+        }
+    }
 }
 
 /// The configurable scoped-models binding table (`core/keybindings.ts:150-175`). Defaults: Alt+Up/Down
@@ -1168,6 +1316,14 @@ impl ModelsKeymap {
             self.set_action(action, keys)
         })
     }
+
+    /// This map's contribution to upstream's `KeybindingsConfig` — the scoped-models `app.models.*` table as
+    /// `action id -> key specs` (pi `KeybindingsManager.getEffectiveConfig()`). Joined with
+    /// its siblings by [`crate::App::effective_keybindings`] and consumed by EXT-039's
+    /// extension-shortcut gate; see [`effective_config`].
+    pub fn effective_config(&self) -> Vec<(String, Vec<String>)> {
+        effective_config(&self.bindings, ModelsAction::id)
+    }
 }
 
 /// The `/resume` session-picker actions (`session-selector.ts:532-637`; `core/keybindings.ts:91-94,
@@ -1210,6 +1366,19 @@ impl SessionAction {
             "app.session.rename" => Some(SessionAction::Rename),
             "app.session.deleteNoninvasive" => Some(SessionAction::DeleteNoninvasive),
             _ => None,
+        }
+    }
+
+    /// The canonical `app.session.*` id — the inverse of [`SessionAction::from_id`], so this table
+    /// can join the `KeybindingsConfig` EXT-039's gate is resolved against.
+    pub fn id(self) -> &'static str {
+        match self {
+            SessionAction::ToggleSort => "app.session.toggleSort",
+            SessionAction::ToggleNamedFilter => "app.session.toggleNamedFilter",
+            SessionAction::Delete => "app.session.delete",
+            SessionAction::TogglePath => "app.session.togglePath",
+            SessionAction::Rename => "app.session.rename",
+            SessionAction::DeleteNoninvasive => "app.session.deleteNoninvasive",
         }
     }
 }
@@ -1278,6 +1447,14 @@ impl SessionKeymap {
             self.set_action(action, keys)
         })
     }
+
+    /// This map's contribution to upstream's `KeybindingsConfig` — the `/resume` `app.session.*` table as
+    /// `action id -> key specs` (pi `KeybindingsManager.getEffectiveConfig()`). Joined with
+    /// its siblings by [`crate::App::effective_keybindings`] and consumed by EXT-039's
+    /// extension-shortcut gate; see [`effective_config`].
+    pub fn effective_config(&self) -> Vec<(String, Vec<String>)> {
+        effective_config(&self.bindings, SessionAction::id)
+    }
 }
 
 /// The `/tree` session-navigator actions (`tree-selector.ts:1180-1197`; `core/keybindings.ts`
@@ -1339,6 +1516,29 @@ impl TreeAction {
             "app.tree.filter.cycleBackward" => Some(TreeAction::FilterCycleBackward),
             "app.message.copy" => Some(TreeAction::Copy),
             _ => None,
+        }
+    }
+
+    /// The canonical id — the inverse of [`TreeAction::from_id`], so this table can join the
+    /// `KeybindingsConfig` EXT-039's gate is resolved against. [`TreeAction::Copy`] is the one
+    /// BORROWED id (`app.message.copy`, `tree-selector.ts:1029-1030`), and it is RESERVED
+    /// (`extensions/runner.ts:72` @v0.84.4) — the global [`Keymap`] names it too, and the gate's
+    /// "reserved wins regardless of iteration order" rule (`runner.ts:104-106`) is what makes
+    /// listing it twice harmless.
+    pub fn id(self) -> &'static str {
+        match self {
+            TreeAction::FoldOrUp => "app.tree.foldOrUp",
+            TreeAction::UnfoldOrDown => "app.tree.unfoldOrDown",
+            TreeAction::EditLabel => "app.tree.editLabel",
+            TreeAction::ToggleLabelTimestamp => "app.tree.toggleLabelTimestamp",
+            TreeAction::FilterDefault => "app.tree.filter.default",
+            TreeAction::FilterNoTools => "app.tree.filter.noTools",
+            TreeAction::FilterUserOnly => "app.tree.filter.userOnly",
+            TreeAction::FilterLabeledOnly => "app.tree.filter.labeledOnly",
+            TreeAction::FilterAll => "app.tree.filter.all",
+            TreeAction::FilterCycleForward => "app.tree.filter.cycleForward",
+            TreeAction::FilterCycleBackward => "app.tree.filter.cycleBackward",
+            TreeAction::Copy => "app.message.copy",
         }
     }
 }
@@ -1461,6 +1661,14 @@ impl TreeKeymap {
         merge_entries(json, TreeAction::from_id, |action, keys| {
             self.set_action(action, keys)
         })
+    }
+
+    /// This map's contribution to upstream's `KeybindingsConfig` — the `/tree` `app.tree.*` table as
+    /// `action id -> key specs` (pi `KeybindingsManager.getEffectiveConfig()`). Joined with
+    /// its siblings by [`crate::App::effective_keybindings`] and consumed by EXT-039's
+    /// extension-shortcut gate; see [`effective_config`].
+    pub fn effective_config(&self) -> Vec<(String, Vec<String>)> {
+        effective_config(&self.bindings, TreeAction::id)
     }
 }
 
@@ -1648,6 +1856,14 @@ impl EditorKeymap {
         merge_entries(json, EditorAction::from_id, |action, keys| {
             self.set_action(action, keys)
         })
+    }
+
+    /// This map's contribution to upstream's `KeybindingsConfig` — the editor `tui.editor.*` / `tui.input.*` table as
+    /// `action id -> key specs` (pi `KeybindingsManager.getEffectiveConfig()`). Joined with
+    /// its siblings by [`crate::App::effective_keybindings`] and consumed by EXT-039's
+    /// extension-shortcut gate; see [`effective_config`].
+    pub fn effective_config(&self) -> Vec<(String, Vec<String>)> {
+        effective_config(&self.bindings, EditorAction::id)
     }
 }
 
@@ -1912,5 +2128,13 @@ impl AltScreenKeymap {
         merge_entries(json, AltScreenAction::from_id, |action, keys| {
             self.set_action(action, keys)
         })
+    }
+
+    /// This map's contribution to upstream's `KeybindingsConfig` — the alternate-screen `tui.altScreen.*` table as
+    /// `action id -> key specs` (pi `KeybindingsManager.getEffectiveConfig()`). Joined with
+    /// its siblings by [`crate::App::effective_keybindings`] and consumed by EXT-039's
+    /// extension-shortcut gate; see [`effective_config`].
+    pub fn effective_config(&self) -> Vec<(String, Vec<String>)> {
+        effective_config(&self.bindings, AltScreenAction::id)
     }
 }

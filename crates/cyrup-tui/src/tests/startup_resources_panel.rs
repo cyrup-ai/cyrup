@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 use crate::{
     App, DiagnosticSeverity, StartupDiagnostic, StartupReport, UiTheme, extension_diagnostics,
-    resource_diagnostics,
+    resource_diagnostics, shortcut_diagnostics,
 };
 use cyrup_resources::{ResourceDiagnostic, ResourceKind};
 use cyrup_session_svc::ExtensionLoadDiagnostic;
@@ -391,4 +391,65 @@ fn startup_panel_rows_wrap_inside_the_frame() {
             line.width()
         );
     }
+}
+
+/// EXT-039 — the extension-shortcut conflict warnings reach the SAME `[Extension issues]` block the
+/// load failures do, appended after them.
+///
+/// Upstream builds one `extensionDiagnostics` vector: load errors first, then the command
+/// diagnostics, then `extensionRunner.getShortcutDiagnostics()`, and renders the lot under one
+/// header (`modes/interactive/interactive-mode.ts:1872-1892` @v0.84.4). A shortcut warning is
+/// `{type: "warning", …}` (`extensions/runner.ts:549-553`), so it must paint as a WARNING beside an
+/// error-painted load failure.
+///
+/// RED before this pass: `shortcut_diagnostics` had no projector and no caller — the registry
+/// recorded the warnings and nothing ever read them, which is the "emit no conflict diagnostics"
+/// half of the item.
+#[test]
+fn shortcut_conflict_warnings_join_the_extension_issues_block() {
+    let load_failure = extension_diagnostics(
+        &[ExtensionLoadDiagnostic {
+            path: PathBuf::from("/x/broken.wasm"),
+            error: "instantiate failed".into(),
+            fatal: true,
+        }],
+        None,
+    );
+    let mut extension = load_failure;
+    extension.extend(shortcut_diagnostics(&[cyrup_ext::ExtensionConflict {
+        path: "ext-a".into(),
+        message: "Extension shortcut 'ctrl+c' from ext-a conflicts with built-in shortcut. \
+                  Skipping."
+            .into(),
+    }]));
+
+    let report = StartupReport {
+        quiet_startup: true,
+        extension_diagnostics: extension,
+        ..Default::default()
+    };
+    let (app, out) = commit(&report);
+
+    assert_eq!(
+        out.matches("[Extension issues]").count(),
+        1,
+        "one block, not two:\n{out}"
+    );
+    assert!(out.contains("instantiate failed"), "{out}");
+    assert!(
+        out.contains("conflicts with built-in shortcut. Skipping."),
+        "the refusal warning never reached the panel:\n{out}"
+    );
+    assert!(
+        out.find("instantiate failed") < out.find("conflicts with built-in"),
+        "pi appends the shortcut diagnostics after the load errors:\n{out}"
+    );
+    assert!(
+        styled(
+            &app,
+            "conflicts with built-in",
+            UiTheme::dark().warning_style()
+        ),
+        "a shortcut conflict is a WARNING, not an error:\n{out}"
+    );
 }

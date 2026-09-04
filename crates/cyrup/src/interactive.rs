@@ -168,10 +168,20 @@ fn build_startup_report(session: &AgentSession, verbose: bool) -> cyrup_tui::Sta
         // block). In practice only the NON-fatal entries — the project-trust skips — are reachable
         // here: a genuine load failure is reported and exits 1 at `report_runtime_diagnostics`, well
         // before this panel is built, exactly as Pi's `main.ts:843-849` precedes `InteractiveMode`.
-        extension_diagnostics: cyrup_tui::extension_diagnostics(
-            &services.startup_diagnostics.extensions,
-            home,
-        ),
+        // EXT-039 — the shortcut-resolution warnings join the load failures in the ONE
+        // `[Extension issues]` block, appended last, exactly as upstream folds
+        // `getShortcutDiagnostics()` in after the command diagnostics
+        // (`interactive-mode.ts:1884-1886` @v0.84.4). They exist only once
+        // `App::install_extension_shortcuts` has run, which the caller does before building this
+        // report.
+        extension_diagnostics: {
+            let mut diags =
+                cyrup_tui::extension_diagnostics(&services.startup_diagnostics.extensions, home);
+            diags.extend(cyrup_tui::shortcut_diagnostics(
+                &services.ext_host.shortcut_diagnostics(),
+            ));
+            diags
+        },
         theme_diagnostics: cyrup_tui::resource_diagnostics(
             &services.startup_diagnostics.resources,
             ResourceKind::Theme,
@@ -335,12 +345,20 @@ pub async fn run_interactive(
     // shortcut key-ids from the session's extension host so a matching press routes to the owning
     // live extension's `execute-shortcut` (refreshed after a session swap inside the run loop).
     //
-    // EXT-040 — `shortcut_specs()`, not `shortcut_keys()`. pi stores an `ExtensionShortcut
-    // {shortcut, description?, handler, extensionPath}` (`extensions/types.ts:1250`, stored at
-    // `:1524-1529` @v0.83.0) and `/hotkeys` renders the DESCRIPTION. `shortcut_keys()` is the bare
-    // `Vec<String>`, so the description an extension registered was dropped one call from the
-    // renderer and `/hotkeys` printed the key id as its own label.
-    app.set_extension_shortcuts(session.services().ext_host.shortcut_specs());
+    // EXT-040 — the installed specs are `(key, description)`, not bare key-ids. pi stores an
+    // `ExtensionShortcut {shortcut, description?, handler, extensionPath}`
+    // (`extensions/types.ts:1547-1552`, stored at `:1524-1529`) and `/hotkeys` renders the
+    // DESCRIPTION. `shortcut_keys()` is the bare `Vec<String>`, so the description an extension
+    // registered was dropped one call from the renderer and `/hotkeys` printed the key id as its
+    // own label.
+    //
+    // EXT-039 — and they are RESOLVED against the live keybindings first, which is why this runs
+    // after the `keybindings.json` merge above. pi's `setupExtensionShortcuts` opens with
+    // `extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig())`
+    // (`modes/interactive/interactive-mode.ts:2079` @v0.84.4): a shortcut on a reserved key is
+    // dropped with a warning instead of being installed dead, and the warnings land in the
+    // `[Extension issues]` panel `build_startup_report` builds below (`:1884-1886`).
+    app.install_extension_shortcuts(&session.services().ext_host);
     // TUI-037 — arm the implicit-trust save `/reload` performs (pi stores the option at
     // `interactive-mode.ts:572` @v0.84.4; the consumer is `App::maybe_save_implicit_project_trust`).
     app.set_auto_trust_on_reload_cwd(auto_trust_on_reload_cwd);

@@ -211,7 +211,7 @@ pub use settings_selector::{FIELD_SEP, SettingRow, SettingsSelector, TrustSelect
 pub use startup::{
     DiagnosticCollision, DiagnosticSeverity, StartupDiagnostic, StartupLine, StartupReport,
     StartupRole, StartupSpan, build_startup_lines, display_path, extension_diagnostics,
-    resource_diagnostics,
+    resource_diagnostics, shortcut_diagnostics,
 };
 pub use startup_selector::run_startup_selector;
 pub use status::{

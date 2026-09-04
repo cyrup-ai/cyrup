@@ -603,6 +603,51 @@ fn shortcut_resolution_refuses_reserved_keys_warns_on_the_rest_and_records_every
     );
 }
 
+/// EXT-039, the shape production installs — `resolve_shortcut_specs` is `resolve_shortcuts` with
+/// the DESCRIPTION kept, because upstream's `getShortcuts` returns whole `ExtensionShortcut`
+/// records (`extensions/types.ts:1547-1552` @v0.84.4) and `/hotkeys` renders the same map it hands
+/// the editor — `shortcut.description ?? shortcut.extensionPath`
+/// (`modes/interactive/interactive-mode.ts:6364-6377`).
+///
+/// So a key the gate REFUSES cannot be listed either, and the `?? extensionPath` fallback resolves
+/// to the extension id, never to the key id.
+#[test]
+fn resolve_shortcut_specs_keeps_descriptions_and_drops_the_refused_key() {
+    let reg = ExtensionRegistry::new();
+    let keymap = vec![
+        ("app.interrupt".to_string(), vec!["ctrl+c".to_string()]),
+        ("app.help".to_string(), vec!["ctrl+h".to_string()]),
+    ];
+    reg.register_shortcut("ext-a".into(), "Ctrl+C", Some("steal interrupt".into()))
+        .unwrap();
+    reg.register_shortcut("ext-a".into(), "ctrl+h", Some("override help".into()))
+        .unwrap();
+    reg.register_shortcut("ext-b".into(), "ctrl+t", None)
+        .unwrap();
+
+    let specs = reg.resolve_shortcut_specs(&keymap).unwrap();
+    assert_eq!(
+        specs,
+        vec![
+            ("ctrl+h".to_string(), Some("override help".to_string())),
+            // `description ?? extensionPath` — the OWNER, not the key id.
+            ("ctrl+t".to_string(), Some("ext-b".to_string())),
+        ],
+        "the reserved `ctrl+c` must be absent, so `/hotkeys` cannot advertise it"
+    );
+    // Same rules, same diagnostics as the owner-only shape: the two must not drift.
+    assert_eq!(
+        reg.resolve_shortcuts(&keymap)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect::<Vec<_>>(),
+        specs.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()
+    );
+    // Rule 2 (`ctrl+c` skipped) and rule 3 (`ctrl+h` overridden) each recorded one.
+    assert_eq!(reg.shortcut_diagnostics().unwrap().len(), 2);
+}
+
 /// EXT-040. BEFORE: `register_shortcut` took only `(owner, key)` and the host discarded `desc` one
 /// line inside `register_shortcut` (`host/live.rs:98-101`), so `/hotkeys` printed the key id as its
 /// own label. pi renders `shortcut.description ?? shortcut.extensionPath`

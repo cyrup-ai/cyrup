@@ -237,6 +237,30 @@ pub fn extension_diagnostics(
         .collect()
 }
 
+/// Project the extension-shortcut conflict warnings onto the panel's shape — EXT-039.
+///
+/// Upstream appends `extensionRunner.getShortcutDiagnostics()` to the SAME `extensionDiagnostics`
+/// vector the per-path load errors go into, immediately after the command diagnostics and just
+/// before the `[Extension issues]` block is rendered
+/// (`modes/interactive/interactive-mode.ts:1884-1886` @v0.84.4). Each is
+/// `{type: "warning", message, path: extensionPath}` (`extensions/runner.ts:549-553`), so they
+/// carry [`DiagnosticSeverity::Warning`] here and the load failures keep their `Error`.
+///
+/// [`cyrup_ext::ExtensionConflict::path`] is the extension ID, not a filesystem path — cyrup's
+/// stand-in for pi's `extensionPath` — so it is passed through verbatim rather than shortened.
+pub fn shortcut_diagnostics(conflicts: &[cyrup_ext::ExtensionConflict]) -> Vec<StartupDiagnostic> {
+    conflicts
+        .iter()
+        .map(|c| {
+            StartupDiagnostic::plain(
+                DiagnosticSeverity::Warning,
+                Some(c.path.to_string()),
+                c.message.clone(),
+            )
+        })
+        .collect()
+}
+
 /// Build the panel (Pi `showLoadedResources`). Returns an empty vec when there is nothing to show —
 /// a quiet startup with no problems prints nothing at all, exactly like Pi.
 pub fn build_startup_lines(report: &StartupReport) -> Vec<StartupLine> {
