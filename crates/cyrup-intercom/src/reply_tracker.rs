@@ -250,6 +250,44 @@ impl ReplyTracker {
         Some(first.clone())
     }
 
+    /// `findActiveReplyTargetMismatch` (`v0.13.0 reply-tracker.ts:124-130`; added by v0.12.1
+    /// `5fe0ee3` #119 "fix: guard active intercom replies", CHANGELOG 0.12.1: "Refuse non-reply
+    /// `send` calls to a different target during a turn triggered by an inbound ask, preventing
+    /// CWD hierarchy or roster guesses from misdirecting replies"):
+    ///
+    /// ```text
+    /// this.pruneExpired(now);
+    /// if (!this.currentTurnContext?.message.expectsReply) return null;
+    /// return this.currentTurnContext.from.id === to ? null : this.currentTurnContext;
+    /// ```
+    ///
+    /// `Some(asker)` means the CURRENT turn was triggered by that peer's ask and `to` — the
+    /// RESOLVED send target, not the caller's `to` — is not that peer's id, so a plain `send` would
+    /// go to the wrong session. `None` means there is nothing to guard: no turn context, a
+    /// context that was a plain message rather than an ask, or a target that IS the asker.
+    ///
+    /// The comparison is on `from.id` ONLY — no name arm, no prefix arm (upstream
+    /// `reply-tracker.test.ts` "active ask context does not trust sender names as destination
+    /// identity"): the caller has already resolved names to ids, so a bare name reaching here is
+    /// a target that did NOT resolve, and a sender's name is never proof of a destination.
+    /// Unlike [`Self::find_unique_pending_ask_from`] this DOES prune (hence `&mut self`), exactly
+    /// as upstream does — an ask that has timed out cannot make its turn a reply turn.
+    pub fn find_active_reply_target_mismatch(
+        &mut self,
+        to: &str,
+        now: u64,
+    ) -> Option<IntercomContext> {
+        self.prune_expired(now);
+        let current = self.current_turn_context.as_ref()?;
+        if current.message.expects_reply != Some(true) {
+            return None;
+        }
+        if current.from.id == to {
+            return None;
+        }
+        Some(current.clone())
+    }
+
     /// Mark an ask replied (`markReplied` → `dismissPendingAsk`, `:95-109`).
     pub fn mark_replied(&mut self, reply_to: &str) {
         self.dismiss_pending_ask(reply_to);
@@ -691,6 +729,109 @@ mod tests {
     }
 
     // reply-tracker.ts:55-64 — `reply_to` still outranks `to`, and `to` is only a cross-check.
+    /// `reply-tracker.test.ts` "active ask context flags non-reply sends to a different target"
+    /// (v0.12.1 `5fe0ee3`, at v0.13.0): with the turn triggered by planner's ask, the asker's own
+    /// id is clean, and BOTH the asker's name and an unrelated id are flagged with the ask.
+    #[test]
+    fn active_ask_context_flags_non_reply_sends_to_a_different_target() {
+        let mut rt = ReplyTracker::new(600_000);
+        let current =
+            rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
+        rt.queue_turn_context(current);
+        rt.begin_turn(1001);
+
+        assert!(
+            rt.find_active_reply_target_mismatch("planner-id", 1002)
+                .is_none()
+        );
+        assert_eq!(
+            rt.find_active_reply_target_mismatch("planner", 1002)
+                .map(|c| c.message.id),
+            Some("ask-1".to_string())
+        );
+        assert_eq!(
+            rt.find_active_reply_target_mismatch("repo-root", 1002)
+                .map(|c| c.message.id),
+            Some("ask-1".to_string())
+        );
+    }
+
+    /// `reply-tracker.test.ts` "active ask context does not trust sender names as destination
+    /// identity" (v0.12.1 `5fe0ee3`, at v0.13.0): `to` equal to the asker's NAME is still a
+    /// mismatch — only the id is destination identity.
+    #[test]
+    fn active_ask_context_does_not_trust_sender_names_as_destination_identity() {
+        let mut rt = ReplyTracker::new(600_000);
+        let current = rt.record_incoming_message(
+            session("asker-session", Some("root-session")),
+            ask("ask-1"),
+            1000,
+        );
+        rt.queue_turn_context(current);
+        rt.begin_turn(1001);
+
+        assert_eq!(
+            rt.find_active_reply_target_mismatch("root-session", 1002)
+                .map(|c| c.message.id),
+            Some("ask-1".to_string())
+        );
+    }
+
+    /// The three `null` arms of `findActiveReplyTargetMismatch` (`v0.13.0 reply-tracker.ts:125-128`):
+    /// no turn context at all; a turn triggered by a plain message (no `expectsReply`); and a
+    /// context whose ask has aged past the timeout — `pruneExpired(now)` runs FIRST and clears the
+    /// current-turn slot, so an expired ask cannot make this a reply turn. `endTurn` clears it too.
+    #[test]
+    fn active_ask_context_is_silent_without_a_live_ask_turn() {
+        let mut rt = ReplyTracker::new(600_000);
+        assert!(
+            rt.find_active_reply_target_mismatch("anyone", 1000)
+                .is_none(),
+            "no turn context"
+        );
+
+        // A plain inbound message (not an ask) triggering the turn.
+        let mut plain = ask("m-1");
+        plain.expects_reply = None;
+        let current = rt.record_incoming_message(session("peer", Some("peer")), plain, 1000);
+        rt.queue_turn_context(current);
+        rt.begin_turn(1001);
+        assert!(
+            rt.find_active_reply_target_mismatch("anyone", 1002)
+                .is_none(),
+            "a non-ask turn context never guards"
+        );
+        rt.end_turn();
+
+        // An ask that expires between `beginTurn` and the send.
+        let mut rt = ReplyTracker::new(1_000);
+        let current = rt.record_incoming_message(session("peer", Some("peer")), ask("ask-1"), 1000);
+        rt.queue_turn_context(current);
+        rt.begin_turn(1001);
+        assert!(
+            rt.find_active_reply_target_mismatch("someone-else", 1500)
+                .is_some(),
+            "live ask guards"
+        );
+        assert!(
+            rt.find_active_reply_target_mismatch("someone-else", 5000)
+                .is_none(),
+            "an expired ask is pruned and the turn slot cleared before the comparison"
+        );
+        assert!(rt.list_pending(5000).is_empty());
+
+        // `endTurn` clears the slot: the guard is scoped to the ask-triggered turn only.
+        let mut rt = ReplyTracker::new(600_000);
+        let current = rt.record_incoming_message(session("peer", Some("peer")), ask("ask-2"), 1000);
+        rt.queue_turn_context(current);
+        rt.begin_turn(1001);
+        rt.end_turn();
+        assert!(
+            rt.find_active_reply_target_mismatch("someone-else", 1002)
+                .is_none()
+        );
+    }
+
     #[test]
     fn explicit_reply_to_still_outranks_to() {
         let mut rt = ReplyTracker::new(600_000);

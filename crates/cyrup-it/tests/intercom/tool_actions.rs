@@ -729,3 +729,180 @@ async fn status_renders_pi_four_line_intercom_status_block() {
     me.disconnect();
     peer.disconnect();
 }
+
+/// ICOM-060 — `intercom.integration.test.ts` "intercom send refuses a different target during an
+/// active inbound ask turn" (v0.12.1 `5fe0ee3` #119, at v0.13.0), plus the positive half the
+/// upstream test leaves implicit: the same turn's `send` to the ASKER is not refused.
+///
+/// Peer `planner` (id `planner-id`) asks this session; `turn_start` adopts that ask as the current
+/// turn context. A `send` to a DIFFERENT live peer (`orchestrator`) with no `replyTo` must be
+/// refused — naming the asker and the ask id — and never reach the broker, leaving the ask pending.
+/// Against the PRE-FIX behaviour `action_send` went straight from the self-target guard to the
+/// inferred-reply lookup, delivered the message to `orchestrator` as an ordinary send, and returned
+/// `Message sent to orchestrator` (the `expect_err` below panicked with that `Ok`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_refuses_a_different_target_during_an_active_inbound_ask_turn() {
+    let broker = Broker::start().await;
+    let me = Arc::new(
+        IntercomClient::connect(
+            &broker.socket,
+            registration("cwd-reply-worker"),
+            Some("worker-session".to_string()),
+        )
+        .await
+        .expect("connects"),
+    );
+    let planner = Arc::new(
+        IntercomClient::connect(
+            &broker.socket,
+            registration("planner"),
+            Some("planner-id".to_string()),
+        )
+        .await
+        .expect("connects"),
+    );
+    let orchestrator = Arc::new(
+        IntercomClient::connect(
+            &broker.socket,
+            registration("orchestrator"),
+            Some("orchestrator-id".to_string()),
+        )
+        .await
+        .expect("connects"),
+    );
+    let mut orchestrator_events = orchestrator.subscribe();
+    let mut planner_events = planner.subscribe();
+
+    let mut me_events = me.subscribe();
+
+    let state = fresh_state();
+    state.set_client(Some(me.clone()));
+
+    // The planner asks this session THROUGH the broker (upstream: `planner.send(worker.id,
+    // { messageId: "cwd-hierarchy-ask", expectsReply: true })`), so the broker holds the ask edge
+    // the positive half below replies along.
+    let sent = planner
+        .send(
+            "worker-session",
+            SendOptions {
+                text: "Please answer me, not the repo-root session.".to_string(),
+                expects_reply: Some(true),
+                message_id: Some("cwd-hierarchy-ask".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the planner's ask routes through the broker");
+    assert!(sent.delivered, "the ask reached this session: {sent:?}");
+    let (asker, ask) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match me_events.recv().await {
+                Ok(InboundEvent::Message { from, message }) => break (from, *message),
+                Ok(_) => {}
+                Err(e) => panic!("worker channel closed: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("the ask arrives");
+    assert_eq!(ask.id, "cwd-hierarchy-ask");
+    // Name and id DIFFER: the refusal labels the asker by NAME (`from.name || from.id`), while
+    // the guard itself compares the ID only.
+    assert_eq!(asker.id, "planner-id");
+    assert_eq!(asker.name.as_deref(), Some("planner"));
+
+    // What the inbound loop and `turn_start` do with it: recorded, queued
+    // (`trigger_turn_over_inbound`), then adopted by `begin_turn` — the sequence `extension.rs`
+    // runs when this ask triggers a turn.
+    {
+        let mut tracker = state.tracker.lock().unwrap();
+        let context = tracker.record_incoming_message(asker, ask, now_ms());
+        tracker.queue_turn_context(context);
+        tracker.begin_turn(now_ms());
+    }
+
+    let tool = IntercomTool::new(state.clone());
+    let cancel = CancelToken::new();
+    let err = run(
+        &tool,
+        &cancel,
+        serde_json::json!({
+            "action": "send",
+            "to": "orchestrator",
+            "message": "This was meant as the ask answer.",
+        }),
+    )
+    .await
+    .expect_err("a non-reply send to a different target during an ask turn is refused");
+    assert_eq!(
+        err.message,
+        "This turn is responding to an intercom ask from \"planner\". Use intercom({ action: \
+         \"reply\", message: \"...\" }) or set replyTo: \"cwd-hierarchy-ask\". Refusing non-reply \
+         send to \"orchestrator\" to avoid a misdirected reply."
+    );
+
+    // The ask is untouched: the guard fires before any delivery, audit or dismissal.
+    let pending = state.tracker.lock().unwrap().list_pending(now_ms());
+    assert_eq!(
+        pending.len(),
+        1,
+        "the refused send must leave the ask pending"
+    );
+    assert_eq!(pending[0].message.id, "cwd-hierarchy-ask");
+
+    // …and the positive half: the same turn's plain `send` to the ASKER is not a mismatch — it is
+    // the inferred reply (ICOM-037), delivered with the ask's `replyTo` attached.
+    let result = run(
+        &tool,
+        &cancel,
+        serde_json::json!({
+            "action": "send",
+            "to": "planner-id",
+            "message": "Here is the answer.",
+        }),
+    )
+    .await
+    .expect("a send to the asker itself is not refused");
+    assert_eq!(
+        result_text(&result),
+        "Reply sent to planner-id (inferred from pending ask)"
+    );
+    let planner_reply = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match planner_events.recv().await {
+                Ok(InboundEvent::Message { message, .. }) => break message,
+                Ok(_) => {}
+                Err(e) => panic!("planner channel closed: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("the planner receives the inferred reply");
+    assert_eq!(planner_reply.reply_to.as_deref(), Some("cwd-hierarchy-ask"));
+    assert_eq!(planner_reply.content.text, "Here is the answer.");
+
+    // The orchestrator never received the MESSAGE. Same drain-and-classify shape as
+    // `send_honors_a_declined_confirm_send_prompt` above: presence traffic is the liveness witness,
+    // and a `MessageReceived` is the misdirection this test exists to rule out.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let mut delivered: Vec<InboundEvent> = Vec::new();
+    let mut saw_presence = false;
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, orchestrator_events.recv()).await {
+        match event {
+            InboundEvent::PresenceUpdate(_) => saw_presence = true,
+            other => delivered.push(other),
+        }
+    }
+    assert!(
+        delivered.is_empty(),
+        "the refused send must never reach the orchestrator; got: {delivered:?}"
+    );
+    assert!(
+        saw_presence,
+        "the orchestrator's event channel must be live, otherwise the empty-delivery assertion is vacuous"
+    );
+
+    me.disconnect();
+    planner.disconnect();
+    orchestrator.disconnect();
+}

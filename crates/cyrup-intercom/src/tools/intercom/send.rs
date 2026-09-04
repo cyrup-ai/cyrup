@@ -1,5 +1,6 @@
-//! `intercom{action:"send"}` (`v0.10.1 index.ts:1971-2061`) — the non-blocking mailbox delivery,
-//! including the confirm gate, the inferred-reply inference and the audit entry.
+//! `intercom{action:"send"}` (`v0.10.1 index.ts:1971-2061`; `v0.13.0 index.ts:2281-2384`) — the
+//! non-blocking mailbox delivery, including the confirm gate, the active-ask-turn misdirection
+//! guard (ICOM-060), the inferred-reply inference and the audit entry.
 
 use std::sync::Arc;
 
@@ -131,6 +132,45 @@ impl IntercomTool {
         // (`:2122`, `:2205`). pi has exactly one self-target message across all three arms.
         if client.session_id().as_deref() == Some(target.as_str()) {
             return Err(ToolError::new("Cannot message the current session"));
+        }
+        // `v0.13.0 index.ts:2320-2328` (v0.12.1 `5fe0ee3` #119 "fix: guard active intercom
+        // replies", issue #117):
+        //
+        //   const activeReplyMismatch = replyTo ? null : replyTracker.findActiveReplyTargetMismatch(sendTo);
+        //   if (activeReplyMismatch) {
+        //     const senderLabel = activeReplyMismatch.from.name || activeReplyMismatch.from.id;
+        //     return { content: [{ type: "text", text: `This turn is responding to …` }],
+        //              details: { error: true, replyTo: activeReplyMismatch.message.id } };
+        //   }
+        //
+        // Sits AFTER the self-target guard and BEFORE the inferred-reply lookup, exactly as
+        // upstream orders it. When this turn was triggered by peer A's ask, a `send` whose
+        // RESOLVED target (`sendTo`, keyed the same way as the inferred lookup below) is anyone
+        // but A is refused instead of delivered: with cwd-addressing (ICOM-042) live, `cwd` alone
+        // or a roster guess can resolve to a parent/root session that never asked anything, and
+        // upstream's fix note names that exact misdirection. An explicit `replyTo` bypasses the
+        // guard — the caller has said which ask it answers, and `resolve_reply_target` polices it.
+        //
+        // `from.name || from.id` — JS `||`, so an EMPTY name falls back to the id too.
+        // `details.replyTo` has no home on `ToolError` (message only); the id is in the text.
+        if params.reply_to.is_none()
+            && let Some(active) = self
+                .state
+                .tracker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .find_active_reply_target_mismatch(&target, now_ms())
+        {
+            let sender_label = active
+                .from
+                .name
+                .as_deref()
+                .filter(|n| !n.is_empty())
+                .unwrap_or(active.from.id.as_str());
+            return Err(ToolError::new(format!(
+                "This turn is responding to an intercom ask from \"{sender_label}\". Use intercom({{ action: \"reply\", message: \"...\" }}) or set replyTo: \"{}\". Refusing non-reply send to \"{target_display}\" to avoid a misdirected reply.",
+                active.message.id
+            )));
         }
         // `v0.10.1 index.ts:2011-2012` (v0.9.3 `5d76146`, CHANGELOG 0.9.3: "Treat a public
         // send to the sole pending asker as its reply"):
