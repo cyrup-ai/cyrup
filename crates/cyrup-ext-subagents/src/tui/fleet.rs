@@ -874,9 +874,29 @@ fn foreground_recent_detail(
     lines
 }
 
-/// pi `asyncDetail(item)` (`fleet.ts:289-307`): the full transcript body when the run's status is
-/// still readable, else pi's small "(status is no longer available)" block.
-fn async_detail(item: &FleetItem, run: &AsyncRunView, step_index: Option<usize>) -> Vec<String> {
+/// pi `asyncDetail(item, state)` (`fleet.ts:551-585` @v0.64.0; `:289-307` @v0.43.0): the full
+/// transcript body when the run's status is still readable, else pi's small "(status is no longer
+/// available)" block.
+///
+/// SUBA-091 — the transcript call passes `sessionRoots: uniquePaths([...(state.trustedSessionRoots
+/// ?? []), trackedJob?.sessionRoot])` (`fleet.ts:557`, landed as `9ceb5650` #1174): the roots the
+/// session-JSONL fallback is confined to. Before that commit the call omitted them, and this port
+/// passed a literal `&[]`, so the fallback refused every read. cyrup's tracked job carries no
+/// `sessionRoot` of its own ([`crate::background::tracker::TrackedJob`] has no such field — its
+/// session root is always the configured `default_session_dir` rung the state already lists), so
+/// [`FleetState::trusted_session_roots`] is the sole source here.
+///
+/// **[CYRUP-DELTA]** pi additionally passes `trustedSessionFiles: [item.step?.sessionFile ??
+/// item.run.sessionFile]` and `trustedSessionFileRoot: state.trustedSessionFileRoot` (`:558-559`,
+/// v0.57.0+), a second containment rung under `<agentDir>/sessions`.
+/// [`crate::background::fleet_view::format_async_run_transcript`] has no such parameters yet;
+/// that rung is recorded as a residual, not folded into `session_roots`.
+fn async_detail(
+    item: &FleetItem,
+    run: &AsyncRunView,
+    step_index: Option<usize>,
+    state: &FleetState,
+) -> Vec<String> {
     // pi calls `readStatus(item.run.asyncDir)` here; cyrup's [`AsyncRunView`] already carries the
     // reconciled status it would return, so the read is not repeated. A run whose directory has
     // gone away is the `None` case below, driven by the caller dropping it from the snapshot.
@@ -886,7 +906,14 @@ fn async_detail(item: &FleetItem, run: &AsyncRunView, step_index: Option<usize>)
             &run.paths,
             step_index,
             Some(TRANSCRIPT_LINES as i64),
-            &[],
+            &unique_paths(
+                state
+                    .trusted_session_roots
+                    .iter()
+                    .cloned()
+                    .map(Some)
+                    .collect(),
+            ),
         )
     {
         return text.split('\n').map(str::to_string).collect();
@@ -926,9 +953,15 @@ fn async_detail(item: &FleetItem, run: &AsyncRunView, step_index: Option<usize>)
     lines
 }
 
-/// pi `detailLines(item, error)` (`fleet.ts:309-318`).
+/// pi `detailLines(item, error, state)` (`fleet.ts:309-318` @v0.43.0; the `state` argument since
+/// `9ceb5650`, `fleet.ts:588-599` @v0.64.0) — `state` reaches only the async arm, for its trusted
+/// session roots.
 #[must_use]
-pub fn detail_lines(item: Option<&FleetItem>, error: Option<&str>) -> Vec<String> {
+pub fn detail_lines(
+    item: Option<&FleetItem>,
+    error: Option<&str>,
+    state: &FleetState,
+) -> Vec<String> {
     let Some(item) = item else {
         return vec![
             error.map_or_else(
@@ -947,7 +980,7 @@ pub fn detail_lines(item: Option<&FleetItem>, error: Option<&str>) -> Vec<String
         FleetItemKind::ForegroundRecent { run, child } => {
             foreground_recent_detail(item, run, child)
         }
-        FleetItemKind::Async { run, step_index } => async_detail(item, run, *step_index),
+        FleetItemKind::Async { run, step_index } => async_detail(item, run, *step_index, state),
     };
     if let Some(error) = error {
         lines.insert(0, String::new());
@@ -1898,7 +1931,11 @@ impl SubagentFleetComponent {
             }
         }
 
-        let mut raw = detail_lines(selected.as_ref(), self.snapshot.error.as_deref());
+        let mut raw = detail_lines(
+            selected.as_ref(),
+            self.snapshot.error.as_deref(),
+            &self.state,
+        );
         if let Some(warning) = transcript_warning {
             raw.insert(0, String::new());
             raw.insert(0, format!("Transcript preview warning: {warning}"));
@@ -2455,7 +2492,7 @@ mod tests {
 
     #[test]
     fn empty_snapshot_detail_reads_upstreams_two_sentences() {
-        let lines = detail_lines(None, None);
+        let lines = detail_lines(None, None, &FleetState::default());
         assert_eq!(
             lines[0],
             "No current-session foreground or recent async children."
@@ -2464,7 +2501,7 @@ mod tests {
             lines[2],
             "New runs appear here automatically while this inspector remains open."
         );
-        let failed = detail_lines(None, Some("boom"));
+        let failed = detail_lines(None, Some("boom"), &FleetState::default());
         assert_eq!(failed[0], "Fleet scan failed: boom");
     }
 
@@ -2492,10 +2529,125 @@ mod tests {
             ..FleetState::default()
         };
         let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
-        let lines = detail_lines(snapshot.items.first(), Some("scan blew up"));
+        let lines = detail_lines(snapshot.items.first(), Some("scan blew up"), &state);
         assert_eq!(lines[0], "Fleet scan warning: scan blew up");
         assert_eq!(lines[1], "");
         assert_eq!(lines[2], "Run: r");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-091 — asyncDetail's session-transcript fallback and its trusted roots
+    // (pi `fleet.ts:551-560` @v0.64.0, landed as `9ceb5650` #1174)
+    // -----------------------------------------------------------------------------------------
+
+    /// A background run that recorded ONLY a session file — no `output-<i>.log` on disk and an
+    /// empty `recentOutput` ring — so `format_async_run_transcript`'s third rung (the session
+    /// JSONL tail) is the only source left.
+    fn session_only_run(root: &Path, session_file: &Path) -> AsyncRunView {
+        let id = RunId::from_token("sessfallback".to_string());
+        let paths = RunPaths::for_run(root, root, &id);
+        std::fs::create_dir_all(&paths.run_dir).expect("run dir");
+        let mut status = RunStatus::queued(id, RunMode::Single, Some(1));
+        status.state = RunState::Complete;
+        status.session_file = Some(session_file.to_path_buf());
+        let mut worker = step("worker", StepState::Complete);
+        worker.session_file = Some(session_file.to_path_buf());
+        status.steps = vec![worker];
+        AsyncRunView {
+            paths,
+            status,
+            session_id: None,
+            description: None,
+            context: None,
+            nested_children: Vec::new(),
+        }
+    }
+
+    fn write_session_line(session_file: &Path, text: &str) {
+        std::fs::create_dir_all(session_file.parent().expect("parent")).expect("sessions dir");
+        std::fs::write(
+            session_file,
+            format!(
+                "{}\n",
+                serde_json::json!({ "role": "assistant", "content": text })
+            ),
+        )
+        .expect("write session file");
+    }
+
+    /// pi `test/unit/fleet.test.ts` "passes current-session trusted roots to async session
+    /// transcript fallback" (added by `9ceb5650`): with the session file inside one of
+    /// `state.trustedSessionRoots`, the detail pane shows the session tail and carries neither
+    /// refusal. Pre-fix the fleet passed a literal empty slice, so this rendered `Warnings:` +
+    /// `Refusing to read session transcript path without a trusted root` instead.
+    #[test]
+    fn async_detail_reads_the_session_transcript_tail_inside_a_trusted_session_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        let session_file = sessions.join("worker.jsonl");
+        write_session_line(&session_file, "TRUSTED SESSION FALLBACK");
+        let state = FleetState {
+            tracked_jobs: vec![session_only_run(dir.path(), &session_file)],
+            trusted_session_roots: vec![sessions],
+            ..FleetState::default()
+        };
+        let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
+        let text = detail_lines(snapshot.items.first(), None, &state).join("\n");
+        assert!(
+            text.contains("assistant: TRUSTED SESSION FALLBACK"),
+            "the session tail must be rendered: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "Session transcript tail from {}",
+                session_file.display()
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains("without a trusted root") && !text.contains("Session read failed"),
+            "no refusal may remain: {text}"
+        );
+    }
+
+    /// The containment gate is unchanged by the fix: a recorded session file OUTSIDE every trusted
+    /// root is still refused (it is data a child wrote), and an empty root list still refuses
+    /// outright — pi's `[]` default at `extension/index.ts:447`.
+    #[test]
+    fn async_detail_still_refuses_a_session_file_outside_every_trusted_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let session_file = elsewhere.path().join("worker.jsonl");
+        write_session_line(&session_file, "MUST NOT LEAK");
+        let run = session_only_run(dir.path(), &session_file);
+
+        let outside = FleetState {
+            tracked_jobs: vec![run.clone()],
+            trusted_session_roots: vec![dir.path().join("sessions")],
+            ..FleetState::default()
+        };
+        let snapshot = collect_fleet_snapshot(&outside, &FleetViewOptions::default());
+        let text = detail_lines(snapshot.items.first(), None, &outside).join("\n");
+        assert!(!text.contains("MUST NOT LEAK"), "{text}");
+        assert!(
+            text.contains("Warnings:")
+                && text.contains("Session read failed for")
+                && text.contains("outside trusted roots"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(no transcript lines available yet)"),
+            "{text}"
+        );
+
+        let no_roots = FleetState {
+            tracked_jobs: vec![run],
+            ..FleetState::default()
+        };
+        let snapshot = collect_fleet_snapshot(&no_roots, &FleetViewOptions::default());
+        let text = detail_lines(snapshot.items.first(), None, &no_roots).join("\n");
+        assert!(!text.contains("MUST NOT LEAK"), "{text}");
+        assert!(text.contains("without a trusted root"), "{text}");
     }
 
     #[test]

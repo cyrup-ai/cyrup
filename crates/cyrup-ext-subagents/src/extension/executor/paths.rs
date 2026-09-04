@@ -140,6 +140,61 @@ pub(crate) fn expand_tilde(value: &str) -> PathBuf {
     }
 }
 
+/// pi `getSubagentSessionRoot(parentSessionFile)` (`extension/index.ts:283-290` @v0.64.0), the
+/// present-parent branch only: `<dirname(parent)>/<basename(parent, ".jsonl")>` — for
+/// `~/.pi/agent/sessions/abc123.jsonl` that is `~/.pi/agent/sessions/abc123/`, the base every
+/// child session root of that session is scoped under. pi's other branch — a fresh
+/// `mkdtempSync(os.tmpdir(), "pi-subagent-session-")` when there is NO parent — is deliberately
+/// not here: the one caller ([`trusted_session_roots`]) is pi's `index.ts:897`, which only calls
+/// this when a parent session file exists, so a trusted root never names a throwaway temp dir.
+pub(crate) fn subagent_session_root(parent_session_file: &Path) -> PathBuf {
+    let base_name = parent_session_file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .map(|name| {
+            name.strip_suffix(".jsonl")
+                .map_or_else(|| name.clone(), str::to_owned)
+        })
+        .unwrap_or_default();
+    parent_session_file
+        .parent()
+        .map_or_else(PathBuf::new, Path::to_path_buf)
+        .join(base_name)
+}
+
+/// SUBA-091 — pi `state.trustedSessionRoots` (`extension/index.ts:895-898` @v0.64.0):
+/// ```ts
+/// state.trustedSessionRoots = [...new Set([
+///     ...(config.defaultSessionDir ? [path.resolve(expandTilde(config.defaultSessionDir))] : []),
+///     ...(state.parentSessionFile ? [getSubagentSessionRoot(state.parentSessionFile)] : []),
+/// ])];
+/// ```
+/// The roots the fleet inspector's session-transcript fallback (`tui/fleet.ts:557`) is confined
+/// to, in pi's order and deduplicated. `path.resolve` is [`resolve_against_process_cwd`] — a
+/// relative `defaultSessionDir` resolves against the REAL process cwd, as Node's does; when the
+/// process cwd is unreadable the expanded value is kept as-is rather than dropped, so a configured
+/// root is never silently lost (it then simply fails containment at read time).
+///
+/// Pure: no filesystem or clock — the executor's `fleet_state` is the shell that supplies the
+/// configured value and the live parent session file.
+pub(crate) fn trusted_session_roots(
+    default_session_dir: Option<&Path>,
+    parent_session_file: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(configured) = default_session_dir.filter(|path| !path.as_os_str().is_empty()) {
+        let expanded = expand_tilde(&configured.to_string_lossy());
+        roots.push(resolve_against_process_cwd(&expanded).unwrap_or(expanded));
+    }
+    if let Some(parent) = parent_session_file {
+        let root = subagent_session_root(parent);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
 /// pi `path.resolve(...)` applied to an already-tilde-expanded value (doctor.ts:111,114): a
 /// relative path resolves against the REAL process working directory, never the doctor call's own
 /// `requestCwd` — Node's single-argument `path.resolve(p)` is exactly `path.resolve(process.cwd(),
@@ -459,6 +514,67 @@ mod tests {
 
     use super::*;
     use crate::background::RunMode;
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-091 — pi `state.trustedSessionRoots` (`extension/index.ts:895-898` @v0.64.0) and
+    // `getSubagentSessionRoot` (`:283-290`). Each fails pre-fix by construction: neither symbol
+    // existed.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn subagent_session_root_is_the_parents_dir_joined_with_its_jsonl_less_basename() {
+        assert_eq!(
+            subagent_session_root(Path::new("/home/u/.pi/agent/sessions/abc123.jsonl")),
+            PathBuf::from("/home/u/.pi/agent/sessions/abc123")
+        );
+        // `path.basename(p, ".jsonl")` strips ONLY that suffix.
+        assert_eq!(
+            subagent_session_root(Path::new("/s/abc123.json")),
+            PathBuf::from("/s/abc123.json")
+        );
+    }
+
+    #[test]
+    fn trusted_session_roots_are_pis_two_rungs_in_pis_order() {
+        let roots = trusted_session_roots(
+            Some(Path::new("/srv/subagent-sessions")),
+            Some(Path::new("/home/u/.pi/agent/sessions/abc123.jsonl")),
+        );
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/srv/subagent-sessions"),
+                PathBuf::from("/home/u/.pi/agent/sessions/abc123"),
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_session_roots_expand_tilde_resolve_relative_dedupe_and_start_empty() {
+        assert!(trusted_session_roots(None, None).is_empty());
+        assert!(
+            trusted_session_roots(Some(Path::new("")), None).is_empty(),
+            "an empty configured value is pi's falsy `defaultSessionDir`"
+        );
+        assert_eq!(
+            trusted_session_roots(Some(Path::new("~/subagent-sessions")), None),
+            vec![crate::paths::home_dir().join("subagent-sessions")]
+        );
+        let cwd = std::env::current_dir().expect("process cwd");
+        assert_eq!(
+            trusted_session_roots(Some(Path::new("rel/sessions")), None),
+            vec![cwd.join("rel/sessions")],
+            "`path.resolve` resolves a relative default against the process cwd"
+        );
+        // pi's `new Set`: the same root reached from both rungs is listed once.
+        assert_eq!(
+            trusted_session_roots(
+                Some(Path::new("/srv/sessions/abc")),
+                Some(Path::new("/srv/sessions/abc.jsonl")),
+            ),
+            vec![PathBuf::from("/srv/sessions/abc")]
+        );
+    }
     use crate::background::RunState;
     use crate::background::atomic::write_atomic_json;
     use crate::discovery::AgentDiscoveryConfig;

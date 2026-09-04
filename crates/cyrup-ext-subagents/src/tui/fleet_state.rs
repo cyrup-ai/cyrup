@@ -449,6 +449,14 @@ pub struct FleetState {
     pub current_session_id: Option<String>,
     /// pi `state.parentSessionFile` — the artifacts-dir resolver's first input (`fleet.ts:336`).
     pub parent_session_file: Option<PathBuf>,
+    /// SUBA-091 — pi `state.trustedSessionRoots` (`extension/index.ts:447` initialised `[]`,
+    /// re-seeded per session at `:895-898` @v0.64.0 from `config.defaultSessionDir` and the
+    /// parent session's subagent session root): the ONLY roots the detail pane's session-JSONL
+    /// fallback (`fleet.ts:557` → `readSessionTranscriptTail`) may read a recorded `sessionFile`
+    /// under. Seeded by the producer (`SubagentExecutor::fleet_state`) through the extension's
+    /// `paths::trusted_session_roots`; empty means every session transcript read is refused,
+    /// exactly as pi's `[]` does.
+    pub trusted_session_roots: Vec<PathBuf>,
     /// pi `state.foregroundControls` (a `Map` upstream; ordered by
     /// [`ForegroundControlView::updated_at`] descending at `fleet.ts:142`).
     pub foreground_controls: Vec<ForegroundControlView>,

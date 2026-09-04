@@ -231,12 +231,22 @@ impl SubagentExecutor {
             });
         }
 
+        let cfg = self.config_snapshot().await;
         let mut state = FleetState {
             // SUBA-048 / pi `state.artifactDirPreference` (`extension/index.ts:375`), seeded from
             // `config.artifactDir` and read by `fleetArtifactsRoot` (`fleet.ts:334-340`).
-            artifact_dir_preference: self.config_snapshot().await.artifact_dir_preference(),
+            artifact_dir_preference: cfg.artifact_dir_preference(),
             base_cwd: cwd.to_path_buf(),
             current_session_id,
+            // SUBA-091 / pi `state.trustedSessionRoots` (`extension/index.ts:895-898` @v0.64.0):
+            // `config.defaultSessionDir` (tilde-expanded, resolved) plus the parent session's
+            // subagent session root — the roots `asyncDetail`'s session-transcript fallback
+            // (`tui/fleet.ts:557`) is confined to. Before this field the fleet passed `[]` and
+            // every such read was refused.
+            trusted_session_roots: super::paths::trusted_session_roots(
+                cfg.default_session_dir.as_deref(),
+                parent_session_file.as_deref(),
+            ),
             parent_session_file,
             foreground_controls,
             foreground_runs: Vec::new(),
@@ -246,7 +256,7 @@ impl SubagentExecutor {
             scan_error: None,
         };
         if include_history {
-            let roots = self.config_snapshot().await.roots;
+            let roots = cfg.roots;
             let async_root = default_async_root_in(&roots, cwd);
             let results_dir = default_results_dir_in(&roots, cwd);
             match crate::tui::fleet::collect_fleet_history(
@@ -435,6 +445,29 @@ mod tests {
     // full per-run rendering + primitive behavior is covered by `background::run_status`'s own tests
     // against explicit temp roots.
     // ---------------------------------------------------------------------------------------
+
+    /// SUBA-091 — `fleet_state` seeds pi's `state.trustedSessionRoots`
+    /// (`extension/index.ts:895-898` @v0.64.0) from the configured `default_session_dir`. With no
+    /// host services bound there is no parent session file, so that rung is the only one; with
+    /// nothing configured the list is pi's initial `[]` (`:447`). Pre-fix the field did not exist
+    /// and the fleet inspector passed a literal empty slice regardless of configuration.
+    #[tokio::test]
+    async fn fleet_state_seeds_trusted_session_roots_from_the_configured_default_session_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let configured = dir.path().join("subagent-sessions");
+        let executor =
+            SubagentExecutor::with_config(crate::registration::SubagentExtensionConfig {
+                default_session_dir: Some(configured.clone()),
+                ..crate::registration::SubagentExtensionConfig::default()
+            });
+        let state = executor.fleet_state(dir.path(), false, false).await;
+        assert_eq!(state.trusted_session_roots, vec![configured]);
+
+        let bare = SubagentExecutor::new()
+            .fleet_state(dir.path(), false, false)
+            .await;
+        assert!(bare.trusted_session_roots.is_empty());
+    }
 
     #[tokio::test]
     async fn control_status_no_id_over_a_fresh_cwd_lists_no_active_runs() {
