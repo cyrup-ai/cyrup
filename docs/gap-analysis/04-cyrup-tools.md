@@ -109,7 +109,7 @@ This area covers `crates/cyrup-tools` — the seven built-in tools (`read`, `wri
 | TOOL-019 | **partially-closed** | Primary closed by `7fd0d9c`: the map is now a process-global `static LazyLock` (`lock.rs:29-30`, attached at `:78-80`, with `Default` hand-written at `:44-51` so a derived `Default` cannot silently re-create per-owner domains), revert-proved at `lock.rs:164-187` and by `tests/cross_registry_mutation_lock.rs:144/:208/:262`. Secondary survives: `key()` still calls the **blocking** `std::fs::canonicalize` from inside the async `guard()`. That residual is written up in full as TOOL-032 — **it is one fix, not two.** |
 | TOOL-020 | still-open | Forced-SIGKILL drain test unchanged at `ops/local.rs:992-1060`; still asserts scheduling and shell-buffering outcomes. |
 | TOOL-021 | still-open, **evidence corrected** | The gap survives; the auditor's upstream mechanism did not. `tool-definition-wrapper.ts` does **not** copy `promptGuidelines` — pi reads them off the definition registry in `agent-session.ts`. Rewritten below on the corrected evidence. Severity medium stands. |
-| TOOL-022 | still-open | WIT `tool-descriptor` is still the 8-field record (`world.wit:39-48`); `WasmTool` still overrides none of `label`/`prompt_guidelines`/`render_kind`/`prepare_arguments`. |
+| TOOL-022 | **closed 2026-09-04** | This line was already stale when written and is kept only so the sequence reads: the WIT record grew `label`/`prepare-arguments`/`render-shell` long before 2026-08-15, and the missing CONSUMER landed in `75532cee`. See the row and the closure block under `## ~~TOOL-022~~`. |
 | TOOL-023 | still-open | `find` still drains the whole walk then sorts and truncates. Now has a sibling in `grep` (TOOL-033) — land them together. |
 | TOOL-024 | still-open, **severity corrected medium→low** | The vacuity is exact and unchanged (9 of 11 assertions compare a default against itself). Downgraded because a vacuous assertion has no user-visible consequence, which is the README's severity axis, and because the sibling test-defect TOOL-025 was rated low on identical reasoning. |
 | TOOL-025 | **partially-closed** | The vacuity is repaired — the racing payloads now differ in length (`tests/tools.rs:395`, `:407`) and the rationale is recorded at `:380-388`; the two requested cases landed as separate files (`cross_registry_mutation_lock.rs:144/:208/:262`). Residual: the test still names "serializes" while observing no ordering, and its guarantee is probabilistic rather than structural. |
@@ -180,7 +180,7 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 | ~~TOOL-019~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | File-mutation-lock key is computed by a blocking canonicalize inside `guard()` (residual only) — **CLOSED 2026-08-14**: sweep 1 — closed together (one fix, as both items state). `key` is async over `tokio::fs::canonicalize` with pi's narrow ENOENT/ENOTDIR catch; the ENOTDIR half required a raw-errno match (`libc::ENOTDIR`) because stable Rust exposes no `ErrorKind` for it. Handoff (d) discharged. |
 | ~~TOOL-020~~ | ~~medium~~ **CLOSED 2026-08-14** | test-defect | M | Forced-SIGKILL drain test asserts scheduling and shell-buffering outcomes — **CLOSED 2026-08-14**: sweep 1 — both defective assertions are gone: the run window is 250 ms decoupled from the 15 ms kill grace, and the shell-flush claim is REFUTED in-source and independently re-verified (`exec_argv` runs the argv it is handed, so `ShellConfig::detect()` is not consulted on this path at all). |
 | ~~TOOL-021~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `Tool::prompt_guidelines` returns `&[&str]`, so guest tools lose their guidelines — **CLOSED 2026-08-14**: sweep 2 (area 06, via the EXT-007 refutation) — the blocker is gone: `Tool::prompt_guidelines` returns `Vec<&str>` (`crates/cyrup-core/src/tool.rs:130`), `ToolDescriptor.prompt_guidelines: Vec<String>` exists (`cyrup-ext/src/registry.rs:27`), and `impl Tool for WasmTool` overrides it (`cyrup-ext/src/host/live.rs:1690`) with an in-source note recording that TOOL-021/EXT-007 unblocked it. Consumed by EXT-038's `promptGuidelines` half. The one remaining producer gap is EXT-007's, not this item's. |
-| TOOL-022 | medium | not-ported | L | `renderShell`, `prepareArguments` and `label` never reach a guest tool's behavior — **FIX SITE: `crates/cyrup-tui/**` + `crates/cyrup-core`, NOT `crates/cyrup-tools`.** **2026-08-14, sweep 6 — re-verified: the PRODUCER half is done** (`WasmTool` overrides `render_kind`/`prompt_guidelines`/`prepare_arguments` at `cyrup-ext/src/host/live.rs:1774-1808`, and `cyrup-ext/src/wrapper.rs:110` delegates `render_kind`). What is missing is a CONSUMER: `grep -rn 'render_kind' crates` shows **zero** sites in `cyrup-tui` that branch on the value. ~~Needs one agent owning cyrup-tui + cyrup-core~~ **CORRECTED 2026-08-14 (sweep 8): needs `cyrup-session-svc` TOO — `ToolRun` carries only `name: String` and no `tool_info`/`tool_catalog`/`set_tools` accessor exists on `App`, so there is nothing for a TUI branch to read.** See the correction block under the body. **STILL OPEN 2026-08-15 — re-verified at HEAD, and TWO of the recorded facts are now corrected; see the 2026-08-15 block under the body. Reported BLOCKED rather than half-landed.** **STILL OPEN 2026-09-04 — re-verified at HEAD `2571969`: `grep -rln 'ToolRenderKind' crates/*/src` returns only `cyrup-core`, `cyrup-ext`, `cyrup-mcp` and `cyrup-tools`; still zero in `cyrup-tui` or `cyrup-session-svc`. No code landed against this row in the `4fb5e40..HEAD` window.** |
+| ~~TOOL-022~~ | ~~medium~~ **CLOSED 2026-09-04** | not-ported | L | `renderShell`, `prepareArguments` and `label` never reach a guest tool's behavior — **CLOSED 2026-09-04**: all three limbs are wired end to end at HEAD, re-read on BOTH sides this pass rather than trusted from the text below. **(1) `prepareArguments`** — the WIT carries the flag (`crates/cyrup-ext/wit/world.wit:109`) plus the `guest.prepare-arguments` export the function-value-across-a-component-boundary inversion forces (`:240`); the SDK lowers it (`cyrup-ext-sdk/src/guest.rs:77`), `register_tool` lifts it (`cyrup-ext/src/host/live.rs:126`), `WasmTool::prepare_arguments` (`live.rs:2153-2172`) calls the export only when the descriptor set it and degrades a guest fault to the identity, and the agent runs it BEFORE schema validation (`cyrup-agent/src/agent/run/tools/preflight.rs:43-56`) — pi's `prepareToolCallArguments` → `validateToolArguments` order (`packages/agent/src/agent-loop.ts:584-596` @v0.84.4). **(2) `renderShell`** — `render-shell: option<string>` (`world.wit:113`), lowered at `guest.rs:78-84`, lifted at `live.rs:127`, `WasmTool::render_kind` mapping `Some("self")` at `live.rs:2127-2131`; the CONSUMER this row was blocked on landed in `75532cee` (EXT-024, 2026-09-04, this branch): `ToolInfo.render_kind` (`cyrup-session-svc/src/tools.rs:41`, filled from `Tool::render_kind` at `:223`, served by `AgentSession::tool_definition`, `session/tools.rs:28`) → `AppState::known_tool_definitions` (`cyrup-tui/src/app/state.rs:391-392`, filled by the live per-tool-start lookup `app/events.rs:213-221` and the bind refresh `app/session_bind.rs:153-159`) → `ToolRun::definition: Option<ToolRenderKind>` (`transcript/entry.rs:283`) → `tool_lines`' `getRenderShell()` port and its `self_rendered_lines` branch (`transcript/tool_render.rs:96-131`, `:139-200`) == `tool-execution.ts:71-79` / `:108-116` / `:237-259` @v0.84.4. **(3) `label`** — `tool-descriptor.label: string` (`world.wit:97`), `WasmTool::label` (`live.rs:2089-2091`, empty ⇒ `None`), delegated by `cyrup-ext/src/wrapper.rs:110-111`; **and the "no consumer" half is PARITY, not a gap** — at v0.84.4 pi copies `label` in `core/tools/tool-definition-wrapper.ts:11`/`:39` onto `AgentTool.label` (`packages/agent/src/types.ts:389`) and then reads it NOWHERE in `packages/coding-agent`, `packages/agent`, `packages/server`, `packages/protocol` or `packages/client` (`ToolExecutionComponent` titles the row from `toolName`, `tool-execution.ts:137-139`), so cyrup having a reachable-but-unread `Tool::label` is exactly upstream's state. A source-text guard now fails the build if any of these overrides is deleted again (`live.rs:2748-2767`, the eleven `fn …(` names). **RESIDUAL, named rather than hidden:** the item's Verify limb (a) — a real WASM fixture guest whose `prepare-arguments` renames a key, asserted through `execute` — still has no test; every link is proven in source and the trait-level ordering is pinned by `cyrup-agent/src/tests/model_boundary.rs::gap18_prepare_arguments_runs_before_execute`, but nothing drives the export across a live component. That is test coverage, not a behavioural gap, and it belongs with the `cyrup-it` wasm fixture suite. **TOOL-015's stated residual ("nothing reads `render_kind`") is discharged by the same commit** — left to that row's owner rather than closed from here. **Superseded text follows.** **FIX SITE: `crates/cyrup-tui/**` + `crates/cyrup-core`, NOT `crates/cyrup-tools`.** **2026-08-14, sweep 6 — re-verified: the PRODUCER half is done** (`WasmTool` overrides `render_kind`/`prompt_guidelines`/`prepare_arguments` at `cyrup-ext/src/host/live.rs:1774-1808`, and `cyrup-ext/src/wrapper.rs:110` delegates `render_kind`). What is missing is a CONSUMER: `grep -rn 'render_kind' crates` shows **zero** sites in `cyrup-tui` that branch on the value. ~~Needs one agent owning cyrup-tui + cyrup-core~~ **CORRECTED 2026-08-14 (sweep 8): needs `cyrup-session-svc` TOO — `ToolRun` carries only `name: String` and no `tool_info`/`tool_catalog`/`set_tools` accessor exists on `App`, so there is nothing for a TUI branch to read.** See the correction block under the body. **STILL OPEN 2026-08-15 — re-verified at HEAD, and TWO of the recorded facts are now corrected; see the 2026-08-15 block under the body. Reported BLOCKED rather than half-landed.** **STILL OPEN 2026-09-04 — re-verified at HEAD `2571969`: `grep -rln 'ToolRenderKind' crates/*/src` returns only `cyrup-core`, `cyrup-ext`, `cyrup-mcp` and `cyrup-tools`; still zero in `cyrup-tui` or `cyrup-session-svc`. No code landed against this row in the `4fb5e40..HEAD` window.** |
 | ~~TOOL-023~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `find` walks the whole tree then sorts and truncates; pi passes `--max-results` — **CLOSED 2026-08-14**: sweep 1 — option (i) chosen (bounded walk, sort DELETED), landed with TOOL-033, discharging handoff (e). Citations corrected: the empty-result check is find.ts:311 (not :172/:297) and `--max-results` is :252. |
 | ~~TOOL-033~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `grep` walks the whole tree before searching; `limit` bounds neither cost nor selection — **CLOSED 2026-08-14**: sweep 1 — walk and search fused; sort deleted. Citations corrected to the re-derived v0.84.1 offsets: the early-return guard is grep.ts:278 (the item implies :288) and the limit block is :292-295 (the item says :288-295). |
 | ~~TOOL-034~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | `grep` materializes every candidate file in memory, twice on the context path — **CLOSED 2026-08-14**: sweep 1 — the seam gained `FsOps::read_stream` with a whole-read default (decorators untouched) and a real-`File` override on `LocalFs`; grep drives `search_reader` from `spawn_blocking`. The item's premise that the FsOps seam "offers no alternative" is now false. The context-path re-read was NOT changed and needed no change. |
@@ -368,10 +368,87 @@ launched with `CYRUP_SHELL` set in the parent's environment does **not** see it 
 
 **Verify** — Register a guest tool declaring two guidelines, assert both appear in the built system prompt. `crates/cyrup-tools/src/tests/pi_schema.rs:139-215` must stay green unchanged.
 
-## TOOL-022 — `renderShell`, `prepareArguments` and `label` never reach a guest tool's behavior
+## ~~TOOL-022~~ — ~~`renderShell`, `prepareArguments` and `label` never reach a guest tool's behavior~~ **CLOSED 2026-09-04**
 
 **Kind** not-ported · **Severity** medium · **Effort** L · **Confidence** high
 
+> **CLOSED 2026-09-04 — all three limbs reach a guest tool at HEAD; the body below is kept for
+> traceability and is STALE from its first sentence.** Both sides were re-read this pass (cyrup at
+> HEAD, pi at **v0.84.4**, the ADR-0006 parity target), not carried forward from the prior editions.
+>
+> **`prepareArguments`.** A function value cannot cross a component boundary, so the descriptor
+> carries a FLAG and the host calls a guest export: `tool-descriptor.prepare-arguments: bool`
+> (`crates/cyrup-ext/wit/world.wit:109`) and `guest.prepare-arguments: func(name, args-json) ->
+> option<string>` (`:236-240`). The SDK lowers the flag (`cyrup-ext-sdk/src/guest.rs:77`) and
+> exports the call (`cyrup-ext-sdk/src/guest.rs:225-236`, `macros.rs:76-81`); `register_tool` lifts
+> it onto `ToolDescriptor` (`cyrup-ext/src/host/live.rs:126`, field at
+> `cyrup-ext/src/registry.rs:39`); `WasmTool::prepare_arguments` (`live.rs:2153-2172`) round-trips
+> to the guest ONLY when the flag is set — a tool that does not use the shim costs no call — and a
+> guest fault or an unparseable return degrades to the identity, which is pi's absent
+> `prepareArguments`. The agent runs it BEFORE schema validation
+> (`crates/cyrup-agent/src/agent/run/tools/preflight.rs:43-56`), the order pi fixes in
+> `prepareToolCallArguments` → `validateToolArguments` (`packages/agent/src/agent-loop.ts:584-596`
+> @v0.84.4; the identity short-circuit at `:585-587` is `WasmTool`'s flag check).
+>
+> **`renderShell`.** `render-shell: option<string>` (`world.wit:110-113`, `none` = upstream's
+> omitted field = `"default"`), lowered at `guest.rs:78-84`, lifted at `live.rs:127`, and read by
+> `WasmTool::render_kind` (`live.rs:2127-2131`, `Some("self")` ⇒ `SelfRendered`, anything else ⇒
+> `Default` — upstream's own literal test). The CONSUMER that this row, `TOOL-015` and `EXT-024`
+> were all blocked on landed in **`75532cee`** (2026-09-04, branch `claude/parity-batch3`):
+> `ToolInfo` gained `render_kind` (`cyrup-session-svc/src/tools.rs:29-41`, filled off
+> `Tool::render_kind` in `DynamicToolState::info_for` at `:216-225`, served by
+> `AgentSession::tool_definition` at `session/tools.rs:28` — pi's `getToolDefinition`); the TUI
+> memoizes it per tool name (`cyrup-tui/src/app/state.rs:377-392`, filled by the live tool-start
+> lookup at `app/events.rs:213-221` and the bind-time refresh at `app/session_bind.rs:144-159`),
+> carries it on the run (`transcript/entry.rs:256-283`, `ToolRun::definition:
+> Option<ToolRenderKind>` — `is_some()` is `hasRendererDefinition()`, the payload is
+> `getRenderShell()`'s first tier), and `tool_lines` resolves and branches on it
+> (`transcript/tool_render.rs:96-131` for the resolution, `:139-200` `self_rendered_lines`). That
+> is pi's `tool-execution.ts:71-79` (bare `Container` instead of `Box(1, 1, bgFn)`), `:108-116`
+> (`getRenderShell()`), `:275-277` (`if (renderContainer instanceof Box) setBgFn` — so no tint) and
+> `:237-259` (`render()`'s self branch) @v0.84.4. The **layout** correction the 2026-08-15 block
+> demanded — that this is a framed-vs-unframed split, not a lookup plus a tint — is what landed:
+> `self_rendered_lines` emits the wrapped rows at column 0 with no padding, no gutter and no state
+> tint, and the built-in `edit`'s own `Box(1, 1, getEditHeaderBg)` is drawn INSIDE that branch, so
+> the pre-existing `edit` output is byte-identical and the shell tail no longer special-cases
+> `run.name == "edit"`.
+>
+> **`label`, and the correction that matters for anyone re-deriving this row.** The cyrup half is
+> done: `tool-descriptor.label: string` (`world.wit:97` — a bare `string`, not an `option`, because
+> upstream's field is REQUIRED), `WasmTool::label` (`live.rs:2089-2091`, mapping an EMPTY label to
+> `None` so a non-SDK guest cannot blank the row), delegated by `cyrup-ext/src/wrapper.rs:110-111`.
+> **The other half is that pi does not consume `label` either.** At v0.84.4 it is copied twice —
+> `core/tools/tool-definition-wrapper.ts:11` (`wrapToolDefinition`) and `:39`
+> (`createToolDefinitionFromAgentTool`) — onto `AgentTool.label` (`packages/agent/src/types.ts:389`,
+> "Human-readable label for UI display") and then read by nothing: `git -C tmp/pi grep -n '\.label'
+> v0.84.4 -- packages/coding-agent/src` returns only selector/tree/session-label/`classification.label`
+> sites, and `packages/agent`, `packages/server`, `packages/protocol` and `packages/client` have no
+> tool-label reader at all. `ToolExecutionComponent` titles the row from `this.toolName`
+> (`tool-execution.ts:137-139`, `:330-333`). So limb (3) of the Impact below — "a guest's distinct
+> display name is unreachable, harmless today only because `Tool::label` has no consumer" — is
+> **parity with upstream**, and giving `Tool::label` a cyrup-side consumer would be a divergence
+> FROM pi, not a closure of this row. (The built-in producer half is `TOOL-045`, independent, and
+> stays open.)
+>
+> **What protects it.** `live.rs:2718-2767` is a source-text guard over the `impl Tool for WasmTool`
+> block that fails if any of the eleven overrides — `label`, `render_kind`, `prepare_arguments`
+> among them — is deleted, because a dropped delegation returns the same trait default a descriptor
+> that left the field unset would (EXT-M03's lesson). `cyrup-ext/src/wrapper.rs:362-460`
+> (`every_surface_method_delegates`, with a MUTATING `prepare_arguments` in the `Fixed` double)
+> covers the wrapper. `cyrup-tui/src/tests/tool_render_shell.rs` drives a real `AgentSession` whose
+> definitions declare each kind through `refresh_known_tool_definitions` +
+> `ingest_session_event_owned`; `cyrup-tui/src/tests/tool_render.rs:412` covers the extension-renderer
+> row. `cyrup-ext/src/tests/payload_and_seam_parity.rs:976`
+> (`the_tool_descriptor_carries_prepare_arguments_and_render_shell`) pins the descriptor round trip.
+>
+> **The one residual, stated rather than hidden.** The `Verify` line below asks for a fixture GUEST
+> tool whose `prepare_arguments` renames a key. No such test exists: every link is proven in source,
+> and the trait-level ordering is pinned by
+> `cyrup-agent/src/tests/model_boundary.rs::gap18_prepare_arguments_runs_before_execute`, but
+> nothing drives the `prepare-arguments` export across a LIVE component. That is a test-coverage
+> residual for the `cyrup-it` wasm fixture suite (which already builds the `cyrup-ext-sdk` example to
+> `wasm32-wasip2` once for the whole suite), not a behavioural gap, and it is **not** counted as this
+> row remaining open.
 **cyrup** — There are two `ToolDescriptor` types and they disagree. The host-facing WIT record is still the 8-field shape — `crates/cyrup-ext/wit/world.wit:39-48`: name / label / description / parameters-json / exec-mode / prompt-snippet / prompt-guidelines / has-renderer — with no `render-shell` and no `prepare-arguments`, so a guest's declaration has no wire to arrive on. `impl Tool for WasmTool` (`crates/cyrup-ext/src/host/live.rs:1386-1420`) overrides neither `label`, `prompt_guidelines`, `render_kind` nor `prepare_arguments`, so all four fall to the `cyrup_core::Tool` defaults (`tool.rs:105-107`, `:120-122`, `:126-128`, `:133-135`). The guest-side type still declares what the host cannot receive: `crates/cyrup-ext-sdk/src/descriptor.rs:19` `RenderShell`, `:45` `render_shell`, `:65` the default.
 
 **upstream** — `pi/packages/coding-agent/src/core/extensions/types.ts:453` `label: string` (REQUIRED), `:465` `renderShell?: "default" | "self"`, `:468` `prepareArguments?`. `tool-definition-wrapper.ts:11` copies `label` and `:15` copies `prepareArguments` onto every AgentTool, extension tools included.
