@@ -106,6 +106,7 @@ corrections are applied and recorded at the item.
 | ~~SUBA-085~~ | ~~high~~ **CLOSED 2026-09-04** | S | missions | `mission.resolve-decision` ported at `5e3aa1c8` — the seventh verb, the store transition, and upstream's open-decision status gate; the goal driver moves past a resolved decision, pinned by test |
 | ~~SUBA-086~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / diagnostics | **Promoted out of `## Carried` 2026-09-04** (both sides read; three corrections to the filed text recorded in the section) **and ported at `275c1f85`**: `AgentDiscoveryDiagnostic`, `parse_agent_file_checked`, `find_blocking_agent_diagnostic`, rendered by `list`/`get`/`models`/doctor and enforced at both delegation seams |
 | ~~SUBA-087~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | M | background control / child-scoped stop | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; one filing error corrected) **and ported at `2d9d0d0a`**: `childId` on the tool, `control/stop-requests/` queue with `targetIndex`/`childId`, `child_identity`/`child_stop` modules, the runner stops ONE step and keeps the run alive with pi's events and texts. Residual: a `ParallelGroup`/`DynamicGroup`'s members are one step to cyrup's status, so a `tasks[]` fan-out's members are not individually addressable |
+| ~~SUBA-088~~ | ~~medium~~ **CLOSED 2026-09-04** | M | config / discovery / model ladder | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; two citation corrections and one impact correction) **and ported at `ba24e5e5`**: `subagents.defaultProvider` + per-agent `agentOverrides.<name>.defaultProvider` parse with upstream's messages, `AgentDefinition::model_provider` stamped per `applySubagentDefaultModel`, the ladder takes `agent.model_provider ?? parent-session provider` and QUALIFIES a bare id to `provider/id` on the child's `--model`, the `models` report resolves per agent. Residuals (low): v0.64.0's `providerOverrides` and the discovery-cache provider key are not ported; a qualified id the provider does not offer fails in the child rather than at the parent |
 | ~~SUBA-092~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / agent schema | `excludeTools:`/`allowNestedSubagents:` ported at `247ff97b` — frontmatter, settings-override, serializer, and the spawn-plan tool subtraction / nested-fanout grant. v0.64.0's cross-field custom-override precedence change (`31562d76`) is a recorded residual, not this row |
 
 > **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
@@ -186,13 +187,14 @@ corrections are applied and recorded at the item.
 >   from the base commit's own files). Every implementer hit it and reverted the churn by hand.
 >   Repo-level decision, ownerless.
 
-Carried-but-unverified (`## Carried — NOT adversarially verified`): **four rows, all medium** —
-`SUBA-088`, `SUBA-089`, `SUBA-090`, `SUBA-091`. (The three highs that sat here,
+Carried-but-unverified (`## Carried — NOT adversarially verified`): **three rows, all medium** —
+`SUBA-089`, `SUBA-090`, `SUBA-091`. (The three highs that sat here,
 `SUBA-082`/`SUBA-084`/`SUBA-086`, were promoted and closed on 2026-09-04 — see the blockquote
 above; `SUBA-087` was promoted, confirmed and PARTIALLY CLOSED on 2026-09-04 at `2d9d0d0a` — see
-`## ~~SUBA-087~~`.) All were re-checked port-side at cyrup HEAD `2571969` this pass: every zero-hit
+`## ~~SUBA-087~~`; `SUBA-088` was promoted, confirmed and CLOSED on 2026-09-04 at `ba24e5e5` — see
+`## ~~SUBA-088~~`.) All were re-checked port-side at cyrup HEAD `2571969` this pass: every zero-hit
 grep this file recorded for them still returns zero hits — none of the 210 commits since baseline
-`4fb5e40` touched any of these symbols/behaviours. The four remaining are left exactly as filed,
+`4fb5e40` touched any of these symbols/behaviours. The three remaining are left exactly as filed,
 still held to the lower evidence standard the section header states (upstream line numbers not
 re-verified) — no pass has yet re-read `git show v0.57.0:<path>` for any of them, only the cyrup
 side.
@@ -1547,12 +1549,157 @@ as upstream accepted it.
 
 ---
 
+## ~~SUBA-088~~ — ~~medium~~ **CLOSED 2026-09-04** — `subagents.defaultProvider` and per-agent `modelProvider` are unported, and the foreground launch path passes no preferred provider into candidate resolution at all
+
+> **PROMOTED OUT OF `## Carried — NOT adversarially verified`, CONFIRMED WITH THREE CORRECTIONS,
+> AND CLOSED 2026-09-04 — landing commit `ba24e5e5` (code), on top of `615bbb1d`.** Upstream re-read
+> with `git show` at BOTH tags. The five type fields and `applySubagentDefaultModel` are exactly as
+> filed at v0.57.0 (`agents.ts:86,116,132,177,1155-1168`). **Two citation errors:** the filed
+> `v0.57.0:agents.ts:997-1004` and `:1045-1051` land in the `toolBudget` override parse and the head of
+> `readSubagentSettings` — the `defaultProvider` parse and `resolveSubagentDefaultProvider` live
+> elsewhere (v0.64.0 lines below); and `AgentConfig::preferred_provider` had drifted from the filed
+> `agent_config.rs:349` to `:417` (it is on `RunOptions`, not the agent config). **One impact
+> correction that changed the fix:** the filing says the gap is "which provider a BARE id resolves
+> against" inside `build_model_candidates` — but cyrup's launch path never resolves against a
+> registry at all (foreground `available_models` is the persona's own list, and the bare id was
+> forwarded verbatim as `--model <id>` for the CHILD to resolve), so the preference has to be applied
+> by QUALIFYING the id to `provider/id` before spawn, or the child's own default-provider resolution
+> decides. Port-side at `615bbb1d`, before the change: `rg 'default_provider|defaultProvider|
+> model_provider|modelProvider|preferred_model_provider|provider_overrides'
+> crates/cyrup-ext-subagents/src` found only the fork-thinking predicate's parent rung
+> (`foreground.rs:952-958`, with the comment "`AgentDefinition` declares no `modelProvider`"), the
+> `types.rs:570` doc listing the override key as deliberately unmodeled, and the settings test at
+> `discovery/mod.rs:2309` that tolerates and DROPS the key — exactly as filed. `RunOptions::
+> preferred_provider` was `None` at every launch site and consumed by nothing on the launch path.
+> Severity `medium` stands; effort M was exact. Port target v0.64.0.
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed (2026-09-04, both tags)
+**Subsystem** config / discovery / model ladder
+**Window** v0.47.1..v0.57.0 · `cc112354 (#1394)`
+
+**upstream (v0.64.0)** — `src/agents/agents.ts:59` `modelProvider` on the override base, `:90`
+`BuiltinAgentOverrideConfig.defaultProvider?: string | false`, `:126`
+`AgentModelSourceInfo.defaultProvider`, `:144` `AgentConfig.modelProvider?: string`, `:192`
+`SubagentSettings.defaultProvider?: string`; `:1086-1089` override parse (`false` | non-empty
+trimmed string, else `Builtin override '${name}' in '${filePath}' has invalid 'defaultProvider';
+expected a non-empty string or false.`); `:1147-1153` settings parse (`Subagent settings in
+'${filePath}' have invalid 'defaultProvider'; expected a non-empty string.`); `:1242-1249`
+`resolveSubagentDefaultProvider` (project beats user when the project scope exists); `:1266-1279`
+`applySubagentDefaultModel(agents, defaultModel, defaultProvider)` whose guard `if (agent.model !==
+undefined && (agent.modelProvider !== undefined || !defaultProvider)) return agent;` stamps
+`modelProvider` onto EVERY agent lacking one, including agents that pin a `model`; `:1387-1390`
+`applyBuiltinOverride` (`false` → `delete next.modelProvider`, string → set), `:1481` the custom path
+delegates to it; `modelProvider` is NOT a frontmatter key (no parser reads it). Consumers:
+`src/runs/foreground/execution.ts:1881-1887` `buildModelCandidates(options.modelOverride ??
+agent.model, agent.fallbackModels, options.availableModels, agent.modelProvider ??
+options.preferredModelProvider, {...})`; `src/runs/shared/model-fallback.ts:412-418`
+`buildModelCandidates(primary, fallbacks, available, preferredProvider?, options?)` resolving each
+candidate through `resolveSubagentModelCandidate(model, available, preferredProvider)` (`:207-218`
+→ `resolveExactIdMatches` `:115-126`, the preferred provider's exact-id match wins);
+`src/runs/foreground/subagent-executor.ts:3648` `const currentProvider = parentModel?.provider`,
+`:3825` `preferredModelProvider: currentProvider`, `:6390` the fork predicate's
+`agentConfig?.modelProvider ?? parentModel?.provider`, `:1297` `currentModelProvider:
+parentModel?.provider` for the async runner; `src/runs/background/async-execution.ts:930`
+`a.modelProvider ?? ctx.currentModelProvider`; `src/agents/agent-management.ts:1012,1025,1050` the
+`models` report resolves with `agent.modelProvider ?? preferredProvider`, `:742` the list line
+prints `${modelProvider}/${model}` for a bare id. **v0.57.0 → v0.64.0:** parse/resolve/apply are
+byte-equivalent for this key; v0.64.0 adds `providerOverrides` (`selectProviderOverrides`,
+`:1231-1240`, per-provider override maps merged over `overrides`) and threads
+`preferredModelProvider` into the discovery cache key (`:2425-2428,2457,2505,2539-2571`).
+
+**cyrup (at `ba24e5e5`)** — `crates/cyrup-ext-subagents/src/discovery/types.rs`:
+`SubagentSettings::default_provider: Option<String>`, `AgentOverrideConfig::default_provider:
+OverrideField<String>` (and `is_empty`), `AgentDefinition::model_provider: Option<ProviderId>`; the
+override census doc now reads "19 modeled, 3 unmodeled". `discovery/mod.rs`:
+`validate_default_provider` and `validate_override_default_providers` (upstream's two messages, the
+file path dropped exactly as the sibling `validate_default_thinking` drops it), trimmed storage in
+`parse_subagent_settings`, `default_provider: project.or(user)` in
+`resolve_layered_subagent_settings`. `discovery/merge.rs`: `resolve_default_provider` (project wins
+when the project scope exists), `apply_default_model(merged, default_model, default_provider)`
+mirroring the `:1269` guard, the builtin full-replace arm and the custom fill arm (gate vacuously
+open — no frontmatter key). `exec/fallback.rs`: `build_model_candidates(override, primary,
+fallbacks, available, preferred_provider: Option<&ProviderId>)` and `build_model_candidates_scoped`
+(same, before `scope`); new pure `qualify_model_candidate` (bare id → `provider/id`, thinking suffix
+kept, qualified ids never rewritten) and `provider_of` (`normalizeParentModel`'s two-non-empty-halves
+rule); dedup on the qualified spelling, allowlist accepting either spelling.
+`exec/agent_config.rs`: `AgentConfig::model_provider`, `ResolvedAgentPersona::model_provider`
+(serde default; hop 2 carries it), `RunOptions::preferred_provider` documented as the parent rung.
+`exec/mod.rs::resolve_model_candidates` passes `agent.model_provider.as_ref().or(opts.
+preferred_provider.as_ref())`. `extension/executor/foreground.rs`: `ResolvedRunAgent::
+preferred_provider` = `provider_of(remembered_parent_model)` → `RunOptions`, and
+`fork_requires_thinking_off` honours `agent.model_provider` first. `background/runner_main.rs::
+build_step_run_options`: `preferred_provider: provider_of(self.inherited_session_model)`.
+`extension/executor/reports.rs::run_models_report`: per-agent `provider_for(agent)` =
+`agent.model_provider ?? session provider` at all three resolution sites. The `cyrup-it` persona
+and agent-config fixtures gained the new field (`model_provider: None` / `default_provider: None`);
+`discovery/runtime_registry.rs:18`'s pre-existing broken intra-doc link (private
+`extension::executor` path, from SUBA-084) was repointed at the public re-export so the required
+rustdoc check passes.
+
+**Design decision (recorded per DESIGN-GUIDANCE, in the commit body):** functional core /
+imperative shell — the provider preference is a pure decision (`qualify_model_candidate`) the
+existing ladder shell applies; no new type. Rejected: a `QualifiedModelId` newtype (every consumer
+takes the plain `ModelId` string, as does upstream; ~30 conversions for no check it would remove);
+resolving against a live registry on the launch path (a larger behavioural change than the row, and
+would make the ladder depend on host availability); folding the provider into `ModelOverride`
+(orthogonal to the override/inherit decision). Documented inference: with no registry, any `/` is a
+provider prefix (upstream: only a REGISTERED provider's prefix) — the convention the fork predicate
+and the models report already used.
+
+**Tests (all fail before / pass after — the parse-rejection test was run against HEAD and failed
+with `Ok(..)`; the rest do not compile at HEAD because the fields/parameter did not exist):**
+`discovery::tests::parse_subagent_settings_reads_and_trims_default_provider`,
+`…::parse_subagent_settings_rejects_invalid_default_provider_with_upstreams_message`,
+`…::parse_subagent_settings_validates_override_default_provider`;
+`discovery::merge::tests::default_provider_stamps_agents_that_pin_a_model_but_no_provider`,
+`…::default_provider_project_wins_over_user`,
+`…::override_default_provider_sets_and_false_clears_model_provider`;
+`exec::fallback::tests::bare_candidate_is_qualified_by_the_preferred_provider`,
+`…::qualified_candidates_and_no_preference_are_left_untouched`,
+`…::qualification_dedups_against_the_qualified_spelling_and_keeps_qualified_allowlist_entries`,
+`…::provider_of_and_qualify_follow_the_parent_model_rules`;
+`exec::tests::a_bare_persona_model_spawns_qualified_by_the_agents_provider_then_the_parents` (the
+launch chain `resolve_model_candidates` → `build_attempt_spawn_plan` puts `openai-codex/gpt-5` on
+`--model` for `model: gpt-5` + a stamped provider, `anthropic/gpt-5` under the parent rung alone, and
+bare `gpt-5` with neither — the last being the pre-SUBA-088 argv). Checks: `cargo fmt --all --
+--check`, `cargo clippy -p cyrup-ext-subagents --all-targets -- -D warnings`, `cargo nextest run -p
+cyrup-ext-subagents` (2707/2707), `RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-ext-subagents
+--no-deps`, `CYRUP_IT_BIN_DIR=<dir> cargo check -p cyrup-it --features it --tests` — all clean.
+Running the `cyrup-it` suite itself needs the nested it-bins build, which hit ENOSPC on this shared
+disk (399 MB free at the end of the run); a maintainer must run it once.
+
+**Falsification** — with `~/.cyrup/agents/settings.json` `{"subagents":{"defaultProvider":
+"openai-codex"}}` and an agent whose frontmatter says `model: gpt-5`, a foreground run must spawn
+the child with `--model openai-codex/gpt-5` (the `attempt-0.jsonl` tee / spawn argv), and
+`subagents-models` must resolve that agent under `openai-codex`; `{"defaultProvider":"  "}` must abort
+discovery with `invalid 'defaultProvider'; expected a non-empty string`; an
+`agentOverrides.<name>.defaultProvider: false` must leave that agent's id bare. Any of those failing
+reopens the row.
+
+**Residuals — recorded, not closed by this row.** (1) **low — v0.64.0 `providerOverrides`**
+(`selectProviderOverrides`, `agents.ts:1231-1240`): per-provider override maps selected by the
+parent's provider are not modeled; the key is dropped by serde as before. (2) **low —
+`preferredModelProvider` in the discovery cache key** (`:2425-2428`): cyrup's discovery is not cached
+by provider; irrelevant until (1) lands. (3) **low — a qualified `provider/id` whose provider does not
+offer the id** fails in the CHILD (`Unknown model …` from its own registry) where upstream throws
+`Unknown subagent model '<id>' in the active Pi model registry.` at the PARENT before spawning — the
+consequence of qualifying without a registry; closing it means resolving the ladder against
+`HostServices` models on the launch path. (4) `AgentModelSourceInfo.defaultProvider` (`:126`) is not
+carried — cyrup's provenance is a `Copy` enum and upstream has no consumer of the field. (5) The
+`formatAgentCapabilitiesLine` list line (`agent-management.ts:727-745`, `${modelProvider}/${model}`
+for a bare id) is not rendered by cyrup at all; the describe view prints the raw `model:` as before.
+(6) Runtime-registered agents (`SUBA-084`) cannot declare `modelProvider` — upstream's
+`registerAgent` does not carry it either (`runtime-agent-registry.ts` has no such field at v0.64.0).
+
+---
+
 ## Carried — NOT adversarially verified
 
 > **2026-09-04: three of the eight rows this section was written for — `SUBA-082`, `SUBA-084`,
 > `SUBA-086` — were held to the confirmed bar, confirmed, ported and CLOSED; each now has a full
-> section in the confirmed set above (in id order) and only a pointer remains here. The five below are
-> unchanged and still carried at this section's lower standard.**
+> section in the confirmed set above (in id order) and only a pointer remains here; `SUBA-087` and
+> `SUBA-088` followed the same day. The three below are unchanged and still carried at this
+> section's lower standard.**
 
 > **READ THIS BEFORE ACTING ON ANYTHING IN THIS SECTION.** The refutation pass for this batch was
 > capped at twelve items. The eight items below were produced by the same analyst lenses as the
@@ -1575,41 +1722,7 @@ as upstream accepted it.
 
 ### ~~SUBA-087~~ — **PROMOTED AND PARTIALLY CLOSED 2026-09-04** — see `## ~~SUBA-087~~` in the confirmed set above (landing commit `2d9d0d0a`)
 
-### SUBA-088 — `subagents.defaultProvider` and per-agent `modelProvider` are unported, and the foreground launch path passes no preferred provider into candidate resolution at all
-
-**Severity** medium (as filed) · **Effort** M · **Window** v0.47.1..v0.57.0 · `cc112354 (#1394)`
-
-*Upstream, as filed (unverified):* `agents.ts:132` `modelProvider?: string` on `AgentConfig`, `:177`
-`defaultProvider?: string` on `SubagentSettings`, `:86` `defaultProvider?: string | false` on
-`BuiltinAgentOverrideConfig` (this one **is** confirmed — see `SUBA-081`'s verified 22-field list),
-`:116` on `AgentModelSourceInfo`; `:997-1004` parses it; `:1045-1051` `resolveSubagentDefaultProvider`
-(project beats user); `:1155-1168` `applySubagentDefaultModel` stamps `modelProvider` onto every agent
-that has not pinned its own — including agents that already pin a MODEL. Consumed at
-`execution.ts:1826-1831`:
-`buildModelCandidates(options.modelOverride ?? agent.model, agent.fallbackModels, options.availableModels, agent.modelProvider ?? options.preferredModelProvider, {...})`,
-whose 4th parameter drives `resolveRequiredSubagentModelCandidate`/`resolveSubagentModelCandidate`
-(`model-fallback.ts:366-397`) — i.e. which provider a BARE model id resolves against.
-
-*Port (re-verified at HEAD):*
-`grep -rnE 'default_provider|defaultProvider|model_provider|modelProvider' --include=*.rs crates/cyrup-ext-subagents/src`
-→ **0 hits** for every spelling. `src/discovery/types.rs:505-541 SubagentSettings` has no
-`default_provider`; `AgentDefinition` has `model` and `model_source` but no provider field;
-`src/discovery/merge.rs:223-250` applies only `defaultModel`, with no provider parameter.
-`src/exec/fallback.rs:127-132 build_model_candidates(model_override, agent_primary_model, agent_fallback_models, available_models)`
-has **no** provider parameter (nor does `build_model_candidates_scoped` at `:174-180`). The unrelated
-`AgentConfig::preferred_provider` (`src/exec/agent_config.rs:349`) is `None` at every foreground call
-site (`src/extension/executor/foreground.rs:361`, `src/background/runner_main.rs:2572`,
-`src/exec/testsupport.rs:59`); only `src/extension/executor/reports.rs:182` populates it, and that is
-the report surface, not the launch path.
-
-*Behaviour gap:* `subagents.defaultProvider: "openai-codex"` has no effect — not parsed, not merged,
-and no channel to reach candidate resolution. An agent naming a bare model id cannot be steered to a
-particular provider, and a bare id that several providers offer resolves without the user's preference.
-
-*Relation:* distinct from `SUBA-050` (`modelScope.strict`, an allowlist) and `SUBA-035` (surfacing the
-scope policy) — this is provider *preference* feeding candidate resolution. Merges three lens
-candidates sharing one fix site: `build_model_candidates`' signature plus the settings parse. Pairs
-with `SUBA-081`'s `defaultProvider` override field.
+### ~~SUBA-088~~ — **PROMOTED AND CLOSED 2026-09-04** — see `## ~~SUBA-088~~` in the confirmed set above (landing commit `ba24e5e5`)
 
 ### SUBA-089 — The model-fallback retry decision ignores whether the failed attempt already ran tools, so a half-completed mutating run is re-dispatched
 
@@ -2043,7 +2156,7 @@ the twenty items above through that partition:
 2. **The agent-definition schema's missing keys** — `SUBA-074`, `SUBA-081`, `SUBA-082`, `SUBA-088`,
    with `SUBA-086` as the amplifier that converts all of them from silence into user-visible errors.
    **Land `SUBA-086` first.** *(2026-09-04: `SUBA-086` landed at `275c1f85` and `SUBA-082` at
-   `5a4ae4ed`; `SUBA-081`'s four remaining fields, `SUBA-074` stage 2 and carried `SUBA-088` are
+   `5a4ae4ed`, `SUBA-088` at `ba24e5e5`; `SUBA-081`'s remaining fields and `SUBA-074` stage 2 are
    what is left of this partition.)*
 3. **The external-runner / `workflowScript` execution model** — `SUBA-074` stage 2, `VL-S2` and its
    dependents. This is the genuinely large remainder and the only part that needs design.
