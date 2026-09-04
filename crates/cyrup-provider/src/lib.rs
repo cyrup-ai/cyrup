@@ -98,7 +98,7 @@ pub use providers::all::{
     default_models,
 };
 pub use providers::builtin_provider_oauth;
-pub use providers::fleet::{FLEET, FleetSpec, fleet_providers_with, fleet_spec};
+pub use providers::fleet::{FLEET, FleetCatalog, FleetSpec, fleet_providers_with, fleet_spec};
 pub use providers::{
     ANTHROPIC_BASE_URL, ANTHROPIC_FLEET, ANTHROPIC_PROVIDER_ID, AnthropicFleetSpec, anthropic_auth,
     anthropic_fleet_providers_with, anthropic_fleet_spec, anthropic_models, anthropic_provider,
@@ -114,6 +114,12 @@ pub use providers::{
     cloudflare_ai_gateway_auth, cloudflare_ai_gateway_models, cloudflare_ai_gateway_provider,
     cloudflare_ai_gateway_provider_with, cloudflare_workers_ai_auth, cloudflare_workers_ai_models,
     cloudflare_workers_ai_provider, cloudflare_workers_ai_provider_with,
+};
+pub use providers::{
+    DEFAULT_RADIUS_GATEWAY, RADIUS_API_KEY_ENV, RADIUS_PROVIDER_ID, RADIUS_PROVIDER_NAME,
+    RadiusGatewayConfig, RadiusGatewayModel, RadiusProvider, RadiusProviderOptions,
+    load_radius_gateway_config, radius_auth, radius_models, radius_models_from_config,
+    radius_provider, radius_provider_with, sanitize_radius_gateway_config,
 };
 pub use providers::{
     FIREWORKS_BASE_URL, FIREWORKS_PROVIDER_ID, fireworks_auth, fireworks_models,

@@ -247,6 +247,37 @@ async fn update_models_forces_a_fetch_for_every_configured_provider() {
     );
 }
 
+/// PROV-014 — `radius` is never fetched from pi.dev (`model-runtime.ts:183-189` @v0.84.4:
+/// `provider.id === "radius" ? provider : withRemoteCatalog(…)`): a configured radius alongside a
+/// configured groq issues exactly ONE request, and a lone radius issues none.
+#[tokio::test]
+async fn update_models_never_fetches_radius_from_pi_dev() {
+    let origin = MockOrigin::spawn().await;
+    let catalog = catalog(&origin.base_url);
+
+    crate::provider::refresh_model_catalogs_with(
+        catalog.clone(),
+        vec!["radius".to_string(), "groq".to_string()],
+    )
+    .await
+    .expect("radius is skipped, groq's 404 is pi's no-remote-catalog branch");
+    assert_eq!(origin.accept_count(), 1, "only groq reaches pi.dev");
+
+    crate::provider::refresh_model_catalogs_with(catalog, vec!["radius".to_string()])
+        .await
+        .expect("a radius-only set is a successful no-op");
+    assert_eq!(origin.accept_count(), 1, "radius alone issues no request");
+
+    assert_eq!(
+        crate::provider::pi_dev_catalog_providers(&[
+            "radius".to_string(),
+            "openai".to_string(),
+            "radius".to_string()
+        ]),
+        vec!["openai".to_string()]
+    );
+}
+
 /// No credential anywhere ⇒ no request, and still a success: a fresh install can run
 /// `cyrup update --models` without an `auth.json` and gets `Model catalogs refreshed`, exactly as
 /// upstream does.

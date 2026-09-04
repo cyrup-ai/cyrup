@@ -5,51 +5,65 @@
 //! `Models` collection (`all.ts:111-117`); the model pattern then resolves to the owning provider.
 //! This module mirrors that for the providers actually implemented in this crate today.
 //!
-//! ## Pi `all.ts` `builtinProviders()` listing (line numbers from `all.ts:89-126` **@ `v0.83.0`**):
+//! ## Pi `all.ts` `builtinProviders()` listing (line numbers from `all.ts:91-130` **@ `v0.84.4`**):
 //!
-//! | Pi line | provider id              | here                                   |
-//! |---------|--------------------------|----------------------------------------|
-//! | 89      | `amazon-bedrock`         | ✓                                      |
-//! | 90      | `ant-ling`               | ✓ fleet                                |
-//! | 91      | `anthropic`              | ✓                                      |
-//! | 92      | `azure-openai-responses` | ✓                                      |
-//! | 93      | `cerebras`               | ✓ fleet                                |
-//! | 94      | `cloudflare-ai-gateway`  | ✓                                      |
-//! | 95      | `cloudflare-workers-ai`  | ✓                                      |
-//! | 96      | `deepseek`               | ✓ fleet                                |
-//! | 97      | `fireworks`              | ✓                                      |
-//! | 98      | `github-copilot`         | ✓                                      |
-//! | 99      | `google`                 | ✓                                      |
-//! | 100     | `google-vertex`          | ✓                                      |
-//! | 101     | `groq`                   | ✓ fleet                                |
-//! | 102     | `huggingface`            | ✓ fleet                                |
-//! | 103     | `kimi-coding`            | ✓ anthropic-compat fleet               |
-//! | 104     | `minimax`                | ✓ anthropic-compat fleet               |
-//! | 105     | `minimax-cn`             | ✓ anthropic-compat fleet               |
-//! | 106     | `mistral`                | ✓                                      |
-//! | 107     | `moonshotai`             | ✓ fleet                                |
-//! | 108     | `moonshotai-cn`          | ✓ fleet                                |
-//! | 109     | `nvidia`                 | ✓ fleet                                |
-//! | 110     | `openai`                 | ✓                                      |
-//! | 111     | `openai-codex`           | ✓                                      |
-//! | 112     | `opencode`               | ✓                                      |
-//! | 113     | `opencode-go`            | ✓                                      |
-//! | 114     | `openrouter`             | ✓ fleet                                |
-//! | **115** | **`qwen-token-plan`**    | **✗ NOT REGISTERED — `PROV-014`**      |
-//! | **116** | **`qwen-token-plan-cn`** | **✗ NOT REGISTERED — `PROV-014`**      |
-//! | **117** | **`radius`**             | **✗ NOT REGISTERED — `PROV-014`**      |
-//! | 118     | `together`               | ✓                                      |
-//! | 119     | `vercel-ai-gateway`      | ✓ anthropic-compat fleet               |
-//! | 120     | `xai`                    | ✓ fleet                                |
-//! | 121     | `xiaomi`                 | ✓ fleet                                |
-//! | 122-124 | `xiaomi-token-plan-*`    | ✓ fleet                                |
-//! | 125     | `zai`                    | ✓ fleet                                |
-//! | 126     | `zai-coding-cn`          | ✓ fleet                                |
+//! | Pi line | provider id                  | here                                   |
+//! |---------|------------------------------|----------------------------------------|
+//! | 91      | `amazon-bedrock`             | ✓                                      |
+//! | 92      | `ant-ling`                   | ✓ fleet                                |
+//! | 93      | `anthropic`                  | ✓                                      |
+//! | 94      | `azure-openai-responses`     | ✓                                      |
+//! | **95**  | **`baseten`**                | **✗ NOT REGISTERED — v0.84.x addition (no ledger id yet; see the guard test)** |
+//! | 96      | `cerebras`                   | ✓ fleet                                |
+//! | 97      | `cloudflare-ai-gateway`      | ✓                                      |
+//! | 98      | `cloudflare-workers-ai`      | ✓                                      |
+//! | 99      | `deepseek`                   | ✓ fleet                                |
+//! | 100     | `fireworks`                  | ✓                                      |
+//! | 101     | `github-copilot`             | ✓                                      |
+//! | 102     | `google`                     | ✓                                      |
+//! | 103     | `google-vertex`              | ✓                                      |
+//! | 104     | `groq`                       | ✓ fleet                                |
+//! | 105     | `huggingface`                | ✓ fleet                                |
+//! | 106     | `kimi-coding`                | ✓ anthropic-compat fleet               |
+//! | 107     | `minimax`                    | ✓ anthropic-compat fleet               |
+//! | 108     | `minimax-cn`                 | ✓ anthropic-compat fleet               |
+//! | 109     | `mistral`                    | ✓                                      |
+//! | 110     | `moonshotai`                 | ✓ fleet                                |
+//! | 111     | `moonshotai-cn`              | ✓ fleet                                |
+//! | 112     | `nvidia`                     | ✓ fleet                                |
+//! | 113     | `openai`                     | ✓                                      |
+//! | 114     | `openai-codex`               | ✓                                      |
+//! | 115     | `opencode`                   | ✓                                      |
+//! | 116     | `opencode-go`                | ✓                                      |
+//! | 117     | `openrouter`                 | ✓ fleet                                |
+//! | 118     | `qwen-token-plan`            | ✓ fleet (dynamic catalog) — PROV-014   |
+//! | 119     | `qwen-token-plan-cn`         | ✓ fleet (dynamic catalog) — PROV-014   |
+//! | 120     | `qwen-token-plan-individual` | ✓ fleet (dynamic catalog) — PROV-014   |
+//! | 121     | `radius`                     | ✓ [`super::radius`] — PROV-014         |
+//! | 122     | `together`                   | ✓                                      |
+//! | 123     | `vercel-ai-gateway`          | ✓ anthropic-compat fleet               |
+//! | 124     | `xai`                        | ✓ fleet                                |
+//! | 125     | `xiaomi`                     | ✓ fleet                                |
+//! | 126-128 | `xiaomi-token-plan-*`        | ✓ fleet                                |
+//! | 129     | `zai`                        | ✓ fleet                                |
+//! | 130     | `zai-coding-cn`              | ✓ fleet                                |
 //!
-//! **33 of pi's 36 built-in providers are registered below.** Every api id the registered providers'
-//! catalogs name has a registered impl — that half is not left to this comment:
+//! **39 of pi v0.84.4's 40 built-in providers are registered below** (every one of the ported
+//! baseline v0.83.0's 38, `all.ts:89-126` @v0.83.0, plus v0.84.x's `qwen-token-plan-individual`;
+//! `baseten` is the one v0.84.x addition still outstanding). Every api id the registered
+//! providers' catalogs name has a registered impl — that half is not left to this comment:
 //! `src/tests/catalog_data.rs`'s `every_catalog_api_has_a_registered_impl` walks all 35 catalogs and
-//! asserts `builtin_registry().contains(&row.api)` for every row.
+//! asserts `builtin_registry().contains(&row.api)` for every row. Four registered providers ship
+//! NO embedded catalog by design — `radius` and the three `qwen-token-plan*` members — and
+//! `catalog_data.rs`'s `DYNAMIC_ONLY_PROVIDERS` pins that set in both directions.
+//!
+//! **PROV-014, 2026-09-04.** `qwen-token-plan` / `qwen-token-plan-cn` (`all.ts:115-117` @v0.83.0)
+//! and `radius` were the three v0.83.0 built-ins this file did not construct. They are now: the
+//! two Qwen plans (plus v0.84.4's Individual plan) as [`super::fleet`] members whose catalog is
+//! [`super::fleet::FleetCatalog::Dynamic`] — the rows are models.dev data that is in git at no
+//! revision, see that module's doc — and `radius` as its own provider kind in [`super::radius`]:
+//! `pi-messages`, api-key OR gateway-bound OAuth, catalog refreshed from the gateway's
+//! `/v1/config` and published to the [`crate::models_store::ModelsStore`].
 //!
 //! **PROV-062, 2026-08-14 (sweep 9) — what this table used to say, and why it was worse than no
 //! table.** It ended at `zai-coding-cn` with **no row for `all.ts:115`, `:116` or `:117`**, and then
@@ -87,6 +101,7 @@ use crate::images::{ImagesModels, ImagesProvider, create_images_models};
 use crate::provider::Provider;
 use crate::providers::anthropic::anthropic_fleet_providers_with;
 use crate::providers::fleet::fleet_providers_with;
+use crate::providers::radius::radius_provider_with;
 use crate::providers::{
     amazon_bedrock_provider_with, anthropic_provider_with, azure_openai_responses_provider_with,
     cloudflare_ai_gateway_provider_with, cloudflare_workers_ai_provider_with,
@@ -174,11 +189,20 @@ fn builtin_providers_with(
     let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
 
     // openai-completions fleet: ant-ling, cerebras, deepseek, groq, huggingface, moonshotai,
-    // moonshotai-cn, nvidia, openrouter, xai, xiaomi, xiaomi-token-plan-{ams,cn,sgp}, zai,
-    // zai-coding-cn (Pi `all.ts` lines 73,76,79,84,85,90,91,92,97,100,101,102-104,105,106).
+    // moonshotai-cn, nvidia, openrouter, qwen-token-plan, qwen-token-plan-cn,
+    // qwen-token-plan-individual, xai, xiaomi, xiaomi-token-plan-{ams,cn,sgp}, zai, zai-coding-cn
+    // (Pi `all.ts` @v0.84.4 lines 92,96,99,104,105,110,111,112,117,118-120,124,125,126-128,129,130).
     for p in fleet_providers_with(store.clone(), registry.clone()) {
         providers.push(Arc::new(p));
     }
+
+    // radius (Pi `all.ts:121` @v0.84.4; `:117` @v0.83.0) — PROV-014. Constructed WITHOUT a
+    // `ModelsStore`, so through this entry point it is static: its persisted gateway catalog is
+    // restored by the overlay `all_providers_with_overlay` applies (see `providers/radius.rs`).
+    providers.push(Arc::new(radius_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
 
     // anthropic (Pi `all.ts:74`).
     providers.push(Arc::new(anthropic_provider_with(
@@ -354,6 +378,12 @@ mod tests {
             "openai-codex",
             "google-vertex",
             "amazon-bedrock",
+            // PROV-014 (2026-09-04): the three v0.83.0 built-ins this registry lacked, plus
+            // v0.84.4's Individual plan.
+            "qwen-token-plan",
+            "qwen-token-plan-cn",
+            "qwen-token-plan-individual",
+            "radius",
         ] {
             assert!(
                 ids.iter().any(|id| id == expected),
@@ -368,17 +398,19 @@ mod tests {
         //
         // PROV-062: this list was DELETED, with a comment claiming "every built-in provider pi ships
         // is now ported, so there is no not-yet list left to assert against". That was false at the
-        // time it was written — PROV-014 has been open against these three since before it — so the
-        // guard was removed in the same edit that made the claim it was guarding untrue. Restored,
-        // and it is the one place a future porter learns the set is incomplete without reading a
-        // backlog file. Each id leaves this array by being implemented (PROV-014), not by being
-        // reclassified.
-        for not_yet in ["qwen-token-plan", "qwen-token-plan-cn", "radius"] {
+        // time it was written — PROV-014 was open against `qwen-token-plan`, `qwen-token-plan-cn`
+        // and `radius` — so the guard was removed in the same edit that made the claim it was
+        // guarding untrue. Restored, and it is the one place a future porter learns the set is
+        // incomplete without reading a backlog file. Each id leaves this array by being
+        // implemented, not by being reclassified: the three PROV-014 ids left on 2026-09-04, and
+        // `baseten` (`all.ts:95` @v0.84.4, a v0.84.x addition; `providers/baseten.ts`) entered.
+        const NOT_YET: &[&str] = &["baseten"];
+        for not_yet in NOT_YET {
             assert!(
                 !ids.iter().any(|id| id == not_yet),
-                "'{not_yet}' is registered but has no working stream path (PROV-014, pi \
-                 all.ts:115-117 @v0.83.0). If it was genuinely ported, delete it from this array \
-                 and from the NOT REGISTERED rows in this module's header table in the same commit."
+                "'{not_yet}' is registered but has no working stream path (pi all.ts:95 \
+                 @v0.84.4). If it was genuinely ported, delete it from this array and from the \
+                 NOT REGISTERED row in this module's header table in the same commit."
             );
         }
 
@@ -406,6 +438,50 @@ mod tests {
                 .is_some(),
             "expected openrouter image model resolvable"
         );
+    }
+
+    /// PROV-014 — the registered `radius` is the real provider kind, not a fleet row: `pi-messages`
+    /// is what its gateway rows speak, its auth carries both strategies, and a persisted gateway
+    /// catalog reaches it through the overlay entry point exactly as every other built-in's does.
+    #[test]
+    fn radius_registers_with_both_auth_strategies_and_takes_the_overlay() {
+        let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::new());
+        let registry = Arc::new(builtin_registry());
+        assert!(
+            registry.contains(&crate::known_api::PI_MESSAGES.into()),
+            "the registry must construct the api radius streams over"
+        );
+        let radius_row = crate::providers::radius::radius_models_from_config(
+            "radius",
+            &crate::providers::radius::RadiusGatewayConfig {
+                base_url: "https://gw.example.test/v1".to_string(),
+                models: vec![crate::providers::radius::RadiusGatewayModel {
+                    id: "radius-1".to_string(),
+                    name: "Radius One".to_string(),
+                    reasoning: false,
+                    thinking_level_map: None,
+                    input: vec![crate::model::Modality::Text],
+                    cost: crate::model::ModelCost::default(),
+                    context_window: 128_000,
+                    max_tokens: 8_192,
+                }],
+            },
+        );
+        let overlay = CatalogOverlay::from_entries([("radius".to_string(), radius_row)]);
+        let providers = all_providers_with_overlay(store, registry, Some(&overlay));
+        let radius = providers
+            .iter()
+            .find(|p| p.id().as_str() == "radius")
+            .expect("radius registered");
+        assert_eq!(radius.name(), "Radius");
+        let auth = radius.provider_auth().expect("auth clause");
+        assert!(auth.api_key.is_some(), "envApiKeyAuth on RADIUS_API_KEY");
+        assert!(auth.oauth.is_some(), "lazyOAuth radius");
+        let model = radius
+            .get_model("radius-1")
+            .expect("overlay restored the gateway row");
+        assert_eq!(model.api.as_str(), crate::known_api::PI_MESSAGES);
+        assert_eq!(model.base_url, "https://gw.example.test/v1");
     }
 
     /// Together's `moonshotai/Kimi-K2.6` resolves through the registry to the together provider.

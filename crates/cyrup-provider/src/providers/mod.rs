@@ -18,6 +18,7 @@ pub mod openai_codex;
 pub mod opencode;
 pub mod opencode_go;
 pub mod openrouter_images;
+pub mod radius;
 pub mod together;
 
 pub use all::{
@@ -73,6 +74,12 @@ pub use opencode_go::{
     opencode_go_provider_with,
 };
 pub use openrouter_images::{openrouter_images_auth, openrouter_images_provider};
+pub use radius::{
+    DEFAULT_RADIUS_GATEWAY, RADIUS_API_KEY_ENV, RADIUS_PROVIDER_ID, RADIUS_PROVIDER_NAME,
+    RadiusGatewayConfig, RadiusGatewayModel, RadiusProvider, RadiusProviderOptions,
+    load_radius_gateway_config, radius_auth, radius_models, radius_models_from_config,
+    radius_provider, radius_provider_with, sanitize_radius_gateway_config,
+};
 pub use together::{
     TOGETHER_BASE_URL, together_auth, together_models, together_provider, together_provider_with,
 };

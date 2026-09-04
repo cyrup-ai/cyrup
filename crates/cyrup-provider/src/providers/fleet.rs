@@ -5,7 +5,24 @@
 //! the shared compat matrix ([`crate::api::compat`]) drives every per-provider behavior.
 //!
 //! Mirrors `providers/{ant-ling,cerebras,deepseek,groq,huggingface,moonshotai,moonshotai-cn,nvidia,
-//! openrouter,xai,xiaomi,xiaomi-token-plan-*,zai,zai-coding-cn}.ts` + their `.models.ts` catalogs.
+//! openrouter,qwen-token-plan,qwen-token-plan-cn,qwen-token-plan-individual,xai,xiaomi,
+//! xiaomi-token-plan-*,zai,zai-coding-cn}.ts` + their `.models.ts` catalogs.
+//!
+//! # Members without an embedded catalog (PROV-014)
+//!
+//! The three `qwen-token-plan*` members are registered with [`FleetCatalog::Dynamic`] — no
+//! `catalog/*.json` — and that is a statement about EVIDENCE, not a shortcut. pi's rows for them
+//! come from models.dev's `alibaba-token-plan[-cn]` records (`ai/scripts/generate-models.ts:2303-2380`
+//! @v0.84.4), generated into a gitignored `providers/data/*.json`. The providers were added at
+//! `bbb91fa8a` (v0.81.0~25, 2026-07-20) and `c03d78bdc` (2026-08-06), both AFTER `b0c2a90e` — the last
+//! revision at which any `*.models.ts` was a data literal and the revision every other embedded
+//! catalog is generated from (`xtask/src/main.rs::DEFAULT_REV`, PROV-060). So their catalog data is
+//! in git at NO revision, `xtask gen-catalogs` cannot produce it, and hand-writing rows from memory is
+//! exactly what the catalog rules forbid. What IS in git — the ids, `baseUrl`, compat, thinking maps
+//! (`qwen-token-plan-models.test.ts` @v0.84.4) — is recorded on each member's doc comment for the
+//! day the data becomes obtainable; the runtime catalog comes from the pi.dev overlay
+//! ([`crate::remote_catalog`], which fetches `/api/models/providers/<id>` for every registered
+//! provider) and from `models.json`.
 
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
@@ -27,19 +44,51 @@ pub struct FleetSpec {
     /// `"Moonshot AI CN API key"` (`providers/moonshotai-cn.ts:11`) — which is why it is a table
     /// column rather than a format string.
     pub auth_name: &'static str,
-    /// The verbatim JSON catalog (extracted from Pi's `<id>.models.ts`).
-    pub catalog_json: &'static str,
+    /// Where this member's rows come from — see [`FleetCatalog`].
+    pub catalog: FleetCatalog,
+    /// Upstream's `createProvider({ baseUrl })` (`Provider.baseUrl`, PROV-017) for the members
+    /// whose catalog cannot carry it because they have none ([`FleetCatalog::Dynamic`]). `None` for
+    /// every embedded-catalog member: each of their rows carries its own `baseUrl`, which is what
+    /// the request path reads.
+    pub base_url: Option<&'static str>,
+}
+
+/// The source of a fleet member's catalog rows. Two variants because "no embedded rows" is a
+/// deliberate, evidence-driven state (see the module doc), not an empty string that a reader
+/// could mistake for a broken `include_str!`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FleetCatalog {
+    /// The verbatim JSON catalog extracted from Pi's `<id>.models.ts` at the pinned revision.
+    Embedded(&'static str),
+    /// No embedded rows: the member's models arrive at runtime (pi.dev overlay, `models.json`).
+    Dynamic,
+}
+
+/// The catalog half of a `fleet!` row: a file stem embeds `catalog/<stem>.json`; `dynamic(<url>)`
+/// declares a member with no embedded rows and the provider-level `baseUrl` upstream's
+/// `createProvider` call carries.
+macro_rules! fleet_catalog {
+    (dynamic($base_url:literal)) => {
+        (FleetCatalog::Dynamic, Some($base_url))
+    };
+    ($file:literal) => {
+        (
+            FleetCatalog::Embedded(include_str!(concat!("catalog/", $file, ".json"))),
+            None::<&'static str>,
+        )
+    };
 }
 
 macro_rules! fleet {
-    ($($id:literal => ($const:ident, $name:literal, $env:literal, $auth:literal, $file:literal)),* $(,)?) => {
+    ($($id:literal => ($const:ident, $name:literal, $env:literal, $auth:literal, $($catalog:tt)+)),* $(,)?) => {
         $(
             pub const $const: FleetSpec = FleetSpec {
                 id: $id,
                 name: $name,
                 env_var: $env,
                 auth_name: $auth,
-                catalog_json: include_str!(concat!("catalog/", $file, ".json")),
+                catalog: fleet_catalog!($($catalog)+).0,
+                base_url: fleet_catalog!($($catalog)+).1,
             };
         )*
 
@@ -58,6 +107,25 @@ fleet! {
     "moonshotai-cn"         => (MOONSHOTAI_CN, "Moonshot AI CN", "MOONSHOT_API_KEY", "Moonshot AI API key", "moonshotai-cn"),
     "nvidia"                => (NVIDIA, "NVIDIA", "NVIDIA_API_KEY", "NVIDIA API key", "nvidia"),
     "openrouter"            => (OPENROUTER, "OpenRouter", "OPENROUTER_API_KEY", "OpenRouter API key", "openrouter"),
+    // PROV-014 — `providers/qwen-token-plan.ts:6-15` @v0.84.4 (identical at v0.83.0), registered at
+    // `all.ts:118`. models.dev source `alibaba-token-plan`; the ids upstream's own test pins as
+    // present (`qwen-token-plan-models.test.ts:42-58` @v0.84.4): MiniMax-M2.5, deepseek-v3.2,
+    // deepseek-v4-flash, deepseek-v4-pro, glm-5, glm-5.1, glm-5.2, kimi-k2.5, kimi-k2.6,
+    // kimi-k2.7-code, qwen3.6-flash, qwen3.6-plus, qwen3.7-max, qwen3.7-plus, qwen3.8-max — every
+    // row `compat: { thinkingFormat: "qwen", supportsDeveloperRole: false, supportsStore: false }`
+    // (`generate-models.ts:2308-2313`), `reasoning_effort` only on the deepseek-v4-*/glm-5* rows
+    // (`:306-316`). See the module doc for why the rows themselves are not embedded.
+    "qwen-token-plan"       => (QWEN_TOKEN_PLAN, "Qwen Token Plan", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan API key", dynamic("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
+    // PROV-014 — `providers/qwen-token-plan-cn.ts:6-15` @v0.84.4 (identical at v0.83.0),
+    // `all.ts:119`. models.dev source `alibaba-token-plan-cn`; same id set as the international
+    // plan, China endpoint, its own key.
+    "qwen-token-plan-cn"    => (QWEN_TOKEN_PLAN_CN, "Qwen Token Plan CN", "QWEN_TOKEN_PLAN_CN_API_KEY", "Qwen Token Plan CN API key", dynamic("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")),
+    // VERSION LAG (v0.83.0 → v0.84.4): `providers/qwen-token-plan-individual.ts:6-15`, added at
+    // `c03d78bdc` (#7659), `all.ts:120`. The international endpoint and the SAME env var as
+    // `qwen-token-plan` (`env-api-keys.ts:83`: `"qwen-token-plan-individual":
+    // "QWEN_TOKEN_PLAN_API_KEY"`), narrowed to the eight-model personal allowlist
+    // (`generate-models.ts:324-336`; `qwen-token-plan-models.test.ts:60-69`).
+    "qwen-token-plan-individual" => (QWEN_TOKEN_PLAN_INDIVIDUAL, "Qwen Token Plan Individual", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan Individual API key", dynamic("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
     "xai"                   => (XAI, "xAI", "XAI_API_KEY", "xAI API key", "xai"),
     "xiaomi"                => (XIAOMI, "Xiaomi", "XIAOMI_API_KEY", "Xiaomi API key", "xiaomi"),
     "xiaomi-token-plan-ams" => (XIAOMI_TP_AMS, "Xiaomi Token Plan AMS", "XIAOMI_TOKEN_PLAN_AMS_API_KEY", "Xiaomi Token Plan AMS API key", "xiaomi-token-plan-ams"),
@@ -70,9 +138,18 @@ fleet! {
 impl FleetSpec {
     /// Parse the embedded catalog into [`Model`]s. Catalogs are compile-time constants extracted
     /// verbatim from Pi; a parse failure yields an empty catalog (surfaced loudly by the
-    /// catalog-count tests) rather than a panic (NO-PANIC policy).
+    /// catalog-count tests) rather than a panic (NO-PANIC policy). A [`FleetCatalog::Dynamic`]
+    /// member has no embedded rows and yields an empty catalog by construction.
     pub fn models(&self) -> Vec<Model> {
-        serde_json::from_str(self.catalog_json).unwrap_or_default()
+        match self.catalog {
+            FleetCatalog::Embedded(json) => serde_json::from_str(json).unwrap_or_default(),
+            FleetCatalog::Dynamic => Vec::new(),
+        }
+    }
+
+    /// `true` for the members whose rows are not embedded (see the module doc).
+    pub fn is_dynamic(&self) -> bool {
+        self.catalog == FleetCatalog::Dynamic
     }
 
     /// The provider's [`ProviderAuth`]: an API key from its env var (Pi `envApiKeyAuth`), plus the
@@ -92,14 +169,18 @@ impl FleetSpec {
         store: Arc<dyn CredentialStore>,
         registry: Arc<ApiRegistry>,
     ) -> WireProvider {
-        WireProvider::new(
+        let provider = WireProvider::new(
             self.id,
             self.name,
             self.models(),
             self.auth(),
             store,
             registry,
-        )
+        );
+        match self.base_url {
+            Some(base_url) => provider.with_base_url(base_url),
+            None => provider,
+        }
     }
 
     /// Build this provider with an in-memory store + the built-in api registry.
@@ -202,14 +283,102 @@ mod tests {
     }
 
     #[test]
-    fn fleet_has_sixteen_providers() {
-        assert_eq!(FLEET.len(), 16);
+    fn fleet_has_nineteen_providers() {
+        assert_eq!(FLEET.len(), 19);
         // Every fleet provider has an env-key mapping in env-api-keys.
         for spec in FLEET {
             let vars = crate::env_api_keys::api_key_env_vars(spec.id)
                 .unwrap_or_else(|| panic!("no env mapping for {}", spec.id));
             assert!(vars.contains(&spec.env_var), "{} env var mismatch", spec.id);
         }
+    }
+
+    /// PROV-014 — the three Qwen Token Plan members, field for field against
+    /// `providers/qwen-token-plan{,-cn,-individual}.ts:6-15` @v0.84.4 and `env-api-keys.ts:81-83`.
+    /// Their catalogs are `Dynamic` (module doc), so the provider-level `baseUrl` is the one
+    /// `createProvider({ baseUrl })` carries, and every other embedded member stays `None`.
+    #[test]
+    fn qwen_token_plan_members_match_upstream() {
+        let expected: &[(&str, &str, &str, &str, &str)] = &[
+            (
+                "qwen-token-plan",
+                "Qwen Token Plan",
+                "QWEN_TOKEN_PLAN_API_KEY",
+                "Qwen Token Plan API key",
+                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+            ),
+            (
+                "qwen-token-plan-cn",
+                "Qwen Token Plan CN",
+                "QWEN_TOKEN_PLAN_CN_API_KEY",
+                "Qwen Token Plan CN API key",
+                "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+            ),
+            (
+                "qwen-token-plan-individual",
+                "Qwen Token Plan Individual",
+                "QWEN_TOKEN_PLAN_API_KEY",
+                "Qwen Token Plan Individual API key",
+                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+            ),
+        ];
+        for (id, name, env, auth, base_url) in expected {
+            let spec = fleet_spec(id).unwrap_or_else(|| panic!("{id} is a fleet member"));
+            assert_eq!(spec.name, *name);
+            assert_eq!(spec.env_var, *env);
+            assert_eq!(spec.auth_name, *auth);
+            assert_eq!(spec.base_url, Some(*base_url));
+            assert!(
+                spec.is_dynamic(),
+                "{id} ships no embedded rows (module doc)"
+            );
+            assert!(spec.models().is_empty());
+            let p = spec.provider();
+            assert_eq!(p.id().as_str(), *id);
+            assert_eq!(Provider::name(&p), *name);
+            assert_eq!(p.base_url(), Some(*base_url));
+            let auth = p.provider_auth().expect("auth");
+            assert_eq!(
+                auth.api_key.as_ref().expect("apiKey").name(),
+                spec.auth_name
+            );
+            assert!(auth.oauth.is_none(), "{id}: no lazyOAuth upstream");
+        }
+        // `all.ts:118-120` @v0.84.4 places them right after openrouter, in this order.
+        let ids: Vec<&str> = FLEET.iter().map(|s| s.id).collect();
+        let at = ids
+            .iter()
+            .position(|id| *id == "openrouter")
+            .expect("openrouter");
+        assert_eq!(
+            &ids[at..at + 4],
+            &[
+                "openrouter",
+                "qwen-token-plan",
+                "qwen-token-plan-cn",
+                "qwen-token-plan-individual"
+            ]
+        );
+        // Exactly these three are dynamic; every embedded member carries its rows' own baseUrl.
+        let dynamic: Vec<&str> = FLEET
+            .iter()
+            .filter(|s| s.is_dynamic())
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(
+            dynamic,
+            [
+                "qwen-token-plan",
+                "qwen-token-plan-cn",
+                "qwen-token-plan-individual"
+            ]
+        );
+        assert!(
+            FLEET
+                .iter()
+                .filter(|s| !s.is_dynamic())
+                .all(|s| s.base_url.is_none())
+        );
     }
 
     #[test]

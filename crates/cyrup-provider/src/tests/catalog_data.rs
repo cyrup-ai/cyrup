@@ -277,17 +277,58 @@ fn the_catalog_manifest_matches_the_file_set() {
     );
 }
 
-/// The same guard one level up: every *registered* provider must expose a non-empty catalog. Catches
-/// a loader wired to the wrong file as well as a bad blob.
+/// Registered providers with NO embedded catalog, by design — each with the upstream fact that
+/// makes it so. This list is asserted in BOTH directions below: an id here must really be empty,
+/// and an empty provider must really be here, so an accidentally empty catalog still fails.
+///
+/// * `radius` — pi's only dynamic built-in, "purely dynamic providers (e.g. `radius`) that have
+///   no static catalog entry" (`all.ts:50-52` @v0.84.4); the catalog comes from the gateway's
+///   `/v1/config` (`providers/radius.rs`). PROV-014.
+/// * `qwen-token-plan`, `qwen-token-plan-cn`, `qwen-token-plan-individual` — pi's rows are
+///   models.dev data generated into a gitignored file, and the providers post-date `b0c2a90e`, the
+///   last revision at which any catalog was a data literal; see `providers/fleet.rs`'s module doc.
+///   PROV-014.
+pub(crate) const DYNAMIC_ONLY_PROVIDERS: &[&str] = &[
+    "qwen-token-plan",
+    "qwen-token-plan-cn",
+    "qwen-token-plan-individual",
+    "radius",
+];
+
+/// The same guard one level up: every *registered* provider must expose a non-empty catalog —
+/// except the [`DYNAMIC_ONLY_PROVIDERS`], which must expose an EMPTY one. Catches a loader wired
+/// to the wrong file as well as a bad blob, and a dynamic member that quietly grew embedded rows
+/// nobody sourced.
 #[test]
 fn every_registered_provider_has_a_non_empty_catalog() {
+    let mut empty: Vec<String> = Vec::new();
     for p in all_providers() {
+        let id = p.id().as_str().to_string();
+        if DYNAMIC_ONLY_PROVIDERS.contains(&id.as_str()) {
+            assert!(
+                p.models().is_empty(),
+                "provider {id} is listed as dynamic-only but ships {} embedded rows — either \
+                 source them and remove it from DYNAMIC_ONLY_PROVIDERS, or delete the rows",
+                p.models().len()
+            );
+            empty.push(id);
+            continue;
+        }
         assert!(
             !p.models().is_empty(),
-            "provider {} exposes zero models — catalog parse likely failed silently",
-            p.id()
+            "provider {id} exposes zero models — catalog parse likely failed silently"
         );
     }
+    empty.sort();
+    let mut expected: Vec<String> = DYNAMIC_ONLY_PROVIDERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        empty, expected,
+        "every dynamic-only provider must be registered, and nothing else may be empty"
+    );
 }
 
 // -------------------------------------------------------------------------- the selection seam --
