@@ -6,10 +6,10 @@
 use std::collections::HashMap;
 
 use super::super::types::{
-    AgentDefinition, AgentSource, ChainDefinition, ChainDiscoveryDiagnostic, ChainStepConfig,
-    SystemPromptMode,
+    AgentDefinition, AgentDiscoveryDiagnostic, AgentSource, ChainDefinition,
+    ChainDiscoveryDiagnostic, ChainStepConfig, SystemPromptMode,
 };
-use super::super::{discover_agents_all, AgentDiscoveryConfig};
+use super::super::{discover_agents_all, find_blocking_agent_diagnostic, AgentDiscoveryConfig};
 use super::agent_crud::{create_agent, delete_agent, rename_agent, update_agent, AgentFields, AgentMutationOutcome};
 use super::chain_crud::{create_chain_with_steps, delete_chain, update_chain_full};
 use super::config_parse::{apply_agent_config, config_object, parse_package_config, parse_step_list};
@@ -34,6 +34,53 @@ fn agent_in_list_scope(source: AgentSource, scope: Option<AgentSource>) -> bool 
 
 fn chain_in_list_scope(source: AgentSource, scope: Option<AgentSource>) -> bool {
     scope.is_none() || source == AgentSource::Package || Some(source) == scope
+}
+
+/// SUBA-086 — pi `diagnosticsForScope` (`agent-management.ts:177-181` @v0.64.0): `both` keeps
+/// everything; `user` drops PROJECT-sourced diagnostics and `project` drops USER-sourced ones
+/// (builtin/package/runtime diagnostics survive either named scope).
+fn diagnostics_for_scope(
+    diagnostics: &[AgentDiscoveryDiagnostic],
+    scope: Option<AgentSource>,
+) -> Vec<AgentDiscoveryDiagnostic> {
+    let excluded = match scope {
+        None => return diagnostics.to_vec(),
+        Some(AgentSource::User) => AgentSource::Project,
+        Some(_) => AgentSource::User,
+    };
+    diagnostics.iter().filter(|d| d.source != excluded).cloned().collect()
+}
+
+/// SUBA-086 — pi `appendAgentDiagnosticLines` (`agent-management.ts:818-825` @v0.64.0;
+/// `:760-764` @v0.57.0): nothing when empty, else a blank separator, `Invalid agent
+/// definitions:` and one `- <name ?? filePath> (<source>): <error>` line per diagnostic.
+fn append_agent_diagnostic_lines(lines: &mut Vec<String>, diagnostics: &[AgentDiscoveryDiagnostic]) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    lines.push(String::new());
+    lines.push("Invalid agent definitions:".to_string());
+    for d in diagnostics {
+        lines.push(format!("- {} ({}): {}", d.label(), source_str(d.source), d.error));
+    }
+}
+
+/// SUBA-086 — the two-probe lookup `get`/`models` run before their ambiguity/not-found branches
+/// (`agent-management.ts:985-989,1084-1089` @v0.64.0): the raw name first, then — only when it
+/// differs — the `sanitizeName`d spelling.
+fn blocking_diagnostic_for_request<'a>(
+    requested: &str,
+    matches: &[AgentDefinition],
+    diagnostics: &'a [AgentDiscoveryDiagnostic],
+) -> Option<&'a AgentDiscoveryDiagnostic> {
+    let candidates: Vec<&AgentDefinition> = matches.iter().collect();
+    let raw = requested.trim();
+    let sanitized = sanitize_name(raw);
+    find_blocking_agent_diagnostic(raw, &candidates, diagnostics).or_else(|| {
+        (sanitized != raw)
+            .then(|| find_blocking_agent_diagnostic(&sanitized, &candidates, diagnostics))
+            .flatten()
+    })
 }
 
 /// pi's name-sensitive create defaults (`agents.ts:36-45`): `delegate` -> `Append`/inherit-context,
@@ -154,6 +201,11 @@ pub(crate) fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -
             lines.push(format!("- {} ({}): {}", c.name, source_str(c.source), c.description));
         }
     }
+    // SUBA-086 — pi `handleList` (`agent-management.ts:946-947` @v0.64.0) appends the agent
+    // diagnostics BEFORE the proactive suggestions, and hands it `d.agentDiagnostics` UNFILTERED
+    // (unlike `get`/`models`, which go through `diagnosticsForScope`) — so a `user`-scoped
+    // listing still shows a broken project file. Ported as written.
+    append_agent_diagnostic_lines(&mut lines, &d.agent_diagnostics);
     // pi `agent-management.ts:765-770,784` @v0.43.0: the proactive suggestions are computed from the same
     // filtered `agents`/`chains` this listing rendered, and spliced in after `Chains:` and before
     // `Chain diagnostics:` — with a leading blank line, and only when non-empty.
@@ -202,10 +254,23 @@ pub(crate) fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) ->
     let mut any_found = false;
     if let Some(agent_name) = req.agent {
         let matches = find_agents(&d, agent_name, None);
-        // pi `handleGet` @ v0.43.0 (`agent-management.ts:871-885`) checks AMBIGUITY first: a match
-        // set spanning several distinct canonical names is refused before the not-found branch.
+        // SUBA-086 — pi `handleGet` (`agent-management.ts:1084-1089` @v0.64.0) consults the
+        // blocking diagnostic BEFORE the ambiguity and not-found branches, so a name whose only
+        // (or outranking) definition is malformed reports the parse error by name instead of
+        // `not found`. `get` takes no `agentScope` here, so the diagnostics are unscoped like
+        // the `find_agents(.., None)` match set beside them.
+        let diagnostics = diagnostics_for_scope(&d.agent_diagnostics, None);
         let distinct = distinct_agent_names(&matches);
-        if distinct.len() > 1 {
+        if let Some(diagnostic) = blocking_diagnostic_for_request(agent_name, &matches, &diagnostics) {
+            let msg = format!("Agent '{agent_name}' has invalid configuration: {}", diagnostic.error);
+            if !has_both {
+                return Ok(ManagementOutcome::err(msg));
+            }
+            blocks.push(msg);
+        } else if distinct.len() > 1 {
+            // pi `handleGet` @ v0.43.0 (`agent-management.ts:871-885`) checks AMBIGUITY next: a
+            // match set spanning several distinct canonical names is refused before the not-found
+            // branch.
             let msg = format!(
                 "Ambiguous agent alias or name '{}': {}",
                 agent_name,
@@ -350,6 +415,11 @@ pub(crate) fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
             }
         }
     }
+    // SUBA-086 — pi `handleModels` (`agent-management.ts:1074` @v0.64.0): `if (!requestedAgent)
+    // appendAgentDiagnosticLines(lines, diagnosticsForScope(discovered.agentDiagnostics, scope))`
+    // — only the all-builtins listing carries the block (a requested agent is answered above).
+    // cyrup's `models` takes no `agentScope`, so the filter is the `both` identity.
+    append_agent_diagnostic_lines(&mut lines, &diagnostics_for_scope(&d.agent_diagnostics, None));
     Ok(ManagementOutcome::ok(lines.join("\n")))
 }
 

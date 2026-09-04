@@ -1012,19 +1012,41 @@ fn format_discovery(discovered: Result<&AgentDiscoveryResult, &str>) -> Vec<Stri
         )
     };
 
-    vec![
+    let mut lines = vec![format!(
+        "- agents: total {} ({})",
+        agent_counts.total(),
+        agent_counts.breakdown()
+    )];
+    // SUBA-086 — pi `formatDiscovery` (`doctor.ts:146-150` @v0.64.0): one
+    // `- invalid agent <name ?? filePath> (<source>): <error>` line per agent diagnostic,
+    // directly under the counts line.
+    lines.extend(discovered.agent_diagnostics.iter().map(|d| {
         format!(
-            "- agents: total {} ({})",
-            agent_counts.total(),
-            agent_counts.breakdown()
-        ),
-        format!(
-            "- chains: total {} ({})",
-            chain_counts.total(),
-            chain_counts.breakdown()
-        ),
-        skills_line,
-    ]
+            "- invalid agent {} ({}): {}",
+            d.label(),
+            doctor_source_label(d.source),
+            d.error
+        )
+    }));
+    lines.push(format!(
+        "- chains: total {} ({})",
+        chain_counts.total(),
+        chain_counts.breakdown()
+    ));
+    lines.push(skills_line);
+    lines
+}
+
+/// pi's `AgentSource` string as the doctor prints it (`doctor.ts:149` interpolates the raw
+/// union member: `builtin` | `package` | `user` | `project` | `runtime`).
+fn doctor_source_label(source: AgentSource) -> &'static str {
+    match source {
+        AgentSource::Builtin => "builtin",
+        AgentSource::Package => "package",
+        AgentSource::User => "user",
+        AgentSource::Project => "project",
+        AgentSource::Runtime => "runtime",
+    }
 }
 
 /// Render the `Runtime` block's session lines (pi `formatSessionLines`, doctor.ts:118-128).
@@ -1935,6 +1957,53 @@ mod tests {
         assert!(
             !report.contains("- agents: total"),
             "a discovery failure must never render a fabricated total-count success line: {report}"
+        );
+    }
+
+
+    /// SUBA-086 — pi `formatDiscovery` (`doctor.ts:146-150` @v0.64.0) prints one
+    /// `- invalid agent <name> (<source>): <error>` line per agent diagnostic under the counts.
+    #[test]
+    fn build_doctor_report_lists_each_invalid_agent_definition() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        write_agent(&dir.path().join("agents"), "scout.md", "scout");
+        std::fs::write(
+            dir.path().join("agents").join("worker.md"),
+            "---\nname: worker\ndescription: d\ntimeoutMs: 30s\n---\n\nBody.\n",
+        )
+        .expect("write broken agent file");
+        let cfg = AgentDiscoveryConfig {
+            project_agent_dirs: vec![dir.path().join("agents")],
+            ..AgentDiscoveryConfig::default()
+        };
+        let discovered = discovery::discover_agents_all(&cfg).expect("discovery succeeds");
+        let temp_root = dir.path().join("temp-root");
+        let async_runs = dir.path().join("async");
+        let chain_runs = dir.path().join("chain-runs");
+        let results = dir.path().join("results");
+        for existing in [&temp_root, &async_runs, &chain_runs, &results] {
+            std::fs::create_dir_all(existing).expect("mkdir dir");
+        }
+        let input = DoctorReportInput {
+            cwd: dir.path(),
+            async_available: true,
+            configured_session_dir: "not configured".to_string(),
+            current_session_file: None,
+            current_session_id: None,
+            session_error: None,
+            temp_root_dir: temp_root,
+            async_runs_dir: async_runs,
+            results_dir: results,
+            chain_runs_dir: chain_runs,
+            discovered: Ok(&discovered),
+        };
+
+        let report = build_doctor_report(&input);
+        assert!(
+            report.contains(
+                "- agents: total 1 (builtin 0, package 0, user 0, project 1)\n- invalid agent worker (project): Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer.\n- chains: total 0"
+            ),
+            "{report}"
         );
     }
 }

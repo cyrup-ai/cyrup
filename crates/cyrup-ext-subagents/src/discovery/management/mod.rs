@@ -1174,4 +1174,81 @@ mod tests {
         assert!(got.text.contains("Local name: scout"), "{}", got.text);
         assert!(got.text.contains("Package: code-analysis"), "{}", got.text);
     }
+
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-086: `list`/`models` render `Invalid agent definitions:`; `get` refuses a blocked name
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_and_models_render_invalid_agent_definitions_and_get_refuses_a_blocked_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        std::fs::create_dir_all(&cfg.project_agent_dirs[0]).expect("mkdir project agents");
+        // `worker` also exists as a bundled builtin — the broken project file must OUTRANK it.
+        std::fs::write(
+            cfg.project_agent_dirs[0].join("worker.md"),
+            "---\nname: worker\ndescription: d\ntimeoutMs: 30s\n---\n\nBody\n",
+        )
+        .expect("write broken worker");
+        // `ghost` exists ONLY as a broken file.
+        std::fs::write(
+            cfg.project_agent_dirs[0].join("ghost.md"),
+            "---\nname: ghost\ndescription: d\noutputMode: file\n---\n\nBody\n",
+        )
+        .expect("write broken ghost");
+
+        let listed = handle_management_action(&cfg, "list", &mreq(None, None, None, None))
+            .await
+            .expect("list ok");
+        assert!(!listed.is_error);
+        assert!(
+            listed.text.contains(
+                "\n\nInvalid agent definitions:\n- ghost (project): Agent 'ghost' has invalid outputMode frontmatter; expected 'inline' or 'file-only'.\n- worker (project): Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer."
+            ),
+            "{}",
+            listed.text
+        );
+        let executable = listed.text.split("\n\nChains:").next().expect("the agents section");
+        assert!(
+            executable.contains("- worker (builtin") && !executable.contains("- worker (project"),
+            "the broken project file must not be listed as an executable agent (the bundled \
+             builtin still is):\n{executable}"
+        );
+        // pi `handleList` (`agent-management.ts:946` @v0.64.0) hands the block `d.agentDiagnostics`
+        // UNFILTERED, so a user-scoped listing still reports the broken project file.
+        let user_listed = handle_management_action(&cfg, "list", &mreq(None, None, Some("user"), None))
+            .await
+            .expect("list ok");
+        assert!(user_listed.text.contains("Invalid agent definitions:"), "{}", user_listed.text);
+
+        let got = handle_management_action(&cfg, "get", &mreq(Some("worker"), None, None, None))
+            .await
+            .expect("get ok");
+        assert!(got.is_error, "{}", got.text);
+        assert_eq!(
+            got.text,
+            "Agent 'worker' has invalid configuration: Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer."
+        );
+        let ghost = handle_management_action(&cfg, "get", &mreq(Some("ghost"), None, None, None))
+            .await
+            .expect("get ok");
+        assert!(ghost.is_error);
+        assert!(
+            ghost.text.starts_with("Agent 'ghost' has invalid configuration:"),
+            "a name with ONLY a broken definition is invalid, not `not found`: {}",
+            ghost.text
+        );
+
+        let models = handle_management_action(&cfg, "models", &mreq(None, None, None, None))
+            .await
+            .expect("models ok");
+        assert!(
+            models.text.ends_with(
+                "Invalid agent definitions:\n- ghost (project): Agent 'ghost' has invalid outputMode frontmatter; expected 'inline' or 'file-only'.\n- worker (project): Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer."
+            ),
+            "{}",
+            models.text
+        );
+    }
 }

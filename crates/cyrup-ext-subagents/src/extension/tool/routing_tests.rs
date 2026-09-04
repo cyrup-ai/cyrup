@@ -1456,3 +1456,62 @@ async fn a_control_action_refuses_a_malformed_acceptance_with_pis_own_prefix() {
         "Cannot resume: chain[0].acceptance.bogus is not supported."
     );
 }
+
+/// SUBA-086 — pi `canonicalizeAgentName` (`subagent-executor.ts:2336-2344` @v0.64.0) consults
+/// `findBlockingAgentDiagnostic` BEFORE the ambiguity/unknown branches, so a dispatch naming an
+/// agent whose highest-ranked definition is malformed is refused with the parse error — never
+/// silently routed to the lower-tier (here: bundled builtin) `worker`, and never reported as
+/// "not found" when the broken file is the ONLY definition.
+#[tokio::test]
+async fn dispatch_refuses_an_agent_whose_outranking_definition_is_malformed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let project_agents = dir.path().join(".cyrup").join("agents");
+    std::fs::create_dir_all(&project_agents).expect("mkdir");
+    std::fs::write(
+        project_agents.join("worker.md"),
+        "---\nname: worker\ndescription: d\ntimeoutMs: 30s\n---\n\nBody\n",
+    )
+    .expect("write broken worker");
+    std::fs::write(
+        project_agents.join("ghost.md"),
+        "---\nname: ghost\ndescription: d\nfast: yes\n---\n\nBody\n",
+    )
+    .expect("write broken ghost");
+    let tool = scoped_tool(dir.path()).await;
+
+    let worker = dispatch_tool(&tool, serde_json::json!({ "agent": "worker", "task": "do it" }))
+        .await
+        .expect_err("the broken project worker outranks the builtin worker")
+        .to_string();
+    assert!(
+        worker.contains(
+            "Agent 'worker' has invalid configuration: Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer."
+        ),
+        "got: {worker}"
+    );
+
+    let ghost = dispatch_tool(&tool, serde_json::json!({ "agent": "ghost", "task": "do it" }))
+        .await
+        .expect_err("a name with only a broken definition is refused")
+        .to_string();
+    assert!(
+        ghost.contains("Agent 'ghost' has invalid configuration: Agent 'ghost' has invalid fast frontmatter; expected true or false."),
+        "must be the invalid-configuration error, not `agent not found`: {ghost}"
+    );
+
+    // The per-site location suffix pi appends for everything but the top-level `agent`.
+    let tasks = dispatch_tool(
+        &tool,
+        serde_json::json!({ "tasks": [
+            { "agent": "scout", "task": "a" },
+            { "agent": "ghost", "task": "b" }
+        ] }),
+    )
+    .await
+    .expect_err("a broken task agent aborts the whole dispatch")
+    .to_string();
+    assert!(
+        tasks.contains("Agent 'ghost' has invalid configuration:") && tasks.contains("(task 2)"),
+        "got: {tasks}"
+    );
+}

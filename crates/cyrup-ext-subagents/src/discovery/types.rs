@@ -1327,6 +1327,61 @@ pub struct ChainDiscoveryDiagnostic {
     pub message: String,
 }
 
+/// SUBA-086 — one malformed AGENT definition file, reported by name instead of silently dropped.
+/// Port of pi `AgentDiscoveryDiagnostic` (`agents.ts:238-249` @v0.64.0; `:229-234` @v0.57.0):
+///
+/// ```text
+/// interface ChainDiscoveryDiagnostic { source; filePath; error }
+/// interface AgentDiscoveryDiagnostic extends ChainDiscoveryDiagnostic {
+///   name?: string; runtimeName?: string; packageSpecified?: boolean; discoveryPriority?: number;
+/// }
+/// ```
+///
+/// Produced by [`crate::discovery::frontmatter::parse_agent_file_checked`] for every validation
+/// pi THROWS on inside `loadAgentsFromDefinitionFiles`' per-file `try { … } catch` (`:1959-2154`,
+/// catch at `:2149-2151`) — a bad `package`, `async`, `timeoutMs`, `toolTimeoutMs`, `outputMode`,
+/// `fast`, `allowNestedSubagents`, `acceptance`, `acceptanceRole`, `toolBudget`, `turnBudget`,
+/// `permission`/`permissions`, `runner` or reserved-profile squat. A file missing `name`/
+/// `description` is NOT a diagnostic (pi `continue`s at `:1970-1972`; R-SA-005's silent skip).
+///
+/// Carried on [`crate::discovery::AgentDiscoveryResult::agent_diagnostics`], rendered under
+/// `Invalid agent definitions:` by `list`/`models`, by `/subagents-doctor`, and consulted by
+/// [`crate::discovery::find_blocking_agent_diagnostic`] so a broken definition BLOCKS resolution
+/// of its own name with its parse error instead of falling through to a lower-tier same-named
+/// agent or to "not found".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentDiscoveryDiagnostic {
+    pub source: AgentSource,
+    pub file_path: PathBuf,
+    /// The exact message pi's throw carries (`error instanceof Error ? error.message : …`).
+    pub error: String,
+    /// The file's LOCAL `name:` — `None` only when the failure preceded reading it (never the
+    /// case today: `package` is validated after `name`, exactly as upstream, `:1974-1979`).
+    pub name: Option<String>,
+    /// The `{package}.{name}` runtime name, set only when it differs from `name` (pi `:2151`
+    /// `runtimeName && runtimeName !== name`).
+    pub runtime_name: Option<String>,
+    /// pi `packageSpecified = parsedPackage.packageName !== undefined || parsedPackage.error !==
+    /// undefined` (`:1976`): a non-blank `package:` was declared, valid or not.
+    pub package_specified: bool,
+    /// pi's per-directory ordinal within a tier (`:2471,2476`). Always `None` here: cyrup's
+    /// [`AgentDefinition`] carries no matching ordinal, so a stamped value on the diagnostic side
+    /// alone would outrank a same-tier surviving definition upstream ties with. Blocking therefore
+    /// reduces to source rank, which is exact for every cross-tier collision.
+    pub discovery_priority: Option<u32>,
+}
+
+impl AgentDiscoveryDiagnostic {
+    /// pi's `diagnostic.name ?? diagnostic.filePath` label (`agent-management.ts:823`,
+    /// `doctor.ts:149` @v0.64.0).
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| self.file_path.display().to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]

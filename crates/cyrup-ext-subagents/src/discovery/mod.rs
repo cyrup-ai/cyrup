@@ -86,8 +86,8 @@ use crate::error::SubagentError;
 use chains::{ChainScanResult, scan_chain_scopes};
 use management::{AgentVisibility, ChainVisibility};
 use types::{
-    AgentDefinition, AgentReadScope, AgentSource, ChainDefinition, ChainDiscoveryDiagnostic,
-    LayeredOverrideSettings, OverrideField, SubagentSettings,
+    AgentDefinition, AgentDiscoveryDiagnostic, AgentReadScope, AgentSource, ChainDefinition,
+    ChainDiscoveryDiagnostic, LayeredOverrideSettings, OverrideField, SubagentSettings,
 };
 
 /// Directory segment reserved for skill bundling (R-SA-007), excluded from agent-file discovery
@@ -526,6 +526,105 @@ pub fn resolve_agent_name<'a>(
 
 fn join_match_names(matches: &[&AgentDefinition]) -> String {
     matches.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+}
+
+/// pi `agentDefinitionPriority` (`agents.ts:259-262` @v0.64.0):
+/// `AGENT_SOURCE_PRIORITY[source] * 1_000_000 + (discoveryPriority ?? 0)`, over the same
+/// `builtin 0 · package 1 · user 2 · project 3 · runtime 4` map as [`source_rank`] (`:251-257`).
+/// NOT [`AgentSource::precedence_rank`], whose "lower wins" orientation is the inverse.
+fn agent_definition_priority(source: AgentSource, discovery_priority: Option<u32>) -> u64 {
+    u64::from(source_rank(source)) * 1_000_000 + u64::from(discovery_priority.unwrap_or(0))
+}
+
+/// SUBA-086 — the candidate set pi hands `findBlockingAgentDiagnostic` for a resolution outcome
+/// (`subagent-executor.ts:2337-2338`, `preflight.ts:264-266`, `slash-commands.ts:891-893`
+/// @v0.64.0):
+///
+/// ```text
+/// const resolved = resolveAgentName(name, agents);
+/// const candidates = resolved.error ? agents.filter((agent) => resolveAgentName(name, [agent]).agent) : resolved.agent;
+/// ```
+///
+/// `Found` → that one agent; `Ambiguous` (pi's `error`) → every agent the name resolves to on
+/// its own; `NotFound` → nothing. Shared by the delegation seams so they cannot drift.
+#[must_use]
+pub fn blocking_candidates<'a>(
+    name: &str,
+    agents: &'a [AgentDefinition],
+    resolution: &AgentNameResolution<'a>,
+) -> Vec<&'a AgentDefinition> {
+    match resolution {
+        AgentNameResolution::Found(agent) => vec![*agent],
+        AgentNameResolution::Ambiguous(_) => agents
+            .iter()
+            .filter(|agent| resolve_agent_name(name, std::slice::from_ref(*agent)).agent().is_some())
+            .collect(),
+        AgentNameResolution::NotFound => Vec::new(),
+    }
+}
+
+/// SUBA-086 — does a malformed definition BLOCK `name`? Direct port of pi
+/// `findBlockingAgentDiagnostic` (`agents.ts:264-278` @v0.64.0; `:249-263` @v0.57.0, identical):
+///
+/// ```text
+/// const normalizedName = name.trim();
+/// let match;
+/// for (const diagnostic of diagnostics ?? []) {
+///   if ((diagnostic.runtimeName === normalizedName
+///       || (diagnostic.name === normalizedName && (!diagnostic.packageSpecified
+///           || diagnostic.runtimeName === undefined
+///           || agents.some((agent) => agent.name === diagnostic.runtimeName && agent.localName === diagnostic.name))))
+///       && (!match || agentDefinitionPriority(diagnostic) > agentDefinitionPriority(match))) {
+///     match = diagnostic;
+///   }
+/// }
+/// const highestPriority = Math.max(...agents.map(agentDefinitionPriority), -Infinity);
+/// return !agents.length || (match && agentDefinitionPriority(match) > highestPriority) ? match : undefined;
+/// ```
+///
+/// A diagnostic matches by runtime name, or by local name unless it declared a `package:` whose
+/// runtime name no candidate carries under that local name. The highest-priority match blocks
+/// only when NO candidate survived, or when it OUTRANKS every survivor — so a broken PROJECT
+/// `worker.md` blocks the valid builtin/user `worker` that would otherwise silently run in its
+/// place (the row's "wrong agent runs" case), while a broken USER copy under a valid PROJECT one
+/// stays a listing-only diagnostic. `candidates` is [`blocking_candidates`]' output (or a
+/// management `find_agents` match set); [`AgentDefinition`] carries no `discoveryPriority`, so
+/// its side of the comparison is source rank alone (see
+/// [`AgentDiscoveryDiagnostic::discovery_priority`]).
+#[must_use]
+pub fn find_blocking_agent_diagnostic<'d>(
+    name: &str,
+    candidates: &[&AgentDefinition],
+    diagnostics: &'d [AgentDiscoveryDiagnostic],
+) -> Option<&'d AgentDiscoveryDiagnostic> {
+    let normalized = name.trim();
+    let diagnostic_priority =
+        |d: &AgentDiscoveryDiagnostic| agent_definition_priority(d.source, d.discovery_priority);
+    let mut best: Option<&'d AgentDiscoveryDiagnostic> = None;
+    for diagnostic in diagnostics {
+        let by_runtime_name = diagnostic.runtime_name.as_deref() == Some(normalized);
+        let by_local_name = diagnostic.name.as_deref() == Some(normalized)
+            && (!diagnostic.package_specified
+                || diagnostic.runtime_name.is_none()
+                || candidates.iter().any(|agent| {
+                    Some(agent.name.as_str()) == diagnostic.runtime_name.as_deref()
+                        && Some(agent.local_name.as_str()) == diagnostic.name.as_deref()
+                }));
+        if (by_runtime_name || by_local_name)
+            && best.is_none_or(|current| diagnostic_priority(diagnostic) > diagnostic_priority(current))
+        {
+            best = Some(diagnostic);
+        }
+    }
+    let highest = candidates
+        .iter()
+        .map(|agent| agent_definition_priority(agent.source, None))
+        .max();
+    match (highest, best) {
+        (None, _) => best,
+        (Some(highest), Some(found)) if diagnostic_priority(found) > highest => Some(found),
+        _ => None,
+    }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1000,31 +1099,56 @@ pub(crate) fn should_prune_discovery_dir(root: &Path, dir: &Path, dir_name: &str
     dir != root && is_discovery_nested_project_root(dir)
 }
 
+/// One tier's (or one directory's) agent-file scan: the definitions that parsed, plus SUBA-086's
+/// per-file diagnostics for the ones that did not — pi `loadAgentsFromDefinitionFiles`' return
+/// shape `{ agents: AgentConfig[]; diagnostics: AgentDiscoveryDiagnostic[] }` (`agents.ts:1959`
+/// @v0.64.0).
+#[derive(Debug, Default)]
+pub(crate) struct AgentFileScan {
+    pub(crate) agents: Vec<AgentDefinition>,
+    pub(crate) diagnostics: Vec<AgentDiscoveryDiagnostic>,
+}
+
+impl AgentFileScan {
+    fn extend(&mut self, other: AgentFileScan) {
+        self.agents.extend(other.agents);
+        self.diagnostics.extend(other.diagnostics);
+    }
+}
+
 /// Recursively walk `root` for agent `.md` files, alphabetical-by-filename, depth-first
 /// (R-SA-004), excluding any subtree rooted at a directory segment literally named
 /// [`SKILLS_DIR_SEGMENT`] (R-SA-007). Each file is parsed via
-/// [`frontmatter::parse_agent_file`], which itself silently skips a file missing `name`/
-/// `description` (R-SA-005) or bearing an invalid `package` identifier (R-SA-006) — this
-/// function simply omits a `None` result from its output, continuing the walk unaffected
-/// (R-SA-005's "discovery of other files MUST continue unaffected").
+/// [`frontmatter::parse_agent_file_checked`]: a file missing `name`/`description` is silently
+/// skipped (R-SA-005), and a file whose frontmatter fails validation is skipped AND recorded as
+/// an [`AgentDiscoveryDiagnostic`] (SUBA-086; pi's per-file catch, `agents.ts:2149-2151`
+/// @v0.64.0) — either way the walk continues unaffected (R-SA-005's "discovery of other files
+/// MUST continue unaffected").
 ///
-/// A `root` that does not exist (or is not readable) yields an empty `Vec`, not an error — an
+/// A `root` that does not exist (or is not readable) yields an empty scan, not an error — an
 /// absent scope directory is a normal, unconfigured-scope condition, not a malformed-discovery
 /// one (mirrors `discovery::chains::scan_chain_dir`'s identical convention).
 ///
 /// Returned in scan order (which, per R-SA-004, is exactly the order that determines same-scope
 /// collision winners once handed to `merge::reduce_last_seen_wins`/`reduce_first_seen_wins`).
-pub fn walk_agent_dir(root: &Path, source: AgentSource) -> Vec<AgentDefinition> {
-    let mut out = Vec::new();
+pub(crate) fn walk_agent_dir_checked(root: &Path, source: AgentSource) -> AgentFileScan {
+    let mut out = AgentFileScan::default();
     walk_agent_dir_into(root, root, source, &mut out);
     out
+}
+
+/// [`walk_agent_dir_checked`] with the diagnostics dropped — the pre-SUBA-086 shape, kept for
+/// callers that only want the parsed definitions.
+#[must_use]
+pub fn walk_agent_dir(root: &Path, source: AgentSource) -> Vec<AgentDefinition> {
+    walk_agent_dir_checked(root, source).agents
 }
 
 fn walk_agent_dir_into(
     root: &Path,
     dir: &Path,
     source: AgentSource,
-    out: &mut Vec<AgentDefinition>,
+    out: &mut AgentFileScan,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1063,20 +1187,22 @@ fn walk_agent_dir_into(
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        if let Some(def) = frontmatter::parse_agent_file(&content, source, &path) {
-            out.push(def);
+        match frontmatter::parse_agent_file_checked(&content, source, &path) {
+            Ok(Some(def)) => out.agents.push(def),
+            Ok(None) => {}
+            Err(diagnostic) => out.diagnostics.push(diagnostic),
         }
     }
 }
 
 /// Walk multiple User/Project agent directories in fixed scan order, concatenating their
-/// per-directory [`walk_agent_dir`] results into one flat, scan-ordered `Vec` — the shape
+/// per-directory [`walk_agent_dir_checked`] results into one flat, scan-ordered scan — the shape
 /// `merge::reduce_last_seen_wins` expects for its own last-directory-scanned-wins reduction
 /// (R-SA-002).
-fn walk_agent_dirs(roots: &[PathBuf], source: AgentSource) -> Vec<AgentDefinition> {
-    let mut out = Vec::new();
+fn walk_agent_dirs(roots: &[PathBuf], source: AgentSource) -> AgentFileScan {
+    let mut out = AgentFileScan::default();
     for root in roots {
-        out.extend(walk_agent_dir(root, source));
+        out.extend(walk_agent_dir_checked(root, source));
     }
     out
 }
@@ -1097,16 +1223,18 @@ fn walk_agent_dirs(roots: &[PathBuf], source: AgentSource) -> Vec<AgentDefinitio
 /// crate's analog: a file entry is parsed directly; a directory entry is expanded via
 /// [`walk_agent_dir`] (R-SA-004/005/006/007 all apply uniformly to that expansion, since it is
 /// the exact same walk User/Project tiers use).
-fn expand_manifest_agent_entry(entry: &Path, source: AgentSource, out: &mut Vec<AgentDefinition>) {
+fn expand_manifest_agent_entry(entry: &Path, source: AgentSource, out: &mut AgentFileScan) {
     if entry.is_file() {
         let Ok(content) = std::fs::read_to_string(entry) else {
             return;
         };
-        if let Some(def) = frontmatter::parse_agent_file(&content, source, entry) {
-            out.push(def);
+        match frontmatter::parse_agent_file_checked(&content, source, entry) {
+            Ok(Some(def)) => out.agents.push(def),
+            Ok(None) => {}
+            Err(diagnostic) => out.diagnostics.push(diagnostic),
         }
     } else if entry.is_dir() {
-        out.extend(walk_agent_dir(entry, source));
+        out.extend(walk_agent_dir_checked(entry, source));
     }
     // A non-existent entry (dangling manifest declaration) is silently skipped — not this
     // function's place to surface a diagnostic (see `scan_package_agents`'s own doc for why
@@ -1138,13 +1266,18 @@ fn expand_manifest_agent_entry(entry: &Path, source: AgentSource, out: &mut Vec<
 /// failure is already surfaced as a warning for skills/prompts, so this crate does not duplicate
 /// that reporting for agents.
 pub fn scan_package_agents(cfg: &AgentDiscoveryConfig) -> Vec<AgentDefinition> {
+    scan_package_agents_checked(cfg).agents
+}
+
+/// [`scan_package_agents`] plus SUBA-086's per-file diagnostics.
+pub(crate) fn scan_package_agents_checked(cfg: &AgentDiscoveryConfig) -> AgentFileScan {
     let mut ordered: Vec<&InstalledPackage> = cfg.installed_packages.packages.iter().collect();
     ordered.sort_by_key(|p| match p.scope {
         InstallScope::Project => 0u8,
         InstallScope::Global => 1u8,
     });
 
-    let mut out = Vec::new();
+    let mut out = AgentFileScan::default();
     for pkg in ordered {
         if pkg.scope == InstallScope::Project && !cfg.trusted_project {
             continue;
@@ -1220,8 +1353,13 @@ pub fn scan_package_chain_scopes(cfg: &AgentDiscoveryConfig) -> Vec<(PathBuf, Ag
 /// not an error — an unconfigured builtin directory (e.g. a minimal test harness with no bundled
 /// personas) is a normal condition.
 pub fn scan_builtin_agents(cfg: &AgentDiscoveryConfig) -> Vec<AgentDefinition> {
+    scan_builtin_agents_checked(cfg).agents
+}
+
+/// [`scan_builtin_agents`] plus SUBA-086's per-file diagnostics.
+pub(crate) fn scan_builtin_agents_checked(cfg: &AgentDiscoveryConfig) -> AgentFileScan {
     let Some(dir) = cfg.builtin_agents_dir.as_ref() else {
-        return Vec::new();
+        return AgentFileScan::default();
     };
     let Ok(manifest) = resolve_manifest(dir) else {
         // A builtin directory that fails manifest resolution (e.g. no recognizable manifest
@@ -1231,7 +1369,7 @@ pub fn scan_builtin_agents(cfg: &AgentDiscoveryConfig) -> Vec<AgentDefinition> {
         // detecting a conventional `agents/` child dir; a directory that is itself already the
         // agents root (no `agents/` subdirectory of its own) falls through to this arm and is
         // walked directly below instead.
-        return walk_agent_dir(dir, AgentSource::Builtin);
+        return walk_agent_dir_checked(dir, AgentSource::Builtin);
     };
     if manifest.agents.is_empty() {
         // No manifest-declared `agents` entries resolved (including the "this directory has no
@@ -1239,9 +1377,9 @@ pub fn scan_builtin_agents(cfg: &AgentDiscoveryConfig) -> Vec<AgentDefinition> {
         // itself as the agents root directly, so a builtin_agents_dir pointing straight at a flat
         // directory of `.md` personas (the common case for this extension's own bundled
         // scout.md/worker.md/delegate.md) still discovers them without requiring a manifest.
-        return walk_agent_dir(dir, AgentSource::Builtin);
+        return walk_agent_dir_checked(dir, AgentSource::Builtin);
     }
-    let mut out = Vec::new();
+    let mut out = AgentFileScan::default();
     for agent_entry in &manifest.agents {
         expand_manifest_agent_entry(agent_entry, AgentSource::Builtin, &mut out);
     }
@@ -1269,6 +1407,12 @@ pub struct AgentDiscoveryResult {
     /// Non-fatal per-chain-file parse diagnostics (R-SA-009's diagnostic case) — never aborts
     /// discovery of sibling files.
     pub diagnostics: Vec<ChainDiscoveryDiagnostic>,
+    /// SUBA-086 — per-AGENT-file parse diagnostics (pi `agentDiagnostics`, `agents.ts:2670`
+    /// on the effective result and `:2705-2710` on `discoverAgentsAll` @v0.64.0), in tier scan
+    /// order builtin → package → user → project. Already narrowed by the requested
+    /// [`AgentReadScope`] the same way pi `discoveryDiagnostics(sources, scope)` (`:2651-2662`)
+    /// is: the tier a scope excludes is never walked here, so it contributes no diagnostic.
+    pub agent_diagnostics: Vec<AgentDiscoveryDiagnostic>,
     /// The effective `subagents.modelScope` policy for this discovery's cwd (pi `discoverAgents`'s
     /// own returned `modelScope`, `agents.ts:1738/1446`): project scope wins over user, `None` =
     /// no policy configured, so model-scope enforcement is off.
@@ -1295,14 +1439,20 @@ pub struct AgentDiscoveryResult {
 /// exposed, so the two can never disagree about what is on disk.
 #[must_use]
 pub fn scan_agent_tiers(cfg: &AgentDiscoveryConfig) -> merge::TieredAgents {
-    scan_agent_tiers_scoped(cfg, AgentReadScope::Both)
+    scan_agent_tiers_scoped(cfg, AgentReadScope::Both).0
 }
 
 /// The tier-scan step shared by [`run_discovery`] and [`scan_agent_tiers`] — see
 /// [`run_discovery`]'s doc for why `scope` narrows the User-vs-Project axis *inside* the scan.
-fn scan_agent_tiers_scoped(cfg: &AgentDiscoveryConfig, scope: AgentReadScope) -> merge::TieredAgents {
-    let builtin = scan_builtin_agents(cfg);
-    let package = scan_package_agents(cfg);
+/// The second element is SUBA-086's agent diagnostics across the scanned tiers, in tier order.
+fn scan_agent_tiers_scoped(
+    cfg: &AgentDiscoveryConfig,
+    scope: AgentReadScope,
+) -> (merge::TieredAgents, Vec<AgentDiscoveryDiagnostic>) {
+    let AgentFileScan { agents: builtin, diagnostics: builtin_diagnostics } =
+        scan_builtin_agents_checked(cfg);
+    let AgentFileScan { agents: package, diagnostics: package_diagnostics } =
+        scan_package_agents_checked(cfg);
     // Scope-filtered discovery (R-SA-013; pi `discoverAgents` + `mergeAgentsForScope`,
     // agents.ts:1752-1778, agent-selection.ts): narrow the User-vs-Project axis **within each
     // tier, BEFORE the merge** — never merge-all-then-filter. Zeroing the excluded tier's
@@ -1313,17 +1463,27 @@ fn scan_agent_tiers_scoped(cfg: &AgentDiscoveryConfig, scope: AgentReadScope) ->
     // always scanned (an `AgentReadScope` narrows only User-vs-Project, mirroring
     // `mergeAgentsForScope`, which always seeds the map with builtin+package then adds only the
     // in-scope User/Project agents).
-    let user = if scope == AgentReadScope::Project {
-        Vec::new()
-    } else {
-        walk_agent_dirs(&cfg.user_agent_dirs, AgentSource::User)
-    };
-    let project = if scope == AgentReadScope::User {
-        Vec::new()
-    } else {
-        walk_agent_dirs(&cfg.project_agent_dirs, AgentSource::Project)
-    };
-    merge::TieredAgents { builtin, package, user, project }
+    let AgentFileScan { agents: user, diagnostics: user_diagnostics } =
+        if scope == AgentReadScope::Project {
+            AgentFileScan::default()
+        } else {
+            walk_agent_dirs(&cfg.user_agent_dirs, AgentSource::User)
+        };
+    let AgentFileScan { agents: project, diagnostics: project_diagnostics } =
+        if scope == AgentReadScope::User {
+            AgentFileScan::default()
+        } else {
+            walk_agent_dirs(&cfg.project_agent_dirs, AgentSource::Project)
+        };
+    // pi `discoveryDiagnostics` (`agents.ts:2651-2662` @v0.64.0) concatenates builtin, then the
+    // in-scope user/project tiers, then package; `buildAllDiscovery` (`:2705-2710`) goes
+    // builtin, user, package, project. Tier scan order is used here — the ORDER is only what
+    // `list`/doctor print, never what blocks (that is priority-ranked).
+    let mut diagnostics = builtin_diagnostics;
+    diagnostics.extend(package_diagnostics);
+    diagnostics.extend(user_diagnostics);
+    diagnostics.extend(project_diagnostics);
+    (merge::TieredAgents { builtin, package, user, project }, diagnostics)
 }
 
 /// Run the shared walk-and-merge pipeline once: four-tier agent scan + merge + overrides
@@ -1339,7 +1499,7 @@ fn run_discovery(
     cfg: &AgentDiscoveryConfig,
     scope: AgentReadScope,
 ) -> Result<AgentDiscoveryResult, SubagentError> {
-    let tiers = scan_agent_tiers_scoped(cfg, scope);
+    let (tiers, agent_diagnostics) = scan_agent_tiers_scoped(cfg, scope);
     let merged = merge::discover_and_merge(tiers, &cfg.override_settings)?;
 
     let mut agents: Vec<AgentDefinition> = merged.into_values().collect();
@@ -1360,7 +1520,10 @@ fn run_discovery(
     // `maxThinking` re-stamp (`:540-545`) has no counterpart here: cyrup carries the ceiling on
     // the RESULT (`max_thinking` below, SUBA-078), not on each agent.
     if !cfg.runtime_agents.is_empty() {
-        let all = scan_agent_tiers_scoped(cfg, AgentReadScope::Both);
+        // The collision snapshot's own diagnostics are NOT surfaced: they duplicate the scoped
+        // scan's (or belong to a tier the requested scope excludes), exactly as upstream's
+        // `discoverAgentsForRuntime` re-snapshot feeds only `configuredAgents`.
+        let (all, _) = scan_agent_tiers_scoped(cfg, AgentReadScope::Both);
         let mut configured: Vec<AgentDefinition> = Vec::with_capacity(
             all.builtin.len() + all.package.len() + all.user.len() + all.project.len(),
         );
@@ -1389,6 +1552,7 @@ fn run_discovery(
         agents,
         chains,
         diagnostics,
+        agent_diagnostics,
         // pi `discoverAgents` returns `{ agents, projectAgentsDir, modelScope }` (`agents.ts:1727-1781`)
         // — the effective policy travels WITH the discovery result so an execution path that
         // already discovered the agent does not have to re-read settings to learn the scope.
@@ -3118,5 +3282,147 @@ mod tests {
         let after = discover_agents_all(&cfg).expect("discovery succeeds");
         assert_eq!(after.agents.len(), 1);
         assert_eq!(after.agents[0].name, "new-agent");
+    }
+
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-086: agent diagnostics travel on the discovery result and block their own name
+    // -----------------------------------------------------------------------------------------
+
+    fn write_broken_agent(dir: &Path, file_name: &str, name: &str) {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        std::fs::write(
+            dir.join(file_name),
+            format!("---\nname: {name}\ndescription: d\ntimeoutMs: 30s\n---\n\nBody\n"),
+        )
+        .expect("write broken agent file");
+    }
+
+    const TIMEOUT_MSG: &str =
+        "Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer.";
+
+    #[test]
+    fn a_malformed_project_agent_file_is_reported_by_name_and_scoped_like_upstream() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        write_broken_agent(&project, "worker.md", "worker");
+        write_agent(&project, "scout.md", "scout", "still discovered");
+        let cfg = AgentDiscoveryConfig {
+            project_agent_dirs: vec![project.clone()],
+            ..AgentDiscoveryConfig::default()
+        };
+
+        let all = discover_agents_all(&cfg).expect("discovery succeeds");
+        assert!(all.agents.iter().all(|a| a.name != "worker"), "the broken file must not load");
+        assert!(all.agents.iter().any(|a| a.name == "scout"), "siblings keep discovering (R-SA-005)");
+        assert_eq!(all.agent_diagnostics.len(), 1, "{:?}", all.agent_diagnostics);
+        let diag = &all.agent_diagnostics[0];
+        assert_eq!(diag.source, AgentSource::Project);
+        assert_eq!(diag.name.as_deref(), Some("worker"));
+        assert_eq!(diag.file_path, project.join("worker.md"));
+        assert_eq!(diag.error, TIMEOUT_MSG);
+
+        // pi `discoveryDiagnostics(sources, "user")` drops the project tier (`agents.ts:2653-2656`).
+        let user_view = discover_agents(&cfg, Some(AgentReadScope::User)).expect("discovery");
+        assert!(user_view.agent_diagnostics.is_empty(), "{:?}", user_view.agent_diagnostics);
+        let project_view = discover_agents(&cfg, Some(AgentReadScope::Project)).expect("discovery");
+        assert_eq!(project_view.agent_diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn a_broken_higher_tier_definition_blocks_the_valid_lower_tier_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user = tmp.path().join("user");
+        let project = tmp.path().join("project");
+        write_agent(&user, "worker.md", "worker", "valid user copy");
+        write_broken_agent(&project, "worker.md", "worker");
+        let cfg = AgentDiscoveryConfig {
+            user_agent_dirs: vec![user],
+            project_agent_dirs: vec![project],
+            ..AgentDiscoveryConfig::default()
+        };
+        let result = discover_agents(&cfg, None).expect("discovery");
+
+        // Plain resolution silently lands on the user copy — the very "wrong agent runs" outcome.
+        let resolution = resolve_agent_name("worker", &result.agents);
+        assert!(matches!(resolution, AgentNameResolution::Found(a) if a.source == AgentSource::User));
+        let candidates = blocking_candidates("worker", &result.agents, &resolution);
+        assert_eq!(candidates.len(), 1);
+        let blocking =
+            find_blocking_agent_diagnostic("worker", &candidates, &result.agent_diagnostics);
+        assert!(
+            blocking.is_some_and(|d| d.source == AgentSource::Project && d.error == TIMEOUT_MSG),
+            "project (3) outranks user (2), so the diagnostic must block: {blocking:?}"
+        );
+    }
+
+    #[test]
+    fn a_broken_lower_tier_definition_does_not_block_the_valid_higher_tier_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user = tmp.path().join("user");
+        let project = tmp.path().join("project");
+        write_broken_agent(&user, "worker.md", "worker");
+        write_agent(&project, "worker.md", "worker", "valid project copy");
+        let cfg = AgentDiscoveryConfig {
+            user_agent_dirs: vec![user],
+            project_agent_dirs: vec![project],
+            ..AgentDiscoveryConfig::default()
+        };
+        let result = discover_agents(&cfg, None).expect("discovery");
+        assert_eq!(result.agent_diagnostics.len(), 1, "still LISTED as a diagnostic");
+        let resolution = resolve_agent_name("worker", &result.agents);
+        let candidates = blocking_candidates("worker", &result.agents, &resolution);
+        assert!(
+            find_blocking_agent_diagnostic("worker", &candidates, &result.agent_diagnostics).is_none(),
+            "a user-tier (2) diagnostic never outranks a project-tier (3) definition"
+        );
+    }
+
+    #[test]
+    fn find_blocking_agent_diagnostic_with_no_candidates_returns_the_trimmed_name_match() {
+        let diag = AgentDiscoveryDiagnostic {
+            source: AgentSource::User,
+            file_path: PathBuf::from("/u/worker.md"),
+            error: "boom".to_string(),
+            name: Some("worker".to_string()),
+            runtime_name: None,
+            package_specified: false,
+            discovery_priority: None,
+        };
+        let diagnostics = std::slice::from_ref(&diag);
+        assert!(find_blocking_agent_diagnostic("worker", &[], diagnostics).is_some());
+        assert!(find_blocking_agent_diagnostic("  worker  ", &[], diagnostics).is_some(), "pi trims");
+        assert!(find_blocking_agent_diagnostic("other", &[], diagnostics).is_none());
+        assert!(find_blocking_agent_diagnostic("worker", &[], &[]).is_none());
+    }
+
+    #[test]
+    fn a_packaged_diagnostic_matches_by_runtime_name_and_gates_local_name_on_a_matching_candidate() {
+        let diag = AgentDiscoveryDiagnostic {
+            source: AgentSource::Project,
+            file_path: PathBuf::from("/p/worker.md"),
+            error: "boom".to_string(),
+            name: Some("worker".to_string()),
+            runtime_name: Some("acme.worker".to_string()),
+            package_specified: true,
+            discovery_priority: None,
+        };
+        let diagnostics = std::slice::from_ref(&diag);
+        // The runtime name matches outright.
+        assert!(find_blocking_agent_diagnostic("acme.worker", &[], diagnostics).is_some());
+        // The bare local name matches only through a candidate carrying that exact
+        // (runtimeName, localName) pair (`agents.ts:270-272`).
+        assert!(find_blocking_agent_diagnostic("worker", &[], diagnostics).is_none());
+        let candidate = frontmatter::parse_agent_file(
+            "---\nname: worker\npackage: acme\ndescription: d\n---\n\nBody\n",
+            AgentSource::User,
+            Path::new("/u/worker.md"),
+        )
+        .expect("candidate parses");
+        assert_eq!(candidate.name, "acme.worker");
+        assert!(
+            find_blocking_agent_diagnostic("worker", &[&candidate], diagnostics).is_some(),
+            "local-name match unlocked by the candidate, and project outranks user"
+        );
     }
 }

@@ -18,22 +18,27 @@
 //!    the trimmed markdown body. Reused as-is by `discovery/chains.rs` for `.chain.md` files
 //!    (same frontmatter grammar, func-SA §4.1), which is why it is `pub(crate)` rather than
 //!    private to this file.
-//! 2. [`parse_agent_file`] — the agent-specific layer: required-field silent-skip (R-SA-005),
-//!    package-identifier validation with whole-file skip on failure (R-SA-006), tool-list
-//!    splitting (`mcp:`-prefixed vs. everything else), name-sensitive `systemPromptMode`/
+//! 2. [`parse_agent_file_checked`] (and its diagnostic-dropping wrapper [`parse_agent_file`]) —
+//!    the agent-specific layer: required-field silent-skip (R-SA-005), package-identifier
+//!    validation with whole-file skip on failure (R-SA-006), tool-list splitting
+//!    (`mcp:`-prefixed vs. everything else), name-sensitive `systemPromptMode`/
 //!    `inheritProjectContext` defaults (R-SA-018), and `AgentDefinition` construction including
-//!    `present_fields`/`extra_fields` round-trip bookkeeping.
+//!    `present_fields`/`extra_fields` round-trip bookkeeping. Every field validation pi THROWS
+//!    on is returned as an [`AgentDiscoveryDiagnostic`] (SUBA-086) so discovery can report the
+//!    file by name instead of dropping it silently.
 //!
 //! # Faithfulness notes (verified against `pi-subagents/src/agents/{frontmatter,agents,
 //! identity,agent-serializer}.ts`)
 //!
 //! - Required fields are exactly `name` and `description`; either missing means the whole file is
 //!   silently skipped (R-SA-005) — no error, no diagnostic, discovery of siblings continues
-//!   (owned by this file's caller in `discovery/mod.rs`, which simply skips a `None` return).
+//!   (owned by this file's caller in `discovery/mod.rs`, which simply skips an `Ok(None)` return).
 //! - `package` normalization (lowercase, whitespace -> `-`, strip non `[a-z0-9.-]`, collapse
 //!   repeats, trim leading/trailing `-`/`.`) then validated against
 //!   `^[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*$`; a failure skips the **entire** file
-//!   (R-SA-006), not merely the `package` field.
+//!   (R-SA-006), not merely the `package` field — and, since SUBA-086, is reported as an
+//!   `AgentDiscoveryDiagnostic` carrying pi's `Agent '<name>' package is invalid after
+//!   sanitization.`.
 //! - `systemPromptMode`/`inheritProjectContext` discovery-time defaults are computed from the
 //!   agent's **local name** (pre-packaging) — `Append`/`true` only when local name is exactly
 //!   `"delegate"`, else `Replace`/`false` (R-SA-018) — applying even when the agent is packaged.
@@ -55,7 +60,10 @@ use std::path::{Path, PathBuf};
 
 use cyrup_core::ModelId;
 
-use super::types::{AgentDefinition, AgentSource, OutputMode, OutputSpec, SystemPromptMode, ToolRef};
+use super::types::{
+    AgentDefinition, AgentDiscoveryDiagnostic, AgentSource, OutputMode, OutputSpec, SystemPromptMode,
+    ToolRef,
+};
 use crate::fork_context::ContextMode;
 use super::package_name::{collapse_repeated_char, is_valid_package_identifier};
 
@@ -768,18 +776,46 @@ fn parse_output_spec(raw: &str) -> Option<OutputSpec> {
     })
 }
 
-/// Parse one agent `.md` file's contents into an [`AgentDefinition`], or `None` if the file MUST
-/// be silently skipped per R-SA-005 (missing `name`/`description`) or R-SA-006 (invalid `package`
-/// identifier — the **entire** file is skipped, not merely the `package` field).
+/// Parse one agent `.md` file's contents into an [`AgentDefinition`], folding every
+/// [`AgentDiscoveryDiagnostic`] from [`parse_agent_file_checked`] into `None`.
+///
+/// This is the pre-SUBA-086 shape kept for the CRUD/serializer round-trip callers
+/// (`management/agent_crud.rs`, `management/frontmatter_write.rs`, `exec/spawn_plan.rs`), which
+/// only need "did this parse". DISCOVERY must call [`parse_agent_file_checked`] instead so a
+/// malformed file is reported by name rather than vanishing (pi surfaces it under
+/// `Invalid agent definitions:`, `agent-management.ts:818-825` @v0.64.0).
+pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) -> Option<AgentDefinition> {
+    parse_agent_file_checked(content, source, file_path).ok().flatten()
+}
+
+/// Parse one agent `.md` file's contents into an [`AgentDefinition`].
+///
+/// `Ok(None)` is the silent skip R-SA-005 reserves for a file missing `name`/`description` — pi
+/// `continue`s at `agents.ts:1970-1972` @v0.64.0 with no diagnostic, and so does this.
+///
+/// `Err(diagnostic)` is SUBA-086's port of pi's per-file `try { … } catch` in
+/// `loadAgentsFromDefinitionFiles` (`agents.ts:1959-2154` @v0.64.0; `:1919-2110` @v0.57.0): every
+/// validation upstream THROWS on — `package` (`:1974-1977`), `runner` (`:1980-1981`), the
+/// reserved-profile squat (`:1993`), `async` (`:2018-2022`), `timeoutMs` (`:2024-2030`),
+/// `toolTimeoutMs` (`:2031-2038`), `acceptance` (`:2039`), `outputMode` (`:2041-2044`),
+/// `acceptanceRole` (`:2046-2050`), `fast` (`:2057-2062`), `allowNestedSubagents`
+/// (`:2063-2068`), `permission`+`permissions` (`:2076-2078`), the permission rules (`:2080-2082`),
+/// `toolBudget` (`:2084-2090`) and `turnBudget` — is caught at `:2149-2151` and pushed as
+/// `{ source, filePath, name, runtimeName, packageSpecified, discoveryPriority, error }`, with
+/// the throw's exact message. The messages here are upstream's verbatim; the `[CYRUP-DELTA]`
+/// that used to turn each of them into a `tracing::warn!` + whole-file skip is now a
+/// `tracing::warn!` + returned diagnostic, so the file is still skipped (discovery of siblings
+/// continues, R-SA-005) but the failure travels to `list`/`get`/`models`/doctor and BLOCKS
+/// delegation to that name ([`crate::discovery::find_blocking_agent_diagnostic`]).
 ///
 /// `source` and `file_path` are supplied by the caller (`discovery/mod.rs`'s directory walk) since
 /// this function has no filesystem access of its own — it operates purely on already-read file
 /// contents, keeping it trivially unit-testable against in-memory fixtures.
 ///
-/// Never returns an `Err` for a malformed individual agent file — R-SA-009's three-way
-/// throw/silent-skip/diagnostic distinction reserves silent-skip for exactly this case (malformed
-/// *agent* frontmatter, as opposed to malformed *settings*, which aborts discovery, or malformed
-/// *chain* files, which produce a non-fatal diagnostic elsewhere in `discovery/chains.rs`).
+/// # Errors
+///
+/// One [`AgentDiscoveryDiagnostic`] naming the file, its local `name:`, its runtime name when
+/// packaged, and the first failing field's upstream message.
 /// SUBA-082 — pi `parseAgentAcceptanceFrontmatter(raw, agentName)` (`agents.ts:1873-1884`
 /// @v0.57.0, `:1913-1924` @v0.64.0):
 ///
@@ -830,22 +866,77 @@ pub(crate) fn parse_agent_acceptance_frontmatter(
     Ok(if parsed.is_null() { None } else { Some(parsed) })
 }
 
-pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) -> Option<AgentDefinition> {
+pub fn parse_agent_file_checked(
+    content: &str,
+    source: AgentSource,
+    file_path: &Path,
+) -> Result<Option<AgentDefinition>, AgentDiscoveryDiagnostic> {
     let parsed = parse_frontmatter_block(content);
 
-    let local_name = parsed.get(REQUIRED_FIELD_NAME)?.to_string();
-    let description = parsed.get(REQUIRED_FIELD_DESCRIPTION)?.to_string();
+    let Some(local_name) = parsed.get(REQUIRED_FIELD_NAME).map(str::to_string) else {
+        return Ok(None);
+    };
+    let Some(description) = parsed.get(REQUIRED_FIELD_DESCRIPTION).map(str::to_string) else {
+        return Ok(None);
+    };
     if local_name.is_empty() || description.is_empty() {
         // Source's `!frontmatter.name || !frontmatter.description` treats an empty string
         // identically to "absent" (both are JS-falsy) — mirror that exactly rather than only
         // checking for the key's literal presence.
-        return None;
+        return Ok(None);
     }
 
-    // R-SA-006: invalid `package` identifier skips the WHOLE file, not merely the field.
-    let package_name = parse_package_name(parsed.get("package")).ok()?;
+    // pi `packageSpecified = parsedPackage.packageName !== undefined || parsedPackage.error !==
+    // undefined` (`agents.ts:1976` @v0.64.0): a non-blank `package:` was declared, valid or not.
+    let package_specified = parsed.get("package").is_some_and(|v| !v.trim().is_empty());
+    // R-SA-006: invalid `package` identifier skips the WHOLE file, not merely the field. pi
+    // `parsePackageName(frontmatter.package, `Agent '${localName}' package`)` throws
+    // `identity.ts:15`'s `${label} is invalid after sanitization.` (`agents.ts:1975-1977`).
+    let package_name = match parse_package_name(parsed.get("package")) {
+        Ok(name) => name,
+        Err(()) => {
+            let error = format!("Agent '{local_name}' package is invalid after sanitization.");
+            tracing::warn!(
+                agent = %local_name,
+                path = %file_path.display(),
+                "{error} — skipping this agent file"
+            );
+            return Err(AgentDiscoveryDiagnostic {
+                source,
+                file_path: file_path.to_path_buf(),
+                error,
+                name: Some(local_name),
+                // Upstream's `runtimeName` is bound only AFTER the package parse succeeds
+                // (`:1978`), so a package failure never carries one.
+                runtime_name: None,
+                package_specified,
+                discovery_priority: None,
+            });
+        }
+    };
 
     let runtime_name = AgentDefinition::qualified_name(&local_name, package_name.as_deref());
+
+    // Every throw below pi's `runtimeName` binding lands in the same catch (`:2149-2151`); this
+    // closure is that catch, keeping the pre-existing `warn` so the tracing log still names the
+    // file. `runtime_name` is carried only when it differs from `name` (`runtimeName !==
+    // name`), `discovery_priority` stays `None` (see the field's doc).
+    let fail = |error: String| -> AgentDiscoveryDiagnostic {
+        tracing::warn!(
+            agent = %local_name,
+            path = %file_path.display(),
+            "{error} — skipping this agent file"
+        );
+        AgentDiscoveryDiagnostic {
+            source,
+            file_path: file_path.to_path_buf(),
+            error,
+            name: Some(local_name.clone()),
+            runtime_name: (runtime_name != local_name).then(|| runtime_name.clone()),
+            package_specified,
+            discovery_priority: None,
+        }
+    };
 
     // G103 / pi `agents.ts:1610` @v0.43.0: `...(rawTools !== undefined ? { tools } : {})` — the
     // `tools` field is carried onto the agent exactly when the frontmatter KEY was present, and its
@@ -928,8 +1019,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
     //
     // `[CYRUP-DELTA]` on the FAILURE path only: pi THROWS out of `loadAgentsFromDir`, so one
     // malformed `toolBudget:` anywhere aborts agent discovery entirely and the user loses every
-    // agent. This function's contract is R-SA-005/006's per-file silent skip (it returns
-    // `Option`, not `Result`), so a malformed budget skips THIS FILE — the same treatment an
+    // agent. This function's contract is a per-FILE skip, so a malformed budget skips THIS FILE — the same treatment an
     // invalid `package` gets — and logs the reason at `warn` rather than taking the whole
     // directory down with it. The valid path is byte-identical to pi.
     let tool_budget = match parsed.get("toolBudget").filter(|v| !v.trim().is_empty()) {
@@ -946,12 +1036,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
             }) {
                 Ok(budget) => budget,
                 Err(message) => {
-                    tracing::warn!(
-                        agent = %local_name,
-                        path = %file_path.display(),
-                        "{message} — skipping this agent file"
-                    );
-                    return None;
+                    return Err(fail(message));
                 }
             }
         }
@@ -985,12 +1070,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
             }) {
                 Ok(budget) => budget,
                 Err(message) => {
-                    tracing::warn!(
-                        agent = %local_name,
-                        path = %file_path.display(),
-                        "{message} — skipping this agent file"
-                    );
-                    return None;
+                    return Err(fail(message));
                 }
             }
         }
@@ -1004,12 +1084,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
     let has_permission = parsed.get("permission").filter(|v| !v.trim().is_empty()).is_some();
     let has_permissions = parsed.get("permissions").filter(|v| !v.trim().is_empty()).is_some();
     if has_permission && has_permissions {
-        tracing::warn!(
-            agent = %local_name,
-            path = %file_path.display(),
-            "Agent '{local_name}' cannot declare both permission and permissions frontmatter. — skipping this agent file"
-        );
-        return None;
+        return Err(fail(format!("Agent '{local_name}' cannot declare both permission and permissions frontmatter.")));
     }
     let permission_rules = match parsed.get("permissions").or_else(|| parsed.get("permission")) {
         None => None,
@@ -1028,12 +1103,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
             }) {
                 Ok(rules) => rules,
                 Err(message) => {
-                    tracing::warn!(
-                        agent = %local_name,
-                        path = %file_path.display(),
-                        "{message} — skipping this agent file"
-                    );
-                    return None;
+                    return Err(fail(message));
                 }
             }
         }
@@ -1049,12 +1119,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
     ) {
         Ok(runner) => runner,
         Err(message) => {
-            tracing::warn!(
-                agent = %local_name,
-                path = %file_path.display(),
-                "{message} — skipping this agent file"
-            );
-            return None;
+            return Err(fail(message));
         }
     };
     if let Err(message) = crate::runner::validate_external_runner_profile(
@@ -1062,12 +1127,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         runner.as_ref(),
         |field| parsed.contains_key(field),
     ) {
-        tracing::warn!(
-            agent = %local_name,
-            path = %file_path.display(),
-            "{message} — skipping this agent file"
-        );
-        return None;
+        return Err(fail(message));
     }
     // SUBA-074 / pi `validateCodeOwnedProfileRunner` (`agents.ts:1951`): a reserved read-only
     // adapter's selection name may not be claimed by anything but that adapter. Runs here rather
@@ -1082,12 +1142,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
                 .as_ref()
                 .and_then(crate::runner::AgentRunnerConfig::code_owned_adapter),
         ) {
-            tracing::warn!(
-                agent = %local_name,
-                path = %file_path.display(),
-                "{message} — skipping this agent file"
-            );
-            return None;
+            return Err(fail(message));
         }
     }
 
@@ -1099,12 +1154,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         Some("true") => Some(true),
         Some("false") => Some(false),
         Some(_) => {
-            tracing::warn!(
-                agent = %local_name,
-                path = %file_path.display(),
-                "Agent '{local_name}' has invalid async frontmatter; expected true or false. — skipping this agent file"
-            );
-            return None;
+            return Err(fail(format!("Agent '{local_name}' has invalid async frontmatter; expected true or false.")));
         }
     };
 
@@ -1118,12 +1168,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         Some("true") => Some(true),
         Some("false") => Some(false),
         Some(_) => {
-            tracing::warn!(
-                agent = %local_name,
-                path = %file_path.display(),
-                "Agent '{local_name}' has invalid allowNestedSubagents frontmatter; expected true or false. — skipping this agent file"
-            );
-            return None;
+            return Err(fail(format!("Agent '{local_name}' has invalid allowNestedSubagents frontmatter; expected true or false.")));
         }
     };
 
@@ -1133,15 +1178,47 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         Some(raw) => match raw.trim().parse::<u64>() {
             Ok(ms) if ms > 0 => Some(ms),
             _ => {
-                tracing::warn!(
-                    agent = %local_name,
-                    path = %file_path.display(),
-                    "Agent '{local_name}' has invalid timeoutMs frontmatter; expected a positive integer. — skipping this agent file"
-                );
-                return None;
+                return Err(fail(format!("Agent '{local_name}' has invalid timeoutMs frontmatter; expected a positive integer.")));
             }
         },
     };
+
+    // SUBA-086 `toolTimeoutMs:` — pi `agents.ts:2031-2038` @v0.64.0: `!Number.isInteger(parsed)
+    // || parsed <= 0 || parsed > 2_147_483_647` THROWS. Validated only: cyrup carries no
+    // per-agent tool-timeout default yet, so a VALID value keeps round-tripping through
+    // `extra_fields` exactly as before (the key is deliberately absent from `KNOWN_FIELDS` here —
+    // adding it without a typed field would drop it from the serializer's output).
+    if let Some(raw) = parsed.get("toolTimeoutMs")
+        && !matches!(raw.trim().parse::<u64>(), Ok(ms) if ms > 0 && ms <= 2_147_483_647)
+    {
+        return Err(fail(format!(
+            "Agent '{local_name}' has invalid toolTimeoutMs frontmatter; expected a positive integer no larger than 2147483647."
+        )));
+    }
+
+    // SUBA-086 `outputMode:` — pi `agents.ts:2041-2044` @v0.64.0: anything but the two literal
+    // spellings `inline`/`file-only` THROWS. Validated only, for the same reason as
+    // `toolTimeoutMs` above ([`AgentDefinition::output`]'s doc: no agent-level default output
+    // MODE is carried yet).
+    if let Some(raw) = parsed.get("outputMode")
+        && raw != "inline"
+        && raw != "file-only"
+    {
+        return Err(fail(format!(
+            "Agent '{local_name}' has invalid outputMode frontmatter; expected 'inline' or 'file-only'."
+        )));
+    }
+
+    // SUBA-086 `fast:` — pi `agents.ts:2057-2062` @v0.64.0: strictly `"true"`/`"false"`, else
+    // THROWS. Validated only, as `toolTimeoutMs`/`outputMode` above.
+    if let Some(raw) = parsed.get("fast")
+        && raw != "true"
+        && raw != "false"
+    {
+        return Err(fail(format!(
+            "Agent '{local_name}' has invalid fast frontmatter; expected true or false."
+        )));
+    }
 
     // SUBA-082 `acceptance:` — pi `const defaultAcceptance = parseAgentAcceptanceFrontmatter(
     // frontmatter.acceptance, localName)` (`agents.ts:2005` @v0.57.0, `:2040` @v0.64.0). Same
@@ -1152,12 +1229,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         match parse_agent_acceptance_frontmatter(parsed.get("acceptance"), &local_name) {
             Ok(value) => value,
             Err(message) => {
-                tracing::warn!(
-                    agent = %local_name,
-                    path = %file_path.display(),
-                    "{message} — skipping this agent file"
-                );
-                return None;
+                return Err(fail(message));
             }
         };
 
@@ -1178,12 +1250,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         Some(raw) => match crate::exec::acceptance::model::AcceptanceRole::parse_exact(raw) {
             Some(role) => Some(role),
             None => {
-                tracing::warn!(
-                    agent = %local_name,
-                    path = %file_path.display(),
-                    "Agent '{local_name}' has invalid acceptanceRole frontmatter; expected 'read-only' or 'writer'. — skipping this agent file"
-                );
-                return None;
+                return Err(fail(format!("Agent '{local_name}' has invalid acceptanceRole frontmatter; expected 'read-only' or 'writer'.")));
             }
         },
     };
@@ -1208,7 +1275,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    Some(AgentDefinition {
+    Ok(Some(AgentDefinition {
         name: runtime_name,
         local_name,
         package_name,
@@ -1251,7 +1318,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         extra_fields,
         override_info: None,
         model_source: None,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -2479,5 +2546,121 @@ mod tests {
                 "allowNestedSubagents: {bad} must skip the file, not parse leniently"
             );
         }
+    }
+
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-086: per-file diagnostics — pi `loadAgentsFromDefinitionFiles`' catch
+    // (`agents.ts:2149-2151` @v0.64.0) pushes `{ source, filePath, name, runtimeName,
+    // packageSpecified, error }` for every validation throw.
+    // -----------------------------------------------------------------------------------------
+
+    fn checked_err(content: &str) -> AgentDiscoveryDiagnostic {
+        parse_agent_file_checked(content, AgentSource::Project, Path::new("/w.md"))
+            .expect_err("a malformed field must surface a diagnostic, not a silent skip")
+    }
+
+    #[test]
+    fn invalid_timeout_ms_is_reported_as_a_named_diagnostic_and_the_wrapper_still_skips() {
+        let content = "---\nname: worker\ndescription: d\ntimeoutMs: 30s\n---\n\nBody\n";
+        let diag = checked_err(content);
+        assert_eq!(
+            diag.error,
+            "Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer."
+        );
+        assert_eq!(diag.name.as_deref(), Some("worker"));
+        assert_eq!(diag.file_path, Path::new("/w.md"));
+        assert_eq!(diag.source, AgentSource::Project);
+        assert_eq!(diag.runtime_name, None, "an unpackaged agent carries no runtimeName (`:2151`)");
+        assert!(!diag.package_specified);
+        assert_eq!(diag.discovery_priority, None);
+        assert_eq!(diag.label(), "worker");
+        // The diagnostic-dropping wrapper keeps the old per-file skip for CRUD callers.
+        assert!(parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).is_none());
+    }
+
+    #[test]
+    fn every_upstream_throw_carries_its_verbatim_message() {
+        let cases = [
+            (
+                "outputMode: file",
+                "Agent 'worker' has invalid outputMode frontmatter; expected 'inline' or 'file-only'.",
+            ),
+            (
+                "toolTimeoutMs: 0",
+                "Agent 'worker' has invalid toolTimeoutMs frontmatter; expected a positive integer no larger than 2147483647.",
+            ),
+            (
+                "toolTimeoutMs: 2147483648",
+                "Agent 'worker' has invalid toolTimeoutMs frontmatter; expected a positive integer no larger than 2147483647.",
+            ),
+            ("fast: yes", "Agent 'worker' has invalid fast frontmatter; expected true or false."),
+            (
+                "allowNestedSubagents: maybe",
+                "Agent 'worker' has invalid allowNestedSubagents frontmatter; expected true or false.",
+            ),
+            ("async: sometimes", "Agent 'worker' has invalid async frontmatter; expected true or false."),
+            (
+                "permission: {\"read\":\"allow\"}\npermissions: {\"read\":\"allow\"}",
+                "Agent 'worker' cannot declare both permission and permissions frontmatter.",
+            ),
+            (
+                "acceptanceRole: owner",
+                "Agent 'worker' has invalid acceptanceRole frontmatter; expected 'read-only' or 'writer'.",
+            ),
+            (
+                "toolBudget: {\"hard\": 0}",
+                "Agent 'worker' toolBudget.hard must be an integer >= 1.",
+            ),
+        ];
+        for (frontmatter, expected) in cases {
+            let content = format!("---\nname: worker\ndescription: d\n{frontmatter}\n---\n\nBody\n");
+            let diag = checked_err(&content);
+            assert_eq!(diag.error, expected, "frontmatter {frontmatter:?}");
+            assert_eq!(diag.name.as_deref(), Some("worker"), "frontmatter {frontmatter:?}");
+        }
+    }
+
+    /// `toolTimeoutMs`/`outputMode`/`fast` are validated only: a VALID value is not (yet) carried
+    /// on the definition, so it must keep round-tripping through `extra_fields` as it did before.
+    #[test]
+    fn valid_tool_timeout_output_mode_and_fast_still_round_trip_as_extra_fields() {
+        let def = parse_agent_file_checked(
+            "---\nname: worker\ndescription: d\ntoolTimeoutMs: 5000\noutputMode: file-only\nfast: false\n---\n\nBody\n",
+            AgentSource::Project,
+            Path::new("/w.md"),
+        )
+        .expect("valid values are not diagnostics")
+        .expect("the file parses");
+        assert_eq!(def.extra_fields.get("toolTimeoutMs").map(String::as_str), Some("5000"));
+        assert_eq!(def.extra_fields.get("outputMode").map(String::as_str), Some("file-only"));
+        assert_eq!(def.extra_fields.get("fast").map(String::as_str), Some("false"));
+    }
+
+    #[test]
+    fn invalid_package_diagnostic_carries_upstreams_message_and_package_specified() {
+        let diag = checked_err("---\nname: worker\ndescription: d\npackage: $$$\n---\n\nBody\n");
+        assert_eq!(diag.error, "Agent 'worker' package is invalid after sanitization.");
+        assert_eq!(diag.name.as_deref(), Some("worker"));
+        assert!(diag.package_specified);
+        assert_eq!(diag.runtime_name, None, "upstream binds runtimeName only after the package parses");
+    }
+
+    #[test]
+    fn a_packaged_agents_diagnostic_carries_its_runtime_name() {
+        let diag = checked_err("---\nname: worker\npackage: acme\ndescription: d\ntimeoutMs: 30s\n---\n\nBody\n");
+        assert_eq!(diag.name.as_deref(), Some("worker"));
+        assert_eq!(diag.runtime_name.as_deref(), Some("acme.worker"));
+        assert!(diag.package_specified);
+    }
+
+    /// pi `continue`s on a missing `name`/`description` (`agents.ts:1970-1972`) — R-SA-005's
+    /// silent skip is preserved as `Ok(None)`, never a diagnostic.
+    #[test]
+    fn missing_description_is_still_a_silent_skip_not_a_diagnostic() {
+        assert!(matches!(
+            parse_agent_file_checked("---\nname: worker\ntimeoutMs: 30s\n---\n\nBody\n", AgentSource::Project, Path::new("/w.md")),
+            Ok(None)
+        ));
     }
 }

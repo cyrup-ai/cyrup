@@ -91,13 +91,22 @@ impl SubagentTool {
     /// per-site location pi appends (`(task 2)`, `(step 3, task 1)`) for everything except the
     /// top-level `agent`, which carries none.
     ///
+    /// SUBA-086 — pi `canonicalizeAgentName` (`subagent-executor.ts:2336-2344` @v0.64.0) checks
+    /// `findBlockingAgentDiagnostic` FIRST, before the ambiguity and unknown branches: a malformed
+    /// definition that outranks every candidate the name resolved to aborts the dispatch with
+    /// `Agent '<name>' has invalid configuration: <error>` (plus the same location suffix). That
+    /// is what stops a broken project-tier `worker.md` from silently launching the builtin
+    /// `worker`, and what turns a name with ONLY a broken definition into a real error instead of
+    /// "not found".
+    ///
     /// [CYRUP-DELTA — deliberate, narrow] pi's `canonicalizeAgentName` ALSO turns an unresolvable
-    /// name into `Unknown agent: <name>` right here. cyrup leaves an unresolvable name UNTOUCHED and
-    /// lets the existing per-mode resolution fail as it already does
-    /// ([`crate::error::SubagentError::AgentNotFound`] -> `agent not found: <name>`): the not-found WORDING is a
-    /// pre-existing, separate difference from pi that this crate's own tests pin, and changing it
-    /// here would be an unrelated behavioural edit smuggled into the alias port. The alias-resolution
-    /// and ambiguity-refusal halves — the parts this port owns — are complete.
+    /// name into `Unknown agent: <name>` right here. cyrup leaves an unresolvable name UNTOUCHED
+    /// (when no diagnostic claims it) and lets the existing per-mode resolution fail as it
+    /// already does ([`crate::error::SubagentError::AgentNotFound`] -> `agent not found: <name>`):
+    /// the not-found WORDING is a pre-existing, separate difference from pi that this crate's own
+    /// tests pin, and changing it here would be an unrelated behavioural edit smuggled into the
+    /// alias port. The alias-resolution and ambiguity-refusal halves — the parts this port owns —
+    /// are complete.
     pub(crate) async fn canonicalize_execution_params(
         &self,
         params: &SubagentToolParams,
@@ -111,7 +120,7 @@ impl SubagentTool {
         // discovery and surfaces the real error (a malformed `settings.json` MUST abort, R-SA-009,
         // and it will — one call later, with its own message). Degrading to "no canonicalization"
         // keeps this step from turning one error into two different ones.
-        let Ok(agents) = self.executor.discovery_config(cwd, &self.executor.config_snapshot().await.roots)
+        let Ok(discovered) = self.executor.discovery_config(cwd, &self.executor.config_snapshot().await.roots)
             // Same scope the mode arms resolve under (pi canonicalizes against the very
             // `discoverAgents(effectiveCwd, scope)` result the executor then uses,
             // `subagent-executor.ts:4921-4923`), so an alias can never resolve here to an agent the
@@ -122,22 +131,39 @@ impl SubagentTool {
                     Some(resolve_execution_agent_scope(params.agent_scope.as_deref())),
                 )
             })
-            .map(|result| result.agents)
         else {
             return Ok(None);
         };
+        let agents = &discovered.agents;
 
-        // `canonicalizeAgentName` + the `location` suffix (`subagent-executor.ts:1683-1690`).
+        // `canonicalizeAgentName` + the `location` suffix (`subagent-executor.ts:2336-2350`
+        // @v0.64.0): `result.error && location ? { error: `${result.error} (${location})` } :
+        // result`.
+        let with_location = |msg: String, location: Option<String>| match location {
+            Some(loc) => format!("{msg} ({loc})"),
+            None => msg,
+        };
         let resolve = |name: &str, location: Option<String>| -> Result<Option<String>, ToolError> {
-            match crate::discovery::resolve_agent_name(name, &agents) {
+            let resolution = crate::discovery::resolve_agent_name(name, agents);
+            // SUBA-086: the blocking-diagnostic check comes BEFORE `resolved.error` /
+            // `!resolved.agent` (`subagent-executor.ts:2337-2341`).
+            let candidates = crate::discovery::blocking_candidates(name, agents, &resolution);
+            if let Some(diagnostic) = crate::discovery::find_blocking_agent_diagnostic(
+                name,
+                &candidates,
+                &discovered.agent_diagnostics,
+            ) {
+                return Err(ToolError::new(with_location(
+                    format!("Agent '{name}' has invalid configuration: {}", diagnostic.error),
+                    location,
+                )));
+            }
+            match resolution {
                 crate::discovery::AgentNameResolution::Found(agent) => {
                     Ok(Some(agent.name.clone()))
                 }
                 crate::discovery::AgentNameResolution::Ambiguous(msg) => {
-                    Err(ToolError::new(match location {
-                        Some(loc) => format!("{msg} ({loc})"),
-                        None => msg,
-                    }))
+                    Err(ToolError::new(with_location(msg, location)))
                 }
                 // See the CYRUP-DELTA above: pass through, do not manufacture a not-found here.
                 crate::discovery::AgentNameResolution::NotFound => Ok(None),

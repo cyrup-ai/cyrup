@@ -167,8 +167,9 @@ impl SubagentExecutor {
     /// # Errors
     ///
     /// Returns [`SubagentError::AgentNotFound`] if no delegation-visible agent matches `name`
-    /// exactly, or propagates a discovery-time [`SubagentError`] (R-SA-009's malformed-settings
-    /// abort).
+    /// exactly, [`SubagentError::InvalidAgentConfiguration`] if a malformed definition file
+    /// claims the name and outranks every resolved one (SUBA-086), or propagates a
+    /// discovery-time [`SubagentError`] (R-SA-009's malformed-settings abort).
     pub fn resolve_agent(
         &self,
         cwd: &Path,
@@ -212,7 +213,24 @@ impl SubagentExecutor {
         // requested string may be an alias. It is name-first — a real agent named `x` always beats
         // another agent that merely lists `x` as an alias — and a non-unique alias is a HARD error
         // (`Ambiguous agent alias 'x': a, b`), never an arbitrary pick.
-        let agent = match crate::discovery::resolve_agent_name(name, &result.agents) {
+        let resolution = crate::discovery::resolve_agent_name(name, &result.agents);
+        // SUBA-086 — pi `canonicalizeAgentName` (`subagent-executor.ts:2336-2344` @v0.64.0)
+        // consults `findBlockingAgentDiagnostic` BEFORE the ambiguity and unknown-agent
+        // branches: a malformed definition that outranks every resolved candidate refuses the
+        // launch with its parse error. This seam covers the background/chain/slash launches that
+        // never pass through the tool router's own copy of the same check.
+        let candidates = crate::discovery::blocking_candidates(name, &result.agents, &resolution);
+        if let Some(diagnostic) = crate::discovery::find_blocking_agent_diagnostic(
+            name,
+            &candidates,
+            &result.agent_diagnostics,
+        ) {
+            return Err(SubagentError::InvalidAgentConfiguration {
+                name: name.to_string(),
+                error: diagnostic.error.clone(),
+            });
+        }
+        let agent = match resolution {
             crate::discovery::AgentNameResolution::Found(agent) => agent.clone(),
             // `Management` is the "already-exact upstream prose, no prefix" variant — the ambiguity
             // string is pi's own wording and reaches the caller unaltered.
@@ -656,4 +674,42 @@ mod tests {
         assert!(scope.is_armed());
     }
 
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-086 — a malformed definition blocks its own name on the LIVE execution path
+    // -----------------------------------------------------------------------------------------
+
+    /// The bundled builtin `worker` is outranked by a broken project-tier `worker.md`
+    /// (pi `findBlockingAgentDiagnostic`, `agents.ts:264-278`; consulted by
+    /// `canonicalizeAgentName` before ambiguity/unknown, `subagent-executor.ts:2336-2344`
+    /// @v0.64.0). Before this landed the lookup silently returned the builtin `worker`.
+    #[tokio::test]
+    async fn resolve_agent_refuses_a_name_whose_outranking_definition_is_malformed() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_agents = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&project_agents).expect("mkdir");
+        std::fs::write(
+            project_agents.join("worker.md"),
+            "---\nname: worker\ndescription: d\ntimeoutMs: 30s\n---\n\nBody\n",
+        )
+        .expect("write");
+
+        let err = executor
+            .resolve_agent(dir.path(), "worker", AgentReadScope::Both, &crate::paths::Roots::from_env())
+            .expect_err("a broken outranking definition must refuse the launch");
+        assert!(matches!(err, SubagentError::InvalidAgentConfiguration { .. }), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "Agent 'worker' has invalid configuration: Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer."
+        );
+        // The diagnostic blocks ONLY its own name — an unrelated bundled persona still resolves.
+        assert_eq!(
+            executor
+                .resolve_agent(dir.path(), "oracle", AgentReadScope::Both, &crate::paths::Roots::from_env())
+                .expect("oracle resolves")
+                .name,
+            "oracle"
+        );
+    }
 }
