@@ -123,6 +123,8 @@ fn write_sigkill_child(dir: &Path, name: &str, line: &str) -> PathBuf {
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: "worker".to_string(),
         model: Some(ModelId::from(model)),
         fallback_models: Vec::new(),
@@ -543,6 +545,8 @@ async fn stopping_a_nested_run_gets_pis_own_scope_refusal_not_the_not_found_text
 /// `background_runner_main_integration.rs`'s own `fixture_persona`).
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: name.to_string(),
         model: Some(ModelId::from("fixture-model")),
         fallback_models: Vec::new(),

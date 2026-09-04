@@ -1114,6 +1114,62 @@ fn is_progress_or_output_instruction_line(line: &str) -> bool {
     PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
 }
 
+/// `[\-‐-―]` — the dash class `SEVERITY_COMPOUND_PATTERN` accepts between the severity
+/// word and its verb: ASCII hyphen plus U+2010..U+2015 (hyphen, non-breaking hyphen, figure dash,
+/// en dash, em dash, horizontal bar).
+fn is_severity_compound_dash(ch: char) -> bool {
+    ch == '-' || ('\u{2010}'..='\u{2015}').contains(&ch)
+}
+
+/// Source: `SEVERITY_COMPOUND_PATTERN` (`task-intent.ts:78` @v0.57.0, `:88` @v0.64.0) —
+/// `/\b(?:must|should|needs)[\-‐-―](?:fix|edit|update|add|remove|replace|create|apply|make|do|implement|modify|delete|patch)\b/gi`.
+/// The `i` flag is honoured by every caller lowercasing first, exactly as the other matchers
+/// in this module assume.
+fn m_severity_compound(text: &str, i: usize) -> Option<usize> {
+    if !boundary_before(text, i) {
+        return None;
+    }
+    let after_severity = alt(text, i, &["must", "should", "needs"])?;
+    let dash = text.get(after_severity..)?.chars().next()?;
+    if !is_severity_compound_dash(dash) {
+        return None;
+    }
+    alt_word(
+        text,
+        after_severity + dash.len_utf8(),
+        &[
+            "fix",
+            "edit",
+            "update",
+            "add",
+            "remove",
+            "replace",
+            "create",
+            "apply",
+            "make",
+            "do",
+            "implement",
+            "modify",
+            "delete",
+            "patch",
+        ],
+    )
+}
+
+/// Source: `stripSeverityCompounds(task)` (`task-intent.ts:80-82` @v0.57.0, `:90-92` @v0.64.0)
+/// — `task.replace(SEVERITY_COMPOUND_PATTERN, " ")`. A hyphenated adjective such as
+/// `must-fix` (as in "the must-fix list") is not an implementation imperative, so the compound
+/// is blanked before any verb-led pattern gets to see it.
+///
+/// SUBA-082 ports it for `inferLevel`'s `rolePatchTask` probe
+/// (`runs/shared/acceptance.ts:93-96` @v0.57.0), its only consumer here. Upstream ALSO applies it
+/// inside `classifyTaskMutationIntent`/`taskMayMutate` (`task-intent.ts:175,207` @v0.64.0, landed
+/// with `2318fb07` in v0.48.0); that half of the same commit is NOT applied in this module's
+/// classifier and is a separate drift from the acceptance-role row.
+pub(crate) fn strip_severity_compounds(task: &str) -> String {
+    strip_patterns(task, &[m_severity_compound])
+}
+
 /// Source: `stripFrameworkInstructions(task)` (`task-intent.ts:95-101`) — drops orchestrator-
 /// injected scaffolding lines so their own vocabulary never contributes classification signal.
 fn strip_framework_instructions(task: &str) -> String {
@@ -1706,6 +1762,22 @@ mod tests {
             classify_task_mutation_intent("researcher", "Implement the fix"),
             TaskMutationIntent::ReadOnly
         );
+    }
+
+    /// SUBA-082 — `stripSeverityCompounds` (`task-intent.ts:78-82` @v0.57.0): the dash class is
+    /// ASCII `-` plus U+2010..U+2015, the verb must end at a word boundary, and the compound is
+    /// replaced by ONE space.
+    #[test]
+    fn strip_severity_compounds_blanks_dashed_severity_verbs_only() {
+        assert_eq!(strip_severity_compounds("the must-fix list"), "the   list");
+        assert_eq!(strip_severity_compounds("a should\u{2014}update note"), "a   note");
+        assert_eq!(strip_severity_compounds("needs\u{2010}patch items"), "  items");
+        // Not compounds: no dash, a dash but the verb continues, a dash but no severity word.
+        assert_eq!(strip_severity_compounds("must fix it"), "must fix it");
+        assert_eq!(strip_severity_compounds("must-fixing"), "must-fixing");
+        assert_eq!(strip_severity_compounds("branch-fix"), "branch-fix");
+        // `\b` holds after a dash, so a compound glued to another word still strips.
+        assert_eq!(strip_severity_compounds("x-must-fix"), "x- ");
     }
 
     #[test]

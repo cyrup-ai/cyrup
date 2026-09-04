@@ -96,6 +96,8 @@ fn reporter_persona() -> ResolvedAgentPersona {
         memory: None,
         tool_budget: None,
         runner: None, // SUBA-074: the native child, as before
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
     }
 }
 

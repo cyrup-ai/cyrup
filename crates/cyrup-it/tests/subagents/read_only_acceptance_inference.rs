@@ -85,6 +85,8 @@ fn message_end_line(text: &str) -> String {
 
 fn agent_config(name: &str) -> AgentConfig {
     AgentConfig {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: name.to_string(),
         model: Some(ModelId::from("fixture-model")),
         fallback_models: Vec::new(),

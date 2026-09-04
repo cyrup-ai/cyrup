@@ -2194,6 +2194,8 @@ mod tests {
     fn capability_agent(tools: Option<Vec<crate::discovery::types::ToolRef>>) -> AgentDefinition {
         AgentDefinition {
             default_turn_budget: None,
+            default_acceptance: None,
+            acceptance_role: None,
             permission_rules: None,
             runner: None,
             name: "cap".to_string(),

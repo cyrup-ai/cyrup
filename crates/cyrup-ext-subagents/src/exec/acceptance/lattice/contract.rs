@@ -233,9 +233,25 @@ impl AcceptanceContract {
     /// `dynamic fanout context` escalation is reachable there rather than lost outright.
     #[must_use]
     pub fn heuristic_default(agent_local_name: &str, task: &str) -> Self {
+        Self::heuristic_default_for_role(agent_local_name, None, task)
+    }
+
+    /// [`Self::heuristic_default`] with the agent's DECLARED acceptance role (SUBA-082) — pi
+    /// threads `acceptanceRole: agent.acceptanceRole` into every `resolveEffectiveAcceptance`
+    /// call it makes from an already-resolved agent config (`runs/foreground/execution.ts:1834`,
+    /// `runs/background/async-execution.ts:978,1036,1044,1122,1130,1768,1799` @v0.64.0). `None`
+    /// is upstream's `undefined`: the agent-NAME alternations decide, exactly as the two-argument
+    /// form above.
+    #[must_use]
+    pub fn heuristic_default_for_role(
+        agent_local_name: &str,
+        acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
+        task: &str,
+    ) -> Self {
         let inferred = crate::exec::acceptance::model::resolve_effective_acceptance(&crate::exec::acceptance::model::AcceptanceResolveInput {
             explicit: None,
             agent_name: agent_local_name.to_string(),
+            acceptance_role,
             task: Some(task.to_string()),
             mode: None,
             is_async: false,
@@ -312,7 +328,21 @@ impl AcceptanceContract {
         agent_local_name: &str,
         task: &str,
     ) -> Self {
-        let inferred = Self::heuristic_default(agent_local_name, task);
+        Self::resolve_effective_for_role(explicit, agent_local_name, None, task)
+    }
+
+    /// [`Self::resolve_effective`] with the agent's DECLARED acceptance role (SUBA-082) threaded
+    /// into the inferred half — pi `resolveEffectiveAcceptance`'s own `acceptanceRole` input
+    /// (`runs/shared/acceptance.ts:412-421` @v0.64.0). The combination rule is unchanged: the
+    /// role only moves the INFERRED floor, and the explicit contract still wins by rank.
+    #[must_use]
+    pub fn resolve_effective_for_role(
+        explicit: Option<Self>,
+        agent_local_name: &str,
+        acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
+        task: &str,
+    ) -> Self {
+        let inferred = Self::heuristic_default_for_role(agent_local_name, acceptance_role, task);
         let Some(mut contract) = explicit else {
             return inferred;
         };

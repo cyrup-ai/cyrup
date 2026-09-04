@@ -115,6 +115,10 @@ fn base_agent_config(model: &str) -> AgentConfig {
         memory: None,
         tool_budget: None,
         runner: None, // SUBA-074: the native child, as before
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
+        exclude_tools: Vec::new(), // SUBA-092: no exclusions (this literal predates the field)
+        allow_nested_subagents: None,
     }
 }
 

@@ -134,16 +134,19 @@ impl SubagentExecutor {
     /// Same agent, same request, two behaviours. The shared owner both surfaces DO have is this
     /// executor, so the resolution lives here and each entry applies it once.
     ///
-    /// Returns `(default_async, default_timeout_ms, default_turn_budget)` — pi's
-    /// `agent.defaultAsync` / `agent.defaultTimeoutMs` / `agent.defaultTurnBudget`, all `None` for
-    /// an unknown agent name (pi `:1588`'s `if (!agent) return params`, which leaves the existing
-    /// "unknown agent" error path to report it) and all `None` on a discovery failure.
+    /// Returns `(default_async, default_timeout_ms, default_turn_budget, default_acceptance)` —
+    /// pi's `agent.defaultAsync` / `agent.defaultTimeoutMs` / `agent.defaultTurnBudget` /
+    /// `agent.defaultAcceptance`, all `None` for an unknown agent name (pi `:1588`'s
+    /// `if (!agent) return params`, which leaves the existing "unknown agent" error path to
+    /// report it) and all `None` on a discovery failure.
     ///
     /// The APPLICATION rules stay at the call sites, because they are fill-unset-only and each
     /// site knows its own "was this supplied?" question (pi `:1591-1594`): `async` applies only
     /// when the call omitted `async` entirely, `timeout_ms` only when it omitted BOTH `timeoutMs`
-    /// and its alias `maxRuntimeMs`, and `turn_budget` only when it omitted `turnBudget`
-    /// (SUBA-008, pi `:1940-1942`).
+    /// and its alias `maxRuntimeMs`, `turn_budget` only when it omitted `turnBudget`
+    /// (SUBA-008, pi `:1940-1942`), and `acceptance` only when it omitted `acceptance`
+    /// (SUBA-082, `subagent-executor.ts:2690-2692` @v0.64.0: `params.acceptance === undefined &&
+    /// agent.defaultAcceptance !== undefined ? { acceptance: agent.defaultAcceptance } : {}`).
     #[must_use]
     pub(crate) fn single_agent_launch_defaults(
         cwd: &Path,
@@ -153,6 +156,7 @@ impl SubagentExecutor {
         Option<bool>,
         Option<u64>,
         Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+        Option<serde_json::Value>,
     ) {
         SubagentExecutor::discovery_config(cwd, roots)
             .and_then(|cfg| discover_agents(&cfg, None))
@@ -163,11 +167,12 @@ impl SubagentExecutor {
                     .into_iter()
                     .find(|candidate| candidate.name == agent)
             })
-            .map_or((None, None, None), |found| {
+            .map_or((None, None, None, None), |found| {
                 (
                     found.default_async,
                     found.default_timeout_ms,
                     found.default_turn_budget,
+                    found.default_acceptance,
                 )
             })
     }

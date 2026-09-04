@@ -79,6 +79,22 @@ pub(crate) fn format_agent_detail(a: &AgentDefinition) -> String {
     if let Some(ctx) = a.default_context {
         lines.push(format!("Default context: {}", context_str(ctx)));
     }
+    // SUBA-082 (`agent-management.ts:901-902` @v0.64.0): `Acceptance:` renders the launch
+    // default as compact JSON for an object and `String(value)` for a scalar; `Acceptance role:`
+    // only when a role is declared (upstream's truthiness test).
+    if let Some(acceptance) = &a.default_acceptance {
+        let rendered = match acceptance {
+            serde_json::Value::String(text) => text.clone(),
+            value @ serde_json::Value::Object(_) => {
+                serde_json::to_string(value).unwrap_or_default()
+            }
+            other => other.to_string(),
+        };
+        lines.push(format!("Acceptance: {rendered}"));
+    }
+    if let Some(role) = a.acceptance_role {
+        lines.push(format!("Acceptance role: {}", role.as_str()));
+    }
     if a.source == AgentSource::Builtin {
         lines.push(format!(
             "Disabled: {}",

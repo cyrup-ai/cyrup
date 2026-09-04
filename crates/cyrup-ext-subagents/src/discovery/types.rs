@@ -555,8 +555,12 @@ pub struct AgentOverrideInfo {
 /// - `defaultProvider?: string | false` — pi `AgentConfig.modelProvider`; no counterpart here
 ///   (this crate resolves a provider from the [`cyrup_core::ModelId`] itself).
 /// - `fast?: boolean` — pi `AgentConfig.fast`; no counterpart here.
-/// - `acceptanceRole?: AcceptanceRole | false` — pi `AgentConfig.acceptanceRole`; no counterpart
-///   here (acceptance roles are resolved by `exec/acceptance/`, not carried on the definition).
+/// - `acceptanceRole?: AcceptanceRole | false` — pi `AgentConfig.acceptanceRole`. The definition
+///   DOES carry it now ([`AgentDefinition::acceptance_role`], SUBA-082's frontmatter half), but
+///   the settings-override delta for it is still unmodeled here (SUBA-081's remainder): pi's
+///   `agentOverrides.<name>.acceptanceRole` accepts `false` to CLEAR the agent's declared role
+///   (`applyAgentOverride`, `agents.ts` @v0.64.0), and that three-state (`unset`/`role`/`false`)
+///   needs its own field.
 ///
 /// The FOURTH, `outputMode?: OutputMode`, is a different case: it IS representable — this crate
 /// merges pi's independent `output` (a path string) and `outputMode` fields into a single
@@ -1090,6 +1094,27 @@ pub struct AgentDefinition {
     /// (`subagent-executor.ts:1940-1942`), and the extension-config `subagents.turnBudget` sits
     /// below it in the same chain.
     pub default_turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-082 — pi `AgentConfig.defaultAcceptance?: AcceptanceInput` (`agents.ts:144`
+    /// @v0.57.0, `:156` @v0.64.0), from the `acceptance:` frontmatter key: the RAW acceptance
+    /// input (`"checked"`, `false`, or a `{ level, criteria, evidence, verify, review, stopRules,
+    /// reason }` object), YAML-parsed and already validated by
+    /// [`crate::exec::acceptance::model::validate_acceptance_input`] at parse time
+    /// (`parseAgentAcceptanceFrontmatter`, `agents.ts:1873-1884` @v0.57.0). Held as the raw
+    /// [`serde_json::Value`] — the same shape as a chain step's `acceptance` — so the single
+    /// lowering [`crate::exec::acceptance::lower_acceptance_input`] applies at the launch seam.
+    ///
+    /// A LAUNCH DEFAULT for SINGLE-agent launches only, fill-unset-only
+    /// (`applySingleAgentLaunchDefaults`, `subagent-executor.ts:2690-2692` @v0.64.0:
+    /// `params.acceptance === undefined && agent.defaultAcceptance !== undefined`): an explicit
+    /// call-site `acceptance` wins, and a chain/parallel step never inherits it
+    /// (`docs/agents.md:326` @v0.64.0).
+    pub default_acceptance: Option<serde_json::Value>,
+    /// SUBA-082 — pi `AgentConfig.acceptanceRole?: AcceptanceRole` (`agents.ts:145` @v0.57.0,
+    /// `:157` @v0.64.0), from the `acceptanceRole:` frontmatter key (strictly `read-only` or
+    /// `writer`, `agents.ts:2011-2014` @v0.57.0). The PRIMARY input to acceptance-level inference
+    /// — see [`crate::exec::acceptance::model::AcceptanceRole`]. `None` (upstream's `undefined`)
+    /// is the branch on which `inferLevel` falls back to agent-NAME guessing.
+    pub acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
     /// SUBA-073 — this agent's own `permission:`/`permissions:` frontmatter, already validated
     /// (`discovery/frontmatter.rs`). Merged with the global `config.permissions` rung at run time
     /// via [`crate::exec::permissions::resolve_permission_rules`] — this field alone is NOT the
@@ -1364,6 +1389,8 @@ mod tests {
     fn sample_agent(tools: Option<Vec<ToolRef>>) -> AgentDefinition {
         AgentDefinition {
             default_turn_budget: None,
+            default_acceptance: None,
+            acceptance_role: None,
             permission_rules: None,
             runner: None,
             name: "reviewer".to_string(),

@@ -213,13 +213,34 @@ pub const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 /// explicit and inferred were mutually exclusive, so `acceptance: "attested"` on a write-capable
 /// task ran a weaker gate than the same policy does under pi, silently. The combination rule
 /// itself lives on [`AcceptanceContract::resolve_effective`]; this function only supplies
-/// `run_sync`'s three inputs to it.
+/// `run_sync`'s inputs to it.
+///
+/// SUBA-082 — two of those inputs now come off the agent itself:
+///
+/// * `agent.acceptance_role` is threaded into the inferred half exactly as pi passes
+///   `acceptanceRole: agent.acceptanceRole` to `resolveEffectiveAcceptance`
+///   (`runs/foreground/execution.ts:1834` @v0.64.0), so a declared `read-only`/`writer` replaces
+///   the agent-NAME guess on every dispatch path that reaches `run_sync` (single, chain/parallel
+///   step, background hop-2 — the persona carries it across the process boundary).
+/// * `agent.default_acceptance` — the agent file's `acceptance:` launch default — is NOT applied
+///   here. pi applies it in `applySingleAgentLaunchDefaults` (`subagent-executor.ts:2690-2692`
+///   @v0.64.0), which bails for any `chain`/`tasks` launch; `run_sync` is this crate's shared
+///   chokepoint for chain/parallel steps too, so the default is folded into the single-agent
+///   call's own params upstream of here (`extension/tool/routing.rs::route_single`), where it
+///   reaches `opts.acceptance` through the ordinary explicit-policy lowering. Applying it at this
+///   seam would leak an agent-level default into chain/parallel steps, which pi keeps as
+///   task/step configuration (`docs/agents.md:326` @v0.64.0).
 fn resolve_run_acceptance(
     opts: &RunOptions,
     agent: &AgentConfig,
     task: &str,
 ) -> AcceptanceContract {
-    AcceptanceContract::resolve_effective(opts.acceptance.clone(), &agent.name, task)
+    AcceptanceContract::resolve_effective_for_role(
+        opts.acceptance.clone(),
+        &agent.name,
+        agent.acceptance_role,
+        task,
+    )
 }
 
 /// Run one subagent task to completion, synchronously, against `agent`/`opts` (func-SA §5.2;
@@ -1365,6 +1386,8 @@ fn build_progress_snapshot(
 pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinition {
     AgentDefinition {
         default_turn_budget: None,
+        default_acceptance: agent.default_acceptance.clone(),
+        acceptance_role: agent.acceptance_role,
         permission_rules: None,
         runner: None,
         name: agent.name.clone(),
@@ -1566,6 +1589,50 @@ mod tests {
         assert!(resolve_run_acceptance(&opts, &agent, "Implement the fix").is_no_op());
     }
 
+
+    // ---- SUBA-082: the agent's DECLARED role reaches the inferred floor at this seam ----
+
+    /// `resolveEffectiveAcceptance({ …, acceptanceRole: agent.acceptanceRole, … })`
+    /// (`runs/foreground/execution.ts:1834` @v0.64.0): the same agent name, task and (absent)
+    /// explicit policy resolve to a DIFFERENT floor once the agent config carries a role. A
+    /// `reviewer` that declares `writer` is a writer; a `worker` that declares `read-only` on
+    /// neutral wording is not.
+    #[test]
+    fn run_sync_threads_the_agents_declared_acceptance_role_into_the_inferred_floor() {
+        use crate::exec::acceptance::model::AcceptanceRole;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        // `base_opts` disarms the gate for the spawn tests; this seam is about the INFERRED half.
+        opts.acceptance = None;
+
+        let mut reviewer = sample_agent_config("m1", &[]);
+        reviewer.name = "reviewer".to_string();
+        assert_eq!(
+            resolve_run_acceptance(&opts, &reviewer, "Handle the authentication flow").required_level,
+            AcceptanceStatus::Attested,
+            "control: the NAME alternation still decides when no role is declared"
+        );
+        reviewer.acceptance_role = Some(AcceptanceRole::Writer);
+        assert_eq!(
+            resolve_run_acceptance(&opts, &reviewer, "Handle the authentication flow").required_level,
+            AcceptanceStatus::Checked,
+            "a declared `writer` role replaces the reviewer-name guess"
+        );
+
+        let mut worker = sample_agent_config("m1", &[]);
+        worker.acceptance_role = Some(AcceptanceRole::ReadOnly);
+        assert_eq!(
+            resolve_run_acceptance(&opts, &worker, "Explore the authentication flow").required_level,
+            AcceptanceStatus::Attested,
+            "a declared `read-only` role replaces the worker-name guess"
+        );
+        assert_eq!(
+            resolve_run_acceptance(&opts, &worker, "Implement the authentication fix").required_level,
+            AcceptanceStatus::Checked,
+            "explicit task mutation intent still wins over a declared read-only role"
+        );
+    }
 
     // ---- SUBA-074: an unsupported runner refuses the RUN, before the model ladder ----
 

@@ -35,6 +35,8 @@ pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig
         memory: None,
         tool_budget: None,
         runner: None,
+        acceptance_role: None,
+        default_acceptance: None,
         depth: DepthEnvelope {
             current_depth: 0,
             max_depth: 5,

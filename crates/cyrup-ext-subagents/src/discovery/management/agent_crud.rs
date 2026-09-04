@@ -280,6 +280,12 @@ fn build_definition(
         // SUBA-008: same rule as `toolBudget` — no management field exists for it, so a CREATED
         // agent declares none.
         default_turn_budget: None,
+        // SUBA-082: upstream's `agentCreate`/`agentUpdate` DO accept `config.acceptance` and
+        // `config.acceptanceRole` (`agent-management.ts:576-587` @v0.64.0); that management
+        // input is not ported here, so a CREATED agent declares neither (an author sets them by
+        // hand-editing the file's `acceptance:`/`acceptanceRole:` frontmatter).
+        default_acceptance: None,
+        acceptance_role: None,
         // SUBA-073: same rule — no management field exists for it, so a CREATED agent declares
         // none (an author sets it by hand-editing the agent file's `permissions:` frontmatter).
         permission_rules: None,
@@ -359,6 +365,11 @@ fn merge_fields(
         tool_budget: existing.tool_budget.clone(),
         // SUBA-008: an UPDATE never edits it but must not DROP it either — see the note above.
         default_turn_budget: existing.default_turn_budget,
+        // SUBA-082: an UPDATE never edits them (no management field yet) but must not DROP them
+        // either — pi's `editableAgentConfig` copies both onto the edit base
+        // (`agent-management.ts:314-315` @v0.64.0).
+        default_acceptance: existing.default_acceptance.clone(),
+        acceptance_role: existing.acceptance_role,
         // SUBA-073: an UPDATE never edits it but must not DROP it either — see the note above.
         permission_rules: existing.permission_rules.clone(),
         // SUBA-074: an UPDATE never edits it but must not DROP it either — see the note above.

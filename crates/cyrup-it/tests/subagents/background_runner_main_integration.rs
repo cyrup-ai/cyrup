@@ -58,6 +58,8 @@ use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 /// an unresolved agent as `Unknown agent` rather than synthesizing a placeholder.
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: name.to_string(),
         model: Some(ModelId::from("fixture-model")),
         fallback_models: Vec::new(),

@@ -72,7 +72,7 @@ pub use report::parse::{
     parse_acceptance_report, parse_acceptance_report_sources, strip_acceptance_report, strip_acceptance_report_from_message_text, ACCEPTANCE_REPORT_NOT_FOUND, ParsedAcceptanceReport,
 };
 pub use types::{
-    AcceptanceConfig, AcceptanceEvidenceKind, AcceptanceEvidenceStatus, AcceptanceGate, AcceptanceInput, AcceptanceLedger, AcceptanceLedgerStatus, AcceptanceLevel, AcceptanceReport, AcceptanceReviewGate, AcceptanceReviewResult, AcceptanceRuntimeCheck, AcceptanceVerifyCommand, AcceptanceVerifyResult, CommandRunReport, CommandRunResult, CriterionInput, CriterionReport, CriterionStatus, GateSeverity, ResolvedAcceptanceConfig, ResolvedAcceptanceGate, ReviewFinding, ReviewFindingSeverity, ReviewResultStatus, ReviewSetting, RuntimeCheckStatus, SerializableGate, VerifyRunStatus, VerifyWorkspaceKind, VerifyWorkspaceState,
+    AcceptanceConfig, AcceptanceEvidenceKind, AcceptanceEvidenceStatus, AcceptanceGate, AcceptanceInput, AcceptanceLedger, AcceptanceLedgerStatus, AcceptanceLevel, AcceptanceReport, AcceptanceReviewGate, AcceptanceReviewResult, AcceptanceRole, AcceptanceRuntimeCheck, AcceptanceVerifyCommand, AcceptanceVerifyResult, CommandRunReport, CommandRunResult, CriterionInput, CriterionReport, CriterionStatus, GateSeverity, ResolvedAcceptanceConfig, ResolvedAcceptanceGate, ReviewFinding, ReviewFindingSeverity, ReviewResultStatus, ReviewSetting, RuntimeCheckStatus, SerializableGate, VerifyRunStatus, VerifyWorkspaceKind, VerifyWorkspaceState,
 };
 pub use validate_input::{
     validate_acceptance_input, EXPLICIT_REVIEWED_UNAVAILABLE,

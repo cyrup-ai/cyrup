@@ -89,6 +89,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
         memory: None,
         tool_budget: None,
         runner: None, // SUBA-074: the native child, as before
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         depth: DepthEnvelope {
             current_depth: 0,
             max_depth: 5,

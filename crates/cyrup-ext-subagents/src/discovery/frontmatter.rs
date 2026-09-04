@@ -113,6 +113,14 @@ const KNOWN_FIELDS: &[&str] = &[
     // omitted the corresponding parameter.
     "async",
     "timeoutMs",
+    // SUBA-082 — both in `KNOWN_FIELDS` at the row's tag (`agent-serializer.ts:24-25` @v0.57.0,
+    // `:26-27` @v0.64.0). Parsed into `default_acceptance`/`acceptance_role`; until then both were
+    // demoted to `extra_fields`, so `acceptanceRole: writer` on a `security-reviewer` silently
+    // did nothing and the classifier kept guessing from the name. Same rule as every key above:
+    // known here AND emitted by `management::serialize_agent`, or the first management rewrite
+    // deletes it.
+    "acceptance",
+    "acceptanceRole",
     // SUBA-008 — `turnBudget` (`agent-serializer.ts:22` @v0.43.0). Parsed into
     // `default_turn_budget` and applied by `route_single`'s `applySingleAgentLaunchDefaults` port
     // only when the call site omitted `turnBudget`. Same rule as `toolBudget` above: a key that is
@@ -772,6 +780,56 @@ fn parse_output_spec(raw: &str) -> Option<OutputSpec> {
 /// throw/silent-skip/diagnostic distinction reserves silent-skip for exactly this case (malformed
 /// *agent* frontmatter, as opposed to malformed *settings*, which aborts discovery, or malformed
 /// *chain* files, which produce a non-fatal diagnostic elsewhere in `discovery/chains.rs`).
+/// SUBA-082 — pi `parseAgentAcceptanceFrontmatter(raw, agentName)` (`agents.ts:1873-1884`
+/// @v0.57.0, `:1913-1924` @v0.64.0):
+///
+/// ```text
+/// if (raw === undefined || !raw.trim()) return undefined;
+/// let parsed: unknown;
+/// try { parsed = parseYaml(raw); }
+/// catch (error) { throw new Error(`Agent '${agentName}' has invalid acceptance frontmatter: ${message}`); }
+/// const errors = validateAcceptanceInput(parsed, `Agent '${agentName}' acceptance frontmatter`);
+/// if (errors.length > 0) throw new Error(errors.join(" "));
+/// return parsed as AcceptanceInput;
+/// ```
+///
+/// The value is YAML, not JSON, because that is what upstream parses and what its docs promise
+/// (`docs/agents.md:326` @v0.64.0: "a scalar level such as `checked` or an inline/block YAML map
+/// such as `{ level: "none", reason: "lightweight lookup" }`") — a bare `checked`, `false`, a
+/// JSON object (JSON is YAML), a YAML flow map with unquoted keys, or a nested block the
+/// frontmatter parser captured and dedented all reach the validator as the same
+/// [`serde_json::Value`] shape a chain step's `acceptance` does. A YAML `null` (`~`, or an
+/// explicit `null`) is treated as absent: upstream would carry `null` through as
+/// `defaultAcceptance: null`, which `applySingleAgentLaunchDefaults` then copies onto the launch
+/// as an `acceptance: null` that `normalizeAcceptanceInput` reads as `auto` — the same outcome.
+///
+/// # Errors
+///
+/// Upstream's two messages verbatim: the YAML-parse failure, or `validateAcceptanceInput`'s
+/// messages space-joined (each prefixed `Agent '<name>' acceptance frontmatter`).
+pub(crate) fn parse_agent_acceptance_frontmatter(
+    raw: Option<&str>,
+    agent_name: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let parsed: serde_json::Value = serde_yml::from_str::<serde_yml::Value>(raw)
+        .map_err(|err| err.to_string())
+        .and_then(|yaml| serde_json::to_value(yaml).map_err(|err| err.to_string()))
+        .map_err(|message| {
+            format!("Agent '{agent_name}' has invalid acceptance frontmatter: {message}")
+        })?;
+    let errors = crate::exec::acceptance::model::validate_acceptance_input(
+        &parsed,
+        &format!("Agent '{agent_name}' acceptance frontmatter"),
+    );
+    if !errors.is_empty() {
+        return Err(errors.join(" "));
+    }
+    Ok(if parsed.is_null() { None } else { Some(parsed) })
+}
+
 pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) -> Option<AgentDefinition> {
     let parsed = parse_frontmatter_block(content);
 
@@ -1085,6 +1143,51 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         },
     };
 
+    // SUBA-082 `acceptance:` — pi `const defaultAcceptance = parseAgentAcceptanceFrontmatter(
+    // frontmatter.acceptance, localName)` (`agents.ts:2005` @v0.57.0, `:2040` @v0.64.0). Same
+    // `[CYRUP-DELTA]` as `toolBudget`/`turnBudget` above: a per-file skip + warn instead of
+    // aborting the whole directory scan. The valid path — YAML parse, then
+    // `validateAcceptanceInput` — is byte-identical to pi.
+    let default_acceptance =
+        match parse_agent_acceptance_frontmatter(parsed.get("acceptance"), &local_name) {
+            Ok(value) => value,
+            Err(message) => {
+                tracing::warn!(
+                    agent = %local_name,
+                    path = %file_path.display(),
+                    "{message} — skipping this agent file"
+                );
+                return None;
+            }
+        };
+
+    // SUBA-082 `acceptanceRole:` — pi `agents.ts:2011-2014` @v0.57.0 (`:2046-2050` @v0.64.0):
+    //
+    //   if (frontmatter.acceptanceRole !== undefined && frontmatter.acceptanceRole.trim()) {
+    //     if (=== "read-only" || === "writer") acceptanceRole = frontmatter.acceptanceRole;
+    //     else throw new Error(`Agent '${localName}' has invalid acceptanceRole frontmatter;
+    //       expected 'read-only' or 'writer'.`);
+    //   }
+    //
+    // A blank value is an ABSENCE (the `.trim()` guard); a non-blank value is compared
+    // UNTRIMMED and exactly, so ` writer` or `Writer` is an error, not a role. Same
+    // `[CYRUP-DELTA]` as `async` above: a per-file skip + warn instead of aborting the scan.
+    let acceptance_role = match parsed.get("acceptanceRole") {
+        None => None,
+        Some(raw) if raw.trim().is_empty() => None,
+        Some(raw) => match crate::exec::acceptance::model::AcceptanceRole::parse_exact(raw) {
+            Some(role) => Some(role),
+            None => {
+                tracing::warn!(
+                    agent = %local_name,
+                    path = %file_path.display(),
+                    "Agent '{local_name}' has invalid acceptanceRole frontmatter; expected 'read-only' or 'writer'. — skipping this agent file"
+                );
+                return None;
+            }
+        },
+    };
+
     // `memory:` — pi `agents.ts:1290` @ v0.43.0 / the same call at v0.34.0. `parseMemoryFrontmatter`
     // never errors: an illegal scope or a missing path simply declines the config.
     let memory = crate::discovery::agent_memory::parse_memory_frontmatter(parsed.get("memory"));
@@ -1136,6 +1239,8 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         memory,
         tool_budget,
         default_turn_budget,
+        default_acceptance,
+        acceptance_role,
         permission_rules,
         runner,
         disabled,
@@ -1854,6 +1959,186 @@ mod tests {
                 "known field {key} must not appear in extra_fields"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-082 — `acceptanceRole:` / `acceptance:` (pi `agents.ts:2005,2011-2014` @v0.57.0,
+    // `parseAgentAcceptanceFrontmatter` `:1873-1884`; `:2040,2046-2050` / `:1913-1924` @v0.64.0)
+    // -----------------------------------------------------------------------------------------
+
+    /// `acceptanceRole: read-only` / `writer` land on the definition as a typed role, are KNOWN
+    /// (never demoted to `extra_fields`) and are tracked in `present_fields`; a blank value is an
+    /// absence (`frontmatter.acceptanceRole.trim()` guard, `agents.ts:2012`).
+    #[test]
+    fn acceptance_role_frontmatter_parses_exactly_and_is_a_known_field() {
+        use crate::exec::acceptance::model::AcceptanceRole;
+
+        let read_only = parse_agent_file(
+            "---\nname: x\ndescription: d\nacceptanceRole: read-only\n---\nbody",
+            AgentSource::Project,
+            Path::new("/x.md"),
+        )
+        .expect("parses");
+        assert_eq!(read_only.acceptance_role, Some(AcceptanceRole::ReadOnly));
+        assert!(
+            !read_only.extra_fields.contains_key("acceptanceRole"),
+            "a KNOWN_FIELDS key must never be demoted to extra_fields — that demotion is exactly \
+             how the role used to do nothing, silently"
+        );
+        assert!(read_only.present_fields.contains("acceptanceRole"));
+
+        let writer = parse_agent_file(
+            "---\nname: x\ndescription: d\nacceptanceRole: writer\n---\nbody",
+            AgentSource::Project,
+            Path::new("/x.md"),
+        )
+        .expect("parses");
+        assert_eq!(writer.acceptance_role, Some(AcceptanceRole::Writer));
+
+        let blank = parse_agent_file(
+            "---\nname: x\ndescription: d\nacceptanceRole: \n---\nbody",
+            AgentSource::Project,
+            Path::new("/x.md"),
+        )
+        .expect("a blank role is an absence, not an error");
+        assert_eq!(blank.acceptance_role, None);
+
+        let absent = parse_agent_file(
+            "---\nname: x\ndescription: d\n---\nbody",
+            AgentSource::Project,
+            Path::new("/x.md"),
+        )
+        .expect("parses");
+        assert_eq!(absent.acceptance_role, None);
+        assert!(!absent.present_fields.contains("acceptanceRole"));
+    }
+
+    /// Anything but the two exact spellings is upstream's THROW (`Agent '<name>' has invalid
+    /// acceptanceRole frontmatter; expected 'read-only' or 'writer'.`, `agents.ts:2014`
+    /// @v0.57.0) — here the crate's per-file `[CYRUP-DELTA]` skip. The comparison is untrimmed
+    /// and case-sensitive upstream, so ` writer` and `Writer` are errors too.
+    #[test]
+    fn invalid_acceptance_role_frontmatter_skips_the_file() {
+        use crate::exec::acceptance::model::AcceptanceRole;
+
+        for raw in ["reviewer", "Writer", "read only", "readonly", "true"] {
+            assert!(
+                parse_agent_file(
+                    &format!("---\nname: x\ndescription: d\nacceptanceRole: {raw}\n---\nbody"),
+                    AgentSource::Project,
+                    Path::new("/x.md"),
+                )
+                .is_none(),
+                "`acceptanceRole: {raw}` must skip the file, not load the agent with no role"
+            );
+        }
+        // The parse the file-level skip is built on, pinned on its own so the exact-spelling rule
+        // is visible: no trimming, no case folding (`agents.ts:2013`).
+        assert_eq!(AcceptanceRole::parse_exact("read-only"), Some(AcceptanceRole::ReadOnly));
+        assert_eq!(AcceptanceRole::parse_exact("writer"), Some(AcceptanceRole::Writer));
+        assert_eq!(AcceptanceRole::parse_exact(" writer"), None);
+        assert_eq!(AcceptanceRole::parse_exact("Writer"), None);
+    }
+
+    /// `acceptance:` is YAML-parsed (`parseYaml`, `agents.ts:1877`) and validated: a bare scalar
+    /// level, the JSON-object form `docs/agents.md:277` @v0.64.0 documents, a YAML flow map with
+    /// unquoted keys (`:326`), the deprecated `false` shorthand, and a nested block all reach the
+    /// definition as the raw validated value.
+    #[test]
+    fn acceptance_frontmatter_parses_scalar_json_flow_map_and_block_defaults() {
+        let scalar = parse_agent_file(
+            "---\nname: x\ndescription: d\nacceptance: checked\n---\nbody",
+            AgentSource::Project,
+            Path::new("/x.md"),
+        )
+        .expect("parses");
+        assert_eq!(scalar.default_acceptance, Some(serde_json::json!("checked")));
+        assert!(!scalar.extra_fields.contains_key("acceptance"));
+        assert!(scalar.present_fields.contains("acceptance"));
+
+        let json_object = parse_agent_file(
+            "---\nname: x\ndescription: d\nacceptance: {\"level\":\"none\",\"reason\":\"lightweight lookup\"}\n---\nbody",
+            AgentSource::Project,
+            Path::new("/x.md"),
+        )
+        .expect("parses");
+        assert_eq!(
+            json_object.default_acceptance,
+            Some(serde_json::json!({ "level": "none", "reason": "lightweight lookup" }))
+        );
+
+        let flow_map = parse_agent_file(
+            "---\nname: x\ndescription: d\nacceptance: { level: \"checked\", evidence: [\"commands-run\", \"changed-files\"] }\n---\nbody",
+            AgentSource::Project,
+            Path::new("/x.md"),
+        )
+        .expect("a YAML flow map with unquoted keys is the documented form, not JSON");
+        assert_eq!(
+            flow_map.default_acceptance,
+            Some(serde_json::json!({ "level": "checked", "evidence": ["commands-run", "changed-files"] }))
+        );
+
+        let disabled = parse_agent_file(
+            "---\nname: x\ndescription: d\nacceptance: false\n---\nbody",
+            AgentSource::Project,
+            Path::new("/x.md"),
+        )
+        .expect("parses");
+        assert_eq!(disabled.default_acceptance, Some(serde_json::json!(false)));
+
+        let block = parse_agent_file(
+            "---\nname: x\ndescription: d\nacceptance:\n  level: checked\n  evidence:\n    - commands-run\n---\nbody",
+            AgentSource::Project,
+            Path::new("/x.md"),
+        )
+        .expect("a nested block is captured by the frontmatter parser and YAML-parsed");
+        assert_eq!(
+            block.default_acceptance,
+            Some(serde_json::json!({ "level": "checked", "evidence": ["commands-run"] }))
+        );
+
+        let blank = parse_agent_file(
+            "---\nname: x\ndescription: d\nacceptance: \n---\nbody",
+            AgentSource::Project,
+            Path::new("/x.md"),
+        )
+        .expect("a blank value is an absence (`!raw.trim()`)");
+        assert_eq!(blank.default_acceptance, None);
+    }
+
+    /// A malformed `acceptance:` skips the FILE (the crate's per-file `[CYRUP-DELTA]`), and the
+    /// message is upstream's verbatim: `validateAcceptanceInput`'s text under the
+    /// `Agent '<name>' acceptance frontmatter` label (`agents.ts:1882`), or the YAML parse
+    /// failure under `Agent '<name>' has invalid acceptance frontmatter: …` (`:1880`).
+    #[test]
+    fn invalid_acceptance_frontmatter_skips_the_file_with_upstreams_message() {
+        assert!(
+            parse_agent_file(
+                "---\nname: x\ndescription: d\nacceptance: nope\n---\nbody",
+                AgentSource::Project,
+                Path::new("/x.md"),
+            )
+            .is_none(),
+            "an invalid level must skip the file, not load the agent with no default"
+        );
+        assert_eq!(
+            parse_agent_acceptance_frontmatter(Some("nope"), "x"),
+            Err("Agent 'x' acceptance frontmatter has invalid level 'nope'.".to_string())
+        );
+        // `none` needs a reason (`acceptance.ts:183` @v0.43.0) — the object form is how an agent
+        // file turns its default OFF, and the bare scalar is rejected exactly as on the wire.
+        assert_eq!(
+            parse_agent_acceptance_frontmatter(Some("none"), "x"),
+            Err("Agent 'x' acceptance frontmatter level \"none\" requires a reason; use { level: \"none\", reason: \"...\" }.".to_string())
+        );
+        let yaml_error = parse_agent_acceptance_frontmatter(Some("{ level: "), "x")
+            .expect_err("unterminated flow map is a YAML parse error");
+        assert!(
+            yaml_error.starts_with("Agent 'x' has invalid acceptance frontmatter: "),
+            "{yaml_error}"
+        );
+        assert_eq!(parse_agent_acceptance_frontmatter(None, "x"), Ok(None));
+        assert_eq!(parse_agent_acceptance_frontmatter(Some("   "), "x"), Ok(None));
     }
 
     // -----------------------------------------------------------------------------------------

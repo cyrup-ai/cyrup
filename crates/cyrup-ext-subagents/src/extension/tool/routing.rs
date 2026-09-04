@@ -282,8 +282,6 @@ impl SubagentTool {
         let context = p.context_override();
         let model = p.model.clone().map(ModelId::from);
 
-        let overrides = Self::single_run_overrides(p)?;
-
         // pi's own `validateFileOnlyOutputMode` gate (`single-output.ts:140-145`, applied at
         // `subagent-executor.ts:2883-2886`) fires AFTER the persona is resolved, because a persona's
         // own `output:` can satisfy `outputMode: "file-only"` on its own. cyrup already enforces the
@@ -304,7 +302,13 @@ impl SubagentTool {
         //  * neither applies to a chain/parallel launch (`:1930` bails on `chain`/`tasks`) — this
         //    is `route_single`, which is only ever reached for a single named agent;
         //  * an unresolvable agent name changes nothing (`:1932`), leaving the existing
-        //    "unknown agent" error path to report it.
+        //    "unknown agent" error path to report it;
+        //  * SUBA-082: `acceptance` applies ONLY when the call omitted `acceptance` entirely
+        //    (`subagent-executor.ts:2690-2692` @v0.64.0) — an explicit call-site policy, `"auto"`
+        //    included, beats the agent's `acceptance:` frontmatter default. It is folded into the
+        //    params HERE, before `single_run_overrides` lowers `p.acceptance`, so the default
+        //    reaches both the foreground and the background request through the ordinary
+        //    explicit-policy path and never touches chain/parallel steps.
         //
         // G98: the RESOLUTION now lives on the executor
         // ([`SubagentExecutor::single_agent_launch_defaults`]) so the `/run` slash surface — an
@@ -326,16 +330,20 @@ impl SubagentTool {
         let cfg = self.executor.config_snapshot().await;
         let depth = resolve_effective_depth(cfg.max_subagent_depth).current_depth;
         let p_with_defaults;
-        let p: &SubagentToolParams = match launch_defaults.0 {
-            Some(default_async) if p.r#async.is_none() => {
-                p_with_defaults = SubagentToolParams {
-                    r#async: Some(default_async),
-                    ..(*p).clone()
-                };
-                &p_with_defaults
-            }
-            _ => p,
+        let fill_async = launch_defaults.0.filter(|_| p.r#async.is_none());
+        let fill_acceptance = launch_defaults.3.clone().filter(|_| p.acceptance.is_none());
+        let p: &SubagentToolParams = if fill_async.is_some() || fill_acceptance.is_some() {
+            p_with_defaults = SubagentToolParams {
+                r#async: fill_async.or(p.r#async),
+                acceptance: fill_acceptance.or_else(|| p.acceptance.clone()),
+                ..(*p).clone()
+            };
+            &p_with_defaults
+        } else {
+            p
         };
+
+        let overrides = Self::single_run_overrides(p)?;
         // SUBA-077: hoisted out of the `if` below because the timeout ladder needs it — the
         // foreground backstop is gated on this launch NOT being async.
         let background = p.is_background(&cfg, depth);

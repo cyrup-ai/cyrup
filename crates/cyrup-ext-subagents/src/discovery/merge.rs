@@ -911,6 +911,8 @@ mod tests {
     fn agent(name: &str, source: AgentSource, file_path: &str) -> AgentDefinition {
         AgentDefinition {
             default_turn_budget: None,
+            default_acceptance: None,
+            acceptance_role: None,
             permission_rules: None,
             runner: None,
             name: name.to_string(),

@@ -1049,6 +1049,8 @@ mod tests {
             default_async: None,
             default_timeout_ms: None,
             default_turn_budget: None,
+            default_acceptance: None,
+            acceptance_role: None,
             permission_rules: None,
             runner: None,
             memory: None,

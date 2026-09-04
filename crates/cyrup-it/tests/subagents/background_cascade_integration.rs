@@ -59,6 +59,8 @@ use cyrup_ext_subagents::spawn::nested_events::{
 
 fn persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: name.to_string(),
         model: Some(ModelId::from("fixture-model")),
         fallback_models: Vec::new(),

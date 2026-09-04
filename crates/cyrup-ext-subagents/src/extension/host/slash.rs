@@ -328,7 +328,13 @@ impl SubagentsExtension {
         // default is ALWAYS eligible; `--bg` is the only async signal, and an explicit
         // `--bg` must beat an agent declaring `async: false`, so the default only decides
         // the case where `--bg` was NOT typed.
-        let (default_async, default_timeout_ms, _default_turn_budget) =
+        // SUBA-082: `_default_acceptance` is deliberately unused on BOTH `/run` branches. The
+        // foreground branch calls `run_foreground(…)`'s flat legacy signature, which carries no
+        // override bundle at all (see the `output`/`skills` note on the background request
+        // below), and the background branch is kept symmetric with it. The agent's `acceptance:`
+        // launch default is applied on the `subagent` TOOL's `route_single`; wiring `/run`'s
+        // override surface is the same separate unit that note already names.
+        let (default_async, default_timeout_ms, _default_turn_budget, _default_acceptance) =
             SubagentExecutor::single_agent_launch_defaults(
                 cwd,
                 &parsed.agent,

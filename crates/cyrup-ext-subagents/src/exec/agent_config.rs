@@ -111,6 +111,19 @@ pub struct AgentConfig {
     /// [`crate::exec::run_sync`] fires identically on every dispatch path. `None` and
     /// `Some(AgentRunnerConfig::Pi)` both mean the native child this crate spawns.
     pub runner: Option<crate::runner::AgentRunnerConfig>,
+    /// SUBA-082 — the agent's declared acceptance role
+    /// ([`AgentDefinition::acceptance_role`]), read by `run_sync`'s acceptance resolution
+    /// (`resolve_run_acceptance`) exactly where pi reads `agent.acceptanceRole`
+    /// (`runs/foreground/execution.ts:1834` @v0.64.0). `None` = no role declared, so the
+    /// agent-name alternations decide.
+    pub acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
+    /// SUBA-082 — the agent's validated `acceptance:` launch default
+    /// ([`AgentDefinition::default_acceptance`]). Carried for the same reason `runner` is
+    /// (so the projection is a faithful copy of the definition), but NOT consulted by
+    /// `run_sync`: pi applies it only to a SINGLE-agent launch's params
+    /// (`applySingleAgentLaunchDefaults`, `subagent-executor.ts:2690-2692` @v0.64.0), which this
+    /// crate does in `extension/tool/routing.rs::route_single` before `RunOptions` exist.
+    pub default_acceptance: Option<serde_json::Value>,
 }
 
 impl AgentConfig {
@@ -142,6 +155,8 @@ impl AgentConfig {
             memory: agent.memory.clone(),
             tool_budget: agent.tool_budget.clone(),
             runner: agent.runner.clone(),
+            acceptance_role: agent.acceptance_role,
+            default_acceptance: agent.default_acceptance.clone(),
         }
     }
 }
@@ -255,6 +270,19 @@ pub struct ResolvedAgentPersona {
     /// single-run path does. `#[serde(default)]` keeps an older on-disk config deserializable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<crate::runner::AgentRunnerConfig>,
+    /// SUBA-082 — the agent's declared acceptance role, carried across the hop-2 process
+    /// boundary so a chain/parallel/background step infers its acceptance level from the SAME
+    /// role the single-run path does (pi threads `acceptanceRole: a.acceptanceRole` into every
+    /// background launch, `runs/background/async-execution.ts:978,1036,1044,1122,1130,1768,1799`
+    /// @v0.64.0). `#[serde(default)]` keeps an older on-disk config deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
+    /// SUBA-082 — the agent's validated `acceptance:` launch default, carried so the persona is a
+    /// faithful copy of the definition (see [`AgentConfig::default_acceptance`] for why no
+    /// chain/parallel/background step ever APPLIES it). `#[serde(default)]` keeps an older
+    /// on-disk config deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_acceptance: Option<serde_json::Value>,
 }
 
 impl ResolvedAgentPersona {
@@ -286,6 +314,8 @@ impl ResolvedAgentPersona {
             memory: agent.memory.clone(),
             tool_budget: agent.tool_budget.clone(),
             runner: agent.runner.clone(),
+            acceptance_role: agent.acceptance_role,
+            default_acceptance: agent.default_acceptance.clone(),
         }
     }
 
@@ -318,6 +348,8 @@ impl ResolvedAgentPersona {
             memory: self.memory.clone(),
             tool_budget: self.tool_budget.clone(),
             runner: self.runner.clone(),
+            acceptance_role: self.acceptance_role,
+            default_acceptance: self.default_acceptance.clone(),
         }
     }
 }
@@ -765,6 +797,8 @@ mod tests {
                     capabilities: None,
                 },
             )),
+            acceptance_role: None,
+            default_acceptance: None,
         };
         let json = serde_json::to_string(&persona).expect("serialize");
         let back: ResolvedAgentPersona = serde_json::from_str(&json).expect("deserialize");
@@ -804,6 +838,8 @@ mod tests {
                     capabilities: None,
                 },
             )),
+            acceptance_role: None,
+            default_acceptance: None,
         };
         let live_depth = DepthEnvelope {
             current_depth: 1,

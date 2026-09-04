@@ -54,6 +54,8 @@ fn write_script(dir: &std::path::Path, name: &str, script_json: &serde_json::Val
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: "worker".to_string(),
         model: Some(ModelId::from(model)),
         fallback_models: Vec::new(),

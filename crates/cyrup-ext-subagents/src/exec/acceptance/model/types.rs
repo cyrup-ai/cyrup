@@ -113,6 +113,46 @@ pub enum GateSeverity {
     Recommended,
 }
 
+/// SUBA-082 — `AcceptanceRole` (`shared/types.ts:31` @v0.64.0: `"read-only" | "writer"`), the
+/// agent-declared role that REPLACES agent-name guessing inside `inferLevel`
+/// (`runs/shared/acceptance.ts:100-104` @v0.64.0): `readOnlyAgent` is `role === "read-only" ||
+/// (role === undefined && /\b(?:reviewer|oracle|scout|researcher|analyst)\b/.test(agent))`, and
+/// `writeTask` gains a `role === "writer" && !readOnlyTask` arm while its `\bworker\b` name arm is
+/// gated on `role === undefined`. Declared on an agent file as `acceptanceRole:` frontmatter
+/// (`agents.ts:2046-2050` @v0.64.0) and carried on
+/// [`crate::discovery::types::AgentDefinition::acceptance_role`]. It does NOT grant or revoke tools
+/// (`docs/agents.md:327` @v0.64.0) — it only steers acceptance inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AcceptanceRole {
+    ReadOnly,
+    Writer,
+}
+
+impl AcceptanceRole {
+    /// The wire/frontmatter spelling (`read-only` / `writer`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AcceptanceRole::ReadOnly => "read-only",
+            AcceptanceRole::Writer => "writer",
+        }
+    }
+
+    /// The exact-spelling parse upstream applies to the frontmatter value
+    /// (`agents.ts:2048` @v0.64.0: `=== "read-only" || === "writer"`, no trimming, no case
+    /// folding). `None` for anything else — the CALLER decides whether that is an error (it is,
+    /// for a non-blank frontmatter value) or an absence (a blank one).
+    #[must_use]
+    pub fn parse_exact(raw: &str) -> Option<Self> {
+        match raw {
+            "read-only" => Some(AcceptanceRole::ReadOnly),
+            "writer" => Some(AcceptanceRole::Writer),
+            _ => Option::None,
+        }
+    }
+}
+
 // --------------------------------------------------------------------------------------------
 // Config-input shapes (shared/types.ts:652-685)
 // --------------------------------------------------------------------------------------------

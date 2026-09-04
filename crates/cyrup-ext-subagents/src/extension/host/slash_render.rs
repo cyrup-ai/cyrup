@@ -464,6 +464,8 @@ mod tests {
             memory: None,
             tool_budget: None,
             runner: None,
+            acceptance_role: None,
+            default_acceptance: None,
         }
     }
 

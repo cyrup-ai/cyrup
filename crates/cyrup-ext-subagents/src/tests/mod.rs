@@ -21,6 +21,7 @@
 )]
 
 mod acceptance_policy_parity;
+mod acceptance_role_inference;
 mod bundled_resources_registration_integration;
 mod child_prompt_runtime_integration;
 mod discovery_integration;

@@ -248,6 +248,35 @@ pub(crate) fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&Ha
         lines.push(format!("timeoutMs: {value}"));
     }
 
+    // SUBA-082 acceptance / acceptanceRole (`agent-serializer.ts:103-110` @v0.64.0):
+    //
+    //   if (config.defaultAcceptance !== undefined || preserve("acceptance")) {
+    //     lines.push(`acceptance: ${config.defaultAcceptance === undefined ? ""
+    //       : typeof config.defaultAcceptance === "object" ? JSON.stringify(config.defaultAcceptance)
+    //       : String(config.defaultAcceptance)}`);
+    //   }
+    //   if (config.acceptanceRole || preserve("acceptanceRole")) lines.push(`acceptanceRole: ${config.acceptanceRole ?? ""}`);
+    //
+    // An object is emitted as compact JSON (which the YAML-parsing reader accepts back, JSON
+    // being YAML); a scalar (`checked`, `false`) is emitted bare, exactly as `String(value)`
+    // renders it. Same silent-deletion trap as `toolBudget`/`turnBudget` below, now that both
+    // keys are in `KNOWN_FIELDS`.
+    if def.default_acceptance.is_some() || preserve(&["acceptance"]) {
+        let value = match &def.default_acceptance {
+            None => String::new(),
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(value @ serde_json::Value::Object(_)) => {
+                serde_json::to_string(value).unwrap_or_default()
+            }
+            Some(other) => other.to_string(),
+        };
+        lines.push(format!("acceptance: {value}"));
+    }
+    if def.acceptance_role.is_some() || preserve(&["acceptanceRole"]) {
+        let value = def.acceptance_role.map_or("", |role| role.as_str());
+        lines.push(format!("acceptanceRole: {value}"));
+    }
+
     // toolBudget (`agent-serializer.ts:91-93` @ v0.34.0): emitted as compact JSON when set, or as
     // an empty value under preserve. Without this, adding `toolBudget` to `KNOWN_FIELDS` would let
     // any management update SILENTLY DELETE an author's budget — the extra-fields loop below skips
@@ -563,6 +592,69 @@ mod tests {
             .is_none(),
             "an invalid turnBudget must skip the agent file, never load it unbudgeted"
         );
+    }
+
+    /// SUBA-082 — the same silent-deletion trap for `acceptance`/`acceptanceRole`
+    /// (`agent-serializer.ts:103-110` @v0.64.0): both are `KNOWN_FIELDS` now, so a rewrite that
+    /// never emitted them would delete an author's declared role and launch default on the first
+    /// management update. An object default is emitted as compact JSON, a scalar bare, and a
+    /// preserved-but-unset key as an empty value that re-parses to an absence.
+    #[test]
+    fn serialize_agent_round_trips_acceptance_and_acceptance_role() {
+        use crate::discovery::frontmatter::parse_agent_file;
+        use crate::exec::acceptance::model::AcceptanceRole;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "editor".to_string();
+        def.name = "editor".to_string();
+        def.description = "Edits things".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.acceptance_role = Some(AcceptanceRole::Writer);
+        def.default_acceptance = Some(serde_json::json!({ "level": "checked" }));
+
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains("acceptance: {\"level\":\"checked\"}"),
+            "an object default is emitted as compact JSON (`JSON.stringify`):\n{serialized}"
+        );
+        assert!(
+            serialized.contains("acceptanceRole: writer"),
+            "the role is emitted under its wire spelling:\n{serialized}"
+        );
+
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(reparsed.acceptance_role, Some(AcceptanceRole::Writer));
+        assert_eq!(reparsed.default_acceptance, def.default_acceptance);
+        assert!(!reparsed.extra_fields.contains_key("acceptance"));
+        assert!(!reparsed.extra_fields.contains_key("acceptanceRole"));
+
+        // A scalar default is emitted bare (`String(value)`), never quoted.
+        def.default_acceptance = Some(serde_json::json!("checked"));
+        def.acceptance_role = Some(AcceptanceRole::ReadOnly);
+        let serialized = serialize_agent(&def, None);
+        assert!(serialized.contains("\nacceptance: checked\n"), "{serialized}");
+        assert!(serialized.contains("\nacceptanceRole: read-only\n"), "{serialized}");
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips");
+        assert_eq!(reparsed.default_acceptance, Some(serde_json::json!("checked")));
+        assert_eq!(reparsed.acceptance_role, Some(AcceptanceRole::ReadOnly));
+
+        // Neither set: nothing emitted on CREATE; on UPDATE with the keys preserved, both are
+        // written empty (`config.acceptanceRole ?? ""`) and re-parse to an absence.
+        def.default_acceptance = None;
+        def.acceptance_role = None;
+        let created = serialize_agent(&def, None);
+        assert!(!created.contains("acceptance"), "{created}");
+        let preserve: HashSet<String> =
+            ["acceptance", "acceptanceRole"].iter().map(|k| k.to_string()).collect();
+        let preserved = serialize_agent(&def, Some(&preserve));
+        assert!(preserved.contains("\nacceptance: \n"), "{preserved}");
+        assert!(preserved.contains("\nacceptanceRole: \n"), "{preserved}");
+        let reparsed = parse_agent_file(&preserved, AgentSource::Project, Path::new("/w.md"))
+            .expect("empty preserved values are absences, not errors");
+        assert_eq!(reparsed.default_acceptance, None);
+        assert_eq!(reparsed.acceptance_role, None);
     }
 
     /// SUBA-073 — the same silent-deletion trap for `permission`/`permissions`: now that both

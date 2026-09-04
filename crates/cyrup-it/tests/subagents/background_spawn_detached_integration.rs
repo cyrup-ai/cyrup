@@ -480,6 +480,8 @@ fn orchestrator_sim_binary_path() -> PathBuf {
 /// mode. Every step's agent must now have a plan-time persona in `resolved_agents`.
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: name.to_string(),
         model: Some(ModelId::from("fixture-model")),
         fallback_models: Vec::new(),
