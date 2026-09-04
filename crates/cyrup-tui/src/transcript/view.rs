@@ -126,7 +126,6 @@ impl TranscriptView {
             || self.bash.is_some()
     }
 
-
     /// Take every committed entry, leaving the pending buffer empty — and, when retention is on,
     /// ALSO keep a clone of each in the retained document (ADR-0005 §Decision B-1).
     ///
@@ -248,7 +247,6 @@ impl TranscriptView {
             || self.bash.is_some()
     }
 
-
     /// Set the live `app.tools.expand` key label every `… to expand` hint resolves through — Pi's
     /// `keyText("app.tools.expand")` (`keybinding-hints.ts:34-36`), which reads the keymap on every
     /// render. cyrup's transcript holds no keymap, so the app pushes the resolved label here
@@ -300,14 +298,18 @@ impl TranscriptView {
         from: usize,
     ) -> impl Iterator<Item = (usize, crate::markdown::MessageType, &str)> + '_ {
         use crate::markdown::MessageType;
-        self.pending.iter().enumerate().skip(from).filter_map(|(i, entry)| match entry {
-            Entry::User { text, .. } => Some((i, MessageType::User, text.as_str())),
-            Entry::Assistant(text) => Some((i, MessageType::Assistant, text.as_str())),
-            Entry::Thinking { text, .. } => {
-                Some((i, MessageType::AssistantThinking, text.as_str()))
-            }
-            _ => None,
-        })
+        self.pending
+            .iter()
+            .enumerate()
+            .skip(from)
+            .filter_map(|(i, entry)| match entry {
+                Entry::User { text, .. } => Some((i, MessageType::User, text.as_str())),
+                Entry::Assistant(text) => Some((i, MessageType::Assistant, text.as_str())),
+                Entry::Thinking { text, .. } => {
+                    Some((i, MessageType::AssistantThinking, text.as_str()))
+                }
+                _ => None,
+            })
     }
 
     /// Replace the markdown body of the pending entry at `index` with a transformer's output.
@@ -323,7 +325,9 @@ impl TranscriptView {
     /// silent no-op: the pass reads and writes within one `&mut self` borrow of the app, so it
     /// cannot actually happen, and the alternative is an index panic the workspace lints forbid.
     pub(crate) fn set_pending_markdown(&mut self, index: usize, text: String) {
-        let Some(entry) = self.pending.get_mut(index) else { return };
+        let Some(entry) = self.pending.get_mut(index) else {
+            return;
+        };
         match entry {
             Entry::User { text: slot, .. } => *slot = text,
             Entry::Assistant(slot) => *slot = text,

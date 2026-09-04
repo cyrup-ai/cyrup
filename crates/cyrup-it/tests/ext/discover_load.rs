@@ -4,7 +4,12 @@
 //! untrusted project records an `Untrusted` error (R-08-002); a trusted project loads the component
 //! and routes a guest slash command across the boundary (R-08-016); `/reload` cache-busts and
 //! re-loads (R-08-005).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use cyrup_core::CancelToken;
 use cyrup_ext::loader::DiscoveryRoots;
@@ -60,7 +65,11 @@ async fn discover_trust_load_command_reload() {
         disabled: Vec::new(),
     };
 
-    let cfg = HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: cwd.clone() };
+    let cfg = HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: cwd.clone(),
+    };
     let host = ExtensionHost::with_wasm(cfg).expect("host with wasm");
 
     // A concrete NON-deny backend: grants control/UI/exec and records the effects (gap-08 #7).
@@ -68,8 +77,15 @@ async fn discover_trust_load_command_reload() {
 
     // 1) UNTRUSTED project: the project-local extension is NOT loaded; an Untrusted error is recorded.
     let untrusted = host.discover_and_load(&roots, false, rec.clone()).await;
-    assert!(untrusted.loaded.is_empty(), "nothing loads in an untrusted project");
-    assert_eq!(untrusted.errors.len(), 1, "the project-local ext is recorded as an error");
+    assert!(
+        untrusted.loaded.is_empty(),
+        "nothing loads in an untrusted project"
+    );
+    assert_eq!(
+        untrusted.errors.len(),
+        1,
+        "the project-local ext is recorded as an error"
+    );
     assert!(
         untrusted.errors[0].error.to_lowercase().contains("untrust"),
         "got: {}",
@@ -78,15 +94,26 @@ async fn discover_trust_load_command_reload() {
 
     // 2) TRUSTED project: the component loads.
     let trusted = host.discover_and_load(&roots, true, rec.clone()).await;
-    assert_eq!(trusted.loaded.len(), 1, "one extension loaded, errors={:?}", trusted.errors);
+    assert_eq!(
+        trusted.loaded.len(),
+        1,
+        "one extension loaded, errors={:?}",
+        trusted.errors
+    );
     assert_eq!(trusted.loaded[0].to_string(), "demo");
     assert!(trusted.errors.is_empty(), "no errors: {:?}", trusted.errors);
 
     // 3) the guest slash command routes across the boundary via the facade (R-08-016).
     let cancel = CancelToken::new();
-    let out = host.run_command("greet", "world", &cancel).await.expect("command runs");
+    let out = host
+        .run_command("greet", "world", &cancel)
+        .await
+        .expect("command runs");
     assert_eq!(out.as_deref(), Some("hello, world!"));
-    let comps = host.command_completions("greet", "te").await.expect("completions");
+    let comps = host
+        .command_completions("greet", "te")
+        .await
+        .expect("completions");
     assert_eq!(comps, vec!["team".to_string()]);
 
     // the command's COMMAND-tier control op (`compact`) reached the NON-deny backend (R-08-008) —
@@ -104,9 +131,15 @@ async fn discover_trust_load_command_reload() {
     );
 
     // 4) hot reload: cache-bust + re-load; the command still routes afterwards.
-    let reloaded = host.reload(&roots, true, rec.clone(), &cancel).await.expect("reload");
+    let reloaded = host
+        .reload(&roots, true, rec.clone(), &cancel)
+        .await
+        .expect("reload");
     assert_eq!(reloaded.loaded.len(), 1, "reload re-loaded the extension");
-    let out2 = host.run_command("greet", "team", &cancel).await.expect("command runs post-reload");
+    let out2 = host
+        .run_command("greet", "team", &cancel)
+        .await
+        .expect("command runs post-reload");
     assert_eq!(out2.as_deref(), Some("hello, team!"));
 
     let _ = std::fs::remove_dir_all(&cwd);

@@ -34,5 +34,8 @@ fn main() {
         println!("cargo:rerun-if-changed={}", file.display());
     }
 
-    println!("cargo:rustc-env=CYRUP_EXT_ABI_FINGERPRINT={}", hash_abi_sources(&crates_dir));
+    println!(
+        "cargo:rustc-env=CYRUP_EXT_ABI_FINGERPRINT={}",
+        hash_abi_sources(&crates_dir)
+    );
 }

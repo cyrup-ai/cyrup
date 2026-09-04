@@ -46,7 +46,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::background::RunId;
 
@@ -333,12 +333,9 @@ pub fn resolve_single_result_status(child: &crate::exec::SingleResult) -> Subage
         exit_code: Some(child.exit_code),
         // pi `...(result.acceptance?.status === "rejected" ? { success: false } : {})`
         // (`subagent-executor.ts:1597`) — the ONLY thing that pins `success` on this path.
-        success: child
-            .acceptance
-            .as_ref()
-            .and_then(|ledger| {
-                (ledger.status == crate::exec::acceptance::AcceptanceStatus::Rejected).then_some(false)
-            }),
+        success: child.acceptance.as_ref().and_then(|ledger| {
+            (ledger.status == crate::exec::acceptance::AcceptanceStatus::Rejected).then_some(false)
+        }),
         state: None,
         interrupted: child.interrupted,
         detached: child.detached,
@@ -392,7 +389,11 @@ fn resolve_step_result_status(
 /// a later phase threads that per-child metadata through, this function starts rendering those
 /// sections with zero further changes to its own logic.
 #[must_use]
-pub fn format_subagent_result_receipt(mode: &str, run_id: &RunId, child_statuses: &[SubagentResultStatus]) -> String {
+pub fn format_subagent_result_receipt(
+    mode: &str,
+    run_id: &RunId,
+    child_statuses: &[SubagentResultStatus],
+) -> String {
     let mode_label = match mode {
         "single" => "single subagent result",
         "chain" => "chain subagent results",
@@ -447,10 +448,9 @@ impl IntercomPayload {
                     // SUBA-008 — same field, same reason, on the run-level fold.
                     turn_budget_exceeded: r.turn_budget_exceeded,
                 };
-                if r.acceptance
-                    .as_ref()
-                    .is_some_and(|l| l.status == crate::exec::acceptance::AcceptanceStatus::Rejected)
-                {
+                if r.acceptance.as_ref().is_some_and(|l| {
+                    l.status == crate::exec::acceptance::AcceptanceStatus::Rejected
+                }) {
                     input.success = Some(false);
                 }
                 resolve_subagent_result_status(&input)
@@ -490,8 +490,10 @@ impl IntercomPayload {
         success: bool,
         children: &[Option<crate::spawn::chain_graph::StepResult>],
     ) -> Self {
-        let child_statuses: Vec<SubagentResultStatus> =
-            children.iter().map(|c| resolve_step_result_status(c.as_ref())).collect();
+        let child_statuses: Vec<SubagentResultStatus> = children
+            .iter()
+            .map(|c| resolve_step_result_status(c.as_ref()))
+            .collect();
         let status = resolve_grouped_status(&child_statuses);
         let summary = format_status_counts(&child_statuses);
         Self {
@@ -500,7 +502,11 @@ impl IntercomPayload {
             success,
             outputs: children
                 .iter()
-                .map(|c| c.as_ref().and_then(|r| r.final_output.clone()).unwrap_or_default())
+                .map(|c| {
+                    c.as_ref()
+                        .and_then(|r| r.final_output.clone())
+                        .unwrap_or_default()
+                })
                 .collect(),
             total_tokens: 0,
             status,
@@ -574,7 +580,10 @@ pub trait DeliveryChannel: Send + Sync {
     /// [`deliver`] — both degrade to [`DeliveryOutcome::NotDelivered`]); `Err` means the transport
     /// itself failed. None of the three outcomes may panic or block past what the implementation's
     /// own I/O naturally takes — [`deliver`]'s outer timeout is the actual safety net.
-    fn send(&self, payload: IntercomPayload) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
+    fn send(
+        &self,
+        payload: IntercomPayload,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 }
 
 /// The default channel: no transport exists (func-SA §9 item 25). `send` resolves immediately to
@@ -586,7 +595,10 @@ pub trait DeliveryChannel: Send + Sync {
 pub struct NoTransportChannel;
 
 impl DeliveryChannel for NoTransportChannel {
-    fn send(&self, _payload: IntercomPayload) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+    fn send(
+        &self,
+        _payload: IntercomPayload,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
         Box::pin(async { Ok(false) })
     }
 }
@@ -612,7 +624,11 @@ pub trait SteerChannel: Send + Sync {
     /// a registered receiver took delivery (the follow-up landed); `Ok(false)` = reachable transport
     /// but no registered receiver at `target` (the genuine "not registered" fallback); `Err` = the
     /// transport itself failed. Never panics or blocks past its own I/O.
-    fn steer(&self, target: String, text: String) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
+    fn steer(
+        &self,
+        target: String,
+        text: String,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 
     /// Whether a real intercom bridge is wired (pi `intercomBridge.active`): callers that only want
     /// to know whether it is worth SHOWING a resolved intercom-target line (e.g. the revive
@@ -636,7 +652,11 @@ pub trait SteerChannel: Send + Sync {
 pub struct NoTransportSteerChannel;
 
 impl SteerChannel for NoTransportSteerChannel {
-    fn steer(&self, _target: String, _text: String) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+    fn steer(
+        &self,
+        _target: String,
+        _text: String,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
         Box::pin(async { Ok(false) })
     }
 
@@ -664,7 +684,12 @@ pub const DEFAULT_STEER_TIMEOUT: Duration = Duration::from_millis(500);
 /// channel confirms `Ok(true)` before `timeout` elapses; any other outcome (`Ok(false)`, `Err`, or the
 /// timeout branch firing first) resolves to `false`, matching pi's `deliverSubagentIntercomMessageEvent`
 /// contract that the caller's turn is never blocked longer than `timeoutMs` (`result-intercom.ts:325-358`).
-pub async fn steer_with_timeout(channel: &dyn SteerChannel, target: String, text: String, timeout: Duration) -> bool {
+pub async fn steer_with_timeout(
+    channel: &dyn SteerChannel,
+    target: String,
+    text: String,
+    timeout: Duration,
+) -> bool {
     let attempt = channel.steer(target, text);
     tokio::select! {
         biased;
@@ -675,7 +700,11 @@ pub async fn steer_with_timeout(channel: &dyn SteerChannel, target: String, text
 
 /// Convenience wrapper over [`steer_with_timeout`] using [`DEFAULT_STEER_TIMEOUT`] (pi's `timeoutMs
 /// = 500` default, applied uniformly to every caller per `result-intercom.ts:325-330`).
-pub async fn steer_with_default_timeout(channel: &dyn SteerChannel, target: String, text: String) -> bool {
+pub async fn steer_with_default_timeout(
+    channel: &dyn SteerChannel,
+    target: String,
+    text: String,
+) -> bool {
     steer_with_timeout(channel, target, text, DEFAULT_STEER_TIMEOUT).await
 }
 
@@ -704,7 +733,11 @@ pub enum DeliveryOutcome {
 /// `tokio::select!` below simply resolves to `NotDelivered` on either the channel returning
 /// `Ok(false)`/`Err`, or the timeout branch firing first), matching R-SA-125's "without needing
 /// to detect presence beforehand" framing.
-pub async fn deliver(channel: &dyn DeliveryChannel, payload: IntercomPayload, timeout: Duration) -> DeliveryOutcome {
+pub async fn deliver(
+    channel: &dyn DeliveryChannel,
+    payload: IntercomPayload,
+    timeout: Duration,
+) -> DeliveryOutcome {
     let attempt = channel.send(payload);
     tokio::select! {
         biased;
@@ -717,7 +750,10 @@ pub async fn deliver(channel: &dyn DeliveryChannel, payload: IntercomPayload, ti
 }
 
 /// Convenience wrapper over [`deliver`] using [`DEFAULT_DELIVERY_TIMEOUT`].
-pub async fn deliver_with_default_timeout(channel: &dyn DeliveryChannel, payload: IntercomPayload) -> DeliveryOutcome {
+pub async fn deliver_with_default_timeout(
+    channel: &dyn DeliveryChannel,
+    payload: IntercomPayload,
+) -> DeliveryOutcome {
     deliver(channel, payload, DEFAULT_DELIVERY_TIMEOUT).await
 }
 
@@ -802,7 +838,10 @@ pub trait ClarifyChannel: Send + Sync {
     /// (an ask is, by design, allowed to wait indefinitely for a human — R-SA-119 is about
     /// visibly pausing the flow while this is outstanding, not about bounding how long a human
     /// may take).
-    fn ask(&self, request: ClarifyRequest) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
+    fn ask(
+        &self,
+        request: ClarifyRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }
 
 /// The documented graceful no-op fallback (see the module-level `NOTE(clarify-wired)` doc):
@@ -814,7 +853,10 @@ pub trait ClarifyChannel: Send + Sync {
 pub struct NoOpClarifyChannel;
 
 impl ClarifyChannel for NoOpClarifyChannel {
-    fn ask(&self, _request: ClarifyRequest) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+    fn ask(
+        &self,
+        _request: ClarifyRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async { Err("no live clarify channel wired".to_string()) })
     }
 }
@@ -840,7 +882,10 @@ impl AskLock {
     /// graceful-fallback behavior (no live UI wired — headless / SDK-embedder).
     #[must_use]
     pub fn new(channel: Arc<dyn ClarifyChannel>) -> Self {
-        Self { channel, slots: AsyncMutex::new(HashMap::new()) }
+        Self {
+            channel,
+            slots: AsyncMutex::new(HashMap::new()),
+        }
     }
 
     /// Builds a lock using the documented no-op fallback (today's default — see
@@ -862,7 +907,11 @@ impl AskLock {
     /// (or its own fallback) to completion before yielding a result, so a caller that renders
     /// "paused" for exactly the lifetime of the awaited call gets correct pause duration for
     /// free.
-    pub async fn request_clarify(&self, session_key: &str, request: ClarifyRequest) -> ClarifyOutcome {
+    pub async fn request_clarify(
+        &self,
+        session_key: &str,
+        request: ClarifyRequest,
+    ) -> ClarifyOutcome {
         {
             let mut slots = self.slots.lock().await;
             if slots.contains_key(session_key) {
@@ -927,7 +976,11 @@ impl std::fmt::Debug for ClarifyDispatch {
     }
 }
 
-pub fn spawn_clarify(lock: Arc<AskLock>, session_key: String, request: ClarifyRequest) -> oneshot::Receiver<ClarifyOutcome> {
+pub fn spawn_clarify(
+    lock: Arc<AskLock>,
+    session_key: String,
+    request: ClarifyRequest,
+) -> oneshot::Receiver<ClarifyOutcome> {
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
         let outcome = lock.request_clarify(&session_key, request).await;
@@ -939,7 +992,12 @@ pub fn spawn_clarify(lock: Arc<AskLock>, session_key: String, request: ClarifyRe
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use cyrup_core::Usage;
@@ -976,8 +1034,16 @@ mod tests {
         // Exhaustive destructure: the `let IntercomPayload { .. } = payload;` form below would
         // still compile if a field were added (the `..` pattern), so instead we name every field
         // explicitly with no `..` — this is what makes the assertion compile-time-exhaustive.
-        let IntercomPayload { run_id, agent, success, outputs, total_tokens, status, summary, child_statuses } =
-            payload;
+        let IntercomPayload {
+            run_id,
+            agent,
+            success,
+            outputs,
+            total_tokens,
+            status,
+            summary,
+            child_statuses,
+        } = payload;
         assert_eq!(run_id.as_str(), "deadbeefcafef00d");
         assert_eq!(agent, "researcher");
         assert!(success);
@@ -1023,15 +1089,24 @@ mod tests {
             !wire.contains("CONTROL_INBOX_ROUTE_LEAK_CANARY"),
             "session_file must never appear in the out-of-band payload: {wire}"
         );
-        assert!(wire.contains("did the thing"), "the allowlisted output must still be present");
+        assert!(
+            wire.contains("did the thing"),
+            "the allowlisted output must still be present"
+        );
     }
 
     #[test]
     fn from_result_sums_token_usage_across_all_steps() {
         let mut a = sample_single_result("scout", "found stuff");
-        a.usage = Usage { total_tokens: 15, ..Usage::default() };
+        a.usage = Usage {
+            total_tokens: 15,
+            ..Usage::default()
+        };
         let mut b = sample_single_result("worker", "did stuff");
-        b.usage = Usage { total_tokens: 150, ..Usage::default() };
+        b.usage = Usage {
+            total_tokens: 150,
+            ..Usage::default()
+        };
 
         let result = crate::background::ResultFile {
             id: RunId::from_token("run00000000000002"),
@@ -1047,7 +1122,10 @@ mod tests {
 
         let payload = IntercomPayload::from_result(&result);
         assert_eq!(payload.total_tokens, 15 + 150);
-        assert_eq!(payload.outputs, vec!["found stuff".to_string(), "did stuff".to_string()]);
+        assert_eq!(
+            payload.outputs,
+            vec!["found stuff".to_string(), "did stuff".to_string()]
+        );
     }
 
     fn sample_single_result(agent: &str, output: &str) -> crate::exec::SingleResult {
@@ -1105,7 +1183,10 @@ mod tests {
         // 2. `stopped` OR `state === "stopped"` — and it wins over `interrupted`, which is the
         //    branch that stops a stopped run from being reported as a resumable pause.
         assert_eq!(
-            resolve_subagent_result_status(&ResultStatusInput { stopped: true, ..base.clone() }),
+            resolve_subagent_result_status(&ResultStatusInput {
+                stopped: true,
+                ..base.clone()
+            }),
             SubagentResultStatus::Stopped
         );
         assert_eq!(
@@ -1127,11 +1208,17 @@ mod tests {
 
         // 3. interrupted / state==="paused".
         assert_eq!(
-            resolve_subagent_result_status(&ResultStatusInput { interrupted: true, ..base.clone() }),
+            resolve_subagent_result_status(&ResultStatusInput {
+                interrupted: true,
+                ..base.clone()
+            }),
             SubagentResultStatus::Paused
         );
         assert_eq!(
-            resolve_subagent_result_status(&ResultStatusInput { state: Some("paused"), ..base.clone() }),
+            resolve_subagent_result_status(&ResultStatusInput {
+                state: Some("paused"),
+                ..base.clone()
+            }),
             SubagentResultStatus::Paused
         );
 
@@ -1179,39 +1266,95 @@ mod tests {
 
         // 6-10. the success/state/exit-code tail, including pi's ultimate `"failed"` default.
         assert_eq!(
-            resolve_subagent_result_status(&ResultStatusInput { success: Some(false), ..base.clone() }),
+            resolve_subagent_result_status(&ResultStatusInput {
+                success: Some(false),
+                ..base.clone()
+            }),
             SubagentResultStatus::Failed
         );
         assert_eq!(
-            resolve_subagent_result_status(&ResultStatusInput { state: Some("complete"), ..base.clone() }),
+            resolve_subagent_result_status(&ResultStatusInput {
+                state: Some("complete"),
+                ..base.clone()
+            }),
             SubagentResultStatus::Completed
         );
         assert_eq!(
-            resolve_subagent_result_status(&ResultStatusInput { state: Some("failed"), ..base.clone() }),
+            resolve_subagent_result_status(&ResultStatusInput {
+                state: Some("failed"),
+                ..base.clone()
+            }),
             SubagentResultStatus::Failed
         );
         assert_eq!(
-            resolve_subagent_result_status(&ResultStatusInput { exit_code: Some(0), ..base.clone() }),
+            resolve_subagent_result_status(&ResultStatusInput {
+                exit_code: Some(0),
+                ..base.clone()
+            }),
             SubagentResultStatus::Completed
         );
         assert_eq!(
-            resolve_subagent_result_status(&ResultStatusInput { exit_code: Some(1), ..base.clone() }),
+            resolve_subagent_result_status(&ResultStatusInput {
+                exit_code: Some(1),
+                ..base.clone()
+            }),
             SubagentResultStatus::Failed
         );
-        assert_eq!(resolve_subagent_result_status(&base), SubagentResultStatus::Failed);
+        assert_eq!(
+            resolve_subagent_result_status(&base),
+            SubagentResultStatus::Failed
+        );
     }
 
     /// pi `isUnexplainedProcessSignal` (`runs/shared/process-signal.ts:5-19`): all four
     /// explanations disqualify, and an absent/empty signal is never "unexplained".
     #[test]
     fn is_unexplained_process_signal_matches_pis_four_disqualifiers() {
-        assert!(is_unexplained_process_signal(Some("SIGKILL"), false, false, false, false));
-        assert!(!is_unexplained_process_signal(None, false, false, false, false));
-        assert!(!is_unexplained_process_signal(Some(""), false, false, false, false));
-        assert!(!is_unexplained_process_signal(Some("SIGKILL"), true, false, false, false));
-        assert!(!is_unexplained_process_signal(Some("SIGKILL"), false, true, false, false));
-        assert!(!is_unexplained_process_signal(Some("SIGKILL"), false, false, true, false));
-        assert!(!is_unexplained_process_signal(Some("SIGKILL"), false, false, false, true));
+        assert!(is_unexplained_process_signal(
+            Some("SIGKILL"),
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!is_unexplained_process_signal(
+            None, false, false, false, false
+        ));
+        assert!(!is_unexplained_process_signal(
+            Some(""),
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!is_unexplained_process_signal(
+            Some("SIGKILL"),
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(!is_unexplained_process_signal(
+            Some("SIGKILL"),
+            false,
+            true,
+            false,
+            false
+        ));
+        assert!(!is_unexplained_process_signal(
+            Some("SIGKILL"),
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(!is_unexplained_process_signal(
+            Some("SIGKILL"),
+            false,
+            false,
+            false,
+            true
+        ));
     }
 
     /// pi `formatStatusCounts` (`result-intercom.ts:57-66`): the RENDER order puts `stopped`
@@ -1251,9 +1394,21 @@ mod tests {
     #[test]
     fn resolve_grouped_status_gives_stopped_its_own_precedence_slot() {
         use SubagentResultStatus::{Completed, Detached, Failed, Paused, Stopped};
-        assert_eq!(resolve_grouped_status(&[Failed, Stopped]), Failed, "failed still outranks stopped");
-        assert_eq!(resolve_grouped_status(&[Stopped, Paused]), Stopped, "stopped outranks paused");
-        assert_eq!(resolve_grouped_status(&[Stopped, Completed]), Stopped, "stopped outranks completed");
+        assert_eq!(
+            resolve_grouped_status(&[Failed, Stopped]),
+            Failed,
+            "failed still outranks stopped"
+        );
+        assert_eq!(
+            resolve_grouped_status(&[Stopped, Paused]),
+            Stopped,
+            "stopped outranks paused"
+        );
+        assert_eq!(
+            resolve_grouped_status(&[Stopped, Completed]),
+            Stopped,
+            "stopped outranks completed"
+        );
         assert_eq!(resolve_grouped_status(&[Stopped, Detached]), Stopped);
         assert_eq!(resolve_grouped_status(&[Stopped]), Stopped);
         // The pre-G104 relations are untouched.
@@ -1287,7 +1442,10 @@ mod tests {
         let payload = IntercomPayload::from_result(&result);
         assert_eq!(
             payload.child_statuses,
-            vec![SubagentResultStatus::Completed, SubagentResultStatus::Stopped],
+            vec![
+                SubagentResultStatus::Completed,
+                SubagentResultStatus::Stopped
+            ],
             "the child that finished BEFORE the stop stays `completed` — pi resolves per child, \
              never by flattening the run's own state onto all of them"
         );
@@ -1307,7 +1465,10 @@ mod tests {
         let mut child = sample_single_result("worker", "partial");
         child.exit_code = 137;
         child.process_signal = Some("SIGKILL".to_string());
-        assert_eq!(resolve_single_result_status(&child), SubagentResultStatus::Stopped);
+        assert_eq!(
+            resolve_single_result_status(&child),
+            SubagentResultStatus::Stopped
+        );
 
         child.timed_out = true;
         assert_eq!(
@@ -1318,7 +1479,10 @@ mod tests {
 
         let mut stopped = sample_single_result("worker", "");
         stopped.stopped = true;
-        assert_eq!(resolve_single_result_status(&stopped), SubagentResultStatus::Stopped);
+        assert_eq!(
+            resolve_single_result_status(&stopped),
+            SubagentResultStatus::Stopped
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1332,7 +1496,10 @@ mod tests {
     struct HangingChannel;
 
     impl DeliveryChannel for HangingChannel {
-        fn send(&self, _payload: IntercomPayload) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+        fn send(
+            &self,
+            _payload: IntercomPayload,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
             Box::pin(std::future::pending())
         }
     }
@@ -1379,20 +1546,30 @@ mod tests {
     async fn deliver_degrades_to_not_delivered_on_channel_error() {
         struct ErroringChannel;
         impl DeliveryChannel for ErroringChannel {
-            fn send(&self, _payload: IntercomPayload) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+            fn send(
+                &self,
+                _payload: IntercomPayload,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
                 Box::pin(async { Err("transport exploded".to_string()) })
             }
         }
 
         let outcome = deliver(&ErroringChannel, sample_payload(), Duration::from_secs(5)).await;
-        assert_eq!(outcome, DeliveryOutcome::NotDelivered, "an error must never propagate to the caller as Err");
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::NotDelivered,
+            "an error must never propagate to the caller as Err"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deliver_reports_delivered_when_a_receiver_confirms_promptly() {
         struct ConfirmingChannel;
         impl DeliveryChannel for ConfirmingChannel {
-            fn send(&self, _payload: IntercomPayload) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+            fn send(
+                &self,
+                _payload: IntercomPayload,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
                 Box::pin(async { Ok(true) })
             }
         }
@@ -1434,8 +1611,14 @@ mod tests {
         // ordinary inline tool-result payload per R-SA-125) is exactly the full payload, field
         // for field — nothing was truncated, stripped, or replaced by the failed attempt.
         assert_eq!(payload_for_local_use.outputs.len(), 2);
-        assert_eq!(payload_for_local_use.outputs[0], "first step output, in full");
-        assert_eq!(payload_for_local_use.outputs[1], "second step output, in full, unabridged");
+        assert_eq!(
+            payload_for_local_use.outputs[0],
+            "first step output, in full"
+        );
+        assert_eq!(
+            payload_for_local_use.outputs[1],
+            "second step output, in full, unabridged"
+        );
         assert_eq!(payload_for_local_use.total_tokens, 999);
         assert_eq!(payload_for_local_use.agent, "orchestrator");
         assert!(payload_for_local_use.success);
@@ -1472,7 +1655,10 @@ mod tests {
             total_tokens: 999,
             status: SubagentResultStatus::Completed,
             summary: "2 completed".to_string(),
-            child_statuses: vec![SubagentResultStatus::Completed, SubagentResultStatus::Completed],
+            child_statuses: vec![
+                SubagentResultStatus::Completed,
+                SubagentResultStatus::Completed,
+            ],
         }
     }
 
@@ -1486,7 +1672,11 @@ mod tests {
         let outcome = lock
             .request_clarify(
                 "session-a",
-                ClarifyRequest { run_id: RunId::from_token("run0000000000000a"), step_index: Some(2), prompt: "ok?".to_string() },
+                ClarifyRequest {
+                    run_id: RunId::from_token("run0000000000000a"),
+                    step_index: Some(2),
+                    prompt: "ok?".to_string(),
+                },
             )
             .await;
         assert_eq!(outcome, ClarifyOutcome::NoLiveChannel);
@@ -1495,7 +1685,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn request_clarify_frees_the_slot_after_completion_so_a_later_ask_succeeds() {
         let lock = AskLock::new_with_no_live_channel();
-        let req = |n: u32| ClarifyRequest { run_id: RunId::from_token("run0000000000000b"), step_index: Some(n), prompt: "ok?".to_string() };
+        let req = |n: u32| ClarifyRequest {
+            run_id: RunId::from_token("run0000000000000b"),
+            step_index: Some(n),
+            prompt: "ok?".to_string(),
+        };
 
         let first = lock.request_clarify("session-b", req(1)).await;
         assert_eq!(first, ClarifyOutcome::NoLiveChannel);
@@ -1503,7 +1697,11 @@ mod tests {
         // The slot must have been released after the first request completed — a second,
         // sequential ask for the SAME session must not be rejected.
         let second = lock.request_clarify("session-b", req(2)).await;
-        assert_eq!(second, ClarifyOutcome::NoLiveChannel, "must not be Rejected once the prior ask completed");
+        assert_eq!(
+            second,
+            ClarifyOutcome::NoLiveChannel,
+            "must not be Rejected once the prior ask completed"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1515,7 +1713,10 @@ mod tests {
             entered: AtomicUsize,
         }
         impl ClarifyChannel for GateChannel {
-            fn ask(&self, _request: ClarifyRequest) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+            fn ask(
+                &self,
+                _request: ClarifyRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
                 Box::pin(async move {
                     self.entered.fetch_add(1, Ordering::SeqCst);
                     self.gate.notified().await;
@@ -1524,10 +1725,17 @@ mod tests {
             }
         }
 
-        let channel = Arc::new(GateChannel { gate: tokio::sync::Notify::new(), entered: AtomicUsize::new(0) });
+        let channel = Arc::new(GateChannel {
+            gate: tokio::sync::Notify::new(),
+            entered: AtomicUsize::new(0),
+        });
         let lock = Arc::new(AskLock::new(channel.clone()));
 
-        let req = |n: u32| ClarifyRequest { run_id: RunId::from_token("run0000000000000c"), step_index: Some(n), prompt: "ok?".to_string() };
+        let req = |n: u32| ClarifyRequest {
+            run_id: RunId::from_token("run0000000000000c"),
+            step_index: Some(n),
+            prompt: "ok?".to_string(),
+        };
 
         let lock_a = lock.clone();
         let first = tokio::spawn(async move { lock_a.request_clarify("session-c", req(1)).await });
@@ -1535,19 +1743,31 @@ mod tests {
         // Wait until the first ask is genuinely in-flight (inside the channel, holding the slot)
         // before firing the second — avoids a race where the second could win the lock first.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while channel.entered.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+        while channel.entered.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline
+        {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(channel.entered.load(Ordering::SeqCst), 1, "first ask must have entered the channel");
+        assert_eq!(
+            channel.entered.load(Ordering::SeqCst),
+            1,
+            "first ask must have entered the channel"
+        );
 
         let second = lock.request_clarify("session-c", req(2)).await;
-        assert_eq!(second, ClarifyOutcome::Rejected, "R-SA-120: a second concurrent ask must be rejected");
+        assert_eq!(
+            second,
+            ClarifyOutcome::Rejected,
+            "R-SA-120: a second concurrent ask must be rejected"
+        );
 
         // Release the first ask and confirm it completes normally (the lock's own bookkeeping
         // is unaffected by the rejected second attempt).
         channel.gate.notify_one();
         let first_outcome = first.await.expect("task join");
-        assert_eq!(first_outcome, ClarifyOutcome::Answered("answered".to_string()));
+        assert_eq!(
+            first_outcome,
+            ClarifyOutcome::Answered("answered".to_string())
+        );
 
         // Only one ask ever actually entered the channel — the rejected attempt never called
         // `ask` at all.
@@ -1557,7 +1777,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn request_clarify_permits_concurrent_asks_for_different_sessions() {
         let lock = Arc::new(AskLock::new_with_no_live_channel());
-        let req = |n: u32| ClarifyRequest { run_id: RunId::from_token("run0000000000000d"), step_index: Some(n), prompt: "ok?".to_string() };
+        let req = |n: u32| ClarifyRequest {
+            run_id: RunId::from_token("run0000000000000d"),
+            step_index: Some(n),
+            prompt: "ok?".to_string(),
+        };
 
         let lock_a = lock.clone();
         let a = tokio::spawn(async move { lock_a.request_clarify("session-d1", req(1)).await });
@@ -1575,9 +1799,15 @@ mod tests {
         let rx = spawn_clarify(
             lock,
             "session-e".to_string(),
-            ClarifyRequest { run_id: RunId::from_token("run0000000000000e"), step_index: None, prompt: "ok?".to_string() },
+            ClarifyRequest {
+                run_id: RunId::from_token("run0000000000000e"),
+                step_index: None,
+                prompt: "ok?".to_string(),
+            },
         );
-        let outcome = rx.await.expect("the spawned ask completes and sends its outcome");
+        let outcome = rx
+            .await
+            .expect("the spawned ask completes and sends its outcome");
         assert_eq!(outcome, ClarifyOutcome::NoLiveChannel);
     }
 }

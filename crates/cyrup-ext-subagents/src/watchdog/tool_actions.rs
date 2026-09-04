@@ -123,7 +123,9 @@ fn parse_scope(raw: Option<&str>) -> Result<ConfigureScope, String> {
         None | Some("session") => Ok(ConfigureScope::Session),
         Some("user") => Ok(ConfigureScope::Write(WatchdogSettingsWriteScope::User)),
         Some("project") => Ok(ConfigureScope::Write(WatchdogSettingsWriteScope::Project)),
-        Some(_) => Err("watchdog.configure scope must be 'session', 'user', or 'project'.".to_string()),
+        Some(_) => {
+            Err("watchdog.configure scope must be 'session', 'user', or 'project'.".to_string())
+        }
     }
 }
 
@@ -276,7 +278,12 @@ pub fn build_check_text(
             "Subagent watchdog config check".to_string(),
             "Config errors:".to_string(),
         ];
-        lines.extend(snapshot.errors.iter().map(|error| format!("- {}", error.message)));
+        lines.extend(
+            snapshot
+                .errors
+                .iter()
+                .map(|error| format!("- {}", error.message)),
+        );
         return lines.join("\n");
     }
     let mut lines = vec![
@@ -348,7 +355,9 @@ fn handle_inner(
         )));
     }
     if action == "watchdog.recommend-model" {
-        return Ok(WatchdogToolActionResult::ok(build_recommendation_text(&model_context(ctx))?));
+        return Ok(WatchdogToolActionResult::ok(build_recommendation_text(
+            &model_context(ctx),
+        )?));
     }
     if action == "watchdog.check" {
         return Ok(WatchdogToolActionResult::ok(build_check_text(runtime, ctx)));
@@ -390,7 +399,9 @@ fn handle_inner(
 
     let ConfigureScope::Write(write_scope) = scope else {
         // Unreachable: `ConfigureScope` has exactly two variants and the session one returned above.
-        return Err("watchdog.configure scope must be 'session', 'user', or 'project'.".to_string());
+        return Err(
+            "watchdog.configure scope must be 'session', 'user', or 'project'.".to_string(),
+        );
     };
     let settings_path = write_watchdog_model_settings(&WatchdogModelSettingsWrite {
         scope: write_scope,
@@ -420,7 +431,12 @@ fn handle_inner(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use crate::watchdog::model_selection::{WatchdogModelInfo, WatchdogModelRegistry};
@@ -435,7 +451,10 @@ mod tests {
             self.0.clone()
         }
         fn find(&self, provider: &str, id: &str) -> Option<WatchdogModelInfo> {
-            self.0.iter().find(|m| m.provider == provider && m.id == id).cloned()
+            self.0
+                .iter()
+                .find(|m| m.provider == provider && m.id == id)
+                .cloned()
         }
         fn has_configured_auth(&self, _model: &WatchdogModelInfo) -> bool {
             true
@@ -490,7 +509,10 @@ mod tests {
     #[test]
     fn scope_defaults_to_session_and_rejects_anything_else() {
         assert_eq!(parse_scope(None).unwrap(), ConfigureScope::Session);
-        assert_eq!(parse_scope(Some("session")).unwrap(), ConfigureScope::Session);
+        assert_eq!(
+            parse_scope(Some("session")).unwrap(),
+            ConfigureScope::Session
+        );
         assert_eq!(
             parse_scope(Some("user")).unwrap(),
             ConfigureScope::Write(WatchdogSettingsWriteScope::User)
@@ -549,18 +571,22 @@ mod tests {
     fn a_models_own_suffix_beats_the_thinking_parameter() {
         let registry = registry();
         let ctx = WatchdogModelContext::new(&registry);
-        let value =
-            resolve_configured_value(&ctx, &params(Some("anthropic/claude-opus-4-8:xhigh"), Some("low")))
-                .unwrap();
+        let value = resolve_configured_value(
+            &ctx,
+            &params(Some("anthropic/claude-opus-4-8:xhigh"), Some("low")),
+        )
+        .unwrap();
         assert_eq!(value.description, "anthropic/claude-opus-4-8:xhigh");
         assert_eq!(
             value.thinking,
             Some(Some(ThinkingSetting::Level("xhigh".into())))
         );
         // Without a suffix the parameter applies.
-        let plain =
-            resolve_configured_value(&ctx, &params(Some("anthropic/claude-opus-4-8"), Some("low")))
-                .unwrap();
+        let plain = resolve_configured_value(
+            &ctx,
+            &params(Some("anthropic/claude-opus-4-8"), Some("low")),
+        )
+        .unwrap();
         assert_eq!(plain.description, "anthropic/claude-opus-4-8:low");
     }
 
@@ -570,7 +596,11 @@ mod tests {
         let ctx = WatchdogModelContext::new(&registry);
         let value = resolve_configured_value(&ctx, &params(Some("inherit"), None)).unwrap();
         assert_eq!(value.description, "inherit");
-        assert_eq!(value.model, Some(None), "Some(None) is upstream's null = delete");
+        assert_eq!(
+            value.model,
+            Some(None),
+            "Some(None) is upstream's null = delete"
+        );
         assert_eq!(value.thinking, Some(None));
     }
 
@@ -579,15 +609,21 @@ mod tests {
         let registry = registry();
         let ctx = WatchdogModelContext::new(&registry);
         assert_eq!(
-            resolve_configured_value(&ctx, &params(None, Some("high"))).unwrap().description,
+            resolve_configured_value(&ctx, &params(None, Some("high")))
+                .unwrap()
+                .description,
             "thinking high"
         );
         assert_eq!(
-            resolve_configured_value(&ctx, &params(None, Some("false"))).unwrap().description,
+            resolve_configured_value(&ctx, &params(None, Some("false")))
+                .unwrap()
+                .description,
             "thinking off"
         );
         assert_eq!(
-            resolve_configured_value(&ctx, &params(None, Some("inherit"))).unwrap().description,
+            resolve_configured_value(&ctx, &params(None, Some("inherit")))
+                .unwrap()
+                .description,
             "thinking inherit"
         );
     }
@@ -696,7 +732,11 @@ mod tests {
             Some(&runtime),
         );
         assert!(result.is_error);
-        assert!(result.text.starts_with("Subagent watchdog action failed: Watchdog model"));
+        assert!(
+            result
+                .text
+                .starts_with("Subagent watchdog action failed: Watchdog model")
+        );
     }
 
     #[test]
@@ -718,7 +758,10 @@ mod tests {
             &ctx,
             None,
         );
-        assert!(!check.is_error, "check reports the absence as content, not an error");
+        assert!(
+            !check.is_error,
+            "check reports the absence as content, not an error"
+        );
         assert_eq!(check.text, "Subagent watchdog runtime is unavailable.");
     }
 

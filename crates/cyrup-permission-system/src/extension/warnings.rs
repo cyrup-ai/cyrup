@@ -30,7 +30,10 @@ pub(super) struct WarningSink {
 
 impl WarningSink {
     pub(super) fn new(host_services: Arc<OnceLock<Arc<dyn HostServices>>>) -> Self {
-        Self { host_services, shown: Mutex::new(HashSet::new()) }
+        Self {
+            host_services,
+            shown: Mutex::new(HashSet::new()),
+        }
     }
 
     /// pi `notifyWarning` (`index.ts:1586-1592`): drop a message already shown this session, else

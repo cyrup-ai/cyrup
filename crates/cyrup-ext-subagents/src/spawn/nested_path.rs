@@ -46,12 +46,18 @@ impl NestedPathEntry {
 
     fn to_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
-        map.insert("runId".to_string(), serde_json::Value::String(self.run_id.clone()));
+        map.insert(
+            "runId".to_string(),
+            serde_json::Value::String(self.run_id.clone()),
+        );
         if let Some(step_index) = self.step_index {
             map.insert("stepIndex".to_string(), serde_json::Value::from(step_index));
         }
         if let Some(agent) = &self.agent {
-            map.insert("agent".to_string(), serde_json::Value::String(agent.clone()));
+            map.insert(
+                "agent".to_string(),
+                serde_json::Value::String(agent.clone()),
+            );
         }
         serde_json::Value::Object(map)
     }
@@ -131,7 +137,12 @@ pub fn encode_nested_path_env(value: &[NestedPathEntry]) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use super::*;
 
@@ -167,8 +178,16 @@ mod tests {
     #[test]
     fn env_round_trip_preserves_sanitized_entries() {
         let entries = vec![
-            NestedPathEntry { run_id: "root-run".into(), step_index: Some(0), agent: Some("root".into()) },
-            NestedPathEntry { run_id: "child".into(), step_index: Some(2), agent: None },
+            NestedPathEntry {
+                run_id: "root-run".into(),
+                step_index: Some(0),
+                agent: Some("root".into()),
+            },
+            NestedPathEntry {
+                run_id: "child".into(),
+                step_index: Some(2),
+                agent: None,
+            },
         ];
         let encoded = encode_nested_path_env(&entries);
         let decoded = parse_nested_path_env(Some(&encoded));

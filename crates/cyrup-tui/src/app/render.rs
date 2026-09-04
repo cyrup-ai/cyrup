@@ -3,8 +3,18 @@ use super::*;
 /// Pure render: lay out conversation / editor / status and render each component (`state -> frame`).
 pub fn render(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
-    let [header_h, msg_h, pending_h, band_h, images_h, wabove_h, slot_h, popup_h, wbelow_h, footer_h] =
-        region_constraints(state, area.width, area.height);
+    let [
+        header_h,
+        msg_h,
+        pending_h,
+        band_h,
+        images_h,
+        wabove_h,
+        slot_h,
+        popup_h,
+        wbelow_h,
+        footer_h,
+    ] = region_constraints(state, area.width, area.height);
     let _ = msg_h; // the message region absorbs the remainder via `Min(0)` below.
     let [
         header_area,
@@ -60,9 +70,8 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         && !state.transcript.has_active()
         && msg_area.height >= 1
     {
-        let rows =
-            crate::chrome::compact_hint_height(&state.theme, &state.keymap, msg_area.width)
-                .min(msg_area.height);
+        let rows = crate::chrome::compact_hint_height(&state.theme, &state.keymap, msg_area.width)
+            .min(msg_area.height);
         let hint_row = ratatui::layout::Rect {
             x: msg_area.x,
             y: msg_area.y.saturating_add(msg_area.height - rows),
@@ -78,7 +87,9 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
             .keymap
             .keys_label(Action::Dequeue)
             .map(|k| crate::chrome::format_key_text(&k, true));
-        state.pending_messages.render(frame, pending_area, &state.theme, dequeue.as_deref());
+        state
+            .pending_messages
+            .render(frame, pending_area, &state.theme, dequeue.as_deref());
     }
     if images_h > 0 {
         render_images(frame, images_area, state);
@@ -87,7 +98,9 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         // `(${keyText("app.interrupt")} to cancel)` (`status-indicator.ts:47,78,100`) — `keyText`,
         // so ALL bound keys joined with `/` (`keybinding-hints.ts:29-36`), not just the first.
         let cancel = state.keymap.keys_label(Action::Interrupt);
-        state.indicator.render(frame, band_area, &state.theme, cancel.as_deref());
+        state
+            .indicator
+            .render(frame, band_area, &state.theme, cancel.as_deref());
     }
     // Pi gates the hardware cursor globally — `showHardwareCursor` (`tui.ts:344,389-397`), fed from
     // the setting at `interactive-mode.ts:1721-1732` — and cyrup parks that flag on the editor
@@ -192,7 +205,12 @@ pub(crate) fn env_rows() -> Option<u16> {
 
 /// `Number(process.env.X) || …` — a positive integer, else `None`.
 pub(crate) fn env_geometry(var: &str) -> Option<u16> {
-    std::env::var(var).ok()?.trim().parse::<u16>().ok().filter(|n| *n > 0)
+    std::env::var(var)
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|n| *n > 0)
 }
 
 /// Pi's `isExtensionCommand(text)` (`interactive-mode.ts:4022-4030` @v0.83.0): a leading `/`, the
@@ -200,9 +218,16 @@ pub(crate) fn env_geometry(var: &str) -> Option<u16> {
 /// command is executed immediately even during a compaction — it is UI work, not a turn — which is
 /// why the compaction queue skips it. TUI-031.
 pub(crate) fn is_extension_command(session: &AgentSession, text: &str) -> bool {
-    let Some(body) = text.strip_prefix('/') else { return false };
+    let Some(body) = text.strip_prefix('/') else {
+        return false;
+    };
     let name = body.split_once(' ').map_or(body, |(n, _)| n);
-    session.services().ext_host.registry().has_command(name).unwrap_or(false)
+    session
+        .services()
+        .ext_host
+        .registry()
+        .has_command(name)
+        .unwrap_or(false)
 }
 
 /// Draw one placement's extension widgets, in mount order — Pi's `renderWidgets` re-adds every
@@ -240,8 +265,15 @@ pub(crate) fn render_images(frame: &mut Frame, area: ratatui::layout::Rect, stat
         }
         let want = state.image_renderer.cell_size(block, width).1.max(1);
         let h = want.min(bottom.saturating_sub(y));
-        let cell = ratatui::layout::Rect { x: area.x, y, width, height: h };
-        state.image_renderer.render(frame, cell, block, &state.theme, state.show_images);
+        let cell = ratatui::layout::Rect {
+            x: area.x,
+            y,
+            width,
+            height: h,
+        };
+        state
+            .image_renderer
+            .render(frame, cell, block, &state.theme, state.show_images);
         y = y.saturating_add(h);
     }
 }

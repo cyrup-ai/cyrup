@@ -79,7 +79,12 @@ const MATRIX: &[Combo] = &[
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-session-svc", "--no-default-features", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-session-svc",
+            "--no-default-features",
+            "--all-targets",
+        ],
         why: "compiles the native arms (builder.rs:936, :1158, :2056; session.rs:1180), which no \
               other row compiles. It does NOT remove wasmtime: `src/lib.rs:30` declares \
               `mod host_services;` ungated and that module names `cyrup_ext::{caps, host}::*`, so \
@@ -89,7 +94,12 @@ const MATRIX: &[Combo] = &[
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-tools", "--no-default-features", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-tools",
+            "--no-default-features",
+            "--all-targets",
+        ],
         why: "`inline-images` off: read.rs:330's fallback arm and the \
               `#[cfg(not(feature = \"inline-images\"))]` test at src/tests/tools.rs:210.",
         slow: false,
@@ -123,7 +133,13 @@ const MATRIX: &[Combo] = &[
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-tui", "--features", "scrollback-accumulator", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-tui",
+            "--features",
+            "scrollback-accumulator",
+            "--all-targets",
+        ],
         why: "defaults + the accumulator — the shape cyrup-it's dev edge creates \
               (crates/cyrup-it/Cargo.toml:99), and the only one in which the perf probe's \
               `scroll_region_*` delegations are actually compiled.",
@@ -131,7 +147,13 @@ const MATRIX: &[Combo] = &[
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-provider", "--features", "faux", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-provider",
+            "--features",
+            "faux",
+            "--all-targets",
+        ],
         why: "the scripted double compiles standalone, not only via cyrup-test-support's edge.",
         slow: false,
     },
@@ -144,14 +166,26 @@ const MATRIX: &[Combo] = &[
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-ext-subagents", "--features", "test-fixtures", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-ext-subagents",
+            "--features",
+            "test-fixtures",
+            "--all-targets",
+        ],
         why: "the two `required-features` fixture bins (Cargo.toml:92-112); cyrup-it's build.rs \
               builds them BY NAME and fails if a target stops existing.",
         slow: false,
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-intercom", "--features", "test-fixtures", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-intercom",
+            "--features",
+            "test-fixtures",
+            "--all-targets",
+        ],
         why: "same, for cyrup-intercom-child-fixture (Cargo.toml:62-72).",
         slow: false,
     },
@@ -174,7 +208,13 @@ const MATRIX: &[Combo] = &[
         // `--exclude cyrup-it` is NOT optional and NOT the caller's business: `--all-features`
         // sets `it`, which un-no-ops crates/cyrup-it/build.rs into a nested build of five binaries
         // plus a wasm guest and re-arms every seam test (docs/TEST-ARCHITECTURE.md §9.3 G3).
-        args: &["--workspace", "--exclude", "cyrup-it", "--all-features", "--all-targets"],
+        args: &[
+            "--workspace",
+            "--exclude",
+            "cyrup-it",
+            "--all-features",
+            "--all-targets",
+        ],
         why: "every optional feature in the workspace on AT ONCE — two that are individually fine \
               and jointly contradictory fail HERE and nowhere else. `--exclude cyrup-it` is part \
               of the row's data; feature selection is per-package, so deselecting that one package \
@@ -191,7 +231,13 @@ const MATRIX: &[Combo] = &[
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-it", "--features", "it,wasm-host", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-it",
+            "--features",
+            "it,wasm-host",
+            "--all-targets",
+        ],
         why: "the deliberate suite's own type-check — its [[test]] targets are `required-features \
               = [\"it\"]`, so the everyday gate never compiles a line of them. SLOW: build.rs runs \
               a nested cargo build of five binaries plus the wasm guest (build.rs:95-180). Set \
@@ -213,7 +259,9 @@ pub fn run_matrix(flags: &[String], root: PathBuf) -> Result<(), String> {
         match flag.as_str() {
             "--fast" => fast = true,
             other => {
-                return Err(format!("unknown flag {other:?} — feature-matrix takes `--fast`"))
+                return Err(format!(
+                    "unknown flag {other:?} — feature-matrix takes `--fast`"
+                ));
             }
         }
     }

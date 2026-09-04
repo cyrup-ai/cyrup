@@ -7,8 +7,8 @@ use crate::dispatch::Dispatcher;
 use crate::event::{EventKind, HostEvent};
 use cyrup_agent::{AgentEvent, EventSubscriber};
 use cyrup_core::CancelToken;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The notify-only subscriber handed to the agent (arch-08 §3.1).
 pub struct ExtSubscriber {
@@ -32,7 +32,10 @@ impl ExtSubscriber {
     /// listener(event, signal)`, `packages/agent/src/agent.ts:574` @v0.83.0) — so the code matched
     /// upstream and the doc did not. Removed rather than implemented, which is the port.
     pub fn new(dispatcher: Arc<Dispatcher>) -> Self {
-        Self { dispatcher, turn_index: AtomicU32::new(0) }
+        Self {
+            dispatcher,
+            turn_index: AtomicU32::new(0),
+        }
     }
 }
 
@@ -58,17 +61,30 @@ impl EventSubscriber for ExtSubscriber {
 
         // Cheap gate: map to kind and bail before any serialization if nobody subscribed
         // (R-08-034 / R-ARCH-EXT-014).
-        let Some(kind) = EventKind::from_agent(event) else { return };
+        let Some(kind) = EventKind::from_agent(event) else {
+            return;
+        };
         if self.dispatcher.no_subscribers(kind) {
             return;
         }
-        let Some(host_ev) = HostEvent::from_agent(event) else { return };
+        let Some(host_ev) = HostEvent::from_agent(event) else {
+            return;
+        };
         // Inject the derived turn index into the turn events (the raw upstream events omit it).
         let host_ev = match host_ev {
-            HostEvent::TurnStart { timestamp, .. } => HostEvent::TurnStart { turn_index, timestamp },
-            HostEvent::TurnEnd { message, tool_results, .. } => {
-                HostEvent::TurnEnd { turn_index, message, tool_results }
-            }
+            HostEvent::TurnStart { timestamp, .. } => HostEvent::TurnStart {
+                turn_index,
+                timestamp,
+            },
+            HostEvent::TurnEnd {
+                message,
+                tool_results,
+                ..
+            } => HostEvent::TurnEnd {
+                turn_index,
+                message,
+                tool_results,
+            },
             other => other,
         };
         self.dispatcher.dispatch_notify(&host_ev, &cancel).await;

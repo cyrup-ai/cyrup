@@ -41,13 +41,11 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-
 use cyrup_core::{CancelToken, Tool, ToolCallId};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::native_supervisor::{
     self, ChildChannelMetadata, NativeSupervisorChannel, SubagentSupervisorTool, SupervisorReason,
 };
-
+use cyrup_ext_subagents::paths::Roots;
 
 /// Point the shared subagents temp root at a private tempdir for the duration of a test, so the
 /// A channel-directory tree owned by one test.
@@ -150,7 +148,9 @@ async fn a_blocking_child_request_is_surfaced_answered_and_then_never_re_surface
         session_id: "session-parent-1".to_string(),
         ..Default::default()
     });
-    let channel = Arc::new(NativeSupervisorChannel::with_root(root_dir.path().to_path_buf()));
+    let channel = Arc::new(NativeSupervisorChannel::with_root(
+        root_dir.path().to_path_buf(),
+    ));
     channel.bind_services(services.clone());
     let tool = SubagentSupervisorTool::new(channel.clone());
 
@@ -161,7 +161,12 @@ async fn a_blocking_child_request_is_surfaced_answered_and_then_never_re_surface
     assert!(status.contains("Pending replies: 0."), "got: {status}");
 
     // --- the child writes a BLOCKING request into its own channel directory ---
-    let channel_dir = native_supervisor::resolve_supervisor_channel_dir_in(root_dir.path(), "run-XYZ", "reviewer", 2);
+    let channel_dir = native_supervisor::resolve_supervisor_channel_dir_in(
+        root_dir.path(),
+        "run-XYZ",
+        "reviewer",
+        2,
+    );
     native_supervisor::ensure_supervisor_channel_dir(&channel_dir).expect("channel dirs");
     let metadata = child_metadata(&channel_dir, "session-parent-1");
 
@@ -185,8 +190,16 @@ async fn a_blocking_child_request_is_surfaced_answered_and_then_never_re_surface
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    assert_eq!(adopted.len(), 1, "the parent must adopt the child's request");
-    assert!(adopted[0].contains("main or develop?"), "got: {}", adopted[0]);
+    assert_eq!(
+        adopted.len(),
+        1,
+        "the parent must adopt the child's request"
+    );
+    assert!(
+        adopted[0].contains("main or develop?"),
+        "got: {}",
+        adopted[0]
+    );
     assert!(
         adopted[0].contains("Reply with: subagent_supervisor("),
         "a blocking request must carry its reply recipe: {}",
@@ -210,7 +223,10 @@ async fn a_blocking_child_request_is_surfaced_answered_and_then_never_re_surface
     // `pending` now lists it with the id the reply recipe named.
     let listed = call_tool(&tool, serde_json::json!({ "action": "pending" })).await;
     assert!(listed.starts_with("- "), "got: {listed}");
-    assert!(listed.contains("reviewer [run-XYZ#2] need_decision."), "got: {listed}");
+    assert!(
+        listed.contains("reviewer [run-XYZ#2] need_decision."),
+        "got: {listed}"
+    );
     let pending = channel.pending();
     assert_eq!(pending.len(), 1);
     let request_id = pending[0].request.id.clone();
@@ -222,7 +238,10 @@ async fn a_blocking_child_request_is_surfaced_answered_and_then_never_re_surface
         serde_json::json!({ "action": "reply", "replyTo": request_id, "message": "use develop" }),
     )
     .await;
-    assert_eq!(replied, format!("Replied to supervisor request {request_id}."));
+    assert_eq!(
+        replied,
+        format!("Replied to supervisor request {request_id}.")
+    );
 
     // --- the BLOCKED child unblocks with the supervisor's answer ---
     let (_request, reply) = child
@@ -237,9 +256,15 @@ async fn a_blocking_child_request_is_surfaced_answered_and_then_never_re_surface
         !request_file.exists(),
         "answering must delete the request file, or every later tick re-injects it"
     );
-    assert!(channel.pending().is_empty(), "an answered request must leave the pending map");
+    assert!(
+        channel.pending().is_empty(),
+        "an answered request must leave the pending map"
+    );
     let after = channel.poll_once();
-    assert!(after.is_empty(), "a second poll must adopt nothing: {after:?}");
+    assert!(
+        after.is_empty(),
+        "a second poll must adopt nothing: {after:?}"
+    );
     assert_eq!(
         services.injected.lock().unwrap().len(),
         1,
@@ -260,10 +285,13 @@ async fn a_progress_update_is_surfaced_but_never_becomes_pending() {
         session_id: "session-parent-1".to_string(),
         ..Default::default()
     });
-    let channel = Arc::new(NativeSupervisorChannel::with_root(root_dir.path().to_path_buf()));
+    let channel = Arc::new(NativeSupervisorChannel::with_root(
+        root_dir.path().to_path_buf(),
+    ));
     channel.bind_services(services.clone());
 
-    let channel_dir = native_supervisor::resolve_supervisor_channel_dir_in(root_dir.path(), "run-A", "worker", 0);
+    let channel_dir =
+        native_supervisor::resolve_supervisor_channel_dir_in(root_dir.path(), "run-A", "worker", 0);
     native_supervisor::ensure_supervisor_channel_dir(&channel_dir).expect("channel dirs");
     let metadata = child_metadata(&channel_dir, "session-parent-1");
     let (request, reply) = native_supervisor::send_supervisor_request(
@@ -275,11 +303,18 @@ async fn a_progress_update_is_surfaced_but_never_becomes_pending() {
     )
     .await
     .expect("a progress update never blocks");
-    assert!(reply.is_none(), "a progress update must not wait for a reply");
+    assert!(
+        reply.is_none(),
+        "a progress update must not wait for a reply"
+    );
     assert!(!request.expects_reply);
 
     let adopted = channel.poll_once();
-    assert_eq!(adopted.len(), 1, "the update is still shown to the supervisor");
+    assert_eq!(
+        adopted.len(),
+        1,
+        "the update is still shown to the supervisor"
+    );
     assert!(adopted[0].contains("UPDATE: halfway"));
     assert!(
         !adopted[0].contains("Reply with:"),
@@ -312,10 +347,13 @@ async fn a_request_from_another_orchestrator_session_is_never_adopted() {
         session_id: "session-parent-1".to_string(),
         ..Default::default()
     });
-    let channel = Arc::new(NativeSupervisorChannel::with_root(root_dir.path().to_path_buf()));
+    let channel = Arc::new(NativeSupervisorChannel::with_root(
+        root_dir.path().to_path_buf(),
+    ));
     channel.bind_services(services.clone());
 
-    let channel_dir = native_supervisor::resolve_supervisor_channel_dir_in(root_dir.path(), "run-B", "worker", 0);
+    let channel_dir =
+        native_supervisor::resolve_supervisor_channel_dir_in(root_dir.path(), "run-B", "worker", 0);
     native_supervisor::ensure_supervisor_channel_dir(&channel_dir).expect("channel dirs");
     // Keyed to a session this orchestrator is not.
     let metadata = child_metadata(&channel_dir, "session-SOMEONE-ELSE");
@@ -356,7 +394,9 @@ async fn a_request_from_another_orchestrator_session_is_never_adopted() {
 async fn send_and_ask_are_refused_with_the_upstream_text_and_unknown_actions_are_rejected() {
     let root_dir = channel_root();
 
-    let channel = Arc::new(NativeSupervisorChannel::with_root(root_dir.path().to_path_buf()));
+    let channel = Arc::new(NativeSupervisorChannel::with_root(
+        root_dir.path().to_path_buf(),
+    ));
     channel.bind_services(Arc::new(RecordingServices {
         session_id: "session-parent-1".to_string(),
         ..Default::default()
@@ -374,7 +414,8 @@ async fn send_and_ask_are_refused_with_the_upstream_text_and_unknown_actions_are
             .await
             .expect_err("send/ask are refused on the parent side");
         assert!(
-            err.to_string().contains("Child agents initiate asks with contact_supervisor"),
+            err.to_string()
+                .contains("Child agents initiate asks with contact_supervisor"),
             "`{action}` must point the model at the child-side tool: {err}"
         );
     }
@@ -388,7 +429,10 @@ async fn send_and_ask_are_refused_with_the_upstream_text_and_unknown_actions_are
         )
         .await
         .expect_err("an unadvertised action is rejected");
-    assert!(err.to_string().contains("Unsupported intercom action: frobnicate"));
+    assert!(
+        err.to_string()
+            .contains("Unsupported intercom action: frobnicate")
+    );
 
     // Every value the schema advertises must have a dispatch arm (the crate's own invariant).
     let advertised: Vec<String> = tool.parameters()["properties"]["action"]["enum"]
@@ -397,7 +441,10 @@ async fn send_and_ask_are_refused_with_the_upstream_text_and_unknown_actions_are
         .iter()
         .map(|v| v.as_str().expect("string").to_string())
         .collect();
-    assert_eq!(advertised, ["list", "send", "ask", "reply", "pending", "status"]);
+    assert_eq!(
+        advertised,
+        ["list", "send", "ask", "reply", "pending", "status"]
+    );
     for action in &advertised {
         let outcome = tool
             .execute(
@@ -429,12 +476,19 @@ async fn an_ambiguous_reply_is_refused_rather_than_guessed() {
         session_id: "session-parent-1".to_string(),
         ..Default::default()
     });
-    let channel = Arc::new(NativeSupervisorChannel::with_root(root_dir.path().to_path_buf()));
+    let channel = Arc::new(NativeSupervisorChannel::with_root(
+        root_dir.path().to_path_buf(),
+    ));
     channel.bind_services(services);
 
     let mut children = Vec::new();
     for index in 0..2usize {
-        let dir = native_supervisor::resolve_supervisor_channel_dir_in(root_dir.path(), "run-C", "worker", index);
+        let dir = native_supervisor::resolve_supervisor_channel_dir_in(
+            root_dir.path(),
+            "run-C",
+            "worker",
+            index,
+        );
         native_supervisor::ensure_supervisor_channel_dir(&dir).expect("channel dirs");
         let mut metadata = child_metadata(&dir, "session-parent-1");
         metadata.run_id = "run-C".to_string();
@@ -484,10 +538,18 @@ async fn an_ambiguous_reply_is_refused_rather_than_guessed() {
 
     // A `to` naming ONE child's own presence label resolves unambiguously and unblocks that child.
     channel
-        .reply(None, Some("subagent-worker-run-c-1"), "answer for the first")
+        .reply(
+            None,
+            Some("subagent-worker-run-c-1"),
+            "answer for the first",
+        )
         .await
         .expect("a unique `to` resolves");
-    assert_eq!(channel.pending().len(), 1, "only the answered one leaves the map");
+    assert_eq!(
+        channel.pending().len(),
+        1,
+        "only the answered one leaves the map"
+    );
 
     for child in children {
         child.abort();
@@ -517,7 +579,7 @@ async fn an_ambiguous_reply_is_refused_rather_than_guessed() {
 async fn the_supervisor_tool_is_registered_and_dispatches_on_a_real_session() {
     use cyrup_ext_subagents::extension::SubagentsExtension;
     use cyrup_ext_subagents::registration::SubagentExtensionConfig;
-    use cyrup_test_support::harness::{create_harness_with_extensions, HarnessOptions};
+    use cyrup_test_support::harness::{HarnessOptions, create_harness_with_extensions};
     use cyrup_test_support::response::FauxResponse;
 
     let home = tempfile::tempdir().expect("home tempdir");
@@ -607,7 +669,11 @@ async fn the_supervisor_tool_is_registered_and_dispatches_on_a_real_session() {
             _ => None,
         })
         .collect();
-    assert_eq!(ends.len(), 2, "expected one tool_execution_end per call; got: {events:#?}");
+    assert_eq!(
+        ends.len(),
+        2,
+        "expected one tool_execution_end per call; got: {events:#?}"
+    );
     for (tool_name, result, is_error) in &ends {
         assert!(
             !is_error,
@@ -732,10 +798,8 @@ async fn a_child_that_declared_intercom_gets_both_native_supervisor_tools() {
 
     // `InitApi` exposes no tool list, so assert on the tools the resolver actually built — the
     // same objects `init` hands to `register_tool`.
-    let contact = native_supervisor::NativeContactSupervisorTool::new(child_metadata(
-        &channel_dir,
-        "sess-e",
-    ));
+    let contact =
+        native_supervisor::NativeContactSupervisorTool::new(child_metadata(&channel_dir, "sess-e"));
     let fallback =
         native_supervisor::NativeChildIntercomTool::new(child_metadata(&channel_dir, "sess-e"));
     assert_eq!(cyrup_core::Tool::name(&contact), "contact_supervisor");

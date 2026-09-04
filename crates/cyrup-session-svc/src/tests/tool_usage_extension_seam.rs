@@ -15,21 +15,28 @@
 //! of `Hooks::after_tool_call` — `cyrup-ext`'s bridge — could neither see nor change it.
 //!
 //! These run the real loop against the real `PolicyHooks` → `ExtHooks` → dispatcher chain.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::{SessionBuilder, SessionConfig};
 use cyrup_core::{
     CancelToken, Content, ExtensionId, StopReason, Tool, ToolCallId, ToolError, ToolResult,
     ToolUpdateSink, Usage,
 };
-use cyrup_ext::{EventKind, EventPatch, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
+use cyrup_ext::{
+    EventKind, EventPatch, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
 };
 use cyrup_provider::Provider;
-use crate::{SessionBuilder, SessionConfig};
+use cyrup_provider::faux::{
+    FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
+};
 use tempfile::TempDir;
 
 // ------------------------------------------------------------------------------ fixtures ----
@@ -46,7 +53,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -57,7 +68,12 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 }
 
 fn usage(input: u64, output: u64) -> Usage {
-    Usage { input, output, total_tokens: input + output, ..Usage::default() }
+    Usage {
+        input,
+        output,
+        total_tokens: input + output,
+        ..Usage::default()
+    }
 }
 
 /// A tool that reports usage for its OWN execution (Pi `AgentToolResult.usage`, types.ts:360-361 —
@@ -117,7 +133,9 @@ impl NativeExtension for UsageExt {
         Ok(())
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        let HostEvent::ToolResult { usage, .. } = ev else { return HookOutcome::Noop };
+        let HostEvent::ToolResult { usage, .. } = ev else {
+            return HookOutcome::Noop;
+        };
         self.seen.lock().unwrap().push(usage.clone());
         match &self.act {
             Act::Observe => HookOutcome::Noop,
@@ -160,14 +178,22 @@ async fn run_full(
     fx: &Fixture,
     reports: Option<Usage>,
     act: Act,
-) -> (Vec<Option<Usage>>, cyrup_agent::ToolResultMessage, crate::SessionStats) {
+) -> (
+    Vec<Option<Usage>>,
+    cyrup_agent::ToolResultMessage,
+    crate::SessionStats,
+) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut cfg = base_config(fx);
-    cfg.custom_tools =
-        vec![Arc::new(BillingTool { reports, params: serde_json::json!({"type":"object"}) })
-            as Arc<dyn Tool>];
+    cfg.custom_tools = vec![Arc::new(BillingTool {
+        reports,
+        params: serde_json::json!({"type":"object"}),
+    }) as Arc<dyn Tool>];
     let session = SessionBuilder::new(faux_one_tool_turn() as Arc<dyn Provider>, cfg)
-        .with_native_extension(Arc::new(UsageExt { seen: seen.clone(), act }))
+        .with_native_extension(Arc::new(UsageExt {
+            seen: seen.clone(),
+            act,
+        }))
         .build()
         .await
         .unwrap()
@@ -211,7 +237,11 @@ async fn run(
 async fn an_extension_observes_the_usage_the_tool_reported() {
     let fx = fixture();
     let (seen, result) = run(&fx, Some(usage(11, 22)), Act::Observe).await;
-    assert_eq!(seen, vec![Some(usage(11, 22))], "the handler saw the tool's own usage");
+    assert_eq!(
+        seen,
+        vec![Some(usage(11, 22))],
+        "the handler saw the tool's own usage"
+    );
     // Observation is not mutation: a `Noop` handler leaves the value exactly as the tool set it.
     assert_eq!(result.usage, Some(usage(11, 22)));
 }
@@ -231,8 +261,16 @@ async fn a_tool_that_reports_no_usage_shows_the_handler_none() {
 async fn an_extension_patches_the_tool_result_usage() {
     let fx = fixture();
     let (seen, result) = run(&fx, Some(usage(11, 22)), Act::Patch(usage(700, 800))).await;
-    assert_eq!(seen, vec![Some(usage(11, 22))], "it observed before replacing");
-    assert_eq!(result.usage, Some(usage(700, 800)), "the handler's usage replaced the tool's");
+    assert_eq!(
+        seen,
+        vec![Some(usage(11, 22))],
+        "it observed before replacing"
+    );
+    assert_eq!(
+        result.usage,
+        Some(usage(700, 800)),
+        "the handler's usage replaced the tool's"
+    );
 }
 
 /// A handler may ADD usage to a tool that reported none — the shape a metering extension needs.
@@ -249,12 +287,20 @@ async fn an_extension_can_attach_usage_to_a_tool_that_reported_none() {
 async fn a_patch_that_omits_usage_keeps_the_tools_value() {
     let fx = fixture();
     let (_seen, result) = run(&fx, Some(usage(11, 22)), Act::PatchContentOnly).await;
-    assert_eq!(result.usage, Some(usage(11, 22)), "an omitted key keeps, never clears");
+    assert_eq!(
+        result.usage,
+        Some(usage(11, 22)),
+        "an omitted key keeps, never clears"
+    );
     let text = result.content.iter().find_map(|c| match c {
         Content::Text { text, .. } => Some(text.to_string()),
         _ => None,
     });
-    assert_eq!(text.as_deref(), Some("rewritten"), "the patch that WAS made still applied");
+    assert_eq!(
+        text.as_deref(),
+        Some("rewritten"),
+        "the patch that WAS made still applied"
+    );
 }
 
 // ------------------------------------------------------------------ session-total accounting ----
@@ -274,7 +320,10 @@ async fn tool_reported_usage_reaches_the_session_stats_totals() {
     let (_seen, result, with_tool) = run_full(&fx, Some(usage(11, 22)), Act::Observe).await;
 
     assert_eq!(result.usage, Some(usage(11, 22)));
-    assert_eq!(with_tool.tool_results, baseline.tool_results, "same shape of run");
+    assert_eq!(
+        with_tool.tool_results, baseline.tool_results,
+        "same shape of run"
+    );
     assert_eq!(
         with_tool.tokens.input - baseline.tokens.input,
         11,

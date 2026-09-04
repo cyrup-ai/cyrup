@@ -13,10 +13,10 @@
 //! - [`BorderedLoader`] — a `DynamicBorder`-delimited spinner+message with an optional cancel hint
 //!   (`bordered-loader.ts` `BorderedLoader`), the loader chrome extension UI and long ops draw inline.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::keymap::{Action, Keymap};
 use crate::selector::border_rule;
@@ -78,10 +78,18 @@ pub fn compact_hints(keymap: &Keymap) -> Vec<(String, String)> {
     // `rawKeyHint(`${keyText("app.clear")}/${keyText("app.exit")}`, …)` — every key here resolves
     // through `keyText`, which joins ALL bound keys with `/` (`keybinding-hints.ts:29-36`). So these
     // are [`Keymap::keys_label`], not the first-key `key_label`: a two-key rebind must show both.
-    let interrupt = keymap.keys_label(Action::Interrupt).unwrap_or_else(|| "escape".into());
-    let clear = keymap.keys_label(Action::Clear).unwrap_or_else(|| "ctrl+c".into());
-    let exit = keymap.keys_label(Action::Quit).unwrap_or_else(|| "ctrl+d".into());
-    let expand = keymap.keys_label(Action::ToolsExpand).unwrap_or_else(|| "ctrl+o".into());
+    let interrupt = keymap
+        .keys_label(Action::Interrupt)
+        .unwrap_or_else(|| "escape".into());
+    let clear = keymap
+        .keys_label(Action::Clear)
+        .unwrap_or_else(|| "ctrl+c".into());
+    let exit = keymap
+        .keys_label(Action::Quit)
+        .unwrap_or_else(|| "ctrl+d".into());
+    let expand = keymap
+        .keys_label(Action::ToolsExpand)
+        .unwrap_or_else(|| "ctrl+o".into());
     vec![
         (interrupt, "interrupt".to_string()),
         (format!("{clear}/{exit}"), "clear/exit".to_string()),
@@ -98,7 +106,9 @@ pub fn compact_hints(keymap: &Keymap) -> Vec<(String, String)> {
 /// had no counterpart at all (`grep -rn "to show full startup help" crates/` found nothing).
 pub fn compact_onboarding(keymap: &Keymap) -> String {
     // `keyText("app.tools.expand")` — all bound keys joined with `/` (`keybinding-hints.ts:29-36`).
-    let expand = keymap.keys_label(Action::ToolsExpand).unwrap_or_else(|| "ctrl+o".into());
+    let expand = keymap
+        .keys_label(Action::ToolsExpand)
+        .unwrap_or_else(|| "ctrl+o".into());
     format!("Press {expand} to show full startup help and loaded resources.")
 }
 
@@ -142,7 +152,9 @@ struct HintEntry {
 
 /// The block's content width — `contentWidth = Math.max(1, width - paddingX * 2)` (`text.ts:64`).
 fn hint_content_width(width: u16) -> u16 {
-    width.saturating_sub(HINT_PADDING_X.saturating_mul(2)).max(1)
+    width
+        .saturating_sub(HINT_PADDING_X.saturating_mul(2))
+        .max(1)
 }
 
 /// The six entries, each already measured against `width`'s wrapping.
@@ -154,10 +166,14 @@ fn hint_content_width(width: u16) -> u16 {
 /// top-aligned `Paragraph`, so a one-row budget drew the blank and the bar vanished entirely.
 fn compact_hint_entries(theme: &UiTheme, keymap: &Keymap, width: u16) -> Vec<HintEntry> {
     let content = hint_content_width(width);
-    let blank = |rank: u8| HintEntry { lines: vec![Line::default()], rows: 1, drop_rank: rank };
+    let blank = |rank: u8| HintEntry {
+        lines: vec![Line::default()],
+        rows: 1,
+        drop_rank: rank,
+    };
     let text = |lines: Vec<Line<'static>>, rank: u8| HintEntry {
-        rows: crate::transcript::wrapped_height(&lines, content as usize)
-            .min(u16::MAX as usize) as u16,
+        rows: crate::transcript::wrapped_height(&lines, content as usize).min(u16::MAX as usize)
+            as u16,
         lines,
         drop_rank: rank,
     };
@@ -179,7 +195,13 @@ fn compact_hint_entries(theme: &UiTheme, keymap: &Keymap, width: u16) -> Vec<Hin
             1,
         ),
         blank(2),
-        text(vec![Line::styled(STARTUP_ONBOARDING.to_string(), theme.dim_style())], 3),
+        text(
+            vec![Line::styled(
+                STARTUP_ONBOARDING.to_string(),
+                theme.dim_style(),
+            )],
+            3,
+        ),
         blank(5),
     ]
 }
@@ -190,7 +212,10 @@ fn compact_hint_entries(theme: &UiTheme, keymap: &Keymap, width: u16) -> Vec<Hin
 /// cyrup previously reserved a fixed row count and rendered a fixed-height `Paragraph` with no
 /// `.wrap()`, so on a narrow terminal the overflowing half of each line was simply lost.
 pub fn compact_hint_height(theme: &UiTheme, keymap: &Keymap, width: u16) -> u16 {
-    compact_hint_entries(theme, keymap, width).iter().map(|e| e.rows).fold(0u16, u16::saturating_add)
+    compact_hint_entries(theme, keymap, width)
+        .iter()
+        .map(|e| e.rows)
+        .fold(0u16, u16::saturating_add)
 }
 
 /// Render the compact hint block into `area`, wrapping each row group at
@@ -220,7 +245,10 @@ pub fn render_compact_hints(frame: &mut Frame, area: Rect, theme: &UiTheme, keym
 
     // Paint the block's own background first: each group renders into an INSET rect, so the padding
     // columns would otherwise keep whatever was in the buffer.
-    frame.render_widget(Paragraph::new(Vec::<Line<'static>>::new()).style(theme.base_style()), area);
+    frame.render_widget(
+        Paragraph::new(Vec::<Line<'static>>::new()).style(theme.base_style()),
+        area,
+    );
 
     // `paddingX` only fits once the row is at least 3 columns wide; below that upstream's
     // `Math.max(1, width - 2)` collapses the content anyway.
@@ -239,7 +267,9 @@ pub fn render_compact_hints(frame: &mut Frame, area: Rect, theme: &UiTheme, keym
             height,
         };
         frame.render_widget(
-            Paragraph::new(entry.lines).wrap(Wrap { trim: false }).style(theme.base_style()),
+            Paragraph::new(entry.lines)
+                .wrap(Wrap { trim: false })
+                .style(theme.base_style()),
             rect,
         );
         y = y.saturating_add(height);
@@ -279,19 +309,26 @@ pub struct VisualTruncate {
 /// count — it also reported the wrong `... N more lines`.
 pub fn truncate_to_visual_lines(text: &str, max: usize, width: usize) -> VisualTruncate {
     if text.is_empty() {
-        return VisualTruncate { lines: Vec::new(), skipped: 0 };
+        return VisualTruncate {
+            lines: Vec::new(),
+            skipped: 0,
+        };
     }
     let width = width.max(1);
     let mut visual: Vec<String> = Vec::new();
     // `wrapTextWithAnsi` splits on `/\r\n|\r|\n/` first (`utils.ts:839`) and wraps each piece,
     // returning `[""]` for an empty one (`:858-860`) so a blank output line keeps its row.
     for logical in text.split('\n') {
-        for row in crate::transcript::wrap_line(&Line::from(Span::raw(logical.to_string())), width) {
+        for row in crate::transcript::wrap_line(&Line::from(Span::raw(logical.to_string())), width)
+        {
             visual.push(row.spans.iter().map(|s| s.content.as_ref()).collect());
         }
     }
     if visual.len() <= max {
-        return VisualTruncate { lines: visual, skipped: 0 };
+        return VisualTruncate {
+            lines: visual,
+            skipped: 0,
+        };
     }
     let skipped = visual.len() - max;
     let lines = visual.split_off(skipped);
@@ -317,12 +354,20 @@ pub struct BorderedLoader {
 impl BorderedLoader {
     /// A cancellable loader with `message` and the `tui.select.cancel` key label for its hint.
     pub fn cancellable(message: impl Into<String>, cancel_key: impl Into<String>) -> Self {
-        BorderedLoader { message: message.into(), cancellable: true, cancel_key: Some(cancel_key.into()) }
+        BorderedLoader {
+            message: message.into(),
+            cancellable: true,
+            cancel_key: Some(cancel_key.into()),
+        }
     }
 
     /// A non-cancellable loader (no hint row).
     pub fn plain(message: impl Into<String>) -> Self {
-        BorderedLoader { message: message.into(), cancellable: false, cancel_key: None }
+        BorderedLoader {
+            message: message.into(),
+            cancellable: false,
+            cancel_key: None,
+        }
     }
 
     /// The number of rows this loader occupies: **7** cancellable, **5** plain.
@@ -334,11 +379,7 @@ impl BorderedLoader {
     /// blank and both `Spacer(1)` rows, so the spinner sat against the top rule and the hint against
     /// the bottom one.
     pub fn height(&self) -> u16 {
-        if self.cancellable {
-            7
-        } else {
-            5
-        }
+        if self.cancellable { 7 } else { 5 }
     }
 
     /// Render the loader into `area`, selecting the spinner frame from `tick` (the 80 ms phase index).
@@ -357,7 +398,10 @@ impl BorderedLoader {
         .areas(area);
         let _ = (lead, gap, tail); // `Spacer(1)` rows: deliberately blank (`spacer.ts:21-27`).
         frame.render_widget(border_rule(top.width, theme), top);
-        let spin = SPINNER_FRAMES.get(tick % SPINNER_FRAMES.len()).copied().unwrap_or("⠋");
+        let spin = SPINNER_FRAMES
+            .get(tick % SPINNER_FRAMES.len())
+            .copied()
+            .unwrap_or("⠋");
         let body_line = Line::from(vec![
             // `spinnerColorFn = (s) => theme.fg("accent", s)` but
             // `messageColorFn = (s) => theme.fg("muted", s)` (`bordered-loader.ts:20-21`, `:28-29`)
@@ -370,7 +414,10 @@ impl BorderedLoader {
         ]);
         frame.render_widget(Paragraph::new(body_line).style(theme.base_style()), body);
         if self.cancellable {
-            let key = self.cancel_key.clone().unwrap_or_else(|| "escape/ctrl+c".into());
+            let key = self
+                .cancel_key
+                .clone()
+                .unwrap_or_else(|| "escape/ctrl+c".into());
             let hint_line = Line::from({
                 let mut spans = vec![Span::raw(" ")];
                 spans.extend(key_hint_spans(&key, "cancel", theme));

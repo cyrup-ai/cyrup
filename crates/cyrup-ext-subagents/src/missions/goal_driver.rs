@@ -100,7 +100,9 @@ fn bounded(value: &str) -> String {
 fn token_usage(value: Option<&Value>) -> Option<u64> {
     let total = value?.as_object()?.get("total")?.as_i64()?;
     // `Number.isSafeInteger(total) && total >= 0` — the upper bound is JS's 2^53-1.
-    (0..=9_007_199_254_740_991).contains(&total).then(|| total.unsigned_abs())
+    (0..=9_007_199_254_740_991)
+        .contains(&total)
+        .then(|| total.unsigned_abs())
 }
 
 /// pi `readLinkedRun` (`goal-driver.ts:30-49`): re-read a linked run's `status.json` and project
@@ -112,15 +114,17 @@ fn token_usage(value: Option<&Value>) -> Option<u64> {
 /// alternative — silently treating a malformed status as "no change" — would let a live run look
 /// idle and generate a spurious continuation notice.
 fn read_linked_run(run: &MissionRunLink) -> MissionResult<MissionRunLink> {
-    let Some(async_dir) = run.async_dir.as_deref() else { return Ok(run.clone()) };
+    let Some(async_dir) = run.async_dir.as_deref() else {
+        return Ok(run.clone());
+    };
     let status_path = Path::new(async_dir).join("status.json");
     if !status_path.exists() {
         return Ok(run.clone());
     }
     let raw = std::fs::read_to_string(&status_path)
         .map_err(|err| super::MissionError::io(&status_path, err))?;
-    let status: Value = serde_json::from_str(&raw)
-        .map_err(|err| super::MissionError::invalid(err.to_string()))?;
+    let status: Value =
+        serde_json::from_str(&raw).map_err(|err| super::MissionError::invalid(err.to_string()))?;
     let state = status
         .get("state")
         .and_then(Value::as_str)
@@ -135,7 +139,11 @@ fn read_linked_run(run: &MissionRunLink) -> MissionResult<MissionRunLink> {
         status.get("steps").and_then(Value::as_array).map(|steps| {
             steps
                 .iter()
-                .map(|step| step.as_object().and_then(|s| token_usage(s.get("tokens"))).unwrap_or(0))
+                .map(|step| {
+                    step.as_object()
+                        .and_then(|s| token_usage(s.get("tokens")))
+                        .unwrap_or(0)
+                })
                 .sum()
         })
     });
@@ -158,13 +166,19 @@ fn refresh_goal_mission(
     location: &MissionStoreLocation,
     record: MissionRecord,
 ) -> MissionResult<MissionRecord> {
-    let runs = record.runs.iter().map(read_linked_run).collect::<MissionResult<Vec<_>>>()?;
+    let runs = record
+        .runs
+        .iter()
+        .map(read_linked_run)
+        .collect::<MissionResult<Vec<_>>>()?;
     if runs == record.runs {
         return Ok(record);
     }
-    let active = runs
-        .iter()
-        .any(|run| run.status.as_deref().is_some_and(|s| ACTIVE_RUN_STATUSES.contains(&s)));
+    let active = runs.iter().any(|run| {
+        run.status
+            .as_deref()
+            .is_some_and(|s| ACTIVE_RUN_STATUSES.contains(&s))
+    });
     let status = if active || record.goal.is_some() {
         MissionStatus::Active
     } else {
@@ -173,7 +187,11 @@ fn refresh_goal_mission(
     update_mission(
         location,
         &record.id,
-        &MissionUpdateInput { status: Some(status), add_runs: runs, ..Default::default() },
+        &MissionUpdateInput {
+            status: Some(status),
+            add_runs: runs,
+            ..Default::default()
+        },
         crate::time::now_epoch_millis(),
         None,
     )
@@ -218,9 +236,10 @@ impl StateNode {
     /// `input[key]` — the entry for `key`, or `None` when this node is not an object.
     fn get(&self, key: &str) -> Option<&Self> {
         match self {
-            Self::Object(entries) => {
-                entries.iter().find(|(k, _)| k == key).map(|(_, value)| value)
-            }
+            Self::Object(entries) => entries
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, value)| value),
             _ => None,
         }
     }
@@ -476,7 +495,9 @@ pub fn collect_goal_continuation_notices(
         if goal.status != MissionGoalStatus::Active {
             continue;
         }
-        let Some(budget) = record.budget else { continue };
+        let Some(budget) = record.budget else {
+            continue;
+        };
         if record.usage.map_or(0, |u| u.tokens) >= budget.tokens {
             // A no-op update whose sole purpose is to re-run `updateMission`'s budget-exhaustion
             // transition and persist it (`goal-driver.ts:132`).
@@ -494,14 +515,16 @@ pub fn collect_goal_continuation_notices(
                 continue;
             }
         }
-        if record
-            .runs
-            .iter()
-            .any(|run| run.status.as_deref().is_some_and(|s| ACTIVE_RUN_STATUSES.contains(&s)))
-        {
+        if record.runs.iter().any(|run| {
+            run.status
+                .as_deref()
+                .is_some_and(|s| ACTIVE_RUN_STATUSES.contains(&s))
+        }) {
             continue;
         }
-        let Some(budget) = record.budget else { continue };
+        let Some(budget) = record.budget else {
+            continue;
+        };
         if !seen.insert(record.id.clone()) {
             continue;
         }
@@ -557,7 +580,9 @@ mod tests {
     use super::*;
     use crate::missions::store::{create_mission, resolve_mission_store_location};
     use crate::missions::workflow_state::create_mission_workflow_state;
-    use crate::missions::{MissionCreateInput, MissionDecisionInput, MissionRunMode, MissionTokenBudget};
+    use crate::missions::{
+        MissionCreateInput, MissionDecisionInput, MissionRunMode, MissionTokenBudget,
+    };
 
     fn location(root: &Path) -> MissionStoreLocation {
         resolve_mission_store_location(root, None, Some(&root.join("agent")))
@@ -613,7 +638,10 @@ mod tests {
             notice.event.event_type,
             crate::registration::ControlEventType::NeedsAttention
         );
-        assert_eq!(notice.event.to, crate::background::ActivityState::NeedsAttention);
+        assert_eq!(
+            notice.event.to,
+            crate::background::ActivityState::NeedsAttention
+        );
         assert_eq!(
             notice.event.reason,
             Some(crate::exec::control::ControlEventReason::Idle)
@@ -655,15 +683,20 @@ mod tests {
         update_mission(
             &loc,
             &closed.id,
-            &MissionUpdateInput { status: Some(MissionStatus::Completed), ..Default::default() },
+            &MissionUpdateInput {
+                status: Some(MissionStatus::Completed),
+                ..Default::default()
+            },
             1,
             None,
         )
         .unwrap();
 
-        assert!(collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
-            .unwrap()
-            .is_empty());
+        assert!(
+            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -675,18 +708,22 @@ mod tests {
             &loc,
             &record.id,
             &MissionUpdateInput {
-                goal: Some(crate::missions::MissionGoalUpdate::Set(crate::missions::MissionGoal {
-                    status: MissionGoalStatus::Paused,
-                })),
+                goal: Some(crate::missions::MissionGoalUpdate::Set(
+                    crate::missions::MissionGoal {
+                        status: MissionGoalStatus::Paused,
+                    },
+                )),
                 ..Default::default()
             },
             1,
             None,
         )
         .unwrap();
-        assert!(collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
-            .unwrap()
-            .is_empty());
+        assert!(
+            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -715,11 +752,16 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
-            .unwrap()
-            .is_empty());
+        assert!(
+            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
+                .unwrap()
+                .is_empty()
+        );
         let after = read_mission(&loc, &record.id).unwrap();
-        assert_eq!(after.goal.unwrap().status, MissionGoalStatus::BudgetExhausted);
+        assert_eq!(
+            after.goal.unwrap().status,
+            MissionGoalStatus::BudgetExhausted
+        );
     }
 
     #[test]
@@ -748,9 +790,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
-            .unwrap()
-            .is_empty());
+        assert!(
+            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -783,21 +827,30 @@ mod tests {
         .unwrap();
         // While the status file says running, nothing is raised…
         std::fs::write(async_dir.join("status.json"), r#"{"state":"running"}"#).unwrap();
-        assert!(collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
-            .unwrap()
-            .is_empty());
+        assert!(
+            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
+                .unwrap()
+                .is_empty()
+        );
         // …and once it settles, the refresh picks it up (and folds in the token total).
         std::fs::write(
             async_dir.join("status.json"),
             r#"{"state":"complete","totalTokens":{"total":42}}"#,
         )
         .unwrap();
-        let notices =
-            collect_goal_continuation_notices(&loc, "sess-1", &[], 3, Some(0)).unwrap();
+        let notices = collect_goal_continuation_notices(&loc, "sess-1", &[], 3, Some(0)).unwrap();
         assert_eq!(notices.len(), 1);
-        assert!(notices[0].message.contains("Remaining budget: 9958 tokens (42/10000 used)"));
+        assert!(
+            notices[0]
+                .message
+                .contains("Remaining budget: 9958 tokens (42/10000 used)")
+        );
         let refreshed = read_mission(&loc, &record.id).unwrap();
-        assert_eq!(refreshed.status, MissionStatus::Active, "a goal mission stays active");
+        assert_eq!(
+            refreshed.status,
+            MissionStatus::Active,
+            "a goal mission stays active"
+        );
         assert_eq!(refreshed.runs[0].status.as_deref(), Some("complete"));
         assert!(refreshed.runs[0].completed_at.is_some());
     }
@@ -945,7 +998,9 @@ mod tests {
             .unwrap();
         let notices = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0)).unwrap();
         assert!(
-            notices[0].message.contains("Next ready action: write the docs"),
+            notices[0]
+                .message
+                .contains("Next ready action: write the docs"),
             "{}",
             notices[0].message
         );
@@ -962,7 +1017,10 @@ mod tests {
         let value = state(
             r#"{"nested": {"status": "ready", "task": "fallback"}, "nextReadyAction": "explicit"}"#,
         );
-        assert_eq!(ready_action_from_value(&value, "state", 0).as_deref(), Some("explicit"));
+        assert_eq!(
+            ready_action_from_value(&value, "state", 0).as_deref(),
+            Some("explicit")
+        );
     }
 
     #[test]
@@ -991,14 +1049,22 @@ mod tests {
     /// it descended alphabetically and returned `"from alpha"`.
     #[test]
     fn the_descent_follows_file_order_not_alphabetical_order() {
-        let value =
-            state(r#"{"zeta": {"nextAction": "from zeta"}, "alpha": {"nextAction": "from alpha"}}"#);
-        assert_eq!(ready_action_from_value(&value, "state", 0).as_deref(), Some("from zeta"));
+        let value = state(
+            r#"{"zeta": {"nextAction": "from zeta"}, "alpha": {"nextAction": "from alpha"}}"#,
+        );
+        assert_eq!(
+            ready_action_from_value(&value, "state", 0).as_deref(),
+            Some("from zeta")
+        );
 
         // …and the mirror image: swapping only the DECLARATION order swaps only the answer.
-        let swapped =
-            state(r#"{"alpha": {"nextAction": "from alpha"}, "zeta": {"nextAction": "from zeta"}}"#);
-        assert_eq!(ready_action_from_value(&swapped, "state", 0).as_deref(), Some("from alpha"));
+        let swapped = state(
+            r#"{"alpha": {"nextAction": "from alpha"}, "zeta": {"nextAction": "from zeta"}}"#,
+        );
+        assert_eq!(
+            ready_action_from_value(&swapped, "state", 0).as_deref(),
+            Some("from alpha")
+        );
     }
 
     /// The reported PATH label follows the same order, so a positional description names the node
@@ -1019,7 +1085,10 @@ mod tests {
         let value = state(
             r#"{"dup": {"nextAction": "first"}, "later": {"nextAction": "later"}, "dup": {"nextAction": "second"}}"#,
         );
-        assert_eq!(ready_action_from_value(&value, "state", 0).as_deref(), Some("second"));
+        assert_eq!(
+            ready_action_from_value(&value, "state", 0).as_deref(),
+            Some("second")
+        );
     }
 
     /// Scalars are skipped without being descended into, and an array is searched in index order.
@@ -1028,7 +1097,10 @@ mod tests {
         let value = state(
             r#"{"n": 1, "b": true, "nul": null, "s": "plain", "items": [{"k": 1}, {"nextAction": "second item"}]}"#,
         );
-        assert_eq!(ready_action_from_value(&value, "state", 0).as_deref(), Some("second item"));
+        assert_eq!(
+            ready_action_from_value(&value, "state", 0).as_deref(),
+            Some("second item")
+        );
     }
 
     #[test]

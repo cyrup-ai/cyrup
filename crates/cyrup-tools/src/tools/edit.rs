@@ -565,11 +565,11 @@ mod tests {
     #[test]
     fn string_arm_leaves_the_original_string_for_every_other_shape() {
         for s in [
-            "{\"oldText\":\"a\"}",                       // object, missing newText
-            "{\"oldText\":1,\"newText\":\"b\"}",         // object, non-string oldText
-            "not json",                                  // parse failure
-            "17",                                        // scalar
-            "null",                                      // parses to null
+            "{\"oldText\":\"a\"}",               // object, missing newText
+            "{\"oldText\":1,\"newText\":\"b\"}", // object, non-string oldText
+            "not json",                          // parse failure
+            "17",                                // scalar
+            "null",                              // parses to null
             "\"[{\\\"oldText\\\":\\\"a\\\",\\\"newText\\\":\\\"b\\\"}]\"", // double-encoded
         ] {
             let out = normalize_args(json!({ "path": "f.txt", "edits": s }));

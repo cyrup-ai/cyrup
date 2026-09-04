@@ -91,7 +91,11 @@ pub enum Entry {
     /// component is added at `:3506`, inside that `if (textContent)` / `children.length > 0` block,
     /// so it is the component the gated spacer actually precedes when a submission opens with a
     /// `<skill>` block.
-    SkillInvocation { name: String, content: String, lead_spacer: bool },
+    SkillInvocation {
+        name: String,
+        content: String,
+        lead_spacer: bool,
+    },
     /// A custom (extension) message (`custom-message.ts`): a bracketed type `label` + a markdown
     /// `body`, styled distinctly from a plain user message.
     ///
@@ -99,7 +103,11 @@ pub enum Entry {
     /// custom type (EXT-006); when present it REPLACES the label+markdown framing, because the
     /// renderer already owns the presentation (Pi hands the resolved renderer to
     /// `CustomMessageComponent` instead of the default, interactive-mode.ts:3324-3336).
-    Custom { label: String, body: String, rendered: Rendered },
+    Custom {
+        label: String,
+        body: String,
+        rendered: Rendered,
+    },
     /// A branch-summary message (`branch-summary-message.ts`): a bold `[branch]` label + the
     /// `**Branch Summary**` markdown body produced when navigating away from a branch.
     ///

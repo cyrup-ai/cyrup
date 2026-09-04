@@ -2,8 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{
-    ToolError, ToolResult};
+use cyrup_core::{ToolError, ToolResult};
 
 /// The [`crate::background::watch::CompletionObserver`] that runs pi's
 /// `syncMissionFromAsyncCompletion` (`extension/index.ts:655`) for every completed background run.
@@ -69,7 +68,13 @@ pub(crate) fn prepare_mission_binding_for_dispatch(
     config: Option<&crate::missions::MissionStoreConfig>,
     owner_session_id: Option<&str>,
     explicit_mission: bool,
-) -> Result<(Option<crate::missions::MissionLaunchBinding>, Option<String>), ToolError> {
+) -> Result<
+    (
+        Option<crate::missions::MissionLaunchBinding>,
+        Option<String>,
+    ),
+    ToolError,
+> {
     match crate::missions::prepare_mission_launch(params, cwd, config, owner_session_id) {
         Ok(binding) => Ok((binding, None)),
         Err(e) if explicit_mission => Err(ToolError::new(e.to_string())),
@@ -131,7 +136,11 @@ pub(crate) fn attach_mission_to_tool_outcome(
     };
     let attached = crate::missions::attach_mission_to_launch_result(
         binding,
-        crate::missions::LaunchOutcome { content, details, is_error },
+        crate::missions::LaunchOutcome {
+            content,
+            details,
+            is_error,
+        },
     );
     match attached {
         Ok(attached) => match outcome {
@@ -169,7 +178,9 @@ pub(crate) fn attach_mission_to_tool_outcome(
                 // warning is carried in both of the places upstream carries it; the one thing that
                 // cannot cross is the `isError` bit, whose only cyrup encoding costs the payload.
                 Ok(mut result) if explicit_mission => {
-                    result.content.push(cyrup_core::Content::text(warning.clone()));
+                    result
+                        .content
+                        .push(cyrup_core::Content::text(warning.clone()));
                     Ok(with_warning(result, &warning))
                 }
                 Ok(result) => Ok(with_warning(result, &warning)),
@@ -188,7 +199,12 @@ pub(crate) fn duplicate_subagent_call_text() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::testsupport::scoped_mission_config;
@@ -243,7 +259,9 @@ mod tests {
             crate::missions::MissionStatus::Active
         );
 
-        let observer = MissionSyncCompletionObserver { async_root: async_root.clone() };
+        let observer = MissionSyncCompletionObserver {
+            async_root: async_root.clone(),
+        };
         observer
             .observe(&crate::background::watch::CompletionNotification {
                 result: crate::background::ResultFile {
@@ -300,7 +318,10 @@ mod tests {
             false,
         )
         .expect("an automatic mission never fails the call");
-        assert!(binding.is_none(), "no binding survives a store that cannot be written");
+        assert!(
+            binding.is_none(),
+            "no binding survives a store that cannot be written"
+        );
         let warning = warning.expect("the degradation must record why");
         assert!(
             warning.starts_with("Mission tracking unavailable: "),
@@ -320,7 +341,10 @@ mod tests {
         )
         .expect("an automatic mission never turns a good run into an error");
         let details = result.details.expect("details survive");
-        assert_eq!(details.get("missionWarning").and_then(|v| v.as_str()), Some(warning.as_str()));
+        assert_eq!(
+            details.get("missionWarning").and_then(|v| v.as_str()),
+            Some(warning.as_str())
+        );
         assert_eq!(details.get("runId").and_then(|v| v.as_str()), Some("r1"));
     }
 
@@ -348,14 +372,20 @@ mod tests {
         );
         // Upstream's `toExecutionErrorResult(…, error, …)` carries the RAW error, without the
         // `Mission tracking unavailable:` prefix that belongs to the degradation arm alone.
-        assert!(!err.to_string().starts_with("Mission tracking unavailable"), "{err}");
+        assert!(
+            !err.to_string().starts_with("Mission tracking unavailable"),
+            "{err}"
+        );
     }
 
     /// A binding whose record is destroyed between launch and settle, so
     /// `attach_mission_to_launch_result` really fails — the post-launch degradation's only trigger.
     fn binding_with_a_corrupt_record(
         root: &Path,
-    ) -> (crate::missions::MissionLaunchBinding, crate::missions::MissionStoreConfig) {
+    ) -> (
+        crate::missions::MissionLaunchBinding,
+        crate::missions::MissionStoreConfig,
+    ) {
         let config = scoped_mission_config(root);
         let binding = crate::missions::prepare_mission_launch(
             &crate::missions::MissionLaunchParams {
@@ -368,9 +398,8 @@ mod tests {
         )
         .expect("prepare")
         .expect("a task-bearing launch binds a mission");
-        let record =
-            crate::missions::mission_record_path(&binding.location, &binding.mission_id)
-                .expect("record path");
+        let record = crate::missions::mission_record_path(&binding.location, &binding.mission_id)
+            .expect("record path");
         std::fs::write(&record, b"{ this is not json").expect("corrupt the record");
         (binding, config)
     }
@@ -393,7 +422,11 @@ mod tests {
             false,
         )
         .expect("bookkeeping failure must not fail the run");
-        assert_eq!(result.content.len(), 1, "no warning part on the automatic arm");
+        assert_eq!(
+            result.content.len(),
+            1,
+            "no warning part on the automatic arm"
+        );
         let details = result.details.expect("details survive");
         assert!(
             details
@@ -403,7 +436,10 @@ mod tests {
             "{details}"
         );
         assert_eq!(details.get("runId").and_then(|v| v.as_str()), Some("r9"));
-        assert!(result.terminate.requested(), "every other ToolResult field survives too");
+        assert!(
+            result.terminate.requested(),
+            "every other ToolResult field survives too"
+        );
     }
 
     /// pi `:5119-5126`. An EXPLICIT mission's post-launch failure appends the warning as a NEW text
@@ -423,7 +459,10 @@ mod tests {
         };
         let result = attach_mission_to_tool_outcome(
             Ok(ToolResult {
-                content: vec![cyrup_core::Content::text("the child's answer"), image.clone()],
+                content: vec![
+                    cyrup_core::Content::text("the child's answer"),
+                    image.clone(),
+                ],
                 details: Some(serde_json::json!({
                     "mode": "single", "runId": "r9",
                     "results": [{"agent": "scout", "exitCode": 0}],
@@ -440,22 +479,34 @@ mod tests {
         // The warning is model-visible, appended AFTER the run's own content (upstream's
         // `content: [...result.content, { type: "text", text: warning }]`).
         assert_eq!(result.content.len(), 3);
-        assert_eq!(result.content[1], image, "a non-text part is carried through untouched");
+        assert_eq!(
+            result.content[1], image,
+            "a non-text part is carried through untouched"
+        );
         let warning = match &result.content[2] {
             cyrup_core::Content::Text { text, .. } => text.to_string(),
             other => panic!("{other:?}"),
         };
-        assert!(warning.starts_with("Mission tracking unavailable after launch: "), "{warning}");
+        assert!(
+            warning.starts_with("Mission tracking unavailable after launch: "),
+            "{warning}"
+        );
 
         // …and none of the run is lost.
         let details = result.details.expect("details survive");
         assert_eq!(details.get("runId").and_then(|v| v.as_str()), Some("r9"));
         assert_eq!(
-            details.get("results").and_then(|v| v.as_array()).map(Vec::len),
+            details
+                .get("results")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
             Some(1),
             "the settled per-child results survive: {details}"
         );
-        assert_eq!(details.get("missionWarning").and_then(|v| v.as_str()), Some(warning.as_str()));
+        assert_eq!(
+            details.get("missionWarning").and_then(|v| v.as_str()),
+            Some(warning.as_str())
+        );
         assert!(result.terminate.requested());
     }
 
@@ -474,5 +525,4 @@ mod tests {
         .expect_err("an error outcome stays an error");
         assert_eq!(err.to_string(), "the child failed");
     }
-
 }

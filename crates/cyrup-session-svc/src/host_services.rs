@@ -23,9 +23,9 @@ use cyrup_ext::host::{
 use cyrup_provider::Provider;
 use cyrup_session::manager::SessionManager;
 use cyrup_tools::{ArgvSpec, ExitStatus, ProcOps};
-use serde_json::{json, Value};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::event::AgentSessionEvent;
 use crate::tools::DynamicToolState;
@@ -685,8 +685,16 @@ impl LiveHostServices {
     /// Build with a caller-supplied fallback exec timeout (tests only; production always gets the
     /// real [`DEFAULT_EXEC_TIMEOUT`] via [`Self::new`]) — L4 review.
     #[cfg(test)]
-    fn with_exec_timeout(provider: Arc<dyn Provider>, proc: Arc<dyn ProcOps>, cwd: PathBuf, exec_timeout: Duration) -> Self {
-        Self { exec_timeout, ..Self::new(provider, proc, cwd) }
+    fn with_exec_timeout(
+        provider: Arc<dyn Provider>,
+        proc: Arc<dyn ProcOps>,
+        cwd: PathBuf,
+        exec_timeout: Duration,
+    ) -> Self {
+        Self {
+            exec_timeout,
+            ..Self::new(provider, proc, cwd)
+        }
     }
 
     fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -694,7 +702,12 @@ impl LiveHostServices {
     }
 
     /// Push the active model + its context window (the session calls this on build + `set_model`).
-    pub fn update_model(&self, model: ModelRef, context_window: u64, thinking_level: Option<String>) {
+    pub fn update_model(
+        &self,
+        model: ModelRef,
+        context_window: u64,
+        thinking_level: Option<String>,
+    ) {
         let mut g = Self::lock(&self.snapshot);
         g.model = Some(model);
         g.context_window = context_window;
@@ -858,7 +871,10 @@ impl LiveHostServices {
         // `extension-selector.ts:51`, `extension-input.ts:54`). Mirror the `> 0` guard the sibling
         // `exec` grant already applies to `timeoutMs` just below ([`Self::exec`]) and the TUI's own
         // countdown applies to the same field (`cyrup-tui/src/app.rs`'s `.filter(|&ms| ms > 0)`).
-        let timeout = opts.timeout_ms.filter(|ms| *ms > 0).map(Duration::from_millis);
+        let timeout = opts
+            .timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 match timeout {
@@ -885,7 +901,8 @@ impl LiveHostServices {
         let (tx, rx): (UnboundedSender<ControlOp>, UnboundedReceiver<ControlOp>) =
             tokio::sync::mpsc::unbounded_channel();
         self.set_control_sink(Arc::new(move |op| {
-            tx.send(op).map_err(|e| format!("control channel closed: {e}"))
+            tx.send(op)
+                .map_err(|e| format!("control channel closed: {e}"))
         }));
         *Self::lock(&self.control_rx) = Some(rx);
     }
@@ -967,7 +984,9 @@ impl LiveHostServices {
         &self,
         f: impl FnOnce(&mut SessionManager) -> Result<R, String>,
     ) -> Result<R, String> {
-        let manager = Self::lock(&self.manager).clone().ok_or("session not attached")?;
+        let manager = Self::lock(&self.manager)
+            .clone()
+            .ok_or("session not attached")?;
         let mut guard = manager.try_lock().map_err(|_| "session busy".to_string())?;
         f(&mut guard)
     }
@@ -982,22 +1001,48 @@ impl HostServices for LiveHostServices {
     // the deny default WITHOUT blocking — byte-for-byte Pi `noOpUIContext` (runner.ts:230-261).
 
     fn confirm(&self, prompt: &str, message: &str, opts: &DialogOptions) -> bool {
-        match self.ui_roundtrip(UiKind::Confirm, prompt, Value::Null, message.to_string(), None, opts) {
+        match self.ui_roundtrip(
+            UiKind::Confirm,
+            prompt,
+            Value::Null,
+            message.to_string(),
+            None,
+            opts,
+        ) {
             Some(UiReply::Confirm(b)) => b,
             _ => false,
         }
     }
 
-    fn input(&self, prompt: &str, placeholder: Option<&str>, opts: &DialogOptions) -> Option<String> {
+    fn input(
+        &self,
+        prompt: &str,
+        placeholder: Option<&str>,
+        opts: &DialogOptions,
+    ) -> Option<String> {
         let placeholder = placeholder.map(str::to_string);
-        match self.ui_roundtrip(UiKind::Input, prompt, Value::Null, String::new(), placeholder, opts) {
+        match self.ui_roundtrip(
+            UiKind::Input,
+            prompt,
+            Value::Null,
+            String::new(),
+            placeholder,
+            opts,
+        ) {
             Some(UiReply::Text(t)) => t,
             _ => None,
         }
     }
 
     fn select(&self, prompt: &str, options: &Value, opts: &DialogOptions) -> Option<String> {
-        match self.ui_roundtrip(UiKind::Select, prompt, options.clone(), String::new(), None, opts) {
+        match self.ui_roundtrip(
+            UiKind::Select,
+            prompt,
+            options.clone(),
+            String::new(),
+            None,
+            opts,
+        ) {
             Some(UiReply::Text(t)) => t,
             _ => None,
         }
@@ -1065,9 +1110,17 @@ impl HostServices for LiveHostServices {
         // No renderer attached (headless print/json, RPC, or a bare embedder): report "not taken"
         // WITHOUT blocking, so the caller falls back to its own non-interactive surface. This is
         // pi's `if (!ctx.hasUI)` branch, expressed as a return value rather than a capability probe.
-        let Some(sink) = Self::lock(&self.overlay_sink).clone() else { return false };
+        let Some(sink) = Self::lock(&self.overlay_sink).clone() else {
+            return false;
+        };
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        if sink.send(OverlayRequest { overlay, done: done_tx }).is_err() {
+        if sink
+            .send(OverlayRequest {
+                overlay,
+                done: done_tx,
+            })
+            .is_err()
+        {
             // The renderer's run loop is gone — degrade exactly as `ui_roundtrip` does.
             return false;
         }
@@ -1118,11 +1171,17 @@ impl HostServices for LiveHostServices {
     // `ExtensionUIContext` mutators.
 
     fn notify(&self, message: &str, kind: NotifyKind) {
-        self.emit_ui_effect(UiEffect::Notify { message: message.to_string(), kind });
+        self.emit_ui_effect(UiEffect::Notify {
+            message: message.to_string(),
+            kind,
+        });
     }
 
     fn set_status(&self, key: &str, text: Option<&str>) {
-        self.emit_ui_effect(UiEffect::SetStatus { key: key.to_string(), text: text.map(str::to_string) });
+        self.emit_ui_effect(UiEffect::SetStatus {
+            key: key.to_string(),
+            text: text.map(str::to_string),
+        });
     }
 
     fn set_widget(
@@ -1143,15 +1202,21 @@ impl HostServices for LiveHostServices {
     }
 
     fn set_header(&self, content: &str) {
-        self.emit_ui_effect(UiEffect::SetHeader { content: content.to_string() });
+        self.emit_ui_effect(UiEffect::SetHeader {
+            content: content.to_string(),
+        });
     }
 
     fn set_footer(&self, content: &str) {
-        self.emit_ui_effect(UiEffect::SetFooter { content: content.to_string() });
+        self.emit_ui_effect(UiEffect::SetFooter {
+            content: content.to_string(),
+        });
     }
 
     fn set_title(&self, title: &str) {
-        self.emit_ui_effect(UiEffect::SetTitle { title: title.to_string() });
+        self.emit_ui_effect(UiEffect::SetTitle {
+            title: title.to_string(),
+        });
     }
 
     fn set_editor_text(&self, text: &str, is_paste: bool) {
@@ -1171,7 +1236,10 @@ impl HostServices for LiveHostServices {
         if !is_paste && let Some(mirror) = Self::lock(&self.editor_mirror).clone() {
             mirror.publish(text);
         }
-        self.emit_ui_effect(UiEffect::SetEditorText { text: text.to_string(), is_paste });
+        self.emit_ui_effect(UiEffect::SetEditorText {
+            text: text.to_string(),
+            is_paste,
+        });
     }
 
     /// Pi `getEditorText()` (`core/extensions/types.ts:219` @v0.83.0), interactively
@@ -1180,7 +1248,10 @@ impl HostServices for LiveHostServices {
     /// half worked, which is what turned a missing read into data loss; see [`EditorTextMirror`]
     /// for the mechanism and why it is a shared cell rather than a `UiSink` round trip.
     fn editor_text(&self) -> String {
-        Self::lock(&self.editor_mirror).clone().map(|m| m.text()).unwrap_or_default()
+        Self::lock(&self.editor_mirror)
+            .clone()
+            .map(|m| m.text())
+            .unwrap_or_default()
     }
 
     // --- the theme family (SEAM-T01) ---
@@ -1244,7 +1315,9 @@ impl HostServices for LiveHostServices {
     // bodies), which is exactly what an unattached `ui_effect_sink` reproduces here.
 
     fn set_working_message(&self, message: Option<&str>) {
-        self.emit_ui_effect(UiEffect::SetWorkingMessage { message: message.map(str::to_string) });
+        self.emit_ui_effect(UiEffect::SetWorkingMessage {
+            message: message.map(str::to_string),
+        });
     }
 
     fn set_working_visible(&self, visible: bool) {
@@ -1252,11 +1325,15 @@ impl HostServices for LiveHostServices {
     }
 
     fn set_working_indicator(&self, opts: Option<&Value>) {
-        self.emit_ui_effect(UiEffect::SetWorkingIndicator { options: opts.cloned() });
+        self.emit_ui_effect(UiEffect::SetWorkingIndicator {
+            options: opts.cloned(),
+        });
     }
 
     fn set_hidden_thinking_label(&self, label: Option<&str>) {
-        self.emit_ui_effect(UiEffect::SetHiddenThinkingLabel { label: label.map(str::to_string) });
+        self.emit_ui_effect(UiEffect::SetHiddenThinkingLabel {
+            label: label.map(str::to_string),
+        });
     }
 
     fn models(&self) -> Value {
@@ -1465,8 +1542,12 @@ impl HostServices for LiveHostServices {
             .filter(|ms| *ms > 0)
             .map(Duration::from_millis)
             .or(Some(self.exec_timeout));
-        let spec =
-            ArgvSpec { program: cmd.to_string(), args: args.to_vec(), cwd, env: Vec::new() };
+        let spec = ArgvSpec {
+            program: cmd.to_string(),
+            args: args.to_vec(),
+            cwd,
+            env: Vec::new(),
+        };
         let proc = self.proc.clone();
         // The `HostServices` trait is sync (the guest is wasm-suspended across the call); drive the
         // async process ops to completion on the current multi-threaded runtime worker.
@@ -1477,7 +1558,12 @@ impl HostServices for LiveHostServices {
             Ok(o) => o,
             // Pi `execCommand` never rejects: a spawn/wait failure resolves `{code:1}` (exec.ts:99-105).
             Err(_) => {
-                return Ok(ExecOutput { code: 1, stdout: String::new(), stderr: String::new(), killed: false });
+                return Ok(ExecOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    killed: false,
+                });
             }
         };
         // Map onto Pi's `{code, killed}` (exec.ts:49,97; `child-process.ts:73-80`): `killed` is set
@@ -1551,7 +1637,10 @@ impl HostServices for LiveHostServices {
         // MCP-client extension that (correctly, matching Pi) omits `cwd` could spawn the server in
         // the wrong directory under concurrent multi-session deployment.
         let spec = if spec.cwd.is_none() {
-            ProcSpawnSpec { cwd: Some(self.cwd.clone()), ..spec.clone() }
+            ProcSpawnSpec {
+                cwd: Some(self.cwd.clone()),
+                ..spec.clone()
+            }
         } else {
             spec.clone()
         };
@@ -1587,8 +1676,13 @@ impl HostServices for LiveHostServices {
         // `sessionManager.appendCustomEntry`, agent-session.ts:2265-2271) and snapshot the persisted
         // entry for the `entry_appended` fan-out.
         let (id, entry) = self.with_manager(|mgr| {
-            let id = mgr.append_custom_entry(custom_type, Some(data.clone())).map_err(|e| e.to_string())?;
-            let entry = mgr.entry(&id).and_then(|e| serde_json::to_value(e).ok()).unwrap_or(Value::Null);
+            let id = mgr
+                .append_custom_entry(custom_type, Some(data.clone()))
+                .map_err(|e| e.to_string())?;
+            let entry = mgr
+                .entry(&id)
+                .and_then(|e| serde_json::to_value(e).ok())
+                .unwrap_or(Value::Null);
             Ok((id, entry))
         })?;
         Self::lock(&self.pending_events).push(AgentSessionEvent::EntryAppended { entry });
@@ -1628,7 +1722,10 @@ impl HostServices for LiveHostServices {
         // session header, in file order. Same serialization `AgentSession::entries_json` performs.
         self.with_manager(|mgr| {
             Ok(Value::Array(
-                mgr.entries().iter().filter_map(|e| serde_json::to_value(e).ok()).collect(),
+                mgr.entries()
+                    .iter()
+                    .filter_map(|e| serde_json::to_value(e).ok())
+                    .collect(),
             ))
         })
         .unwrap_or_else(|_| json!([]))
@@ -1640,7 +1737,10 @@ impl HostServices for LiveHostServices {
         // `core/agent-session.ts:1802`), which is `branch_path(None)` here.
         self.with_manager(|mgr| {
             Ok(Value::Array(
-                mgr.branch_path(None).iter().filter_map(|e| serde_json::to_value(e).ok()).collect(),
+                mgr.branch_path(None)
+                    .iter()
+                    .filter_map(|e| serde_json::to_value(e).ok())
+                    .collect(),
             ))
         })
         .unwrap_or_else(|_| json!([]))
@@ -1650,8 +1750,12 @@ impl HostServices for LiveHostServices {
         // pi `SessionManager.getTree()` (`core/session-manager.ts:1306`) → `SessionTreeNode[]`.
         // Shares [`tree_node_to_json`] with `AgentSession::tree_json`, so the `labelTimestamp`
         // SEAM-060 restored on the RPC side cannot go missing on this one.
-        self.with_manager(|mgr| Ok(Value::Array(mgr.tree().iter().map(tree_node_to_json).collect())))
-            .unwrap_or(Value::Null)
+        self.with_manager(|mgr| {
+            Ok(Value::Array(
+                mgr.tree().iter().map(tree_node_to_json).collect(),
+            ))
+        })
+        .unwrap_or(Value::Null)
     }
 
     fn scoped_models(&self) -> Value {
@@ -1704,7 +1808,9 @@ impl HostServices for LiveHostServices {
             // resolve. Cyrup cannot re-prompt across the suspended guest call, so it reports the
             // step unsatisfied, which is upstream's reject-on-no-value.
             Some(UiReply::Text(Some(text))) if allow_empty || !text.trim().is_empty() => Ok(text),
-            Some(UiReply::Text(Some(_))) => Err("oauth prompt cancelled: a value is required".into()),
+            Some(UiReply::Text(Some(_))) => {
+                Err("oauth prompt cancelled: a value is required".into())
+            }
             // Esc / timeout / a dropped renderer — pi's `prompt()` REJECTS on cancel/abort.
             _ => Err("oauth prompt cancelled".into()),
         }
@@ -1763,7 +1869,8 @@ impl HostServices for LiveHostServices {
         // — which is why the capability's parameter is optional. A no-op result (unknown id / busy)
         // degrades silently.
         let _ = self.with_manager(|mgr| {
-            mgr.append_label(&EntryId::from(entry_id), label).map_err(|e| e.to_string())?;
+            mgr.append_label(&EntryId::from(entry_id), label)
+                .map_err(|e| e.to_string())?;
             Ok(())
         });
     }
@@ -1814,7 +1921,9 @@ impl HostServices for LiveHostServices {
         // The rebuilt pair this synchronous call produces is deliberately DROPPED rather than
         // queued: the drain re-runs the restriction after its own EXT-004 tool refresh, which can
         // have auto-activated names in between. See [`PendingActiveTools`].
-        let Some(dt) = Self::lock(&self.dynamic_tools).clone() else { return };
+        let Some(dt) = Self::lock(&self.dynamic_tools).clone() else {
+            return;
+        };
         let _rebuilt = { Self::lock(&dt).set_active(names) };
         *Self::lock(&self.pending_active_tools) = Some(names.to_vec());
     }
@@ -1842,7 +1951,9 @@ impl HostServices for LiveHostServices {
         // hold two of these at once.
         let tools = { Self::lock(&dt).tools() };
         let catalog = Self::lock(&self.catalog).clone();
-        let ext_source_info = catalog.map(|c| c.extension_tool_source_info()).unwrap_or_default();
+        let ext_source_info = catalog
+            .map(|c| c.extension_tool_source_info())
+            .unwrap_or_default();
         Some(
             tools
                 .iter()
@@ -1915,7 +2026,11 @@ mod tests {
 
     /// A backend seeded with the real local process ops + a temp cwd (the `exec` grant path).
     fn svc_with(provider: Arc<dyn Provider>) -> LiveHostServices {
-        LiveHostServices::new(provider, cyrup_tools::Backend::default().proc, std::env::temp_dir())
+        LiveHostServices::new(
+            provider,
+            cyrup_tools::Backend::default().proc,
+            std::env::temp_dir(),
+        )
     }
 
     #[test]
@@ -1927,11 +2042,21 @@ mod tests {
         assert!(svc.current_model().is_none());
         assert!(svc.control(ControlOp::Reload).is_err());
         let models = svc.models();
-        assert!(models.is_array(), "models() must serialize the provider catalog");
-        assert!(!models.as_array().unwrap().is_empty(), "faux provider has at least one model");
+        assert!(
+            models.is_array(),
+            "models() must serialize the provider catalog"
+        );
+        assert!(
+            !models.as_array().unwrap().is_empty(),
+            "faux provider has at least one model"
+        );
 
         // After the session pushes its active model, the read reflects it.
-        let m = ModelRef { provider: "faux".into(), api: None, model: "faux-1".into() };
+        let m = ModelRef {
+            provider: "faux".into(),
+            api: None,
+            model: "faux-1".into(),
+        };
         svc.update_model(m, 128_000, Some("medium".into()));
         svc.update_state(Some("my session".into()), 42);
         assert_eq!(svc.current_model().as_deref(), Some("faux/faux-1"));
@@ -1952,8 +2077,12 @@ mod tests {
             h.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }));
-        svc.control(ControlOp::Reload).expect("control routes to the sink");
-        svc.control(ControlOp::Compact { custom_instructions: None }).expect("control routes to the sink");
+        svc.control(ControlOp::Reload)
+            .expect("control routes to the sink");
+        svc.control(ControlOp::Compact {
+            custom_instructions: None,
+        })
+        .expect("control routes to the sink");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
@@ -1977,17 +2106,34 @@ mod tests {
         // 2) shell:false — an argv that a shell would splice is passed literally, so `echo` prints the
         //    metacharacters verbatim (proves no `bash -c` word-splitting).
         let out = svc
-            .exec("echo", &["a; echo b".to_string()], &json!({}), CancelToken::new())
+            .exec(
+                "echo",
+                &["a; echo b".to_string()],
+                &json!({}),
+                CancelToken::new(),
+            )
             .expect("echo runs");
-        assert_eq!(out.stdout, "a; echo b\n", "argv is literal — no shell interpretation");
+        assert_eq!(
+            out.stdout, "a; echo b\n",
+            "argv is literal — no shell interpretation"
+        );
 
         // 3) `cwd` option honored (Pi `opts?.cwd ?? cwd`).
         let tmp = std::env::temp_dir();
         let out = svc
-            .exec("pwd", &[], &json!({ "cwd": tmp.to_string_lossy() }), CancelToken::new())
+            .exec(
+                "pwd",
+                &[],
+                &json!({ "cwd": tmp.to_string_lossy() }),
+                CancelToken::new(),
+            )
             .expect("pwd runs");
         let printed = std::fs::canonicalize(out.stdout.trim_end()).unwrap_or_default();
-        assert_eq!(printed, std::fs::canonicalize(&tmp).unwrap_or(tmp), "exec ran in the given cwd");
+        assert_eq!(
+            printed,
+            std::fs::canonicalize(&tmp).unwrap_or(tmp),
+            "exec ran in the given cwd"
+        );
 
         // 4) a guest-supplied `env` key is IGNORED — Pi's real `execCommand` (exec.ts:41-45) never
         //    accepts an env override at all; the child only inherits the host's own ambient
@@ -2008,7 +2154,10 @@ mod tests {
             "a guest-supplied `env` override must be ignored — printenv must NOT find an injected \
              value"
         );
-        assert!(out.stdout.is_empty(), "no injected value may ever reach the child's environment");
+        assert!(
+            out.stdout.is_empty(),
+            "no injected value may ever reach the child's environment"
+        );
 
         // 5) a timeout ⇒ the host SIGTERMs the group, then (since `sleep` obeys SIGTERM and dies
         //    well within the 5s grace period, no SIGKILL escalation needed here) reports
@@ -2017,12 +2166,14 @@ mod tests {
         //    @v0.83.0) — the host used to accept ONLY cyrup's SDK spelling `timeoutMs`, so a bag
         //    written by anything else was silently ignored and fell through to the 120s ceiling.
         for key in ["timeout", "timeoutMs"] {
-            let opts =
-                Value::Object(serde_json::Map::from_iter([(key.to_string(), json!(100))]));
+            let opts = Value::Object(serde_json::Map::from_iter([(key.to_string(), json!(100))]));
             let out = svc
                 .exec("sleep", &["30".to_string()], &opts, CancelToken::new())
                 .expect("sleep runs then is killed on timeout");
-            assert!(out.killed, "a timed-out exec is `killed` under the `{key}` key");
+            assert!(
+                out.killed,
+                "a timed-out exec is `killed` under the `{key}` key"
+            );
         }
 
         // 6) an already-aborted signal (pre-cancelled token) kills immediately ⇒ `killed=true`.
@@ -2040,13 +2191,22 @@ mod tests {
         let out = svc
             .exec(
                 "sh",
-                &["-c".to_string(), "trap 'exit 7' TERM; while true; do sleep 1; done".to_string()],
+                &[
+                    "-c".to_string(),
+                    "trap 'exit 7' TERM; while true; do sleep 1; done".to_string(),
+                ],
                 &json!({ "timeoutMs": 100 }),
                 CancelToken::new(),
             )
             .expect("the SIGTERM-trapping child runs then exits itself");
-        assert_eq!(out.code, 7, "the child's own real exit code survives a host-initiated kill");
-        assert!(out.killed, "a timeout-initiated kill is still `killed`, independent of `code`");
+        assert_eq!(
+            out.code, 7,
+            "the child's own real exit code survives a host-initiated kill"
+        );
+        assert!(
+            out.killed,
+            "a timeout-initiated kill is still `killed`, independent of `code`"
+        );
     }
 
     /// L4 round-12 finding #3: `exec`'s `cwd` option must treat a guest-supplied EMPTY string the
@@ -2071,7 +2231,10 @@ mod tests {
         let out = svc
             .exec("pwd", &[], &json!({ "cwd": "" }), CancelToken::new())
             .expect("pwd runs even though the guest passed an empty cwd");
-        assert_eq!(out.code, 0, "must NOT silently degrade to code:1 the way a hard current_dir(\"\") spawn failure would");
+        assert_eq!(
+            out.code, 0,
+            "must NOT silently degrade to code:1 the way a hard current_dir(\"\") spawn failure would"
+        );
         let printed = std::fs::canonicalize(out.stdout.trim_end()).unwrap_or_default();
         assert_eq!(
             printed,
@@ -2104,11 +2267,19 @@ mod tests {
 
         let started = std::time::Instant::now();
         let out = svc
-            .exec("sleep", &["3600".to_string()], &json!({}), CancelToken::new())
+            .exec(
+                "sleep",
+                &["3600".to_string()],
+                &json!({}),
+                CancelToken::new(),
+            )
             .expect("exec resolves even though the guest gave no timeoutMs at all");
         let elapsed = started.elapsed();
 
-        assert!(out.killed, "the fallback ceiling must kill an untimed exec — a 3600s sleep can never exit on its own");
+        assert!(
+            out.killed,
+            "the fallback ceiling must kill an untimed exec — a 3600s sleep can never exit on its own"
+        );
         assert!(
             elapsed < Duration::from_secs(10),
             "must be bounded by the (overridden, 100ms) fallback ceiling, not the real 3600s sleep — \
@@ -2137,7 +2308,9 @@ mod tests {
             cwd: None,
             capture_stderr: false,
         };
-        let handle = svc.proc_spawn(&spec).expect("pwd spawns with no cwd override");
+        let handle = svc
+            .proc_spawn(&spec)
+            .expect("pwd spawns with no cwd override");
         let stdout = wait_for_exit_and_read_stdout(&svc, handle).await;
         let printed = std::fs::canonicalize(stdout.trim_end()).unwrap_or_default();
         assert_eq!(
@@ -2156,7 +2329,9 @@ mod tests {
             cwd: Some(explicit.clone()),
             capture_stderr: false,
         };
-        let handle = svc.proc_spawn(&spec).expect("pwd spawns with an explicit cwd");
+        let handle = svc
+            .proc_spawn(&spec)
+            .expect("pwd spawns with an explicit cwd");
         let stdout = wait_for_exit_and_read_stdout(&svc, handle).await;
         let printed = std::fs::canonicalize(stdout.trim_end()).unwrap_or_default();
         assert_eq!(
@@ -2182,7 +2357,11 @@ mod tests {
         let base = std::env::temp_dir();
         let weird = base.join("cyrup-session-cwd-${MY_REPRO_VAR}-dir");
         std::fs::create_dir_all(&weird).expect("create the literal, unusual session cwd");
-        let svc = LiveHostServices::new(provider, cyrup_tools::Backend::default().proc, weird.clone());
+        let svc = LiveHostServices::new(
+            provider,
+            cyrup_tools::Backend::default().proc,
+            weird.clone(),
+        );
 
         let spec = ProcSpawnSpec {
             cmd: "pwd".to_string(),
@@ -2214,7 +2393,9 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let bytes = svc.proc_read_stdout(handle, 65536).expect("read_stdout on a live handle");
+        let bytes = svc
+            .proc_read_stdout(handle, 65536)
+            .expect("read_stdout on a live handle");
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
@@ -2227,8 +2408,14 @@ mod tests {
         let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
         let svc = svc_with(provider);
         assert!(!svc.confirm("ok?", "body", &DialogOptions::default()));
-        assert_eq!(svc.input("name?", Some("placeholder"), &DialogOptions::default()), None);
-        assert_eq!(svc.select("pick", &json!(["a", "b"]), &DialogOptions::default()), None);
+        assert_eq!(
+            svc.input("name?", Some("placeholder"), &DialogOptions::default()),
+            None
+        );
+        assert_eq!(
+            svc.select("pick", &json!(["a", "b"]), &DialogOptions::default()),
+            None
+        );
         assert_eq!(svc.editor("title", "seed"), None);
     }
 
@@ -2289,7 +2476,11 @@ mod tests {
         // Each guest-facing call blocks until the responder answers (run on a blocking-capable worker).
         let s1 = svc.clone();
         let confirm = tokio::task::spawn_blocking(move || {
-            s1.confirm("proceed?", "a large formatted body, distinct from the title", &DialogOptions::default())
+            s1.confirm(
+                "proceed?",
+                "a large formatted body, distinct from the title",
+                &DialogOptions::default(),
+            )
         })
         .await
         .expect("confirm task");
@@ -2297,7 +2488,11 @@ mod tests {
 
         let s2 = svc.clone();
         let input = tokio::task::spawn_blocking(move || {
-            s2.input("name?", Some("e.g. Ada Lovelace"), &DialogOptions::default())
+            s2.input(
+                "name?",
+                Some("e.g. Ada Lovelace"),
+                &DialogOptions::default(),
+            )
         })
         .await
         .expect("input task");
@@ -2311,18 +2506,28 @@ mod tests {
                 .iter()
                 .find(|s| s.kind == UiKind::Confirm)
                 .map(|s| (s.prompt.as_str(), s.message.as_str())),
-            Some(("proceed?", "a large formatted body, distinct from the title")),
+            Some((
+                "proceed?",
+                "a large formatted body, distinct from the title"
+            )),
             "confirm's message body round-trips separately from its title: {seen_snapshot:?}"
         );
         assert_eq!(
-            seen_snapshot.iter().find(|s| s.kind == UiKind::Input).map(|s| s.placeholder.clone()),
+            seen_snapshot
+                .iter()
+                .find(|s| s.kind == UiKind::Input)
+                .map(|s| s.placeholder.clone()),
             Some(Some("e.g. Ada Lovelace".to_string())),
             "input's placeholder round-trips instead of being dropped: {seen_snapshot:?}"
         );
 
         let s3 = svc.clone();
         let select = tokio::task::spawn_blocking(move || {
-            s3.select("pick one", &json!(["x", "y", "z"]), &DialogOptions::default())
+            s3.select(
+                "pick one",
+                &json!(["x", "y", "z"]),
+                &DialogOptions::default(),
+            )
         })
         .await
         .expect("select task");
@@ -2375,7 +2580,10 @@ mod tests {
             }
         });
 
-        let opts = DialogOptions { timeout_ms: Some(50), signal_id: None };
+        let opts = DialogOptions {
+            timeout_ms: Some(50),
+            signal_id: None,
+        };
 
         let s1 = svc.clone();
         let o1 = opts.clone();
@@ -2384,7 +2592,10 @@ mod tests {
             .await
             .expect("confirm task");
         let elapsed = started.elapsed();
-        assert!(!confirm, "an unanswered confirm resolves to Pi's `false` default, not a hang");
+        assert!(
+            !confirm,
+            "an unanswered confirm resolves to Pi's `false` default, not a hang"
+        );
         assert!(
             elapsed < Duration::from_secs(2),
             "confirm must settle close to the 50ms timeout, not hang indefinitely (took {elapsed:?})"
@@ -2392,17 +2603,25 @@ mod tests {
 
         let s2 = svc.clone();
         let o2 = opts.clone();
-        let input = tokio::task::spawn_blocking(move || s2.input("name?", Some("placeholder"), &o2))
-            .await
-            .expect("input task");
-        assert_eq!(input, None, "an unanswered input resolves to Pi's `undefined` default");
+        let input =
+            tokio::task::spawn_blocking(move || s2.input("name?", Some("placeholder"), &o2))
+                .await
+                .expect("input task");
+        assert_eq!(
+            input, None,
+            "an unanswered input resolves to Pi's `undefined` default"
+        );
 
         let s3 = svc.clone();
         let o3 = opts;
-        let select = tokio::task::spawn_blocking(move || s3.select("pick", &json!(["a", "b"]), &o3))
-            .await
-            .expect("select task");
-        assert_eq!(select, None, "an unanswered select resolves to Pi's `undefined` default");
+        let select =
+            tokio::task::spawn_blocking(move || s3.select("pick", &json!(["a", "b"]), &o3))
+                .await
+                .expect("select task");
+        assert_eq!(
+            select, None,
+            "an unanswered select resolves to Pi's `undefined` default"
+        );
     }
 
     /// `timeout_ms: 0` means NO timeout, not an instant one — Pi's `createDialogPromise` only arms
@@ -2427,7 +2646,10 @@ mod tests {
             }
         });
 
-        let opts = DialogOptions { timeout_ms: Some(0), signal_id: None };
+        let opts = DialogOptions {
+            timeout_ms: Some(0),
+            signal_id: None,
+        };
         let started = tokio::time::Instant::now();
         let confirm = tokio::task::spawn_blocking(move || svc.confirm("proceed?", "body", &opts))
             .await
@@ -2468,7 +2690,10 @@ mod tests {
         });
 
         // A 10-second timeout that must NOT be what unblocks this call.
-        let opts = DialogOptions { timeout_ms: Some(10_000), signal_id: None };
+        let opts = DialogOptions {
+            timeout_ms: Some(10_000),
+            signal_id: None,
+        };
         let started = tokio::time::Instant::now();
         let confirm = tokio::task::spawn_blocking(move || svc.confirm("proceed?", "body", &opts))
             .await
@@ -2489,7 +2714,10 @@ mod tests {
         let err = DenyServices
             .exec("echo", &["hi".to_string()], &json!({}), CancelToken::new())
             .expect_err("deny-all backend refuses exec");
-        assert!(err.contains("not granted"), "denied with the Pi message: {err}");
+        assert!(
+            err.contains("not granted"),
+            "denied with the Pi message: {err}"
+        );
     }
 
     // ---------------------------------------------------- EXT-037 / EXT-038: guest introspection --
@@ -2504,7 +2732,11 @@ mod tests {
 
     impl CatalogTool {
         fn new(name: &'static str, guidelines: Vec<&'static str>) -> Self {
-            Self { name, params: json!({"type": "object", "properties": {}}), guidelines }
+            Self {
+                name,
+                params: json!({"type": "object", "properties": {}}),
+                guidelines,
+            }
         }
     }
 
@@ -2565,7 +2797,11 @@ mod tests {
             cyrup_session::prompt::PromptInputs::default(),
             contributions,
         );
-        Arc::new(Mutex::new(DynamicToolState::new(tools.clone(), tools, rebuilder)))
+        Arc::new(Mutex::new(DynamicToolState::new(
+            tools.clone(),
+            tools,
+            rebuilder,
+        )))
     }
 
     /// EXT-061 — `system_prompt_options()` is the BAG behind `system_prompt()`, in pi's
@@ -2585,28 +2821,42 @@ mod tests {
         let svc = svc_with(provider);
 
         // Unattached ⇒ `None`. The import layer, not this backend, supplies pi's `{cwd}` default.
-        assert!(svc.system_prompt_options().is_none(), "no dynamic-tool view attached ⇒ no live bag");
+        assert!(
+            svc.system_prompt_options().is_none(),
+            "no dynamic-tool view attached ⇒ no live bag"
+        );
 
         let read: Arc<dyn Tool> = Arc::new(CatalogTool::new("read", vec!["read: prefer read"]));
         let bash: Arc<dyn Tool> = Arc::new(CatalogTool::new("bash", vec![]));
         svc.attach_dynamic_tools(dynamic_tools_with(vec![read, bash]));
 
-        let bag = svc.system_prompt_options().expect("a live dynamic-tool view answers");
+        let bag = svc
+            .system_prompt_options()
+            .expect("a live dynamic-tool view answers");
         assert_eq!(
             bag["selectedTools"],
             json!(["read", "bash"]),
             "pi's bag carries `selectedTools: validToolNames` — the ACTIVE set, not the rebuild \
              base's cleared field: {bag}"
         );
-        assert!(bag.get("cwd").is_some(), "`cwd` is the one REQUIRED key of pi's bag: {bag}");
+        assert!(
+            bag.get("cwd").is_some(),
+            "`cwd` is the one REQUIRED key of pi's bag: {bag}"
+        );
         assert_eq!(
             bag["promptGuidelines"],
             json!(["read: prefer read"]),
             "each active tool's guidelines, in active order (agent-session.ts:1031-1034): {bag}"
         );
         // pi omits `customPrompt`/`appendSystemPrompt` when unset rather than emitting null.
-        assert!(bag.get("customPrompt").is_none(), "an unset optional is OMITTED, not null: {bag}");
-        assert!(bag.get("appendSystemPrompt").is_none(), "an unset optional is OMITTED, not null: {bag}");
+        assert!(
+            bag.get("customPrompt").is_none(),
+            "an unset optional is OMITTED, not null: {bag}"
+        );
+        assert!(
+            bag.get("appendSystemPrompt").is_none(),
+            "an unset optional is OMITTED, not null: {bag}"
+        );
     }
 
     /// EXT-038 — `all_tools()` must report the WHOLE merged registry (built-ins included) in pi's
@@ -2619,7 +2869,10 @@ mod tests {
         let svc = svc_with(provider);
 
         // Unattached: `None`, which is what keeps the cyrup-ext registry fallback reachable.
-        assert!(svc.all_tools().is_none(), "no dynamic-tool view attached ⇒ no live answer");
+        assert!(
+            svc.all_tools().is_none(),
+            "no dynamic-tool view attached ⇒ no live answer"
+        );
 
         let builtin: Arc<dyn Tool> = Arc::new(CatalogTool::new("read", vec!["read: prefer read"]));
         let ext: Arc<dyn Tool> = Arc::new(CatalogTool::new("ext_tool", vec![]));
@@ -2628,27 +2881,54 @@ mod tests {
 
         let rows = svc.all_tools().expect("a live dynamic-tool view answers");
         let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
-        assert!(names.contains(&"read"), "the BUILT-IN must appear — the whole point of EXT-038: {names:?}");
-        assert!(names.contains(&"ext_tool"), "the extension tool must still appear: {names:?}");
+        assert!(
+            names.contains(&"read"),
+            "the BUILT-IN must appear — the whole point of EXT-038: {names:?}"
+        );
+        assert!(
+            names.contains(&"ext_tool"),
+            "the extension tool must still appear: {names:?}"
+        );
 
-        let read = rows.iter().find(|r| r["name"] == json!("read")).expect("read row");
+        let read = rows
+            .iter()
+            .find(|r| r["name"] == json!("read"))
+            .expect("read row");
         // pi's `ToolInfo` is EXACTLY these five keys (`extensions/types.ts:1552-1554` @v0.83.0) —
         // no `source` discriminator (EXT-060).
-        let keys: Vec<&str> = read.as_object().expect("object").keys().map(String::as_str).collect();
+        let keys: Vec<&str> = read
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             keys,
-            ["description", "name", "parameters", "promptGuidelines", "sourceInfo"],
+            [
+                "description",
+                "name",
+                "parameters",
+                "promptGuidelines",
+                "sourceInfo"
+            ],
             "pi's ToolInfo keys and no others"
         );
         assert_eq!(read["description"], json!("described"));
-        assert_eq!(read["promptGuidelines"], json!(["read: prefer read"]), "guidelines must survive");
+        assert_eq!(
+            read["promptGuidelines"],
+            json!(["read: prefer read"]),
+            "guidelines must survive"
+        );
         assert_eq!(
             read["sourceInfo"],
             json!({"path": "<builtin:read>", "source": "builtin", "scope": "temporary", "origin": "top-level"}),
             "a tool the extension registry does not own gets pi's synthetic builtin SourceInfo"
         );
 
-        let ext_row = rows.iter().find(|r| r["name"] == json!("ext_tool")).expect("ext row");
+        let ext_row = rows
+            .iter()
+            .find(|r| r["name"] == json!("ext_tool"))
+            .expect("ext row");
         assert_eq!(
             ext_row["sourceInfo"]["source"],
             json!("demo-ext"),
@@ -2697,23 +2977,43 @@ mod tests {
         // honest answer — there is no session to report on.
         assert_eq!(svc.entries(), json!([]), "unattached ⇒ pi's empty read");
         assert_eq!(svc.branch(), json!([]), "unattached ⇒ pi's empty read");
-        assert_eq!(svc.tree(), Value::Null, "unattached ⇒ the trait's null tree");
+        assert_eq!(
+            svc.tree(),
+            Value::Null,
+            "unattached ⇒ the trait's null tree"
+        );
 
         let mut mgr = SessionManager::in_memory(&std::env::temp_dir(), NewSessionOpts::default())
             .expect("an in-memory session tree");
-        let root = mgr.append_custom_entry("note", Some(json!({"n": 1}))).expect("append root");
-        let leaf = mgr.append_custom_entry("note", Some(json!({"n": 2}))).expect("append leaf");
-        let label = mgr.append_label(&root, Some("checkpoint")).expect("label the root");
+        let root = mgr
+            .append_custom_entry("note", Some(json!({"n": 1})))
+            .expect("append root");
+        let leaf = mgr
+            .append_custom_entry("note", Some(json!({"n": 2})))
+            .expect("append leaf");
+        let label = mgr
+            .append_label(&root, Some("checkpoint"))
+            .expect("label the root");
         let (root, leaf, label) = (root.to_string(), leaf.to_string(), label.to_string());
         svc.attach_session(Arc::new(AsyncMutex::new(mgr)));
 
         // `entries` — pi `SessionManager.getEntries()`: every entry except the header. The label is
         // itself an appended entry, so three rows, and the two notes are among them BY ID.
         let entries = svc.entries();
-        let ids: Vec<&str> =
-            entries.as_array().expect("an array").iter().filter_map(|e| e["id"].as_str()).collect();
-        assert!(ids.contains(&root.as_str()), "the live tree's entries reached the guest: {ids:?}");
-        assert!(ids.contains(&leaf.as_str()), "the live tree's entries reached the guest: {ids:?}");
+        let ids: Vec<&str> = entries
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|e| e["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&root.as_str()),
+            "the live tree's entries reached the guest: {ids:?}"
+        );
+        assert!(
+            ids.contains(&leaf.as_str()),
+            "the live tree's entries reached the guest: {ids:?}"
+        );
 
         // `branch` — pi `SessionManager.getBranch()`: walk parent-ward from the CURRENT leaf, then
         // reverse. Its doc is explicit that the walk "Includes all entry types (messages,
@@ -2723,8 +3023,12 @@ mod tests {
         // `SessionManager::append_label` is the same mechanism (`push_entry` of a
         // `KnownEntry::Label`), so the path is asserted exactly rather than by containment.
         let branch = svc.branch();
-        let branch_ids: Vec<&str> =
-            branch.as_array().expect("an array").iter().filter_map(|e| e["id"].as_str()).collect();
+        let branch_ids: Vec<&str> = branch
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|e| e["id"].as_str())
+            .collect();
         assert_eq!(
             branch_ids,
             vec![root.as_str(), leaf.as_str(), label.as_str()],
@@ -2736,9 +3040,17 @@ mod tests {
         // `get_tree` reply rather than re-deriving the node shape.
         let tree = svc.tree();
         let roots = tree.as_array().expect("an array of roots");
-        assert_eq!(roots.len(), 1, "a well-formed session has exactly one root: {tree}");
+        assert_eq!(
+            roots.len(),
+            1,
+            "a well-formed session has exactly one root: {tree}"
+        );
         assert_eq!(roots[0]["entry"]["id"], json!(root));
-        assert_eq!(roots[0]["label"], json!("checkpoint"), "labels survive the serialization");
+        assert_eq!(
+            roots[0]["label"],
+            json!("checkpoint"),
+            "labels survive the serialization"
+        );
         assert!(
             roots[0]["labelTimestamp"].is_string(),
             "SEAM-060's labelTimestamp must not be dropped on this side either: {tree}"
@@ -2770,9 +3082,17 @@ mod tests {
         ]);
         let scoped = svc.scoped_models();
         let rows = scoped.as_array().expect("an array");
-        assert_eq!(rows.len(), 2, "the whole scoped set reaches the guest: {scoped}");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the whole scoped set reaches the guest: {scoped}"
+        );
         assert_eq!(rows[0]["model"]["id"], json!("faux-1"));
-        assert_eq!(rows[0]["thinkingLevel"], json!("high"), "pi's per-model thinking level survives");
+        assert_eq!(
+            rows[0]["thinkingLevel"],
+            json!("high"),
+            "pi's per-model thinking level survives"
+        );
         assert!(
             rows[1].get("thinkingLevel").is_none(),
             "an unset thinkingLevel is OMITTED, matching an `undefined` field upstream: {scoped}"
@@ -2800,7 +3120,10 @@ mod tests {
         let svc = Arc::new(svc_with(provider));
 
         // Headless (no renderer): the deny defaults, without blocking — pi's `noOpUIContext`.
-        assert!(svc.oauth_prompt("paste the callback url", None, false).is_err());
+        assert!(
+            svc.oauth_prompt("paste the callback url", None, false)
+                .is_err()
+        );
         assert_eq!(svc.oauth_select("pick an account", &json!([])), None);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
@@ -2811,15 +3134,20 @@ mod tests {
         let seen2 = seen.clone();
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
-                seen2
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((req.kind, req.prompt.clone(), req.options.clone()));
+                seen2.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    req.kind,
+                    req.prompt.clone(),
+                    req.options.clone(),
+                ));
                 let reply = match req.kind {
                     UiKind::Input => UiReply::Text(Some("pasted-code".to_string())),
                     // Pick the SECOND row, so the id mapped back cannot be an accident of ordering.
                     UiKind::Select => UiReply::Text(
-                        req.options.as_array().and_then(|a| a.get(1)).and_then(Value::as_str).map(str::to_string),
+                        req.options
+                            .as_array()
+                            .and_then(|a| a.get(1))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                     ),
                     _ => UiReply::Confirm(false),
                 };
@@ -2861,10 +3189,18 @@ mod tests {
         // The renderer saw the OAuth selector's LABELS, not raw `{id,label}` objects it cannot
         // render (the `UiRequest.options` contract is a flat array of option strings).
         let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let select = seen.iter().find(|(k, _, _)| *k == UiKind::Select).expect("a select request");
-        assert_eq!(select.2, json!(["Personal", "Work"]), "labels are what reach the renderer");
+        let select = seen
+            .iter()
+            .find(|(k, _, _)| *k == UiKind::Select)
+            .expect("a select request");
+        assert_eq!(
+            select.2,
+            json!(["Personal", "Work"]),
+            "labels are what reach the renderer"
+        );
         assert!(
-            seen.iter().any(|(k, p, _)| *k == UiKind::Input && p == "paste the callback url"),
+            seen.iter()
+                .any(|(k, p, _)| *k == UiKind::Input && p == "paste the callback url"),
             "the prompt message rides the dialog title, like every other kind: {seen:?}"
         );
     }
@@ -2888,13 +3224,20 @@ mod tests {
         let strict = tokio::task::spawn_blocking(move || s1.oauth_prompt("token?", None, false))
             .await
             .expect("task");
-        assert!(strict.is_err(), "a mandatory prompt does not resolve with an empty value");
+        assert!(
+            strict.is_err(),
+            "a mandatory prompt does not resolve with an empty value"
+        );
 
         let s2 = svc.clone();
         let lenient = tokio::task::spawn_blocking(move || s2.oauth_prompt("token?", None, true))
             .await
             .expect("task");
-        assert_eq!(lenient.as_deref(), Ok(""), "allow-empty accepts the empty submission");
+        assert_eq!(
+            lenient.as_deref(),
+            Ok(""),
+            "allow-empty accepts the empty submission"
+        );
     }
 
     /// EXT-037 — the override must (a) answer `None` when no catalog is attached, so the cyrup-ext
@@ -2912,7 +3255,10 @@ mod tests {
         let svc = svc_with(provider);
 
         // Unattached: `None` ⇒ the cyrup-ext binding falls back to the registry's resolved commands.
-        assert!(svc.commands().is_none(), "no catalog attached ⇒ no live answer");
+        assert!(
+            svc.commands().is_none(),
+            "no catalog attached ⇒ no live answer"
+        );
 
         svc.attach_session_catalog(Arc::new(FakeCatalog));
         let rows = svc.commands().expect("an attached catalog answers");
@@ -2925,7 +3271,8 @@ mod tests {
         let sources: Vec<&str> = rows.iter().filter_map(|r| r["source"].as_str()).collect();
         assert_eq!(sources, ["extension", "extension", "prompt", "skill"]);
         assert!(
-            rows.iter().all(|r| !r["description"].as_str().unwrap_or_default().is_empty()),
+            rows.iter()
+                .all(|r| !r["description"].as_str().unwrap_or_default().is_empty()),
             "every row carries a description — the bare-name walk carried none"
         );
     }
@@ -2949,7 +3296,9 @@ mod tests {
 
         svc.set_working_message(Some("indexing the repo"));
         svc.set_working_visible(false);
-        svc.set_working_indicator(Some(&json!({"frames": ["-", "\\", "|", "/"], "intervalMs": 120})));
+        svc.set_working_indicator(Some(
+            &json!({"frames": ["-", "\\", "|", "/"], "intervalMs": 120}),
+        ));
         svc.set_hidden_thinking_label(Some("redacted"));
 
         let mut got = Vec::new();
@@ -2959,7 +3308,9 @@ mod tests {
         assert_eq!(got.len(), 4, "all four verbs must emit; got {got:?}");
         assert_eq!(
             got[0],
-            UiEffect::SetWorkingMessage { message: Some("indexing the repo".to_string()) }
+            UiEffect::SetWorkingMessage {
+                message: Some("indexing the repo".to_string())
+            }
         );
         assert_eq!(got[1], UiEffect::SetWorkingVisible { visible: false });
         assert_eq!(
@@ -2971,7 +3322,9 @@ mod tests {
         );
         assert_eq!(
             got[3],
-            UiEffect::SetHiddenThinkingLabel { label: Some("redacted".to_string()) }
+            UiEffect::SetHiddenThinkingLabel {
+                label: Some("redacted".to_string())
+            }
         );
 
         // `None` is upstream's no-argument call ("restore the default") and must be DISTINGUISHABLE
@@ -2979,9 +3332,18 @@ mod tests {
         svc.set_working_message(None);
         svc.set_hidden_thinking_label(None);
         svc.set_working_indicator(None);
-        assert_eq!(rx.try_recv().ok(), Some(UiEffect::SetWorkingMessage { message: None }));
-        assert_eq!(rx.try_recv().ok(), Some(UiEffect::SetHiddenThinkingLabel { label: None }));
-        assert_eq!(rx.try_recv().ok(), Some(UiEffect::SetWorkingIndicator { options: None }));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(UiEffect::SetWorkingMessage { message: None })
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(UiEffect::SetHiddenThinkingLabel { label: None })
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(UiEffect::SetWorkingIndicator { options: None })
+        );
     }
 
     /// MIRROR: with NO effect sink (headless print/json) the four silently drop and — critically —
@@ -3019,8 +3381,10 @@ mod tests {
         tokio::spawn(async move {
             while let Some(mut req) = rx.recv().await {
                 let rows = req.overlay.render(60, 24);
-                *painted2.lock().unwrap_or_else(|e| e.into_inner()) =
-                    rows.iter().map(cyrup_ext::host::OverlayLine::plain_text).collect();
+                *painted2.lock().unwrap_or_else(|e| e.into_inner()) = rows
+                    .iter()
+                    .map(cyrup_ext::host::OverlayLine::plain_text)
+                    .collect();
                 req.overlay.handle_key(cyrup_ext::host::OverlayKey::plain(
                     cyrup_ext::host::OverlayKeyCode::Down,
                 ));

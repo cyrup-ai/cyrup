@@ -10,9 +10,9 @@ use crate::event::{AgentEvent, AgentMessage};
 use cyrup_core::{AssistantMessage, ToolCall, ToolError, ToolUpdate, ToolUpdateSink};
 use futures::future::FutureExt;
 use serde_json::Value;
-use std::future::{poll_fn, Future};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::{Future, poll_fn};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -81,7 +81,14 @@ impl RunCtx {
         // driven to its first suspension point — which for `write`/`edit` is inside
         // `FileMutationLocks::guard`, so the mutation registrations line up in source order.
         let mut prev_started: Option<oneshot::Receiver<()>> = None;
-        for PreparedCall { source_index, tool, args, call_id, tool_name } in deferred {
+        for PreparedCall {
+            source_index,
+            tool,
+            args,
+            call_id,
+            tool_name,
+        } in deferred
+        {
             let accepting = Arc::new(AtomicBool::new(true));
             let acc2 = accepting.clone();
             let utx = tx.clone();
@@ -177,22 +184,31 @@ impl RunCtx {
                     })
                     .await?;
                 }
-                Some(ToolRuntimeMsg::Finished { call_id, source_index, tool_name, outcome }) => {
+                Some(ToolRuntimeMsg::Finished {
+                    call_id,
+                    source_index,
+                    tool_name,
+                    outcome,
+                }) => {
                     let (args, call) = calls
                         .iter()
                         .find(|c| c.id == call_id)
                         .map(|c| (Value::Object((*c.arguments).clone()), c.clone()))
                         .unwrap_or_else(|| {
                             // Defensive: the id always matches a source call; synthesize a stand-in.
-                            (Value::Null, ToolCall {
-                                id: call_id.clone(),
-                                name: tool_name.clone(),
-                                arguments: serde_json::Map::new().into(),
-                                thought_signature: None,
-                            })
+                            (
+                                Value::Null,
+                                ToolCall {
+                                    id: call_id.clone(),
+                                    name: tool_name.clone(),
+                                    arguments: serde_json::Map::new().into(),
+                                    thought_signature: None,
+                                },
+                            )
                         });
-                    let fin =
-                        self.finalize(assistant, ctx_messages, &call, source_index, args, outcome).await;
+                    let fin = self
+                        .finalize(assistant, ctx_messages, &call, source_index, args, outcome)
+                        .await;
                     self.emit(fin.end_event()).await?;
                     if let Some(slot) = finalized.get_mut(fin.source_index()) {
                         *slot = Some(fin);
@@ -218,11 +234,17 @@ impl RunCtx {
         for fin in present {
             let message = fin.into_message();
             let msg = AgentMessage::ToolResult(message.clone());
-            self.emit(AgentEvent::MessageStart { message: msg.clone() }).await?;
+            self.emit(AgentEvent::MessageStart {
+                message: msg.clone(),
+            })
+            .await?;
             self.emit(AgentEvent::MessageEnd { message: msg }).await?;
             tool_results.push(message);
         }
-        Ok(Batch { messages: tool_results, terminate: all_terminate })
+        Ok(Batch {
+            messages: tool_results,
+            terminate: all_terminate,
+        })
     }
 
     /// Sequential batch: each call fully processed before the next; abort breaks the loop (R-02-018).
@@ -246,7 +268,12 @@ impl RunCtx {
 
             let fin = match self.prepare(assistant, ctx_messages, call, idx).await {
                 Prep::Immediate(fin) => *fin,
-                Prep::Ready(PreparedCall { source_index, tool, args, .. }) => {
+                Prep::Ready(PreparedCall {
+                    source_index,
+                    tool,
+                    args,
+                    ..
+                }) => {
                     // AGENT-003 — UNBOUNDED, same reasoning as the parallel path: pi's only drop
                     // rule is `acceptingUpdates` (`agent-loop.ts:672`/`:680` @v0.83.0).
                     let (utx, mut urx) = mpsc::unbounded_channel::<ToolUpdate>();
@@ -312,7 +339,8 @@ impl RunCtx {
                         })
                         .await?;
                     }
-                    self.finalize(assistant, ctx_messages, call, source_index, args, outcome).await
+                    self.finalize(assistant, ctx_messages, call, source_index, args, outcome)
+                        .await
                 }
             };
 
@@ -322,7 +350,10 @@ impl RunCtx {
             }
             let message = fin.into_message();
             let msg = AgentMessage::ToolResult(message.clone());
-            self.emit(AgentEvent::MessageStart { message: msg.clone() }).await?;
+            self.emit(AgentEvent::MessageStart {
+                message: msg.clone(),
+            })
+            .await?;
             self.emit(AgentEvent::MessageEnd { message: msg }).await?;
             tool_results.push(message);
             produced += 1;
@@ -334,6 +365,9 @@ impl RunCtx {
         if produced == 0 {
             all_terminate = false;
         }
-        Ok(Batch { messages: tool_results, terminate: all_terminate })
+        Ok(Batch {
+            messages: tool_results,
+            terminate: all_terminate,
+        })
     }
 }

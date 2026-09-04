@@ -128,7 +128,10 @@ impl ExtensionProvenance {
     /// directory as `baseDir`.
     #[must_use]
     pub fn local(base_dir: impl Into<String>) -> Self {
-        Self { source: "local".to_string(), base_dir: Some(base_dir.into()) }
+        Self {
+            source: "local".to_string(),
+            base_dir: Some(base_dir.into()),
+        }
     }
 
     /// A synthetic extension registered from an in-process factory rather than a path — upstream's
@@ -138,7 +141,10 @@ impl ExtensionProvenance {
     /// are: no path, no directory, loaded by the host itself.
     #[must_use]
     pub fn inline() -> Self {
-        Self { source: "inline".to_string(), base_dir: None }
+        Self {
+            source: "inline".to_string(),
+            base_dir: None,
+        }
     }
 }
 
@@ -362,7 +368,11 @@ impl ExtensionRegistry {
         if let Some(existing) = Self::tool_owner_in(&g, &name)
             && existing != owner
         {
-            Self::record_conflict(&mut g, owner, format!("Tool \"{name}\" conflicts with {existing}"));
+            Self::record_conflict(
+                &mut g,
+                owner,
+                format!("Tool \"{name}\" conflicts with {existing}"),
+            );
             return Ok(());
         }
         if !g.tools.contains_key(&name) {
@@ -409,13 +419,15 @@ impl ExtensionRegistry {
     /// Mark the tool set as changed (Pi's `runtime.refreshTools()` trigger, loader.ts:249-256).
     /// Consumed by [`Self::take_tools_dirty`].
     pub fn mark_tools_dirty(&self) {
-        self.tools_dirty.store(true, std::sync::atomic::Ordering::Release);
+        self.tools_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Take-and-clear the "tools changed since the last refresh" flag (EXT-004). `true` = at least
     /// one tool registration landed since the previous call.
     pub fn take_tools_dirty(&self) -> bool {
-        self.tools_dirty.swap(false, std::sync::atomic::Ordering::AcqRel)
+        self.tools_dirty
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Register a guest (WASM) tool by descriptor (R-08-012). Same precedence rule as
@@ -434,7 +446,11 @@ impl ExtensionRegistry {
         if let Some(existing) = Self::tool_owner_in(&g, &name)
             && existing != owner
         {
-            Self::record_conflict(&mut g, owner, format!("Tool \"{name}\" conflicts with {existing}"));
+            Self::record_conflict(
+                &mut g,
+                owner,
+                format!("Tool \"{name}\" conflicts with {existing}"),
+            );
             return Ok(());
         }
         if !g.guest_tools.contains_key(&name) {
@@ -507,7 +523,9 @@ impl ExtensionRegistry {
         custom_type: impl Into<String>,
     ) -> Result<(), ExtError> {
         let mut g = self.lock_write()?;
-        g.message_renderer_owner.entry(custom_type.into()).or_insert(owner);
+        g.message_renderer_owner
+            .entry(custom_type.into())
+            .or_insert(owner);
         Ok(())
     }
 
@@ -567,8 +585,15 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.terminal_input_subscribers.clone())
     }
 
-    pub fn message_renderer_owner(&self, custom_type: &str) -> Result<Option<ExtensionId>, ExtError> {
-        Ok(self.lock_read()?.message_renderer_owner.get(custom_type).cloned())
+    pub fn message_renderer_owner(
+        &self,
+        custom_type: &str,
+    ) -> Result<Option<ExtensionId>, ExtError> {
+        Ok(self
+            .lock_read()?
+            .message_renderer_owner
+            .get(custom_type)
+            .cloned())
     }
 
     /// Record a custom-ENTRY renderer registration (Pi `registerEntryRenderer(customType, …)`,
@@ -580,13 +605,19 @@ impl ExtensionRegistry {
         custom_type: impl Into<String>,
     ) -> Result<(), ExtError> {
         let mut g = self.lock_write()?;
-        g.entry_renderer_owner.entry(custom_type.into()).or_insert(owner);
+        g.entry_renderer_owner
+            .entry(custom_type.into())
+            .or_insert(owner);
         Ok(())
     }
 
     /// The extension that renders custom ENTRIES of `custom_type` (first-wins), if any.
     pub fn entry_renderer_owner(&self, custom_type: &str) -> Result<Option<ExtensionId>, ExtError> {
-        Ok(self.lock_read()?.entry_renderer_owner.get(custom_type).cloned())
+        Ok(self
+            .lock_read()?
+            .entry_renderer_owner
+            .get(custom_type)
+            .cloned())
     }
 
     /// All registered tool names with Pi's **first-registration-wins** ordering (`getAllRegisteredTools`,
@@ -669,7 +700,10 @@ impl ExtensionRegistry {
     /// All guest tool descriptors in registration order.
     pub fn guest_tool_descriptors(&self) -> Result<Vec<ToolDescriptor>, ExtError> {
         let g = self.lock_read()?;
-        Ok(g.guest_tool_order.iter().filter_map(|n| g.guest_tools.get(n).map(|(_, d)| d.clone())).collect())
+        Ok(g.guest_tool_order
+            .iter()
+            .filter_map(|n| g.guest_tools.get(n).map(|(_, d)| d.clone()))
+            .collect())
     }
 
     /// All guest tool descriptors in registration order, each with its OWNING extension id — what
@@ -709,9 +743,12 @@ impl ExtensionRegistry {
     ) -> Result<(), ExtError> {
         let name = name.into();
         let mut g = self.lock_write()?;
-        g.commands.insert(name.clone(), (owner.clone(), desc.clone()));
-        if let Some(slot) =
-            g.command_order.iter_mut().find(|(o, n, _)| *o == owner && *n == name)
+        g.commands
+            .insert(name.clone(), (owner.clone(), desc.clone()));
+        if let Some(slot) = g
+            .command_order
+            .iter_mut()
+            .find(|(o, n, _)| *o == owner && *n == name)
         {
             slot.2 = desc;
         } else {
@@ -821,7 +858,10 @@ impl ExtensionRegistry {
     /// [`crate::ExtensionHost::execute_native_command`] and `AgentSession::try_execute_wasm_command`
     /// (`cyrup-session-svc/src/session.rs:1131`) — already treat `None` as pi's `false`, so removing
     /// it yields upstream's fall-through at both.
-    pub fn resolved_command_owner(&self, invocation: &str) -> Result<Option<ExtensionId>, ExtError> {
+    pub fn resolved_command_owner(
+        &self,
+        invocation: &str,
+    ) -> Result<Option<ExtensionId>, ExtError> {
         Ok(self
             .resolved_commands()?
             .into_iter()
@@ -874,7 +914,10 @@ impl ExtensionRegistry {
             .iter()
             .filter_map(|k| {
                 g.shortcuts.get(k).map(|(owner, desc)| {
-                    (k.clone(), Some(desc.clone().unwrap_or_else(|| owner.to_string())))
+                    (
+                        k.clone(),
+                        Some(desc.clone().unwrap_or_else(|| owner.to_string())),
+                    )
                 })
             })
             .collect())
@@ -927,10 +970,15 @@ impl ExtensionRegistry {
         let mut out: Vec<(String, ExtensionId)> = Vec::new();
         let order = g.shortcut_order.clone();
         for key in order {
-            let Some((owner, _)) = g.shortcuts.get(&key).cloned() else { continue };
+            let Some((owner, _)) = g.shortcuts.get(&key).cloned() else {
+                continue;
+            };
             let normalized = key.to_lowercase();
             let warn = |g: &mut RegistryInner, message: String| {
-                let record = ExtensionConflict { path: owner.clone(), message };
+                let record = ExtensionConflict {
+                    path: owner.clone(),
+                    message,
+                };
                 if !g.shortcut_diagnostics.contains(&record) {
                     g.shortcut_diagnostics.push(record);
                 }
@@ -996,7 +1044,9 @@ impl ExtensionRegistry {
     ) -> Result<(), ExtError> {
         let id = id.into();
         let mut g = self.lock_write()?;
-        g.provider_hub.register(id.clone(), &config).map_err(ExtError::Component)?;
+        g.provider_hub
+            .register(id.clone(), &config)
+            .map_err(ExtError::Component)?;
         g.provider_owner.insert(id, owner);
         Ok(())
     }
@@ -1017,7 +1067,9 @@ impl ExtensionRegistry {
         owner: ExtensionId,
         command: impl Into<String>,
     ) -> Result<(), ExtError> {
-        self.lock_write()?.command_autocomplete.push((owner, command.into()));
+        self.lock_write()?
+            .command_autocomplete
+            .push((owner, command.into()));
         Ok(())
     }
 
@@ -1056,7 +1108,10 @@ impl ExtensionRegistry {
     }
 
     /// A resolved provider registration by id (typed config + resolved api key).
-    pub fn provider_registration(&self, id: &str) -> Result<Option<ProviderRegistration>, ExtError> {
+    pub fn provider_registration(
+        &self,
+        id: &str,
+    ) -> Result<Option<ProviderRegistration>, ExtError> {
         Ok(self.lock_read()?.provider_hub.get(id).cloned())
     }
 
@@ -1123,7 +1178,10 @@ impl ExtensionRegistry {
     /// All extension tools in registration order (overrides resolved).
     pub fn extension_tools(&self) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
         let g = self.lock_read()?;
-        Ok(g.tool_order.iter().filter_map(|n| g.tools.get(n).cloned()).collect())
+        Ok(g.tool_order
+            .iter()
+            .filter_map(|n| g.tools.get(n).cloned())
+            .collect())
     }
 
     /// Look up an extension tool by name.
@@ -1137,7 +1195,11 @@ impl ExtensionRegistry {
 
     /// The extension that owns a registered command (for slash-command routing, R-08-016).
     pub fn command_owner(&self, name: &str) -> Result<Option<ExtensionId>, ExtError> {
-        Ok(self.lock_read()?.commands.get(name).map(|(owner, _)| owner.clone()))
+        Ok(self
+            .lock_read()?
+            .commands
+            .get(name)
+            .map(|(owner, _)| owner.clone()))
     }
 
     /// All registered command names (diagnostics / `getCommands`).
@@ -1188,19 +1250,24 @@ impl ExtensionRegistry {
         }
         for n in &g.tool_order {
             if !seen.contains(n)
-                && let Some(t) = g.tools.get(n) {
-                    out.push(t.clone());
-                }
+                && let Some(t) = g.tools.get(n)
+            {
+                out.push(t.clone());
+            }
         }
         Ok(out)
     }
 
     fn lock_read(&self) -> Result<std::sync::RwLockReadGuard<'_, RegistryInner>, ExtError> {
-        self.inner.read().map_err(|_| ExtError::Io("registry lock poisoned".into()))
+        self.inner
+            .read()
+            .map_err(|_| ExtError::Io("registry lock poisoned".into()))
     }
 
     fn lock_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, RegistryInner>, ExtError> {
-        self.inner.write().map_err(|_| ExtError::Io("registry lock poisoned".into()))
+        self.inner
+            .write()
+            .map_err(|_| ExtError::Io("registry lock poisoned".into()))
     }
 }
 
@@ -1262,7 +1329,10 @@ pub fn build_builtin_keybindings(
             }
             out.insert(
                 normalized,
-                BuiltinKeybinding { keybinding: keybinding.clone(), restrict_override },
+                BuiltinKeybinding {
+                    keybinding: keybinding.clone(),
+                    restrict_override,
+                },
             );
         }
     }

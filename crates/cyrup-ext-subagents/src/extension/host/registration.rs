@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use cyrup_ext::native::NativeExtension;
 
-use crate::registration::SubagentExtensionConfig;
 use crate::extension::host::SubagentsExtension;
+use crate::registration::SubagentExtensionConfig;
 
 /// How much of the extension surface [`NativeExtension::init`] registers — the child-mode gate
 /// (T6, pi `extension/index.ts:243-245` + `extension/fanout-child.ts:131`).
@@ -117,7 +117,9 @@ pub fn is_installed_with(
     }
     [
         agent_dir.join(CONFIG_SUBDIR).join(CONFIG_FILE),
-        cwd.join(PROJECT_SUBDIR).join(CONFIG_SUBDIR).join(CONFIG_FILE),
+        cwd.join(PROJECT_SUBDIR)
+            .join(CONFIG_SUBDIR)
+            .join(CONFIG_FILE),
     ]
     .iter()
     .any(|p| p.exists())
@@ -152,7 +154,9 @@ pub fn subagent_extension_for_env(
     let installed = is_installed(agent_dir, &cwd);
     registration_mode_from_env()
         .and_then(|mode| gate_on_install(mode, installed))
-        .map(|mode| Arc::new(SubagentsExtension::with_mode(config, cwd, mode)) as Arc<dyn NativeExtension>)
+        .map(|mode| {
+            Arc::new(SubagentsExtension::with_mode(config, cwd, mode)) as Arc<dyn NativeExtension>
+        })
 }
 
 /// As [`subagent_extension_for_env`], but threads the intercom companion's real broker-backed
@@ -178,14 +182,14 @@ pub fn subagent_extension_for_env_with_channels(
     registration_mode_from_env()
         .and_then(|mode| gate_on_install(mode, installed))
         .map(|mode| match mode {
-            RegistrationMode::Full => {
-                Arc::new(SubagentsExtension::with_channels(config, cwd, delivery, clarify, steer))
-                    as Arc<dyn NativeExtension>
-            }
-            RegistrationMode::ChildSafe => {
-                Arc::new(SubagentsExtension::with_mode(config, cwd, RegistrationMode::ChildSafe))
-                    as Arc<dyn NativeExtension>
-            }
+            RegistrationMode::Full => Arc::new(SubagentsExtension::with_channels(
+                config, cwd, delivery, clarify, steer,
+            )) as Arc<dyn NativeExtension>,
+            RegistrationMode::ChildSafe => Arc::new(SubagentsExtension::with_mode(
+                config,
+                cwd,
+                RegistrationMode::ChildSafe,
+            )) as Arc<dyn NativeExtension>,
         })
 }
 
@@ -205,12 +209,19 @@ pub fn subagent_extension_for(
 ) -> Option<Arc<dyn NativeExtension>> {
     resolve_registration_mode(child, fanout_authorized)
         .and_then(|mode| gate_on_install(mode, installed))
-        .map(|mode| Arc::new(SubagentsExtension::with_mode(config, cwd, mode)) as Arc<dyn NativeExtension>)
+        .map(|mode| {
+            Arc::new(SubagentsExtension::with_mode(config, cwd, mode)) as Arc<dyn NativeExtension>
+        })
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -220,10 +231,19 @@ mod tests {
     #[test]
     fn resolve_registration_mode_encodes_the_child_gate() {
         // Not a child → full orchestrator surface (the fanout flag is irrelevant when not a child).
-        assert_eq!(resolve_registration_mode(false, false), Some(RegistrationMode::Full));
-        assert_eq!(resolve_registration_mode(false, true), Some(RegistrationMode::Full));
+        assert_eq!(
+            resolve_registration_mode(false, false),
+            Some(RegistrationMode::Full)
+        );
+        assert_eq!(
+            resolve_registration_mode(false, true),
+            Some(RegistrationMode::Full)
+        );
         // Fanout-authorized child → the restricted child-safe tool.
-        assert_eq!(resolve_registration_mode(true, true), Some(RegistrationMode::ChildSafe));
+        assert_eq!(
+            resolve_registration_mode(true, true),
+            Some(RegistrationMode::ChildSafe)
+        );
         // Plain subagent child → register NOTHING.
         assert_eq!(resolve_registration_mode(true, false), None);
     }
@@ -243,7 +263,10 @@ mod tests {
             /* fanout_authorized */ false,
             /* installed */ false,
         );
-        assert!(none.is_none(), "a top-level session that has not opted in attaches nothing");
+        assert!(
+            none.is_none(),
+            "a top-level session that has not opted in attaches nothing"
+        );
     }
 
     /// A fanout-authorized CHILD ([`RegistrationMode::ChildSafe`]) attaches its restricted surface
@@ -286,7 +309,11 @@ mod tests {
         assert!(!is_installed_with(&unset, agent.path(), cwd.path()));
 
         // Env opted in on its own is sufficient, with no file present at all.
-        assert!(is_installed_with(&|_| Some("1".to_string()), agent.path(), cwd.path()));
+        assert!(is_installed_with(
+            &|_| Some("1".to_string()),
+            agent.path(),
+            cwd.path()
+        ));
 
         // User-scope tier-3 config present → installed regardless of env.
         let user_cfg = agent.path().join("subagents");
@@ -311,7 +338,10 @@ mod tests {
     /// when installed; a `ChildSafe` fanout child survives REGARDLESS.
     #[test]
     fn gate_on_install_only_gates_full() {
-        assert_eq!(gate_on_install(RegistrationMode::Full, true), Some(RegistrationMode::Full));
+        assert_eq!(
+            gate_on_install(RegistrationMode::Full, true),
+            Some(RegistrationMode::Full)
+        );
         assert_eq!(gate_on_install(RegistrationMode::Full, false), None);
         assert_eq!(
             gate_on_install(RegistrationMode::ChildSafe, true),
@@ -322,5 +352,4 @@ mod tests {
             Some(RegistrationMode::ChildSafe)
         );
     }
-
 }

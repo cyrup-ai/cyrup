@@ -185,10 +185,8 @@ mod tests {
             // must reproduce. The carve-out is spelled as an id, not a count, so a SECOND row
             // drifting off the completions protocol still fails here.
             assert!(
-                models
-                    .iter()
-                    .all(|m| m.api.as_str() == OPENAI_COMPLETIONS
-                        || (*id == "xai" && m.id.as_str() == "grok-4.5")),
+                models.iter().all(|m| m.api.as_str() == OPENAI_COMPLETIONS
+                    || (*id == "xai" && m.id.as_str() == "grok-4.5")),
                 "{id} api"
             );
             assert!(

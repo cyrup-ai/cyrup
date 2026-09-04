@@ -37,7 +37,10 @@ impl TranscriptView {
 
     /// Push a bordered info block (`/hotkeys`, `/changelog`, `/session`, `/debug`).
     pub fn push_block(&mut self, title: impl Into<String>, markdown: impl Into<String>) {
-        self.pending.push(Entry::Block { title: title.into(), markdown: markdown.into() });
+        self.pending.push(Entry::Block {
+            title: title.into(),
+            markdown: markdown.into(),
+        });
     }
 
     /// The startup "packages are out of date" notice — Pi `showPackageUpdateNotification`
@@ -123,7 +126,9 @@ impl TranscriptView {
     /// (`setToolsExpanded`, `:4032-4046`), so it is resolved at RENDER time from
     /// [`ImageOpts::tools_expanded`], never captured here.
     pub fn push_branch_summary(&mut self, summary: impl Into<String>) {
-        self.pending.push(Entry::BranchSummary { summary: summary.into() });
+        self.pending.push(Entry::BranchSummary {
+            summary: summary.into(),
+        });
     }
 
     /// Push a compaction-summary message (`compaction-summary-message.ts`): the pre-compaction token
@@ -131,7 +136,10 @@ impl TranscriptView {
     pub fn push_compaction_summary(&mut self, tokens_before: u64, summary: impl Into<String>) {
         // X14 — `interactive-mode.ts:3486`'s `setExpanded(this.toolOutputExpanded)`; like the branch
         // summary above, resolved at render time from the LIVE flag.
-        self.pending.push(Entry::CompactionSummary { tokens_before, summary: summary.into() });
+        self.pending.push(Entry::CompactionSummary {
+            tokens_before,
+            summary: summary.into(),
+        });
     }
 
     /// pi `addCacheMissNotice` (`interactive-mode.ts:3828-3842` @v0.83.0) — the in-transcript
@@ -171,7 +179,10 @@ impl TranscriptView {
             // `:3835-3836` — `Math.round`, which for a non-negative `idle_ms` (the detector clamps
             // it at `cache_stats.rs:176-179`) is `f64::round`. The `as i64` is a saturating cast,
             // so it renders an integer count of minutes without a fallible conversion.
-            format!("Cache miss after {}m idle", (miss.idle_ms as f64 / 60_000.0).round() as i64)
+            format!(
+                "Cache miss after {}m idle",
+                (miss.idle_ms as f64 / 60_000.0).round() as i64
+            )
         } else {
             "Cache miss".to_string()
         };

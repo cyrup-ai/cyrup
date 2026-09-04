@@ -177,7 +177,10 @@ impl Default for ModeSwitchOptions {
     /// pi's declared defaults — `restoreProgress = true, startRenderer = true`
     /// (`interactive-mode.ts:842`). Not derivable: `bool`'s own default is the opposite of both.
     fn default() -> Self {
-        ModeSwitchOptions { restore_progress: true, start_renderer: true }
+        ModeSwitchOptions {
+            restore_progress: true,
+            start_renderer: true,
+        }
     }
 }
 

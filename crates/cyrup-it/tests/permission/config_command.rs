@@ -12,14 +12,19 @@
 //! `NativeExtension::execute_command` → `save_extension_config` (pi `index.ts:1402-1420`) /
 //! `set_yolo_mode` (pi `index.ts:1422-1469`) → `ExtensionConfig::save`. Nothing here calls `save`
 //! itself; every assertion is against the bytes that landed on disk.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::CancelToken;
 use cyrup_ext::{ExtensionHost, HostConfig, HostServices, NativeExtension, NotifyKind};
-use cyrup_permission_system::{PermissionSystemExtension, PERMISSION_SYSTEM_COMMAND};
+use cyrup_permission_system::{PERMISSION_SYSTEM_COMMAND, PermissionSystemExtension};
 
 /// A `HostServices` backend that records every notification the extension raises, so a test can
 /// assert on the channel the HUMAN actually sees rather than on a returned string.
@@ -35,7 +40,10 @@ struct RecordingHost {
 
 impl RecordingHost {
     fn taken(&self) -> Vec<(String, NotifyKind)> {
-        self.notifications.lock().map(|g| g.clone()).unwrap_or_default()
+        self.notifications
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -49,7 +57,9 @@ impl HostServices for RecordingHost {
 
 /// `<agent_dir>/cyrup-permission-system/config.json` — `PermissionSystemExtension::config_path_for`.
 fn config_path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("cyrup-permission-system").join("config.json")
+    agent_dir
+        .join("cyrup-permission-system")
+        .join("config.json")
 }
 
 fn write_config(agent_dir: &Path, body: &str) -> PathBuf {
@@ -87,7 +97,11 @@ async fn run_command_observed(
     agent_dir: &Path,
     args: &str,
     has_ui: bool,
-) -> (Option<String>, Arc<PermissionSystemExtension>, Arc<RecordingHost>) {
+) -> (
+    Option<String>,
+    Arc<PermissionSystemExtension>,
+    Arc<RecordingHost>,
+) {
     let ext = Arc::new(PermissionSystemExtension::new(
         agent_dir.to_path_buf(),
         agent_dir.to_path_buf(),
@@ -137,10 +151,17 @@ async fn the_yolo_setting_command_persists_to_disk_and_preserves_foreign_keys() 
     let (out, ext) = run_command(agent_dir.path(), "yoloMode on").await;
 
     assert!(out.contains("YOLO mode on"), "handler output: {out}");
-    assert!(ext.yolo_mode(), "the live in-memory config must report yolo on");
+    assert!(
+        ext.yolo_mode(),
+        "the live in-memory config must report yolo on"
+    );
 
     let saved = read_config(agent_dir.path());
-    assert_eq!(saved["yoloMode"], serde_json::json!(true), "on disk: {saved}");
+    assert_eq!(
+        saved["yoloMode"],
+        serde_json::json!(true),
+        "on disk: {saved}"
+    );
     assert_eq!(
         saved["operatorNotes"],
         serde_json::json!({ "owner": "platform-team", "ticket": "OPS-1234" }),
@@ -168,7 +189,11 @@ async fn the_debug_setting_command_writes_only_its_own_field() {
 
     let saved = read_config(agent_dir.path());
     assert_eq!(saved["debug"], serde_json::json!(true), "on disk: {saved}");
-    assert_eq!(saved["yoloMode"], serde_json::json!(false), "yolo must be untouched: {saved}");
+    assert_eq!(
+        saved["yoloMode"],
+        serde_json::json!(false),
+        "yolo must be untouched: {saved}"
+    );
     assert_eq!(
         saved["operatorNotes"]["ticket"],
         serde_json::json!("OPS-1234"),
@@ -189,10 +214,16 @@ async fn a_bare_invocation_renders_settings_without_writing() {
 
     assert!(out.contains("debug"), "handler output: {out}");
     assert!(out.contains("yoloMode"), "handler output: {out}");
-    assert!(out.contains("Config file:"), "pi's modal helpText, config-modal.ts:85: {out}");
+    assert!(
+        out.contains("Config file:"),
+        "pi's modal helpText, config-modal.ts:85: {out}"
+    );
 
     let after = std::fs::read_to_string(config_path(agent_dir.path())).unwrap();
-    assert_eq!(before, after, "rendering the settings must not rewrite the file");
+    assert_eq!(
+        before, after,
+        "rendering the settings must not rewrite the file"
+    );
 }
 
 /// MIRROR: an unknown setting id is rejected and writes nothing (pi `applySetting`'s
@@ -239,7 +270,11 @@ async fn a_refused_save_leaves_yolo_mode_off_in_memory_and_on_disk() {
     // strictly stronger than the old assertion on the returned string — this is the channel the
     // human actually sees, and it now also pins the LEVEL.
     let raised = recorder.taken();
-    assert_eq!(raised.len(), 1, "a refused save raises exactly ONE notification: {raised:?}");
+    assert_eq!(
+        raised.len(),
+        1,
+        "a refused save raises exactly ONE notification: {raised:?}"
+    );
     assert_eq!(
         raised[0].1,
         NotifyKind::Error,
@@ -291,7 +326,11 @@ async fn without_a_ui_the_command_declines_and_writes_nothing() {
     // is strictly stronger than the old assertion on the returned string: it checks the channel the
     // human sees AND that the level really is `warning`.
     let raised = recorder.taken();
-    assert_eq!(raised.len(), 1, "the UI-less refusal raises exactly ONE notification: {raised:?}");
+    assert_eq!(
+        raised.len(),
+        1,
+        "the UI-less refusal raises exactly ONE notification: {raised:?}"
+    );
     assert_eq!(
         raised[0].1,
         NotifyKind::Warning,

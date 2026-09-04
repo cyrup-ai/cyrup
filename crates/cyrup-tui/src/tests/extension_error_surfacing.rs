@@ -27,21 +27,30 @@
 //! `App::run` itself needs a real terminal event source, so the loop is not spun here; every
 //! function it calls on this path is.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::sync::Arc;
 
+use crate::{App, UiTheme};
 use cyrup_core::{CancelToken, ExtensionId};
 use cyrup_ext::{
     EventKind, ExtError, ExtMode, ExtensionError, ExtensionHost, HookOutcome, HostConfig, HostCtx,
     HostEvent, InitApi, NativeExtension,
 };
-use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: std::path::PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: std::path::PathBuf::from("."),
+    }
 }
 
 fn app() -> App<TestBackend> {
@@ -130,8 +139,15 @@ async fn a_contained_fault_is_drawn_into_the_transcript() {
     let err = rx.try_recv().expect(
         "TUI-S02: `App::install_error_listener` must deliver the contained fault to the run loop",
     );
-    assert_eq!(err.extension.as_str(), "broken-gate", "attributed to the faulting extension");
-    assert_eq!(err.event, "tool_call", "carries the event kind the fault happened during");
+    assert_eq!(
+        err.extension.as_str(),
+        "broken-gate",
+        "attributed to the faulting extension"
+    );
+    assert_eq!(
+        err.event, "tool_call",
+        "carries the event kind the fault happened during"
+    );
 
     let mut app = app();
     app.show_extension_error(&err);
@@ -179,7 +195,10 @@ async fn every_fault_is_delivered_not_just_the_first() {
         app.show_extension_error(&err);
         seen += 1;
     }
-    assert!(seen >= 2, "both dispatches' faults must be reported, got {seen}");
+    assert!(
+        seen >= 2,
+        "both dispatches' faults must be reported, got {seen}"
+    );
     let text = rendered(&mut app);
     assert!(
         text.matches("Extension \"broken-gate\" error:").count() >= 2,

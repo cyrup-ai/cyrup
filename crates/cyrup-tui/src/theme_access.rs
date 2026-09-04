@@ -35,7 +35,7 @@
 use std::sync::{Arc, Mutex};
 
 use cyrup_resources::{ResourceRegistry, Theme};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// The channel a validated `TuiThemeAccess::set` hands the resolved theme to `App::run` on. The
@@ -63,7 +63,11 @@ pub struct TuiThemeAccess {
 impl TuiThemeAccess {
     /// Bind to one session's resources, seeded with the app's current theme name.
     pub fn new(resources: Arc<ResourceRegistry>, active: &str, switch: ThemeSwitchSink) -> Self {
-        Self { resources, active: Mutex::new(active.to_string()), switch }
+        Self {
+            resources,
+            active: Mutex::new(active.to_string()),
+            switch,
+        }
     }
 
     /// Republish the active theme name (the app, once per frame).
@@ -78,7 +82,12 @@ impl TuiThemeAccess {
 
 impl cyrup_session_svc::ThemeAccess for TuiThemeAccess {
     fn active(&self) -> Option<String> {
-        Some(self.active.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        Some(
+            self.active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        )
     }
 
     /// Pi `getAvailableThemesWithPaths()` (`modes/interactive/theme/theme.ts:493-520` @v0.83.0):
@@ -113,12 +122,18 @@ impl cyrup_session_svc::ThemeAccess for TuiThemeAccess {
             .map(|t| {
                 (
                     t.key.as_str().to_string(),
-                    t.origin_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    t.origin_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
                 )
             })
             .collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
-        Value::Array(rows.into_iter().map(|(name, path)| json!({"name": name, "path": path})).collect())
+        Value::Array(
+            rows.into_iter()
+                .map(|(name, path)| json!({"name": name, "path": path}))
+                .collect(),
+        )
     }
 
     /// Pi `getThemeByName(name)` (`theme.ts:671-677`) — load WITHOUT switching, `undefined` when it
@@ -153,6 +168,8 @@ impl cyrup_session_svc::ThemeAccess for TuiThemeAccess {
         // be misleading, so a closed channel reports the no-UI state instead — the same string
         // `LiveHostServices::set_theme` uses when no handle is attached at all
         // (`core/extensions/runner.ts:263`).
-        self.switch.send(theme.clone()).map_err(|_| "UI not available".to_string())
+        self.switch
+            .send(theme.clone())
+            .map_err(|_| "UI not available".to_string())
     }
 }

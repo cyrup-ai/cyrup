@@ -91,7 +91,11 @@ pub fn validate_tool_budget_config(
         None | Some(serde_json::Value::Null) => None,
         Some(v) => match as_positive_integer(v) {
             Some(n) if n >= 1 => Some(n),
-            _ => return Err(format!("{label}.soft must be an integer >= 1 when provided.")),
+            _ => {
+                return Err(format!(
+                    "{label}.soft must be an integer >= 1 when provided."
+                ));
+            }
         },
     };
     if let Some(soft) = soft
@@ -102,10 +106,14 @@ pub fn validate_tool_budget_config(
 
     let block = match obj.get("block") {
         None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(s)) if s == "*" => Some(ToolBudgetBlock::All(AllToolsMarker)),
+        Some(serde_json::Value::String(s)) if s == "*" => {
+            Some(ToolBudgetBlock::All(AllToolsMarker))
+        }
         Some(serde_json::Value::Array(items)) => {
             if items.is_empty() {
-                return Err(format!("{label}.block must contain at least one tool name."));
+                return Err(format!(
+                    "{label}.block must contain at least one tool name."
+                ));
             }
             let mut names = Vec::with_capacity(items.len());
             for item in items {
@@ -214,7 +222,12 @@ pub fn decode_tool_budget_env(value: Option<&str>) -> Result<Option<ResolvedTool
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -229,7 +242,12 @@ mod tests {
 
     #[test]
     fn hard_must_be_an_integer_at_least_one() {
-        for bad in ["{}", "{\"hard\": 0}", "{\"hard\": 1.5}", "{\"hard\": \"3\"}"] {
+        for bad in [
+            "{}",
+            "{\"hard\": 0}",
+            "{\"hard\": 1.5}",
+            "{\"hard\": \"3\"}",
+        ] {
             assert_eq!(
                 validate_tool_budget_config(Some(&v(bad)), "toolBudget"),
                 Err("toolBudget.hard must be an integer >= 1.".to_string()),
@@ -268,11 +286,17 @@ mod tests {
             Err("toolBudget.block must contain at least one tool name.".to_string())
         );
         assert_eq!(
-            validate_tool_budget_config(Some(&v("{\"hard\": 5, \"block\": [\" \"]}")), "toolBudget"),
+            validate_tool_budget_config(
+                Some(&v("{\"hard\": 5, \"block\": [\" \"]}")),
+                "toolBudget"
+            ),
             Err("toolBudget.block must contain non-empty tool names.".to_string())
         );
         assert_eq!(
-            validate_tool_budget_config(Some(&v("{\"hard\": 5, \"block\": \"all\"}")), "toolBudget"),
+            validate_tool_budget_config(
+                Some(&v("{\"hard\": 5, \"block\": \"all\"}")),
+                "toolBudget"
+            ),
             Err("toolBudget.block must be \"*\" or an array of tool names.".to_string())
         );
     }
@@ -298,7 +322,9 @@ mod tests {
     #[test]
     fn an_explicit_block_is_trimmed_and_deduplicated_in_first_seen_order() {
         let budget = validate_tool_budget_config(
-            Some(&v("{\"hard\": 2, \"block\": [\" bash \", \"read\", \"bash\"]}")),
+            Some(&v(
+                "{\"hard\": 2, \"block\": [\" bash \", \"read\", \"bash\"]}",
+            )),
             "toolBudget",
         )
         .expect("valid")
@@ -311,12 +337,10 @@ mod tests {
 
     #[test]
     fn star_blocks_every_tool_once_hard_is_passed() {
-        let budget = validate_tool_budget_config(
-            Some(&v("{\"hard\": 2, \"block\": \"*\"}")),
-            "toolBudget",
-        )
-        .expect("valid")
-        .expect("some");
+        let budget =
+            validate_tool_budget_config(Some(&v("{\"hard\": 2, \"block\": \"*\"}")), "toolBudget")
+                .expect("valid")
+                .expect("some");
         assert!(!should_block_tool_for_budget(&budget, "anything", 2));
         assert!(should_block_tool_for_budget(&budget, "anything", 3));
     }
@@ -333,12 +357,10 @@ mod tests {
 
     #[test]
     fn messages_match_upstream_text_including_pluralization() {
-        let budget = validate_tool_budget_config(
-            Some(&v("{\"hard\": 3, \"soft\": 1}")),
-            "toolBudget",
-        )
-        .expect("valid")
-        .expect("some");
+        let budget =
+            validate_tool_budget_config(Some(&v("{\"hard\": 3, \"soft\": 1}")), "toolBudget")
+                .expect("valid")
+                .expect("some");
         assert_eq!(
             tool_budget_soft_nudge(&budget, 1),
             "Tool budget soft limit reached after 1 tool call (soft 1, hard 3). Stop starting new browsing/search work and finalize from the context you already have."
@@ -366,12 +388,10 @@ mod tests {
 
     #[test]
     fn a_star_block_survives_the_env_round_trip_as_the_star_literal() {
-        let budget = validate_tool_budget_config(
-            Some(&v("{\"hard\": 1, \"block\": \"*\"}")),
-            "toolBudget",
-        )
-        .expect("valid")
-        .expect("some");
+        let budget =
+            validate_tool_budget_config(Some(&v("{\"hard\": 1, \"block\": \"*\"}")), "toolBudget")
+                .expect("valid")
+                .expect("some");
         let encoded = encode_tool_budget_env(Some(&budget)).expect("encodes");
         assert!(encoded.contains("\"block\":\"*\""), "encoded: {encoded}");
         assert_eq!(decode_tool_budget_env(Some(&encoded)), Ok(Some(budget)));

@@ -3,14 +3,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::background::{run_status, RunId, RunPaths, RunState};
+use crate::background::{RunId, RunPaths, RunState, run_status};
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
 use crate::extension::executor::requests::StatusViewSelector;
 use crate::extension::host::native_impl::read_nested_children;
 
 impl SubagentExecutor {
-
     /// Resume background-run tracking from disk (R-SA-093's "resume on session start" note in
     /// `on_event`'s own doc): re-discover any run directories still present under this cwd's
     /// `AsyncRoot` from a prior process and re-track them, so a restarted orchestrator does not
@@ -121,7 +120,8 @@ impl SubagentExecutor {
         dir: Option<&str>,
         child_safe: bool,
     ) -> Result<String, String> {
-        self.control_status_view(cwd, id, dir, child_safe, StatusViewSelector::default()).await
+        self.control_status_view(cwd, id, dir, child_safe, StatusViewSelector::default())
+            .await
     }
 
     /// G92: `action: "status"` with pi's optional `view`/`lines`/`index` selectors
@@ -214,7 +214,9 @@ impl SubagentExecutor {
 
         let mut tracked_jobs: Vec<AsyncRunView> = Vec::new();
         for job in self.tracker.snapshot() {
-            let Some(status) = job.last_status else { continue };
+            let Some(status) = job.last_status else {
+                continue;
+            };
             // pi `nestedChildren` (`fleet-status.ts:193,212`), resolved from the ids each step
             // records. One level, read-only — see this method's doc.
             let nested_children = read_nested_children(&job.paths, &status).await;
@@ -285,13 +287,19 @@ impl SubagentExecutor {
             && view != "fleet"
             && view != "transcript"
         {
-            return Err(format!("Unknown status view: {view}. Valid: fleet, transcript."));
+            return Err(format!(
+                "Unknown status view: {view}. Valid: fleet, transcript."
+            ));
         }
         // (2) pi `run-status.ts:200`.
         if view == Some("fleet") {
-            let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
-                .await
-                .map_err(|e| e.to_string())?;
+            let runs = run_status::list_active_runs(
+                &async_root,
+                &results_dir,
+                self.current_session_id().as_deref(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             return crate::background::fleet_view::format_fleet(
                 &self.foreground_fleet_entries(),
                 &runs,
@@ -310,9 +318,13 @@ impl SubagentExecutor {
                         .to_string(),
                 );
             }
-            let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
-                .await
-                .map_err(|e| e.to_string())?;
+            let runs = run_status::list_active_runs(
+                &async_root,
+                &results_dir,
+                self.current_session_id().as_deref(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             if !transcript {
                 return Ok(run_status::format_run_list(&runs));
             }
@@ -372,12 +384,14 @@ impl SubagentExecutor {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut entries: Vec<_> = controls
             .iter()
-            .map(|(run_id, entry)| crate::background::fleet_view::ForegroundFleetEntry {
-                run_id: run_id.clone(),
-                current_agent: entry.current_agent.clone(),
-                current_index: entry.current_index,
-                activity_state: entry.current_activity_state,
-            })
+            .map(
+                |(run_id, entry)| crate::background::fleet_view::ForegroundFleetEntry {
+                    run_id: run_id.clone(),
+                    current_agent: entry.current_agent.clone(),
+                    current_index: entry.current_index,
+                    activity_state: entry.current_activity_state,
+                },
+            )
             .collect();
         // pi sorts by `updatedAt` descending (`fleet-view.ts:236`); cyrup's registry carries no
         // per-entry timestamp, so run id gives the same STABLE ordering a `HashMap` iteration
@@ -403,7 +417,12 @@ impl SubagentExecutor {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -457,5 +476,4 @@ mod tests {
             "Child-safe subagent status requires an id when no foreground run is active."
         );
     }
-
 }

@@ -46,7 +46,8 @@ pub(crate) const HELD_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
 /// (`cyrup-core/src/lib.rs:44`), so there is nowhere to smuggle one back — purely to express a
 /// singleton. `Relaxed` is sufficient: the reader only asks "is this the value I saw", and never
 /// orders other memory against it.
-pub(crate) static INPUT_SERVICED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static INPUT_SERVICED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// One input event has been fully serviced.
 pub(crate) fn mark_input_serviced() {
@@ -67,7 +68,8 @@ pub(crate) fn input_serviced() -> u64 {
 /// `Ctrl+Z` suspend re-enables raw mode *before* the loop resumes servicing — so the probe would
 /// read "raw, and not servicing" for the whole `fg` resume window and promote a working feature
 /// into an app exit.
-pub(crate) static TERMINAL_RELEASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static TERMINAL_RELEASED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// RAII marker for the two paths that block the run loop by design: [`App::suspend`] and
 /// [`App::edit_in_external_editor`]. A guard rather than a pair of calls because both bodies return
@@ -114,7 +116,8 @@ pub(crate) static ACTIVE_ARM: std::sync::Mutex<Option<(&'static str, std::time::
 /// The last arm to exceed [`ARM_BUDGET`], drained by the run loop into the transcript on its next
 /// healthy iteration — so the report reaches the user without ever writing to a raw-mode terminal
 /// from a `Drop`.
-pub(crate) static OVER_BUDGET_ARM: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+pub(crate) static OVER_BUDGET_ARM: std::sync::Mutex<Option<&'static str>> =
+    std::sync::Mutex::new(None);
 
 /// Marks an arm body as entered for as long as it is held, and records an overrun on the way out.
 ///
@@ -199,7 +202,10 @@ pub(crate) fn hard_exit_from_reader() -> ! {
     if let Ok(slot) = ACTIVE_ARM.try_lock()
         && let Some((arm, since)) = *slot
     {
-        eprintln!("cyrup: run loop wedged in arm `{arm}` for {:?}", since.elapsed());
+        eprintln!(
+            "cyrup: run loop wedged in arm `{arm}` for {:?}",
+            since.elapsed()
+        );
     }
     cyrup_tools::kill_tracked_detached_children();
     // PERF-004 §3.5: the wedge escalation never reaches `runtime.dispose()`, so drain the session
@@ -226,7 +232,11 @@ pub(crate) enum Escalation {
     /// `presses` chords have been forwarded, each at least [`PANIC_MIN_GAP`] after the last, with
     /// the run loop's serviced count stuck at `serviced` throughout. `last` is the previous counted
     /// chord, for the auto-repeat floor. At `presses == 2` the cooperative cancel has already fired.
-    Armed { serviced: u64, last: std::time::Instant, presses: u32 },
+    Armed {
+        serviced: u64,
+        last: std::time::Instant,
+        presses: u32,
+    },
 }
 
 impl Escalation {
@@ -246,19 +256,36 @@ impl Escalation {
         }
         let serviced = input_serviced();
         let now = std::time::Instant::now();
-        let Self::Armed { serviced: seen, last, presses } = self else {
+        let Self::Armed {
+            serviced: seen,
+            last,
+            presses,
+        } = self
+        else {
             // Chord #1: no evidence of anything yet. Arm and let the normal path handle it.
-            return Self::Armed { serviced, last: now, presses: 1 };
+            return Self::Armed {
+                serviced,
+                last: now,
+                presses: 1,
+            };
         };
         // The loop drained input since the last chord: it IS servicing, and that chord already did
         // its HEAD job (cleared the editor, deleted a char, quit). Back to the bottom of the ladder.
         if seen != serviced {
-            return Self::Armed { serviced, last: now, presses: 1 };
+            return Self::Armed {
+                serviced,
+                last: now,
+                presses: 1,
+            };
         }
         // Auto-repeat floor: a held key is a stream of genuine `Press` events on unix, so only
         // deliberately-spaced chords climb.
         if now.duration_since(last) < PANIC_MIN_GAP {
-            return Self::Armed { serviced: seen, last, presses };
+            return Self::Armed {
+                serviced: seen,
+                last,
+                presses,
+            };
         }
         let presses = presses.saturating_add(1);
         if presses >= PANIC_PRESSES {
@@ -268,7 +295,11 @@ impl Escalation {
         // Chord #2: the cooperative half of `signals.rs`'s escalation. Unblocks the loop's `cancel`
         // arm if it can still run at all; if it cannot, chord #3 leaves.
         cancel.cancel();
-        Self::Armed { serviced: seen, last: now, presses }
+        Self::Armed {
+            serviced: seen,
+            last: now,
+            presses,
+        }
     }
 
     /// One reader iteration with no chord. Disarms only — it can never promote.
@@ -405,9 +436,12 @@ pub(crate) fn map_event(ev: Event) -> Option<InputEvent> {
         }
         _ => None,
     };
-    map_event_on(ev, crate::native_modifiers::host_platform(), term_program.as_deref(), |k| {
-        crate::native_modifiers::is_native_modifier_pressed(k)
-    })
+    map_event_on(
+        ev,
+        crate::native_modifiers::host_platform(),
+        term_program.as_deref(),
+        |k| crate::native_modifiers::is_native_modifier_pressed(k),
+    )
 }
 
 /// [`map_event`] with `process.platform`, `process.env.TERM_PROGRAM` and the native modifier helper
@@ -427,14 +461,9 @@ pub(crate) fn map_event_on(
     probe: impl Fn(crate::native_modifiers::ModifierKey) -> bool,
 ) -> Option<InputEvent> {
     match ev {
-        Event::Key(k) if !matches!(k.kind, KeyEventKind::Release) => {
-            Some(InputEvent::Key(crate::native_modifiers::rescue_native_shift_enter(
-                k,
-                platform,
-                term_program,
-                probe,
-            )))
-        }
+        Event::Key(k) if !matches!(k.kind, KeyEventKind::Release) => Some(InputEvent::Key(
+            crate::native_modifiers::rescue_native_shift_enter(k, platform, term_program, probe),
+        )),
         Event::Key(_) => None,
         Event::Paste(s) => Some(InputEvent::Paste(s)),
         Event::Resize(w, h) => Some(InputEvent::Resize(w, h)),
@@ -459,4 +488,3 @@ pub(crate) fn map_event_on(
         Event::Mouse(m) => crate::altscreen::mouse::map_reader_event(m),
     }
 }
-

@@ -21,7 +21,12 @@ impl PromptInput {
         content.extend(images);
         // Pi `normalizePromptInput` stamps the string-input user message with `Date.now()`
         // (agent.ts:393); this value reaches the wire payload via `convert_to_llm`.
-        Self { messages: vec![AgentMessage::User { content, timestamp: Some(now_millis()) }] }
+        Self {
+            messages: vec![AgentMessage::User {
+                content,
+                timestamp: Some(now_millis()),
+            }],
+        }
     }
 
     /// The single message this input wraps (panics-free: returns an empty user message if empty).
@@ -37,14 +42,24 @@ impl PromptInput {
 impl From<&str> for PromptInput {
     fn from(s: &str) -> Self {
         // Pi `normalizePromptInput` stamps a string prompt with `Date.now()` (agent.ts:389-393).
-        Self { messages: vec![AgentMessage::User { content: vec![Content::text(s)], timestamp: Some(now_millis()) }] }
+        Self {
+            messages: vec![AgentMessage::User {
+                content: vec![Content::text(s)],
+                timestamp: Some(now_millis()),
+            }],
+        }
     }
 }
 
 impl From<String> for PromptInput {
     fn from(s: String) -> Self {
         // Pi `normalizePromptInput` stamps a string prompt with `Date.now()` (agent.ts:389-393).
-        Self { messages: vec![AgentMessage::User { content: vec![Content::text(s)], timestamp: Some(now_millis()) }] }
+        Self {
+            messages: vec![AgentMessage::User {
+                content: vec![Content::text(s)],
+                timestamp: Some(now_millis()),
+            }],
+        }
     }
 }
 

@@ -17,20 +17,25 @@
 //!
 //! These tests assert on the RENDERED TERMINAL CELLS: the extension's text is on screen and the
 //! default framing is not. Nothing here asserts that a registration returned `Ok`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::sync::Arc;
 
+use crate::{App, UiTheme};
 use cyrup_agent::AgentMessage;
 use cyrup_core::{ExtensionId, ToolCallId};
 use cyrup_ext::{
-    ExtError, ExtMode, ExtensionHost, HostConfig, HostCtx, HostEvent, HookOutcome, InitApi,
+    ExtError, ExtMode, ExtensionHost, HookOutcome, HostConfig, HostCtx, HostEvent, InitApi,
     NativeExtension,
 };
 use cyrup_session_svc::AgentSessionEvent;
-use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// An extension that renders BOTH surfaces: custom messages of type `demo`, and the `bash` tool —
 /// a BUILT-IN, so the test also proves an extension can take over a tool cyrup already draws.
@@ -56,11 +61,17 @@ impl NativeExtension for RendererExt {
     // "the built-in did not also draw" assertion cannot be satisfied by this text quoting the
     // built-in's own marker back.
     fn render_call(&self, key: &str, call: &Value) -> Option<Value> {
-        Some(Value::String(format!("EXTCALL[{key}] payload-bytes={}", weigh(call))))
+        Some(Value::String(format!(
+            "EXTCALL[{key}] payload-bytes={}",
+            weigh(call)
+        )))
     }
 
     fn render_result(&self, key: &str, result: &Value) -> Option<Value> {
-        Some(Value::String(format!("EXTRESULT[{key}] payload-bytes={}", weigh(result))))
+        Some(Value::String(format!(
+            "EXTRESULT[{key}] payload-bytes={}",
+            weigh(result)
+        )))
     }
 }
 
@@ -150,8 +161,14 @@ async fn an_unclaimed_custom_type_keeps_the_default_framing() {
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
-    assert!(sb.contains("plain fallback body"), "the default body drew:\n{sb}");
-    assert!(!sb.contains("EXTCALL"), "no renderer was consulted for an unclaimed type:\n{sb}");
+    assert!(
+        sb.contains("plain fallback body"),
+        "the default body drew:\n{sb}"
+    );
+    assert!(
+        !sb.contains("EXTCALL"),
+        "no renderer was consulted for an unclaimed type:\n{sb}"
+    );
 }
 
 /// A tool an extension registered a renderer for draws the EXTENSION's call header and result body
@@ -215,8 +232,14 @@ async fn an_unclaimed_tool_keeps_its_builtin_rendering() {
     app.draw().unwrap();
 
     let live = buffer_text(&app);
-    assert!(live.contains("read src/main.rs:10-14"), "the built-in read header drew:\n{live}");
-    assert!(!live.contains("EXTCALL"), "no renderer was consulted for an unclaimed tool:\n{live}");
+    assert!(
+        live.contains("read src/main.rs:10-14"),
+        "the built-in read header drew:\n{live}"
+    );
+    assert!(
+        !live.contains("EXTCALL"),
+        "no renderer was consulted for an unclaimed tool:\n{live}"
+    );
 }
 
 // =============================================================================================
@@ -329,7 +352,10 @@ async fn a_widget_tree_draws_as_rows_not_as_json() {
     assert!(sb.contains("WIDGET-HEADER"), "the `text` node drew:\n{sb}");
     // The `hstack` joined its two children on one row — `left-` and `right` are adjacent, not
     // stacked, which is the whole point of the tag.
-    assert!(sb.contains("left-right"), "the `hstack` joined its children on ONE row:\n{sb}");
+    assert!(
+        sb.contains("left-right"),
+        "the `hstack` joined its children on ONE row:\n{sb}"
+    );
     // The `spacer(2)` put TWO blank rows between the header and the hstack row.
     assert!(
         sb.contains("WIDGET-HEADER\n\n\nleft-right"),
@@ -340,7 +366,10 @@ async fn a_widget_tree_draws_as_rows_not_as_json() {
         !sb.contains("\"widget\""),
         "the serialized tree was FLATTENED, not dumped as JSON:\n{sb}"
     );
-    assert!(!sb.contains("plain fallback body"), "the default framing did not also draw:\n{sb}");
+    assert!(
+        !sb.contains("plain fallback body"),
+        "the default framing did not also draw:\n{sb}"
+    );
 }
 
 /// The same vocabulary on the TOOL surface, through `push_tool_*` rather than the custom-message
@@ -358,7 +387,10 @@ async fn a_widget_tree_draws_on_the_tool_surface_too() {
     app.ingest_event_with_extensions(&start, &host).await;
     app.draw().unwrap();
     let live = buffer_text(&app);
-    assert!(live.contains("WIDGET-HEADER"), "the tool row drew the widget tree:\n{live}");
+    assert!(
+        live.contains("WIDGET-HEADER"),
+        "the tool row drew the widget tree:\n{live}"
+    );
     assert!(!live.contains("\"widget\""), "not as JSON:\n{live}");
 
     let end = AgentSessionEvent::ToolExecutionEnd {
@@ -371,7 +403,10 @@ async fn a_widget_tree_draws_on_the_tool_surface_too() {
     app.draw().unwrap();
 
     let seen = format!("{}\n{}", buffer_text(&app), app.scrollback_text());
-    assert!(seen.contains("WIDGET-RESULT-BODY"), "the bare-array shorthand drew:\n{seen}");
+    assert!(
+        seen.contains("WIDGET-RESULT-BODY"),
+        "the bare-array shorthand drew:\n{seen}"
+    );
     assert!(!seen.contains("\"markdown\""), "not as JSON:\n{seen}");
 }
 
@@ -394,7 +429,10 @@ async fn an_unknown_widget_tag_is_still_visible() {
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
-    assert!(sb.contains("MISTYPED-NODE"), "the unrecognized node is visible, not dropped:\n{sb}");
+    assert!(
+        sb.contains("MISTYPED-NODE"),
+        "the unrecognized node is visible, not dropped:\n{sb}"
+    );
 }
 
 // ============================================================ X11 — the REPLAY arm ============
@@ -468,8 +506,14 @@ async fn a_replayed_unclaimed_custom_type_keeps_the_default_framing() {
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
-    assert!(sb.contains("plain fallback body"), "the default body drew:\n{sb}");
-    assert!(!sb.contains("EXTCALL"), "no renderer was consulted for an unclaimed type:\n{sb}");
+    assert!(
+        sb.contains("plain fallback body"),
+        "the default body drew:\n{sb}"
+    );
+    assert!(
+        !sb.contains("EXTCALL"),
+        "no renderer was consulted for an unclaimed type:\n{sb}"
+    );
 }
 
 /// MIRROR 2 — `display: false` is still the outer gate (`:3470`): the renderer is not consulted and
@@ -495,8 +539,14 @@ async fn a_replayed_undisplayed_custom_message_renders_nothing() {
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
-    assert!(!sb.contains("EXTCALL"), "no renderer ran for a non-display message:\n{sb}");
-    assert!(!sb.contains("plain fallback body"), "and no default box either:\n{sb}");
+    assert!(
+        !sb.contains("EXTCALL"),
+        "no renderer ran for a non-display message:\n{sb}"
+    );
+    assert!(
+        !sb.contains("plain fallback body"),
+        "and no default box either:\n{sb}"
+    );
 }
 
 /// MIRROR 3 — the renderer sees the message at the position it occupies in the replay, so a walk
@@ -519,7 +569,10 @@ async fn each_replayed_custom_message_gets_its_own_renderer_output() {
         })
     };
     app.replay_session_with_extensions(
-        &[msg(json!("s")), msg(json!("a much longer payload than the first one"))],
+        &[
+            msg(json!("s")),
+            msg(json!("a much longer payload than the first one")),
+        ],
         &host,
     )
     .await;
@@ -532,7 +585,10 @@ async fn each_replayed_custom_message_gets_its_own_renderer_output() {
         .filter_map(|n| n.trim().parse::<usize>().ok())
         .collect();
     assert_eq!(sizes.len(), 2, "both messages rendered:\n{sb}");
-    assert!(sizes[0] < sizes[1], "each got ITS OWN payload, in order: {sizes:?}\n{sb}");
+    assert!(
+        sizes[0] < sizes[1],
+        "each got ITS OWN payload, in order: {sizes:?}\n{sb}"
+    );
 }
 
 // =============================================================================================
@@ -565,9 +621,10 @@ impl NativeExtension for EntryRendererExt {
 
     fn render_entry(&self, custom_type: &str, entry: &Value) -> Option<Value> {
         match custom_type {
-            "card" => {
-                Some(Value::String(format!("ENTRYCARD payload-bytes={}", weigh(entry))))
-            }
+            "card" => Some(Value::String(format!(
+                "ENTRYCARD payload-bytes={}",
+                weigh(entry)
+            ))),
             "boom" => panic!("entry renderer exploded"),
             _ => None,
         }
@@ -610,7 +667,8 @@ async fn a_panicking_entry_renderer_draws_the_failure_box() {
     let host = host_with_entry_renderer().await;
     let mut app = app();
 
-    app.ingest_event_with_extensions(&entry_event("boom"), &host).await;
+    app.ingest_event_with_extensions(&entry_event("boom"), &host)
+        .await;
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
@@ -634,13 +692,23 @@ async fn a_working_entry_renderer_draws_its_own_output_and_no_failure_box() {
     let host = host_with_entry_renderer().await;
     let mut app = app();
 
-    app.ingest_event_with_extensions(&entry_event("card"), &host).await;
+    app.ingest_event_with_extensions(&entry_event("card"), &host)
+        .await;
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
-    assert!(sb.contains("ENTRYCARD payload-bytes="), "the extension's own output drew:\n{sb}");
-    assert!(!sb.contains("renderer failed"), "a working renderer draws no failure box:\n{sb}");
-    assert!(!sb.contains("entry appended"), "and no receipt either:\n{sb}");
+    assert!(
+        sb.contains("ENTRYCARD payload-bytes="),
+        "the extension's own output drew:\n{sb}"
+    );
+    assert!(
+        !sb.contains("renderer failed"),
+        "a working renderer draws no failure box:\n{sb}"
+    );
+    assert!(
+        !sb.contains("entry appended"),
+        "and no receipt either:\n{sb}"
+    );
 }
 
 /// The OTHER half of the regression: an entry type NO extension claims must NOT draw the failure
@@ -652,7 +720,8 @@ async fn an_unclaimed_entry_type_never_draws_the_failure_box() {
     let host = host_with_entry_renderer().await;
     let mut app = app();
 
-    app.ingest_event_with_extensions(&entry_event("nobody-renders-this"), &host).await;
+    app.ingest_event_with_extensions(&entry_event("nobody-renders-this"), &host)
+        .await;
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
@@ -697,7 +766,9 @@ async fn a_faulting_message_renderer_still_falls_through_to_the_default_box() {
         has_ui: true,
         cwd: std::path::PathBuf::from("."),
     }));
-    host.load_native(Arc::new(ThrowingMessageExt)).await.unwrap();
+    host.load_native(Arc::new(ThrowingMessageExt))
+        .await
+        .unwrap();
 
     let mut app = app();
     let ev = AgentSessionEvent::MessageEnd {

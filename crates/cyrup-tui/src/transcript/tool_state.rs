@@ -72,7 +72,10 @@ impl TranscriptView {
     pub fn push_tool_update(&mut self, call_id: Option<&str>, partial: Option<Value>) {
         self.bump_render_generation();
         let run = match call_id {
-            Some(id) => self.active_tools.iter_mut().find(|r| !r.done && r.call_id.as_deref() == Some(id)),
+            Some(id) => self
+                .active_tools
+                .iter_mut()
+                .find(|r| !r.done && r.call_id.as_deref() == Some(id)),
             None => self.active_tools.iter_mut().rev().find(|r| !r.done),
         };
         if let Some(run) = run
@@ -111,9 +114,10 @@ impl TranscriptView {
     pub fn set_edit_preview(&mut self, call_id: Option<&str>, preview: Result<String, String>) {
         self.bump_render_generation();
         let run = match call_id {
-            Some(id) => {
-                self.active_tools.iter_mut().find(|r| !r.done && r.call_id.as_deref() == Some(id))
-            }
+            Some(id) => self
+                .active_tools
+                .iter_mut()
+                .find(|r| !r.done && r.call_id.as_deref() == Some(id)),
             None => self.active_tools.iter_mut().rev().find(|r| !r.done),
         };
         if let Some(run) = run {
@@ -127,7 +131,12 @@ impl TranscriptView {
     ///
     /// Prefer [`Self::push_tool_end_rendered`] with the result's `toolCallId` — see
     /// [`ToolRun::call_id`] and [`Self::pending_run_mut`].
-    pub fn push_tool_end(&mut self, name: impl Into<String>, is_error: bool, result: Option<Value>) {
+    pub fn push_tool_end(
+        &mut self,
+        name: impl Into<String>,
+        is_error: bool,
+        result: Option<Value>,
+    ) {
         self.bump_render_generation();
         self.push_tool_end_rendered(name, None, is_error, result, None);
     }
@@ -150,7 +159,10 @@ impl TranscriptView {
         let name = name.into();
         // Decode the result's `image` content blocks ONCE here (`tool-execution.ts:331-350`), not on
         // every frame — a screenshot-sized PNG must never be re-decoded per redraw.
-        let images = result.as_ref().map(decode_result_images).unwrap_or_default();
+        let images = result
+            .as_ref()
+            .map(decode_result_images)
+            .unwrap_or_default();
         if let Some(run) = self.pending_run_mut(&name, call_id) {
             run.done = true;
             run.is_error = is_error;
@@ -209,7 +221,11 @@ impl TranscriptView {
                     .rev()
                     .find(|r| !r.done && r.call_id.is_none() && r.name == name)
             }
-            None => self.active_tools.iter_mut().rev().find(|r| !r.done && r.name == name),
+            None => self
+                .active_tools
+                .iter_mut()
+                .rev()
+                .find(|r| !r.done && r.name == name),
         }
     }
 

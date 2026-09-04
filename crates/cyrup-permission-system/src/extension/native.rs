@@ -132,7 +132,11 @@ impl NativeExtension for PermissionSystemExtension {
 
     async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::ToolCall { call_id, name, input } => {
+            HostEvent::ToolCall {
+                call_id,
+                name,
+                input,
+            } => {
                 // PERM-005 / pi `tool_call` (`index.ts:2210`): every tool call re-enters
                 // `startForwardedPermissionPolling`, so a watcher that could not attach at session
                 // start (unresolved session id, UI attached late) is armed here instead of never.

@@ -1415,8 +1415,9 @@ mod tests {
             faux_assistant_message(vec![faux_text("ordinary")], StopReason::Stop),
         ]);
 
-        let m1 = collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default()))
-            .await;
+        let m1 =
+            collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default()))
+                .await;
         assert_eq!(m1.stop_reason, StopReason::Deferred);
         assert_eq!(m1.deferred.as_deref(), Some(&h));
 

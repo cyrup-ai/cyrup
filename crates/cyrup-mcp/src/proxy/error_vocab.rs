@@ -2,11 +2,8 @@
 //!
 //! See [`crate::proxy`] for the module overview.
 
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-
 
 // ==================================================================================================
 // 1 · `details.error` — the machine-readable vocabulary (MCP-169)
@@ -198,7 +195,12 @@ pub fn tool_error_override(details: Option<&Value>) -> Option<bool> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -255,11 +257,19 @@ mod tests {
             .map(|code| code.as_str())
             .collect();
         assert_eq!(overrides, vec!["tool_error", "call_failed"]);
-        assert_eq!(tool_error_override(Some(&json!({"error": "tool_error"}))), Some(true));
-        assert_eq!(tool_error_override(Some(&json!({"error": "call_failed"}))), Some(true));
-        assert_eq!(tool_error_override(Some(&json!({"error": "auth_required"}))), None);
+        assert_eq!(
+            tool_error_override(Some(&json!({"error": "tool_error"}))),
+            Some(true)
+        );
+        assert_eq!(
+            tool_error_override(Some(&json!({"error": "call_failed"}))),
+            Some(true)
+        );
+        assert_eq!(
+            tool_error_override(Some(&json!({"error": "auth_required"}))),
+            None
+        );
         assert_eq!(tool_error_override(Some(&json!({"mode": "status"}))), None);
         assert_eq!(tool_error_override(None), None);
     }
-
 }

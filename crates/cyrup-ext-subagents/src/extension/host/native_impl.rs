@@ -5,17 +5,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cyrup_core::ExtensionId;
-use cyrup_ext::{ExtError, HookOutcome, HostEvent};
 use cyrup_ext::native::{HostCtx, InitApi, NativeExtension};
+use cyrup_ext::{ExtError, HookOutcome, HostEvent};
 
-use crate::registration::slash_commands::{SlashCommandName, SLASH_COMMANDS};
 use crate::extension::TOOL_NAME;
 use crate::extension::host::SubagentsExtension;
 use crate::extension::host::registration::RegistrationMode;
 use crate::extension::tool::SubagentTool;
 use crate::extension::tool::text::SUBAGENT_TOOL_DESCRIPTION;
 use crate::extension::wait_tool::WaitTool;
-
+use crate::registration::slash_commands::{SLASH_COMMANDS, SlashCommandName};
 
 #[async_trait]
 impl NativeExtension for SubagentsExtension {
@@ -104,7 +103,10 @@ impl NativeExtension for SubagentsExtension {
                 // inputs, outputs and JSONL older than a week.
                 crate::artifacts::cleanup_all_artifact_dirs(
                     &self.cwd,
-                    self.executor.config_snapshot().await.artifact_cleanup_days(),
+                    self.executor
+                        .config_snapshot()
+                        .await
+                        .artifact_cleanup_days(),
                 );
 
                 // SUBA-025 / pi `description: buildSubagentToolDescription(config)`
@@ -384,7 +386,10 @@ impl NativeExtension for SubagentsExtension {
                 // handler, so pi's runner awaits it too).
                 self.watchdog.handle_agent_end(&ctx.cwd).await;
                 // pi's `agent_end` goal-mission handler (`extension/index.ts:585-601`).
-                let _ = self.executor.raise_goal_continuation_notices(&ctx.cwd).await;
+                let _ = self
+                    .executor
+                    .raise_goal_continuation_notices(&ctx.cwd)
+                    .await;
                 // The fleet status widget's repaint edge (pi's 500 ms `setInterval` tick) — not a
                 // registered handler, so its position here is free.
                 self.refresh_fleet_status_widget(&ctx.cwd, ctx.has_ui).await;
@@ -415,7 +420,11 @@ impl NativeExtension for SubagentsExtension {
                 }
             }
             // pi `register-main.ts:415-418`.
-            HostEvent::BeforeAgentStart { prompt, system_prompt, .. } => {
+            HostEvent::BeforeAgentStart {
+                prompt,
+                system_prompt,
+                ..
+            } => {
                 self.watchdog.handle_before_agent_start(
                     &serde_json::json!({ "prompt": prompt, "systemPrompt": system_prompt }),
                     &ctx.cwd,
@@ -424,11 +433,13 @@ impl NativeExtension for SubagentsExtension {
             // pi `register-main.ts:419-422`. The event is re-shaped into the `{type:"turn_end",
             // message, toolResults}` object `formatWatchdogTurnDelta`/`eventIndicatesRepoEdit`
             // duck-type against — the same JSON pi's own handler receives.
-            HostEvent::TurnEnd { message, tool_results, .. } => {
-                let event = crate::watchdog::turn_delta::watchdog_turn_end_event(
-                    message,
-                    tool_results,
-                );
+            HostEvent::TurnEnd {
+                message,
+                tool_results,
+                ..
+            } => {
+                let event =
+                    crate::watchdog::turn_delta::watchdog_turn_end_event(message, tool_results);
                 self.watchdog.handle_turn_end(&event, &ctx.cwd);
             }
             // pi `register-main.ts:423-426` — the mid-run cadence trigger.
@@ -438,22 +449,24 @@ impl NativeExtension for SubagentsExtension {
             // pi `register-main.ts:431-432` — a switch or a fork abandons this session's review
             // state entirely, scope artifact and auto-follow counters included.
             HostEvent::SessionBeforeSwitch { .. } | HostEvent::SessionBeforeFork { .. } => {
-                self.watchdog.reset(crate::watchdog::runtime::WatchdogResetOptions {
-                    clear_review_input_signature: true,
-                    clear_lsp_ledger: true,
-                    clear_scope: true,
-                    reset_auto_follow: true,
-                    ..crate::watchdog::runtime::WatchdogResetOptions::default()
-                });
+                self.watchdog
+                    .reset(crate::watchdog::runtime::WatchdogResetOptions {
+                        clear_review_input_signature: true,
+                        clear_lsp_ledger: true,
+                        clear_scope: true,
+                        reset_auto_follow: true,
+                        ..crate::watchdog::runtime::WatchdogResetOptions::default()
+                    });
             }
             // pi `register-main.ts:433` — a compaction rewrote the history the scope record was
             // built from, so the scope goes; the auto-follow counters and the review-input hash do
             // NOT (upstream passes only `clearScope`).
             HostEvent::SessionCompact { .. } => {
-                self.watchdog.reset(crate::watchdog::runtime::WatchdogResetOptions {
-                    clear_scope: true,
-                    ..crate::watchdog::runtime::WatchdogResetOptions::default()
-                });
+                self.watchdog
+                    .reset(crate::watchdog::runtime::WatchdogResetOptions {
+                        clear_scope: true,
+                        ..crate::watchdog::runtime::WatchdogResetOptions::default()
+                    });
             }
             // R-SA-132/134: contribute this crate's BUNDLED packaged resources — the
             // `skills/pi-subagents/SKILL.md` operational skill and the seven `prompts/*.md`
@@ -467,10 +480,11 @@ impl NativeExtension for SubagentsExtension {
             // override. A contribution of nothing at all returns `Noop`, which leaves the
             // discovered registry untouched (the host's own early return, `builder.rs:997`).
             HostEvent::ResourcesDiscover { .. } => {
-                let skill_paths: Vec<String> = crate::registration::resources::bundled_skill_files()
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect();
+                let skill_paths: Vec<String> =
+                    crate::registration::resources::bundled_skill_files()
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect();
                 let prompt_paths: Vec<String> =
                     crate::registration::resources::bundled_prompt_files()
                         .iter()
@@ -577,7 +591,11 @@ impl NativeExtension for SubagentsExtension {
 /// renderer contract returns a serialized widget tree the host flattens, and pi's own return here
 /// is a single `Text` node in every branch.
 fn render_subagent_call(args: &serde_json::Value) -> String {
-    let string_field = |key: &str| args.get(key).and_then(serde_json::Value::as_str).unwrap_or("");
+    let string_field = |key: &str| {
+        args.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
     // `:466-472` — a management/control action names its target when it has one.
     let action = string_field("action");
     if !action.is_empty() {
@@ -591,8 +609,11 @@ fn render_subagent_call(args: &serde_json::Value) -> String {
             format!("subagent {action} {target}")
         };
     }
-    let array_len =
-        |key: &str| args.get(key).and_then(serde_json::Value::as_array).map_or(0, Vec::len);
+    let array_len = |key: &str| {
+        args.get(key)
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len)
+    };
     // `:475` — the `[async]` badge, suppressed while clarifying.
     let async_label = if args.get("async") == Some(&serde_json::Value::Bool(true))
         && args.get("clarify") != Some(&serde_json::Value::Bool(true))
@@ -644,9 +665,9 @@ fn effective_parallel_task_count(args: &serde_json::Value) -> u64 {
 /// strings, which the host flattens newline-joined (`cyrup-tui/src/app.rs:4512`).
 fn render_subagent_result(result: &serde_json::Value) -> serde_json::Value {
     let details = result.get("details");
-    let payload = details
-        .filter(|d| !d.is_null())
-        .and_then(|d| serde_json::from_value::<crate::tui::events::SubagentUpdatePayload>(d.clone()).ok());
+    let payload = details.filter(|d| !d.is_null()).and_then(|d| {
+        serde_json::from_value::<crate::tui::events::SubagentUpdatePayload>(d.clone()).ok()
+    });
 
     // pi `:1413` — no details, or no settled run: the plain-text branch.
     let settled = payload.as_ref().filter(|p| !p.results.is_empty());
@@ -660,7 +681,9 @@ fn render_subagent_result(result: &serde_json::Value) -> serde_json::Value {
             .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
             .and_then(|b| b.get("text").and_then(serde_json::Value::as_str))
             .unwrap_or("(no output)");
-        let prefix = if details.and_then(|d| d.get("context")).and_then(serde_json::Value::as_str)
+        let prefix = if details
+            .and_then(|d| d.get("context"))
+            .and_then(serde_json::Value::as_str)
             == Some("fork")
         {
             "[fork] "
@@ -704,10 +727,10 @@ pub(crate) async fn read_nested_children(
     for (step_index, step) in status.steps.iter().enumerate() {
         for nested_id in &step.nested_run_ids {
             let nested_paths = paths.nested(nested_id);
-            let Ok(bytes) = tokio::fs::read(&nested_paths.status).await else { continue };
-            let Ok(nested) =
-                serde_json::from_slice::<crate::background::RunStatus>(&bytes)
-            else {
+            let Ok(bytes) = tokio::fs::read(&nested_paths.status).await else {
+                continue;
+            };
+            let Ok(nested) = serde_json::from_slice::<crate::background::RunStatus>(&bytes) else {
                 continue;
             };
             out.push(crate::tui::fleet_state::NestedRunView::from_run_status(

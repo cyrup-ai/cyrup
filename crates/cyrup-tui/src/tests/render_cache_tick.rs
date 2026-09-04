@@ -39,9 +39,9 @@ const TRANSCRIPT_SRC: &str = include_str!("../transcript/cache.rs");
 /// anchors must resolve — a terminator that no longer matches (an arm renamed, a fn moved to
 /// another file by a re-split) is a lost check, not a licence to read on.
 fn arm_body<'a>(src: &'a str, arm: &str, next_arm: &str) -> &'a str {
-    let start = src
-        .find(arm)
-        .unwrap_or_else(|| panic!("run-loop arm `{arm}` not found — if the loop moved, move this guard with it"));
+    let start = src.find(arm).unwrap_or_else(|| {
+        panic!("run-loop arm `{arm}` not found — if the loop moved, move this guard with it")
+    });
     let rest = &src[start..];
     let end = rest.find(next_arm).unwrap_or_else(|| {
         panic!("terminator `{next_arm}` not found after `{arm}` — if the loop was re-split, re-anchor this guard rather than reading to EOF")
@@ -55,7 +55,11 @@ fn arm_body<'a>(src: &'a str, arm: &str, next_arm: &str) -> &'a str {
 #[test]
 fn the_spinner_tick_bumps_when_time_derived_content_is_live() {
     // Terminator `_ = dialog_countdown.tick()` lives in app/run.rs (APP_SRC), the next select! arm.
-    let arm = arm_body(APP_SRC, "_ = ctx.spinner.tick()", "_ = dialog_countdown.tick()");
+    let arm = arm_body(
+        APP_SRC,
+        "_ = ctx.spinner.tick()",
+        "_ = dialog_countdown.tick()",
+    );
     assert!(
         arm.contains("bash_running()"),
         "the spinner arm's guard must cover the `!` block's live glyph (`bash_running()`):\n{arm}"
@@ -64,13 +68,21 @@ fn the_spinner_tick_bumps_when_time_derived_content_is_live() {
     // (`has_running_elapsed_tool()`), inside `on_spinner_tick` (run_arms.rs).
     // Terminator `fn on_dialog_countdown_tick(` lives in app/run_arms.rs (ARMS_SRC), the next fn.
     assert!(
-        arm_body(ARMS_SRC, "fn on_spinner_tick(", "fn on_dialog_countdown_tick(")
-            .contains("has_running_elapsed_tool()"),
+        arm_body(
+            ARMS_SRC,
+            "fn on_spinner_tick(",
+            "fn on_dialog_countdown_tick("
+        )
+        .contains("has_running_elapsed_tool()"),
         "the spinner bump must also be gated on the tool's live `Elapsed` footer"
     );
     // …and the arm's handler (`on_spinner_tick`, run_arms.rs) owns the bump-then-repaint body.
     // Terminator `fn on_dialog_countdown_tick(` lives in app/run_arms.rs (ARMS_SRC), the next fn.
-    let body = arm_body(ARMS_SRC, "fn on_spinner_tick(", "fn on_dialog_countdown_tick(");
+    let body = arm_body(
+        ARMS_SRC,
+        "fn on_spinner_tick(",
+        "fn on_dialog_countdown_tick(",
+    );
     let bump = body
         .find("bump_render_tick()")
         .unwrap_or_else(|| panic!("the spinner arm must invalidate the render cache:\n{body}"));
@@ -90,7 +102,11 @@ fn the_spinner_tick_bumps_when_time_derived_content_is_live() {
 #[test]
 fn the_elapsed_tick_bumps_before_repainting() {
     // Terminator `_ = git_branch_poll.tick()` lives in app/run.rs (APP_SRC), the next select! arm.
-    let arm = arm_body(APP_SRC, "_ = elapsed_tick.tick()", "_ = git_branch_poll.tick()");
+    let arm = arm_body(
+        APP_SRC,
+        "_ = elapsed_tick.tick()",
+        "_ = git_branch_poll.tick()",
+    );
     assert!(
         arm.contains("has_running_elapsed_tool()"),
         "the elapsed arm stays gated on a live `Elapsed` footer:\n{arm}"
@@ -115,7 +131,8 @@ fn the_elapsed_tick_bumps_before_repainting() {
 /// the public-mutator boundary (the census: 33 bump calls = 32 content mutators + this one).
 #[test]
 fn bump_render_tick_is_a_single_generation_bump_defined_once() {
-    let needle = "pub fn bump_render_tick(&mut self) {\n        self.bump_render_generation();\n    }";
+    let needle =
+        "pub fn bump_render_tick(&mut self) {\n        self.bump_render_generation();\n    }";
     assert_eq!(
         TRANSCRIPT_SRC.matches(needle).count(),
         1,

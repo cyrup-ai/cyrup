@@ -60,7 +60,13 @@ impl ComposeOverlay {
     /// A fresh overlay targeting `target` (displayed as `target_label`).
     #[must_use]
     pub fn new(target: SessionInfo, target_label: String) -> Self {
-        Self { target, target_label, input_buffer: String::new(), sending: false, error: None }
+        Self {
+            target,
+            target_label,
+            input_buffer: String::new(),
+            sending: false,
+            error: None,
+        }
     }
 
     /// The current input text (for the caller's send on [`ComposeAction::Submit`]).
@@ -141,10 +147,21 @@ impl ComposeOverlay {
         self.sending = true;
         self.error = None;
         let text = self.input_buffer.trim().to_string();
-        match client.send(&self.target.id, SendOptions { text: text.clone(), ..Default::default() }).await {
-            Ok(result) if result.delivered => {
-                Some(ComposeResult { sent: true, message_id: Some(result.id), text: Some(text) })
-            }
+        match client
+            .send(
+                &self.target.id,
+                SendOptions {
+                    text: text.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(result) if result.delivered => Some(ComposeResult {
+                sent: true,
+                message_id: Some(result.id),
+                text: Some(text),
+            }),
             Ok(result) => {
                 self.error = Some(result.reason.unwrap_or_else(|| {
                     "Message not delivered. Session may not exist or has disconnected.".to_string()
@@ -163,7 +180,12 @@ impl ComposeOverlay {
     /// Render the overlay to `width` display columns (pi `ComposeOverlay.render`). Inner width is
     /// clamped to [`COMPOSE_MAX_WIDTH`]; every line is exactly `min(width, 72)` columns.
     #[must_use]
-    pub fn render(&self, theme: &dyn Theme, keybindings: &dyn Keybindings, width: usize) -> Vec<String> {
+    pub fn render(
+        &self,
+        theme: &dyn Theme,
+        keybindings: &dyn Keybindings,
+        width: usize,
+    ) -> Vec<String> {
         let inner_width = width.clamp(1, COMPOSE_MAX_WIDTH);
         if inner_width == 1 {
             return vec![theme.fg("accent", "│")];
@@ -176,13 +198,19 @@ impl ComposeOverlay {
         );
         let row = |text: &str| box_row(theme, content_width, text);
         let rule = |left: char, right: char| {
-            theme.fg("accent", &format!("{left}{}{right}", "─".repeat(content_width)))
+            theme.fg(
+                "accent",
+                &format!("{left}{}{right}", "─".repeat(content_width)),
+            )
         };
 
         let mut lines: Vec<String> = Vec::new();
         lines.push(rule('╭', '╮'));
         lines.push(row(&theme.bold(&format!(" Send to: {}", self.target_label))));
-        lines.push(row(&theme.fg("dim", &format!(" {} • {}", self.target.cwd, self.target.model))));
+        lines.push(row(&theme.fg(
+            "dim",
+            &format!(" {} • {}", self.target.cwd, self.target.model),
+        )));
         lines.push(rule('├', '┤'));
         lines.push(row(""));
 
@@ -208,7 +236,12 @@ impl ComposeOverlay {
 fn box_row(theme: &dyn Theme, content_width: usize, text: &str) -> String {
     let clipped = truncate_to_width(text, content_width);
     let pad = content_width.saturating_sub(visible_width(&clipped));
-    format!("{}{clipped}{}{}", theme.fg("accent", "│"), " ".repeat(pad), theme.fg("accent", "│"))
+    format!(
+        "{}{clipped}{}{}",
+        theme.fg("accent", "│"),
+        " ".repeat(pad),
+        theme.fg("accent", "│")
+    )
 }
 
 /// Send a composed message to `target_id` over the broker (pi `ComposeOverlay.sendMessage`,
@@ -217,21 +250,30 @@ fn box_row(theme: &dyn Theme, content_width: usize, text: &str) -> String {
 ///
 /// # Errors
 /// [`IntercomError::Client`] on an empty message, a non-delivered send, or a transport failure.
-pub async fn compose_send(client: &Arc<IntercomClient>, target_id: &str, text: &str) -> Result<SendResult> {
+pub async fn compose_send(
+    client: &Arc<IntercomClient>,
+    target_id: &str,
+    text: &str,
+) -> Result<SendResult> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err(IntercomError::Client("message must not be empty".to_string()));
+        return Err(IntercomError::Client(
+            "message must not be empty".to_string(),
+        ));
     }
     let result = client
-        .send(target_id, SendOptions { text: trimmed.to_string(), ..Default::default() })
+        .send(
+            target_id,
+            SendOptions {
+                text: trimmed.to_string(),
+                ..Default::default()
+            },
+        )
         .await?;
     if !result.delivered {
-        return Err(IntercomError::Client(
-            result
-                .reason
-                .clone()
-                .unwrap_or_else(|| "Message not delivered. Session may not exist or has disconnected.".to_string()),
-        ));
+        return Err(IntercomError::Client(result.reason.clone().unwrap_or_else(
+            || "Message not delivered. Session may not exist or has disconnected.".to_string(),
+        )));
     }
     Ok(result)
 }
@@ -292,7 +334,11 @@ mod tests {
             let lines = overlay.render(&PlainTheme, &MockKeybindings, width);
             assert!(!lines.is_empty());
             for (i, line) in lines.iter().enumerate() {
-                assert_eq!(visible_width(line), width, "width {width} line {i}: {line:?}");
+                assert_eq!(
+                    visible_width(line),
+                    width,
+                    "width {width} line {i}: {line:?}"
+                );
             }
         }
     }
@@ -310,7 +356,10 @@ mod tests {
         assert_eq!(overlay.handle_input(&kb, "\x1b[A"), ComposeAction::Ignore);
         overlay.handle_input(&kb, "ello");
         // Enter submits the trimmed buffer.
-        assert_eq!(overlay.handle_input(&kb, "\r"), ComposeAction::Submit("hello".to_string()));
+        assert_eq!(
+            overlay.handle_input(&kb, "\r"),
+            ComposeAction::Submit("hello".to_string())
+        );
         // Esc cancels.
         assert_eq!(overlay.handle_input(&kb, "\x1b"), ComposeAction::Cancel);
     }

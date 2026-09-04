@@ -8,9 +8,10 @@
 use std::sync::{Arc, OnceLock};
 
 use cyrup_core::ExtensionId;
-use cyrup_ext::{EventKind, ExtError, HandledValue, HookOutcome, HostCtx, HostEvent, InitApi,
-                NativeExtension};
 use cyrup_ext::registry::CommandDescriptor;
+use cyrup_ext::{
+    EventKind, ExtError, HandledValue, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
+};
 
 /// The Flux native extension.
 pub struct FluxExtension {
@@ -75,7 +76,9 @@ impl NativeExtension for FluxExtension {
             "flux/status" => match crate::render_status::parse_sections(args) {
                 Ok((todo, done, review)) => {
                     let base = crate::state::derive_base();
-                    Ok(Some(crate::render_status::render(&base, todo, done, review)))
+                    Ok(Some(crate::render_status::render(
+                        &base, todo, done, review,
+                    )))
                 }
                 Err(bad) => {
                     // Self-issued Error notify, then `Ok(None)` — keeps the wording under this

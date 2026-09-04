@@ -15,7 +15,12 @@
 //!
 //! Workspace clippy DENIES `unwrap_used`/`expect_used`/`panic`/`indexing_slicing` — hence the
 //! file-level allow.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::assert_jsonl_roundtrip;
 
@@ -53,7 +58,11 @@ fn jsonl(lines: &[String]) -> String {
 fn settled_turn_round_trips_raw_stop_reason() {
     let input = jsonl(&[
         user("aaaaaaa1", None, "hello"),
-        assistant("aaaaaaa2", "aaaaaaa1", r#""stopReason":"stop","rawStopReason":"end_turn""#),
+        assistant(
+            "aaaaaaa2",
+            "aaaaaaa1",
+            r#""stopReason":"stop","rawStopReason":"end_turn""#,
+        ),
     ]);
 
     let exported = assert_jsonl_roundtrip(&input).expect("pi turn must round-trip");
@@ -112,7 +121,10 @@ fn deferred_turn_round_trips_its_handle() {
         r#""reasoningIndex":2"#,
         r#""rawStopReason":"queued""#,
     ] {
-        assert!(exported.contains(needle), "lost {needle} on re-export:\n{exported}");
+        assert!(
+            exported.contains(needle),
+            "lost {needle} on re-export:\n{exported}"
+        );
     }
 }
 
@@ -120,7 +132,8 @@ fn deferred_turn_round_trips_its_handle() {
 /// "session truncates at the first entry it cannot parse" failure mode directly.
 #[test]
 fn entries_after_a_deferred_turn_survive() {
-    let handle = r#"{"provider":"openai","modelId":"gpt-5.5","api":"openai-responses","id":"resp_mid"}"#;
+    let handle =
+        r#"{"provider":"openai","modelId":"gpt-5.5","api":"openai-responses","id":"resp_mid"}"#;
     let input = jsonl(&[
         user("ddddddd1", None, "first"),
         assistant(
@@ -129,7 +142,11 @@ fn entries_after_a_deferred_turn_survive() {
             &format!(r#""stopReason":"deferred","deferred":{handle}"#),
         ),
         user("ddddddd3", Some("ddddddd2"), "second"),
-        assistant("ddddddd4", "ddddddd3", r#""stopReason":"stop","rawStopReason":"end_turn""#),
+        assistant(
+            "ddddddd4",
+            "ddddddd3",
+            r#""stopReason":"stop","rawStopReason":"end_turn""#,
+        ),
     ]);
 
     let exported = assert_jsonl_roundtrip(&input).expect("tail after a deferred turn must survive");
@@ -138,7 +155,10 @@ fn entries_after_a_deferred_turn_survive() {
         5,
         "header + 4 entries must all be re-exported:\n{exported}"
     );
-    assert!(exported.contains(r#""text":"second""#), "tail entry lost:\n{exported}");
+    assert!(
+        exported.contains(r#""text":"second""#),
+        "tail entry lost:\n{exported}"
+    );
 }
 
 /// MIRROR — a v0.83.0-shaped turn that carries NEITHER new field must re-export with neither key
@@ -153,6 +173,12 @@ fn mirror_turn_without_the_new_fields_gains_no_new_keys() {
     ]);
 
     let exported = assert_jsonl_roundtrip(&input).expect("plain turn must round-trip");
-    assert!(!exported.contains("rawStopReason"), "invented a rawStopReason key:\n{exported}");
-    assert!(!exported.contains("deferred"), "invented a deferred key:\n{exported}");
+    assert!(
+        !exported.contains("rawStopReason"),
+        "invented a rawStopReason key:\n{exported}"
+    );
+    assert!(
+        !exported.contains("deferred"),
+        "invented a deferred key:\n{exported}"
+    );
 }

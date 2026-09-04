@@ -14,24 +14,30 @@
 //! Gated on the `test-fixtures` Cargo feature, matching every other fixture-dependent integration
 //! test in this crate; without it this file compiles to an empty, passing test list.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
-
-
 
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult};
 use cyrup_ext::native::{ExtMode, HostCtx, NativeExtension};
 use cyrup_ext_subagents::extension::SubagentsExtension;
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
-
+use cyrup_ext_subagents::spawn::SpawnCommand;
 
 fn scoped_config(root: &std::path::Path, script_path: &Path) -> SubagentExtensionConfig {
     SubagentExtensionConfig {
         missions: Some(cyrup_ext_subagents::missions::MissionStoreConfig {
             global_index_dir: Some(
-                root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+                root.join("agent")
+                    .join("missions")
+                    .join("index")
+                    .to_string_lossy()
+                    .into_owned(),
             ),
             ..Default::default()
         }),
@@ -40,7 +46,10 @@ fn scoped_config(root: &std::path::Path, script_path: &Path) -> SubagentExtensio
         // through `ExecSingleStepExecutor::foreground`, and the child's argv via `base_args`.
         spawn_command: Some(SpawnCommand {
             binary: fixture_binary_path(),
-            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            base_args: vec![
+                "--fixture-script".to_string(),
+                script_path.display().to_string(),
+            ],
         }),
         // SUBA-083: this suite spawns real children and asserts their completed output, so the
         // config states its launch mode rather than inheriting it (an absent `asyncByDefault`
@@ -90,7 +99,9 @@ fn write_fixture_persona(cwd: &Path, local_name: &str) {
 /// The per-attempt raw-stdout tee for the (first, here only) spawn attempt of a child that ran in
 /// `child_cwd` — holds every raw NDJSON line the real child emitted, incl. `echo_argv` lines.
 fn read_attempt_tee(child_cwd: &Path) -> String {
-    let path = child_cwd.join(".cyrup-subagent-scratch").join("attempt-0.jsonl");
+    let path = child_cwd
+        .join(".cyrup-subagent-scratch")
+        .join("attempt-0.jsonl");
     std::fs::read_to_string(&path).unwrap_or_default()
 }
 
@@ -324,7 +335,10 @@ async fn tool_chain_static_parallel_group_count_expands_fan_out() {
         2,
         "[count=2] inside a chain parallel group must spawn two real children: {text}"
     );
-    assert!(text.contains("child 1: ok") && text.contains("child 2: ok"), "got: {text}");
+    assert!(
+        text.contains("child 1: ok") && text.contains("child 2: ok"),
+        "got: {text}"
+    );
 }
 
 // =============================================================================================
@@ -353,7 +367,10 @@ async fn slash_run_inline_model_override_reaches_the_child() {
         .expect("run produces textual output");
 
     let tee = read_attempt_tee(work_dir.path());
-    assert!(!tee.is_empty(), "the /run child must have spawned (a tee exists)");
+    assert!(
+        !tee.is_empty(),
+        "the /run child must have spawned (a tee exists)"
+    );
     assert!(
         tee.contains("\"arg\":\"--model\"") && tee.contains("\"arg\":\"override-model-zzz\""),
         "the inline [model=…] override must reach the child as `--model override-model-zzz`: {tee}"
@@ -397,7 +414,10 @@ async fn slash_chain_inline_group_count_multiplies_fan_out() {
         .expect("chain produces textual output");
 
     // step 1 is the seed single-step; step 2 is the group, widened to 3 children by [count=2] + 1.
-    assert!(output.contains("step 2: ok (parallel group)"), "got: {output}");
+    assert!(
+        output.contains("step 2: ok (parallel group)"),
+        "got: {output}"
+    );
     assert!(
         output.contains("child 3: ok"),
         "the [count=2] task + its sibling must fan out to three group children: {output}"

@@ -94,7 +94,10 @@ impl<B: Backend> App<B> {
     /// notices pi re-injects on a rebuild, so a caller that wants them asks the session for the
     /// full stream ([`cyrup_session_svc::AgentSession::replay_items`]) instead.
     pub fn replay_session(&mut self, messages: &[cyrup_session_svc::agent_message::AgentMessage]) {
-        self.replay_session_rendered(&as_replay_items(messages), &std::collections::HashMap::new());
+        self.replay_session_rendered(
+            &as_replay_items(messages),
+            &std::collections::HashMap::new(),
+        );
     }
 
     /// TUI-N04 — the second statement of Pi's `renderInitialMessages()`, immediately after the
@@ -136,7 +139,9 @@ impl<B: Backend> App<B> {
         // No `Warning: ` prefix: pi's trust banner is a RAW `Text` in the warning colour (`:3505`),
         // not a `showWarning` call, so — unlike `interactive-mode.ts:3884-3888`'s
         // `Warning: ${warningMessage}` — there is no prefix to carry (TUI-062).
-        self.state.transcript.push_warning(PROJECT_UNTRUSTED_WARNING);
+        self.state
+            .transcript
+            .push_warning(PROJECT_UNTRUSTED_WARNING);
     }
 
     /// Reload [`AppState::known_tool_definitions`] from the bound session's tool registry — Pi's
@@ -165,7 +170,8 @@ impl<B: Backend> App<B> {
         messages: &[cyrup_session_svc::agent_message::AgentMessage],
         ext_host: &Arc<cyrup_ext::ExtensionHost>,
     ) {
-        self.replay_items_with_extensions(&as_replay_items(messages), ext_host).await;
+        self.replay_items_with_extensions(&as_replay_items(messages), ext_host)
+            .await;
     }
 
     /// [`Self::replay_session_with_extensions`] over the FULL replay stream — the messages plus the
@@ -189,7 +195,9 @@ impl<B: Backend> App<B> {
         // message's renderer onto its neighbour.
         for (i, message) in replay_messages(items).enumerate() {
             // `if (message.display)` (`:3470`) gates the whole arm, lookup included.
-            let AgentMessage::Custom(c) = message else { continue };
+            let AgentMessage::Custom(c) = message else {
+                continue;
+            };
             if !c.display {
                 continue;
             }
@@ -211,7 +219,8 @@ impl<B: Backend> App<B> {
         // Upstream cannot have it: pi rebuilds real `UserMessage`/`AssistantMessage` components on
         // replay (`renderSessionEntries`, `interactive-mode.ts:3781-3796`), each with its own
         // `createMarkdownTransform`.
-        self.apply_markdown_transformers(ext_host, first_pending).await;
+        self.apply_markdown_transformers(ext_host, first_pending)
+            .await;
     }
 
     /// The replay walk itself — pi `renderSessionItems` (`interactive-mode.ts:3705-3775`), over the
@@ -299,8 +308,7 @@ impl<B: Backend> App<B> {
                         // call: the bind refreshed the whole registry into
                         // [`AppState::known_tool_definitions`] just above, which is the only place
                         // this walk can ask — it holds messages, not a session.
-                        let has_definition =
-                            self.state.known_tool_definitions.contains(&call.name);
+                        let has_definition = self.state.known_tool_definitions.contains(&call.name);
                         self.state.transcript.push_tool_start_defined(
                             call.name.clone(),
                             Some(call.id.as_str().to_string()),
@@ -399,7 +407,9 @@ impl<B: Backend> App<B> {
     /// but nothing rendered it. Push it before the first draw so it lands at the top of scrollback,
     /// ahead of the conversation.
     pub fn push_loaded_resources(&mut self, report: &crate::startup::StartupReport) {
-        self.state.transcript.push_loaded_resources(crate::startup::build_startup_lines(report));
+        self.state
+            .transcript
+            .push_loaded_resources(crate::startup::build_startup_lines(report));
     }
 
     /// Put already-queued steering/follow-up text back into the editor — the buffer half of Pi's

@@ -13,8 +13,10 @@
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use cyrup_ext::host::{HostServices, InteractiveOverlay, NotifyKind, OverlayColor, OverlayKey,
-                      OverlayKeyCode, OverlayLine, OverlayOutcome, OverlaySpan};
+use cyrup_ext::host::{
+    HostServices, InteractiveOverlay, NotifyKind, OverlayColor, OverlayKey, OverlayKeyCode,
+    OverlayLine, OverlayOutcome, OverlaySpan,
+};
 
 use crate::state::{self, DoneGroup};
 
@@ -128,19 +130,31 @@ impl FluxStatusOverlay {
 
     fn status_span(status: &str) -> OverlaySpan {
         if status.is_empty() {
-            return OverlaySpan { text: "(unknown)".to_string(), dim: true, ..OverlaySpan::default() };
+            return OverlaySpan {
+                text: "(unknown)".to_string(),
+                dim: true,
+                ..OverlaySpan::default()
+            };
         }
         let (icon, color) = status_style(status);
         let text = match icon {
             Some(icon) => format!("{icon}  {status}"),
             None => status.to_string(),
         };
-        OverlaySpan { text, fg: color, ..OverlaySpan::default() }
+        OverlaySpan {
+            text,
+            fg: color,
+            ..OverlaySpan::default()
+        }
     }
 
     fn row_line(name: &str, stage: &str, status: &str, name_w: usize) -> OverlayLine {
         let mut spans = vec![
-            OverlaySpan { text: ljust(name, name_w), fg: Some(OverlayColor::Cyan), ..OverlaySpan::default() },
+            OverlaySpan {
+                text: ljust(name, name_w),
+                fg: Some(OverlayColor::Cyan),
+                ..OverlaySpan::default()
+            },
             OverlaySpan::raw(ljust(stage, STAGE_W)),
         ];
         spans.push(Self::status_span(status));
@@ -183,7 +197,11 @@ impl InteractiveOverlay for FluxStatusOverlay {
                 bold: true,
                 ..OverlaySpan::default()
             },
-            OverlaySpan { text: "   (ESC to close)".to_string(), dim: true, ..OverlaySpan::default() },
+            OverlaySpan {
+                text: "   (ESC to close)".to_string(),
+                dim: true,
+                ..OverlaySpan::default()
+            },
         ]));
         Self::push_rule(&mut lines, total_w, '\u{2550}');
 
@@ -191,9 +209,24 @@ impl InteractiveOverlay for FluxStatusOverlay {
         let rendered_any = true; // TODO always renders (even as "(no todos)")
         lines.push(OverlayLine::default());
         lines.push(OverlayLine::new(vec![
-            OverlaySpan { text: ljust("TODO-FILE", name_w), fg: Some(OverlayColor::White), bold: true, ..OverlaySpan::default() },
-            OverlaySpan { text: ljust("STAGE", STAGE_W), fg: Some(OverlayColor::White), bold: true, ..OverlaySpan::default() },
-            OverlaySpan { text: "STATUS".to_string(), fg: Some(OverlayColor::White), bold: true, ..OverlaySpan::default() },
+            OverlaySpan {
+                text: ljust("TODO-FILE", name_w),
+                fg: Some(OverlayColor::White),
+                bold: true,
+                ..OverlaySpan::default()
+            },
+            OverlaySpan {
+                text: ljust("STAGE", STAGE_W),
+                fg: Some(OverlayColor::White),
+                bold: true,
+                ..OverlaySpan::default()
+            },
+            OverlaySpan {
+                text: "STATUS".to_string(),
+                fg: Some(OverlayColor::White),
+                bold: true,
+                ..OverlaySpan::default()
+            },
         ]));
         Self::push_dim_rule(&mut lines, total_w, '\u{2500}');
         if self.snapshot.todos.is_empty() {
@@ -221,9 +254,24 @@ impl InteractiveOverlay for FluxStatusOverlay {
             }]));
             lines.push(OverlayLine::default());
             lines.push(OverlayLine::new(vec![
-                OverlaySpan { text: ljust("TASK-FILE", name_w), fg: Some(OverlayColor::White), bold: true, ..OverlaySpan::default() },
-                OverlaySpan { text: ljust("STAGE", STAGE_W), fg: Some(OverlayColor::White), bold: true, ..OverlaySpan::default() },
-                OverlaySpan { text: "STATUS".to_string(), fg: Some(OverlayColor::White), bold: true, ..OverlaySpan::default() },
+                OverlaySpan {
+                    text: ljust("TASK-FILE", name_w),
+                    fg: Some(OverlayColor::White),
+                    bold: true,
+                    ..OverlaySpan::default()
+                },
+                OverlaySpan {
+                    text: ljust("STAGE", STAGE_W),
+                    fg: Some(OverlayColor::White),
+                    bold: true,
+                    ..OverlaySpan::default()
+                },
+                OverlaySpan {
+                    text: "STATUS".to_string(),
+                    fg: Some(OverlayColor::White),
+                    bold: true,
+                    ..OverlaySpan::default()
+                },
             ]));
             for (ts_label, rows) in self.snapshot.done_groups.clone() {
                 lines.push(OverlayLine::new(vec![OverlaySpan {
@@ -266,8 +314,11 @@ impl InteractiveOverlay for FluxStatusOverlay {
             }
             lines.push(OverlayLine::new(head));
             let review_w = (name_w
-                + state::SEVERITIES.iter().map(|s| sev_col_width(s)).sum::<usize>())
-                .max(MIN_PANEL_W);
+                + state::SEVERITIES
+                    .iter()
+                    .map(|s| sev_col_width(s))
+                    .sum::<usize>())
+            .max(MIN_PANEL_W);
             Self::push_dim_rule(&mut lines, review_w, '\u{2500}');
             for (name, sev) in self.snapshot.reviews.clone() {
                 let mut spans = vec![OverlaySpan {

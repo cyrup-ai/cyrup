@@ -2,10 +2,15 @@
 //! `ExtensionApi` routing the wasm `guest` glue uses — subscription bitset, typed event dispatch,
 //! outcome lowering, and guest-tool execution — WITHOUT a wasm runtime (the `Ctx` capability calls
 //! are inert stubs on the host target).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
-use crate::prelude::*;
 use crate::RawOutcome;
+use crate::prelude::*;
 use serde_json::json;
 
 #[test]
@@ -96,7 +101,9 @@ fn guest_tool_executes_and_streams() {
         other => panic!("unexpected content {other:?}"),
     }
     // an unknown tool errors instead of panicking.
-    let err = api.execute_tool("nope", ToolCall::new("t", json!({}))).unwrap_err();
+    let err = api
+        .execute_tool("nope", ToolCall::new("t", json!({})))
+        .unwrap_err();
     assert!(err.contains("no such tool"));
 }
 
@@ -108,13 +115,27 @@ fn guest_command_executes_and_completes() {
         CommandDescriptor::new("greet"),
         |args: &str, _ctx: &CommandCtx| Ok(Some(format!("hi {}", args.trim()))),
         |prefix: &str| {
-            ["world", "team"].iter().filter(|c| c.starts_with(prefix)).map(|c| c.to_string()).collect()
+            ["world", "team"]
+                .iter()
+                .filter(|c| c.starts_with(prefix))
+                .map(|c| c.to_string())
+                .collect()
         },
     );
-    assert_eq!(api.execute_command("greet", "bob").unwrap(), Some("hi bob".to_string()));
-    assert_eq!(api.argument_completions("greet", "te"), vec!["team".to_string()]);
+    assert_eq!(
+        api.execute_command("greet", "bob").unwrap(),
+        Some("hi bob".to_string())
+    );
+    assert_eq!(
+        api.argument_completions("greet", "te"),
+        vec!["team".to_string()]
+    );
     // an unknown command errors rather than panicking.
-    assert!(api.execute_command("nope", "").unwrap_err().contains("no such command"));
+    assert!(
+        api.execute_command("nope", "")
+            .unwrap_err()
+            .contains("no such command")
+    );
 }
 
 #[test]
@@ -123,7 +144,10 @@ fn static_completions_fall_back_when_no_dynamic_completer() {
     let mut desc = CommandDescriptor::new("x");
     desc.completions = vec!["alpha".into(), "beta".into()];
     api.register_command("x", desc, |_a: &str, _c: &CommandCtx| Ok(None));
-    assert_eq!(api.argument_completions("x", "al"), vec!["alpha".to_string()]);
+    assert_eq!(
+        api.argument_completions("x", "al"),
+        vec!["alpha".to_string()]
+    );
 }
 
 #[test]
@@ -142,14 +166,20 @@ fn message_renderer_renders_call_and_result() {
     let call = api.render_call("demo", &json!({ "a": 1 })).unwrap();
     assert_eq!(call["kind"], json!("call"));
     assert_eq!(call["echo"]["a"], json!(1));
-    assert_eq!(api.render_result("demo", &json!({})).unwrap()["kind"], json!("result"));
+    assert_eq!(
+        api.render_result("demo", &json!({})).unwrap()["kind"],
+        json!("result")
+    );
     // an unregistered type returns None (default renderer).
     assert!(api.render_call("other", &json!({})).is_none());
 }
 
 #[test]
 fn content_block_serializes_like_core_content() {
-    let block = ContentBlock::Image { data: "AAAA".into(), mime_type: "image/png".into() };
+    let block = ContentBlock::Image {
+        data: "AAAA".into(),
+        mime_type: "image/png".into(),
+    };
     let v = serde_json::to_value(block).unwrap();
     assert_eq!(v["type"], json!("image"));
     assert_eq!(v["mimeType"], json!("image/png"));
@@ -169,7 +199,11 @@ fn provider_oauth_closures_dispatch() {
             Ok(json!({ "refresh": r, "access": "a1", "expires": 0 }))
         },
         |creds: &serde_json::Value| {
-            Ok(creds.get("access").and_then(|v| v.as_str()).unwrap_or_default().to_string())
+            Ok(creds
+                .get("access")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string())
         },
     )
     .with_modify_models(|m: serde_json::Value, _c: &serde_json::Value| Ok(m));
@@ -199,16 +233,27 @@ fn provider_oauth_closures_dispatch() {
     assert_eq!(refreshed["access"], json!("a1"));
     assert_eq!(api.provider_get_api_key("demo", &creds).unwrap(), "a0");
     let models = json!([{ "id": "m" }]);
-    assert_eq!(api.provider_modify_models("demo", models.clone(), &creds).unwrap(), models);
+    assert_eq!(
+        api.provider_modify_models("demo", models.clone(), &creds)
+            .unwrap(),
+        models
+    );
     // A provider without an OAuth handler surfaces an error rather than panicking.
-    assert!(api.provider_login("missing").unwrap_err().contains("no OAuth handler"));
+    assert!(
+        api.provider_login("missing")
+            .unwrap_err()
+            .contains("no OAuth handler")
+    );
 }
 
 #[test]
 fn provider_stream_simple_pushes_events() {
     use crate::{ProviderConfig, ProviderHandlers, ProviderStream};
     let mut api = ExtensionApi::new();
-    let stream = |model: serde_json::Value, _c: serde_json::Value, _o: serde_json::Value, out: &ProviderStream| {
+    let stream = |model: serde_json::Value,
+                  _c: serde_json::Value,
+                  _o: serde_json::Value,
+                  out: &ProviderStream| {
         out.emit(json!({ "type": "text", "text": model["id"].clone() }));
         Ok(())
     };
@@ -231,7 +276,8 @@ fn provider_stream_simple_pushes_events() {
     assert!(api.providers()[0].1.has_stream_simple);
     // On the host target `emit` is inert, but the handler still runs end-to-end (no panic / Ok).
     let st = ProviderStream::new("s1");
-    api.provider_stream_simple("p", &st, json!({ "id": "m" }), json!({}), json!({})).unwrap();
+    api.provider_stream_simple("p", &st, json!({ "id": "m" }), json!({}), json!({}))
+        .unwrap();
 }
 
 #[test]
@@ -242,14 +288,20 @@ fn autocomplete_provider_stacking_folds_over_base() {
         |q: &AutocompleteQuery, current: Option<&AutocompleteSuggestions>| {
             let mut items = current.map(|c| c.items.clone()).unwrap_or_default();
             items.push(AutocompleteItem::new("x:one"));
-            Some(AutocompleteSuggestions { items, prefix: q.current_line().to_string() })
+            Some(AutocompleteSuggestions {
+                items,
+                prefix: q.current_line().to_string(),
+            })
         },
     );
     api.add_autocomplete_provider(
         |_q: &AutocompleteQuery, current: Option<&AutocompleteSuggestions>| {
             let mut items = current.map(|c| c.items.clone()).unwrap_or_default();
             items.push(AutocompleteItem::new("y:two"));
-            current.map(|c| AutocompleteSuggestions { items, prefix: c.prefix.clone() })
+            current.map(|c| AutocompleteSuggestions {
+                items,
+                prefix: c.prefix.clone(),
+            })
         },
     );
     assert_eq!(api.autocomplete_provider_count(), 2);
@@ -258,11 +310,23 @@ fn autocomplete_provider_stacking_folds_over_base() {
         items: vec![AutocompleteItem::new("builtin")],
         prefix: String::new(),
     };
-    let query = AutocompleteQuery { lines: vec!["he".into()], cursor_line: 0, cursor_col: 2, force: false };
+    let query = AutocompleteQuery {
+        lines: vec!["he".into()],
+        cursor_line: 0,
+        cursor_col: 2,
+        force: false,
+    };
     let folded = api.autocomplete_suggest(Some(base), &query).unwrap();
     let values: Vec<&str> = folded.items.iter().map(|i| i.value.as_str()).collect();
-    assert_eq!(values, vec!["builtin", "x:one", "y:two"], "providers stack in registration order");
-    assert_eq!(folded.prefix, "he", "first provider set the prefix from the cursor line");
+    assert_eq!(
+        values,
+        vec!["builtin", "x:one", "y:two"],
+        "providers stack in registration order"
+    );
+    assert_eq!(
+        folded.prefix, "he",
+        "first provider set the prefix from the cursor line"
+    );
 
     // With no base and no providers, suggest yields None.
     let empty = ExtensionApi::new();
@@ -274,11 +338,17 @@ fn define_tool_factory_bundles_descriptor_and_exec() {
     use crate::tool_factory::{bash_descriptor, define_tool};
     let mut api = ExtensionApi::new();
     let tool = define_tool(bash_descriptor("/work"), |call: ToolCall| {
-        let cmd = call.params.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let cmd = call
+            .params
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         Ok(ToolOutput::text(format!("ran: {cmd}")))
     });
     api.register_tool_def(tool);
-    let out = api.execute_tool("bash", ToolCall::new("t", json!({ "command": "ls" }))).unwrap();
+    let out = api
+        .execute_tool("bash", ToolCall::new("t", json!({ "command": "ls" })))
+        .unwrap();
     match &out.content[0] {
         ContentBlock::Text { text } => assert_eq!(text, "ran: ls"),
         other => panic!("unexpected {other:?}"),
@@ -296,7 +366,11 @@ fn dialog_options_and_typed_command_options_serialize() {
     // `required-features = ["it"]` and the merge gate never builds it (residual ledger, structural
     // defect J). Production (`cyrup-ext-sdk/src/descriptor.rs:180`) is the correct side.
     let to = serde_json::to_value(DialogOptions::timeout(5000)).unwrap();
-    assert_eq!(to["timeout"], json!(5000), "EXT-048: the wire key is `timeout`");
+    assert_eq!(
+        to["timeout"],
+        json!(5000),
+        "EXT-048: the wire key is `timeout`"
+    );
     assert!(
         to.get("timeoutMs").is_none(),
         "the pre-EXT-048 `timeoutMs` key must NOT be emitted: {to}"
@@ -304,7 +378,11 @@ fn dialog_options_and_typed_command_options_serialize() {
     // The alias survives for bags cyrup's own SDK already wrote (`descriptor.rs:180`), so a stored
     // `timeoutMs` still round-trips into the canonical field.
     let legacy: DialogOptions = serde_json::from_value(json!({ "timeoutMs": 5000 })).unwrap();
-    assert_eq!(legacy.timeout_ms, Some(5000), "the `timeoutMs` alias still deserializes");
+    assert_eq!(
+        legacy.timeout_ms,
+        Some(5000),
+        "the `timeoutMs` alias still deserializes"
+    );
 
     let sig = serde_json::to_value(DialogOptions::signal("abort-1")).unwrap();
     assert_eq!(sig["signalId"], json!("abort-1"));
@@ -338,8 +416,16 @@ fn dialog_options_and_typed_command_options_serialize() {
 
     // The CommandCtx typed methods are inert on the host target but must dispatch without panic.
     let ctx = CommandCtx::new();
-    ctx.fork_with("e1", &ForkOptions { position: Some(ForkPosition::At), with_session: false }).unwrap();
-    ctx.navigate_with("t1", &NavigateOptions::default()).unwrap();
+    ctx.fork_with(
+        "e1",
+        &ForkOptions {
+            position: Some(ForkPosition::At),
+            with_session: false,
+        },
+    )
+    .unwrap();
+    ctx.navigate_with("t1", &NavigateOptions::default())
+        .unwrap();
     ctx.new_session_with(&NewSessionOptions::default()).unwrap();
 }
 
@@ -349,8 +435,14 @@ fn example_registers_oauth_provider_and_autocomplete() {
     // The bundled demo now registers the demo-oauth provider with OAuth + streamSimple.
     let creds = api.provider_login("demo-oauth").err();
     // On host target on_prompt errors (inert), so login surfaces that error — proving the closure ran.
-    assert!(creds.is_some(), "login closure dispatched (host-inert prompt errors)");
-    assert!(api.autocomplete_provider_count() >= 1, "demo stacks an autocomplete provider");
+    assert!(
+        creds.is_some(),
+        "login closure dispatched (host-inert prompt errors)"
+    );
+    assert!(
+        api.autocomplete_provider_count() >= 1,
+        "demo stacks an autocomplete provider"
+    );
 }
 
 #[test]
@@ -411,7 +503,11 @@ fn all_33_event_kinds_are_registerable() {
     api.on_session_info_changed(|_, _| {});
 
     let kinds = api.subscription_kinds();
-    assert_eq!(kinds.len(), 33, "all 33 Pi events registerable, got {kinds:?}");
+    assert_eq!(
+        kinds.len(),
+        33,
+        "all 33 Pi events registerable, got {kinds:?}"
+    );
     assert_eq!(kinds.first(), Some(&0));
     assert_eq!(kinds.last(), Some(&32));
 }
@@ -444,7 +540,10 @@ fn tool_call_carries_a_cancellation_signal() {
     // host-backed poll across the boundary.
     let call = ToolCall::new("c1", json!({ "text": "hi" }));
     assert_eq!(call.call_id, "c1");
-    assert!(!call.signal().is_aborted(), "host-target signal poll is inert");
+    assert!(
+        !call.signal().is_aborted(),
+        "host-target signal poll is inert"
+    );
 }
 
 #[test]
@@ -483,7 +582,8 @@ fn new_session_with_callback_is_command_tier_and_ok_on_host() {
     assert!(out.is_ok());
     let out = ctx.fork_with_callback("e1", &ForkOptions::default(), |_rsc| Ok(()));
     assert!(out.is_ok());
-    let out = ctx.switch_session_with_callback("s1", &SwitchSessionOptions::default(), |_rsc| Ok(()));
+    let out =
+        ctx.switch_session_with_callback("s1", &SwitchSessionOptions::default(), |_rsc| Ok(()));
     assert!(out.is_ok());
 }
 
@@ -504,7 +604,15 @@ fn tool_result_decodes_the_usage_argument() {
     });
     api.dispatch(
         1,
-        &["c1", "bash", "{}", "[]", "false", "", r#"{"input":11,"output":22}"#],
+        &[
+            "c1",
+            "bash",
+            "{}",
+            "[]",
+            "false",
+            "",
+            r#"{"input":11,"output":22}"#,
+        ],
         &Ctx::new(),
     );
     assert_eq!(
@@ -520,16 +628,19 @@ fn tool_result_decodes_the_usage_argument() {
 fn tool_result_decodes_an_absent_usage_argument_as_none() {
     use std::cell::RefCell;
     use std::rc::Rc;
-    let seen: Rc<RefCell<Option<serde_json::Value>>> = Rc::new(RefCell::new(Some(
-        serde_json::json!("sentinel"),
-    )));
+    let seen: Rc<RefCell<Option<serde_json::Value>>> =
+        Rc::new(RefCell::new(Some(serde_json::json!("sentinel"))));
     let sink = seen.clone();
     let mut api = ExtensionApi::new();
     api.on_tool_result(move |ev, _| {
         *sink.borrow_mut() = ev.usage.clone();
         Outcome::noop()
     });
-    api.dispatch(1, &["c1", "write", "{}", "[]", "false", "", ""], &Ctx::new());
+    api.dispatch(
+        1,
+        &["c1", "write", "{}", "[]", "false", "", ""],
+        &Ctx::new(),
+    );
     assert_eq!(seen.borrow().clone(), None, "empty arg = Pi `undefined`");
 }
 

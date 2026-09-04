@@ -240,7 +240,12 @@ pub(crate) fn text_lines_of(
 /// that builds a span out of raw text and so the only one that is a `Text` in upstream's sense. The
 /// tool-block path is covered by [`normalize_line`] at the `tool_lines` seam instead, which is
 /// where pi's other layer (`applyLineResets`) lands.
-pub(super) fn text_lines(text: &str, width: usize, padding_x: usize, style: Style) -> Vec<Line<'static>> {
+pub(super) fn text_lines(
+    text: &str,
+    width: usize,
+    padding_x: usize,
+    style: Style,
+) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     // `wrapTextWithAnsi` splits on newlines first (`utils.ts:839`) and wraps each piece.
     for logical in text.split('\n') {
@@ -248,13 +253,21 @@ pub(super) fn text_lines(text: &str, width: usize, padding_x: usize, style: Styl
         // the `Text` was constructed with (`theme.fg("dim", message)`), inside the margins, so it
         // survives being nested in a `Box` that later paints `Line::style` with a background.
         let logical = normalize_terminal_output(logical).into_owned();
-        out.extend(text_lines_of(&Line::from(Span::styled(logical, style)), width, padding_x));
+        out.extend(text_lines_of(
+            &Line::from(Span::styled(logical, style)),
+            width,
+            padding_x,
+        ));
     }
     out
 }
 
 /// The tool block's shell: `new Box(1, 1, <state bg>)` (tool-execution.ts:68).
-pub(super) fn finalize_block(lines: Vec<Line<'static>>, width: usize, bg: Style) -> Vec<Line<'static>> {
+pub(super) fn finalize_block(
+    lines: Vec<Line<'static>>,
+    width: usize,
+    bg: Style,
+) -> Vec<Line<'static>> {
     box_lines(lines, width, 1, 1, bg)
 }
 

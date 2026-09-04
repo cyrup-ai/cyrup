@@ -18,19 +18,24 @@
 //!
 //! These assertions are on transcript CONTENT, never on a length: a length check would pass against
 //! any implementation that happened to carry the right NUMBER of messages.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cyrup_core::{EntryId, Message, StopReason};
-use cyrup_provider::Provider;
-use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use crate::{
     AgentSessionEvent, AgentSessionRuntime, ForkPosition, SessionConfig, SessionFactory,
     SessionTarget,
 };
+use cyrup_core::{EntryId, Message, StopReason};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use futures::StreamExt;
 use tempfile::TempDir;
 
@@ -46,7 +51,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 /// A NON-PERSISTED session — `persist: false` is what `--no-save` / a `SessionTarget::New` embedder
@@ -99,7 +108,9 @@ async fn runtime_with_two_exchanges(fx: &Fixture) -> Arc<AgentSessionRuntime> {
     ]);
     let provider: Arc<dyn Provider> = faux;
     let factory = Arc::new(SessionFactory::new(provider, in_memory_config(fx)));
-    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.expect("runtime");
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .expect("runtime");
 
     let session = runtime.session().await;
     assert!(
@@ -147,7 +158,10 @@ async fn forking_an_unsaved_session_carries_the_transcript_into_the_branch() {
     let anchor: EntryId = anchors[1].entry_id.clone();
     drop(session);
 
-    let fork = runtime.fork(anchor, ForkPosition::Before).await.expect("fork must succeed");
+    let fork = runtime
+        .fork(anchor, ForkPosition::Before)
+        .await
+        .expect("fork must succeed");
     assert!(!fork.cancelled);
     assert_eq!(
         fork.selected_text.as_deref(),
@@ -178,7 +192,10 @@ async fn cloning_an_unsaved_session_at_its_leaf_retains_the_whole_transcript() {
     let anchor: EntryId = anchors[1].entry_id.clone();
     drop(session);
 
-    let fork = runtime.fork(anchor, ForkPosition::At).await.expect("fork must succeed");
+    let fork = runtime
+        .fork(anchor, ForkPosition::At)
+        .await
+        .expect("fork must succeed");
     assert!(!fork.cancelled);
 
     let child = runtime.session().await;
@@ -232,17 +249,21 @@ async fn a_fork_during_a_live_turn_keeps_the_dying_turns_content_in_the_branch()
     for i in 0..64 {
         body.push_str(&format!(" tail-{i:02}"));
     }
-    let faux = Arc::new(FauxProvider::with_config(cyrup_provider::faux::FauxConfig {
-        tokens_per_second: Some(20.0),
-        ..Default::default()
-    }));
+    let faux = Arc::new(FauxProvider::with_config(
+        cyrup_provider::faux::FauxConfig {
+            tokens_per_second: Some(20.0),
+            ..Default::default()
+        },
+    ));
     faux.set_responses(vec![
         faux_assistant_message(vec![faux_text("ANSWER-ONE")], StopReason::Stop),
         faux_assistant_message(vec![faux_text(body)], StopReason::Stop),
     ]);
     let provider: Arc<dyn Provider> = faux;
     let factory = Arc::new(SessionFactory::new(provider, in_memory_config(&fx)));
-    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.expect("runtime");
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .expect("runtime");
 
     let session = runtime.session().await;
     assert!(
@@ -275,8 +296,14 @@ async fn a_fork_during_a_live_turn_keeps_the_dying_turns_content_in_the_branch()
     })
     .await
     .expect("the slow turn must stream");
-    assert!(saw_marker, "fixture precondition: the second turn must stream the marker");
-    assert!(!session.is_idle(), "precondition: the turn is STILL RUNNING when the fork lands");
+    assert!(
+        saw_marker,
+        "fixture precondition: the second turn must stream the marker"
+    );
+    assert!(
+        !session.is_idle(),
+        "precondition: the turn is STILL RUNNING when the fork lands"
+    );
 
     // Fork AT the in-flight user message, so the branch path ends at it and the dying turn's
     // assistant message is appended as its child — the entry Pi keeps and cyrup was dropping.
@@ -286,7 +313,10 @@ async fn a_fork_during_a_live_turn_keeps_the_dying_turns_content_in_the_branch()
     let anchor: EntryId = anchors[1].entry_id.clone();
     drop(session);
 
-    let fork = runtime.fork(anchor, ForkPosition::At).await.expect("fork must succeed");
+    let fork = runtime
+        .fork(anchor, ForkPosition::At)
+        .await
+        .expect("fork must succeed");
     assert!(!fork.cancelled);
 
     let child = runtime.session().await;

@@ -1,13 +1,13 @@
 //! Request encoding — `functionDeclarations` and the `functionCallingConfig` mode (Pi
 //! `convertTools` / `resolveGoogleFunctionCallingMode`, google-shared.ts:272-324).
 
+use super::capabilities::gemini_major_version;
 use crate::context::ToolDef;
 use crate::stream::ToolChoice;
 use crate::utils::constrained_sampling::{
     ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use serde_json::{Value, json};
-use super::capabilities::gemini_major_version;
 
 /// Convert tools to Gemini `functionDeclarations` (Pi `convertTools`, `google-shared.ts:318-339`
 /// @v0.84.2). Uses `parametersJsonSchema` (full JSON Schema). `None` when there are no tools.

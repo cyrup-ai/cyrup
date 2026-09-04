@@ -22,9 +22,12 @@ pub(crate) fn resolve_external_editor(session: &AgentSession) -> String {
 /// caller's ([`App::edit_in_external_editor`]) responsibility.
 pub(crate) fn run_editor_over_file(editor_cmd: &str, path: &std::path::Path) -> Option<String> {
     let mut parts = editor_cmd.split_whitespace();
-    let status = parts
-        .next()
-        .map(|bin| std::process::Command::new(bin).args(parts).arg(path).status());
+    let status = parts.next().map(|bin| {
+        std::process::Command::new(bin)
+            .args(parts)
+            .arg(path)
+            .status()
+    });
     if let Some(Ok(s)) = status
         && s.success()
         && let Ok(new_text) = std::fs::read_to_string(path)
@@ -78,8 +81,14 @@ impl App<InlineBackend<Stdout>> {
         // A silent/absent terminal falls back to the bottom row — where `App::draw`'s first
         // `resize_viewport` bottom-anchors the region anyway (`reanchor_inline_region` with
         // `old_height` 0).
-        let bottom = backend.size().map(|s| s.height.saturating_sub(1)).unwrap_or(0);
-        backend.set_anchor(ratatui::layout::Position::new(0, probed_row.unwrap_or(bottom).min(bottom)));
+        let bottom = backend
+            .size()
+            .map(|s| s.height.saturating_sub(1))
+            .unwrap_or(0);
+        backend.set_anchor(ratatui::layout::Position::new(
+            0,
+            probed_row.unwrap_or(bottom).min(bottom),
+        ));
         App::new(backend, theme)
     }
 
@@ -119,7 +128,9 @@ impl App<InlineBackend<Stdout>> {
             // Stop our own process group; `kill` exits before the stop takes effect, and we resume on
             // SIGCONT (shell `fg`) at the next statement.
             let pid = std::process::id().to_string();
-            let _ = std::process::Command::new("kill").args(["-s", "TSTP", &pid]).status();
+            let _ = std::process::Command::new("kill")
+                .args(["-s", "TSTP", &pid])
+                .status();
         }
         // Resumed (or non-unix): re-enter raw mode + flags, then redraw the live region. The flags
         // are re-pushed unconditionally, exactly as Pi's `start()` does (`terminal.ts:164-166`) —
@@ -157,8 +168,15 @@ impl App<InlineBackend<Stdout>> {
     /// [`Selector::apply_external_edit`] — the dialog stays open (Pi never resolves it from this
     /// path, `extension-editor.ts:119-157`); only `Enter`/`Esc` close it. A no-op if no selector is
     /// open or the open one doesn't support external editing (`external_edit_text` returns `None`).
-    pub(crate) fn open_external_editor_for_selector(&mut self, editor_cmd: &str) -> Result<(), TuiError> {
-        let Some(current) = self.state.selector.as_ref().and_then(|a| a.inner.external_edit_text())
+    pub(crate) fn open_external_editor_for_selector(
+        &mut self,
+        editor_cmd: &str,
+    ) -> Result<(), TuiError> {
+        let Some(current) = self
+            .state
+            .selector
+            .as_ref()
+            .and_then(|a| a.inner.external_edit_text())
         else {
             return Ok(());
         };
@@ -204,7 +222,9 @@ impl App<InlineBackend<Stdout>> {
         let mut tmp = std::env::temp_dir();
         tmp.push(format!("cyrup-editor-{}.pi.md", std::process::id()));
         if std::fs::write(&tmp, initial).is_err() {
-            self.state.transcript.push_status("external editor: could not write temp file");
+            self.state
+                .transcript
+                .push_status("external editor: could not write temp file");
             return Ok(None);
         }
 

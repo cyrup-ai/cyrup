@@ -52,7 +52,9 @@ fn the_input_arm_outranks_every_ticker() {
         let body = &APP_SRC[offset..];
         // The arm list of one `select!`: everything up to the next one, which is enough context
         // to see all three arms of interest.
-        let end = body[1..].find("tokio::select! {").map_or(body.len(), |i| i + 1);
+        let end = body[1..]
+            .find("tokio::select! {")
+            .map_or(body.len(), |i| i + 1);
         let block = &body[..end];
         if !block.contains("cancel.cancelled()") || !block.contains("input.next()") {
             continue;
@@ -61,9 +63,11 @@ fn the_input_arm_outranks_every_ticker() {
         let cancel_pos = block
             .find("_ = cancel.cancelled() => break")
             .unwrap_or_else(|| panic!("the cancel arm must be spelled `_ = cancel.cancelled() => break` at byte {offset} of app.rs"));
-        let input_pos = block
-            .find("maybe_in = input.next()")
-            .unwrap_or_else(|| panic!("the input arm must be spelled `maybe_in = input.next()` at byte {offset} of app.rs"));
+        let input_pos = block.find("maybe_in = input.next()").unwrap_or_else(|| {
+            panic!(
+                "the input arm must be spelled `maybe_in = input.next()` at byte {offset} of app.rs"
+            )
+        });
         assert!(
             cancel_pos < input_pos,
             "the cancel arm keeps position #1 (run_loop_cancel_bias.rs pins why); \

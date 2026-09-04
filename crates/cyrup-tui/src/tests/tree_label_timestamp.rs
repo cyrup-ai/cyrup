@@ -12,15 +12,18 @@
 //! What is asserted here is the render contract; the producer that will eventually fill the column
 //! is the remaining half of the fix and lives in `cyrup-session`/`cyrup-session-svc` (see the
 //! comment on `time_label` in `app.rs`'s `tree_node_from_dag`).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
-use cyrup_session_svc::{SessionDagKind, SessionDagNode};
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{
-    tree_node_from_dag, App, InputEvent, SelectorKind, TreeNode, TreeSelector, UiTheme,
-};
-use ratatui::backend::TestBackend;
 use super::harness::*;
+use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::{App, InputEvent, SelectorKind, TreeNode, TreeSelector, UiTheme, tree_node_from_dag};
+use cyrup_session_svc::{SessionDagKind, SessionDagNode};
+use ratatui::backend::TestBackend;
 
 /// `app.tree.toggleLabelTimestamp` is bound to **`shift+t`** upstream (`keybindings.ts:131-134`,
 /// v0.83.0), which a terminal delivers as the shifted letter. A *bare* `t` is not the toggle at

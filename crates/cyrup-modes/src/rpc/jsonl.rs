@@ -13,7 +13,10 @@ use super::RpcOut;
 
 /// Serialize one protocol record and write it as a single LF-terminated line, flushed immediately so
 /// the peer never waits on buffering (R-11-013).
-pub(super) async fn write_out<W: AsyncWrite + Unpin>(writer: &mut W, out: &RpcOut) -> Result<(), ModesError> {
+pub(super) async fn write_out<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    out: &RpcOut,
+) -> Result<(), ModesError> {
     let mut line = serde_json::to_string(out)?;
     line.push('\n');
     // TOOL-037 note — pi's RPC writer is `writeRawStdout` (`rpc-mode.ts:60`), whose retry loop

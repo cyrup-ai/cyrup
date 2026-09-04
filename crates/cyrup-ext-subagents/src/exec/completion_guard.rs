@@ -84,9 +84,7 @@ pub(crate) fn word_boundary_contains(haystack_lower: &str, needle: &str) -> bool
             .chars()
             .next_back()
             .is_none_or(|c| !is_word_char(c));
-        let after_ok = bytes
-            .get(match_end)
-            .is_none()
+        let after_ok = bytes.get(match_end).is_none()
             || haystack_lower[match_end..]
                 .chars()
                 .next()
@@ -125,7 +123,6 @@ pub(crate) fn any_word_boundary(haystack_lower: &str, needles: &[&str]) -> bool 
 /// (`exec/acceptance.rs`) is its second consumer and needs all three values plus
 /// [`crate::exec::task_intent::task_may_mutate`], which this guard never sees.
 pub use crate::exec::task_intent::expects_implementation_mutation;
-
 
 /// Source: `hasMutationToolCall(messages)` (`completion-guard.ts:69-84` @v0.43.0), re-scoped to this
 /// crate's dependency-free [`SubagentEvent`] transcript instead of a rich `Message[]` array (this
@@ -762,8 +759,7 @@ pub struct CompletionMutationGuardResult {
 /// completion path) that want a fixed, greppable string rather than composing their own — R-SA-034
 /// requires "a distinguishing error message" but does not fix its exact wording; this constant is
 /// this crate's canonical phrasing so every trigger site produces consistent text.
-pub const COMPLETION_GUARD_ERROR_MESSAGE: &str =
-    "completion-mutation guard: task appeared to require an implementation change, but no \
+pub const COMPLETION_GUARD_ERROR_MESSAGE: &str = "completion-mutation guard: task appeared to require an implementation change, but no \
      mutating edit/write/bash tool call was observed before the run completed";
 
 /// Evaluate the full R-SA-034 completion-mutation guard for one finished run: `agent` is the
@@ -819,7 +815,11 @@ mod tests {
 
     use crate::discovery::types::{AgentSource, SystemPromptMode};
 
-    fn agent(local_name: &str, tools: Option<Vec<ToolRef>>, completion_guard: Option<bool>) -> AgentDefinition {
+    fn agent(
+        local_name: &str,
+        tools: Option<Vec<ToolRef>>,
+        completion_guard: Option<bool>,
+    ) -> AgentDefinition {
         AgentDefinition {
             default_turn_budget: None,
             default_acceptance: None,
@@ -893,8 +893,14 @@ mod tests {
 
     #[test]
     fn word_boundary_contains_requires_boundaries_on_both_sides() {
-        assert!(word_boundary_contains("please review only this", "review only"));
-        assert!(!word_boundary_contains("prereview only this", "review only"));
+        assert!(word_boundary_contains(
+            "please review only this",
+            "review only"
+        ));
+        assert!(!word_boundary_contains(
+            "prereview only this",
+            "review only"
+        ));
         assert!(!word_boundary_contains("review onlyish", "review only"));
     }
 
@@ -918,10 +924,22 @@ mod tests {
             "worker",
             "Implement this. Do not edit files outside this repo. Do not edit files."
         ));
-        assert!(!expects_implementation_mutation("worker", "Investigate why this failed"));
-        assert!(!expects_implementation_mutation("researcher", "Research the API behavior"));
-        assert!(!expects_implementation_mutation("researcher", "Research this and patch the bug"));
-        assert!(!expects_implementation_mutation("reviewer", "Review this and fix any real issues"));
+        assert!(!expects_implementation_mutation(
+            "worker",
+            "Investigate why this failed"
+        ));
+        assert!(!expects_implementation_mutation(
+            "researcher",
+            "Research the API behavior"
+        ));
+        assert!(!expects_implementation_mutation(
+            "researcher",
+            "Research this and patch the bug"
+        ));
+        assert!(!expects_implementation_mutation(
+            "reviewer",
+            "Review this and fix any real issues"
+        ));
         assert!(expects_implementation_mutation(
             "reviewer",
             "Review this and fix any real issues; regardless of findings, apply changes directly"
@@ -931,11 +949,23 @@ mod tests {
             "[Write to: /tmp/result.md]\n\nSummarize findings"
         ));
         assert!(!expects_implementation_mutation("worker", "Write report"));
-        assert!(!expects_implementation_mutation("worker", "Create a report"));
-        assert!(!expects_implementation_mutation("worker", "Create a summary"));
+        assert!(!expects_implementation_mutation(
+            "worker",
+            "Create a report"
+        ));
+        assert!(!expects_implementation_mutation(
+            "worker",
+            "Create a summary"
+        ));
         assert!(!expects_implementation_mutation("worker", "Add a report"));
-        assert!(!expects_implementation_mutation("worker", "Update a summary"));
-        assert!(!expects_implementation_mutation("worker", "Write to {chain_dir}"));
+        assert!(!expects_implementation_mutation(
+            "worker",
+            "Update a summary"
+        ));
+        assert!(!expects_implementation_mutation(
+            "worker",
+            "Write to {chain_dir}"
+        ));
         assert!(!expects_implementation_mutation(
             "worker",
             "Do async work\nUpdate progress at: /tmp/progress.md\n**Output:**\nWrite your findings to exactly this path: /tmp/out.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere."
@@ -956,12 +986,18 @@ mod tests {
             "worker",
             "Fix the bug where no edits were made"
         ));
-        assert!(expects_implementation_mutation("worker", "Implement the fix and return findings."));
+        assert!(expects_implementation_mutation(
+            "worker",
+            "Implement the fix and return findings."
+        ));
     }
 
     #[test]
     fn worker_edit_intent_covers_common_docs_config_and_source_tasks() {
-        assert!(expects_implementation_mutation("worker", "Update README to mention the native tool"));
+        assert!(expects_implementation_mutation(
+            "worker",
+            "Update README to mention the native tool"
+        ));
         assert!(expects_implementation_mutation(
             "worker",
             "Remove share functionality and all Vercel references"
@@ -970,8 +1006,14 @@ mod tests {
             "worker",
             "Replace the registered command with a render tool"
         ));
-        assert!(expects_implementation_mutation("worker", "Create completion-guard.ts"));
-        assert!(expects_implementation_mutation("worker", "Add tests for the completion guard"));
+        assert!(expects_implementation_mutation(
+            "worker",
+            "Create completion-guard.ts"
+        ));
+        assert!(expects_implementation_mutation(
+            "worker",
+            "Add tests for the completion guard"
+        ));
         assert!(expects_implementation_mutation(
             "worker",
             "Implement the approved fixes. Do not edit files outside this repo."
@@ -986,8 +1028,14 @@ mod tests {
 
     #[test]
     fn edit_and_write_tool_calls_count_as_mutation_attempts() {
-        assert!(has_mutation_tool_call(&[tool_start("edit", serde_json::json!({"path": "a.ts"}))]));
-        assert!(has_mutation_tool_call(&[tool_start("write", serde_json::json!({"path": "a.ts"}))]));
+        assert!(has_mutation_tool_call(&[tool_start(
+            "edit",
+            serde_json::json!({"path": "a.ts"})
+        )]));
+        assert!(has_mutation_tool_call(&[tool_start(
+            "write",
+            serde_json::json!({"path": "a.ts"})
+        )]));
     }
 
     #[test]
@@ -1023,14 +1071,18 @@ mod tests {
         assert!(is_mutating_bash_command(
             "mkdir -p src && cat > src/file.ts <<'EOF'\nhi\nEOF"
         ));
-        assert!(is_mutating_bash_command("cat <<'EOF' > src/file.ts\nhi\nEOF"));
+        assert!(is_mutating_bash_command(
+            "cat <<'EOF' > src/file.ts\nhi\nEOF"
+        ));
         assert!(is_mutating_bash_command(
             "python3 -c \"from pathlib import Path; Path('x').write_text('hi')\""
         ));
         assert!(is_mutating_bash_command("node script.js > generated.txt"));
         assert!(!is_mutating_bash_command("echo 'a > b'"));
         assert!(!is_mutating_bash_command("node -e \"console.log(a > b)\""));
-        assert!(!is_mutating_bash_command("python3 <<'PY'\nprint('inspect only')\nPY"));
+        assert!(!is_mutating_bash_command(
+            "python3 <<'PY'\nprint('inspect only')\nPY"
+        ));
         assert!(!is_mutating_bash_command("echo 'rm file'"));
         assert!(!is_mutating_bash_command("printf \"mkdir x\""));
         assert!(is_mutating_bash_command("git apply patch.diff"));
@@ -1055,7 +1107,9 @@ mod tests {
         // Global options the source's regex explicitly tolerates between `git` and the verb.
         assert!(is_mutating_bash_command("git -C /repo commit -am x"));
         assert!(is_mutating_bash_command("git --git-dir=/r/.git add ."));
-        assert!(is_mutating_bash_command("git --work-tree /r --git-dir /r/.git push"));
+        assert!(is_mutating_bash_command(
+            "git --work-tree /r --git-dir /r/.git push"
+        ));
         assert!(is_mutating_bash_command("git --paginate add ."));
         // Not the first command in the line: the source splits on shell separators first.
         assert!(is_mutating_bash_command("cargo test && git commit -am wip"));
@@ -1096,8 +1150,11 @@ mod tests {
         )];
         assert!(has_mutation_tool_call(&events));
 
-        let result =
-            evaluate_completion_mutation_guard(&committer, "Implement the fix and commit it", &events);
+        let result = evaluate_completion_mutation_guard(
+            &committer,
+            "Implement the fix and commit it",
+            &events,
+        );
         assert!(
             result.expected_mutation,
             "a bash-capable worker told to implement is expected to mutate"
@@ -1110,10 +1167,17 @@ mod tests {
         assert!(!result.triggered);
 
         // MIRROR: the same agent that only ran `git status` still trips the guard.
-        let looker = vec![tool_start("bash", serde_json::json!({"command": "git status"}))];
+        let looker = vec![tool_start(
+            "bash",
+            serde_json::json!({"command": "git status"}),
+        )];
         assert!(
-            evaluate_completion_mutation_guard(&committer, "Implement the fix and commit it", &looker)
-                .triggered
+            evaluate_completion_mutation_guard(
+                &committer,
+                "Implement the fix and commit it",
+                &looker
+            )
+            .triggered
         );
     }
 
@@ -1196,7 +1260,10 @@ mod tests {
     fn omitted_empty_bash_unknown_write_and_mcp_tool_capabilities_stay_conservative() {
         let task = "Implement the approved source fix";
 
-        assert!(evaluate_completion_mutation_guard(&agent("architect", None, None), task, &[]).triggered);
+        assert!(
+            evaluate_completion_mutation_guard(&agent("architect", None, None), task, &[])
+                .triggered
+        );
         // G103: an agent granted NO tools cannot mutate anything, so the guard must never fire on
         // it — `hasMutationToolCapability([]) === false` (`completion-guard.ts:39-43` @v0.43.0),
         // which short-circuits `expectedMutation` to `false` and with it `triggered`. This
@@ -1207,60 +1274,68 @@ mod tests {
             evaluate_completion_mutation_guard(&agent("architect", Some(vec![]), None), task, &[]);
         assert!(!empty_allowlist.expected_mutation);
         assert!(!empty_allowlist.triggered);
-        assert!(evaluate_completion_mutation_guard(
-            &agent(
-                "architect",
-                Some(vec![
-                    ToolRef::Builtin("read".to_string()),
-                    ToolRef::Builtin("bash".to_string()),
-                    ToolRef::Builtin("ls".to_string()),
-                ]),
-                None
-            ),
-            task,
-            &[]
-        )
-        .triggered);
-        assert!(evaluate_completion_mutation_guard(
-            &agent(
-                "architect",
-                Some(vec![
-                    ToolRef::Builtin("read".to_string()),
-                    ToolRef::Builtin("custom_lookup".to_string()),
-                ]),
-                None
-            ),
-            task,
-            &[]
-        )
-        .triggered);
-        assert!(evaluate_completion_mutation_guard(
-            &agent(
-                "architect",
-                Some(vec![
-                    ToolRef::Builtin("read".to_string()),
-                    ToolRef::Builtin("write".to_string()),
-                ]),
-                None
-            ),
-            task,
-            &[]
-        )
-        .triggered);
-        assert!(evaluate_completion_mutation_guard(
-            &agent(
-                "architect",
-                Some(vec![
-                    ToolRef::Builtin("read".to_string()),
-                    ToolRef::Builtin("grep".to_string()),
-                    ToolRef::Mcp("mcp:github.search".to_string()),
-                ]),
-                None
-            ),
-            task,
-            &[]
-        )
-        .triggered);
+        assert!(
+            evaluate_completion_mutation_guard(
+                &agent(
+                    "architect",
+                    Some(vec![
+                        ToolRef::Builtin("read".to_string()),
+                        ToolRef::Builtin("bash".to_string()),
+                        ToolRef::Builtin("ls".to_string()),
+                    ]),
+                    None
+                ),
+                task,
+                &[]
+            )
+            .triggered
+        );
+        assert!(
+            evaluate_completion_mutation_guard(
+                &agent(
+                    "architect",
+                    Some(vec![
+                        ToolRef::Builtin("read".to_string()),
+                        ToolRef::Builtin("custom_lookup".to_string()),
+                    ]),
+                    None
+                ),
+                task,
+                &[]
+            )
+            .triggered
+        );
+        assert!(
+            evaluate_completion_mutation_guard(
+                &agent(
+                    "architect",
+                    Some(vec![
+                        ToolRef::Builtin("read".to_string()),
+                        ToolRef::Builtin("write".to_string()),
+                    ]),
+                    None
+                ),
+                task,
+                &[]
+            )
+            .triggered
+        );
+        assert!(
+            evaluate_completion_mutation_guard(
+                &agent(
+                    "architect",
+                    Some(vec![
+                        ToolRef::Builtin("read".to_string()),
+                        ToolRef::Builtin("grep".to_string()),
+                        ToolRef::Mcp("mcp:github.search".to_string()),
+                    ]),
+                    None
+                ),
+                task,
+                &[]
+            )
+            .triggered
+        );
     }
 
     #[test]
@@ -1314,7 +1389,11 @@ mod tests {
         // mutation capability at all (`[].every(...) === true`), so the guard exempts it. This
         // asserted `!` while cyrup still mirrored v0.34.0's `tools.length === 0 =>
         // mutation-capable` short-circuit.
-        assert!(declares_only_read_only_tools(&agent("a", Some(vec![]), None)));
+        assert!(declares_only_read_only_tools(&agent(
+            "a",
+            Some(vec![]),
+            None
+        )));
         assert!(declares_only_read_only_tools(&agent(
             "a",
             Some(vec![ToolRef::Builtin("read".to_string())]),

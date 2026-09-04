@@ -261,8 +261,12 @@ where
     // ownership of exactly the one element they claim from the shared cursor, without cloning `T`
     // (workers must be able to run over non-`Clone` task payloads, e.g. a `ChildSpawnSpec` with a
     // temp-file list that must not be logically duplicated).
-    let tasks: Arc<Vec<std::sync::Mutex<Option<T>>>> =
-        Arc::new(tasks.into_iter().map(|t| std::sync::Mutex::new(Some(t))).collect());
+    let tasks: Arc<Vec<std::sync::Mutex<Option<T>>>> = Arc::new(
+        tasks
+            .into_iter()
+            .map(|t| std::sync::Mutex::new(Some(t)))
+            .collect(),
+    );
 
     let worker = Arc::new(worker);
     let mut join_set: JoinSet<()> = JoinSet::new();
@@ -285,7 +289,13 @@ where
                     // already have been claimed and be mid-flight, in which case its eventual
                     // real outcome — not a synthesized Cancelled skip — wins, since this only
                     // marks slots whose `skip_reasons`/`slots` entry is still genuinely `None`).
-                    mark_remaining_skipped(&cursor, total, &slots, &skip_reasons, SkipReason::Cancelled);
+                    mark_remaining_skipped(
+                        &cursor,
+                        total,
+                        &slots,
+                        &skip_reasons,
+                        SkipReason::Cancelled,
+                    );
                     return;
                 }
                 if fail_fast.load_tripped(&fail_fast_tripped) {
@@ -793,13 +803,8 @@ mod tests {
         // every later worker sails through — no stranded tail, and no wall-clock lower bound left.
         let rendezvous = Arc::new(FirstArrivalsRendezvous::new(cap));
 
-        let result: FanOutResult<i32, String> = run_bounded(
-            tasks,
-            cap,
-            &global,
-            false,
-            cancel,
-            move |index, ()| {
+        let result: FanOutResult<i32, String> =
+            run_bounded(tasks, cap, &global, false, cancel, move |index, ()| {
                 let dir_path = dir_path.clone();
                 let running = Arc::clone(&running_for_worker);
                 let peak = Arc::clone(&peak_for_worker);
@@ -815,9 +820,8 @@ mod tests {
                     )
                     .await
                 }
-            },
-        )
-        .await;
+            })
+            .await;
 
         assert_eq!(result.slots.len(), total_tasks, "one slot per input task");
         assert!(
@@ -1064,7 +1068,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.any_failed, "task 0's real nonzero exit must surface as a failure");
+        assert!(
+            result.any_failed,
+            "task 0's real nonzero exit must surface as a failure"
+        );
         assert!(
             result.slots[0].as_ref().expect("slot 0 populated").is_err(),
             "task 0 itself failed"
@@ -1188,7 +1195,10 @@ mod tests {
         let guard = DispatchGuard::new();
         let _held = guard.try_acquire().expect("first dispatch claims the slot");
         let rejected = guard.try_acquire_or_reject("tool:subagent");
-        assert!(matches!(rejected, Err(SubagentError::AcceptanceRejected(_))));
+        assert!(matches!(
+            rejected,
+            Err(SubagentError::AcceptanceRejected(_))
+        ));
     }
 
     /// R-SA-069's other half: rejecting a concurrent duplicate top-level call must NOT affect
@@ -1216,13 +1226,8 @@ mod tests {
         // straight through rather than waiting on a generation that will never fill.
         let rendezvous = Arc::new(FirstArrivalsRendezvous::new(2));
 
-        let result: FanOutResult<i32, String> = run_bounded(
-            tasks,
-            4,
-            &global,
-            false,
-            cancel,
-            move |index, ()| {
+        let result: FanOutResult<i32, String> =
+            run_bounded(tasks, 4, &global, false, cancel, move |index, ()| {
                 let dir_path = dir_path.clone();
                 let running = Arc::clone(&running_for_worker);
                 let peak = Arc::clone(&peak_for_worker);
@@ -1238,9 +1243,8 @@ mod tests {
                     )
                     .await
                 }
-            },
-        )
-        .await;
+            })
+            .await;
 
         // SUBA-033: the claim — "the dispatch guard being held must not serialize the intentional
         // in-call parallel fan-out down to peak concurrency 1" — is now enforced by the rendezvous
@@ -1292,13 +1296,8 @@ mod tests {
             cancel_for_trigger.cancel();
         });
 
-        let result: FanOutResult<i32, String> = run_bounded(
-            tasks,
-            2,
-            &global,
-            false,
-            cancel,
-            move |index, _| {
+        let result: FanOutResult<i32, String> =
+            run_bounded(tasks, 2, &global, false, cancel, move |index, _| {
                 let dir_path = dir_path.clone();
                 let dispatched = Arc::clone(&dispatched_for_worker);
                 async move {
@@ -1324,9 +1323,8 @@ mod tests {
                     child.finish();
                     Ok(status.code().unwrap_or(-1))
                 }
-            },
-        )
-        .await;
+            })
+            .await;
 
         cancel_trigger.await.expect("trigger task completes");
 
@@ -1366,20 +1364,14 @@ mod tests {
         let cancel = cyrup_core::CancelToken::new();
         let dir_path = dir.path().to_path_buf();
 
-        let result: FanOutResult<i32, String> = run_bounded(
-            vec![()],
-            1,
-            &global,
-            false,
-            cancel,
-            move |index, ()| {
+        let result: FanOutResult<i32, String> =
+            run_bounded(vec![()], 1, &global, false, cancel, move |index, ()| {
                 let dir_path = dir_path.clone();
                 let running = Arc::clone(&running);
                 let peak = Arc::clone(&peak);
                 async move { real_child_worker(dir_path, running, peak, index, 10).await }
-            },
-        )
-        .await;
+            })
+            .await;
 
         assert_eq!(result.slots.len(), 1);
         assert!(result.slots[0].as_ref().expect("populated").is_ok());

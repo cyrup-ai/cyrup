@@ -33,13 +33,25 @@ pub(super) struct FrameResult {
 
 impl FrameResult {
     pub(super) fn cont() -> Self {
-        Self { outcome: FrameOutcome::Continue, schedule_shutdown: false, rearmed_registration: false }
+        Self {
+            outcome: FrameOutcome::Continue,
+            schedule_shutdown: false,
+            rearmed_registration: false,
+        }
     }
     pub(super) fn close_self() -> Self {
-        Self { outcome: FrameOutcome::CloseSelf, schedule_shutdown: false, rearmed_registration: false }
+        Self {
+            outcome: FrameOutcome::CloseSelf,
+            schedule_shutdown: false,
+            rearmed_registration: false,
+        }
     }
     pub(super) fn protocol_error() -> Self {
-        Self { outcome: FrameOutcome::ProtocolError, schedule_shutdown: false, rearmed_registration: false }
+        Self {
+            outcome: FrameOutcome::ProtocolError,
+            schedule_shutdown: false,
+            rearmed_registration: false,
+        }
     }
 }
 

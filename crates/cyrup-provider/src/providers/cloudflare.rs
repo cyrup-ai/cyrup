@@ -9,8 +9,8 @@
 //! catalog.
 
 use crate::api::{ApiRegistry, builtin_registry};
-use crate::auth::types::{AuthContext, AuthResult, Credential, ModelAuth, ProviderEnv};
 use crate::auth::oauth::AuthPrompt;
+use crate::auth::types::{AuthContext, AuthResult, Credential, ModelAuth, ProviderEnv};
 use crate::auth::{ApiKeyAuth, CredentialStore, InMemoryCredentialStore, ProviderAuth};
 use crate::error::AuthError;
 use crate::model::Model;

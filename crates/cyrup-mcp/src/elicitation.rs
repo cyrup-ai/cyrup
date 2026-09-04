@@ -20,14 +20,14 @@
 //! [`rmcp::model::ElicitationSchema::properties`] directly is LEXICOGRAPHIC, which is the silent bug
 //! MCP-462 names.
 
-use std::collections::HashSet;
-use std::sync::Arc;
 use indexmap::IndexMap;
 use rmcp::model::{
     ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationSchema, ErrorData,
     PrimitiveSchemaDefinition,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::owner::McpDialog;
 
@@ -180,7 +180,14 @@ pub fn js_number(value: &str) -> f64 {
     if trimmed.is_empty() {
         return 0.0;
     }
-    for (prefix, radix) in [("0x", 16), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)] {
+    for (prefix, radix) in [
+        ("0x", 16),
+        ("0X", 16),
+        ("0o", 8),
+        ("0O", 8),
+        ("0b", 2),
+        ("0B", 2),
+    ] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             return u64::from_str_radix(rest, radix).map_or(f64::NAN, |parsed| parsed as f64);
         }
@@ -189,9 +196,10 @@ pub fn js_number(value: &str) -> f64 {
         "Infinity" | "+Infinity" => f64::INFINITY,
         "-Infinity" => f64::NEG_INFINITY,
         // Rust accepts "inf"/"NaN"; JS `Number()` does not. Reject them explicitly so the two agree.
-        other if other.eq_ignore_ascii_case("inf")
-            || other.eq_ignore_ascii_case("infinity")
-            || other.eq_ignore_ascii_case("nan") =>
+        other
+            if other.eq_ignore_ascii_case("inf")
+                || other.eq_ignore_ascii_case("infinity")
+                || other.eq_ignore_ascii_case("nan") =>
         {
             f64::NAN
         }
@@ -371,7 +379,11 @@ async fn collect_field(
         PrimitiveSchemaDefinition::Enum(EnumSchema::Single(SingleSelectEnumSchema::Titled(
             schema,
         ))) => {
-            let values: Vec<String> = schema.one_of.iter().map(|item| item.const_.clone()).collect();
+            let values: Vec<String> = schema
+                .one_of
+                .iter()
+                .map(|item| item.const_.clone())
+                .collect();
             let labels: Vec<String> = schema
                 .one_of
                 .iter()
@@ -414,8 +426,12 @@ async fn collect_field(
                     (values, labels)
                 }
                 MultiSelectEnumSchema::Titled(schema) => {
-                    let values: Vec<String> =
-                        schema.items.any_of.iter().map(|item| item.const_.clone()).collect();
+                    let values: Vec<String> = schema
+                        .items
+                        .any_of
+                        .iter()
+                        .map(|item| item.const_.clone())
+                        .collect();
                     let labels: Vec<String> = schema
                         .items
                         .any_of
@@ -469,10 +485,12 @@ fn description_of(definition: &PrimitiveSchemaDefinition) -> Option<String> {
         PrimitiveSchemaDefinition::Number(schema) => schema.description.as_deref(),
         PrimitiveSchemaDefinition::Integer(schema) => schema.description.as_deref(),
         PrimitiveSchemaDefinition::Boolean(schema) => schema.description.as_deref(),
-        PrimitiveSchemaDefinition::Enum(EnumSchema::Legacy(schema)) => schema.description.as_deref(),
-        PrimitiveSchemaDefinition::Enum(EnumSchema::Single(SingleSelectEnumSchema::Untitled(s))) => {
-            s.description.as_deref()
+        PrimitiveSchemaDefinition::Enum(EnumSchema::Legacy(schema)) => {
+            schema.description.as_deref()
         }
+        PrimitiveSchemaDefinition::Enum(EnumSchema::Single(SingleSelectEnumSchema::Untitled(
+            s,
+        ))) => s.description.as_deref(),
         PrimitiveSchemaDefinition::Enum(EnumSchema::Single(SingleSelectEnumSchema::Titled(s))) => {
             s.description.as_deref()
         }
@@ -510,9 +528,7 @@ async fn select_one(
         return FieldOutcome::Cancelled;
     };
     match unique.iter().position(|label| *label == chosen) {
-        Some(index) => FieldOutcome::Collected(
-            values.get(index).cloned().map(FieldValue::Text),
-        ),
+        Some(index) => FieldOutcome::Collected(values.get(index).cloned().map(FieldValue::Text)),
         // A selection that matches no label is a dismissal, not a silent empty pick.
         None => FieldOutcome::Cancelled,
     }
@@ -666,7 +682,9 @@ pub fn coerce_and_validate(
         .get_or_compile(&as_value)
         .map_err(|error| internal_msg(&invalid_elicitation_response(&error.to_string())))?;
     if let Err(error) = validator.validate(&rendered) {
-        return Err(internal_msg(&invalid_elicitation_response(&error.to_string())));
+        return Err(internal_msg(&invalid_elicitation_response(
+            &error.to_string(),
+        )));
     }
     Ok(rendered)
 }
@@ -760,11 +778,7 @@ fn format_review(
 fn render_json(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
-        Value::Array(items) => items
-            .iter()
-            .map(render_json)
-            .collect::<Vec<_>>()
-            .join(", "),
+        Value::Array(items) => items.iter().map(render_json).collect::<Vec<_>>().join(", "),
         other => other.to_string(),
     }
 }
@@ -818,11 +832,15 @@ pub async fn handle_form_elicitation(
         // NOT caught. A cross-field failure here is a JSON-RPC error, exactly as upstream's is.
         let content = coerce_and_validate(options, schema, &values)?;
         let review = format_review(server, &properties, &content);
-        match dialog.select(&review, &[SUBMIT, EDIT, DECLINE]).await.as_deref() {
+        match dialog
+            .select(&review, &[SUBMIT, EDIT, DECLINE])
+            .await
+            .as_deref()
+        {
             None => return Ok(ElicitResult::new(ElicitationAction::Cancel)),
             Some(DECLINE) => return Ok(ElicitResult::new(ElicitationAction::Decline)),
             Some(SUBMIT) => {
-                return Ok(ElicitResult::new(ElicitationAction::Accept).with_content(content))
+                return Ok(ElicitResult::new(ElicitationAction::Accept).with_content(content));
             }
             Some(_) => {}
         }
@@ -956,7 +974,10 @@ pub async fn handle_elicitation_request(
         } => handle_url_elicitation(options, server, &message, &url, &elicitation_id).await,
         // A mode rmcp models and this port does not. Upstream's wire enum folds absent-or-unknown
         // into `form`, so reaching here means a genuinely new variant, not a malformed request.
-        _ => Err(ErrorData::invalid_params(UNSUPPORTED_ELICITATION_MODE, None)),
+        _ => Err(ErrorData::invalid_params(
+            UNSUPPORTED_ELICITATION_MODE,
+            None,
+        )),
     }
 }
 
@@ -993,12 +1014,18 @@ mod tests {
             "apple".to_string(),
             "middle".to_string(),
         ]);
-        let names: Vec<&str> = ordered_properties(&schema).into_iter().map(|(n, _)| n).collect();
+        let names: Vec<&str> = ordered_properties(&schema)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         assert_eq!(names, vec!["zebra", "apple", "middle"]);
 
         // With no wire order the BTreeMap order is the only order there ever was.
         schema.property_order = None;
-        let names: Vec<&str> = ordered_properties(&schema).into_iter().map(|(n, _)| n).collect();
+        let names: Vec<&str> = ordered_properties(&schema)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         assert_eq!(names, vec!["apple", "middle", "zebra"]);
     }
 
@@ -1096,7 +1123,10 @@ mod tests {
 
         let check = |text: &str| {
             let mut values = IndexMap::new();
-            values.insert("count".to_string(), Some(FieldValue::Text(text.to_string())));
+            values.insert(
+                "count".to_string(),
+                Some(FieldValue::Text(text.to_string())),
+            );
             coerce_and_validate(&options(), &schema, &values)
         };
 

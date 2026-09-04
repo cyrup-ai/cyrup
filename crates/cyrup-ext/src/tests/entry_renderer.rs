@@ -14,18 +14,27 @@
 //! renderer is registered" returns — so the two were the same value and the ported failure box could
 //! never be produced. These tests pin the distinction at the host seam, on the native arm; the guest
 //! arm is `wasm_renderer_routing.rs`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use cyrup_core::ExtensionId;
 use crate::{
     ExtMode, ExtensionHost, HookOutcome, HostConfig, HostCtx, HostEvent, InitApi, NativeExtension,
     RenderOutcome,
 };
-use serde_json::{json, Value};
+use cyrup_core::ExtensionId;
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: std::path::PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: std::path::PathBuf::from("."),
+    }
 }
 
 /// Registers an ENTRY renderer for `card` (draws), `boom` (panics — upstream's `throw`) and `quiet`
@@ -69,7 +78,9 @@ impl NativeExtension for EntryExt {
 
 async fn host() -> ExtensionHost {
     let host = ExtensionHost::new(cfg());
-    host.load_native(Arc::new(EntryExt)).await.expect("load native");
+    host.load_native(Arc::new(EntryExt))
+        .await
+        .expect("load native");
     host
 }
 
@@ -81,14 +92,26 @@ async fn host() -> ExtensionHost {
 async fn the_entry_renderer_table_is_disjoint_from_the_message_renderer_table() {
     let host = host().await;
 
-    assert!(host.has_entry_renderer("card"), "registered on the entry surface");
+    assert!(
+        host.has_entry_renderer("card"),
+        "registered on the entry surface"
+    );
     assert!(host.has_entry_renderer("boom"));
-    assert!(!host.has_entry_renderer("nobody"), "no extension claims this type");
+    assert!(
+        !host.has_entry_renderer("nobody"),
+        "no extension claims this type"
+    );
 
     // `registerMessageRenderer("msg_boom")` must NOT make `msg_boom` an ENTRY renderer, and
     // `registerEntryRenderer("card")` must NOT make `card` a MESSAGE renderer.
-    assert!(!host.has_entry_renderer("msg_boom"), "a MESSAGE renderer is not an entry renderer");
-    assert!(!host.has_message_renderer("card"), "an ENTRY renderer is not a message renderer");
+    assert!(
+        !host.has_entry_renderer("msg_boom"),
+        "a MESSAGE renderer is not an entry renderer"
+    );
+    assert!(
+        !host.has_message_renderer("card"),
+        "an ENTRY renderer is not a message renderer"
+    );
     assert!(host.has_message_renderer("msg_boom"));
 }
 
@@ -133,11 +156,19 @@ async fn no_renderer_and_a_renderer_that_draws_nothing_are_both_none_never_faile
     let host = host().await;
 
     let unclaimed = host.render_entry("nobody", &json!({})).await;
-    assert_eq!(unclaimed, RenderOutcome::None, "no extension registered `nobody`");
+    assert_eq!(
+        unclaimed,
+        RenderOutcome::None,
+        "no extension registered `nobody`"
+    );
     assert_eq!(unclaimed.failure(), None, "absence is not a fault");
 
     let opted_out = host.render_entry("quiet", &json!({})).await;
-    assert_eq!(opted_out, RenderOutcome::None, "the renderer returned `undefined`");
+    assert_eq!(
+        opted_out,
+        RenderOutcome::None,
+        "the renderer returned `undefined`"
+    );
     assert_eq!(opted_out.failure(), None, "opting out is not a fault");
 }
 
@@ -155,13 +186,16 @@ async fn the_message_surface_still_collapses_a_fault_but_the_outcome_form_expose
         "`custom-message.ts:82-84` falls through to the default box"
     );
     assert_eq!(
-        host.render_message_call_outcome("msg_boom", &json!({})).await.failure(),
+        host.render_message_call_outcome("msg_boom", &json!({}))
+            .await
+            .failure(),
         Some("message renderer exploded"),
         "the fault survives to callers that need it"
     );
     // …and "no renderer at all" is still a different value from "the renderer threw".
     assert_eq!(
-        host.render_message_call_outcome("unclaimed", &json!({})).await,
+        host.render_message_call_outcome("unclaimed", &json!({}))
+            .await,
         RenderOutcome::None
     );
 }
@@ -172,7 +206,12 @@ async fn the_message_surface_still_collapses_a_fault_but_the_outcome_form_expose
 async fn a_faulting_renderer_is_contained_and_the_host_keeps_rendering() {
     let host = host().await;
     for _ in 0..3 {
-        assert!(host.render_entry("boom", &json!({})).await.failure().is_some());
+        assert!(
+            host.render_entry("boom", &json!({}))
+                .await
+                .failure()
+                .is_some()
+        );
     }
     assert!(matches!(
         host.render_entry("card", &json!({ "after": true })).await,

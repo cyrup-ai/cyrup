@@ -50,7 +50,9 @@ impl SeenInboundMessages {
         // `now - seenAt` is a JS number subtraction that can go negative on a clock step; the
         // comparison is then false, so `saturating_sub` reproduces it exactly (0 is never `>`
         // the retention).
-        self.seen.retain(|_, seen_at| now.saturating_sub(*seen_at) <= INBOUND_MESSAGE_DEDUPE_RETENTION_MS);
+        self.seen.retain(|_, seen_at| {
+            now.saturating_sub(*seen_at) <= INBOUND_MESSAGE_DEDUPE_RETENTION_MS
+        });
         if self.order.len() != self.seen.len() {
             self.order.retain(|k| self.seen.contains_key(k));
         }
@@ -60,7 +62,9 @@ impl SeenInboundMessages {
         self.seen.insert(key.clone(), now);
         self.order.push_back(key);
         while self.seen.len() > INBOUND_MESSAGE_DEDUPE_MAX {
-            let Some(oldest) = self.order.pop_front() else { break };
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
             self.seen.remove(&oldest);
         }
         false
@@ -256,14 +260,17 @@ impl SharedIntercomState {
     /// `case "message_receipt"` (`v0.10.1 index.ts:1018-1024`) — remember the newest receipt for a
     /// message THIS session sent. Last writer wins; upstream `Map.set`s unconditionally.
     pub fn record_outbound_receipt(&self, receipt: &MessageReceipt) {
-        self.latest_outbound_receipts.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            receipt.message_id.clone(),
-            OutboundReceipt {
-                status: receipt.status,
-                timestamp: receipt.timestamp.clone(),
-                detail: receipt.detail.clone().filter(|d| !d.is_empty()),
-            },
-        );
+        self.latest_outbound_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                receipt.message_id.clone(),
+                OutboundReceipt {
+                    status: receipt.status,
+                    timestamp: receipt.timestamp.clone(),
+                    detail: receipt.detail.clone().filter(|d| !d.is_empty()),
+                },
+            );
     }
 
     /// `latestDeliveryState(messageId, fallback)` (`v0.10.1 index.ts:570-576`) — the newest receipt
@@ -277,7 +284,10 @@ impl SharedIntercomState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(message_id)
-            .map_or_else(|| fallback.to_string(), |r| r.status.wire_name().to_string())
+            .map_or_else(
+                || fallback.to_string(),
+                |r| r.status.wire_name().to_string(),
+            )
     }
 
     /// `handleMessageControl(control)` (`v0.10.1 index.ts:562-569`) — a peer withdrew or replaced a
@@ -300,7 +310,10 @@ impl SharedIntercomState {
             ),
             MessageControlAction::Supersede => {
                 // `control.supersededBy ? \`superseded by ${…}\` : undefined` (`:568`).
-                let detail = control.superseded_by.as_deref().map(|by| format!("superseded by {by}"));
+                let detail = control
+                    .superseded_by
+                    .as_deref()
+                    .map(|by| format!("superseded by {by}"));
                 self.emit_message_receipt(
                     &control.message_id,
                     MessageReceiptStatus::Superseded,
@@ -322,7 +335,10 @@ impl SharedIntercomState {
     /// load it per call and degrade to a no-op when absent).
     #[must_use]
     pub fn host_services(&self) -> Option<Arc<dyn HostServices>> {
-        self.host_services.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.host_services
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Late-bind the project-pane launcher (ICOM-042 §5-A: `HerdrLauncher`). Bound from the same
@@ -331,7 +347,10 @@ impl SharedIntercomState {
         &self,
         launcher: Arc<dyn crate::project_pane::ProjectPaneLauncher>,
     ) {
-        *self.project_pane_launcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(launcher);
+        *self
+            .project_pane_launcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(launcher);
     }
 
     /// The bound project-pane launcher, if any. `None` is not an error — it is the headless case,
@@ -340,7 +359,10 @@ impl SharedIntercomState {
     pub fn project_pane_launcher(
         &self,
     ) -> Option<Arc<dyn crate::project_pane::ProjectPaneLauncher>> {
-        self.project_pane_launcher.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.project_pane_launcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Record whether this session has an interactive UI (pi `hasUI`). Called ONCE from the
@@ -367,7 +389,8 @@ impl SharedIntercomState {
     /// forever.
     #[must_use]
     pub fn is_idle(&self) -> bool {
-        self.host_services().is_none_or(|services| services.is_idle())
+        self.host_services()
+            .is_none_or(|services| services.is_idle())
     }
 
     /// `activeTools.set(event.toolCallId, event.toolName)` (`v0.10.1 index.ts:1437`). Re-setting an
@@ -383,14 +406,20 @@ impl SharedIntercomState {
 
     /// `activeTools.delete(event.toolCallId)` (`v0.10.1 index.ts:1444`).
     pub fn tool_ended(&self, call_id: &cyrup_core::ToolCallId) {
-        self.active_tools.lock().unwrap_or_else(|e| e.into_inner()).retain(|(id, _)| id != call_id);
+        self.active_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _)| id != call_id);
     }
 
     /// `activeTools.clear()` (`v0.10.1 index.ts:1430`, `:1452`, `:1409`) plus the `agentRunning`
     /// flag those same three sites set — the two always move together upstream.
     pub fn set_agent_running(&self, running: bool) {
         self.agent_running.store(running, Ordering::SeqCst);
-        self.active_tools.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.active_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// `currentStatus()` (`v0.10.1 index.ts:676-680`, 5 lines):
@@ -406,8 +435,12 @@ impl SharedIntercomState {
     /// to `thinking`, which is the whole reason the map exists.
     #[must_use]
     pub fn current_status(&self) -> String {
-        let active_tool =
-            self.active_tools.lock().unwrap_or_else(|e| e.into_inner()).first().map(|(_, n)| n.clone());
+        let active_tool = self
+            .active_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .first()
+            .map(|(_, n)| n.clone());
         let lifecycle = match active_tool {
             Some(name) => format!("tool:{name}"),
             None if self.agent_running.load(Ordering::SeqCst) => "thinking".to_string(),
@@ -475,20 +508,35 @@ impl SharedIntercomState {
             return PresenceContext::default();
         };
         // `contextWindow <= 0` ⇒ pi has no usage object at all ⇒ omit all three keys.
-        let window = obj.get("contextWindow").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let window = obj
+            .get("contextWindow")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         if window == 0 {
             return PresenceContext::default();
         }
-        let tokens = obj.get("usedTokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let tokens = obj
+            .get("usedTokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         let (pct, tokens) = if tokens == 0 {
             // pi `{ tokens: null, percent: null }` — send the CLEAR, do not omit.
             (Some(None), Some(None))
         } else {
-            let pct = u64::try_from((u128::from(tokens) * 100 + u128::from(window) / 2) / u128::from(window))
-                .unwrap_or(u64::MAX);
-            (Some(Some(serde_json::Number::from(pct))), Some(Some(serde_json::Number::from(tokens))))
+            let pct = u64::try_from(
+                (u128::from(tokens) * 100 + u128::from(window) / 2) / u128::from(window),
+            )
+            .unwrap_or(u64::MAX);
+            (
+                Some(Some(serde_json::Number::from(pct))),
+                Some(Some(serde_json::Number::from(tokens))),
+            )
         };
-        PresenceContext { pct, tokens, window: Some(Some(serde_json::Number::from(window))) }
+        PresenceContext {
+            pct,
+            tokens,
+            window: Some(Some(serde_json::Number::from(window))),
+        }
     }
 
     /// `startNamePoll()` (`v0.10.1 index.ts:817-831`, 15 lines):
@@ -513,8 +561,15 @@ impl SharedIntercomState {
     /// does not heartbeat the name. This is upstream's third and last name-sync point; the other two
     /// (`turn_start`, every `intercom` tool call) are the cheap 80% and need no timer at all.
     pub fn start_name_poll(self: &Arc<Self>) {
-        let metadata = self.presence_metadata.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        *self.last_presence_identity.lock().unwrap_or_else(|e| e.into_inner()) =
+        let metadata = self
+            .presence_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *self
+            .last_presence_identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
             Some(crate::connect::presence_identity(self, metadata.as_ref()));
         let interval = std::time::Duration::from_millis(crate::identity::name_poll_ms());
         let state = self.clone();
@@ -530,8 +585,11 @@ impl SharedIntercomState {
                 if state.client().is_none() {
                     continue;
                 }
-                let metadata =
-                    state.presence_metadata.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let metadata = state
+                    .presence_metadata
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 let identity = crate::connect::presence_identity(&state, metadata.as_ref());
                 let changed = state
                     .last_presence_identity
@@ -546,8 +604,11 @@ impl SharedIntercomState {
         });
         // `clearNamePollTimer()` at the head of `startNamePoll` (`v0.10.1 index.ts:818`): a runtime
         // replacement must not leave two pollers running.
-        let previous =
-            self.name_poll_task.lock().unwrap_or_else(|e| e.into_inner()).replace(handle);
+        let previous = self
+            .name_poll_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(handle);
         if let Some(previous) = previous {
             previous.abort();
         }
@@ -555,10 +616,18 @@ impl SharedIntercomState {
 
     /// `clearNamePollTimer()` (`v0.10.1 index.ts:1407`, on `session_shutdown`).
     pub fn stop_name_poll(&self) {
-        if let Some(task) = self.name_poll_task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(task) = self
+            .name_poll_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             task.abort();
         }
-        *self.last_presence_identity.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .last_presence_identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// `currentSessionTargetMatches(to, resolvedTo?, activeClient?)`
@@ -600,14 +669,27 @@ impl SharedIntercomState {
         add(services.as_ref().and_then(|s| s.session_id()));
         add(self_id);
         add(services.as_ref().and_then(|s| s.session_name()));
-        let metadata = self.presence_metadata.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        add(crate::connect::presence_identity_name(self, metadata.as_ref()));
+        let metadata = self
+            .presence_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        add(crate::connect::presence_identity_name(
+            self,
+            metadata.as_ref(),
+        ));
         targets.contains(&to.trim().to_lowercase())
     }
 
     /// Publish this session's child-orchestrator metadata for [`Self::sync_presence_identity`].
-    pub fn set_presence_metadata(&self, metadata: Option<crate::identity::ChildOrchestratorMetadata>) {
-        *self.presence_metadata.lock().unwrap_or_else(|e| e.into_inner()) = metadata;
+    pub fn set_presence_metadata(
+        &self,
+        metadata: Option<crate::identity::ChildOrchestratorMetadata>,
+    ) {
+        *self
+            .presence_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = metadata;
     }
 
     /// `syncPresenceIdentity(sessionId)` (`v0.10.1 index.ts:808-815`) — re-derive the presence NAME
@@ -621,16 +703,26 @@ impl SharedIntercomState {
         let Some(client) = self.client() else {
             return;
         };
-        let metadata = self.presence_metadata.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let metadata = self
+            .presence_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let identity = crate::connect::presence_identity(self, metadata.as_ref());
         // `lastPresenceName = identity.name; lastPresenceRuntimeFallbackAlias = …`
         // (`v0.10.1 index.ts:813-814`) — every sync updates the poll's baseline, so a rename that
         // reached the broker through `turn_start` or a tool call does not also fire from the poll.
-        *self.last_presence_identity.lock().unwrap_or_else(|e| e.into_inner()) = Some(identity.clone());
+        *self
+            .last_presence_identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(identity.clone());
         let usage = self.current_context_usage();
         client.update_presence_full(
             identity.name.clone(),
-            identity.name.as_ref().map(|_| identity.runtime_fallback_alias),
+            identity
+                .name
+                .as_ref()
+                .map(|_| identity.runtime_fallback_alias),
             Some(self.current_status()),
             None,
             usage.pct,
@@ -660,7 +752,11 @@ impl SharedIntercomState {
     ///
     /// # Errors
     /// [`IntercomError::Client`] on a `list` failure or an ambiguous match.
-    pub async fn resolve_target(&self, client: &Arc<IntercomClient>, name_or_id: &str) -> Result<Option<String>> {
+    pub async fn resolve_target(
+        &self,
+        client: &Arc<IntercomClient>,
+        name_or_id: &str,
+    ) -> Result<Option<String>> {
         let sessions = client.list_sessions().await?;
 
         if let Some(by_id) = sessions.iter().find(|s| s.id == name_or_id) {
@@ -688,8 +784,10 @@ impl SharedIntercomState {
             return Ok(Some(only.id.clone()));
         }
 
-        let by_id_prefix: Vec<&crate::transport::protocol::SessionInfo> =
-            sessions.iter().filter(|s| s.id.starts_with(name_or_id)).collect();
+        let by_id_prefix: Vec<&crate::transport::protocol::SessionInfo> = sessions
+            .iter()
+            .filter(|s| s.id.starts_with(name_or_id))
+            .collect();
         if by_id_prefix.len() > 1 {
             return Err(IntercomError::Client(format!(
                 "Multiple sessions match ID prefix \"{name_or_id}\". Use a longer session ID prefix."
@@ -706,7 +804,10 @@ impl SharedIntercomState {
     /// The live client, if connected.
     #[must_use]
     pub fn client(&self) -> Option<Arc<IntercomClient>> {
-        self.client.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// This session's own broker-assigned id, if connected (for the self-target guard).
@@ -714,7 +815,10 @@ impl SharedIntercomState {
     /// Record one `intercom:extension-register` (`v0.12.0 index.ts:856-861`). Re-registering an
     /// existing namespace is refused, matching upstream's already-registered branch.
     pub fn record_extension_registration(&self, namespace: &str, owner_eligible: bool) -> bool {
-        let mut guard = self.extension_registrations.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .extension_registrations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if guard.contains_key(namespace) {
             return false;
         }
@@ -746,11 +850,18 @@ impl SharedIntercomState {
 
     /// `outboxRequestIds.clear()` (`v0.12.0 index.ts:1582`) — the dedupe window is one runtime.
     pub fn clear_outbox_request_ids(&self) {
-        self.outbox_request_ids.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.outbox_request_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Track an in-flight request so a runtime change can settle it (`index.ts:1064`).
-    pub fn track_pending_outbox(&self, request_id: String, pending: crate::outbox::PendingOutboxRequest) {
+    pub fn track_pending_outbox(
+        &self,
+        request_id: String,
+        pending: crate::outbox::PendingOutboxRequest,
+    ) {
         self.pending_outbox_requests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -759,7 +870,10 @@ impl SharedIntercomState {
 
     /// Pop one in-flight request. `None` means it was already settled — the caller must then emit
     /// NOTHING, which is how `settleOutboxRequest` stays exactly-once (`index.ts:1009-1021`).
-    pub fn take_pending_outbox(&self, request_id: &str) -> Option<crate::outbox::PendingOutboxRequest> {
+    pub fn take_pending_outbox(
+        &self,
+        request_id: &str,
+    ) -> Option<crate::outbox::PendingOutboxRequest> {
         self.pending_outbox_requests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -773,8 +887,14 @@ impl SharedIntercomState {
     /// generation, and the requests they are orphaning are stamped with exactly that value. A `<`
     /// here would drain nothing and leak every in-flight request on a runtime change. A request
     /// started under a LATER generation is left alone.
-    pub fn drain_pending_outbox_upto(&self, generation: u64) -> Vec<crate::outbox::PendingOutboxRequest> {
-        let mut guard = self.pending_outbox_requests.lock().unwrap_or_else(|e| e.into_inner());
+    pub fn drain_pending_outbox_upto(
+        &self,
+        generation: u64,
+    ) -> Vec<crate::outbox::PendingOutboxRequest> {
+        let mut guard = self
+            .pending_outbox_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let stale: Vec<String> = guard
             .iter()
             .filter(|(_, p)| p.generation <= generation)
@@ -820,7 +940,10 @@ impl SharedIntercomState {
         // Inline the reply's attachments into the visible body, exactly as pi does
         // (`replyText + formatAttachments(replyMessage.content.attachments)`,
         // `v0.10.1 index.ts:2168-2170`, `index.ts:1354-1357`) — never silently drop them.
-        Ok(inline_reply_attachments(message.content.text, message.content.attachments.as_deref()))
+        Ok(inline_reply_attachments(
+            message.content.text,
+            message.content.attachments.as_deref(),
+        ))
     }
 
     /// [`Self::ask_and_wait`] carrying the caller's `replyTo` — pi `index.ts:2154-2160`
@@ -861,16 +984,19 @@ impl SharedIntercomState {
             .map_err(IntercomError::Client)?;
 
         let send_result = client
-            .send(target, SendOptions {
-                text,
-                attachments,
-                reply_to,
-                expects_reply: Some(true),
-                message_id: Some(question_id.clone()),
-                supersedes,
-                retry_of,
-                provenance: None,
-            })
+            .send(
+                target,
+                SendOptions {
+                    text,
+                    attachments,
+                    reply_to,
+                    expects_reply: Some(true),
+                    message_id: Some(question_id.clone()),
+                    supersedes,
+                    retry_of,
+                    provenance: None,
+                },
+            )
             .await;
 
         match send_result {
@@ -878,7 +1004,9 @@ impl SharedIntercomState {
             Ok(result) => {
                 self.waiter.clear_matching(&question_id);
                 return Err(IntercomError::Client(
-                    result.reason.unwrap_or_else(|| "ask was not delivered".to_string()),
+                    result
+                        .reason
+                        .unwrap_or_else(|| "ask was not delivered".to_string()),
                 ));
             }
             Err(e) => {
@@ -967,7 +1095,10 @@ impl SharedIntercomState {
 /// Inline a reply's attachments into its visible text (pi `replyText + formatAttachments(...)`,
 /// `index.ts:1646-1649` (ask) and `index.ts:1354-1357` (contact_supervisor)) — attachments the
 /// replying session sent back must never be silently dropped.
-fn inline_reply_attachments(text: String, attachments: Option<&[crate::transport::protocol::Attachment]>) -> String {
+fn inline_reply_attachments(
+    text: String,
+    attachments: Option<&[crate::transport::protocol::Attachment]>,
+) -> String {
     let attachment_text = attachments
         .filter(|a| !a.is_empty())
         .map(crate::inbound::format_attachments)
@@ -986,7 +1117,12 @@ fn describe_timeout(ask_timeout_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     /// ICOM-017 — `hasSeenInboundMessage` (`v0.10.1 index.ts:532-548`).
@@ -1031,8 +1167,14 @@ mod tests {
             !seen.seen.contains_key("p\0m0"),
             "the oldest key must be the one evicted at the cap"
         );
-        assert!(seen.seen.contains_key("p\0m1"), "the second-oldest must survive one eviction");
-        assert!(seen.seen.contains_key("p\0overflow"), "the newly inserted key must survive");
+        assert!(
+            seen.seen.contains_key("p\0m1"),
+            "the second-oldest must survive one eviction"
+        );
+        assert!(
+            seen.seen.contains_key("p\0overflow"),
+            "the newly inserted key must survive"
+        );
     }
 
     /// ICOM-017 — `latestDeliveryState(messageId, fallback)` (`v0.10.1 index.ts:570-576`), the ONLY
@@ -1046,7 +1188,10 @@ mod tests {
             std::path::PathBuf::from("/w"),
         );
         assert_eq!(s.latest_delivery_state(None, "created"), "created");
-        assert_eq!(s.latest_delivery_state(Some("q1"), "socket_delivered"), "socket_delivered");
+        assert_eq!(
+            s.latest_delivery_state(Some("q1"), "socket_delivered"),
+            "socket_delivered"
+        );
 
         s.record_outbound_receipt(&MessageReceipt {
             message_id: "q1".to_string(),
@@ -1055,7 +1200,10 @@ mod tests {
             detail: None,
             extra: Default::default(),
         });
-        assert_eq!(s.latest_delivery_state(Some("q1"), "socket_delivered"), "receiver_received");
+        assert_eq!(
+            s.latest_delivery_state(Some("q1"), "socket_delivered"),
+            "receiver_received"
+        );
         // `Map.set` is unconditional — the newest receipt wins.
         s.record_outbound_receipt(&MessageReceipt {
             message_id: "q1".to_string(),
@@ -1064,7 +1212,10 @@ mod tests {
             detail: None,
             extra: Default::default(),
         });
-        assert_eq!(s.latest_delivery_state(Some("q1"), "socket_delivered"), "injected");
+        assert_eq!(
+            s.latest_delivery_state(Some("q1"), "socket_delivered"),
+            "injected"
+        );
         // A different message is untouched by either write.
         assert_eq!(s.latest_delivery_state(Some("q2"), "created"), "created");
     }
@@ -1079,7 +1230,10 @@ mod tests {
     /// inside the `cancel` branch would pass a cancel-only test.
     #[test]
     fn a_peer_control_frame_retracts_the_pending_ask_for_both_actions() {
-        for action in [MessageControlAction::Cancel, MessageControlAction::Supersede] {
+        for action in [
+            MessageControlAction::Cancel,
+            MessageControlAction::Supersede,
+        ] {
             let s = SharedIntercomState::new(
                 IntercomConfig::default(),
                 600_000,
@@ -1109,7 +1263,10 @@ mod tests {
                 expects_reply: Some(true),
                 ..Default::default()
             };
-            s.tracker.lock().unwrap().record_incoming_message(from, message, 0);
+            s.tracker
+                .lock()
+                .unwrap()
+                .record_incoming_message(from, message, 0);
             assert_eq!(
                 s.tracker.lock().unwrap().list_pending(0).len(),
                 1,
@@ -1149,7 +1306,10 @@ mod tests {
     #[test]
     fn current_status_tracks_overlapping_tools_and_appends_the_config_suffix() {
         use cyrup_core::ToolCallId;
-        let config = IntercomConfig { status: Some("reviewing".to_string()), ..IntercomConfig::default() };
+        let config = IntercomConfig {
+            status: Some("reviewing".to_string()),
+            ..IntercomConfig::default()
+        };
         let s = SharedIntercomState::new(config, 600_000, std::path::PathBuf::from("/w"));
 
         assert_eq!(s.current_status(), "idle · reviewing");
@@ -1181,9 +1341,16 @@ mod tests {
     /// ` · ` separator.
     #[test]
     fn current_status_without_a_configured_suffix_is_the_bare_lifecycle_status() {
-        let s = SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w"));
+        let s = SharedIntercomState::new(
+            IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        );
         assert_eq!(s.current_status(), "idle");
-        let blank = IntercomConfig { status: Some("   ".to_string()), ..IntercomConfig::default() };
+        let blank = IntercomConfig {
+            status: Some("   ".to_string()),
+            ..IntercomConfig::default()
+        };
         let s = SharedIntercomState::new(blank, 600_000, std::path::PathBuf::from("/w"));
         assert_eq!(s.current_status(), "idle");
     }
@@ -1193,7 +1360,11 @@ mod tests {
     /// lower-cased set membership is what the seams rely on.
     #[test]
     fn current_session_target_matches_is_false_without_an_identity() {
-        let s = SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w"));
+        let s = SharedIntercomState::new(
+            IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        );
         assert!(!s.current_session_target_matches("anyone", None));
         // The resolved-id arm needs a live client id, so it cannot fire either.
         assert!(!s.current_session_target_matches("anyone", Some("some-id")));
@@ -1201,7 +1372,11 @@ mod tests {
 
     #[test]
     fn set_and_clear_client() {
-        let state = SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w"));
+        let state = SharedIntercomState::new(
+            IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        );
         assert!(state.client().is_none());
         assert!(state.self_session_id().is_none());
     }
@@ -1226,15 +1401,24 @@ mod tests {
                 extra: Default::default(),
             }]),
         );
-        assert_eq!(text, "Looks good\n\n---\nAttachment: patch.diff\n~~~diff\n+1 line\n~~~");
+        assert_eq!(
+            text,
+            "Looks good\n\n---\nAttachment: patch.diff\n~~~diff\n+1 line\n~~~"
+        );
     }
 
     /// No attachments ⇒ the reply text passes through unchanged (pi: `replyAttachments = ""` when
     /// `replyMessage.content.attachments?.length` is falsy).
     #[test]
     fn inline_reply_attachments_passes_through_when_none() {
-        assert_eq!(inline_reply_attachments("no attachments here".to_string(), None), "no attachments here");
-        assert_eq!(inline_reply_attachments("empty vec".to_string(), Some(&[])), "empty vec");
+        assert_eq!(
+            inline_reply_attachments("no attachments here".to_string(), None),
+            "no attachments here"
+        );
+        assert_eq!(
+            inline_reply_attachments("empty vec".to_string(), Some(&[])),
+            "empty vec"
+        );
     }
 
     /// The ask/reply race in [`SharedIntercomState::ask_and_wait_with_reply_to`], driven into the
@@ -1280,8 +1464,9 @@ mod tests {
                     std::process::id()
                 )),
             );
-            let mut listener =
-                crate::broker::listener::BrokerListener::bind(&target).await.unwrap();
+            let mut listener = crate::broker::listener::BrokerListener::bind(&target)
+                .await
+                .unwrap();
 
             // The broker saw the `send` frame; the test may now fill the reply slot.
             let send_seen = Arc::new(tokio::sync::Notify::new());
@@ -1348,8 +1533,11 @@ mod tests {
 
             // `ask_timeout_ms = 0` ⇒ `tokio::time::sleep(Duration::ZERO)` is ready on the very
             // first poll, exactly like a deadline that elapsed while the task was descheduled.
-            let state =
-                Arc::new(SharedIntercomState::new(IntercomConfig::default(), 0, "/w".into()));
+            let state = Arc::new(SharedIntercomState::new(
+                IntercomConfig::default(),
+                0,
+                "/w".into(),
+            ));
 
             let ask = tokio::spawn({
                 let (state, client) = (state.clone(), client.clone());
@@ -1375,7 +1563,10 @@ mod tests {
                 id: "r1".to_string(),
                 timestamp: now_ms().into(),
                 reply_to: Some("q1".to_string()),
-                content: MessageContent { text: "yes".to_string(), ..Default::default() },
+                content: MessageContent {
+                    text: "yes".to_string(),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let peer = SessionInfo {
@@ -1396,7 +1587,10 @@ mod tests {
                 tmux_pane: None,
                 extra: Default::default(),
             };
-            assert!(state.waiter.try_deliver(&peer, &reply), "the waiter slot must be armed");
+            assert!(
+                state.waiter.try_deliver(&peer, &reply),
+                "the waiter slot must be armed"
+            );
             ack_gate.notify_one();
 
             let outcome = ask.await.unwrap();

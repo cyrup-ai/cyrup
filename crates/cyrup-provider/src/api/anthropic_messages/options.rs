@@ -1,7 +1,6 @@
 //! Typed options (Pi `AnthropicThinkingDisplay` / `AnthropicOptions`,
 //! anthropic-messages.ts:165-230).
 
-
 /// How thinking content is returned (Pi `AnthropicThinkingDisplay`, anthropic-messages.ts:165).
 /// `"summarized"` returns summarized thinking text; `"omitted"` returns an empty thinking field
 /// (the encrypted signature still travels back for multi-turn continuity).

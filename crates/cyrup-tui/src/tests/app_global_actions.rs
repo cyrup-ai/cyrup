@@ -16,7 +16,12 @@
 //! this.defaultEditor.onAction("app.session.fork",    () => this.showUserMessageSelector());  // :2617
 //! this.defaultEditor.onAction("app.session.resume",  () => this.showSessionSelector());      // :2618
 //! ```
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::selector::SelectorKind;
@@ -63,7 +68,10 @@ fn ctrl_l_opens_the_model_selector_unfiltered() {
 #[test]
 fn ctrl_x_runs_the_copy_command() {
     let mut app = new_app();
-    assert_eq!(app.handle_input(&ctrl('x')), AppAction::Command(AppCommand::Copy));
+    assert_eq!(
+        app.handle_input(&ctrl('x')),
+        AppAction::Command(AppCommand::Copy)
+    );
 }
 
 /// Ctrl+T toggles reasoning-block visibility: flip, PERSIST (`settingsManager.setHideThinkingBlock`,
@@ -72,7 +80,10 @@ fn ctrl_x_runs_the_copy_command() {
 #[test]
 fn ctrl_t_toggles_thinking_visibility_persists_it_and_says_so() {
     let mut app = new_app();
-    assert!(!app.state().transcript.hide_thinking_block(), "fixture: visible to start");
+    assert!(
+        !app.state().transcript.hide_thinking_block(),
+        "fixture: visible to start"
+    );
 
     let first = app.handle_input(&ctrl('t'));
     assert_eq!(
@@ -83,7 +94,10 @@ fn ctrl_t_toggles_thinking_visibility_persists_it_and_says_so() {
         }),
         "the flip is PERSISTED (`:3836`), not just applied to the view"
     );
-    assert!(app.state().transcript.hide_thinking_block(), "live effect, before any run-loop turn");
+    assert!(
+        app.state().transcript.hide_thinking_block(),
+        "live effect, before any run-loop turn"
+    );
     let status = statuses(&app);
     assert!(
         status.iter().any(|s| s == "Thinking blocks: hidden"),
@@ -117,7 +131,10 @@ fn the_four_unbound_session_ids_route_to_their_commands_once_bound() {
     )
     .unwrap();
 
-    assert_eq!(app.handle_input(&ctrl('a')), AppAction::Command(AppCommand::NewSession));
+    assert_eq!(
+        app.handle_input(&ctrl('a')),
+        AppAction::Command(AppCommand::NewSession)
+    );
     assert_eq!(
         app.handle_input(&ctrl('b')),
         AppAction::Command(AppCommand::OpenSelector(SelectorKind::Tree))
@@ -159,8 +176,15 @@ fn hotkeys_other_table_carries_the_three_restored_rows_in_upstream_order() {
         );
     }
 
-    let at = |needle: &str| other.find(needle).unwrap_or_else(|| panic!("{needle} absent"));
-    assert!(at("| Cycle models |") < at("| Open model selector |"), "`:5833` then `:5834`");
+    let at = |needle: &str| {
+        other
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} absent"))
+    };
+    assert!(
+        at("| Cycle models |") < at("| Open model selector |"),
+        "`:5833` then `:5834`"
+    );
     assert!(
         at("| Open model selector |") < at("| Toggle tool output expansion |"),
         "`:5834` then `:5835`"
@@ -188,7 +212,8 @@ fn hotkeys_other_table_carries_the_three_restored_rows_in_upstream_order() {
 #[test]
 fn a_rebind_moves_the_restored_hotkeys_cells() {
     let mut app = new_app();
-    app.load_keybindings_json(r#"{"app.thinking.toggle": ["ctrl+alt+t", "f9"]}"#).unwrap();
+    app.load_keybindings_json(r#"{"app.thinking.toggle": ["ctrl+alt+t", "f9"]}"#)
+        .unwrap();
     let body = app.hotkeys_markdown_for_test();
     let line = body
         .lines()
@@ -198,10 +223,17 @@ fn a_rebind_moves_the_restored_hotkeys_cells() {
     // `chrome.rs:41-47`), so the expected spelling is derived, never hardcoded — TUI-N10 is the
     // record of what hardcoding it costs. Derived with `cfg!`, NOT with `format_key_text`, so a
     // broken formatter cannot satisfy its own assertion.
-    let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
+    let alt = if cfg!(target_os = "macos") {
+        "Option"
+    } else {
+        "Alt"
+    };
     assert!(
         line.contains(&format!("Ctrl+{alt}+T/F9")),
         "every bound key, `/`-joined (`keybinding-hints.ts:29-36`): {line}"
     );
-    assert!(!line.contains("Ctrl+T |"), "the replaced default must be gone: {line}");
+    assert!(
+        !line.contains("Ctrl+T |"),
+        "the replaced default must be gone: {line}"
+    );
 }

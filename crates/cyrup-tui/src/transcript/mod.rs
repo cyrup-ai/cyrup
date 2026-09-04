@@ -35,17 +35,17 @@
 //! ports and stay verbatim.
 
 use cyrup_core::Content;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
-use ratatui::Frame;
 use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::bash::BashExecution;
 use crate::component::Component;
-use crate::image::{image_fallback_text, ImageBlock};
+use crate::image::{ImageBlock, image_fallback_text};
 use crate::theme::UiTheme;
 
 mod bash_block;
@@ -68,14 +68,14 @@ mod view;
 #[cfg(test)]
 mod tests;
 
-pub use content::{content_text, parse_skill_block, thinking_text, ParsedSkillBlock};
+pub use content::{ParsedSkillBlock, content_text, parse_skill_block, thinking_text};
 pub use entry::{CompactionCostKind, Entry, Rendered, ToolRun};
-pub use images::{ResultImage, DEFAULT_IMAGE_WIDTH_CELLS};
+pub use images::{DEFAULT_IMAGE_WIDTH_CELLS, ResultImage};
 pub use message::HIDDEN_THINKING_LABEL;
 
 pub(crate) use layout::{is_ws_grapheme, text_lines_of, wrap_all_owned, wrap_line, wrapped_height};
 pub(crate) use render::entry_lines;
-pub(crate) use tool_render::{tool_lines, ImageOpts};
+pub(crate) use tool_render::{ImageOpts, tool_lines};
 
 // The transcript-internal helpers the submodules share. Re-bound here so every submodule reaches
 // them through its own `use super::*;`, the same way `crate::app`'s split modules do.
@@ -86,9 +86,8 @@ use layout::{
 };
 use message::{collapsed_summary_lines, group_thousands, labeled_message_lines, thinking_lines};
 use tool_args::{
-    compact_read_call, compact_read_classification, js_arg, js_truthy, key_hint_spans,
-    more_lines_hint,
-    push_search_path, read_line_range, str_arg, tool_path_span, StrArg,
+    StrArg, compact_read_call, compact_read_classification, js_arg, js_truthy, key_hint_spans,
+    more_lines_hint, push_search_path, read_line_range, str_arg, tool_path_span,
 };
 use tool_builtin::{
     builtin_kind, edit_header_preview, render_builtin_call, render_builtin_result,

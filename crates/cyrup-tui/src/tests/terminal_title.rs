@@ -13,12 +13,17 @@
 //! calls — `App::update_terminal_title` (which the loop turns into the OSC 0 write) and
 //! `App::ingest_event`'s `SessionInfoChanged` arm.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 
+use crate::{APP_TITLE, App, UiTheme, session_terminal_title};
 use cyrup_session_svc::AgentSessionEvent;
-use crate::{session_terminal_title, App, UiTheme, APP_TITLE};
 use ratatui::backend::TestBackend;
 
 fn app() -> App<TestBackend> {
@@ -29,8 +34,14 @@ fn app() -> App<TestBackend> {
 #[test]
 fn composer_matches_pis_two_branches() {
     let cwd = PathBuf::from("/home/u/src/cyrup");
-    assert_eq!(APP_TITLE, "cyrup", "the rebranded APP_TITLE (config.ts:490)");
-    assert_eq!(session_terminal_title(Some("nightly audit"), &cwd), "cyrup - nightly audit - cyrup");
+    assert_eq!(
+        APP_TITLE, "cyrup",
+        "the rebranded APP_TITLE (config.ts:490)"
+    );
+    assert_eq!(
+        session_terminal_title(Some("nightly audit"), &cwd),
+        "cyrup - nightly audit - cyrup"
+    );
     assert_eq!(session_terminal_title(None, &cwd), "cyrup - cyrup");
     // `if (sessionName)` is a JS truthiness test, so an empty name takes the un-named branch.
     assert_eq!(session_terminal_title(Some(""), &cwd), "cyrup - cyrup");
@@ -44,8 +55,14 @@ fn update_terminal_title_composes_and_deduplicates() {
     app.set_title_cwd(PathBuf::from("/home/u/work/my-repo"));
 
     // Startup, un-named session: `cyrup - <cwd basename>`.
-    assert_eq!(app.update_terminal_title().as_deref(), Some("cyrup - my-repo"));
-    assert_eq!(app.state().terminal_title.as_deref(), Some("cyrup - my-repo"));
+    assert_eq!(
+        app.update_terminal_title().as_deref(),
+        Some("cyrup - my-repo")
+    );
+    assert_eq!(
+        app.state().terminal_title.as_deref(),
+        Some("cyrup - my-repo")
+    );
     // Nothing moved ⇒ nothing to write (Pi calls `setTitle` only from the four sites above).
     assert_eq!(app.update_terminal_title(), None);
 }
@@ -75,6 +92,9 @@ fn a_rename_retitles_the_window_and_the_footer() {
 
     // Clearing the name falls back to Pi's un-named branch.
     app.ingest_event(&AgentSessionEvent::SessionInfoChanged { name: None });
-    assert_eq!(app.state().terminal_title.as_deref(), Some("cyrup - my-repo"));
+    assert_eq!(
+        app.state().terminal_title.as_deref(),
+        Some("cyrup - my-repo")
+    );
     assert_eq!(app.state().status.session_name, None);
 }

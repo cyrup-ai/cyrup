@@ -16,20 +16,22 @@
 //! Gated on the `test-fixtures` Cargo feature, matching every other fixture-dependent integration
 //! test in this crate.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-
 use cyrup_ext::native::{ExtMode, HostCtx, NativeExtension};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::RunState;
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::SpawnCommand;
-
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -119,7 +121,10 @@ fn fixture_config(script_path: &Path, home: Option<&Path>) -> SubagentExtensionC
     SubagentExtensionConfig {
         spawn_command: Some(SpawnCommand {
             binary: fixture_binary_path(),
-            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            base_args: vec![
+                "--fixture-script".to_string(),
+                script_path.display().to_string(),
+            ],
         }),
         roots: home.map_or_else(Roots::from_env, Roots::sandboxed),
         ..SubagentExtensionConfig::default()
@@ -141,7 +146,6 @@ fn command_ctx(cwd: &Path) -> HostCtx {
 /// (not a stub echoing the command back).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chain_command_runs_every_step_through_a_real_child_process_in_order() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "researcher");
     write_fixture_persona(work_dir.path(), "reviewer");
@@ -209,7 +213,6 @@ async fn chain_command_runs_every_step_through_a_real_child_process_in_order() {
 /// capability (no `cyrup`-shaped, `__subagent-runner`-aware binary is built by this crate).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chain_command_with_bg_flag_spawns_a_real_tracked_detached_process() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let cyrup_home = tempfile::tempdir().expect("real tempdir for CYRUP_HOME");
     write_fixture_persona(work_dir.path(), "worker");
@@ -229,7 +232,11 @@ async fn chain_command_with_bg_flag_spawns_a_real_tracked_detached_process() {
     let ctx = command_ctx(work_dir.path());
 
     let output = extension
-        .execute_command("chain", "worker \"do it\" -> worker \"do it again\" --bg", &ctx)
+        .execute_command(
+            "chain",
+            "worker \"do it\" -> worker \"do it again\" --bg",
+            &ctx,
+        )
         .await
         .expect("execute_command does not error")
         .expect("bg dispatch produces a status message");
@@ -307,7 +314,6 @@ async fn chain_command_with_bg_flag_spawns_a_real_tracked_detached_process() {
 /// layer: every step's own output is present, in input order, regardless of completion order).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_command_fans_out_over_real_child_processes() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
 
@@ -366,13 +372,15 @@ async fn parallel_command_fans_out_over_real_child_processes() {
 /// through the same real chain-walker `/chain` itself uses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_chain_command_resolves_a_saved_chain_through_real_discovery_and_executes_it() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
     write_fixture_chain(
         work_dir.path(),
         "release",
-        &[single_step("worker", "placeholder"), single_step("worker", "fixed second step")],
+        &[
+            single_step("worker", "placeholder"),
+            single_step("worker", "fixed second step"),
+        ],
     );
 
     let script = serde_json::json!({

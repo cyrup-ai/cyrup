@@ -1,9 +1,8 @@
 //! Heuristic model classification and ranking (pi `classifyModel`): capability bands, cost
 //! normalization, Pareto filtering and the profile-check report.
 
-
+use crate::extension::models::probe::{ProbeOutcome, probe_model};
 use crate::extension::models::registry_models;
-use crate::extension::models::probe::{probe_model, ProbeOutcome};
 
 /// pi `extractVersionScore` (profiles.ts:167-171): the max of every `\d+(\.\d+)?` numeric token in
 /// `id`, or `0.0` if none. Hand-rolled digit-run scan (no `regex` dependency in this crate) —
@@ -25,7 +24,9 @@ fn extract_version_score(id: &str) -> f64 {
                     i += 1;
                 }
             }
-            if let Some(token) = bytes.get(start..i).and_then(|slice| std::str::from_utf8(slice).ok())
+            if let Some(token) = bytes
+                .get(start..i)
+                .and_then(|slice| std::str::from_utf8(slice).ok())
                 && let Ok(value) = token.parse::<f64>()
                 && value.is_finite()
             {
@@ -95,7 +96,11 @@ fn infer_profile_band(model_name: &str) -> u8 {
 pub(crate) fn combined_cost(cost: &cyrup_provider::ModelCost) -> Option<f64> {
     let values = [cost.input, cost.output, cost.cache_read, cost.cache_write];
     let filtered: Vec<f64> = values.into_iter().filter(|v| v.is_finite()).collect();
-    if filtered.is_empty() { None } else { Some(filtered.iter().sum()) }
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(filtered.iter().sum())
+    }
 }
 
 /// pi's `NumericStats` (profiles.ts:205-208): the min/max of a value set, used to min-max
@@ -108,7 +113,10 @@ struct NumericStats {
 
 /// pi `collectStats` (profiles.ts:223-227): `None` when every input is missing/non-finite.
 fn collect_stats(values: &[Option<f64>]) -> Option<NumericStats> {
-    let filtered: Vec<f64> = values.iter().filter_map(|v| v.filter(|x| x.is_finite())).collect();
+    let filtered: Vec<f64> = values
+        .iter()
+        .filter_map(|v| v.filter(|x| x.is_finite()))
+        .collect();
     if filtered.is_empty() {
         return None;
     }
@@ -138,13 +146,21 @@ pub(crate) struct ClassificationContext {
     max_tokens: Option<NumericStats>,
 }
 
-pub(crate) fn build_classification_context(models: &[cyrup_provider::Model]) -> ClassificationContext {
+pub(crate) fn build_classification_context(
+    models: &[cyrup_provider::Model],
+) -> ClassificationContext {
     ClassificationContext {
         context_window: collect_stats(
-            &models.iter().map(|m| Some(m.context_window as f64)).collect::<Vec<_>>(),
+            &models
+                .iter()
+                .map(|m| Some(m.context_window as f64))
+                .collect::<Vec<_>>(),
         ),
         max_tokens: collect_stats(
-            &models.iter().map(|m| Some(m.max_tokens as f64)).collect::<Vec<_>>(),
+            &models
+                .iter()
+                .map(|m| Some(m.max_tokens as f64))
+                .collect::<Vec<_>>(),
         ),
     }
 }
@@ -166,12 +182,23 @@ pub(crate) struct ModelClassification {
 /// classification, reduced to its `profileRank` output (see [`ModelClassification`]'s doc comment).
 /// See the module-level doc comment above for why this crate's registry input always has
 /// "official metadata" (pi's `hasOfficialMetadata` is always `true` here).
-pub(crate) fn classify_model(model: &cyrup_provider::Model, ctx: &ClassificationContext) -> ModelClassification {
-    let model_name = if model.name.trim().is_empty() { model.id.as_str() } else { model.name.as_str() };
-    let tokens: std::collections::HashSet<String> = model_name_tokens(model_name).into_iter().collect();
+pub(crate) fn classify_model(
+    model: &cyrup_provider::Model,
+    ctx: &ClassificationContext,
+) -> ModelClassification {
+    let model_name = if model.name.trim().is_empty() {
+        model.id.as_str()
+    } else {
+        model.name.as_str()
+    };
+    let tokens: std::collections::HashSet<String> =
+        model_name_tokens(model_name).into_iter().collect();
     let band = infer_profile_band(model_name);
     let version_score = extract_version_score(model.id.as_str());
-    let context_norm = normalize(Some(model.context_window as f64), ctx.context_window.as_ref());
+    let context_norm = normalize(
+        Some(model.context_window as f64),
+        ctx.context_window.as_ref(),
+    );
     let max_tokens_norm = normalize(Some(model.max_tokens as f64), ctx.max_tokens.as_ref());
 
     let heuristic_base = f64::from(band) / 4.0;
@@ -196,8 +223,9 @@ pub(crate) fn classify_model(model: &cyrup_provider::Model, ctx: &Classification
     quality_score = quality_score.clamp(0.0, 1.0);
 
     let latency_penalty: i64 = if latency_hints_fast { 125 } else { 0 };
-    let profile_rank =
-        (quality_score * 100.0 * 10.0).round() as i64 + (version_score * 25.0).round() as i64 - latency_penalty;
+    let profile_rank = (quality_score * 100.0 * 10.0).round() as i64
+        + (version_score * 25.0).round() as i64
+        - latency_penalty;
 
     ModelClassification { profile_rank }
 }
@@ -256,7 +284,12 @@ pub(crate) fn filter_dominated(candidates: Vec<RankedCandidate>) -> Vec<RankedCa
                 .any(|other| !std::ptr::eq(other, candidate) && dominates(other, candidate))
         })
         .collect();
-    candidates.into_iter().zip(keep).filter(|(_, k)| *k).map(|(c, _)| c).collect()
+    candidates
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(c, _)| c)
+        .collect()
 }
 
 /// Render `/subagents-check-profile`'s report (pi `checkSubagentProfile`, profiles.ts:608-637):
@@ -290,11 +323,14 @@ pub(crate) async fn render_profile_check_report(
     let mut known: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for m in registry_models() {
         let full_id = format!("{}/{}", m.provider.as_str(), m.id.as_str());
-        known.entry(m.id.as_str().to_string()).or_insert_with(|| full_id.clone());
+        known
+            .entry(m.id.as_str().to_string())
+            .or_insert_with(|| full_id.clone());
         known.entry(full_id.clone()).or_insert(full_id);
     }
 
-    let mut probe_cache: std::collections::HashMap<String, ProbeOutcome> = std::collections::HashMap::new();
+    let mut probe_cache: std::collections::HashMap<String, ProbeOutcome> =
+        std::collections::HashMap::new();
     let mut out = format!("subagents-check-profile '{name}':\n");
     for (agent, model) in refs {
         let resolved_full_id = known.get(&model).cloned();
@@ -326,7 +362,12 @@ pub(crate) async fn render_profile_check_report(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -401,11 +442,26 @@ mod tests {
     /// "cheap" tier) and the expensive/weak model LAST (the "strong" tier) — exactly backwards.
     #[test]
     fn classify_model_ranks_by_capability_not_raw_cost() {
-        let expensive_but_weak =
-            test_model("acme", "acme-nano-1", "Acme Nano 1", 100.0, 4_000, 1_000, false);
-        let cheap_but_strong =
-            test_model("acme", "acme-opus-9", "Acme Opus 9", 2.0, 200_000, 64_000, true);
-        let ctx = build_classification_context(&[expensive_but_weak.clone(), cheap_but_strong.clone()]);
+        let expensive_but_weak = test_model(
+            "acme",
+            "acme-nano-1",
+            "Acme Nano 1",
+            100.0,
+            4_000,
+            1_000,
+            false,
+        );
+        let cheap_but_strong = test_model(
+            "acme",
+            "acme-opus-9",
+            "Acme Opus 9",
+            2.0,
+            200_000,
+            64_000,
+            true,
+        );
+        let ctx =
+            build_classification_context(&[expensive_but_weak.clone(), cheap_but_strong.clone()]);
 
         let weak_rank = classify_model(&expensive_but_weak, &ctx).profile_rank;
         let strong_rank = classify_model(&cheap_but_strong, &ctx).profile_rank;
@@ -419,7 +475,10 @@ mod tests {
         // disagree, so this test is a genuine regression proof, not a vacuous assertion.
         let cost_ascending_puts_strong_first =
             combined_cost(&cheap_but_strong.cost) < combined_cost(&expensive_but_weak.cost);
-        assert!(cost_ascending_puts_strong_first, "test fixture must actually invert cost vs capability");
+        assert!(
+            cost_ascending_puts_strong_first,
+            "test fixture must actually invert cost vs capability"
+        );
     }
 
     /// pi `dominatesModel`/`filterDominatedModels` (profiles.ts:382-400): a candidate that is
@@ -453,9 +512,14 @@ mod tests {
         };
         let kept = filter_dominated(vec![dominated, dominator.clone(), incomparable.clone()]);
         let kept_ids: Vec<&str> = kept.iter().map(|c| c.full_id.as_str()).collect();
-        assert!(!kept_ids.contains(&"acme/weak-and-pricier"), "the dominated candidate must be dropped");
+        assert!(
+            !kept_ids.contains(&"acme/weak-and-pricier"),
+            "the dominated candidate must be dropped"
+        );
         assert!(kept_ids.contains(&"acme/strong-and-cheaper"));
-        assert!(kept_ids.contains(&"acme/cheap-but-narrow"), "an incomparable (Pareto-optimal) candidate must survive");
+        assert!(
+            kept_ids.contains(&"acme/cheap-but-narrow"),
+            "an incomparable (Pareto-optimal) candidate must survive"
+        );
     }
-
 }

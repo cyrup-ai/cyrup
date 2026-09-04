@@ -398,7 +398,10 @@ mod tests {
     /// developer's real one. Every layout test below is about path ARITHMETIC, so it states the
     /// home it wants and gets the same answer on every machine.
     fn env_rooted_at(home: &str) -> EnvVars {
-        EnvVars { home: Some(PathBuf::from(home)), ..Default::default() }
+        EnvVars {
+            home: Some(PathBuf::from(home)),
+            ..Default::default()
+        }
     }
 
     /// The fixed home every layout test in this module resolves against.
@@ -435,8 +438,9 @@ mod tests {
         });
         assert_eq!(long.agent_dir, Some(PathBuf::from("/opt/long")));
 
-        let short =
-            EnvVars::from_lookup(|k| (k == "CYRUP_AGENT_DIR").then(|| OsString::from("/opt/short")));
+        let short = EnvVars::from_lookup(|k| {
+            (k == "CYRUP_AGENT_DIR").then(|| OsString::from("/opt/short"))
+        });
         assert_eq!(short.agent_dir, Some(PathBuf::from("/opt/short")));
 
         // The documented spelling wins when both are set, and the `PI_` migration fallback stays
@@ -572,10 +576,10 @@ mod flag_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod telemetry_tristate_tests {
-    use std::ffi::OsString;
     use super::{CliConfigOverrides, EnvVars};
     use crate::policy::NetworkPolicy;
     use crate::settings::{EffectiveSettings, Settings};
+    use std::ffi::OsString;
 
     fn env_with(pairs: &[(&str, &str)]) -> EnvVars {
         let owned: Vec<(String, OsString)> = pairs

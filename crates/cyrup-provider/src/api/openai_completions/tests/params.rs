@@ -14,7 +14,11 @@ use super::*;
 /// actually ships.
 #[test]
 fn with_no_caller_cap_the_models_own_max_tokens_reaches_the_body() {
-    let ctx = Context { system_prompt: None, messages: vec![], tools: vec![] };
+    let ctx = Context {
+        system_prompt: None,
+        messages: vec![],
+        tools: vec![],
+    };
 
     // Exactly what the turn path passes today: nothing.
     let body = build_body(&model(), &ctx, &StreamOptions::default());
@@ -24,9 +28,18 @@ fn with_no_caller_cap_the_models_own_max_tokens_reaches_the_body() {
     );
 
     // A caller cap still wins, so a `maxTokens` setting / modelOverrides keeps precedence.
-    let capped =
-        build_body(&model(), &ctx, &StreamOptions { max_tokens: Some(256), ..Default::default() });
-    assert_eq!(capped["max_tokens"], 256, "an explicit caller cap beats the model's");
+    let capped = build_body(
+        &model(),
+        &ctx,
+        &StreamOptions {
+            max_tokens: Some(256),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        capped["max_tokens"], 256,
+        "an explicit caller cap beats the model's"
+    );
 
     // Modelless fallback (`max_tokens: 0`) sends nothing, leaving upstream behaviour unchanged.
     let mut modelless = model();
@@ -54,7 +67,8 @@ fn request_body_matches_openai_shape() {
                     arguments: json!({ "city": "Paris" })
                         .as_object()
                         .cloned()
-                        .expect("object").into(),
+                        .expect("object")
+                        .into(),
                     thought_signature: None,
                 })],
                 provider: "together".into(),

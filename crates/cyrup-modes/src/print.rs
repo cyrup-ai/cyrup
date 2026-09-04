@@ -84,7 +84,9 @@ where
     runtime
         .session()
         .await
-        .bind_extensions_with(BindOptions { on_error: Some(extension_error_sink()) })
+        .bind_extensions_with(BindOptions {
+            on_error: Some(extension_error_sink()),
+        })
         .await;
 
     // Send loop (Pi print-mode.ts:121-127): prompt each message to completion, in order, producing

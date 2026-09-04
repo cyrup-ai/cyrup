@@ -195,7 +195,10 @@ impl MissionWorkflowState {
                 ))
             })?;
             self.values = Some(
-                object.iter().map(|(key, value)| (key.clone(), value.clone())).collect(),
+                object
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
             );
         }
         Ok(self.values.get_or_insert_with(BTreeMap::new))
@@ -253,7 +256,10 @@ pub fn create_mission_workflow_state(
     location: &MissionStoreLocation,
     mission_id: &str,
 ) -> MissionResult<MissionWorkflowState> {
-    Ok(MissionWorkflowState { path: mission_state_path(location, mission_id)?, values: None })
+    Ok(MissionWorkflowState {
+        path: mission_state_path(location, mission_id)?,
+        values: None,
+    })
 }
 
 #[cfg(test)]
@@ -294,8 +300,13 @@ mod tests {
         let loc = location(tmp.path());
         let mut state = create_mission_workflow_state(&loc, "m-1").unwrap();
         assert_eq!(state.get("phase").unwrap(), None);
-        state.set("phase", serde_json::json!({"step": 2, "done": false})).unwrap();
-        assert_eq!(state.get("phase").unwrap(), Some(serde_json::json!({"step": 2, "done": false})));
+        state
+            .set("phase", serde_json::json!({"step": 2, "done": false}))
+            .unwrap();
+        assert_eq!(
+            state.get("phase").unwrap(),
+            Some(serde_json::json!({"step": 2, "done": false}))
+        );
 
         // A SECOND, independent handle sees the persisted value — the file, not the map, is the
         // source of truth across processes.
@@ -307,8 +318,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode =
-                std::fs::metadata(state.path()).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(state.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600);
         }
     }
@@ -323,13 +337,22 @@ mod tests {
         assert_eq!(state.get("").unwrap_err().to_string(), expected);
         assert_eq!(state.get("_leading").unwrap_err().to_string(), expected);
         assert_eq!(state.get("has space").unwrap_err().to_string(), expected);
-        assert_eq!(state.set("nope/slash", Value::Null).unwrap_err().to_string(), expected);
+        assert_eq!(
+            state
+                .set("nope/slash", Value::Null)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
         assert_eq!(
             state.get(&"k".repeat(129)).unwrap_err().to_string(),
             expected,
             "129 characters is one too many"
         );
-        assert!(state.get(&"k".repeat(128)).is_ok(), "128 characters is the ceiling");
+        assert!(
+            state.get(&"k".repeat(128)).is_ok(),
+            "128 characters is the ceiling"
+        );
     }
 
     #[test]
@@ -340,10 +363,14 @@ mod tests {
         let huge = Value::String("x".repeat(MISSION_STATE_MAX_BYTES + 10));
         let err = state.set("big", huge).unwrap_err();
         assert!(
-            err.to_string().starts_with("Mission state exceeds the 256 KiB limit ("),
+            err.to_string()
+                .starts_with("Mission state exceeds the 256 KiB limit ("),
             "{err}"
         );
-        assert!(!state.path().exists(), "a refused set must not create the file");
+        assert!(
+            !state.path().exists(),
+            "a refused set must not create the file"
+        );
     }
 
     #[test]
@@ -352,11 +379,17 @@ mod tests {
         let loc = location(tmp.path());
         let path = mission_state_path(&loc, "m-1").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, format!("{{\"k\":\"{}\"}}", "x".repeat(MISSION_STATE_MAX_BYTES)))
-            .unwrap();
+        std::fs::write(
+            &path,
+            format!("{{\"k\":\"{}\"}}", "x".repeat(MISSION_STATE_MAX_BYTES)),
+        )
+        .unwrap();
         let mut state = create_mission_workflow_state(&loc, "m-1").unwrap();
         let err = state.get("k").unwrap_err();
-        assert!(err.to_string().contains("exceeds the 256 KiB limit"), "{err}");
+        assert!(
+            err.to_string().contains("exceeds the 256 KiB limit"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -368,15 +401,20 @@ mod tests {
         std::fs::write(&path, "[1,2,3]").unwrap();
         let mut state = create_mission_workflow_state(&loc, "m-1").unwrap();
         let err = state.get("k").unwrap_err();
-        assert!(err.to_string().contains("root must be a JSON object"), "{err}");
+        assert!(
+            err.to_string().contains("root must be a JSON object"),
+            "{err}"
+        );
     }
 
     #[test]
     fn assert_workflow_json_value_accepts_every_representable_value() {
-        assert!(assert_workflow_json_value(
-            &serde_json::json!({"a": [1, "two", null, {"b": true}]}),
-            "value"
-        )
-        .is_ok());
+        assert!(
+            assert_workflow_json_value(
+                &serde_json::json!({"a": [1, "two", null, {"b": true}]}),
+                "value"
+            )
+            .is_ok()
+        );
     }
 }

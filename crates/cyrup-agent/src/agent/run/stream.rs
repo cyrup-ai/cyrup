@@ -2,13 +2,13 @@
 //! `message_start`..`message_end` pair — including on abort — so the caller's closing sequence is
 //! complete.
 
-use std::sync::Arc;
 use super::assistant_stream::{AssistantStream, Step};
 use super::{RunCtx, RunFailure};
 use crate::event::{AgentEvent, AgentMessage};
 use cyrup_core::AssistantMessage;
 use cyrup_provider::{Context, StreamOptions};
 use futures::StreamExt;
+use std::sync::Arc;
 
 impl RunCtx {
     /// The LLM boundary (arch-02 §6.2). Always emits the assistant `message_start..message_end`
@@ -40,15 +40,18 @@ impl RunCtx {
         // `set_messages` must not cross between the two.
         let base_messages = self.messages.clone();
 
-        let transformed =
-            match self.hooks.transform_context(base_messages, self.cancel.child()).await {
-                Ok(m) => m,
-                // Pi awaits `transformContext` bare (agent-loop.ts:288-292), so a throw unwinds to
-                // `handleRunFailure`, whose `errorMessage` is the thrown value's own text
-                // (`error instanceof Error ? error.message : String(error)`, agent.ts:504). Surface
-                // `e.to_string()` — never a fixed label — or the hook's reason is lost outright.
-                Err(e) => return Err(RunFailure(e.to_string())),
-            };
+        let transformed = match self
+            .hooks
+            .transform_context(base_messages, self.cancel.child())
+            .await
+        {
+            Ok(m) => m,
+            // Pi awaits `transformContext` bare (agent-loop.ts:288-292), so a throw unwinds to
+            // `handleRunFailure`, whose `errorMessage` is the thrown value's own text
+            // (`error instanceof Error ? error.message : String(error)`, agent.ts:504). Surface
+            // `e.to_string()` — never a fixed label — or the hook's reason is lost outright.
+            Err(e) => return Err(RunFailure(e.to_string())),
+        };
         let llm = match self.hooks.convert_to_llm(&transformed).await {
             Ok(m) => m,
             // Same bare await for `convertToLlm` (agent-loop.ts:295) → same `handleRunFailure` text.
@@ -179,6 +182,9 @@ impl RunCtx {
     /// The one `message_start` site for an assistant message: both the [`Step::Start`] arm and
     /// the closing tail of `stream_assistant` go through it.
     async fn emit_assistant_start(&self, message: Arc<AssistantMessage>) -> Result<(), RunFailure> {
-        self.emit(AgentEvent::MessageStart { message: AgentMessage::Assistant(message) }).await
+        self.emit(AgentEvent::MessageStart {
+            message: AgentMessage::Assistant(message),
+        })
+        .await
     }
 }

@@ -6,11 +6,16 @@
 //! This is the discipline the audit demanded: NOT a hand-built event handed to `dispatch_*`, but the
 //! real `ExtensionHost::emit_before_agent_start` / `emit_input` / `emit_message_end` /
 //! `emit_before_provider_request` / `emit_user_bash` entry points reaching the live `.wasm` guest.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use cyrup_core::{CancelToken, Content, Message};
 use cyrup_ext::{
-    CompactionReduction, DenyServices, EventKind, Extension, ExtMode, ExtensionHost, HostConfig,
+    CompactionReduction, DenyServices, EventKind, ExtMode, Extension, ExtensionHost, HostConfig,
     InputEventSource, InputReduction, TreeReduction, UserBashReduction,
 };
 use serde_json::json;
@@ -26,7 +31,11 @@ fn fixture_component() -> PathBuf {
 }
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: PathBuf::from("."),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -46,7 +55,10 @@ async fn live_guest_dispatches_the_mutating_seams_end_to_end() {
         EventKind::BeforeProviderRequest,
         EventKind::UserBash,
     ] {
-        assert!(ext.subscriptions().contains(kind), "guest subscribed to {kind:?}");
+        assert!(
+            ext.subscriptions().contains(kind),
+            "guest subscribed to {kind:?}"
+        );
     }
 
     let cancel = CancelToken::new();
@@ -61,7 +73,11 @@ async fn live_guest_dispatches_the_mutating_seams_end_to_end() {
         Some("INJECTED:BASE"),
         "guest replaced the system prompt across the live boundary"
     );
-    assert_eq!(reduction.injected.len(), 1, "guest injected exactly one message");
+    assert_eq!(
+        reduction.injected.len(),
+        1,
+        "guest injected exactly one message"
+    );
     match &reduction.injected[0] {
         Message::User { content, .. } => match content.first() {
             Some(Content::Text { text, .. }) => assert_eq!(text, "injected by demo"),
@@ -71,32 +87,65 @@ async fn live_guest_dispatches_the_mutating_seams_end_to_end() {
     }
     // A non-matching prompt yields no modification (Pi returns undefined).
     assert!(
-        host.emit_before_agent_start("idle", json!([]), "BASE", json!({}), &cancel).await.is_none(),
+        host.emit_before_agent_start("idle", json!([]), "BASE", json!({}), &cancel)
+            .await
+            .is_none(),
         "unmatched prompt => no before_agent_start reduction"
     );
 
     // 2) input (gap-08 #2): block / transform / continue, all via the live guest.
-    match host.emit_input("secret", vec![], InputEventSource::Interactive, None, &cancel).await {
+    match host
+        .emit_input(
+            "secret",
+            vec![],
+            InputEventSource::Interactive,
+            None,
+            &cancel,
+        )
+        .await
+    {
         InputReduction::Blocked { reason, by } => {
             assert_eq!(by.to_string(), "demo");
-            assert!(reason.as_deref().unwrap_or("").contains("input blocked"), "got {reason:?}");
+            assert!(
+                reason.as_deref().unwrap_or("").contains("input blocked"),
+                "got {reason:?}"
+            );
         }
         other => panic!("expected input block, got {other:?}"),
     }
-    match host.emit_input("up:hello", vec![], InputEventSource::Interactive, None, &cancel).await {
+    match host
+        .emit_input(
+            "up:hello",
+            vec![],
+            InputEventSource::Interactive,
+            None,
+            &cancel,
+        )
+        .await
+    {
         InputReduction::Transform { text, .. } => assert_eq!(text, "HELLO"),
         other => panic!("expected input transform, got {other:?}"),
     }
     assert!(
         matches!(
-            host.emit_input("plain", vec![], InputEventSource::Interactive, None, &cancel).await,
+            host.emit_input(
+                "plain",
+                vec![],
+                InputEventSource::Interactive,
+                None,
+                &cancel
+            )
+            .await,
             InputReduction::Continue
         ),
         "an unmatched input continues unchanged"
     );
 
     // 3) message_end (gap-08 #3): the guest returns a same-role replacement.
-    let original = Message::User { content: vec![Content::text("redact me")], timestamp: 0 };
+    let original = Message::User {
+        content: vec![Content::text("redact me")],
+        timestamp: 0,
+    };
     let replaced = host
         .emit_message_end(original, &cancel)
         .await
@@ -109,13 +158,29 @@ async fn live_guest_dispatches_the_mutating_seams_end_to_end() {
         other => panic!("unexpected replacement message: {other:?}"),
     }
     // An unmatched message is left unmodified (None).
-    let untouched = Message::User { content: vec![Content::text("keep me")], timestamp: 0 };
-    assert!(host.emit_message_end(untouched, &cancel).await.is_none(), "unmatched => no replacement");
+    let untouched = Message::User {
+        content: vec![Content::text("keep me")],
+        timestamp: 0,
+    };
+    assert!(
+        host.emit_message_end(untouched, &cancel).await.is_none(),
+        "unmatched => no replacement"
+    );
 
     // 4) before_provider_request (gap-08 #4): the guest tags the payload (whole-payload replacement).
-    let out = host.emit_before_provider_request(json!({ "model": "x" }), &cancel).await;
-    assert_eq!(out["demoTag"], json!(true), "guest replaced the provider payload");
-    assert_eq!(out["model"], json!("x"), "the guest preserved the original field");
+    let out = host
+        .emit_before_provider_request(json!({ "model": "x" }), &cancel)
+        .await;
+    assert_eq!(
+        out["demoTag"],
+        json!(true),
+        "guest replaced the provider payload"
+    );
+    assert_eq!(
+        out["model"],
+        json!("x"),
+        "the guest preserved the original field"
+    );
 
     // 5) user_bash (gap-08 #5): block a destructive command, proceed otherwise.
     match host.emit_user_bash("rm -rf /", &cancel).await {
@@ -123,7 +188,10 @@ async fn live_guest_dispatches_the_mutating_seams_end_to_end() {
         other => panic!("expected user_bash block, got {other:?}"),
     }
     assert!(
-        matches!(host.emit_user_bash("ls", &cancel).await, UserBashReduction::Continue),
+        matches!(
+            host.emit_user_bash("ls", &cancel).await,
+            UserBashReduction::Continue
+        ),
         "a safe user_bash command proceeds"
     );
 
@@ -131,7 +199,8 @@ async fn live_guest_dispatches_the_mutating_seams_end_to_end() {
     // the event and returns a custom-summary override that flows back across the live wasm boundary
     // with the new WIT arity (preparation-json + branch-entries-json + reason + willRetry).
     assert!(
-        ext.subscriptions().contains(EventKind::SessionBeforeCompact),
+        ext.subscriptions()
+            .contains(EventKind::SessionBeforeCompact),
         "guest subscribed to SessionBeforeCompact"
     );
     match host
@@ -163,7 +232,10 @@ async fn live_guest_dispatches_the_mutating_seams_end_to_end() {
         "guest subscribed to SessionBeforeTree"
     );
     match host
-        .emit_session_before_tree(json!({ "targetId": "t9", "userWantsSummary": true }), &cancel)
+        .emit_session_before_tree(
+            json!({ "targetId": "t9", "userWantsSummary": true }),
+            &cancel,
+        )
         .await
     {
         TreeReduction::Override(v) => {

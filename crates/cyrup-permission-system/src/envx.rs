@@ -26,8 +26,13 @@ thread_local! {
 #[cfg(test)]
 #[must_use]
 pub(crate) fn var(key: &str) -> Option<String> {
-    let pinned = OVERLAY
-        .with_borrow(|stack| stack.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.clone()));
+    let pinned = OVERLAY.with_borrow(|stack| {
+        stack
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    });
     match pinned {
         Some(value) => value,
         None => std::env::var(key).ok(),

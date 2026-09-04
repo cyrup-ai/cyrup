@@ -66,7 +66,12 @@
 //! `tool_meta.original_name` — which is what the fixture server sees on the wire, and what
 //! `details.tool` reports back.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -74,10 +79,10 @@ use std::time::Duration;
 
 use cyrup_core::{Message, StopReason};
 use cyrup_mcp::McpExtension;
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
-};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{
+    FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
+};
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -210,10 +215,19 @@ fn fixture_with(direct_tools: bool) -> Fixture {
             }
         }
     });
-    std::fs::write(agent_dir.join("mcp.json"), serde_json::to_string_pretty(&config).unwrap())
-        .unwrap();
+    std::fs::write(
+        agent_dir.join("mcp.json"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
 
-    Fixture { _tmp: tmp, cwd, agent_dir, started, handshook }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+        started,
+        handshook,
+    }
 }
 
 /// `SessionConfig::new` already sets `home = agent_dir`, so the session and the adapter agree on one
@@ -234,7 +248,9 @@ fn config(fx: &Fixture) -> SessionConfig {
 /// committed. The session gets the same `Arc`, coerced at the attach.
 fn adapter(fx: &Fixture) -> Arc<McpExtension> {
     let dirs = cyrup_mcp::dirs::McpDirs::new(fx.agent_dir.clone(), fx.cwd.clone());
-    McpExtension::with_config(dirs, None).with_home(fx.agent_dir.clone()).into_arc()
+    McpExtension::with_config(dirs, None)
+        .with_home(fx.agent_dir.clone())
+        .into_arc()
 }
 
 /// Build the session, attach the adapter, and fire the one event that starts everything.
@@ -286,9 +302,12 @@ async fn await_live_connection(ext: &Arc<McpExtension>) -> Arc<cyrup_mcp::state:
     let poll = async {
         loop {
             if let Some(state) = ext.state()
-                && state.manager.get_connection(SERVER).is_some_and(|connection| {
-                    connection.status() == cyrup_mcp::lifecycle::ConnectionStatus::Connected
-                })
+                && state
+                    .manager
+                    .get_connection(SERVER)
+                    .is_some_and(|connection| {
+                        connection.status() == cyrup_mcp::lifecycle::ConnectionStatus::Connected
+                    })
                 && ext.proxy_ctx().is_some()
                 && ext.init_task().is_none()
             {
@@ -313,7 +332,10 @@ async fn await_file(path: &std::path::Path, why: &str) {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     };
-    if tokio::time::timeout(Duration::from_secs(10), poll).await.is_err() {
+    if tokio::time::timeout(Duration::from_secs(10), poll)
+        .await
+        .is_err()
+    {
         panic!("{why} — `{}` never appeared", path.display());
     }
 }
@@ -385,7 +407,10 @@ async fn drive_tool_call(
         {
             let offered = Arc::clone(&offered);
             FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-                offered.lock().unwrap().push(ctx.tools.iter().map(|t| t.name.clone()).collect());
+                offered
+                    .lock()
+                    .unwrap()
+                    .push(ctx.tools.iter().map(|t| t.name.clone()).collect());
                 faux_assistant_message(
                     vec![faux_tool_call(&scripted, args.clone())],
                     StopReason::ToolUse,
@@ -395,7 +420,10 @@ async fn drive_tool_call(
         {
             let offered = Arc::clone(&offered);
             FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-                offered.lock().unwrap().push(ctx.tools.iter().map(|t| t.name.clone()).collect());
+                offered
+                    .lock()
+                    .unwrap()
+                    .push(ctx.tools.iter().map(|t| t.name.clone()).collect());
                 faux_assistant_message(vec![faux_text("done")], StopReason::Stop)
             })
         },
@@ -408,11 +436,17 @@ async fn drive_tool_call(
 
     // The stream is dropped on purpose: `wait_for_idle` is what settles the turn, and
     // `late_tools.rs` drives a turn the same way.
-    let _stream = session.prompt("use the mcp surface").await.expect("prompt accepted");
+    let _stream = session
+        .prompt("use the mcp surface")
+        .await
+        .expect("prompt accepted");
     session.wait_for_idle().await;
 
     let offered = offered.lock().unwrap().clone();
-    assert!(!offered.is_empty(), "the agent drove at least one real turn against the provider");
+    assert!(
+        !offered.is_empty(),
+        "the agent drove at least one real turn against the provider"
+    );
     assert!(
         offered[0].contains(&tool),
         "the AGENT offered `{tool}` to the model, or the scripted call below would be answered by \
@@ -425,26 +459,30 @@ async fn drive_tool_call(
         .await
         .into_iter()
         .find_map(|message| match message {
-            Message::ToolResult { tool_name, content, is_error, details, .. }
-                if tool_name == tool =>
-            {
-                Some(GatewayAnswer {
-                    text: content
-                        .iter()
-                        .filter_map(|block| match block {
-                            cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    is_error,
-                    details,
-                    offered: offered.clone(),
-                })
-            }
+            Message::ToolResult {
+                tool_name,
+                content,
+                is_error,
+                details,
+                ..
+            } if tool_name == tool => Some(GatewayAnswer {
+                text: content
+                    .iter()
+                    .filter_map(|block| match block {
+                        cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                is_error,
+                details,
+                offered: offered.clone(),
+            }),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("the scripted `{tool}` call must land a tool result in the transcript"));
+        .unwrap_or_else(|| {
+            panic!("the scripted `{tool}` call must land a tool result in the transcript")
+        });
 
     (ext, answer)
 }
@@ -473,7 +511,9 @@ impl GatewayAnswer {
 
     /// Every tool name the model was offered across the run, deduplicated by presence.
     fn was_offered(&self, name: &str) -> bool {
-        self.offered.iter().any(|turn| turn.iter().any(|tool| tool == name))
+        self.offered
+            .iter()
+            .any(|turn| turn.iter().any(|tool| tool == name))
     }
 }
 
@@ -490,7 +530,10 @@ impl GatewayAnswer {
 async fn a_configured_server_connects_when_the_session_starts() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
 
     let (session, ext) = start_session(&fx, faux, true).await;
     let state = await_live_connection(&ext).await;
@@ -537,7 +580,10 @@ async fn a_configured_server_connects_when_the_session_starts() {
 
     // (5) The memo is cleared, and only after the surface sync — a caller arriving during the sync
     //     window should join a settled build rather than be told there is none.
-    assert!(ext.init_task().is_none(), "`initPromise = null` ran at the end of the commit tail");
+    assert!(
+        ext.init_task().is_none(),
+        "`initPromise = null` ran at the end of the commit tail"
+    );
 
     // (6) Teardown, through the production path: `dispose` dispatches
     //     `HostEvent::SessionShutdown` to the extension, which routes the outgoing generation
@@ -585,7 +631,10 @@ async fn a_model_issued_mcp_call_is_answered_by_the_live_runtime() {
         Some("status"),
         "the call reached the nine-arm router's status mode: {answer:?}"
     );
-    assert!(!answer.is_error, "a status answer is not an error: {answer:?}");
+    assert!(
+        !answer.is_error,
+        "a status answer is not an error: {answer:?}"
+    );
 
     // THE LIVE FACTS. `execute_status` computes each row's status from
     // `ctx.env.get_connection(name)`, so `"connected"` here is the real child process's connection
@@ -595,7 +644,11 @@ async fn a_model_issued_mcp_call_is_answered_by_the_live_runtime() {
         Some(&serde_json::json!(1)),
         "the model was told the fixture server is connected: {answer:?}"
     );
-    let servers = answer.detail("servers").and_then(Value::as_array).cloned().unwrap_or_default();
+    let servers = answer
+        .detail("servers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let row = servers
         .iter()
         .find(|row| row.get("name").and_then(Value::as_str) == Some(SERVER))
@@ -700,7 +753,10 @@ async fn a_model_issued_gateway_call_returns_the_servers_own_result() {
         answer.text.contains(SERVER_ANSWER),
         "the server's real `tools/call` result reached the model: {answer:?}"
     );
-    assert!(!answer.is_error, "a successful tool call is not an error: {answer:?}");
+    assert!(
+        !answer.is_error,
+        "a successful tool call is not an error: {answer:?}"
+    );
     assert_eq!(
         answer.detail("error"),
         None,
@@ -713,7 +769,10 @@ async fn a_model_issued_gateway_call_returns_the_servers_own_result() {
         Some("call"),
         "the call reached `execute_call` against the committed `ProxyCtx`: {answer:?}"
     );
-    assert_eq!(answer.detail("server").and_then(Value::as_str), Some(SERVER));
+    assert_eq!(
+        answer.detail("server").and_then(Value::as_str),
+        Some(SERVER)
+    );
     assert_eq!(
         answer.detail("tool").and_then(Value::as_str),
         Some(REMOTE_TOOL),
@@ -724,8 +783,14 @@ async fn a_model_issued_gateway_call_returns_the_servers_own_result() {
     // `details.mcpResult` is the raw MCP payload, kept beside the rendered text. Asserted because
     // it is the half a UI reads, and because it shows the `isError: false` the server itself sent
     // rather than a flag this side inferred.
-    let raw = answer.detail("mcpResult").unwrap_or_else(|| panic!("the raw MCP result: {answer:?}"));
-    assert_eq!(raw.get("isError"), Some(&serde_json::json!(false)), "{answer:?}");
+    let raw = answer
+        .detail("mcpResult")
+        .unwrap_or_else(|| panic!("the raw MCP result: {answer:?}"));
+    assert_eq!(
+        raw.get("isError"),
+        Some(&serde_json::json!(false)),
+        "{answer:?}"
+    );
     assert_eq!(
         raw.pointer("/content/0/text").and_then(Value::as_str),
         Some(SERVER_ANSWER),
@@ -750,8 +815,7 @@ async fn a_model_issued_gateway_call_returns_the_servers_own_result() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_model_issued_direct_tool_call_returns_the_servers_own_result() {
     let fx = fixture();
-    let (_ext, answer) =
-        call_tool(&fx, DIRECT_TOOL, serde_json::json!({ "text": "pong" })).await;
+    let (_ext, answer) = call_tool(&fx, DIRECT_TOOL, serde_json::json!({ "text": "pong" })).await;
 
     assert!(
         answer.text.contains(SERVER_ANSWER),
@@ -760,7 +824,10 @@ async fn a_model_issued_direct_tool_call_returns_the_servers_own_result() {
     );
     assert!(!answer.is_error, "{answer:?}");
     assert_eq!(answer.detail("error"), None, "{answer:?}");
-    assert_eq!(answer.detail("server").and_then(Value::as_str), Some(SERVER));
+    assert_eq!(
+        answer.detail("server").and_then(Value::as_str),
+        Some(SERVER)
+    );
     assert_eq!(
         answer.detail("tool").and_then(Value::as_str),
         Some(REMOTE_TOOL),
@@ -799,23 +866,37 @@ async fn the_gateway_resolves_the_catalog_name_not_the_wire_name() {
         Some("tool_not_found"),
         "the WIRE name is not a catalog name: {answer:?}"
     );
-    assert_eq!(answer.detail("requestedTool").and_then(Value::as_str), Some(REMOTE_TOOL));
-    assert_eq!(answer.detail("hintServer").and_then(Value::as_str), Some(SERVER));
+    assert_eq!(
+        answer.detail("requestedTool").and_then(Value::as_str),
+        Some(REMOTE_TOOL)
+    );
+    assert_eq!(
+        answer.detail("hintServer").and_then(Value::as_str),
+        Some(SERVER)
+    );
 
     // …and the answer is USEFUL: it names the tool the model should have asked for, which is the
     // whole difference between this and the empty-catalog failure it replaced (that one suggested
     // nothing, because there was nothing to suggest).
-    let suggestions =
-        answer.detail("suggestions").and_then(Value::as_array).cloned().unwrap_or_default();
+    let suggestions = answer
+        .detail("suggestions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     assert!(
-        suggestions.iter().any(|name| name.as_str() == Some(DIRECT_TOOL)),
+        suggestions
+            .iter()
+            .any(|name| name.as_str() == Some(DIRECT_TOOL)),
         "the runtime names the catalog entry it DOES have: {answer:?}"
     );
     assert!(
         answer.text.contains(DIRECT_TOOL),
         "…in the text the model reads, too: {answer:?}"
     );
-    assert!(!answer.is_error, "an MCP tool error is a successful result with details: {answer:?}");
+    assert!(
+        !answer.is_error,
+        "an MCP tool error is a successful result with details: {answer:?}"
+    );
 }
 
 /// [`DIRECT_TOOL`] really is what `format_tool_name` produces for this server and tool under the
@@ -858,7 +939,11 @@ async fn the_live_surface_carries_the_servers_discovered_catalog() {
     let (ext, answer) = call_gateway(&fx, serde_json::json!({})).await;
 
     // (2) The status report, which is `execute_status` reading the live generation.
-    let servers = answer.detail("servers").and_then(Value::as_array).cloned().unwrap_or_default();
+    let servers = answer
+        .detail("servers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let row = servers
         .iter()
         .find(|row| row.get("name").and_then(Value::as_str) == Some(SERVER))
@@ -879,9 +964,16 @@ async fn the_live_surface_carries_the_servers_discovered_catalog() {
         .get(SERVER)
         .unwrap_or_else(|| panic!("`state.tool_metadata[\"{SERVER}\"]` exists"));
     let names: Vec<&str> = entries.iter().map(|tool| tool.name.as_str()).collect();
-    assert_eq!(names, vec![DIRECT_TOOL], "the catalog holds the model-facing name");
+    assert_eq!(
+        names,
+        vec![DIRECT_TOOL],
+        "the catalog holds the model-facing name"
+    );
     let echo = entries.first().expect("one entry");
-    assert_eq!(echo.original_name, REMOTE_TOOL, "…beside the wire name the child answers to");
+    assert_eq!(
+        echo.original_name, REMOTE_TOOL,
+        "…beside the wire name the child answers to"
+    );
     assert_eq!(
         echo.description, "echo back",
         "…and the server's OWN description, which only `tools/list` could have supplied"
@@ -908,7 +1000,10 @@ async fn the_live_surface_carries_the_servers_discovered_catalog() {
     // a rewrite that added the direct tool while dropping the gateway would leave a server with no
     // `mcp({connect})`, no `mcp({})` status and no route at all for a tool the filters excluded.
     assert!(
-        answer.offered.iter().all(|turn| turn.iter().any(|tool| tool == PROXY_TOOL)),
+        answer
+            .offered
+            .iter()
+            .all(|turn| turn.iter().any(|tool| tool == PROXY_TOOL)),
         "the gateway is on the model's surface throughout: {:?}",
         answer.offered
     );
@@ -937,7 +1032,12 @@ async fn the_gateway_is_the_route_without_the_direct_tools_opt_in() {
     // Discovery ran all the same — this is not a server that failed to connect.
     let state = ext.state().expect("the generation committed");
     assert_eq!(
-        state.tool_metadata.lock().unwrap().get(SERVER).map(Vec::len),
+        state
+            .tool_metadata
+            .lock()
+            .unwrap()
+            .get(SERVER)
+            .map(Vec::len),
         Some(1),
         "the catalog is discovered whether or not direct tools were asked for"
     );

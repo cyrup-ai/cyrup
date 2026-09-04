@@ -240,7 +240,13 @@ impl Serialize for DeltaOnly<'_> {
                 content_index,
                 content,
                 ..
-            } => indexed_str(serializer, "thinking_end", *content_index, "content", content),
+            } => indexed_str(
+                serializer,
+                "thinking_end",
+                *content_index,
+                "content",
+                content,
+            ),
             StreamEvent::ToolCallEnd {
                 content_index,
                 tool_call,

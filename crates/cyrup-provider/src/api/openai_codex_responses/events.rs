@@ -27,7 +27,10 @@ pub(super) enum MappedCodexEvent {
 /// `applyServiceTierPricing` — whose multiplier table is byte-identical to Codex's
 /// `getServiceTierCostMultiplier` (`:598-610` vs `openai-responses.ts:281-293`) — prices the turn
 /// exactly as upstream's `resolveServiceTier` hook would.
-pub(super) fn map_codex_event(event: &Value, request_service_tier: Option<&str>) -> MappedCodexEvent {
+pub(super) fn map_codex_event(
+    event: &Value,
+    request_service_tier: Option<&str>,
+) -> MappedCodexEvent {
     let Some(etype) = event.get("type").and_then(Value::as_str) else {
         return MappedCodexEvent::Skip;
     };
@@ -144,7 +147,10 @@ struct MapState {
 /// [`ProviderError::Decode`], whose `Display` prefixes `"decode error: "`, because emitting an
 /// unprefixed terminal from inside the *shared* decoder would mean changing
 /// `openai_responses::decode_stream`. The message body is upstream's exact text.
-pub(super) fn map_codex_frames(frames: FrameStream, request_service_tier: Option<String>) -> FrameStream {
+pub(super) fn map_codex_frames(
+    frames: FrameStream,
+    request_service_tier: Option<String>,
+) -> FrameStream {
     let state = MapState {
         inner: frames,
         done: false,

@@ -49,7 +49,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cyrup_core::{
-    TerminateHint,CancelToken, Content, ExecMode, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
+    CancelToken, Content, ExecMode, TerminateHint, Tool, ToolCallId, ToolError, ToolResult,
+    ToolUpdateSink,
+};
 
 /// `NATIVE_INTERCOM_EXTENSION_DIR` (`intercom/intercom-bridge.ts:8`) — the constant the doctor report's
 /// intercom section renders in place of the old on-disk `pi-intercom` extension-directory probe.
@@ -352,13 +354,16 @@ pub struct ChildChannelMetadata {
 pub fn read_child_metadata_from(
     get: &dyn Fn(&str) -> Option<String>,
 ) -> Option<ChildChannelMetadata> {
-    let text = |k: &str| get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let text = |k: &str| {
+        get(k)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
 
     let channel_dir = text(crate::spawn::intercom_target::ENV_SUPERVISOR_CHANNEL_DIR)?;
     let run_id = text(crate::spawn::nested_events::RUN_ID_ENV)?;
     let agent = text(crate::spawn::intercom_target::ENV_CHILD_AGENT)?;
-    let orchestrator_session_id =
-        text(crate::spawn::intercom_target::ENV_ORCHESTRATOR_SESSION_ID)?;
+    let orchestrator_session_id = text(crate::spawn::intercom_target::ENV_ORCHESTRATOR_SESSION_ID)?;
     let raw_index = text(crate::spawn::nested_events::CHILD_INDEX_ENV)?;
     if !raw_index.chars().all(|c| c.is_ascii_digit()) {
         return None;
@@ -413,7 +418,8 @@ pub fn format_child_message(
                 .to_string(),
         );
         if let Some(interview) = interview {
-            lines.push(serde_json::to_string_pretty(interview).unwrap_or_else(|_| "{}".to_string()));
+            lines
+                .push(serde_json::to_string_pretty(interview).unwrap_or_else(|_| "{}".to_string()));
         }
     }
     lines.join("\n").trim_end().to_string()
@@ -582,22 +588,40 @@ fn remove_request_file(file: &Path) {
 pub fn parse_request_file(file: &Path, channel_dir: &Path) -> Option<PendingSupervisorRequest> {
     let bytes = std::fs::read(file).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("subagent.supervisor.request") {
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("subagent.supervisor.request")
+    {
         return None;
     }
-    if !value.get("id").and_then(serde_json::Value::as_str).is_some_and(|s| !s.is_empty()) {
+    if !value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+    {
         return None;
     }
     value
         .get("reason")
         .and_then(serde_json::Value::as_str)
         .and_then(SupervisorReason::from_str_exact)?;
-    if !value.get("message").and_then(serde_json::Value::as_str).is_some_and(|s| !s.is_empty()) {
+    if !value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+    {
         return None;
     }
-    if value.get("runId").and_then(serde_json::Value::as_str).is_none()
-        || value.get("agent").and_then(serde_json::Value::as_str).is_none()
-        || value.get("childIndex").and_then(serde_json::Value::as_u64).is_none()
+    if value
+        .get("runId")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+        || value
+            .get("agent")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        || value
+            .get("childIndex")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
     {
         return None;
     }
@@ -894,7 +918,10 @@ impl NativeSupervisorChannel {
     /// Bind (or rebind) the P-1 capability backend requests are injected through and whose
     /// `session_id` decides which requests belong to THIS orchestrator session.
     pub fn bind_services(&self, services: Arc<dyn cyrup_ext::host::HostServices>) {
-        *self.services.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(services);
+        *self
+            .services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(services);
     }
 
     fn services(&self) -> Option<Arc<dyn cyrup_ext::host::HostServices>> {
@@ -926,8 +953,16 @@ impl NativeSupervisorChannel {
         let mut adopted = Vec::new();
         let mut to_inject = Vec::new();
         {
-            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            refresh_pending(&mut state.pending, Some(session_id.as_str()), now, ask_timeout);
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            refresh_pending(
+                &mut state.pending,
+                Some(session_id.as_str()),
+                now,
+                ask_timeout,
+            );
 
             for (channel_dir, file) in list_request_files_in(&self.root) {
                 if state.seen_files.contains(&file) {
@@ -975,7 +1010,10 @@ impl NativeSupervisorChannel {
     }
 
     fn cleanup_stale_channels_if_due(&self, now: u64) {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if now.saturating_sub(state.last_stale_cleanup_at) < STALE_EMPTY_CHANNEL_CLEANUP_INTERVAL_MS
         {
             return;
@@ -989,7 +1027,10 @@ impl NativeSupervisorChannel {
     /// second call while a poller is already running is a no-op, matching upstream's `if (poller)
     /// return`.
     pub fn start(self: &Arc<Self>) {
-        let mut slot = self.poller.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slot = self
+            .poller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
@@ -1015,7 +1056,10 @@ impl NativeSupervisorChannel {
         {
             handle.abort();
         }
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.pending.clear();
         state.seen_files.clear();
     }
@@ -1062,11 +1106,16 @@ impl NativeSupervisorChannel {
         reply_to: Option<&str>,
         to: Option<&str>,
     ) -> Result<PendingSupervisorRequest, String> {
-        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(id) = reply_to {
-            return state.pending.get(id).cloned().ok_or_else(|| {
-                format!("No pending supervisor request found for replyTo '{id}'.")
-            });
+            return state
+                .pending
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("No pending supervisor request found for replyTo '{id}'."));
         }
         let requests: Vec<PendingSupervisorRequest> = state
             .pending
@@ -1129,7 +1178,12 @@ fn refresh_pending(
 ) {
     let stale: Vec<(String, SupervisorRequestLifecycle)> = pending
         .values()
-        .map(|p| (p.request.id.clone(), request_lifecycle(p, session_id, now, ask_timeout)))
+        .map(|p| {
+            (
+                p.request.id.clone(),
+                request_lifecycle(p, session_id, now, ask_timeout),
+            )
+        })
         .filter(|(_, lifecycle)| *lifecycle != SupervisorRequestLifecycle::Pending)
         .collect();
     for (id, lifecycle) in stale {
@@ -1277,7 +1331,11 @@ impl Tool for SubagentSupervisorTool {
              `intercom({ action: \"reply\", replyTo: \"<id>\", message: \"...\" })` — the child \
              is blocked until the reply lands.",
         ];
-        if self.alias { ALIAS_GUIDELINES.to_vec() } else { GUIDELINES.to_vec() }
+        if self.alias {
+            ALIAS_GUIDELINES.to_vec()
+        } else {
+            GUIDELINES.to_vec()
+        }
     }
 
     /// Sequential: a reply mutates the shared pending map and writes a file the blocked child is
@@ -1449,7 +1507,9 @@ impl Tool for NativeContactSupervisorTool {
     }
 
     fn prompt_snippet(&self) -> Option<&str> {
-        Some("contact_supervisor: ask this run's supervisor for a decision, an interview, or send a progress update")
+        Some(
+            "contact_supervisor: ask this run's supervisor for a decision, an interview, or send a progress update",
+        )
     }
 
     fn execution_mode(&self) -> ExecMode {
@@ -1630,15 +1690,10 @@ impl Tool for NativeChildIntercomTool {
                 } else {
                     SupervisorReason::NeedDecision
                 };
-                let (request, reply) = send_supervisor_request(
-                    &self.metadata,
-                    reason,
-                    Some(message),
-                    None,
-                    &cancel,
-                )
-                .await
-                .map_err(ToolError::new)?;
+                let (request, reply) =
+                    send_supervisor_request(&self.metadata, reason, Some(message), None, &cancel)
+                        .await
+                        .map_err(ToolError::new)?;
                 match reply {
                     None => Ok(json_result(
                         "Supervisor progress update queued.".to_string(),
@@ -1931,25 +1986,36 @@ mod tests {
     fn ask_timeout_falls_back_on_a_non_positive_or_unparsable_value() {
         assert_eq!(ask_timeout_ms_from(&|_| None), DEFAULT_ASK_TIMEOUT_MS);
         assert_eq!(ask_timeout_ms_from(&|_| Some("1500".to_string())), 1500);
-        assert_eq!(ask_timeout_ms_from(&|_| Some("0".to_string())), DEFAULT_ASK_TIMEOUT_MS);
-        assert_eq!(ask_timeout_ms_from(&|_| Some("-5".to_string())), DEFAULT_ASK_TIMEOUT_MS);
-        assert_eq!(ask_timeout_ms_from(&|_| Some("nope".to_string())), DEFAULT_ASK_TIMEOUT_MS);
+        assert_eq!(
+            ask_timeout_ms_from(&|_| Some("0".to_string())),
+            DEFAULT_ASK_TIMEOUT_MS
+        );
+        assert_eq!(
+            ask_timeout_ms_from(&|_| Some("-5".to_string())),
+            DEFAULT_ASK_TIMEOUT_MS
+        );
+        assert_eq!(
+            ask_timeout_ms_from(&|_| Some("nope".to_string())),
+            DEFAULT_ASK_TIMEOUT_MS
+        );
     }
 
     #[test]
     fn a_decision_with_no_message_is_rejected_but_a_progress_update_is_not() {
         let dir = tempfile::tempdir().expect("tempdir");
         let m = meta(dir.path());
-        assert!(build_supervisor_request(
-            &m,
-            SupervisorReason::NeedDecision,
-            None,
-            None,
-            "id".to_string(),
-            0,
-            1000
-        )
-        .is_err());
+        assert!(
+            build_supervisor_request(
+                &m,
+                SupervisorReason::NeedDecision,
+                None,
+                None,
+                "id".to_string(),
+                0,
+                1000
+            )
+            .is_err()
+        );
         let update = build_supervisor_request(
             &m,
             SupervisorReason::ProgressUpdate,
@@ -2037,7 +2103,9 @@ mod tests {
 
         // A blank reply is refused; a real one lands and deletes the request file.
         assert!(write_reply(&parsed, "   ").await.is_err());
-        write_reply(&parsed, " use main ").await.expect("reply writes");
+        write_reply(&parsed, " use main ")
+            .await
+            .expect("reply writes");
         assert!(!file.exists(), "answering must delete the request file");
         let reply = read_reply_file(&reply_path(&channel, "req-1"), "req-1")
             .expect("the child reads its reply back");
@@ -2155,20 +2223,32 @@ mod tests {
 
         // The env opt-in alone is enough for the orchestrator to attach and hold a presence.
         let env_opt_in = |k: &str| (k == ENV_INTERCOM_INSTALL).then(|| "1".to_string());
-        assert!(!native_child_client_should_register_from(&env_opt_in, dir.path()));
+        assert!(!native_child_client_should_register_from(
+            &env_opt_in,
+            dir.path()
+        ));
 
         // A present config file is `is_installed` on its own, and `enabled` defaults to true.
         let intercom = dir.path().join("intercom");
         std::fs::create_dir_all(&intercom).expect("mkdir");
         std::fs::write(intercom.join("config.json"), "{\"enabled\": true}").expect("write");
-        assert!(!native_child_client_should_register_from(&no_env, dir.path()));
+        assert!(!native_child_client_should_register_from(
+            &no_env,
+            dir.path()
+        ));
 
         // `enabled: false` is the state where `intercom_extension_for_env_concrete` returns `None`
         // even for a child with metadata — and it beats the env opt-in, exactly as upstream's
         // `if !config.enabled { return Ok(None) }` runs before the install check.
         std::fs::write(intercom.join("config.json"), "{\"enabled\": false}").expect("write");
-        assert!(native_child_client_should_register_from(&no_env, dir.path()));
-        assert!(native_child_client_should_register_from(&env_opt_in, dir.path()));
+        assert!(native_child_client_should_register_from(
+            &no_env,
+            dir.path()
+        ));
+        assert!(native_child_client_should_register_from(
+            &env_opt_in,
+            dir.path()
+        ));
     }
 
     /// G106's SECOND child registration: the bare-named `intercom` fallback layers on top of the
@@ -2194,7 +2274,10 @@ mod tests {
             dir.path()
         ));
         // No allowlist at all (the agent declared no `tools:`) is not a licence to claim the name.
-        assert!(!native_child_intercom_fallback_should_register(&|_| None, dir.path()));
+        assert!(!native_child_intercom_fallback_should_register(
+            &|_| None,
+            dir.path()
+        ));
         // A malformed payload degrades to "no allowlist", never to a claim.
         assert!(!native_child_intercom_fallback_should_register(
             &with_tools("not json"),
@@ -2242,14 +2325,20 @@ mod tests {
         let intercom = dir.path().join("intercom");
         std::fs::create_dir_all(&intercom).expect("mkdir");
         std::fs::write(intercom.join("config.json"), "{}").expect("write");
-        assert!(!native_intercom_alias_should_register(&|_| None, dir.path()));
+        assert!(!native_intercom_alias_should_register(
+            &|_| None,
+            dir.path()
+        ));
     }
 
     #[test]
     fn the_agent_dir_resolution_matches_the_intercom_crates_table() {
         // Absolute `CYRUP_CODING_AGENT_DIR` wins verbatim.
         assert_eq!(
-            intercom_agent_dir_from(&|k| (k == "CYRUP_CODING_AGENT_DIR").then(|| "/opt/agent".to_string()), None),
+            intercom_agent_dir_from(
+                &|k| (k == "CYRUP_CODING_AGENT_DIR").then(|| "/opt/agent".to_string()),
+                None
+            ),
             PathBuf::from("/opt/agent")
         );
         // A relative one resolves against cwd.

@@ -22,7 +22,7 @@ use cyrup_core::{EventStream, ModelRef, StopReason};
 use cyrup_provider::faux::{faux_assistant_message, faux_text};
 use cyrup_provider::{Context, StreamEvent, StreamOptions};
 use futures::StreamExt;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::support::{faux_stream_fn, model_ref};
 
@@ -37,7 +37,15 @@ fn app_role_parse_round_trips_and_rejects_the_rest() {
     for role in AppRole::ALL {
         assert_eq!(AppRole::parse(role.as_str()), Some(role), "{role:?}");
     }
-    for tag in ["user", "assistant", "toolResult", "custom", "", "BashExecution", "bash_execution"] {
+    for tag in [
+        "user",
+        "assistant",
+        "toolResult",
+        "custom",
+        "",
+        "BashExecution",
+        "bash_execution",
+    ] {
         assert_eq!(AppRole::parse(tag), None, "{tag:?} must not parse");
     }
     assert_eq!(AppRole::BashExecution.as_str(), "bashExecution");
@@ -52,14 +60,24 @@ fn app_role_parse_round_trips_and_rejects_the_rest() {
 #[test]
 fn app_message_wire_role_is_the_enum_tag_and_round_trips() {
     let mut payload = Map::new();
-    payload.insert("role".to_string(), Value::from(AppRole::BashExecution.as_str()));
+    payload.insert(
+        "role".to_string(),
+        Value::from(AppRole::BashExecution.as_str()),
+    );
     payload.insert("command".to_string(), json!("ls"));
-    let msg = AgentMessage::App { role: AppRole::BashExecution, payload };
+    let msg = AgentMessage::App {
+        role: AppRole::BashExecution,
+        payload,
+    };
     let value = serde_json::to_value(&msg).unwrap();
     assert_eq!(value["role"], json!("bashExecution"));
     assert_eq!(value["command"], json!("ls"));
     let text = serde_json::to_string(&msg).unwrap();
-    assert_eq!(text.matches("\"role\"").count(), 1, "the role key appears exactly once: {text}");
+    assert_eq!(
+        text.matches("\"role\"").count(),
+        1,
+        "the role key appears exactly once: {text}"
+    );
 
     let back: AgentMessage = serde_json::from_value(value).unwrap();
     match back {
@@ -76,7 +94,10 @@ fn app_message_wire_role_is_the_enum_tag_and_round_trips() {
 // ---------------------------------------------------------------------------
 
 fn assistant(text: &str) -> AgentMessage {
-    AgentMessage::Assistant(Arc::new(faux_assistant_message(vec![faux_text(text)], StopReason::Stop)))
+    AgentMessage::Assistant(Arc::new(faux_assistant_message(
+        vec![faux_text(text)],
+        StopReason::Stop,
+    )))
 }
 
 /// The one resume rule: an empty transcript is `NoMessages` (carrying the caller's surface, so
@@ -106,12 +127,20 @@ fn resume_point_check_is_the_one_resume_rule() {
 /// drain skips the first poll (pi `skipInitialSteeringPoll`).
 #[test]
 fn run_entry_derives_the_steering_poll_skip() {
-    let steering =
-        RunEntry::Prompt { messages: vec![AgentMessage::user_text("s")], source: PromptSource::SteeringDrain };
-    let fresh = RunEntry::Prompt { messages: vec![AgentMessage::user_text("f")], source: PromptSource::Fresh };
-    let follow =
-        RunEntry::Prompt { messages: vec![AgentMessage::user_text("u")], source: PromptSource::FollowUpDrain };
-    let proof = ResumePoint::check(&[AgentMessage::user_text("x")], ContinueSurface::Agent).unwrap();
+    let steering = RunEntry::Prompt {
+        messages: vec![AgentMessage::user_text("s")],
+        source: PromptSource::SteeringDrain,
+    };
+    let fresh = RunEntry::Prompt {
+        messages: vec![AgentMessage::user_text("f")],
+        source: PromptSource::Fresh,
+    };
+    let follow = RunEntry::Prompt {
+        messages: vec![AgentMessage::user_text("u")],
+        source: PromptSource::FollowUpDrain,
+    };
+    let proof =
+        ResumePoint::check(&[AgentMessage::user_text("x")], ContinueSurface::Agent).unwrap();
     let cont = RunEntry::Continue(proof);
     assert!(steering.skip_initial_steering_poll());
     assert!(!fresh.skip_initial_steering_poll());
@@ -128,10 +157,16 @@ fn run_entry_derives_the_steering_poll_skip() {
 #[test]
 fn queue_mode_from_str_is_strict() {
     assert_eq!("all".parse::<QueueMode>(), Ok(QueueMode::All));
-    assert_eq!("one-at-a-time".parse::<QueueMode>(), Ok(QueueMode::OneAtATime));
+    assert_eq!(
+        "one-at-a-time".parse::<QueueMode>(),
+        Ok(QueueMode::OneAtATime)
+    );
     for bad in ["ALL", "one_at_a_time", "", "steer"] {
         let err = bad.parse::<QueueMode>().expect_err(bad);
-        assert!(err.contains(bad), "the error names the rejected value: {err}");
+        assert!(
+            err.contains(bad),
+            "the error names the rejected value: {err}"
+        );
     }
 }
 
@@ -145,13 +180,23 @@ fn queue_mode_from_str_is_strict() {
 /// makes the same agent run.
 #[tokio::test]
 async fn modelless_agent_refuses_to_run_without_holding_the_latch() {
-    let (_faux, sf) = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let (_faux, sf) = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let agent = AgentBuilder::new(sf).build();
     assert!(agent.snapshot().await.model.is_none());
 
-    let err = agent.prompt("hi").await.err().expect("modelless prompt must be refused");
+    let err = agent
+        .prompt("hi")
+        .await
+        .err()
+        .expect("modelless prompt must be refused");
     assert!(matches!(err, AgentError::NoModelSelected), "{err}");
-    assert_eq!(err.to_string(), "No model selected. Select a model before starting a run.");
+    assert_eq!(
+        err.to_string(),
+        "No model selected. Select a model before starting a run."
+    );
     assert!(!agent.is_running(), "a refused run must not hold the latch");
     tokio::time::timeout(Duration::from_secs(1), agent.wait_for_idle())
         .await
@@ -159,13 +204,21 @@ async fn modelless_agent_refuses_to_run_without_holding_the_latch() {
     assert!(!agent.snapshot().await.is_streaming);
 
     // `continue_run` goes through the same claim: a resumable transcript still needs a model.
-    agent.set_messages(vec![AgentMessage::user_text("resume me")]).await;
-    assert!(matches!(agent.continue_run().await, Err(AgentError::NoModelSelected)));
+    agent
+        .set_messages(vec![AgentMessage::user_text("resume me")])
+        .await;
+    assert!(matches!(
+        agent.continue_run().await,
+        Err(AgentError::NoModelSelected)
+    ));
     assert!(!agent.is_running());
 
     agent.set_model(Some(model_ref())).await;
     assert_eq!(agent.snapshot().await.model, Some(model_ref()));
-    let handle = agent.prompt("now").await.expect("a model makes the same agent run");
+    let handle = agent
+        .prompt("now")
+        .await
+        .expect("a model makes the same agent run");
     handle.finished().await;
     agent.wait_for_idle().await;
     assert!(!agent.is_running());
@@ -192,10 +245,18 @@ async fn builder_with_model_and_explicit_model_setter_agree() {
 struct BlockingStreamFn;
 
 impl StreamFn for BlockingStreamFn {
-    fn stream(&self, _model: &ModelRef, _ctx: &Context, _opts: &StreamOptions) -> EventStream<StreamEvent> {
+    fn stream(
+        &self,
+        _model: &ModelRef,
+        _ctx: &Context,
+        _opts: &StreamOptions,
+    ) -> EventStream<StreamEvent> {
         let tail = futures::stream::once(async {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            StreamEvent::terminal(faux_assistant_message(vec![faux_text("late")], StopReason::Stop))
+            StreamEvent::terminal(faux_assistant_message(
+                vec![faux_text("late")],
+                StopReason::Stop,
+            ))
         });
         let start = StreamEvent::Start {
             partial: Arc::new(faux_assistant_message(Vec::new(), StopReason::Pending)),
@@ -218,13 +279,17 @@ async fn transcript_edits_are_atomic_and_predicate_driven_when_idle() {
     assert_eq!(len.ok(), Some(1));
     assert_eq!(agent.snapshot().await.messages.len(), 1);
 
-    agent.set_messages(vec![AgentMessage::user_text("q"), assistant("a")]).await;
+    agent
+        .set_messages(vec![AgentMessage::user_text("q"), assistant("a")])
+        .await;
     // Predicate false: nothing is popped.
     let none = agent.pop_trailing_assistant_if(|_| false).unwrap();
     assert!(none.is_none());
     assert_eq!(agent.snapshot().await.messages.len(), 2);
     // Predicate true: the assistant comes back and is gone from the transcript.
-    let popped = agent.pop_trailing_assistant_if(|a| a.stop_reason == StopReason::Stop).unwrap();
+    let popped = agent
+        .pop_trailing_assistant_if(|a| a.stop_reason == StopReason::Stop)
+        .unwrap();
     assert!(popped.is_some());
     assert_eq!(agent.snapshot().await.messages.len(), 1);
     // A trailing non-assistant is never popped, whatever the predicate says.
@@ -242,7 +307,10 @@ async fn transcript_edits_are_refused_while_a_run_is_in_flight() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(agent.is_running());
 
-    let err = agent.edit_transcript(|m| m.push(AgentMessage::user_text("sneak"))).err().unwrap();
+    let err = agent
+        .edit_transcript(|m| m.push(AgentMessage::user_text("sneak")))
+        .err()
+        .unwrap();
     assert!(matches!(err, AgentError::RunActive(BusyEntry::Edit)));
     assert_eq!(
         err.to_string(),
@@ -256,7 +324,11 @@ async fn transcript_edits_are_refused_while_a_run_is_in_flight() {
     agent.abort();
     agent.wait_for_idle().await;
     assert!(!agent.is_running());
-    assert!(agent.edit_transcript(|m| m.push(AgentMessage::user_text("now"))).is_ok());
+    assert!(
+        agent
+            .edit_transcript(|m| m.push(AgentMessage::user_text("now")))
+            .is_ok()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +347,10 @@ async fn snapshot_is_streaming_reads_the_run_latch() {
     agent.prompt("hi").await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(agent.is_running());
-    assert!(agent.snapshot().await.is_streaming, "the snapshot reads the latch");
+    assert!(
+        agent.snapshot().await.is_streaming,
+        "the snapshot reads the latch"
+    );
 
     agent.abort();
     agent.wait_for_idle().await;

@@ -45,7 +45,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::config::McpConfig;
-use crate::dirs::{hex_sha256, stable_stringify, HashValue};
+use crate::dirs::{HashValue, hex_sha256, stable_stringify};
 use crate::errors::McpResult;
 use crate::lifecycle::McpLifecycleManager;
 use crate::owner::{McpRuntimeOwner, OwnedServices};
@@ -228,7 +228,11 @@ impl McpState {
     #[must_use]
     pub fn dialog(&self) -> Option<crate::owner::McpDialog> {
         let ui = self.ui.as_ref()?;
-        let ctx = self.human_wait_ctx.lock().ok().and_then(|slot| slot.clone());
+        let ctx = self
+            .human_wait_ctx
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
         Some(crate::owner::McpDialog::fenced(ui).with_human_wait(ctx))
     }
 
@@ -468,7 +472,10 @@ pub struct ServerFailure {
 
 impl Default for ServerFailure {
     fn default() -> Self {
-        Self { last_failure: std::time::Instant::now(), count: 0 }
+        Self {
+            last_failure: std::time::Instant::now(),
+            count: 0,
+        }
     }
 }
 
@@ -568,7 +575,7 @@ impl Default for McpStatusSnapshot {
 #[cfg(test)]
 mod tests {
     use super::approval_cache_key;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     /// `__tests__/tool-approval.test.ts` "caches only Allow for session decisions", as rewritten by
     /// `5bcd6c5`: three calls, **two** approvals. The reordered payload is the same request; the
@@ -594,8 +601,14 @@ mod tests {
             &json!({"record": {"id": "other", "type": "demo"}}),
         );
 
-        assert_eq!(approved, reordered, "the same payload in a different key order is one request");
-        assert_ne!(approved, other, "a changed argument must not inherit an earlier approval (#367)");
+        assert_eq!(
+            approved, reordered,
+            "the same payload in a different key order is one request"
+        );
+        assert_ne!(
+            approved, other,
+            "a changed argument must not inherit an earlier approval (#367)"
+        );
     }
 
     /// `stableStringify(args ?? {})` — `mcp({tool})` and `mcp({tool, args: {}})` are one approval,
@@ -643,7 +656,11 @@ mod tests {
         assert_eq!(fields.next(), Some("search-records"));
         let digest = fields.next().unwrap_or_default();
         assert_eq!(digest.len(), 64);
-        assert!(digest.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert!(
+            digest
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
         assert_eq!(fields.next(), None);
     }
 }

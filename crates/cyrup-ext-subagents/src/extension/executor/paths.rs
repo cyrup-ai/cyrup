@@ -56,11 +56,7 @@ pub(crate) fn default_results_dir_in(roots: &crate::paths::Roots, cwd: &Path) ->
 /// just spawned the run, so it resolves to the identical directory (including the nested-route
 /// subtree when this process inherited one). `None` only when the roots cannot be resolved at all,
 /// in which case the key is omitted rather than guessed at.
-fn async_dir_for_run(
-    cwd: &Path,
-    run_id: &RunId,
-    roots: &crate::paths::Roots,
-) -> Option<PathBuf> {
+fn async_dir_for_run(cwd: &Path, run_id: &RunId, roots: &crate::paths::Roots) -> Option<PathBuf> {
     let inherited = crate::spawn::nested_events::resolve_inherited_nested_route_from_env(|key| {
         std::env::var(key).ok()
     });
@@ -79,10 +75,19 @@ pub(crate) fn async_launch_details(
     roots: &crate::paths::Roots,
 ) -> serde_json::Value {
     let mut details = serde_json::Map::new();
-    details.insert("mode".to_string(), serde_json::Value::String(mode.to_string()));
-    details.insert("runId".to_string(), serde_json::Value::String(run_id.as_str().to_string()));
+    details.insert(
+        "mode".to_string(),
+        serde_json::Value::String(mode.to_string()),
+    );
+    details.insert(
+        "runId".to_string(),
+        serde_json::Value::String(run_id.as_str().to_string()),
+    );
     details.insert("results".to_string(), serde_json::Value::Array(Vec::new()));
-    details.insert("asyncId".to_string(), serde_json::Value::String(run_id.as_str().to_string()));
+    details.insert(
+        "asyncId".to_string(),
+        serde_json::Value::String(run_id.as_str().to_string()),
+    );
     if let Some(dir) = async_dir_for_run(cwd, run_id, roots) {
         details.insert(
             "asyncDir".to_string(),
@@ -116,8 +121,10 @@ pub(crate) fn resolve_background_storage_roots(
             crate::spawn::nested_events::nested_results_dir(&route.root_run_id)?,
         )),
         None => {
-            let crate::background::RunArtifactRoots { async_root, results_dir } =
-                crate::background::run_artifact_roots_in(roots, cwd);
+            let crate::background::RunArtifactRoots {
+                async_root,
+                results_dir,
+            } = crate::background::run_artifact_roots_in(roots, cwd);
             Ok((async_root, results_dir))
         }
     }
@@ -172,7 +179,6 @@ pub(crate) fn format_configured_session_dir(
         None => "not configured".to_string(),
     }
 }
-
 
 /// Write a completed foreground run's output/metadata/event-stream artifacts (T6, the after-run half
 /// of pi `runs/foreground/execution.ts:1047-1069`). The `_input.md` is written by the caller BEFORE
@@ -341,8 +347,10 @@ pub(crate) fn format_slash_run_completion(result: &SingleResult) -> String {
         format!("failed (exit {})", result.exit_code)
     };
     let plural = if tool_count == 1 { "" } else { "s" };
-    let header =
-        format!("subagent {} · {status} · {tool_count} tool call{plural} · {tokens} tokens", result.agent);
+    let header = format!(
+        "subagent {} · {status} · {tool_count} tool call{plural} · {tokens} tokens",
+        result.agent
+    );
     let body = result.final_output.clone().unwrap_or_default();
     let body = if body.trim().is_empty() {
         result
@@ -442,11 +450,15 @@ pub(crate) fn unreachable_session_manager() -> cyrup_session::SessionManager {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::background::RunMode;
-    use crate::fork_context::ContextRequest;
     use crate::background::RunState;
     use crate::background::atomic::write_atomic_json;
     use crate::discovery::AgentDiscoveryConfig;
@@ -461,6 +473,7 @@ mod tests {
     use crate::extension::testsupport::scoped_tool;
     use crate::extension::testsupport::seed_orphaned_run;
     use crate::extension::testsupport::tool_text;
+    use crate::fork_context::ContextRequest;
     use crate::spawn::chain_graph::RunnerStep;
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -600,7 +613,9 @@ mod tests {
             RunMode::Single,
             Some(std::process::id()),
         );
-        running_status.advance_state(RunState::Running).expect("Queued -> Running");
+        running_status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
         write_atomic_json(&running_paths.status, &running_status)
             .await
             .expect("write running status fixture");
@@ -615,11 +630,8 @@ mod tests {
         tokio::fs::create_dir_all(&complete_paths.run_dir)
             .await
             .expect("mkdir complete run_dir");
-        let mut complete_status = crate::background::RunStatus::queued(
-            complete_run_id.clone(),
-            RunMode::Single,
-            Some(1),
-        );
+        let mut complete_status =
+            crate::background::RunStatus::queued(complete_run_id.clone(), RunMode::Single, Some(1));
         complete_status.state = RunState::Complete;
         write_atomic_json(&complete_paths.status, &complete_status)
             .await
@@ -662,16 +674,21 @@ mod tests {
         let route = crate::spawn::nested_events::create_nested_route("root-parity-test-async-exec")
             .expect("create_nested_route should succeed");
 
-        let (nested_async, nested_results) =
-            resolve_background_storage_roots(dir.path(), Some(&route), &crate::paths::Roots::from_env())
-                .expect("nested rerouting must succeed for a valid route");
+        let (nested_async, nested_results) = resolve_background_storage_roots(
+            dir.path(),
+            Some(&route),
+            &crate::paths::Roots::from_env(),
+        )
+        .expect("nested rerouting must succeed for a valid route");
         assert!(
             nested_async.ends_with("root-parity-test-async-exec"),
             "the async root for a nested run must be keyed under the inherited route's own root \
              run id, got: {nested_async:?}"
         );
         assert!(
-            nested_async.to_string_lossy().contains("nested-subagent-runs"),
+            nested_async
+                .to_string_lossy()
+                .contains("nested-subagent-runs"),
             "a nested run's async root must live under the nested-subagent-runs subtree, got: \
              {nested_async:?}"
         );
@@ -681,10 +698,17 @@ mod tests {
              {nested_results:?}"
         );
 
-        let (default_async, default_results) = resolve_background_storage_roots(dir.path(), None, &crate::paths::Roots::from_env())
-            .expect("the non-nested default derivation must still succeed");
-        assert_eq!(default_async, default_async_root_in(&crate::paths::Roots::from_env(), dir.path()));
-        assert_eq!(default_results, default_results_dir_in(&crate::paths::Roots::from_env(), dir.path()));
+        let (default_async, default_results) =
+            resolve_background_storage_roots(dir.path(), None, &crate::paths::Roots::from_env())
+                .expect("the non-nested default derivation must still succeed");
+        assert_eq!(
+            default_async,
+            default_async_root_in(&crate::paths::Roots::from_env(), dir.path())
+        );
+        assert_eq!(
+            default_results,
+            default_results_dir_in(&crate::paths::Roots::from_env(), dir.path())
+        );
         assert_ne!(
             nested_async, default_async,
             "a nested run must never land in the same shared per-cwd async root as a top-level run"
@@ -825,7 +849,8 @@ mod tests {
     async fn dismiss_clears_a_reload_orphaned_run_from_the_fleet_listing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = scoped_tool(dir.path()).await;
-        tool.executor().set_host_services(Arc::new(FixedSessionHost("session-a")));
+        tool.executor()
+            .set_host_services(Arc::new(FixedSessionHost("session-a")));
         seed_orphaned_run(dir.path(), "run0orphan00", Some("session-a"), None);
 
         // The defect itself: before the dismissal the orphan is reported as live.
@@ -834,11 +859,17 @@ mod tests {
             .control_status(dir.path(), None, None, false)
             .await
             .expect("status list");
-        assert!(before.contains("run0orphan00"), "the orphan must start out listed: {before}");
+        assert!(
+            before.contains("run0orphan00"),
+            "the orphan must start out listed: {before}"
+        );
 
-        let result = dispatch_tool(&tool, serde_json::json!({ "action": "dismiss", "id": "run0orphan00" }))
-            .await
-            .expect("dismiss dispatches through the tool");
+        let result = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "dismiss", "id": "run0orphan00" }),
+        )
+        .await
+        .expect("dismiss dispatches through the tool");
         assert_eq!(
             tool_text(&result),
             "Dismissed recovered workflow run0orphan00 from the display. No running work was \
@@ -865,13 +896,19 @@ mod tests {
         let persisted: crate::background::RunStatus =
             serde_json::from_slice(&std::fs::read(&paths.status).expect("read status"))
                 .expect("parse status");
-        assert!(persisted.display_dismissed_at.is_some(), "the marker must be persisted");
+        assert!(
+            persisted.display_dismissed_at.is_some(),
+            "the marker must be persisted"
+        );
         assert_eq!(
             persisted.state,
             RunState::Running,
             "dismissal is display-only — it must NOT advance the run's state"
         );
-        assert!(!paths.result.exists(), "dismissal must not fabricate a terminal result file");
+        assert!(
+            !paths.result.exists(),
+            "dismissal must not fabricate a terminal result file"
+        );
 
         // An id-addressed lookup still answers honestly, with pi's display-dismissed report.
         let single = tool
@@ -894,7 +931,10 @@ mod tests {
 
         // pi `subagent-executor.ts:5874` — no selector at all.
         assert_eq!(
-            executor.control_dismiss(dir.path(), None).await.expect_err("id required"),
+            executor
+                .control_dismiss(dir.path(), None)
+                .await
+                .expect_err("id required"),
             "action='dismiss' requires id."
         );
 
@@ -910,7 +950,11 @@ mod tests {
         // pi `:24-30` — a run directory exists but carries no readable `status.json`.
         let async_root = default_async_root_in(&crate::paths::Roots::from_env(), dir.path());
         let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), dir.path());
-        let bare = RunPaths::for_run(&async_root, &results_dir, &RunId::from_token("run0bare0000".to_string()));
+        let bare = RunPaths::for_run(
+            &async_root,
+            &results_dir,
+            &RunId::from_token("run0bare0000".to_string()),
+        );
         std::fs::create_dir_all(&bare.run_dir).expect("mkdir bare run dir");
         assert_eq!(
             executor
@@ -935,8 +979,11 @@ mod tests {
         let mut status: crate::background::RunStatus =
             serde_json::from_slice(&std::fs::read(&paused.status).expect("read")).expect("parse");
         status.state = RunState::Paused;
-        std::fs::write(&paused.status, serde_json::to_string(&status).expect("serialize"))
-            .expect("rewrite paused status");
+        std::fs::write(
+            &paused.status,
+            serde_json::to_string(&status).expect("serialize"),
+        )
+        .expect("rewrite paused status");
         assert_eq!(
             executor
                 .control_dismiss(dir.path(), Some("run0paused00"))
@@ -952,11 +999,28 @@ mod tests {
     fn an_async_launch_reports_the_run_directory_it_spawned_into() {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = crate::background::RunId::from_token("bgrun000042");
-        let details = async_launch_details("single", &run_id, dir.path(), &crate::paths::Roots::from_env());
+        let details = async_launch_details(
+            "single",
+            &run_id,
+            dir.path(),
+            &crate::paths::Roots::from_env(),
+        );
         assert_eq!(details.get("mode").and_then(|v| v.as_str()), Some("single"));
-        assert_eq!(details.get("runId").and_then(|v| v.as_str()), Some("bgrun000042"));
-        assert_eq!(details.get("asyncId").and_then(|v| v.as_str()), Some("bgrun000042"));
-        assert_eq!(details.get("results").and_then(|v| v.as_array()).map(Vec::len), Some(0));
+        assert_eq!(
+            details.get("runId").and_then(|v| v.as_str()),
+            Some("bgrun000042")
+        );
+        assert_eq!(
+            details.get("asyncId").and_then(|v| v.as_str()),
+            Some("bgrun000042")
+        );
+        assert_eq!(
+            details
+                .get("results")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
 
         // Absent a nested route in this process's env, the dir is the ordinary per-cwd C7 slot —
         // exactly what `spawn_background`'s `RunPaths::for_run` created.
@@ -1003,9 +1067,17 @@ mod tests {
         .expect("a task-bearing launch binds a mission");
 
         let run_id = crate::background::RunId::from_token("bgrun000043");
-        let details = async_launch_details("single", &run_id, dir.path(), &crate::paths::Roots::from_env());
+        let details = async_launch_details(
+            "single",
+            &run_id,
+            dir.path(),
+            &crate::paths::Roots::from_env(),
+        );
         let async_dir = PathBuf::from(
-            details.get("asyncDir").and_then(|v| v.as_str()).expect("asyncDir is reported"),
+            details
+                .get("asyncDir")
+                .and_then(|v| v.as_str())
+                .expect("asyncDir is reported"),
         );
         // The spawn creates this directory; the binding file lands in it.
         std::fs::create_dir_all(&async_dir).expect("mkdir");
@@ -1029,7 +1101,10 @@ mod tests {
             Some("active"),
             "an async launch is ACTIVE, not completed"
         );
-        assert_eq!(record.runs[0].async_dir.as_deref(), Some(async_dir.to_string_lossy().as_ref()));
+        assert_eq!(
+            record.runs[0].async_dir.as_deref(),
+            Some(async_dir.to_string_lossy().as_ref())
+        );
         assert!(record.runs[0].completed_at.is_none());
 
         let artifacts: Vec<&str> = record.artifacts.iter().map(|a| a.path.as_str()).collect();
@@ -1063,8 +1138,9 @@ mod tests {
                 &self,
                 target: String,
                 text: String,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-            {
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>,
+            > {
                 self.received.lock().expect("lock").push((target, text));
                 Box::pin(async { Ok(true) })
             }
@@ -1075,7 +1151,9 @@ mod tests {
         let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), dir.path());
         let run_id = RunId::from_token("run00042");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
         // A genuinely live run always carries a real runner pid (`RunStatus::pid`'s own doc: "in
         // practice this is `Some` from the very first write") — the SteerRunning arm's own
         // interrupt-precondition check (pi `interruptLiveAsyncResumeTarget`,
@@ -1084,7 +1162,9 @@ mod tests {
         // rather than the "no interrupt-capable runner pid was found" abort.
         let mut status =
             crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, Some(4242));
-        status.advance_state(RunState::Running).expect("Queued -> Running");
+        status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
         let mut step = crate::background::StepStatus::pending("researcher");
         step.status = crate::background::StepState::Running;
         status.steps = vec![step];
@@ -1111,9 +1191,15 @@ mod tests {
         );
 
         let received = steer.received.lock().expect("lock");
-        assert_eq!(received.len(), 1, "the follow-up must be delivered exactly once");
+        assert_eq!(
+            received.len(),
+            1,
+            "the follow-up must be delivered exactly once"
+        );
         assert!(
-            received[0].1.starts_with("Follow-up for async run run00042 (researcher):\n\n"),
+            received[0]
+                .1
+                .starts_with("Follow-up for async run run00042 (researcher):\n\n"),
             "the follow-up header must include the resolved agent name, got: {:?}",
             received[0].1
         );
@@ -1128,15 +1214,17 @@ mod tests {
     /// post-fix it must resolve to the "not registered" fallback within a small bounded multiple of
     /// [`crate::tui::intercom::DEFAULT_STEER_TIMEOUT`] (500ms).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn control_resume_steer_running_degrades_within_the_bounded_timeout_when_steer_never_resolves() {
+    async fn control_resume_steer_running_degrades_within_the_bounded_timeout_when_steer_never_resolves()
+     {
         struct HangingSteerChannel;
         impl crate::tui::intercom::SteerChannel for HangingSteerChannel {
             fn steer(
                 &self,
                 _target: String,
                 _text: String,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-            {
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>,
+            > {
                 Box::pin(std::future::pending())
             }
         }
@@ -1146,7 +1234,9 @@ mod tests {
         let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), dir.path());
         let run_id = RunId::from_token("run00099");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
         // A genuinely live run always carries a real runner pid (`RunStatus::pid`'s own doc: "in
         // practice this is `Some` from the very first write") — the SteerRunning arm's own
         // interrupt-precondition check (pi `interruptLiveAsyncResumeTarget`,
@@ -1155,7 +1245,9 @@ mod tests {
         // rather than the "no interrupt-capable runner pid was found" abort.
         let mut status =
             crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, Some(4242));
-        status.advance_state(RunState::Running).expect("Queued -> Running");
+        status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
         let mut step = crate::background::StepStatus::pending("researcher");
         step.status = crate::background::StepState::Running;
         status.steps = vec![step];
@@ -1187,7 +1279,8 @@ mod tests {
 
         // A steer that never resolves must degrade to the documented "not registered" fallback —
         // never hang the caller's own turn indefinitely.
-        let err = outcome.expect_err("an undelivered steer must degrade to the not-registered fallback");
+        let err =
+            outcome.expect_err("an undelivered steer must degrade to the not-registered fallback");
         assert!(
             err.starts_with("Async child appears live but its intercom target is not registered."),
             "got: {err}"
@@ -1217,8 +1310,9 @@ mod tests {
                 &self,
                 target: String,
                 text: String,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-            {
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>,
+            > {
                 self.received.lock().expect("lock").push((target, text));
                 Box::pin(async { Ok(true) })
             }
@@ -1229,11 +1323,16 @@ mod tests {
         let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), dir.path());
         let run_id = RunId::from_token("run0nopid");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
         // `Running` overall state, but NO known runner pid (`pid: None`) — pi's guard treats this
         // identically to "no interrupt-capable runner pid was found", never as a steerable child.
-        let mut status = crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, None);
-        status.advance_state(RunState::Running).expect("Queued -> Running");
+        let mut status =
+            crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, None);
+        status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
         let mut step = crate::background::StepStatus::pending("researcher");
         step.status = crate::background::StepState::Running;
         status.steps = vec![step];
@@ -1295,20 +1394,28 @@ mod tests {
         // The source run's storage lives under `request_dir`'s own async root (resume looks it up
         // via the REQUEST cwd, matching pi's fixed-but-here-cwd-scoped async/results roots) — only
         // the run's OWN recorded `cwd` field (set by `finish_run`) points back at `orig_dir`.
-        let async_root = default_async_root_in(&crate::paths::Roots::from_env(), request_dir.path());
-        let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), request_dir.path());
+        let async_root =
+            default_async_root_in(&crate::paths::Roots::from_env(), request_dir.path());
+        let results_dir =
+            default_results_dir_in(&crate::paths::Roots::from_env(), request_dir.path());
         let run_id = RunId::from_token("run0revive");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
 
         let mut status =
             crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, Some(4242));
-        status.advance_state(RunState::Running).expect("Queued -> Running");
+        status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
         let mut step = crate::background::StepStatus::pending("orig-only-agent");
         step.status = crate::background::StepState::Complete;
         step.session_file = Some(session_file.clone());
         status.steps = vec![step];
-        status.advance_state(RunState::Complete).expect("Running -> Complete");
+        status
+            .advance_state(RunState::Complete)
+            .expect("Running -> Complete");
         status.cwd = Some(orig_dir.path().to_path_buf());
         write_atomic_json(&paths.status, &status)
             .await
@@ -1418,5 +1525,4 @@ mod tests {
             "a package-provided agent must be discovered at Package scope"
         );
     }
-
 }

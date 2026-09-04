@@ -1,7 +1,7 @@
 //! The model-issued [`ToolCall`] and its self-tagging serializer (func-01 §4.4).
 
-use crate::lazy_args::LazyArgs;
 use crate::ToolCallId;
+use crate::lazy_args::LazyArgs;
 
 /// A model-issued tool call (func-01 §4.4).
 ///
@@ -73,20 +73,36 @@ mod tests {
             thought_signature: None,
         };
         let s = serde_json::to_string(&tc).expect("serialize");
-        assert_eq!(s.matches("\"type\"").count(), 1, "exactly one type key: {s}");
+        assert_eq!(
+            s.matches("\"type\"").count(),
+            1,
+            "exactly one type key: {s}"
+        );
         let v = serde_json::to_value(&tc).expect("serialize");
         assert_eq!(v["type"], "toolCall");
         assert_eq!(v["id"], "tc1");
         assert_eq!(v["name"], "read");
         assert!(v["arguments"].is_object());
-        assert!(v.get("thoughtSignature").is_none(), "omitted when None: {v}");
+        assert!(
+            v.get("thoughtSignature").is_none(),
+            "omitted when None: {v}"
+        );
         // Round-trip (req 4).
-        assert_eq!(serde_json::from_value::<ToolCall>(v).expect("deserialize"), tc);
+        assert_eq!(
+            serde_json::from_value::<ToolCall>(v).expect("deserialize"),
+            tc
+        );
         // thoughtSignature is emitted (camelCase) when present and still round-trips.
-        let tc_sig = ToolCall { thought_signature: Some("sig".into()), ..tc.clone() };
+        let tc_sig = ToolCall {
+            thought_signature: Some("sig".into()),
+            ..tc.clone()
+        };
         let vs = serde_json::to_value(&tc_sig).expect("serialize");
         assert_eq!(vs["thoughtSignature"], "sig");
-        assert_eq!(serde_json::from_value::<ToolCall>(vs).expect("deserialize"), tc_sig);
+        assert_eq!(
+            serde_json::from_value::<ToolCall>(vs).expect("deserialize"),
+            tc_sig
+        );
     }
 
     #[test]

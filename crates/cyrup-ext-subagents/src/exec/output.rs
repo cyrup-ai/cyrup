@@ -186,7 +186,8 @@ pub(crate) const ACCEPTANCE_REPORT_COMPANION_KEYS: &[&str] = &[
 /// The two fence language tags an acceptance report may carry. G79 widened the PARSER to
 /// `acceptance[-_]report` everywhere (`acceptance.ts:702,774,792` @v0.43.0); this probe has to
 /// recognize the same set or the two disagree about whether a report exists at all.
-pub(crate) const ACCEPTANCE_REPORT_FENCE_LANGS: &[&str] = &["acceptance-report", "acceptance_report"];
+pub(crate) const ACCEPTANCE_REPORT_FENCE_LANGS: &[&str] =
+    &["acceptance-report", "acceptance_report"];
 
 /// The snake_case spelling of a camelCase acceptance-report key, derived MECHANICALLY rather than
 /// kept as a second hardcoded list, so this can never drift from
@@ -350,10 +351,7 @@ pub fn extract_final_output(events: &[SubagentEvent]) -> Option<String> {
         // point — an earlier (older) message's fallback text must never override a more recent
         // message's fallback text.
         if fallback.is_none() {
-            let last = non_empty
-                .last()
-                .map(|s| (*s).clone())
-                .unwrap_or_default();
+            let last = non_empty.last().map(|s| (*s).clone()).unwrap_or_default();
             fallback = Some(last);
         }
     }
@@ -410,7 +408,10 @@ impl DetectedSubagentError {
                 "{} failed (exit {}): {details}",
                 self.error_type, self.exit_code
             ),
-            None => format!("{} failed with exit code {}", self.error_type, self.exit_code),
+            None => format!(
+                "{} failed with exit code {}",
+                self.error_type, self.exit_code
+            ),
         }
     }
 }
@@ -481,7 +482,9 @@ fn parse_exit_code(text: &str) -> Option<i32> {
             pos += 1;
         }
         if pos > digits_start
-            && let Some(code) = lower.get(digits_start..pos).and_then(|d| d.parse::<i32>().ok())
+            && let Some(code) = lower
+                .get(digits_start..pos)
+                .and_then(|d| d.parse::<i32>().ok())
         {
             return Some(code);
         }
@@ -611,10 +614,7 @@ pub fn detect_subagent_error(events: &[SubagentEvent]) -> Option<DetectedSubagen
 
         if tool_result.is_error {
             let details = tool_result.text.clone();
-            let exit_code = details
-                .as_deref()
-                .and_then(parse_exit_code)
-                .unwrap_or(1);
+            let exit_code = details.as_deref().and_then(parse_exit_code).unwrap_or(1);
             return Some(DetectedSubagentError {
                 exit_code,
                 error_type: if tool_result.tool_name.is_empty() {
@@ -707,7 +707,11 @@ pub fn is_terminal_assistant_stop(event: &SubagentEvent) -> bool {
     if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
         return false;
     }
-    if message.get("stopReason").and_then(serde_json::Value::as_str) != Some("stop") {
+    if message
+        .get("stopReason")
+        .and_then(serde_json::Value::as_str)
+        != Some("stop")
+    {
         return false;
     }
     let has_tool_call = message
@@ -800,10 +804,7 @@ pub fn validate_file_only_requires_path(
     output_mode: crate::discovery::types::OutputMode,
     output_path: Option<&Path>,
 ) -> Option<crate::error::SubagentError> {
-    let is_file_only = matches!(
-        output_mode,
-        crate::discovery::types::OutputMode::FileOnly
-    );
+    let is_file_only = matches!(output_mode, crate::discovery::types::OutputMode::FileOnly);
     if is_file_only && output_path.is_none() {
         Some(crate::error::SubagentError::OutputPathRequired)
     } else {
@@ -840,9 +841,9 @@ pub fn resolve_output_handoff(
         .and_then(|meta| meta.modified().ok().map(|mtime| (mtime, meta.len())));
 
     let changed = match (before.and_then(|snap| snap.state), after) {
-        (None, None) => false,             // never existed, still doesn't: unchanged
-        (None, Some(_)) => true,           // didn't exist before, exists now: the child wrote it
-        (Some(_), None) => false,          // existed before, gone now: nothing to read back
+        (None, None) => false,    // never existed, still doesn't: unchanged
+        (None, Some(_)) => true,  // didn't exist before, exists now: the child wrote it
+        (Some(_), None) => false, // existed before, gone now: nothing to read back
         (Some(before_state), Some(after_state)) => before_state != after_state,
     };
     // No snapshot was ever taken for this attempt: treat as "assume changed" (see doc comment).
@@ -942,7 +943,10 @@ fn format_byte_size(bytes: usize) -> String {
         value /= 1024.0;
         unit_index += 1;
     }
-    format!("{value:.1} {}", units.get(unit_index).copied().unwrap_or("TB"))
+    format!(
+        "{value:.1} {}",
+        units.get(unit_index).copied().unwrap_or("TB")
+    )
 }
 
 /// pi single-output `countLines` (`single-output.ts:110-114`): count `\r\n`/`\r`/`\n` separators, plus
@@ -1040,10 +1044,13 @@ pub fn format_output_path_instruction(
     output_path: &Path,
     capabilities: OutputInstructionCapabilities<'_>,
 ) -> String {
-    let write_capable = capabilities
-        .is_none_or(crate::exec::completion_guard::has_mutation_tool_capability);
+    let write_capable =
+        capabilities.is_none_or(crate::exec::completion_guard::has_mutation_tool_capability);
     let delivery = if write_capable {
-        format!("Write your findings to exactly this path: {}", output_path.display())
+        format!(
+            "Write your findings to exactly this path: {}",
+            output_path.display()
+        )
     } else {
         format!(
             "Return the complete artifact in your final response.\n\
@@ -1452,7 +1459,8 @@ mod tests {
 
     #[test]
     fn detects_json_block_with_criteria_satisfied_and_companion_key() {
-        let text = "Done.\n```json\n{\"criteriaSatisfied\": true, \"changedFiles\": [\"a.rs\"]}\n```\n";
+        let text =
+            "Done.\n```json\n{\"criteriaSatisfied\": true, \"changedFiles\": [\"a.rs\"]}\n```\n";
         assert!(looks_like_acceptance_report(text));
     }
 
@@ -1471,9 +1479,7 @@ mod tests {
     #[test]
     fn plain_text_is_not_acceptance_report_shaped() {
         assert!(!looks_like_acceptance_report("Just a normal answer."));
-        assert!(!looks_like_acceptance_report(
-            "```rust\nfn main() {}\n```"
-        ));
+        assert!(!looks_like_acceptance_report("```rust\nfn main() {}\n```"));
     }
 
     /// G79 widened the acceptance-report PARSER to accept the `acceptance_report` fence tag and a
@@ -1594,15 +1600,9 @@ mod tests {
         // Two messages BOTH carry an acceptance-report shape; the reverse scan must return the
         // one from the MORE RECENT message (message recency is the outer priority level).
         let events = vec![
-            message_end(
-                "assistant",
-                &["```acceptance-report\nOLDER\n```"],
-            ),
+            message_end("assistant", &["```acceptance-report\nOLDER\n```"]),
             message_end("assistant", &["unrelated plain text"]),
-            message_end(
-                "assistant",
-                &["```acceptance-report\nNEWEST\n```"],
-            ),
+            message_end("assistant", &["```acceptance-report\nNEWEST\n```"]),
         ];
         let out = extract_final_output(&events).expect("must extract");
         assert!(out.contains("NEWEST"), "got: {out}");
@@ -1720,7 +1720,11 @@ mod tests {
     fn detect_subagent_error_flags_a_trailing_nonzero_bash_exit() {
         // pi "does not retry on ordinary task/tool failures": a bash result reporting exit 127,
         // with NO later assistant text, is a run failure diagnosed at exit code 127.
-        let events = vec![tool_result_end("bash", "process exited with code 127", false)];
+        let events = vec![tool_result_end(
+            "bash",
+            "process exited with code 127",
+            false,
+        )];
         let detected = detect_subagent_error(&events).expect("must diagnose a failure");
         assert_eq!(detected.exit_code, 127);
         assert_eq!(detected.error_type, "bash");
@@ -1738,7 +1742,10 @@ mod tests {
     #[test]
     fn a_re_diagnosed_tool_failure_is_never_classified_as_a_retryable_model_failure() {
         for (tool, text) in [
-            ("bash", "curl: (7) Failed to connect to api.test: Connection refused"),
+            (
+                "bash",
+                "curl: (7) Failed to connect to api.test: Connection refused",
+            ),
             ("bash", "timeout: sending signal TERM to command, exit 124"),
             ("mcp.server/write", "quota exceeded, exit code: 3"),
         ] {
@@ -1770,7 +1777,11 @@ mod tests {
 
     #[test]
     fn detect_subagent_error_flags_a_fatal_bash_pattern_without_a_code() {
-        let events = vec![tool_result_end("bash", "bash: frobnicate: command not found", false)];
+        let events = vec![tool_result_end(
+            "bash",
+            "bash: frobnicate: command not found",
+            false,
+        )];
         let detected = detect_subagent_error(&events).expect("must diagnose a fatal pattern");
         assert_eq!(detected.exit_code, 1);
         assert_eq!(detected.error_type, "bash");
@@ -1825,7 +1836,10 @@ mod tests {
     fn is_terminal_assistant_stop_requires_stop_reason_and_no_tool_call() {
         assert!(is_terminal_assistant_stop(&assistant_stop("done")));
         // A message with no explicit stopReason is NOT a terminal stop.
-        assert!(!is_terminal_assistant_stop(&message_end("assistant", &["done"])));
+        assert!(!is_terminal_assistant_stop(&message_end(
+            "assistant",
+            &["done"]
+        )));
         let with_tool_call = SubagentEvent::MessageEnd {
             message: serde_json::json!({
                 "role": "assistant",
@@ -1842,7 +1856,10 @@ mod tests {
         assert!(message_end_has_error_message(&message_end_with_error(
             "x", "boom"
         )));
-        assert!(!message_end_has_error_message(&message_end("assistant", &["ok"])));
+        assert!(!message_end_has_error_message(&message_end(
+            "assistant",
+            &["ok"]
+        )));
         let empty_error = SubagentEvent::MessageEnd {
             message: serde_json::json!({
                 "role": "assistant", "content": [], "errorMessage": ""
@@ -1908,10 +1925,7 @@ mod tests {
         // but the real assertion is that the KEPT body has no dangling half-character): strip the
         // marker line and confirm the body's char count times 2 equals its byte length (i.e. no
         // partial trailing codepoint was kept).
-        let (_, body) = result
-            .text
-            .split_once('\n')
-            .expect("marker line present");
+        let (_, body) = result.text.split_once('\n').expect("marker line present");
         assert_eq!(body.len(), body.chars().count() * 2);
         assert!(body.chars().all(|c| c == 'é'));
     }
@@ -1927,10 +1941,7 @@ mod tests {
         };
         let result = truncate_output(&text, cap, None);
         assert!(result.truncated);
-        let (_, body) = result
-            .text
-            .split_once('\n')
-            .expect("marker line present");
+        let (_, body) = result.text.split_once('\n').expect("marker line present");
         // Must be valid UTF-8 (implicit: this compiles and holds a `String`) and must not exceed
         // the byte cap.
         assert!(body.len() <= cap.bytes);
@@ -1954,10 +1965,7 @@ mod tests {
 
     #[test]
     fn empty_output_is_never_truncated() {
-        let cap = OutputCap {
-            bytes: 0,
-            lines: 0,
-        };
+        let cap = OutputCap { bytes: 0, lines: 0 };
         let result = truncate_output("", cap, None);
         assert!(!result.truncated);
         assert_eq!(result.text, "");
@@ -1968,10 +1976,8 @@ mod tests {
 
     #[test]
     fn validate_file_only_requires_path_fails_fast_when_missing() {
-        let err = validate_file_only_requires_path(
-            crate::discovery::types::OutputMode::FileOnly,
-            None,
-        );
+        let err =
+            validate_file_only_requires_path(crate::discovery::types::OutputMode::FileOnly, None);
         assert!(matches!(
             err,
             Some(crate::error::SubagentError::OutputPathRequired)
@@ -1990,10 +1996,8 @@ mod tests {
 
     #[test]
     fn validate_file_only_requires_path_is_a_no_op_for_other_modes() {
-        let err = validate_file_only_requires_path(
-            crate::discovery::types::OutputMode::Inline,
-            None,
-        );
+        let err =
+            validate_file_only_requires_path(crate::discovery::types::OutputMode::Inline, None);
         assert!(err.is_none());
     }
 
@@ -2257,12 +2261,18 @@ mod tests {
             Some(Path::new("/tmp/report.md")),
             Some(&agent),
         );
-        assert!(output.starts_with("Analyze this\n\n---\n**Output:**\n"), "{output:?}");
+        assert!(
+            output.starts_with("Analyze this\n\n---\n**Output:**\n"),
+            "{output:?}"
+        );
         assert!(
             output.contains("Write your findings to exactly this path: /tmp/report.md"),
             "{output:?}"
         );
-        assert!(output.contains("This path is authoritative for this run."), "{output:?}");
+        assert!(
+            output.contains("This path is authoritative for this run."),
+            "{output:?}"
+        );
         assert!(
             output.contains("Ignore any other output filename or output path mentioned elsewhere"),
             "{output:?}"
@@ -2311,12 +2321,18 @@ mod tests {
             Some(&read_only),
         );
         assert!(prompt.starts_with("Analyze only"), "{prompt:?}");
-        assert!(prompt.contains("Runtime output path override:"), "{prompt:?}");
+        assert!(
+            prompt.contains("Runtime output path override:"),
+            "{prompt:?}"
+        );
         assert!(
             prompt.contains("The runtime will persist it to exactly this path: /tmp/new.md"),
             "{prompt:?}"
         );
-        assert!(!prompt.contains("Write your findings to exactly this path"), "{prompt:?}");
+        assert!(
+            !prompt.contains("Write your findings to exactly this path"),
+            "{prompt:?}"
+        );
 
         // An agent with no declared allowlist at all is mutation-capable (`tools === undefined`).
         let unrestricted = capability_agent(None);
@@ -2372,7 +2388,11 @@ mod tests {
         events.extend(completed_write("w2", "/tmp/other.md", "unrelated"));
         events.extend(completed_write("w3", "/tmp/out.md", "final report"));
         assert_eq!(
-            extract_child_written_output(&events, Some(Path::new("/tmp/out.md")), Path::new("/repo")),
+            extract_child_written_output(
+                &events,
+                Some(Path::new("/tmp/out.md")),
+                Path::new("/repo")
+            ),
             Some("final report".to_string())
         );
     }
@@ -2474,7 +2494,11 @@ mod tests {
             tool_result("w1", false),
         ];
         assert_eq!(
-            extract_child_written_output(&events, Some(Path::new("/tmp/out.md")), Path::new("/repo")),
+            extract_child_written_output(
+                &events,
+                Some(Path::new("/tmp/out.md")),
+                Path::new("/repo")
+            ),
             None,
             "an `edit` call and a `write` call with no `content` are both non-authorship"
         );
@@ -2483,7 +2507,11 @@ mod tests {
             None
         );
         assert_eq!(
-            extract_child_written_output(&completed_write("w1", "/tmp/out.md", "x"), None, Path::new("/repo")),
+            extract_child_written_output(
+                &completed_write("w1", "/tmp/out.md", "x"),
+                None,
+                Path::new("/repo")
+            ),
             None,
             "no configured output path means no authorship question to answer"
         );

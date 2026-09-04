@@ -3,16 +3,17 @@
 
 use std::sync::Arc;
 
-use cyrup_core::{
-    AssistantMessage, CancelToken, Content, Message, ModelRef, StopReason, ModelThinkingLevel, Usage,
-};
 use cyrup_core::Cost;
+use cyrup_core::{
+    AssistantMessage, CancelToken, Content, Message, ModelRef, ModelThinkingLevel, StopReason,
+    Usage,
+};
 use cyrup_provider::{
-    collect_message, retry_assistant_call, CacheRetention, Context, Model, Provider, RetryObserver,
-    RetryPolicy, StreamOptions,
+    CacheRetention, Context, Model, Provider, RetryObserver, RetryPolicy, StreamOptions,
+    collect_message, retry_assistant_call,
 };
 
-use crate::agent_message::{convert_to_llm, AgentMessage};
+use crate::agent_message::{AgentMessage, convert_to_llm};
 use crate::compaction::error::CompactionError;
 use crate::compaction::files::format_file_operations;
 use crate::compaction::prepare::CompactionPreparation;
@@ -69,7 +70,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
 /// Iterative-update prompt when a previous summary exists (R-05-008/012). Byte-1:1 with Pi
 /// `UPDATE_SUMMARIZATION_PROMPT` (`compaction.ts:493-530`).
-pub const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to \
+pub const UPDATE_SUMMARIZATION_PROMPT: &str =
+    "The messages above are NEW conversation messages to \
 incorporate into the existing summary provided in <previous-summary> tags.
 
 Update the existing structured summary with new information. RULES:
@@ -111,7 +113,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
 /// Prompt for the turn-prefix half of a split-turn compaction (R-05-006). Byte-1:1 with Pi
 /// `TURN_PREFIX_SUMMARIZATION_PROMPT` (`compaction.ts:737-750`).
-pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large \
+pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str =
+    "This is the PREFIX of a turn that was too large \
 to keep. The SUFFIX (recent work) is retained.
 
 Summarize the prefix to provide context for the retained suffix:
@@ -261,7 +264,11 @@ impl<P: Provider> ProviderSummarizer<P> {
     /// the first response unchanged (`retry.ts:159-160`). Production callers must supply the
     /// session's policy via [`Self::with_retry`].
     pub fn new(provider: Arc<P>, model: Model) -> Self {
-        Self { provider, model, retry: RetryPolicy::DISABLED }
+        Self {
+            provider,
+            model,
+            retry: RetryPolicy::DISABLED,
+        }
     }
 
     /// Bind the session's retry policy, as Pi threads `settingsManager.getRetrySettings()` into
@@ -365,7 +372,9 @@ pub async fn generate_summary<S: Summarizer>(
     let transcript = serialize_conversation(&convert_to_llm(msgs));
     let mut prompt = format!("<conversation>\n{transcript}\n</conversation>\n\n");
     if let Some(prev) = previous_summary {
-        prompt.push_str(&format!("<previous-summary>\n{prev}\n</previous-summary>\n\n"));
+        prompt.push_str(&format!(
+            "<previous-summary>\n{prev}\n</previous-summary>\n\n"
+        ));
     }
     prompt.push_str(&base);
 
@@ -383,9 +392,9 @@ pub async fn generate_summary<S: Summarizer>(
     };
     let resp = summarizer.complete(req, cancel).await?;
     match resp.stop_reason {
-        StopReason::Error => {
-            Err(CompactionError::Summarization(resp.error_message.unwrap_or_default()))
-        }
+        StopReason::Error => Err(CompactionError::Summarization(
+            resp.error_message.unwrap_or_default(),
+        )),
         StopReason::Aborted => Err(CompactionError::Aborted),
         // An unsettled response is NOT a summary. The `_ =>` this replaces would have accepted a
         // `Pending` message's partial text as a finished summary and compacted the transcript
@@ -399,11 +408,13 @@ pub async fn generate_summary<S: Summarizer>(
         // every real provider throws for deferred (`v0.84.1 ai/src/models.ts:714,728`). Unreachable
         // on both sides, so this is a strictly safer spelling of the same behaviour.
         StopReason::Pending | StopReason::Deferred => Err(CompactionError::Summarization(
-            resp.error_message.unwrap_or_else(|| PENDING_SUMMARY.to_string()),
+            resp.error_message
+                .unwrap_or_else(|| PENDING_SUMMARY.to_string()),
         )),
-        StopReason::Stop | StopReason::Length | StopReason::ToolUse => {
-            Ok(SummaryOutput { text: join_text(&resp.content), usage: resp.usage })
-        }
+        StopReason::Stop | StopReason::Length | StopReason::ToolUse => Ok(SummaryOutput {
+            text: join_text(&resp.content),
+            usage: resp.usage,
+        }),
     }
 }
 
@@ -418,8 +429,9 @@ pub async fn generate_turn_prefix_summary<S: Summarizer>(
     cancel: CancelToken,
 ) -> Result<SummaryOutput, CompactionError> {
     let transcript = serialize_conversation(&convert_to_llm(msgs));
-    let prompt =
-        format!("<conversation>\n{transcript}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}");
+    let prompt = format!(
+        "<conversation>\n{transcript}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
+    );
     let req = SummarizationRequest {
         system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
         prompt_text: prompt,
@@ -434,9 +446,9 @@ pub async fn generate_turn_prefix_summary<S: Summarizer>(
     };
     let resp = summarizer.complete(req, cancel).await?;
     match resp.stop_reason {
-        StopReason::Error => {
-            Err(CompactionError::Summarization(resp.error_message.unwrap_or_default()))
-        }
+        StopReason::Error => Err(CompactionError::Summarization(
+            resp.error_message.unwrap_or_default(),
+        )),
         StopReason::Aborted => Err(CompactionError::Aborted),
         // An unsettled response is NOT a summary. The `_ =>` this replaces would have accepted a
         // `Pending` message's partial text as a finished summary and compacted the transcript
@@ -450,11 +462,13 @@ pub async fn generate_turn_prefix_summary<S: Summarizer>(
         // every real provider throws for deferred (`v0.84.1 ai/src/models.ts:714,728`). Unreachable
         // on both sides, so this is a strictly safer spelling of the same behaviour.
         StopReason::Pending | StopReason::Deferred => Err(CompactionError::Summarization(
-            resp.error_message.unwrap_or_else(|| PENDING_SUMMARY.to_string()),
+            resp.error_message
+                .unwrap_or_else(|| PENDING_SUMMARY.to_string()),
         )),
-        StopReason::Stop | StopReason::Length | StopReason::ToolUse => {
-            Ok(SummaryOutput { text: join_text(&resp.content), usage: resp.usage })
-        }
+        StopReason::Stop | StopReason::Length | StopReason::ToolUse => Ok(SummaryOutput {
+            text: join_text(&resp.content),
+            usage: resp.usage,
+        }),
     }
 }
 
@@ -500,8 +514,9 @@ pub async fn compact_default<S: Summarizer>(
             cancel,
         )
         .await?;
-        let history_text =
-            history.as_ref().map_or_else(|| "No prior history.".to_string(), |h| h.text.clone());
+        let history_text = history
+            .as_ref()
+            .map_or_else(|| "No prior history.".to_string(), |h| h.text.clone());
         let merged = match &history {
             Some(h) => combine_usage(&h.usage, &prefix.usage),
             None => prefix.usage.clone(),

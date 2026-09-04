@@ -137,7 +137,10 @@ fn list_models_renders_the_persisted_remote_overlay() {
     );
 
     // A background refresh completes and writes the cache...
-    seed_store(&fx.agent_dir, vec![groq_model_json("overlay-only-model", 777_777)]);
+    seed_store(
+        &fx.agent_dir,
+        vec![groq_model_json("overlay-only-model", 777_777)],
+    );
 
     // ...and the very next `--list-models` renders it, under its own provider.
     let warm = list_models(&fx, "overlay-only-model");
@@ -161,7 +164,11 @@ fn the_overlay_never_shrinks_the_listing() {
     // (header + several rows) so a baseline that collapsed to "No models available" cannot make the
     // `before + 1` comparison below vacuously true.
     assert!(
-        before_lines > 3 && before.lines().next().is_some_and(|l| l.starts_with("provider")),
+        before_lines > 3
+            && before
+                .lines()
+                .next()
+                .is_some_and(|l| l.starts_with("provider")),
         "baseline must be a real groq listing with a header; got {before_lines} lines:\n{before}"
     );
     assert!(
@@ -169,7 +176,10 @@ fn the_overlay_never_shrinks_the_listing() {
         "only the configured provider may appear, or the baseline is env-dependent again:\n{before}"
     );
 
-    seed_store(&fx.agent_dir, vec![groq_model_json("overlay-only-model", 777_777)]);
+    seed_store(
+        &fx.agent_dir,
+        vec![groq_model_json("overlay-only-model", 777_777)],
+    );
 
     let after = list_models(&fx, "");
     assert_eq!(

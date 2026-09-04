@@ -27,21 +27,18 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::child_protocol::MAX_CHILD_PENDING_LINE_BYTES;
 use cyrup_ext_subagents::exec::fallback::{
-    ModelOverride, SUBAGENT_STARTUP_RETRY_DELAYS_MS,
-    format_subagent_startup_retry_exhausted_error,
+    ModelOverride, SUBAGENT_STARTUP_RETRY_DELAYS_MS, format_subagent_startup_retry_exhausted_error,
 };
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult};
 use cyrup_ext_subagents::fork_context::ForkContext;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -59,7 +56,10 @@ fn write_script(dir: &Path, name: &str, script: &serde_json::Value) -> PathBuf {
 fn fixture_spawn_command(script_path: &Path) -> SpawnCommand {
     SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     }
 }
 

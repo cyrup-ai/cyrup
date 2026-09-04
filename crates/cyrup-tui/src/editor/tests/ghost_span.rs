@@ -1,7 +1,12 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use crate::editor::*;
 use crate::editor::render::ghost_span;
+use crate::editor::*;
 
 // ---- ghost_span ---------------------------------------------------------------------------
 
@@ -29,10 +34,18 @@ fn ghost_span_single_column_is_just_an_ellipsis() {
 #[test]
 fn ghost_span_clips_with_a_trailing_ellipsis_when_it_overflows() {
     let dim = Style::default();
-    let span = ghost_span("todo_file | number_of_agents | additional_instructions", 10, dim)
-        .unwrap();
+    let span = ghost_span(
+        "todo_file | number_of_agents | additional_instructions",
+        10,
+        dim,
+    )
+    .unwrap();
     assert_eq!(span.content.as_ref(), "todo_file…");
-    assert_eq!(display_width(&span.content), 10, "never overruns its budget");
+    assert_eq!(
+        display_width(&span.content),
+        10,
+        "never overruns its budget"
+    );
 }
 
 #[test]

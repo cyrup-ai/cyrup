@@ -352,7 +352,9 @@ fn infer_grammar_input_property(tool: &ToolDef) -> Result<String> {
         Some(Value::Array(a)) => a,
         // `!Array.isArray(schema.required)` — a missing or non-array `required` lands here.
         _ => {
-            return err("grammar constrained sampling requires exactly one required string property");
+            return err(
+                "grammar constrained sampling requires exactly one required string property",
+            );
         }
     };
     if required.len() != 1 {
@@ -442,7 +444,10 @@ pub fn resolve_grammar_constrained_sampling(
     }
 
     // `typeof d === "string" && d.trim().length > 0`.
-    let lark = variants.openai_lark.as_deref().filter(|d| !d.trim().is_empty());
+    let lark = variants
+        .openai_lark
+        .as_deref()
+        .filter(|d| !d.trim().is_empty());
     let regex = variants
         .openai_regex
         .as_deref()
@@ -480,7 +485,9 @@ pub fn create_grammar_tool_input_properties(
 ) -> Result<HashMap<String, String>> {
     let mut properties = HashMap::new();
     for tool in tools {
-        if let Some(grammar) = resolve_grammar_constrained_sampling(tool, supports_openai_grammar_tools)? {
+        if let Some(grammar) =
+            resolve_grammar_constrained_sampling(tool, supports_openai_grammar_tools)?
+        {
             properties.insert(tool.name.clone(), grammar.input_property);
         }
     }
@@ -533,10 +540,16 @@ mod tests {
 
     #[test]
     fn strict_sampling_is_undefined_without_a_config() {
-        assert_eq!(resolve_json_schema_strict_sampling(&tool(None), true), Ok(None));
+        assert_eq!(
+            resolve_json_schema_strict_sampling(&tool(None), true),
+            Ok(None)
+        );
         // pi's `false` literal is indistinguishable from an absent field.
         assert_eq!(
-            resolve_json_schema_strict_sampling(&tool(Some(ConstrainedSampling::Disabled(false))), true),
+            resolve_json_schema_strict_sampling(
+                &tool(Some(ConstrainedSampling::Disabled(false))),
+                true
+            ),
             Ok(None)
         );
         // A grammar config is not a json_schema config.
@@ -580,7 +593,10 @@ mod tests {
         );
         // Lark wins when both are present.
         assert_eq!(
-            resolve_grammar_constrained_sampling(&tool(grammar(Some("start: /x/"), Some("[a-z]+"))), true),
+            resolve_grammar_constrained_sampling(
+                &tool(grammar(Some("start: /x/"), Some("[a-z]+"))),
+                true
+            ),
             Ok(Some(GrammarConstrainedSampling {
                 format: GrammarFormat::Lark,
                 definition: "start: /x/".into(),
@@ -656,11 +672,16 @@ mod tests {
         let tools = vec![plain, tool(grammar(Some("start: /x/"), None))];
         let map = create_grammar_tool_input_properties(&tools, true).unwrap();
         assert_eq!(map.len(), 1);
-        assert_eq!(map.get("grammar_tool").map(String::as_str), Some("expression"));
+        assert_eq!(
+            map.get("grammar_tool").map(String::as_str),
+            Some("expression")
+        );
         // Capability off ⇒ empty map, so callers fall back to normal function tools.
-        assert!(create_grammar_tool_input_properties(&tools, false)
-            .unwrap()
-            .is_empty());
+        assert!(
+            create_grammar_tool_input_properties(&tools, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ---- getGrammarToolInput (constrained-sampling.ts:21-31) ----
@@ -679,9 +700,15 @@ mod tests {
         let expected = err::<String>(
             "Grammar tool call \"calc\" requires argument \"expression\" to be a string.",
         );
-        assert_eq!(get_grammar_tool_input("calc", &wrong, "expression"), expected);
+        assert_eq!(
+            get_grammar_tool_input("calc", &wrong, "expression"),
+            expected
+        );
         // Absent behaves exactly like the wrong type upstream (`typeof undefined !== "string"`).
-        assert_eq!(get_grammar_tool_input("calc", &Map::new(), "expression"), expected);
+        assert_eq!(
+            get_grammar_tool_input("calc", &Map::new(), "expression"),
+            expected
+        );
     }
 
     // ---- appendGrammarToolInputJsonDelta (constrained-sampling.ts:33-62) ----

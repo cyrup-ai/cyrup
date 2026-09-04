@@ -10,7 +10,10 @@ use cyrup_core::{
 /// A minimal persisted user message (Pi `userMsg`, utilities.ts:130-132). `timestamp` is fixed at 0
 /// for deterministic snapshots (Pi uses `Date.now()`; [CYRUP-DELTA] zeroes it).
 pub fn user_msg(text: impl Into<SharedStr>) -> Message {
-    Message::User { content: vec![Content::text(text)], timestamp: 0 }
+    Message::User {
+        content: vec![Content::text(text)],
+        timestamp: 0,
+    }
 }
 
 /// A minimal persisted assistant message (Pi `assistantMsg`, utilities.ts:137-155): provider

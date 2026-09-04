@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::support::{build_runtime, fixture, parse_lines, type_of};
 use crate::run_rpc;
 use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 
 // ----------------------------------------------------------------------------------------------
 // G2 (CRITICAL) — a contained extension fault must surface to the RPC client as an `extension_error`
@@ -23,7 +23,9 @@ use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpc_contained_extension_fault_surfaces_as_extension_error_event() {
     use cyrup_core::ExtensionId;
-    use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
+    use cyrup_ext::{
+        EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
+    };
 
     struct FaultyInputExt {
         id: ExtensionId,
@@ -44,7 +46,10 @@ async fn rpc_contained_extension_fault_surfaces_as_extension_error_event() {
 
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let runtime = build_runtime(&fx, faux).await;
 
     // Load the faulting extension into the very session the RPC loop drives.
@@ -52,23 +57,39 @@ async fn rpc_contained_extension_fault_surfaces_as_extension_error_event() {
     session
         .services()
         .ext_host
-        .load_native(Arc::new(FaultyInputExt { id: "faulty".into() }))
+        .load_native(Arc::new(FaultyInputExt {
+            id: "faulty".into(),
+        }))
         .await
         .expect("load faulty ext");
 
     let input = concat!(r#"{"type":"prompt","id":"p1","message":"hi"}"#, "\n");
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
 
     let lines = parse_lines(&out);
-    let err_ev = lines.iter().find(|l| type_of(l) == "extension_error").unwrap_or_else(|| {
-        panic!(
-            "a contained extension fault must surface as an `extension_error` event (Pi \
+    let err_ev = lines
+        .iter()
+        .find(|l| type_of(l) == "extension_error")
+        .unwrap_or_else(|| {
+            panic!(
+                "a contained extension fault must surface as an `extension_error` event (Pi \
              rpc-mode.ts:347-349); none found in:\n{lines:#?}"
-        )
-    });
-    assert_eq!(err_ev["event"], "input", "carries the Pi ExtensionError.event name: {err_ev}");
-    assert!(err_ev["extensionPath"].is_string(), "carries extensionPath: {err_ev}");
-    assert!(err_ev["error"].is_string(), "carries the error message: {err_ev}");
+            )
+        });
+    assert_eq!(
+        err_ev["event"], "input",
+        "carries the Pi ExtensionError.event name: {err_ev}"
+    );
+    assert!(
+        err_ev["extensionPath"].is_string(),
+        "carries extensionPath: {err_ev}"
+    );
+    assert!(
+        err_ev["error"].is_string(),
+        "carries the error message: {err_ev}"
+    );
 }

@@ -4,12 +4,17 @@
 //! half-block protocol (`ratatui-image`'s portable fallback, the `App` default) writes ordinary `▀`
 //! cells with fg/bg colors, so the **inline** image path is snapshot-testable on a virtual buffer —
 //! and the `show_images = false` toggle swaps it for the one-line text placeholder.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::*;
 use crate::{App, ImageBlock, ImageRenderer, UiTheme};
 use image::{DynamicImage, Rgba, RgbaImage};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 /// A solid-red test image of `w×h` pixels (no file IO / decode needed).
 fn red_image(w: u32, h: u32) -> ImageBlock {
@@ -41,16 +46,31 @@ fn a_terminal_with_no_image_protocol_gets_one_fallback_line_and_no_raster() {
     app.draw().unwrap();
 
     let text = buf_text(&app);
-    assert!(text.contains("[Image:"), "pi's `imageFallback` line missing:\n{text}");
-    assert!(text.contains("red.png"), "fallback filename missing:\n{text}");
-    assert!(text.contains("64x48"), "fallback dimensions missing:\n{text}");
-    assert!(!text.contains('\u{1f5bc}'), "the invented emoji placeholder is gone:\n{text}");
+    assert!(
+        text.contains("[Image:"),
+        "pi's `imageFallback` line missing:\n{text}"
+    );
+    assert!(
+        text.contains("red.png"),
+        "fallback filename missing:\n{text}"
+    );
+    assert!(
+        text.contains("64x48"),
+        "fallback dimensions missing:\n{text}"
+    );
+    assert!(
+        !text.contains('\u{1f5bc}'),
+        "the invented emoji placeholder is gone:\n{text}"
+    );
     let buf = app.terminal().backend().buffer();
     let painted = buf.content().iter().any(|c| {
         c.fg == ratatui::style::Color::Rgb(220, 30, 30)
             || c.bg == ratatui::style::Color::Rgb(220, 30, 30)
     });
-    assert!(!painted, "no raster may paint on a terminal with no image protocol");
+    assert!(
+        !painted,
+        "no raster may paint on a terminal with no image protocol"
+    );
 }
 
 /// The inline raster still paints when the terminal DOES have a protocol — the half of the old test
@@ -65,12 +85,21 @@ fn show_images_off_renders_the_fallback_line_not_a_raster() {
     app.draw().unwrap();
 
     let text = buf_text(&app);
-    assert!(text.contains("[Image:"), "pi's `imageFallback` line missing:\n{text}");
+    assert!(
+        text.contains("[Image:"),
+        "pi's `imageFallback` line missing:\n{text}"
+    );
     assert!(text.contains("red.png"), "fallback label missing:\n{text}");
-    assert!(text.contains("64x48"), "fallback dimensions missing:\n{text}");
+    assert!(
+        text.contains("64x48"),
+        "fallback dimensions missing:\n{text}"
+    );
     // No raster color painted when the toggle is off.
     let buf = app.terminal().backend().buffer();
-    let painted = buf.content().iter().any(|c| c.bg == ratatui::style::Color::Rgb(220, 30, 30));
+    let painted = buf
+        .content()
+        .iter()
+        .any(|c| c.bg == ratatui::style::Color::Rgb(220, 30, 30));
     assert!(!painted, "no raster should paint when show_images is off");
 }
 
@@ -84,11 +113,18 @@ fn the_placeholder_is_pis_image_fallback_format() {
     {
         let img = RgbaImage::from_pixel(3, 2, Rgba([1, 2, 3, 255]));
         DynamicImage::ImageRgba8(img)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .unwrap();
     }
     let block = ImageBlock::decode(&bytes, "shot.png").expect("valid png decodes");
-    assert_eq!(block.mime_type(), "image/png", "MIME is sniffed from the encoded bytes");
+    assert_eq!(
+        block.mime_type(),
+        "image/png",
+        "MIME is sniffed from the encoded bytes"
+    );
     let line = block.placeholder_line(&theme);
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(text, "[Image: shot.png [image/png] 3x2]");
@@ -102,7 +138,10 @@ fn clear_images_removes_the_strip() {
     assert!(app.pending_images().is_empty());
     app.draw().unwrap();
     let buf = app.terminal().backend().buffer();
-    let painted = buf.content().iter().any(|c| c.bg == ratatui::style::Color::Rgb(220, 30, 30));
+    let painted = buf
+        .content()
+        .iter()
+        .any(|c| c.bg == ratatui::style::Color::Rgb(220, 30, 30));
     assert!(!painted, "cleared image must not render");
 }
 
@@ -114,7 +153,10 @@ fn decode_rejects_non_image_bytes_and_accepts_png() {
     {
         let img = RgbaImage::from_pixel(1, 1, Rgba([1, 2, 3, 255]));
         DynamicImage::ImageRgba8(img)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .unwrap();
     }
     let block = ImageBlock::decode(&bytes, "one.png").expect("valid png decodes");

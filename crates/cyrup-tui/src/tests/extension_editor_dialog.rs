@@ -10,14 +10,19 @@
 //! (`open_extension_dialog` was never reached) and the assertions below would fail immediately rather
 //! than the test blocking on a real child process — so a red run here is unambiguous, not a hang.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use cyrup_ext::host::DialogOptions;
-use cyrup_session_svc::{UiKind, UiReply, UiRequest};
+use super::harness::*;
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{App, InputEvent, SelectorKind, UiTheme};
+use cyrup_ext::host::DialogOptions;
+use cyrup_session_svc::{UiKind, UiReply, UiRequest};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 fn editor_request(
     reply: tokio::sync::oneshot::Sender<UiReply>,
@@ -30,7 +35,10 @@ fn editor_request(
         options: serde_json::Value::Null,
         message: initial.to_string(),
         placeholder: None,
-        opts: DialogOptions { timeout_ms: None, signal_id: None },
+        opts: DialogOptions {
+            timeout_ms: None,
+            signal_id: None,
+        },
         reply,
     }
 }
@@ -43,11 +51,20 @@ fn ui_editor_opens_inline_showing_the_real_title_and_seed_text() {
     let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
     let (tx, _rx) = tokio::sync::oneshot::channel();
     app.open_extension_dialog(editor_request(tx, "edit the changelog", "## seed content"));
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionEditor));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionEditor)
+    );
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("edit the changelog"), "the real title must render inline:\n{text}");
-    assert!(text.contains("## seed content"), "the seed text must render inline:\n{text}");
+    assert!(
+        text.contains("edit the changelog"),
+        "the real title must render inline:\n{text}"
+    );
+    assert!(
+        text.contains("## seed content"),
+        "the seed text must render inline:\n{text}"
+    );
 }
 
 /// Typing extra text then `Enter` resolves the guest's suspended call with the FULL edited buffer
@@ -63,7 +80,11 @@ fn ui_editor_enter_confirms_with_the_live_edited_text() {
         app.handle_input(&key(KeyCode::Char(c)));
     }
     app.handle_input(&key(KeyCode::Enter));
-    assert_eq!(app.active_selector_kind(), None, "the dialog closes on Enter");
+    assert_eq!(
+        app.active_selector_kind(),
+        None,
+        "the dialog closes on Enter"
+    );
     let reply = rx.try_recv().expect("a reply was sent");
     assert_eq!(reply, UiReply::Text(Some("seed more".to_string())));
 }
@@ -92,12 +113,18 @@ fn ui_editor_ctrl_g_requests_the_external_editor_without_closing_the_dialog() {
     let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     app.open_extension_dialog(editor_request(tx, "title", "seed"));
-    let action = app.handle_input(&InputEvent::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)));
+    let action = app.handle_input(&InputEvent::Key(KeyEvent::new(
+        KeyCode::Char('g'),
+        KeyModifiers::CONTROL,
+    )));
     assert_eq!(action, crate::AppAction::OpenExternalEditorForSelector);
     assert_eq!(
         app.active_selector_kind(),
         Some(SelectorKind::ExtensionEditor),
         "the dialog must still be open — Ctrl+G never resolves it directly"
     );
-    assert!(rx.try_recv().is_err(), "no reply was sent yet — the guest is still suspended");
+    assert!(
+        rx.try_recv().is_err(),
+        "no reply was sent yet — the guest is still suspended"
+    );
 }

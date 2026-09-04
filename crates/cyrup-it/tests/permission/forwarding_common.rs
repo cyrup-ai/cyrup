@@ -22,8 +22,8 @@
 
 use std::path::Path;
 use std::process::Child;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use cyrup_ext::{DialogOptions, HostServices, HumanInteractionLock, NotifyKind};
@@ -64,8 +64,11 @@ impl HostServices for ScriptedHost {
 
 /// Empty-tool default is ASK; make bash explicitly ASK so a `bash` call forwards.
 pub fn write_policy(agent_dir: &Path) {
-    std::fs::write(agent_dir.join("cyrup-permissions.jsonc"), r#"{ "bash": { "*": "ask" } }"#)
-        .expect("write policy");
+    std::fs::write(
+        agent_dir.join("cyrup-permissions.jsonc"),
+        r#"{ "bash": { "*": "ask" } }"#,
+    )
+    .expect("write policy");
 }
 
 /// Poll a spawned child to completion under an overall wall-clock bound (kills + returns `None` if it

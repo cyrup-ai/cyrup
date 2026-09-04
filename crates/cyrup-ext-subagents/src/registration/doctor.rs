@@ -294,7 +294,15 @@ impl DoctorRunner {
         let (agents, chains, model_scope) = discovery_result;
 
         DoctorReport {
-            checks: vec![binary, temp_dir, config, agents, chains, catalog, model_scope],
+            checks: vec![
+                binary,
+                temp_dir,
+                config,
+                agents,
+                chains,
+                catalog,
+                model_scope,
+            ],
         }
     }
 }
@@ -449,7 +457,10 @@ async fn check_temp_dir_writable(async_root: &Path) -> DoctorCheck {
         );
     }
 
-    let probe_name = format!(".cyrup-subagents-doctor-probe-{}", uuid::Uuid::new_v4().as_simple());
+    let probe_name = format!(
+        ".cyrup-subagents-doctor-probe-{}",
+        uuid::Uuid::new_v4().as_simple()
+    );
     let probe_path = async_root.join(probe_name);
 
     let write_result = tokio::fs::write(&probe_path, b"doctor-write-probe").await;
@@ -524,10 +535,7 @@ async fn check_config_json(config_json_path: &Path) -> DoctorCheck {
                     "config.json at {} could not be read: {err}",
                     config_json_path.display()
                 ),
-                format!(
-                    "check permissions on {}",
-                    config_json_path.display()
-                ),
+                format!("check permissions on {}", config_json_path.display()),
             );
         }
     };
@@ -569,7 +577,9 @@ async fn check_config_json(config_json_path: &Path) -> DoctorCheck {
 /// (d), (e) AND (g), since a single discovery pass covers all three and a failure here means
 /// neither count nor policy was obtainable), matching this module's "each check catches its own
 /// failure" contract even though the three checks share one underlying computation.
-async fn run_discovery_checks(cfg: &AgentDiscoveryConfig) -> (DoctorCheck, DoctorCheck, DoctorCheck) {
+async fn run_discovery_checks(
+    cfg: &AgentDiscoveryConfig,
+) -> (DoctorCheck, DoctorCheck, DoctorCheck) {
     // Discovery (`discovery::run_discovery`'s callees) is synchronous, real filesystem I/O
     // (R-SA-019: re-scanned per call, never cached) — run it on a blocking-safe spawn so it never
     // blocks this async check's siblings running concurrently in the same `tokio::join!`. The
@@ -577,8 +587,8 @@ async fn run_discovery_checks(cfg: &AgentDiscoveryConfig) -> (DoctorCheck, Docto
     // derives `Clone` (arch-SA §3.3), so a cheap clone here is well within this check's own
     // "read-only, independent probe" framing.
     let cfg_owned = cfg.clone();
-    let result = tokio::task::spawn_blocking(move || discovery::discover_agents_all(&cfg_owned))
-        .await;
+    let result =
+        tokio::task::spawn_blocking(move || discovery::discover_agents_all(&cfg_owned)).await;
 
     match result {
         Ok(Ok(discovered)) => {
@@ -608,7 +618,11 @@ async fn run_discovery_checks(cfg: &AgentDiscoveryConfig) -> (DoctorCheck, Docto
                 format!("{chain_count} chain file(s) discovered across all scopes"),
             );
 
-            (agents_check, chains_check, model_scope_check(discovered.model_scope.as_ref()))
+            (
+                agents_check,
+                chains_check,
+                model_scope_check(discovered.model_scope.as_ref()),
+            )
         }
         Ok(Err(err)) => {
             let detail = format!("agent/chain discovery failed: {err}");
@@ -624,7 +638,8 @@ async fn run_discovery_checks(cfg: &AgentDiscoveryConfig) -> (DoctorCheck, Docto
             )
         }
         Err(join_err) => {
-            let detail = format!("agent/chain discovery task panicked or was cancelled: {join_err}");
+            let detail =
+                format!("agent/chain discovery task panicked or was cancelled: {join_err}");
             let remedy = "this indicates a bug in discovery itself rather than a configuration \
                            problem; please report it"
                 .to_string();
@@ -672,8 +687,7 @@ fn model_scope_check(scope: Option<&crate::exec::model_scope::ModelScopeConfig>)
         return DoctorCheck::warn(
             CHECK_MODEL_SCOPE,
             "subagents.modelScope has enforce: true with no allow patterns, so it enforces nothing",
-            "add an allow list (e.g. [\"anthropic/*\"]) or remove enforce"
-                .to_string(),
+            "add an allow list (e.g. [\"anthropic/*\"]) or remove enforce".to_string(),
         );
     }
     DoctorCheck::ok(
@@ -681,9 +695,17 @@ fn model_scope_check(scope: Option<&crate::exec::model_scope::ModelScopeConfig>)
         format!(
             "subagents.modelScope enforcing ({}): allow {}; an out-of-scope explicit model is an \
              error, an inherited/fallback one {}",
-            if scope.strict == Some(true) { "strict" } else { "non-strict" },
+            if scope.strict == Some(true) {
+                "strict"
+            } else {
+                "non-strict"
+            },
             patterns.join(", "),
-            if scope.strict == Some(true) { "is also an error" } else { "only warns" }
+            if scope.strict == Some(true) {
+                "is also an error"
+            } else {
+                "only warns"
+            }
         ),
     )
 }
@@ -729,8 +751,8 @@ async fn check_provider_catalog_freshness(
                     .any(|agent| agent.model.is_some() || !agent.fallback_models.is_empty())
             })
             .unwrap_or(false) // a discovery failure here is already fully reported by (d)/(e); this
-                               // check degrades to "nothing to check" rather than duplicating that
-                               // failure a third time.
+        // check degrades to "nothing to check" rather than duplicating that
+        // failure a third time.
     })
     .await
     .unwrap_or(false);
@@ -799,7 +821,7 @@ async fn check_provider_catalog_freshness(
     let age = std::time::SystemTime::now()
         .duration_since(modified)
         .unwrap_or(Duration::ZERO); // a modified-in-the-future timestamp (clock skew) is treated
-                                     // as zero age rather than underflowing/erroring.
+    // as zero age rather than underflowing/erroring.
 
     if age > CATALOG_STALE_THRESHOLD {
         DoctorCheck::warn(
@@ -957,7 +979,10 @@ fn format_existing_directory(label: &str, dir_path: &Path) -> String {
         }
         Err(err) => format!("- {label}: failed ({}) — {err}", dir_path.display()),
         Ok(meta) if !meta.is_dir() => {
-            format!("- {label}: failed ({}) — not a directory", dir_path.display())
+            format!(
+                "- {label}: failed ({}) — not a directory",
+                dir_path.display()
+            )
         }
         Ok(_) => format!("- {label}: ok ({})", dir_path.display()),
     }
@@ -1002,7 +1027,8 @@ fn format_discovery(discovered: Result<&AgentDiscoveryResult, &str>) -> Vec<Stri
         }
     }
     let skills_line = if skill_pointers.is_empty() {
-        "- skills: total 0 (full skill discovery not implemented in this build — Tier 5)".to_string()
+        "- skills: total 0 (full skill discovery not implemented in this build — Tier 5)"
+            .to_string()
     } else {
         format!(
             "- skills: total {} referenced by agents ({}) — full skill discovery not implemented \
@@ -1063,9 +1089,10 @@ fn format_session_lines(input: &DoctorReportInput) -> Vec<String> {
         ),
         format!(
             "- current session dir: {}",
-            session_file
-                .and_then(Path::parent)
-                .map_or_else(|| "not available".to_string(), |dir| dir.display().to_string())
+            session_file.and_then(Path::parent).map_or_else(
+                || "not available".to_string(),
+                |dir| dir.display().to_string()
+            )
         ),
         format!(
             "- current session id: {}",
@@ -1106,9 +1133,15 @@ pub fn build_doctor_report(input: &DoctorReportInput) -> String {
     lines.push(String::new());
     lines.push("Filesystem".to_string());
     lines.push(format_existing_directory("temp root", &input.temp_root_dir));
-    lines.push(format_existing_directory("async runs", &input.async_runs_dir));
+    lines.push(format_existing_directory(
+        "async runs",
+        &input.async_runs_dir,
+    ));
     lines.push(format_existing_directory("results", &input.results_dir));
-    lines.push(format_existing_directory("chain runs", &input.chain_runs_dir));
+    lines.push(format_existing_directory(
+        "chain runs",
+        &input.chain_runs_dir,
+    ));
 
     lines.push(String::new());
     lines.push("Discovery".to_string());
@@ -1186,10 +1219,7 @@ mod tests {
         assert!(report.all_ok());
 
         let report_with_warn = DoctorReport {
-            checks: vec![
-                DoctorCheck::ok("a", "d"),
-                DoctorCheck::warn("b", "d", "r"),
-            ],
+            checks: vec![DoctorCheck::ok("a", "d"), DoctorCheck::warn("b", "d", "r")],
         };
         assert!(!report_with_warn.all_ok());
     }
@@ -1203,8 +1233,11 @@ mod tests {
                 DoctorCheck::fail("fail-check", "d", "r"),
             ],
         };
-        let actionable_names: Vec<&str> =
-            report.actionable().iter().map(|c| c.name.as_str()).collect();
+        let actionable_names: Vec<&str> = report
+            .actionable()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
         assert_eq!(actionable_names, vec!["warn-check", "fail-check"]);
     }
 
@@ -1495,7 +1528,10 @@ mod tests {
         let raw = serde_json::json!({ "agentOverrides": "not-an-object" });
         let result = discovery::parse_subagent_settings(Some(&raw));
         assert!(
-            matches!(result, Err(crate::error::SubagentError::MalformedSettings(_))),
+            matches!(
+                result,
+                Err(crate::error::SubagentError::MalformedSettings(_))
+            ),
             "a caller MUST reject malformed subagents settings before ever constructing an \
              AgentDiscoveryConfig from them (R-SA-009) — this is the actual abort point, not \
              run_discovery_checks itself"
@@ -1534,7 +1570,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn catalog_freshness_warns_when_overrides_exist_but_no_catalog_path_configured() {
         let dir = tempfile::tempdir().expect("real tempdir");
-        write_agent_with_model(dir.path(), "opus.md", "opus-agent", "anthropic/claude-opus-4");
+        write_agent_with_model(
+            dir.path(),
+            "opus.md",
+            "opus-agent",
+            "anthropic/claude-opus-4",
+        );
 
         let cfg = AgentDiscoveryConfig {
             project_agent_dirs: vec![dir.path().to_path_buf()],
@@ -1549,7 +1590,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn catalog_freshness_warns_when_configured_path_does_not_exist() {
         let dir = tempfile::tempdir().expect("real tempdir");
-        write_agent_with_model(dir.path(), "opus.md", "opus-agent", "anthropic/claude-opus-4");
+        write_agent_with_model(
+            dir.path(),
+            "opus.md",
+            "opus-agent",
+            "anthropic/claude-opus-4",
+        );
         let cfg = AgentDiscoveryConfig {
             project_agent_dirs: vec![dir.path().to_path_buf()],
             ..AgentDiscoveryConfig::default()
@@ -1563,7 +1609,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn catalog_freshness_ok_when_catalog_file_is_fresh() {
         let dir = tempfile::tempdir().expect("real tempdir");
-        write_agent_with_model(dir.path(), "opus.md", "opus-agent", "anthropic/claude-opus-4");
+        write_agent_with_model(
+            dir.path(),
+            "opus.md",
+            "opus-agent",
+            "anthropic/claude-opus-4",
+        );
         let cfg = AgentDiscoveryConfig {
             project_agent_dirs: vec![dir.path().to_path_buf()],
             ..AgentDiscoveryConfig::default()
@@ -1581,7 +1632,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn catalog_freshness_warns_when_catalog_file_is_stale() {
         let dir = tempfile::tempdir().expect("real tempdir");
-        write_agent_with_model(dir.path(), "opus.md", "opus-agent", "anthropic/claude-opus-4");
+        write_agent_with_model(
+            dir.path(),
+            "opus.md",
+            "opus-agent",
+            "anthropic/claude-opus-4",
+        );
         let cfg = AgentDiscoveryConfig {
             project_agent_dirs: vec![dir.path().to_path_buf()],
             ..AgentDiscoveryConfig::default()
@@ -1617,10 +1673,7 @@ mod tests {
         assert_eq!(humanize_duration(Duration::from_secs(30)), "30s");
         assert_eq!(humanize_duration(Duration::from_secs(90)), "1m");
         assert_eq!(humanize_duration(Duration::from_secs(3661)), "1h 1m");
-        assert_eq!(
-            humanize_duration(Duration::from_secs(90_000)),
-            "1d 1h"
-        );
+        assert_eq!(humanize_duration(Duration::from_secs(90_000)), "1d 1h");
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1643,7 +1696,12 @@ mod tests {
         let none = model_scope_check(None);
         assert_eq!(none.name, CHECK_MODEL_SCOPE);
         assert_eq!(none.status, CheckStatus::Ok);
-        assert!(none.detail.contains("no subagents.modelScope policy configured"), "{}", none.detail);
+        assert!(
+            none.detail
+                .contains("no subagents.modelScope policy configured"),
+            "{}",
+            none.detail
+        );
 
         let armed = model_scope_check(Some(&ModelScopeConfig {
             enforce: Some(true),
@@ -1661,7 +1719,11 @@ mod tests {
             allow: Some(vec!["anthropic/*".to_string()]),
         }));
         assert!(strict.detail.contains("strict"), "{}", strict.detail);
-        assert!(strict.detail.contains("is also an error"), "{}", strict.detail);
+        assert!(
+            strict.detail.contains("is also an error"),
+            "{}",
+            strict.detail
+        );
 
         // Present but not enforcing: reported, and reported as inert.
         let inert = model_scope_check(Some(&ModelScopeConfig {
@@ -1679,7 +1741,11 @@ mod tests {
             allow: None,
         }));
         assert_eq!(broken.status, CheckStatus::Warn);
-        assert!(broken.detail.contains("enforces nothing"), "{}", broken.detail);
+        assert!(
+            broken.detail.contains("enforces nothing"),
+            "{}",
+            broken.detail
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1749,10 +1815,7 @@ mod tests {
 
         assert_eq!(
             actionable_names,
-            std::collections::BTreeSet::from([
-                CHECK_TEMP_DIR_WRITABLE,
-                CHECK_CONFIG_JSON,
-            ]),
+            std::collections::BTreeSet::from([CHECK_TEMP_DIR_WRITABLE, CHECK_CONFIG_JSON,]),
             "exactly the deliberately-misconfigured checks (temp-dir, config.json) must be \
              actionable; every other check (other than binary-resolution, excluded above for its \
              own documented reason) must report Ok. Full report: {report:#?}"
@@ -1878,8 +1941,14 @@ mod tests {
 
         // Runtime/session block.
         assert!(report.contains("- async support: available"), "{report}");
-        assert!(report.contains(&format!("- cwd: {}", dir.path().display())), "{report}");
-        assert!(report.contains("- current session id: sess-123"), "{report}");
+        assert!(
+            report.contains(&format!("- cwd: {}", dir.path().display())),
+            "{report}"
+        );
+        assert!(
+            report.contains("- current session id: sess-123"),
+            "{report}"
+        );
         assert!(
             report.contains(&format!(
                 "- current session dir: {}",
@@ -1908,9 +1977,18 @@ mod tests {
 
         let report = build_doctor_report(&input);
         assert!(report.contains("- async support: unavailable"), "{report}");
-        assert!(report.contains("- current session file: not available"), "{report}");
-        assert!(report.contains("- current session id: not available"), "{report}");
-        assert!(report.contains("- session manager: failed — boom"), "{report}");
+        assert!(
+            report.contains("- current session file: not available"),
+            "{report}"
+        );
+        assert!(
+            report.contains("- current session id: not available"),
+            "{report}"
+        );
+        assert!(
+            report.contains("- session manager: failed — boom"),
+            "{report}"
+        );
         assert!(
             report.contains("- agents: total 0 (builtin 0, package 0, user 0, project 0)"),
             "{report}"
@@ -1959,7 +2037,6 @@ mod tests {
             "a discovery failure must never render a fabricated total-count success line: {report}"
         );
     }
-
 
     /// SUBA-086 — pi `formatDiscovery` (`doctor.ts:146-150` @v0.64.0) prints one
     /// `- invalid agent <name> (<source>): <error>` line per agent diagnostic under the counts.

@@ -17,7 +17,11 @@ pub fn api_key() -> Option<String> {
     std::env::var("ANTHROPIC_OAUTH_TOKEN")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
 }
 
 /// Whether [`api_key`] is present — the predicate authenticated e2e tests gate on (Pi `!!API_KEY`,
@@ -128,7 +132,9 @@ pub async fn resolve_api_key_refreshing_in(
 
     match &current {
         Credential::ApiKey { key, .. } => return Ok(key.clone()),
-        Credential::Oauth { access, expires, .. } => {
+        Credential::Oauth {
+            access, expires, ..
+        } => {
             if now_millis() < *expires {
                 return Ok(Some(access.clone()));
             }
@@ -222,13 +228,19 @@ mod tests {
         .await
         .unwrap();
 
-        let oauth = FreshOAuth { new_access: "fresh-token".into() };
-        let key = resolve_api_key_refreshing_in(&s, &provider, &oauth).await.unwrap();
+        let oauth = FreshOAuth {
+            new_access: "fresh-token".into(),
+        };
+        let key = resolve_api_key_refreshing_in(&s, &provider, &oauth)
+            .await
+            .unwrap();
         assert_eq!(key.as_deref(), Some("fresh-token"));
 
         // The refreshed credential is PERSISTED (Pi `saveAuthStorage`), not just returned.
         match s.read(&provider).await.unwrap() {
-            Some(Credential::Oauth { access, expires, .. }) => {
+            Some(Credential::Oauth {
+                access, expires, ..
+            }) => {
                 assert_eq!(access, "fresh-token");
                 assert!(expires > now_millis());
             }
@@ -256,8 +268,12 @@ mod tests {
         .await
         .unwrap();
 
-        let oauth = FreshOAuth { new_access: "fresh-token".into() };
-        let key = resolve_api_key_refreshing_in(&s, &provider, &oauth).await.unwrap();
+        let oauth = FreshOAuth {
+            new_access: "fresh-token".into(),
+        };
+        let key = resolve_api_key_refreshing_in(&s, &provider, &oauth)
+            .await
+            .unwrap();
         assert_eq!(
             key.as_deref(),
             Some("fresh-token"),
@@ -280,8 +296,12 @@ mod tests {
         .await
         .unwrap();
 
-        let oauth = FreshOAuth { new_access: "should-not-be-used".into() };
-        let key = resolve_api_key_refreshing_in(&s, &provider, &oauth).await.unwrap();
+        let oauth = FreshOAuth {
+            new_access: "should-not-be-used".into(),
+        };
+        let key = resolve_api_key_refreshing_in(&s, &provider, &oauth)
+            .await
+            .unwrap();
         assert_eq!(key.as_deref(), Some("live-token"));
     }
 
@@ -289,17 +309,27 @@ mod tests {
     async fn api_key_credential_returns_key() {
         let (s, _dir) = store();
         let provider = ProviderId::from("anthropic");
-        s.modify(&provider, |_| async { Ok(Some(Credential::api_key("ak"))) }).await.unwrap();
-        let oauth = FreshOAuth { new_access: "x".into() };
-        let key = resolve_api_key_refreshing_in(&s, &provider, &oauth).await.unwrap();
+        s.modify(&provider, |_| async { Ok(Some(Credential::api_key("ak"))) })
+            .await
+            .unwrap();
+        let oauth = FreshOAuth {
+            new_access: "x".into(),
+        };
+        let key = resolve_api_key_refreshing_in(&s, &provider, &oauth)
+            .await
+            .unwrap();
         assert_eq!(key.as_deref(), Some("ak"));
     }
 
     #[tokio::test]
     async fn absent_credential_is_none() {
         let (s, _dir) = store();
-        let oauth = FreshOAuth { new_access: "x".into() };
-        let key = resolve_api_key_refreshing_in(&s, &ProviderId::from("none"), &oauth).await.unwrap();
+        let oauth = FreshOAuth {
+            new_access: "x".into(),
+        };
+        let key = resolve_api_key_refreshing_in(&s, &ProviderId::from("none"), &oauth)
+            .await
+            .unwrap();
         assert!(key.is_none());
     }
 }

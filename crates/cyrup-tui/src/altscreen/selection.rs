@@ -62,11 +62,11 @@
 
 use std::time::{Duration, Instant};
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::Frame;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::scroll::{self, ScrollState};

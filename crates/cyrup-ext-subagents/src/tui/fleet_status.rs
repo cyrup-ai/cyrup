@@ -59,9 +59,7 @@
 
 use ratatui::text::{Line, Span};
 
-use super::fleet_state::{
-    AsyncRunView, FleetState, NestedRunView, NestedStepView,
-};
+use super::fleet_state::{AsyncRunView, FleetState, NestedRunView, NestedStepView};
 use super::fleet_theme::{self as th, Role};
 use crate::background::{ActivityState, RunMode, StepState};
 use crate::formatters::{format_model_thinking, run_mode_label};
@@ -226,11 +224,7 @@ pub fn nested_run_label(run: &NestedRunView) -> String {
     if run.agents.len() == 1 {
         return run.agents.first().cloned().unwrap_or_default();
     }
-    let head = run
-        .agents
-        .get(..2)
-        .unwrap_or(&run.agents)
-        .join(", ");
+    let head = run.agents.get(..2).unwrap_or(&run.agents).join(", ");
     if run.agents.len() > 2 {
         format!("{head} +{}", run.agents.len().saturating_sub(2))
     } else {
@@ -388,7 +382,11 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
                 // pi `:161-163`: the step's own nested children, else — for a single-child run —
                 // the run's whole nested set, else nothing.
                 let nested_children = if attached.is_empty() {
-                    if single { control.nested_children.clone() } else { Vec::new() }
+                    if single {
+                        control.nested_children.clone()
+                    } else {
+                        Vec::new()
+                    }
                 } else {
                     attached
                 };
@@ -435,7 +433,11 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
         if !is_active_state(job.state_label()) {
             continue;
         }
-        let started_at = if status.started_at != 0 { status.started_at } else { now };
+        let started_at = if status.started_at != 0 {
+            status.started_at
+        } else {
+            now
+        };
         let total_tokens = status
             .telemetry
             .total_tokens
@@ -755,7 +757,8 @@ impl SubagentFleetStatus {
         }
 
         if !self.active {
-            let activates = key.code == FleetStatusKeyCode::Down || key.code == FleetStatusKeyCode::Left;
+            let activates =
+                key.code == FleetStatusKeyCode::Down || key.code == FleetStatusKeyCode::Left;
             if !activates || !editor_text.is_empty() {
                 return FleetStatusKeyOutcome::Pass;
             }
@@ -774,7 +777,10 @@ impl SubagentFleetStatus {
                 let next = selected_index
                     .saturating_add(1)
                     .min(roster.len().saturating_sub(1));
-                self.selected_key = roster.get(next).cloned().unwrap_or_else(|| "main".to_string());
+                self.selected_key = roster
+                    .get(next)
+                    .cloned()
+                    .unwrap_or_else(|| "main".to_string());
                 FleetStatusKeyOutcome::Consume
             }
             FleetStatusKeyCode::Up | FleetStatusKeyCode::Char('k') => {
@@ -821,7 +827,11 @@ impl SubagentFleetStatus {
             let label = format!(
                 "{} active {}",
                 self.entries.len(),
-                if self.entries.len() == 1 { "agent" } else { "agents" }
+                if self.entries.len() == 1 {
+                    "agent"
+                } else {
+                    "agents"
+                }
             );
             return vec![th::clip(
                 &Line::from(vec![
@@ -864,7 +874,9 @@ impl SubagentFleetStatus {
         let tree = fleet_tree_rows(&self.entries);
         let selected_tree_index = tree
             .iter()
-            .position(|row| matches!(row, FleetTreeRow::Owner(entry) if entry.key == self.selected_key))
+            .position(
+                |row| matches!(row, FleetTreeRow::Owner(entry) if entry.key == self.selected_key),
+            )
             .unwrap_or(0);
         let visible_count = self.max_agent_rows.min(tree.len());
         let start = if selected_tree_index < visible_count {
@@ -1107,7 +1119,10 @@ pub fn render_nested_row(
     if let Some(started_at) = row.started_at {
         spans.push(th::fg(
             Role::Dim,
-            format!(" · {}", format_fleet_elapsed(now.saturating_sub(started_at))),
+            format!(
+                " · {}",
+                format_fleet_elapsed(now.saturating_sub(started_at))
+            ),
         ));
     }
     th::clip(&Line::from(spans), width)
@@ -1150,7 +1165,10 @@ impl FleetStatusKey {
     /// A press of `code`.
     #[must_use]
     pub const fn press(code: FleetStatusKeyCode) -> Self {
-        Self { code, is_release: false }
+        Self {
+            code,
+            is_release: false,
+        }
     }
 }
 
@@ -1180,12 +1198,17 @@ mod tests {
     }
 
     fn async_view(run_id: &str, state: RunState, steps: Vec<StepStatus>) -> AsyncRunView {
-        let mut status = RunStatus::queued(RunId::from_token(run_id.to_string()), RunMode::Chain, None);
+        let mut status =
+            RunStatus::queued(RunId::from_token(run_id.to_string()), RunMode::Chain, None);
         status.state = state;
         status.steps = steps;
         status.started_at = 1_000;
         status.last_update = 1_000;
-        status.telemetry.total_tokens = Some(TokenTotals { input: 10, output: 10, total: 20 });
+        status.telemetry.total_tokens = Some(TokenTotals {
+            input: 10,
+            output: 10,
+            total: 20,
+        });
         AsyncRunView {
             paths: crate::background::RunPaths::for_run(
                 &PathBuf::from("/tmp/async"),
@@ -1220,7 +1243,10 @@ mod tests {
             resolve_fleet_view_placement(Some("AboveEditor")),
             FleetViewPlacement::BelowEditor
         );
-        assert_eq!(resolve_fleet_view_placement(None), FleetViewPlacement::BelowEditor);
+        assert_eq!(
+            resolve_fleet_view_placement(None),
+            FleetViewPlacement::BelowEditor
+        );
     }
 
     #[test]
@@ -1268,10 +1294,23 @@ mod tests {
     fn foreground_active_children_expand_and_sort_by_index() {
         let mut c = control("run-b", "coder", 100);
         c.active_children = vec![
-            ForegroundChildView { index: 1, agent: "b".into(), started_at: 300, ..Default::default() },
-            ForegroundChildView { index: 0, agent: "a".into(), started_at: 200, ..Default::default() },
+            ForegroundChildView {
+                index: 1,
+                agent: "b".into(),
+                started_at: 300,
+                ..Default::default()
+            },
+            ForegroundChildView {
+                index: 0,
+                agent: "a".into(),
+                started_at: 200,
+                ..Default::default()
+            },
         ];
-        let state = FleetState { foreground_controls: vec![c], ..FleetState::default() };
+        let state = FleetState {
+            foreground_controls: vec![c],
+            ..FleetState::default()
+        };
         let entries = collect_fleet_status_entries(&state, 10_000);
         assert_eq!(
             entries.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
@@ -1283,8 +1322,19 @@ mod tests {
     fn only_active_background_runs_and_active_steps_are_listed() {
         let state = FleetState {
             tracked_jobs: vec![
-                async_view("r1", RunState::Running, vec![step("a", StepState::Running), step("b", StepState::Complete)]),
-                async_view("r2", RunState::Complete, vec![step("c", StepState::Complete)]),
+                async_view(
+                    "r1",
+                    RunState::Running,
+                    vec![
+                        step("a", StepState::Running),
+                        step("b", StepState::Complete),
+                    ],
+                ),
+                async_view(
+                    "r2",
+                    RunState::Complete,
+                    vec![step("c", StepState::Complete)],
+                ),
             ],
             ..FleetState::default()
         };
@@ -1304,7 +1354,10 @@ mod tests {
         );
         job.status.mode = RunMode::Chain;
         job.status.current_step = Some(1);
-        let state = FleetState { tracked_jobs: vec![job], ..FleetState::default() };
+        let state = FleetState {
+            tracked_jobs: vec![job],
+            ..FleetState::default()
+        };
         let entries = collect_fleet_status_entries(&state, 10_000);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "async:r3:1");
@@ -1363,18 +1416,32 @@ mod tests {
             mode: Some(RunMode::Parallel),
             state: "running".into(),
             steps: vec![
-                NestedStepView { agent: "x".into(), status: "running".into(), ..Default::default() },
-                NestedStepView { agent: "y".into(), status: "pending".into(), ..Default::default() },
+                NestedStepView {
+                    agent: "x".into(),
+                    status: "running".into(),
+                    ..Default::default()
+                },
+                NestedStepView {
+                    agent: "y".into(),
+                    status: "pending".into(),
+                    ..Default::default()
+                },
             ],
             ..NestedRunView::default()
         };
         let rows = nested_fleet_rows(std::slice::from_ref(&child));
-        assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["x", "y"]);
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
     }
 
     #[test]
     fn nested_run_label_falls_back_agent_then_agents_then_id() {
-        let mut run = NestedRunView { id: "the-id".into(), ..NestedRunView::default() };
+        let mut run = NestedRunView {
+            id: "the-id".into(),
+            ..NestedRunView::default()
+        };
         assert_eq!(nested_run_label(&run), "the-id");
         run.agents = vec!["a".into(), "b".into(), "c".into(), "d".into()];
         assert_eq!(nested_run_label(&run), "a, b +2");
@@ -1390,8 +1457,18 @@ mod tests {
             key: "k".into(),
             agent: "a".into(),
             nested_children: vec![
-                NestedRunView { id: "n0".into(), agent: Some("x".into()), state: "running".into(), ..Default::default() },
-                NestedRunView { id: "n1".into(), agent: Some("y".into()), state: "running".into(), ..Default::default() },
+                NestedRunView {
+                    id: "n0".into(),
+                    agent: Some("x".into()),
+                    state: "running".into(),
+                    ..Default::default()
+                },
+                NestedRunView {
+                    id: "n1".into(),
+                    agent: Some("y".into()),
+                    state: "running".into(),
+                    ..Default::default()
+                },
             ],
             ..FleetStatusEntry::default()
         };
@@ -1489,7 +1566,11 @@ mod tests {
         };
         let mut widget = armed_widget(&busy);
         assert_eq!(
-            widget.handle_key(&FleetStatusKey::press(FleetStatusKeyCode::Down), true, "hello"),
+            widget.handle_key(
+                &FleetStatusKey::press(FleetStatusKeyCode::Down),
+                true,
+                "hello"
+            ),
             FleetStatusKeyOutcome::Pass
         );
         assert!(!widget.is_active());
@@ -1552,8 +1633,14 @@ mod tests {
             ..FleetState::default()
         };
         let mut widget = armed_widget(&busy);
-        let release = FleetStatusKey { code: FleetStatusKeyCode::Down, is_release: true };
-        assert_eq!(widget.handle_key(&release, true, ""), FleetStatusKeyOutcome::Pass);
+        let release = FleetStatusKey {
+            code: FleetStatusKeyCode::Down,
+            is_release: true,
+        };
+        assert_eq!(
+            widget.handle_key(&release, true, ""),
+            FleetStatusKeyOutcome::Pass
+        );
         assert!(!widget.is_active());
     }
 
@@ -1566,7 +1653,10 @@ mod tests {
         let mut widget = armed_widget(&busy);
         widget.handle_key(&FleetStatusKey::press(FleetStatusKeyCode::Down), true, "");
         let text = th::lines_text(&widget.render(100, 10_000));
-        assert!(text.contains("↑↓/jk select · enter inspect · esc back"), "{text}");
+        assert!(
+            text.contains("↑↓/jk select · enter inspect · esc back"),
+            "{text}"
+        );
         assert!(text.contains("> main"), "{text}");
         assert!(text.contains("coder · running"), "{text}");
         assert!(text.contains("10s"), "{text}");
@@ -1589,7 +1679,10 @@ mod tests {
         ] {
             let line = Line::from(vec![nested_status_glyph(state)]);
             assert!(
-                th::paints_as(th::painted_style(std::slice::from_ref(&line), 4, glyph), role),
+                th::paints_as(
+                    th::painted_style(std::slice::from_ref(&line), 4, glyph),
+                    role
+                ),
                 "{state} must paint as {role:?}"
             );
         }
@@ -1603,8 +1696,14 @@ mod tests {
         };
         let widget = armed_widget(&busy);
         let lines = widget.render(80, 10_000);
-        assert!(th::paints_as(th::painted_style(&lines, 80, "2 active agents"), Role::Muted));
-        assert!(th::paints_as(th::painted_style(&lines, 80, "↓/← to inspect"), Role::Dim));
+        assert!(th::paints_as(
+            th::painted_style(&lines, 80, "2 active agents"),
+            Role::Muted
+        ));
+        assert!(th::paints_as(
+            th::painted_style(&lines, 80, "↓/← to inspect"),
+            Role::Dim
+        ));
     }
 
     #[test]

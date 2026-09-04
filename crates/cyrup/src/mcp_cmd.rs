@@ -112,7 +112,10 @@ fn run_init(argv: &[String], dirs: &ConfigDirs) -> i32 {
     // 6 and 7 — what is about to happen, in upstream's order.
     if !to_add.is_empty() {
         let kinds: Vec<&str> = to_add.iter().map(|kind| kind.as_str()).collect();
-        println!("\nDetected host configs to import into cyrup: {}", kinds.join(", "));
+        println!(
+            "\nDetected host configs to import into cyrup: {}",
+            kinds.join(", ")
+        );
     }
     if discovery_setting_changed {
         println!(
@@ -134,9 +137,7 @@ fn run_init(argv: &[String], dirs: &ConfigDirs) -> i32 {
         eprintln!("{error}");
         return 1;
     }
-    if discovery_setting_changed
-        && let Err(error) = ctx.enable_host_config_discovery()
-    {
+    if discovery_setting_changed && let Err(error) = ctx.enable_host_config_discovery() {
         eprintln!("{error}");
         return 1;
     }
@@ -207,7 +208,11 @@ mod tests {
         let target = ConfigContext::new(mcp_dirs, None)
             .with_home(dirs.home.clone())
             .user_path();
-        assert!(!target.exists(), "a dry run must not create {}", target.display());
+        assert!(
+            !target.exists(),
+            "a dry run must not create {}",
+            target.display()
+        );
     }
 
     /// The second run is the idempotence contract: `enable_host_config_discovery` returns `false`
@@ -220,7 +225,10 @@ mod tests {
         let mcp_dirs = McpDirs::new(dirs.agent_dir.clone(), dirs.cwd.clone());
         let ctx = ConfigContext::new(mcp_dirs, None).with_home(dirs.home.clone());
 
-        assert!(ctx.enable_host_config_discovery().unwrap(), "first call writes");
+        assert!(
+            ctx.enable_host_config_discovery().unwrap(),
+            "first call writes"
+        );
         let first = std::fs::read_to_string(ctx.user_path()).unwrap();
         assert!(first.contains("hostConfigDiscovery"));
 
@@ -254,8 +262,17 @@ mod tests {
 
         assert!(ctx.enable_host_config_discovery().unwrap());
         let after = std::fs::read_to_string(&target).unwrap();
-        assert!(after.contains("\"keep\""), "an unrelated server survived: {after}");
-        assert!(after.contains("requestTimeoutMs"), "a sibling setting survived: {after}");
-        assert!(after.contains("hostConfigDiscovery"), "and the new key landed: {after}");
+        assert!(
+            after.contains("\"keep\""),
+            "an unrelated server survived: {after}"
+        );
+        assert!(
+            after.contains("requestTimeoutMs"),
+            "a sibling setting survived: {after}"
+        );
+        assert!(
+            after.contains("hostConfigDiscovery"),
+            "and the new key landed: {after}"
+        );
     }
 }

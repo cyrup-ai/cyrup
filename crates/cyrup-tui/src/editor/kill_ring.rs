@@ -19,7 +19,11 @@ pub(crate) fn kill_ring_push(ring: &mut Vec<String>, text: &str, prepend: bool, 
         return;
     }
     if accumulate && let Some(last) = ring.pop() {
-        ring.push(if prepend { format!("{text}{last}") } else { format!("{last}{text}") });
+        ring.push(if prepend {
+            format!("{text}{last}")
+        } else {
+            format!("{last}{text}")
+        });
         return;
     }
     ring.push(text.to_string());
@@ -28,7 +32,9 @@ pub(crate) fn kill_ring_push(ring: &mut Vec<String>, text: &str, prepend: bool, 
 /// `KillRing.rotate` (`kill-ring.ts:36-41`): move the last entry to the front, so a repeated
 /// yank-pop cycles the ring. A no-op below two entries.
 pub(crate) fn kill_ring_rotate(ring: &mut Vec<String>) {
-    if ring.len() > 1 && let Some(last) = ring.pop() {
+    if ring.len() > 1
+        && let Some(last) = ring.pop()
+    {
         ring.insert(0, last);
     }
 }
@@ -38,7 +44,12 @@ impl InputEditor {
     /// `!prepend`. The `!text` early return is behaviour-preserving here: all four editor callers
     /// (`editor/edit.rs`) already return early on an empty range.
     pub(super) fn push_kill(&mut self, text: &str, append: bool) {
-        kill_ring_push(&mut self.kill_ring, text, !append, self.last_action == LastAction::Kill);
+        kill_ring_push(
+            &mut self.kill_ring,
+            text,
+            !append,
+            self.last_action == LastAction::Kill,
+        );
     }
 
     /// Yank the kill-ring top at the cursor (Ctrl+Y, `editor.ts:1852`).

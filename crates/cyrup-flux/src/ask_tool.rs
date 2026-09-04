@@ -97,10 +97,15 @@ impl AskUserQuestionTool {
         // host runs them on its own executor"); hop it off the async executor so the tool's own
         // task doesn't block the runtime while a human thinks.
         tokio::task::spawn_blocking(move || {
-            let labels: Vec<serde_json::Value> =
-                rows.iter().map(|(display, _)| serde_json::Value::String(display.clone())).collect();
-            let picked =
-                host.select(&prompt, &serde_json::Value::Array(labels), &DialogOptions::default())?;
+            let labels: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|(display, _)| serde_json::Value::String(display.clone()))
+                .collect();
+            let picked = host.select(
+                &prompt,
+                &serde_json::Value::Array(labels),
+                &DialogOptions::default(),
+            )?;
             // Map the chosen DISPLAY ROW back to its bare label; two options with identical labels
             // resolve to the first (the same documented caveat `oauth_select` carries). Fall back
             // to matching the reply against the labels directly, so a renderer that echoed a label
@@ -170,7 +175,9 @@ impl Tool for AskUserQuestionTool {
         }
 
         let Some(lock) = host.human_interaction_lock() else {
-            return Err(ToolError::new("ask_user_question: interaction lock unavailable"));
+            return Err(ToolError::new(
+                "ask_user_question: interaction lock unavailable",
+            ));
         };
         // Hold the guard across the WHOLE dialog (including the multi-select loop below): a
         // second question, or a permission dialog, waits rather than opening an overlapping
@@ -214,6 +221,9 @@ impl Tool for AskUserQuestionTool {
             picked.unwrap_or_else(|| CANCELLED.to_string())
         };
 
-        Ok(ToolResult { content: vec![Content::text(answer)], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text(answer)],
+            ..Default::default()
+        })
     }
 }

@@ -35,7 +35,12 @@ pub(super) fn make_tx() -> UnboundedSender<Vec<u8>> {
     tx
 }
 
-pub(super) fn register(state: &mut BrokerState, conn_id: u64, session_id: &mut Option<String>, id: &str) {
+pub(super) fn register(
+    state: &mut BrokerState,
+    conn_id: u64,
+    session_id: &mut Option<String>,
+    id: &str,
+) {
     let tx = make_tx();
     let value = json!({
         "type": "register",
@@ -49,7 +54,9 @@ pub(super) fn register(state: &mut BrokerState, conn_id: u64, session_id: &mut O
 }
 
 /// Decode every queued frame on `rx` as JSON, dropping the 4-byte length prefix.
-pub(super) fn payloads(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<serde_json::Value> {
+pub(super) fn payloads(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     while let Ok(frame) = rx.try_recv() {
         out.push(
@@ -95,5 +102,11 @@ pub(super) fn send_frame(
     message: serde_json::Value,
     now: u64,
 ) {
-    state.handle_frame(conn_id, tx, &json!({ "type": "send", "to": to, "message": message }), sid, now);
+    state.handle_frame(
+        conn_id,
+        tx,
+        &json!({ "type": "send", "to": to, "message": message }),
+        sid,
+        now,
+    );
 }

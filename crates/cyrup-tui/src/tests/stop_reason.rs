@@ -12,13 +12,18 @@
 //! These tests drive the real `App::ingest_event` seam with a terminal `StreamEvent` and read the
 //! committed scrollback, so they assert what the user actually sees — text AND the `error` role
 //! colour — not merely that a function exists.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use crate::{App, UiTheme};
 use cyrup_agent::AgentMessage;
 use cyrup_core::{ApiId, AssistantMessage, Content, ProviderId, StopReason, ToolCall, ToolCallId};
 use cyrup_provider::StreamEvent;
 use cyrup_session_svc::AgentSessionEvent;
-use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
 
 /// Pi v0.84.1 `coding-agent/src/modes/interactive/components/assistant-message.ts:180`, verbatim.
@@ -57,7 +62,10 @@ fn message(
 }
 
 fn text(t: &str) -> Content {
-    Content::Text { text: t.into(), text_signature: None }
+    Content::Text {
+        text: t.into(),
+        text_signature: None,
+    }
 }
 
 fn tool_call() -> Content {
@@ -73,7 +81,10 @@ fn tool_call() -> Content {
 /// scrollback the shell would hand to `Terminal::insert_before`.
 fn scrollback_for(ev: StreamEvent) -> (App<TestBackend>, String) {
     let mut app = new_app();
-    let message = ev.terminal_message().cloned().expect("terminal event carries a message");
+    let message = ev
+        .terminal_message()
+        .cloned()
+        .expect("terminal event carries a message");
     // The production shape. `cyrup-agent` emits `MessageStart` on the stream's `Start` frame
     // (`agent.rs:802-808`), then `break 'consume`s the moment the stream yields its terminal
     // (`:813-820`) and re-emits it as `MessageEnd` (`:854`) — a terminal event never rides a
@@ -110,82 +121,177 @@ fn styled_error(app: &App<TestBackend>, needle: &str) -> bool {
 
 #[test]
 fn error_stop_reason_surfaces_the_provider_error() {
-    let (app, out) = scrollback_for(StreamEvent::terminal(message(StopReason::Error, Some("upstream 503"), vec![text("partial answer")])));
-    assert!(out.contains("partial answer"), "partial body still committed:\n{out}");
-    assert!(out.contains("Error: upstream 503"), "provider error surfaced:\n{out}");
-    assert!(styled_error(&app, "Error: upstream 503"), "notice uses the error role:\n{out}");
+    let (app, out) = scrollback_for(StreamEvent::terminal(message(
+        StopReason::Error,
+        Some("upstream 503"),
+        vec![text("partial answer")],
+    )));
+    assert!(
+        out.contains("partial answer"),
+        "partial body still committed:\n{out}"
+    );
+    assert!(
+        out.contains("Error: upstream 503"),
+        "provider error surfaced:\n{out}"
+    );
+    assert!(
+        styled_error(&app, "Error: upstream 503"),
+        "notice uses the error role:\n{out}"
+    );
 }
 
 #[test]
 fn error_stop_reason_without_a_message_says_unknown_error() {
-    let (_app, out) =
-        scrollback_for(StreamEvent::terminal(message(StopReason::Error, None, vec![])));
-    assert!(out.contains("Error: Unknown error"), "unknown-error fallback:\n{out}");
+    let (_app, out) = scrollback_for(StreamEvent::terminal(message(
+        StopReason::Error,
+        None,
+        vec![],
+    )));
+    assert!(
+        out.contains("Error: Unknown error"),
+        "unknown-error fallback:\n{out}"
+    );
 }
 
 #[test]
 fn aborted_stop_reason_surfaces_the_abort_message() {
-    let (app, out) = scrollback_for(StreamEvent::terminal(message(StopReason::Aborted, Some("user pressed escape"), vec![])));
-    assert!(out.contains("user pressed escape"), "abort message surfaced:\n{out}");
-    assert!(!out.contains("Error: user pressed escape"), "abort is not `Error:`-prefixed:\n{out}");
-    assert!(styled_error(&app, "user pressed escape"), "notice uses the error role:\n{out}");
+    let (app, out) = scrollback_for(StreamEvent::terminal(message(
+        StopReason::Aborted,
+        Some("user pressed escape"),
+        vec![],
+    )));
+    assert!(
+        out.contains("user pressed escape"),
+        "abort message surfaced:\n{out}"
+    );
+    assert!(
+        !out.contains("Error: user pressed escape"),
+        "abort is not `Error:`-prefixed:\n{out}"
+    );
+    assert!(
+        styled_error(&app, "user pressed escape"),
+        "notice uses the error role:\n{out}"
+    );
 }
 
 #[test]
 fn aborted_stop_reason_replaces_the_internal_sentinel() {
     // `Request was aborted` is Pi's internal sentinel; the user-facing wording is `Operation aborted`.
-    let (_app, out) = scrollback_for(StreamEvent::terminal(message(StopReason::Aborted, Some("Request was aborted"), vec![])));
-    assert!(out.contains("Operation aborted"), "sentinel replaced:\n{out}");
-    assert!(!out.contains("Request was aborted"), "sentinel not shown verbatim:\n{out}");
+    let (_app, out) = scrollback_for(StreamEvent::terminal(message(
+        StopReason::Aborted,
+        Some("Request was aborted"),
+        vec![],
+    )));
+    assert!(
+        out.contains("Operation aborted"),
+        "sentinel replaced:\n{out}"
+    );
+    assert!(
+        !out.contains("Request was aborted"),
+        "sentinel not shown verbatim:\n{out}"
+    );
 }
 
 #[test]
 fn aborted_stop_reason_without_a_message_says_operation_aborted() {
-    let (_app, out) = scrollback_for(StreamEvent::terminal(message(StopReason::Aborted, None, vec![])));
-    assert!(out.contains("Operation aborted"), "abort fallback wording:\n{out}");
+    let (_app, out) = scrollback_for(StreamEvent::terminal(message(
+        StopReason::Aborted,
+        None,
+        vec![],
+    )));
+    assert!(
+        out.contains("Operation aborted"),
+        "abort fallback wording:\n{out}"
+    );
 }
 
 #[test]
 fn length_stop_reason_surfaces_the_truncation_notice() {
-    let (app, out) = scrollback_for(StreamEvent::terminal(message(StopReason::Length, None, vec![text("a truncated answer")])));
-    assert!(out.contains("a truncated answer"), "truncated body committed:\n{out}");
-    assert!(out.contains(LENGTH_NOTICE), "neutral truncation notice:\n{out}");
-    assert!(styled_error(&app, LENGTH_NOTICE), "notice uses the error role:\n{out}");
+    let (app, out) = scrollback_for(StreamEvent::terminal(message(
+        StopReason::Length,
+        None,
+        vec![text("a truncated answer")],
+    )));
+    assert!(
+        out.contains("a truncated answer"),
+        "truncated body committed:\n{out}"
+    );
+    assert!(
+        out.contains(LENGTH_NOTICE),
+        "neutral truncation notice:\n{out}"
+    );
+    assert!(
+        styled_error(&app, LENGTH_NOTICE),
+        "notice uses the error role:\n{out}"
+    );
     // The wording is neutral about the CAUSE (`32850ef7c`) — it must not claim a token limit.
-    assert!(!out.contains(OLD_LENGTH_NOTICE), "v0.83.0 wording must be gone:\n{out}");
+    assert!(
+        !out.contains(OLD_LENGTH_NOTICE),
+        "v0.83.0 wording must be gone:\n{out}"
+    );
     // MIRROR: `assistant-message.ts:180` passes the bare sentence to `theme.fg("error", …)`; only
     // the `error` arm (`:193`) builds an `Error: `-prefixed string. A length stop is not prefixed.
-    assert!(!out.contains("Error: Response was truncated"), "length notice is not prefixed:\n{out}");
+    assert!(
+        !out.contains("Error: Response was truncated"),
+        "length notice is not prefixed:\n{out}"
+    );
 }
 
 #[test]
 fn length_notice_is_shown_even_when_the_turn_carries_tool_calls() {
     // `assistant-message.ts:177` — the `length` branch is NOT gated on `hasToolCalls`.
-    let (_app, out) = scrollback_for(StreamEvent::terminal(message(StopReason::Length, None, vec![text("calling out"), tool_call()])));
-    assert!(out.contains(LENGTH_NOTICE), "length notice survives a tool turn:\n{out}");
+    let (_app, out) = scrollback_for(StreamEvent::terminal(message(
+        StopReason::Length,
+        None,
+        vec![text("calling out"), tool_call()],
+    )));
+    assert!(
+        out.contains(LENGTH_NOTICE),
+        "length notice survives a tool turn:\n{out}"
+    );
 }
 
 #[test]
 fn error_notice_is_suppressed_when_the_turn_carries_tool_calls() {
     // `assistant-message.ts:189` — the tool-execution component reports the failure instead.
-    let (_app, out) = scrollback_for(StreamEvent::terminal(message(StopReason::Error, Some("tool blew up"), vec![tool_call()])));
-    assert!(!out.contains("tool blew up"), "tool turns do not duplicate the error:\n{out}");
+    let (_app, out) = scrollback_for(StreamEvent::terminal(message(
+        StopReason::Error,
+        Some("tool blew up"),
+        vec![tool_call()],
+    )));
+    assert!(
+        !out.contains("tool blew up"),
+        "tool turns do not duplicate the error:\n{out}"
+    );
 }
 
 #[test]
 fn aborted_notice_is_suppressed_when_the_turn_carries_tool_calls() {
-    let (_app, out) = scrollback_for(StreamEvent::terminal(message(StopReason::Aborted, None, vec![tool_call()])));
-    assert!(!out.contains("Operation aborted"), "tool turns do not duplicate the abort:\n{out}");
+    let (_app, out) = scrollback_for(StreamEvent::terminal(message(
+        StopReason::Aborted,
+        None,
+        vec![tool_call()],
+    )));
+    assert!(
+        !out.contains("Operation aborted"),
+        "tool turns do not duplicate the abort:\n{out}"
+    );
 }
 
 #[test]
 fn a_clean_stop_adds_no_notice() {
-    let (_app, out) = scrollback_for(StreamEvent::terminal(message(StopReason::Stop, None, vec![text("all done")])));
+    let (_app, out) = scrollback_for(StreamEvent::terminal(message(
+        StopReason::Stop,
+        None,
+        vec![text("all done")],
+    )));
     assert!(out.contains("all done"), "body committed:\n{out}");
     assert!(!out.contains("Error:"), "no notice on a clean stop:\n{out}");
-    assert!(!out.contains("aborted"), "no abort wording on a clean stop:\n{out}");
+    assert!(
+        !out.contains("aborted"),
+        "no abort wording on a clean stop:\n{out}"
+    );
 }
-
 
 /// `Pending` is the in-flight sentinel (`cyrup_core::StopReason`), and Pi renders it like a clean
 /// stop: its chain is `if ("length") … else if (!hasToolCalls) { if ("aborted") … else if
@@ -211,6 +317,12 @@ fn a_pending_in_flight_message_adds_no_notice() {
     });
     app.draw().unwrap();
     let out = app.scrollback_text();
-    assert!(!out.contains("Error:"), "an in-flight turn must not show a notice:\n{out}");
-    assert!(!out.contains("aborted"), "an in-flight turn must not show abort wording:\n{out}");
+    assert!(
+        !out.contains("Error:"),
+        "an in-flight turn must not show a notice:\n{out}"
+    );
+    assert!(
+        !out.contains("aborted"),
+        "an in-flight turn must not show abort wording:\n{out}"
+    );
 }

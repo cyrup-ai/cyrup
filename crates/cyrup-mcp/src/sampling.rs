@@ -29,9 +29,9 @@
 // written against `crate::owner::confirm_sampling` stays valid, which is the same technique
 // `crate::state` uses for its forward declarations.
 pub use crate::owner::{
-    confirm_sampling, format_request_approval, format_response_approval, SamplingApproval,
     MESSAGE_TEXT_UNKNOWN_BLOCK, SAMPLING_REQUEST_APPROVAL_TITLE, SAMPLING_REQUEST_DECLINED,
-    SAMPLING_REQUIRES_INTERACTIVE_APPROVAL, SAMPLING_RESPONSE_APPROVAL_TITLE,
+    SAMPLING_REQUIRES_INTERACTIVE_APPROVAL, SAMPLING_RESPONSE_APPROVAL_TITLE, SamplingApproval,
+    confirm_sampling, format_request_approval, format_response_approval,
 };
 
 use std::sync::Arc;
@@ -115,7 +115,9 @@ fn result_block_unsupported(kind: &str) -> String {
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// `SamplingHandlerOptions` (`sampling-handler.ts:18-25`), minus `serverName`, which is per request.
@@ -243,7 +245,10 @@ pub async fn handle_sampling_request(
         temperature: params.temperature,
         ..Default::default()
     };
-    let assistant = options.models.complete(&resolved, &context, &stream_options).await;
+    let assistant = options
+        .models
+        .complete(&resolved, &context, &stream_options)
+        .await;
 
     let converted = convert_assistant_result(&assistant)?;
     throw_if_aborted(&signal, None).map_err(internal)?;
@@ -325,12 +330,18 @@ fn convert_assistant_result(message: &AssistantMessage) -> Result<CreateMessageR
     match message.stop_reason {
         StopReason::Error => {
             return Err(internal_msg(
-                message.error_message.as_deref().unwrap_or(SAMPLING_CALL_FAILED),
+                message
+                    .error_message
+                    .as_deref()
+                    .unwrap_or(SAMPLING_CALL_FAILED),
             ));
         }
         StopReason::Aborted => {
             return Err(internal_msg(
-                message.error_message.as_deref().unwrap_or(SAMPLING_CALL_ABORTED),
+                message
+                    .error_message
+                    .as_deref()
+                    .unwrap_or(SAMPLING_CALL_ABORTED),
             ));
         }
         _ => {}
@@ -344,7 +355,7 @@ fn convert_assistant_result(message: &AssistantMessage) -> Result<CreateMessageR
             Content::Thinking { .. } => {}
             Content::Image { .. } => return Err(internal_msg(&result_block_unsupported("image"))),
             Content::ToolCall(_) => {
-                return Err(internal_msg(&result_block_unsupported("toolCall")))
+                return Err(internal_msg(&result_block_unsupported("toolCall")));
             }
         }
     }
@@ -370,13 +381,11 @@ fn convert_assistant_result(message: &AssistantMessage) -> Result<CreateMessageR
     // `SamplingMessage` is `#[non_exhaustive]`; `assistant_text` is rmcp's own constructor for
     // exactly this shape — role `Assistant`, one text block — so it stays correct if the struct
     // grows a field.
-    Ok(
-        CreateMessageResult::new(
-            SamplingMessage::assistant_text(text),
-            format!("{}/{}", message.provider.as_str(), message.model),
-        )
-        .with_stop_reason(stop_reason),
+    Ok(CreateMessageResult::new(
+        SamplingMessage::assistant_text(text),
+        format!("{}/{}", message.provider.as_str(), message.model),
     )
+    .with_stop_reason(stop_reason))
 }
 
 /// `resolveSamplingModel`'s candidate assembly (`sampling-handler.ts:135-154`) with
@@ -442,9 +451,12 @@ async fn resolve_sampling_model(
         .and_then(|preferences| preferences.hints.as_ref())
         .map(|hints| hints.iter().filter_map(|hint| hint.name.clone()).collect())
         .unwrap_or_default();
-    let current = options
-        .current_model()
-        .and_then(|id| available.iter().find(|model| model.id.as_str() == id).cloned());
+    let current = options.current_model().and_then(|id| {
+        available
+            .iter()
+            .find(|model| model.id.as_str() == id)
+            .cloned()
+    });
     let candidates = sampling_candidates(&available, &hints, current.as_ref());
 
     let mut errors: Vec<String> = Vec::new();
@@ -484,7 +496,7 @@ async fn resolve_sampling_model(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, deprecated)]
 mod tests {
     use super::*;
-    use cyrup_provider::{ModelCost, Modality};
+    use cyrup_provider::{Modality, ModelCost};
 
     fn model(provider: &str, id: &str, name: &str) -> Model {
         Model {
@@ -534,7 +546,11 @@ mod tests {
         let available = vec![model("a", "one", "First"), model("b", "two", "Second")];
         let current = model("b", "two", "Second");
         let got = sampling_candidates(&available, &["two".to_string()], Some(&current));
-        assert_eq!(names(&got), vec!["b/two", "a/one"], "no duplicate, no reorder");
+        assert_eq!(
+            names(&got),
+            vec!["b/two", "a/one"],
+            "no duplicate, no reorder"
+        );
     }
 
     /// `if (!normalizedHint) continue;` — an empty or whitespace-only hint matches NOTHING, where a
@@ -608,7 +624,10 @@ mod tests {
             let result = convert_assistant_result(&assistant(reason, vec![text("hi")]))
                 .expect("a text block converts");
             assert_eq!(result.stop_reason.as_deref(), Some(expected));
-            assert_eq!(result.model, "p/m", "`provider/model`, as upstream sends it");
+            assert_eq!(
+                result.model, "p/m",
+                "`provider/model`, as upstream sends it"
+            );
         }
     }
 
@@ -653,7 +672,11 @@ mod tests {
             }],
         );
         let error = convert_assistant_result(&message).expect_err("no text is fatal");
-        assert!(error.message.contains(SAMPLING_RESULT_EMPTY), "got {}", error.message);
+        assert!(
+            error.message.contains(SAMPLING_RESULT_EMPTY),
+            "got {}",
+            error.message
+        );
     }
 
     /// `:234` / `:237` — the provider's own message wins, and the constant is the fallback.

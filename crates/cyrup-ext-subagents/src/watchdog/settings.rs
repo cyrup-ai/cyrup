@@ -94,7 +94,9 @@ pub fn default_watchdog_config() -> ResolvedWatchdogConfig {
             stalemate_repeats: 3,
         },
         scope: WatchdogScopeConfig { enabled: true },
-        cadence: WatchdogCadenceConfig { every_n_tools: None },
+        cadence: WatchdogCadenceConfig {
+            every_n_tools: None,
+        },
         main: WatchdogEndpointConfig {
             enabled: false,
             model: None,
@@ -454,7 +456,8 @@ fn parse_endpoint_like_patch(
     })?;
     take(input, &mut patch, "thinking", |v| {
         let thinking = parse_thinking(v, &format!("{field}.thinking"), meta)?;
-        serde_json::to_value(thinking).map_err(|e| meta.invalid(&format!("{field}.thinking"), &e.to_string()))
+        serde_json::to_value(thinking)
+            .map_err(|e| meta.invalid(&format!("{field}.thinking"), &e.to_string()))
     })?;
     Ok(Value::Object(patch))
 }
@@ -472,7 +475,8 @@ fn parse_children_patch(value: &Value, field: &str, meta: &ParseMeta) -> Result<
     })?;
     take(input, &mut patch, "thinking", |v| {
         let thinking = parse_thinking(v, &format!("{field}.thinking"), meta)?;
-        serde_json::to_value(thinking).map_err(|e| meta.invalid(&format!("{field}.thinking"), &e.to_string()))
+        serde_json::to_value(thinking)
+            .map_err(|e| meta.invalid(&format!("{field}.thinking"), &e.to_string()))
     })?;
     take(input, &mut patch, "watchdogTailTimeoutMs", |v| {
         parse_integer(
@@ -492,10 +496,9 @@ fn parse_children_patch(value: &Value, field: &str, meta: &ParseMeta) -> Result<
         let mut parsed = Map::new();
         for (agent, override_value) in overrides {
             if agent.trim().is_empty() {
-                return Err(meta.invalid(
-                    &format!("{field}.overrides"),
-                    "agent names to be non-empty",
-                ));
+                return Err(
+                    meta.invalid(&format!("{field}.overrides"), "agent names to be non-empty")
+                );
             }
             parsed.insert(
                 agent.clone(),
@@ -580,7 +583,10 @@ fn parse_watchdog_patch(value: &Value, field: &str, meta: &ParseMeta) -> Result<
         parse_boolean(v, &format!("{field}.enabled"), meta).map(Value::from)
     })?;
     take(input, &mut patch, "delivery", |v| {
-        let values: Vec<&str> = WatchdogDeliveryMode::ALL.iter().map(|d| d.as_str()).collect();
+        let values: Vec<&str> = WatchdogDeliveryMode::ALL
+            .iter()
+            .map(|d| d.as_str())
+            .collect();
         parse_enum(v, &format!("{field}.delivery"), meta, &values).map(Value::from)
     })?;
     take(input, &mut patch, "showDuringRun", |v| {
@@ -757,7 +763,9 @@ pub fn get_watchdog_user_settings_path() -> PathBuf {
 fn find_project_settings_path(cwd: &Path) -> Option<PathBuf> {
     let mut current = cwd.to_path_buf();
     loop {
-        if is_directory(&crate::paths::project_config_dir(&current)) || is_directory(&current.join(".agents")) {
+        if is_directory(&crate::paths::project_config_dir(&current))
+            || is_directory(&current.join(".agents"))
+        {
             return Some(crate::paths::project_config_dir(&current).join("settings.json"));
         }
         let parent = current.parent()?.to_path_buf();
@@ -852,20 +860,12 @@ pub fn resolve_watchdog_config_strict(
     session: Option<&Value>,
 ) -> Result<ResolvedWatchdogConfig, String> {
     let mut patch = Value::Object(Map::new());
-    patch = deep_merge(
-        &patch,
-        &parse_source_file(&user_settings_path())?,
-    );
+    patch = deep_merge(&patch, &parse_source_file(&user_settings_path())?);
     if let Some(project_path) = find_project_settings_path(cwd) {
-        patch = deep_merge(
-            &patch,
-            &parse_source_file(&project_path)?,
-        );
+        patch = deep_merge(&patch, &parse_source_file(&project_path)?);
     }
     if let Some(session) = session {
-        let meta = ParseMeta {
-            path: None,
-        };
+        let meta = ParseMeta { path: None };
         patch = deep_merge(&patch, &parse_session_override(session, &meta)?);
     }
     Ok(resolve_patch(&patch))
@@ -909,9 +909,7 @@ pub fn resolve_watchdog_config(cwd: &Path, session: Option<&Value>) -> WatchdogS
             path: None,
             exists: true,
         });
-        let meta = ParseMeta {
-            path: None,
-        };
+        let meta = ParseMeta { path: None };
         match parse_session_override(session, &meta) {
             Ok(layer) => patch = deep_merge(&patch, &layer),
             Err(message) => errors.push(WatchdogSettingsError {
@@ -1035,7 +1033,11 @@ fn write_settings_file(settings_path: &Path, settings: &Value) -> Result<PathBuf
 /// The read-modify-write body shared by both writers: read strictly, dig/create
 /// `subagents.watchdog` (`ensureWatchdogSettings`, `settings.ts:490-493`), let `edit` mutate it,
 /// write back.
-fn edit_watchdog_settings<F>(settings_path: &Path, meta: &ParseMeta, edit: F) -> Result<PathBuf, String>
+fn edit_watchdog_settings<F>(
+    settings_path: &Path,
+    meta: &ParseMeta,
+    edit: F,
+) -> Result<PathBuf, String>
 where
     F: FnOnce(&mut Map<String, Value>, &ParseMeta) -> Result<(), String>,
 {
@@ -1110,7 +1112,9 @@ pub fn write_user_watchdog_enabled(enabled: bool) -> Result<PathBuf, String> {
 ///
 /// # Errors
 /// An unreadable/unparseable settings file, an empty agent name, or a write failure.
-pub fn write_watchdog_model_settings(input: &WatchdogModelSettingsWrite) -> Result<PathBuf, String> {
+pub fn write_watchdog_model_settings(
+    input: &WatchdogModelSettingsWrite,
+) -> Result<PathBuf, String> {
     let settings_path = settings_path_for_write(input.scope, input.cwd.as_deref());
     let meta = ParseMeta {
         path: Some(settings_path.display().to_string()),
@@ -1153,9 +1157,7 @@ mod tests {
     use serde_json::json;
 
     fn meta() -> ParseMeta {
-        ParseMeta {
-            path: None,
-        }
+        ParseMeta { path: None }
     }
 
     fn file_meta() -> ParseMeta {
@@ -1244,18 +1246,22 @@ mod tests {
 
     #[test]
     fn the_cadence_floor_is_five_not_one() {
-        assert!(parse_watchdog_patch(
-            &json!({ "cadence": { "everyNTools": 4 } }),
-            "subagents.watchdog",
-            &meta()
-        )
-        .is_err());
-        assert!(parse_watchdog_patch(
-            &json!({ "cadence": { "everyNTools": 5 } }),
-            "subagents.watchdog",
-            &meta()
-        )
-        .is_ok());
+        assert!(
+            parse_watchdog_patch(
+                &json!({ "cadence": { "everyNTools": 4 } }),
+                "subagents.watchdog",
+                &meta()
+            )
+            .is_err()
+        );
+        assert!(
+            parse_watchdog_patch(
+                &json!({ "cadence": { "everyNTools": 5 } }),
+                "subagents.watchdog",
+                &meta()
+            )
+            .is_ok()
+        );
         // `null` is the "boundary only" setting and is always allowed.
         let config = resolve_patch(
             &parse_watchdog_patch(
@@ -1296,18 +1302,22 @@ mod tests {
 
     #[test]
     fn max_diagnostics_alone_accepts_zero() {
-        assert!(parse_watchdog_patch(
-            &json!({ "lsp": { "maxDiagnostics": 0 } }),
-            "subagents.watchdog",
-            &meta()
-        )
-        .is_ok());
-        assert!(parse_watchdog_patch(
-            &json!({ "lsp": { "maxFiles": 0 } }),
-            "subagents.watchdog",
-            &meta()
-        )
-        .is_err());
+        assert!(
+            parse_watchdog_patch(
+                &json!({ "lsp": { "maxDiagnostics": 0 } }),
+                "subagents.watchdog",
+                &meta()
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_watchdog_patch(
+                &json!({ "lsp": { "maxFiles": 0 } }),
+                "subagents.watchdog",
+                &meta()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1328,14 +1338,22 @@ mod tests {
             &meta(),
         )
         .unwrap();
-        assert_eq!(resolve_patch(&patch).main.thinking, Some(ThinkingSetting::Off));
+        assert_eq!(
+            resolve_patch(&patch).main.thinking,
+            Some(ThinkingSetting::Off)
+        );
         let error = parse_watchdog_patch(
             &json!({ "main": { "thinking": "false" } }),
             "subagents.watchdog",
             &meta(),
         )
         .unwrap_err();
-        assert!(error.contains("'off' or 'minimal' or 'low' or 'medium' or 'high' or 'xhigh' or 'max' or false"), "{error}");
+        assert!(
+            error.contains(
+                "'off' or 'minimal' or 'low' or 'medium' or 'high' or 'xhigh' or 'max' or false"
+            ),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1354,12 +1372,14 @@ mod tests {
 
     #[test]
     fn a_blank_model_string_is_rejected() {
-        assert!(parse_watchdog_patch(
-            &json!({ "main": { "model": "   " } }),
-            "subagents.watchdog",
-            &meta()
-        )
-        .is_err());
+        assert!(
+            parse_watchdog_patch(
+                &json!({ "main": { "model": "   " } }),
+                "subagents.watchdog",
+                &meta()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1405,19 +1425,22 @@ mod tests {
         let patch =
             parse_watchdog_patch(&json!({ "syncBacklog": 4 }), "subagents.watchdog", &meta())
                 .unwrap();
-        assert_eq!(resolve_patch(&patch).sync_backlog, WatchdogSyncBacklog::Count(4));
-        assert!(parse_watchdog_patch(
-            &json!({ "syncBacklog": 0 }),
-            "subagents.watchdog",
-            &meta()
-        )
-        .is_err());
-        assert!(parse_watchdog_patch(
-            &json!({ "syncBacklog": "on" }),
-            "subagents.watchdog",
-            &meta()
-        )
-        .is_err());
+        assert_eq!(
+            resolve_patch(&patch).sync_backlog,
+            WatchdogSyncBacklog::Count(4)
+        );
+        assert!(
+            parse_watchdog_patch(&json!({ "syncBacklog": 0 }), "subagents.watchdog", &meta())
+                .is_err()
+        );
+        assert!(
+            parse_watchdog_patch(
+                &json!({ "syncBacklog": "on" }),
+                "subagents.watchdog",
+                &meta()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1426,15 +1449,18 @@ mod tests {
             &json!({ "a": 1, "nested": { "x": 1, "y": 2 } }),
             &json!({ "a": 2, "nested": { "y": 3, "z": 4 } }),
         );
-        assert_eq!(merged, json!({ "a": 2, "nested": { "x": 1, "y": 3, "z": 4 } }));
+        assert_eq!(
+            merged,
+            json!({ "a": 2, "nested": { "x": 1, "y": 3, "z": 4 } })
+        );
     }
 
     #[test]
     fn a_settings_file_without_the_watchdog_key_contributes_nothing() {
         let patch = parse_settings_object(&json!({ "theme": "dark" }), &file_meta()).unwrap();
         assert_eq!(patch, json!({}));
-        let patch = parse_settings_object(&json!({ "subagents": { "other": 1 } }), &file_meta())
-            .unwrap();
+        let patch =
+            parse_settings_object(&json!({ "subagents": { "other": 1 } }), &file_meta()).unwrap();
         assert_eq!(patch, json!({}));
     }
 
@@ -1493,13 +1519,20 @@ mod tests {
         assert!(!error.is_empty());
 
         let lenient = resolve_watchdog_config(&fx.project, None);
-        assert!(!lenient.ok, "the same layer fails for the lenient variant too");
+        assert!(
+            !lenient.ok,
+            "the same layer fails for the lenient variant too"
+        );
         assert!(!lenient.errors.is_empty());
         // Same failure, one propagated and one recorded.
         assert!(
             lenient.errors.iter().any(|e| e.message == error),
             "strict error {error:?} must be one the lenient variant recorded: {:?}",
-            lenient.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+            lenient
+                .errors
+                .iter()
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
         );
         // …and the lenient one still hands back a usable config; the strict one hands back none.
         assert_eq!(lenient.config, default_watchdog_config());
@@ -1557,7 +1590,10 @@ mod tests {
         let path = root.path().join("settings.json");
         std::fs::write(&path, "{ not json").expect("write");
         let error = read_settings_file_strict(&path).unwrap_err();
-        assert!(error.starts_with("Failed to parse settings file '"), "{error}");
+        assert!(
+            error.starts_with("Failed to parse settings file '"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1576,7 +1612,8 @@ mod tests {
             path: Some(path.display().to_string()),
         };
         edit_watchdog_settings(&path, &meta, |watchdog, meta| {
-            let target = target_settings_object(watchdog, &WatchdogModelSettingsTarget::Main, meta)?;
+            let target =
+                target_settings_object(watchdog, &WatchdogModelSettingsTarget::Main, meta)?;
             target.insert("model".to_string(), json!("anthropic/opus"));
             Ok(())
         })
@@ -1590,7 +1627,9 @@ mod tests {
             json!("anthropic/opus")
         );
         assert!(
-            std::fs::read_to_string(&path).expect("read").ends_with("\n"),
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .ends_with("\n"),
             "trailing newline"
         );
     }
@@ -1608,7 +1647,8 @@ mod tests {
             path: Some(path.display().to_string()),
         };
         edit_watchdog_settings(&path, &meta, |watchdog, meta| {
-            let target = target_settings_object(watchdog, &WatchdogModelSettingsTarget::Main, meta)?;
+            let target =
+                target_settings_object(watchdog, &WatchdogModelSettingsTarget::Main, meta)?;
             target.remove("model");
             Ok(())
         })
@@ -1631,7 +1671,10 @@ mod tests {
             path: Some(path.display().to_string()),
         };
         let error = edit_watchdog_settings(&path, &meta, |_, _| Ok(())).unwrap_err();
-        assert!(error.starts_with("Failed to parse settings file '"), "{error}");
+        assert!(
+            error.starts_with("Failed to parse settings file '"),
+            "{error}"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
             "{oops",
@@ -1721,7 +1764,10 @@ mod tests {
             sources: Vec::new(),
         };
         assert!(!result.ok);
-        assert!(!result.config.enabled, "a broken config disables the watchdog");
+        assert!(
+            !result.config.enabled,
+            "a broken config disables the watchdog"
+        );
     }
 
     #[test]

@@ -113,7 +113,12 @@ where
                     break;
                 }
             }
-            let taken = this.shared.final_value.lock().ok().and_then(|mut g| g.take());
+            let taken = this
+                .shared
+                .final_value
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take());
             taken.unwrap_or_else(|| (this.shared.fallback)())
         }
     }
@@ -139,8 +144,15 @@ pub fn finalizing_channel<T, F>(
         final_value: Mutex::new(None),
     });
     let (tx, rx) = mpsc::unbounded_channel();
-    let sink = FinalizingSink { tx: Some(tx), shared: shared.clone(), done: false };
-    let stream = FinalizingStream { rx: UnboundedReceiverStream::new(rx), shared };
+    let sink = FinalizingSink {
+        tx: Some(tx),
+        shared: shared.clone(),
+        done: false,
+    };
+    let stream = FinalizingStream {
+        rx: UnboundedReceiverStream::new(rx),
+        shared,
+    };
     (sink, stream)
 }
 

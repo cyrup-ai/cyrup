@@ -22,16 +22,21 @@
 //! makes at main.rs:157) → the bin's `Cli::to_session_config` → `SessionBuilder` → `AgentSession` over
 //! a real `FauxProvider` and real cyrup-resources discovery. On PRE-FIX code both the config assertion
 //! and the skill-load assertion fail; POST-FIX both pass.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use clap::Parser;
 use crate::{AppMode, Cli};
+use clap::Parser;
 use cyrup_config::{CliConfigOverrides, ConfigDirs, EnvVars};
-use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use cyrup_resources::{InstallScope, PackageManager, PackageSource, PackageStore};
 use cyrup_sdk::core::CancelToken;
 use cyrup_session_svc::SessionBuilder;
@@ -50,7 +55,10 @@ fn skill_md(name: &str, description: &str) -> String {
 
 /// A package tree with one skill (`alpha`) declared under `cyrup.toml` — the minimal faithful package.
 fn make_package_tree(dir: &Path) {
-    write(&dir.join("skills/alpha/SKILL.md"), &skill_md("alpha", "alpha skill"));
+    write(
+        &dir.join("skills/alpha/SKILL.md"),
+        &skill_md("alpha", "alpha skill"),
+    );
     write(
         &dir.join("cyrup.toml"),
         "[package]\nname = \"pack\"\nversion = \"0.1.0\"\n\n\
@@ -75,7 +83,12 @@ fn fixture() -> Fx {
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
     std::fs::create_dir_all(&custom_package_dir).unwrap();
-    Fx { _tmp: tmp, cwd, agent_dir, custom_package_dir }
+    Fx {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+        custom_package_dir,
+    }
 }
 
 /// THE headline proof: a GLOBAL-scope package recorded by the real `install` path into a CUSTOM
@@ -98,7 +111,9 @@ async fn custom_package_dir_install_loads_into_assembled_session() {
     let store = PackageStore::new(fx.custom_package_dir.clone(), Some(fx.cwd.clone()));
     let mgr = PackageManager::new(store);
     mgr.install(
-        PackageSource::Path { path: pkg_src.clone() },
+        PackageSource::Path {
+            path: pkg_src.clone(),
+        },
         InstallScope::Global,
         true,
         CancelToken::new(),
@@ -119,7 +134,10 @@ async fn custom_package_dir_install_loads_into_assembled_session() {
     // `ConfigDirs::resolve` says so with an error rather than quietly consulting the developer's
     // real one. This test is about the `--package-dir` slot, so it states a home and gets the same
     // answer on every machine.
-    let env = EnvVars { home: Some(fx.agent_dir.clone()), ..EnvVars::default() };
+    let env = EnvVars {
+        home: Some(fx.agent_dir.clone()),
+        ..EnvVars::default()
+    };
     let dirs = ConfigDirs::resolve(&overrides, &env).unwrap();
     // Sanity: the resolved package dir is the CUSTOM dir and is genuinely distinct from the default the
     // pre-fix code fell back to — otherwise the test could pass for the wrong reason.
@@ -145,7 +163,10 @@ async fn custom_package_dir_install_loads_into_assembled_session() {
 
     // Assemble the REAL session and prove the custom-dir install loads.
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux, config).build().await.expect("build");
+    let session = SessionBuilder::new(faux, config)
+        .build()
+        .await
+        .expect("build");
 
     let res = session.resources();
     assert!(

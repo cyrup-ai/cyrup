@@ -20,7 +20,11 @@ pub const MAX_VISIBLE: usize = 8;
 /// The `name (id) [tags]` title for a session (pi `sessionTitle`, `session-list.ts:36-42`).
 #[must_use]
 pub fn session_title(session: &SessionInfo, is_self: bool, same_cwd: bool) -> String {
-    let name = session.name.as_deref().filter(|n| !n.is_empty()).unwrap_or("Unnamed session");
+    let name = session
+        .name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .unwrap_or("Unnamed session");
     let mut tags: Vec<&str> = Vec::new();
     if is_self {
         tags.push("self");
@@ -28,7 +32,11 @@ pub fn session_title(session: &SessionInfo, is_self: bool, same_cwd: bool) -> St
     if same_cwd {
         tags.push("same cwd");
     }
-    let suffix = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
+    let suffix = if tags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", tags.join(", "))
+    };
     format!("{name} ({}){suffix}", short_session_id(&session.id))
 }
 
@@ -62,7 +70,12 @@ impl SessionListOverlay {
     /// A picker over `sessions` (the OTHER sessions), with `current_session` shown at the top.
     #[must_use]
     pub fn new(current_session: SessionInfo, sessions: Vec<SessionInfo>) -> Self {
-        Self { current_session, sessions, selected_index: 0, max_visible: MAX_VISIBLE }
+        Self {
+            current_session,
+            sessions,
+            selected_index: 0,
+            max_visible: MAX_VISIBLE,
+        }
     }
 
     /// The currently-highlighted session, if any.
@@ -81,11 +94,19 @@ impl SessionListOverlay {
         }
         let last = self.sessions.len() - 1;
         if keybindings.matches(data, "tui.select.up") {
-            self.selected_index = if self.selected_index == 0 { last } else { self.selected_index - 1 };
+            self.selected_index = if self.selected_index == 0 {
+                last
+            } else {
+                self.selected_index - 1
+            };
             return SessionListAction::Redraw;
         }
         if keybindings.matches(data, "tui.select.down") {
-            self.selected_index = if self.selected_index == last { 0 } else { self.selected_index + 1 };
+            self.selected_index = if self.selected_index == last {
+                0
+            } else {
+                self.selected_index + 1
+            };
             return SessionListAction::Redraw;
         }
         if keybindings.matches(data, "tui.select.confirm")
@@ -111,7 +132,12 @@ impl SessionListOverlay {
     /// Render the overlay to `width` display columns (pi `SessionListOverlay.render`). Inner width is
     /// clamped to [`SESSION_LIST_MAX_WIDTH`]; every line is exactly `min(width, 88)` columns.
     #[must_use]
-    pub fn render(&self, theme: &dyn Theme, keybindings: &dyn Keybindings, width: usize) -> Vec<String> {
+    pub fn render(
+        &self,
+        theme: &dyn Theme,
+        keybindings: &dyn Keybindings,
+        width: usize,
+    ) -> Vec<String> {
         let inner_width = width.clamp(1, SESSION_LIST_MAX_WIDTH);
         if inner_width == 1 {
             return vec![theme.fg("accent", "│")];
@@ -125,10 +151,17 @@ impl SessionListOverlay {
         );
         let row = |text: &str| box_row(theme, content_width, text);
         let rule = |left: char, right: char| {
-            theme.fg("accent", &format!("{left}{}{right}", "─".repeat(content_width)))
+            theme.fg(
+                "accent",
+                &format!("{left}{}{right}", "─".repeat(content_width)),
+            )
         };
         let path_line = |session: &SessionInfo| {
-            format!("{} • {}", middle_truncate(&session.cwd, path_width), session.model)
+            format!(
+                "{} • {}",
+                middle_truncate(&session.cwd, path_width),
+                session.model
+            )
         };
 
         let mut lines: Vec<String> = Vec::new();
@@ -136,24 +169,42 @@ impl SessionListOverlay {
         lines.push(row(&theme.bold(" Current Session")));
         lines.push(rule('├', '┤'));
         lines.push(row(""));
-        lines.push(row(&format!("  {}", theme.fg("dim", &session_title(&self.current_session, true, false)))));
-        lines.push(row(&format!("  {}", theme.fg("dim", &path_line(&self.current_session)))));
+        lines.push(row(&format!(
+            "  {}",
+            theme.fg("dim", &session_title(&self.current_session, true, false))
+        )));
+        lines.push(row(&format!(
+            "  {}",
+            theme.fg("dim", &path_line(&self.current_session))
+        )));
         lines.push(row(""));
         lines.push(rule('├', '┤'));
         lines.push(row(&theme.bold(" Other Sessions")));
         lines.push(row(""));
 
         if self.sessions.is_empty() {
-            lines.push(row(&theme.fg("dim", " No other intercom-connected sessions")));
+            lines.push(row(
+                &theme.fg("dim", " No other intercom-connected sessions")
+            ));
         } else {
             let (start, end) = self.window();
             for index in start..end {
-                let Some(session) = self.sessions.get(index) else { continue };
+                let Some(session) = self.sessions.get(index) else {
+                    continue;
+                };
                 let is_selected = index == self.selected_index;
                 let same_cwd = session.cwd == self.current_session.cwd;
-                let prefix = if is_selected { theme.fg("accent", "→ ") } else { "  ".to_string() };
+                let prefix = if is_selected {
+                    theme.fg("accent", "→ ")
+                } else {
+                    "  ".to_string()
+                };
                 let title = session_title(session, false, same_cwd);
-                let title = if is_selected { theme.fg("accent", &title) } else { title };
+                let title = if is_selected {
+                    theme.fg("accent", &title)
+                } else {
+                    title
+                };
                 lines.push(row(&format!("{prefix}{title}")));
                 lines.push(row(&format!("  {}", theme.fg("dim", &path_line(session)))));
                 if index < end - 1 {
@@ -162,7 +213,10 @@ impl SessionListOverlay {
             }
             if start > 0 || end < self.sessions.len() {
                 lines.push(row(""));
-                lines.push(row(&theme.fg("dim", &format!(" {}/{}", self.selected_index + 1, self.sessions.len()))));
+                lines.push(row(&theme.fg(
+                    "dim",
+                    &format!(" {}/{}", self.selected_index + 1, self.sessions.len()),
+                )));
             }
         }
 
@@ -178,7 +232,12 @@ impl SessionListOverlay {
 fn box_row(theme: &dyn Theme, content_width: usize, text: &str) -> String {
     let clipped = truncate_to_width(text, content_width);
     let pad = content_width.saturating_sub(visible_width(&clipped));
-    format!("{}{clipped}{}{}", theme.fg("accent", "│"), " ".repeat(pad), theme.fg("accent", "│"))
+    format!(
+        "{}{clipped}{}{}",
+        theme.fg("accent", "│"),
+        " ".repeat(pad),
+        theme.fg("accent", "│")
+    )
 }
 
 #[cfg(test)]
@@ -231,7 +290,11 @@ mod tests {
             let lines = overlay.render(&PlainTheme, &MockKeybindings, width);
             assert!(!lines.is_empty());
             for (i, line) in lines.iter().enumerate() {
-                assert_eq!(visible_width(line), width, "width {width} line {i}: {line:?}");
+                assert_eq!(
+                    visible_width(line),
+                    width,
+                    "width {width} line {i}: {line:?}"
+                );
             }
         }
     }
@@ -244,7 +307,10 @@ mod tests {
         let b = session("bbbb2222", "bob");
         let mut overlay = SessionListOverlay::new(current, vec![a.clone(), b.clone()]);
         // Down moves to bob.
-        assert_eq!(overlay.handle_input(&kb, "\x1b[B"), SessionListAction::Redraw);
+        assert_eq!(
+            overlay.handle_input(&kb, "\x1b[B"),
+            SessionListAction::Redraw
+        );
         assert_eq!(overlay.selected().map(|s| s.id.as_str()), Some("bbbb2222"));
         // Down again wraps to alice.
         overlay.handle_input(&kb, "\x1b[B");
@@ -253,7 +319,10 @@ mod tests {
         overlay.handle_input(&kb, "\x1b[A");
         assert_eq!(overlay.selected().map(|s| s.id.as_str()), Some("bbbb2222"));
         // Enter selects the highlighted session.
-        assert_eq!(overlay.handle_input(&kb, "\r"), SessionListAction::Select(Box::new(b)));
+        assert_eq!(
+            overlay.handle_input(&kb, "\r"),
+            SessionListAction::Select(Box::new(b))
+        );
         // Esc cancels.
         assert_eq!(overlay.handle_input(&kb, "\x1b"), SessionListAction::Cancel);
     }
@@ -270,7 +339,10 @@ mod tests {
     fn session_title_tags_self_and_same_cwd() {
         let s = session("abcdef1234", "worker");
         assert_eq!(session_title(&s, true, false), "worker (abcdef12) [self]");
-        assert_eq!(session_title(&s, false, true), "worker (abcdef12) [same cwd]");
+        assert_eq!(
+            session_title(&s, false, true),
+            "worker (abcdef12) [same cwd]"
+        );
         assert_eq!(session_title(&s, false, false), "worker (abcdef12)");
     }
 }

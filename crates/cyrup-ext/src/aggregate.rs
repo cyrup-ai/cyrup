@@ -42,13 +42,15 @@ pub fn parse_trust_decision(v: &serde_json::Value) -> Option<bool> {
 /// Fold the collected `project_trust` handled values into a decision: the FIRST extension that
 /// returns a DECIDED tri-state (`"yes"`/`"no"`) wins (Pi runner.ts:197-227); `"undecided"` handlers
 /// fall through. `None` = no extension decided (the host falls back to its own trust prompt).
-pub fn fold_project_trust(
-    handled: &[(ExtensionId, HandledValue)],
-) -> Option<ProjectTrustDecision> {
+pub fn fold_project_trust(handled: &[(ExtensionId, HandledValue)]) -> Option<ProjectTrustDecision> {
     for (id, HandledValue(v)) in handled {
         if let Some(trusted) = parse_trust_decision(v) {
             let remember = v.get("remember").and_then(|r| r.as_bool()).unwrap_or(false);
-            return Some(ProjectTrustDecision { trusted, remember, by: id.clone() });
+            return Some(ProjectTrustDecision {
+                trusted,
+                remember,
+                by: id.clone(),
+            });
         }
     }
     None
@@ -109,7 +111,10 @@ fn append_attributed(
     if let Some(arr) = field.and_then(|v| v.as_array()) {
         for item in arr {
             if let Some(s) = item.as_str() {
-                dst.push(AttributedPath { path: s.to_string(), extension: id.clone() });
+                dst.push(AttributedPath {
+                    path: s.to_string(),
+                    extension: id.clone(),
+                });
             }
         }
     }

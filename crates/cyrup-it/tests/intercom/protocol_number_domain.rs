@@ -37,7 +37,12 @@
 //! far side an integer and a `-1` must come out `-1`, because pi's broker object-spreads what it
 //! was handed (`v0.9.2 broker/broker.ts:672-676`) and a lossy widening would be its own divergence.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -46,10 +51,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::common::Broker;
 use cyrup_intercom::transport::client::{InboundEvent, IntercomClient};
 use cyrup_intercom::transport::framing::{FrameReader, encode_json};
 use cyrup_intercom::transport::protocol::{SessionRegistration, now_ms};
-use crate::common::Broker;
 
 /// JSON numbers a `u32`/`u64` field cannot hold, every one of which passes `typeof x === "number"`.
 ///
@@ -97,7 +102,9 @@ struct RawClient {
 impl RawClient {
     async fn connect(socket: &Path) -> Self {
         Self {
-            stream: UnixStream::connect(socket).await.expect("connect to the broker socket"),
+            stream: UnixStream::connect(socket)
+                .await
+                .expect("connect to the broker socket"),
             reader: FrameReader::new(),
             queued: VecDeque::new(),
             buf: vec![0u8; 16 * 1024],
@@ -119,9 +126,13 @@ impl RawClient {
                 Ok(Ok(0) | Err(_)) => return None,
                 Ok(Ok(n)) => n,
             };
-            let frames = self.reader.push(&self.buf[..n]).expect("broker frames are well-formed");
+            let frames = self
+                .reader
+                .push(&self.buf[..n])
+                .expect("broker frames are well-formed");
             for payload in frames {
-                self.queued.push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
+                self.queued
+                    .push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
             }
         }
     }
@@ -158,7 +169,10 @@ impl RawClient {
 
     async fn register(&mut self, session_id: &str) {
         self.register_with(session_id, &serde_json::json!({})).await;
-        assert_eq!(self.expect_frame("registered").await["sessionId"], session_id);
+        assert_eq!(
+            self.expect_frame("registered").await["sessionId"],
+            session_id
+        );
     }
 
     /// Assert the broker destroyed this connection. A `list` is queued first so a broker that
@@ -180,14 +194,19 @@ impl RawClient {
 
     /// Assert the broker did NOT destroy this connection.
     async fn assert_alive(&mut self, what: &str) {
-        self.send(&serde_json::json!({ "type": "list", "requestId": "alive" })).await;
+        self.send(&serde_json::json!({ "type": "list", "requestId": "alive" }))
+            .await;
         let frame = self.expect_frame("sessions").await;
-        assert_eq!(frame["requestId"], "alive", "the broker must keep serving after {what}");
+        assert_eq!(
+            frame["requestId"], "alive",
+            "the broker must keep serving after {what}"
+        );
     }
 
     /// The `sessions[]` entry for `session_id` from a fresh `list`.
     async fn list_entry(&mut self, session_id: &str) -> serde_json::Value {
-        self.send(&serde_json::json!({ "type": "list", "requestId": "entry" })).await;
+        self.send(&serde_json::json!({ "type": "list", "requestId": "entry" }))
+            .await;
         let frame = self.expect_frame("sessions").await;
         frame["sessions"]
             .as_array()
@@ -209,14 +228,16 @@ async fn register_accepts_every_json_number_for_pid_started_at_and_last_activity
         for value in js_numbers() {
             let id = format!("reg-{key}-{value}");
             let mut c = RawClient::connect(&broker.socket).await;
-            c.register_with(&id, &serde_json::json!({ key: value.clone() })).await;
+            c.register_with(&id, &serde_json::json!({ key: value.clone() }))
+                .await;
             let ack = c.next_frame_within(Duration::from_secs(5)).await;
             assert_eq!(
                 ack.as_ref().map(|f| f["type"].clone()),
                 Some(serde_json::json!("registered")),
                 "`register` with `{key}` = {value} must be accepted, as pi accepts it; got {ack:?}"
             );
-            c.assert_alive(&format!("`register.session.{key}` = {value}")).await;
+            c.assert_alive(&format!("`register.session.{key}` = {value}"))
+                .await;
         }
     }
 }
@@ -237,17 +258,27 @@ async fn a_js_number_registration_relays_losslessly_to_peers() {
         &serde_json::json!({ "pid": -1, "startedAt": 1.5, "lastActivity": 4_294_967_296i64 }),
     )
     .await;
-    assert_eq!(c.expect_frame("registered").await["sessionId"], "odd-numbers-session");
+    assert_eq!(
+        c.expect_frame("registered").await["sessionId"],
+        "odd-numbers-session"
+    );
 
     let joined = observer.expect_frame("session_joined").await;
     assert_eq!(joined["session"]["id"], "odd-numbers-session");
-    assert_eq!(joined["session"]["pid"], serde_json::json!(-1), "a -1 pid must relay as -1");
+    assert_eq!(
+        joined["session"]["pid"],
+        serde_json::json!(-1),
+        "a -1 pid must relay as -1"
+    );
     assert_eq!(
         joined["session"]["startedAt"],
         serde_json::json!(1.5),
         "a fractional startedAt must relay unrounded"
     );
-    assert_eq!(joined["session"]["lastActivity"], serde_json::json!(4_294_967_296i64));
+    assert_eq!(
+        joined["session"]["lastActivity"],
+        serde_json::json!(4_294_967_296i64)
+    );
 
     let entry = observer.list_entry("odd-numbers-session").await;
     assert_eq!(entry["pid"], serde_json::json!(-1));
@@ -269,7 +300,10 @@ async fn register_still_serves_ordinary_integer_registrations() {
         &serde_json::json!({ "pid": 4321, "startedAt": 1_700_000_000_000i64, "lastActivity": 1_700_000_000_001i64 }),
     )
     .await;
-    assert_eq!(c.expect_frame("registered").await["sessionId"], "ordinary-session");
+    assert_eq!(
+        c.expect_frame("registered").await["sessionId"],
+        "ordinary-session"
+    );
 
     let joined = observer.expect_frame("session_joined").await;
     let raw = serde_json::to_string(&joined["session"]).expect("re-serializes");
@@ -287,8 +321,13 @@ async fn register_with_a_non_number_pid_still_destroys_the_connection() {
     let broker = Broker::start().await;
     for value in non_numbers() {
         let mut c = RawClient::connect(&broker.socket).await;
-        c.register_with("bad-pid-session", &serde_json::json!({ "pid": value.clone() })).await;
-        c.assert_destroyed(&format!("`register.session.pid` = {value}")).await;
+        c.register_with(
+            "bad-pid-session",
+            &serde_json::json!({ "pid": value.clone() }),
+        )
+        .await;
+        c.assert_destroyed(&format!("`register.session.pid` = {value}"))
+            .await;
     }
 }
 
@@ -305,7 +344,12 @@ async fn send_accepts_every_json_number_and_acks_with_the_real_message_id() {
     alpha.register("alpha").await;
     let _ = beta.expect_frame("session_joined").await;
 
-    for key in ["timestamp", "senderSequence", "receiverReceivedAt", "injectedAt"] {
+    for key in [
+        "timestamp",
+        "senderSequence",
+        "receiverReceivedAt",
+        "injectedAt",
+    ] {
         for value in js_numbers() {
             let id = format!("m-{key}-{value}");
             let mut message =
@@ -348,10 +392,15 @@ async fn send_with_a_non_number_timestamp_still_fails_with_unknown_and_keeps_the
             }))
             .await;
         let failure = alpha.expect_frame("delivery_failed").await;
-        assert_eq!(failure["messageId"], "unknown", "pi's fallback for an unparseable message");
+        assert_eq!(
+            failure["messageId"], "unknown",
+            "pi's fallback for an unparseable message"
+        );
         assert_eq!(failure["reason"], "Invalid message format");
     }
-    alpha.assert_alive("a `send` whose message failed `isMessage`").await;
+    alpha
+        .assert_alive("a `send` whose message failed `isMessage`")
+        .await;
 }
 
 /// **Batch 2's newly-extended defect, live.** `MessageReceipt` gained a modelled `timestamp` when
@@ -370,7 +419,8 @@ async fn message_receipt_accepts_every_json_number_for_timestamp() {
             "receipt": { "messageId": "m1", "status": "queued", "timestamp": value.clone() },
         }))
         .await;
-        c.assert_alive(&format!("`message_receipt.receipt.timestamp` = {value}")).await;
+        c.assert_alive(&format!("`message_receipt.receipt.timestamp` = {value}"))
+            .await;
     }
 }
 
@@ -387,7 +437,8 @@ async fn message_receipt_with_a_non_number_timestamp_still_destroys_the_connecti
             "receipt": { "messageId": "m1", "status": "queued", "timestamp": value.clone() },
         }))
         .await;
-        c.assert_destroyed(&format!("`message_receipt.receipt.timestamp` = {value}")).await;
+        c.assert_destroyed(&format!("`message_receipt.receipt.timestamp` = {value}"))
+            .await;
     }
 }
 
@@ -423,11 +474,15 @@ impl HostileBroker {
             let mut reader = FrameReader::new();
             let mut buf = vec![0u8; 16 * 1024];
             loop {
-                let Ok(n) = stream.read(&mut buf).await else { return };
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
                 if n == 0 {
                     return;
                 }
-                let Ok(got) = reader.push(&buf[..n]) else { return };
+                let Ok(got) = reader.push(&buf[..n]) else {
+                    return;
+                };
                 if !got.is_empty() {
                     break;
                 }
@@ -447,7 +502,11 @@ impl HostileBroker {
             // Hold the socket open so a client disconnect can only come from the client itself.
             std::future::pending::<()>().await;
         });
-        Self { _dir: dir, socket, release }
+        Self {
+            _dir: dir,
+            socket,
+            release,
+        }
     }
 }
 
@@ -494,7 +553,10 @@ async fn client_events_on(frame: serde_json::Value) -> Vec<InboundEvent> {
 }
 
 async fn client_disconnects_on(frame: serde_json::Value) -> bool {
-    client_events_on(frame).await.iter().any(|e| matches!(e, InboundEvent::Disconnected(_)))
+    client_events_on(frame)
+        .await
+        .iter()
+        .any(|e| matches!(e, InboundEvent::Disconnected(_)))
 }
 
 /// Assert a real client survives EVERY frame in `frames`, delivered back-to-back on one connection.
@@ -589,9 +651,13 @@ async fn the_client_survives_a_relayed_session_info_carrying_any_json_number() {
 /// by the BROKER (`v0.9.2 broker/broker.ts:674-675`), so a cyrup client trusts it sight unseen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_client_survives_a_relayed_message_carrying_any_json_number() {
-    for key in
-        ["timestamp", "senderSequence", "brokerReceivedAt", "brokerDeliveredAt", "injectedAt"]
-    {
+    for key in [
+        "timestamp",
+        "senderSequence",
+        "brokerReceivedAt",
+        "brokerDeliveredAt",
+        "injectedAt",
+    ] {
         let frames = js_numbers()
             .into_iter()
             .map(|value| {
@@ -600,8 +666,11 @@ async fn the_client_survives_a_relayed_message_carrying_any_json_number() {
                 serde_json::json!({ "type": "message", "from": good_session(), "message": message })
             })
             .collect();
-        assert_client_survives_all(frames, &format!("a `message` whose `{key}` is any JSON number"))
-            .await;
+        assert_client_survives_all(
+            frames,
+            &format!("a `message` whose `{key}` is any JSON number"),
+        )
+        .await;
     }
 }
 
@@ -619,8 +688,11 @@ async fn the_client_survives_a_relayed_receipt_or_control_carrying_any_json_numb
             })
         })
         .collect();
-    assert_client_survives_all(receipts, "a `message_receipt` whose timestamp is any JSON number")
-        .await;
+    assert_client_survives_all(
+        receipts,
+        "a `message_receipt` whose timestamp is any JSON number",
+    )
+    .await;
 
     let controls = js_numbers()
         .into_iter()
@@ -631,8 +703,11 @@ async fn the_client_survives_a_relayed_receipt_or_control_carrying_any_json_numb
             })
         })
         .collect();
-    assert_client_survives_all(controls, "a `message_control` whose timestamp is any JSON number")
-        .await;
+    assert_client_survives_all(
+        controls,
+        "a `message_control` whose timestamp is any JSON number",
+    )
+    .await;
 }
 
 /// **Positive control for side B, and the fidelity assertion.** The frames a real pi peer sends
@@ -643,20 +718,32 @@ async fn the_client_survives_a_relayed_receipt_or_control_carrying_any_json_numb
 async fn the_client_surfaces_wire_numbers_intact() {
     // Ordinary integers, exactly as a pi broker emits them.
     let session = good_session();
-    let events =
-        client_events_on(serde_json::json!({ "type": "session_joined", "session": session.clone() }))
-            .await;
-    let Some(InboundEvent::SessionJoined(info)) =
-        events.iter().find(|e| matches!(e, InboundEvent::SessionJoined(_)))
+    let events = client_events_on(
+        serde_json::json!({ "type": "session_joined", "session": session.clone() }),
+    )
+    .await;
+    let Some(InboundEvent::SessionJoined(info)) = events
+        .iter()
+        .find(|e| matches!(e, InboundEvent::SessionJoined(_)))
     else {
         panic!("no `session_joined` event surfaced; got {events:?}");
     };
     // Compared through `to_value` rather than against a Rust type on purpose: this file asserts
     // WIRE behaviour, so it must stay compilable against the pre-fix `u32`/`u64` fields — that is
     // what makes the revert proof a genuine test failure rather than a compile error.
-    assert_eq!(serde_json::to_value(&info.pid).unwrap(), serde_json::json!(1));
-    assert_eq!(serde_json::to_value(&info.started_at).unwrap(), serde_json::json!(2));
-    assert_eq!(serde_json::to_value(info).unwrap(), session, "integers must round-trip as integers");
+    assert_eq!(
+        serde_json::to_value(&info.pid).unwrap(),
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        serde_json::to_value(&info.started_at).unwrap(),
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        serde_json::to_value(info).unwrap(),
+        session,
+        "integers must round-trip as integers"
+    );
 
     // …and the out-of-domain values too: surfaced, not silently normalised.
     let mut odd = good_session();
@@ -666,12 +753,17 @@ async fn the_client_surfaces_wire_numbers_intact() {
     let events =
         client_events_on(serde_json::json!({ "type": "session_joined", "session": odd.clone() }))
             .await;
-    let Some(InboundEvent::SessionJoined(info)) =
-        events.iter().find(|e| matches!(e, InboundEvent::SessionJoined(_)))
+    let Some(InboundEvent::SessionJoined(info)) = events
+        .iter()
+        .find(|e| matches!(e, InboundEvent::SessionJoined(_)))
     else {
         panic!("no `session_joined` event surfaced for the odd session; got {events:?}");
     };
-    assert_eq!(serde_json::to_value(info).unwrap(), odd, "a -1 pid must round-trip as -1");
+    assert_eq!(
+        serde_json::to_value(info).unwrap(),
+        odd,
+        "a -1 pid must round-trip as -1"
+    );
     assert!(
         !info.extra.contains_key("pid"),
         "a guarded field must be modelled, not parked in the `extra` catch-all"

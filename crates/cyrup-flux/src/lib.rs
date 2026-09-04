@@ -12,7 +12,12 @@
 //!
 //! State on disk (`~/.flux/<flattened-cwd>/`) stays byte-identical to code-puppy's so one
 //! project's task tree is readable by both harnesses.
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 #![forbid(unsafe_code)]
 
 pub mod ask_tool;

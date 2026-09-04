@@ -325,8 +325,9 @@ pub fn resolve_config_path_tail(interpolated: &str, home: &Path) -> PathBuf {
     if interpolated == "~" {
         return home.to_path_buf();
     }
-    if let Some(rest) =
-        interpolated.strip_prefix("~/").or_else(|| interpolated.strip_prefix("~\\"))
+    if let Some(rest) = interpolated
+        .strip_prefix("~/")
+        .or_else(|| interpolated.strip_prefix("~\\"))
     {
         return node_path_join(home, rest);
     }
@@ -403,8 +404,11 @@ pub fn node_path_join(base: &Path, rest: &str) -> PathBuf {
 #[must_use]
 pub fn resolve_from(base: &Path, raw: &str) -> PathBuf {
     let candidate = Path::new(raw);
-    let joined =
-        if candidate.is_absolute() { candidate.to_path_buf() } else { base.join(candidate) };
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
     normalize_lexically(&joined)
 }
 
@@ -430,7 +434,11 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     for component in stack {
         out.push(component.as_os_str());
     }
-    if out.as_os_str().is_empty() { PathBuf::from(".") } else { out }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
 }
 
 /// `resolveConfiguredOAuthDir(raw, cwd)` (`config.ts:1235`) — the `settings.oauthDir` half of the
@@ -651,7 +659,10 @@ pub struct MetadataCache {
 
 impl Default for MetadataCache {
     fn default() -> Self {
-        Self { version: CACHE_VERSION, servers: IndexMap::new() }
+        Self {
+            version: CACHE_VERSION,
+            servers: IndexMap::new(),
+        }
     }
 }
 
@@ -689,8 +700,10 @@ pub fn load_metadata_cache(path: &Path) -> Option<MetadataCache> {
 /// (`writeRawConfigObject` appends `"\n"`); this file does not, and the asymmetry is upstream's.
 pub fn save_metadata_cache(path: &Path, cache: &MetadataCache) -> McpResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|source| McpError::Io { path: parent.to_path_buf(), source })?;
+        std::fs::create_dir_all(parent).map_err(|source| McpError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
 
     let mut merged = load_metadata_cache(path).unwrap_or_default();
@@ -706,12 +719,18 @@ pub fn save_metadata_cache(path: &Path, cache: &MetadataCache) -> McpResult<()> 
     temp.push(format!(".{}.tmp", std::process::id()));
     let temp = PathBuf::from(temp);
 
-    std::fs::write(&temp, body).map_err(|source| McpError::Io { path: temp.clone(), source })?;
+    std::fs::write(&temp, body).map_err(|source| McpError::Io {
+        path: temp.clone(),
+        source,
+    })?;
     std::fs::rename(&temp, path).map_err(|source| {
         // A failed rename leaves the temp file behind; upstream's `renameSync` throw does too, but
         // there is no reason to keep it.
         let _ = std::fs::remove_file(&temp);
-        McpError::Io { path: path.to_path_buf(), source }
+        McpError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
     })
 }
 
@@ -785,11 +804,17 @@ pub fn serialize_tools(tools: &[rmcp::model::Tool]) -> Vec<CachedTool> {
         .filter(|tool| !tool.name.is_empty())
         .map(|tool| CachedTool {
             name: tool.name.to_string(),
-            description: tool.description.as_ref().map(std::string::ToString::to_string),
+            description: tool
+                .description
+                .as_ref()
+                .map(std::string::ToString::to_string),
             input_schema: Some(Value::Object((*tool.input_schema).clone())),
             ui_resource_uri: None,
             ui_visibility: extract_ui_tool_visibility(
-                tool.meta.as_ref().map(|meta| Value::Object(meta.0.clone())).as_ref(),
+                tool.meta
+                    .as_ref()
+                    .map(|meta| Value::Object(meta.0.clone()))
+                    .as_ref(),
             ),
             ui_stream_mode: None,
         })
@@ -1018,7 +1043,10 @@ impl ResolvedIdentity {
     pub fn resolve(entry: &ServerEntry, env: &EnvFn, home: &Path) -> McpResult<Self> {
         Ok(Self {
             env: interpolate_env_record(entry.env.as_ref(), env)?,
-            cwd: entry.cwd.as_deref().map(|raw| resolve_config_path(raw, env, home)),
+            cwd: entry
+                .cwd
+                .as_deref()
+                .map(|raw| resolve_config_path(raw, env, home)),
             url: crate::credentials::resolve_server_url(entry.url.as_deref(), env)?,
             headers: interpolate_env_record(entry.headers.as_ref(), env)?,
             bearer_token: crate::credentials::resolve_bearer_token(
@@ -1093,7 +1121,9 @@ fn interpolate_env_record(
 #[must_use]
 pub fn resolve_config_path(raw: &str, env: &EnvFn, home: &Path) -> String {
     let interpolated = crate::credentials::interpolate_env_vars(raw, env);
-    resolve_config_path_tail(&interpolated, home).to_string_lossy().into_owned()
+    resolve_config_path_tail(&interpolated, home)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// [`compute_server_hash`] with the resolvers applied — `computeServerHash(definition)` end to end
@@ -1104,12 +1134,11 @@ pub fn resolve_config_path(raw: &str, env: &EnvFn, home: &Path) -> String {
 /// literal: [`crate::credentials::resolve_server_url`], and `interpolateEnvRecord` on an `env`,
 /// `headers` or `requestHeadersCommand.env` block carrying a non-string member
 /// ([`crate::config::StringRecord`]).
-pub fn try_compute_server_hash(
-    entry: &ServerEntry,
-    env: &EnvFn,
-    home: &Path,
-) -> McpResult<String> {
-    Ok(compute_server_hash(entry, &ResolvedIdentity::resolve(entry, env, home)?))
+pub fn try_compute_server_hash(entry: &ServerEntry, env: &EnvFn, home: &Path) -> McpResult<String> {
+    Ok(compute_server_hash(
+        entry,
+        &ResolvedIdentity::resolve(entry, env, home)?,
+    ))
 }
 
 /// One node of `stableStringify`'s input (`metadata-cache.ts:344`).
@@ -1155,9 +1184,11 @@ impl HashValue {
             Value::Array(items) => {
                 HashValue::Array(items.into_iter().map(HashValue::from_json).collect())
             }
-            Value::Object(map) => {
-                HashValue::Object(map.into_iter().map(|(k, v)| (k, HashValue::from_json(v))).collect())
-            }
+            Value::Object(map) => HashValue::Object(
+                map.into_iter()
+                    .map(|(k, v)| (k, HashValue::from_json(v)))
+                    .collect(),
+            ),
         }
     }
 
@@ -1190,7 +1221,11 @@ pub fn stable_stringify(value: &HashValue) -> String {
         HashValue::Bool(false) => "false".to_string(),
         HashValue::Number(n) => {
             // `JSON.stringify(NaN) === "null"`, and likewise for ±Infinity.
-            if n.is_finite() { format!("{n}") } else { "null".to_string() }
+            if n.is_finite() {
+                format!("{n}")
+            } else {
+                "null".to_string()
+            }
         }
         HashValue::String(s) => json_quote(s),
         HashValue::Array(items) => {
@@ -1270,21 +1305,41 @@ pub fn server_identity_pre_image(entry: &ServerEntry, resolved: &ResolvedIdentit
         // `"socket":undefined` rather than dropping it, and omitting it moved every cyrup digest.
         ("socket".to_string(), HashValue::Undefined),
         ("url".to_string(), opt_string(resolved.url.as_deref())),
-        ("headers".to_string(), opt_string_map(resolved.headers.as_ref())),
+        (
+            "headers".to_string(),
+            opt_string_map(resolved.headers.as_ref()),
+        ),
         (
             "requestHeadersCommand".to_string(),
             opt_request_headers_command(resolved.request_headers_command.as_ref()),
         ),
         ("auth".to_string(), opt_serde(entry.auth.as_ref())),
-        ("protocolVersion".to_string(), opt_serde(entry.protocol_version.as_ref())),
-        ("bearerToken".to_string(), opt_string(resolved.bearer_token.as_deref())),
-        ("bearerTokenEnv".to_string(), opt_string(entry.bearer_token_env.as_deref())),
+        (
+            "protocolVersion".to_string(),
+            opt_serde(entry.protocol_version.as_ref()),
+        ),
+        (
+            "bearerToken".to_string(),
+            opt_string(resolved.bearer_token.as_deref()),
+        ),
+        (
+            "bearerTokenEnv".to_string(),
+            opt_string(entry.bearer_token_env.as_deref()),
+        ),
         (
             "exposeResources".to_string(),
-            entry.expose_resources.map_or(HashValue::Undefined, HashValue::Bool),
+            entry
+                .expose_resources
+                .map_or(HashValue::Undefined, HashValue::Bool),
         ),
-        ("includeTools".to_string(), opt_string_list(entry.include_tools.as_ref())),
-        ("excludeTools".to_string(), opt_string_list(entry.exclude_tools.as_ref())),
+        (
+            "includeTools".to_string(),
+            opt_string_list(entry.include_tools.as_ref()),
+        ),
+        (
+            "excludeTools".to_string(),
+            opt_string_list(entry.exclude_tools.as_ref()),
+        ),
     ]);
     stable_stringify(&identity)
 }
@@ -1333,12 +1388,17 @@ fn opt_string_list(value: Option<&Vec<String>>) -> HashValue {
 fn opt_request_headers_command(value: Option<&HttpRequestHeadersCommand>) -> HashValue {
     value.map_or(HashValue::Undefined, |command| {
         HashValue::Object(vec![
-            ("command".to_string(), opt_string(command.command.as_deref())),
+            (
+                "command".to_string(),
+                opt_string(command.command.as_deref()),
+            ),
             ("args".to_string(), opt_string_list(command.args.as_ref())),
             ("env".to_string(), opt_string_map(command.env.as_deref())),
             (
                 "timeoutMs".to_string(),
-                command.timeout_ms.map_or(HashValue::Undefined, HashValue::Number),
+                command
+                    .timeout_ms
+                    .map_or(HashValue::Undefined, HashValue::Number),
             ),
         ])
     })
@@ -1349,7 +1409,9 @@ fn opt_request_headers_command(value: Option<&HttpRequestHeadersCommand>) -> Has
 fn opt_string_map(value: Option<&BTreeMap<String, String>>) -> HashValue {
     value.map_or(HashValue::Undefined, |map| {
         HashValue::Object(
-            map.iter().map(|(k, v)| (k.clone(), HashValue::String(v.clone()))).collect(),
+            map.iter()
+                .map(|(k, v)| (k.clone(), HashValue::String(v.clone())))
+                .collect(),
         )
     })
 }
@@ -1365,7 +1427,12 @@ fn opt_serde<T: Serialize>(value: Option<&T>) -> HashValue {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     /// node's `path.join` semantics, pinned against values measured by running upstream's own
     /// `resolveConfigPath` on node 22 (pi-mcp-adapter @ v2.26.1, `fafae21`) with `HOME=/home/u`.
@@ -1403,8 +1470,14 @@ mod tests {
     /// behaviours, and both reachable from a config that over-uses `../`.
     #[test]
     fn node_path_join_clamps_dotdot_at_the_root_and_keeps_it_when_relative() {
-        assert_eq!(node_path_join(Path::new("/home/u"), "../../../.."), PathBuf::from("/"));
-        assert_eq!(node_path_join(Path::new("a"), "../../b"), PathBuf::from("../b"));
+        assert_eq!(
+            node_path_join(Path::new("/home/u"), "../../../.."),
+            PathBuf::from("/")
+        );
+        assert_eq!(
+            node_path_join(Path::new("a"), "../../b"),
+            PathBuf::from("../b")
+        );
         assert_eq!(node_path_join(Path::new("/"), "x"), PathBuf::from("/x"));
     }
 
@@ -1424,22 +1497,46 @@ mod tests {
     #[test]
     fn config_path_tilde_takes_the_windows_form_and_does_not_trim() {
         let home = Path::new("/home/u");
-        assert_eq!(resolve_config_path_tail("~", home), PathBuf::from("/home/u"));
-        assert_eq!(resolve_config_path_tail("~/x", home), PathBuf::from("/home/u/x"));
+        assert_eq!(
+            resolve_config_path_tail("~", home),
+            PathBuf::from("/home/u")
+        );
+        assert_eq!(
+            resolve_config_path_tail("~/x", home),
+            PathBuf::from("/home/u/x")
+        );
         // `utils.ts:192` tests BOTH prefixes; `agent-dir.ts` tests only `~/`.
-        assert_eq!(resolve_config_path_tail("~\\x", home), PathBuf::from("/home/u/x"));
+        assert_eq!(
+            resolve_config_path_tail("~\\x", home),
+            PathBuf::from("/home/u/x")
+        );
         // …and it never trims, because a config value is used as written.
-        assert_eq!(resolve_config_path_tail(" ~/x", home), PathBuf::from(" ~/x"));
+        assert_eq!(
+            resolve_config_path_tail(" ~/x", home),
+            PathBuf::from(" ~/x")
+        );
     }
 
     #[test]
     fn adapter_owned_paths_hang_off_agent_dir() {
         let dirs = McpDirs::new(PathBuf::from("/a/agent"), PathBuf::from("/w"));
         assert_eq!(dirs.global_config(), PathBuf::from("/a/agent/mcp.json"));
-        assert_eq!(dirs.metadata_cache(), PathBuf::from("/a/agent/mcp-cache.json"));
-        assert_eq!(dirs.onboarding_state(), PathBuf::from("/a/agent/mcp-onboarding.json"));
-        assert_eq!(dirs.agent_plugin_data("p"), PathBuf::from("/a/agent/agent-plugin-data/p"));
-        assert_eq!(dirs.default_oauth_dir(), PathBuf::from("/a/agent/mcp-oauth"));
+        assert_eq!(
+            dirs.metadata_cache(),
+            PathBuf::from("/a/agent/mcp-cache.json")
+        );
+        assert_eq!(
+            dirs.onboarding_state(),
+            PathBuf::from("/a/agent/mcp-onboarding.json")
+        );
+        assert_eq!(
+            dirs.agent_plugin_data("p"),
+            PathBuf::from("/a/agent/agent-plugin-data/p")
+        );
+        assert_eq!(
+            dirs.default_oauth_dir(),
+            PathBuf::from("/a/agent/mcp-oauth")
+        );
         assert_eq!(dirs.trace_dir(), PathBuf::from("/w/.cyrup/mcp-traces"));
     }
 
@@ -1447,7 +1544,10 @@ mod tests {
     fn ladder_paths_match_config_ts() {
         let dirs = McpDirs::new(PathBuf::from("/a/agent"), PathBuf::from("/w"));
         let home = Path::new("/home/u");
-        assert_eq!(shared_global_config(home), PathBuf::from("/home/u/.config/mcp/mcp.json"));
+        assert_eq!(
+            shared_global_config(home),
+            PathBuf::from("/home/u/.config/mcp/mcp.json")
+        );
         assert_eq!(
             agents_global_configs(home),
             [
@@ -1456,23 +1556,41 @@ mod tests {
             ]
         );
         assert_eq!(dirs.project_shared_config(), PathBuf::from("/w/.mcp.json"));
-        assert_eq!(dirs.project_agent_config(), PathBuf::from("/w/.cyrup/mcp.json"));
+        assert_eq!(
+            dirs.project_agent_config(),
+            PathBuf::from("/w/.cyrup/mcp.json")
+        );
         // `getPiGlobalConfigPath(undefined)` vs `resolve(overridePath)`.
         assert_eq!(dirs.user_config(None), PathBuf::from("/a/agent/mcp.json"));
-        assert_eq!(dirs.user_config(Some("mcp.json")), PathBuf::from("/w/mcp.json"));
-        assert_eq!(dirs.user_config(Some("/etc/mcp.json")), PathBuf::from("/etc/mcp.json"));
+        assert_eq!(
+            dirs.user_config(Some("mcp.json")),
+            PathBuf::from("/w/mcp.json")
+        );
+        assert_eq!(
+            dirs.user_config(Some("/etc/mcp.json")),
+            PathBuf::from("/etc/mcp.json")
+        );
     }
 
     #[test]
     fn resolve_from_folds_dot_segments_lexically() {
         let base = Path::new("/w/project");
         assert_eq!(resolve_from(base, "a/../b"), PathBuf::from("/w/project/b"));
-        assert_eq!(resolve_from(base, "./a/./b/"), PathBuf::from("/w/project/a/b"));
-        assert_eq!(resolve_from(base, "../sibling"), PathBuf::from("/w/sibling"));
+        assert_eq!(
+            resolve_from(base, "./a/./b/"),
+            PathBuf::from("/w/project/a/b")
+        );
+        assert_eq!(
+            resolve_from(base, "../sibling"),
+            PathBuf::from("/w/sibling")
+        );
         // `path.resolve("/a/../..") === "/"` — `..` cannot escape the root.
         assert_eq!(resolve_from(Path::new("/a"), "../.."), PathBuf::from("/"));
         // node's resolve does NOT expand `~`; a port that "helpfully" did would relocate secrets.
-        assert_eq!(resolve_from(base, "~/creds"), PathBuf::from("/w/project/~/creds"));
+        assert_eq!(
+            resolve_from(base, "~/creds"),
+            PathBuf::from("/w/project/~/creds")
+        );
     }
 
     #[test]
@@ -1483,18 +1601,27 @@ mod tests {
         let blank = |_: &str| Some("   ".to_string());
 
         // Tier 3: the default.
-        assert_eq!(resolve_auth_base_dir(&dirs, None, &none), PathBuf::from("/a/agent/mcp-oauth"));
+        assert_eq!(
+            resolve_auth_base_dir(&dirs, None, &none),
+            PathBuf::from("/a/agent/mcp-oauth")
+        );
         // Tier 2: `settings.oauthDir`, resolved against cwd.
         let configured = resolve_configured_oauth_dir(" creds ", dirs.cwd()).unwrap();
         assert_eq!(configured, PathBuf::from("/w/creds"));
-        assert_eq!(resolve_auth_base_dir(&dirs, Some(&configured), &none), configured);
+        assert_eq!(
+            resolve_auth_base_dir(&dirs, Some(&configured), &none),
+            configured
+        );
         // Tier 1: the env var outranks both, trimmed but otherwise verbatim.
         assert_eq!(
             resolve_auth_base_dir(&dirs, Some(&configured), &set),
             PathBuf::from("/env/oauth")
         );
         // A whitespace-only override is not an override.
-        assert_eq!(resolve_auth_base_dir(&dirs, Some(&configured), &blank), configured);
+        assert_eq!(
+            resolve_auth_base_dir(&dirs, Some(&configured), &blank),
+            configured
+        );
         // Blank after trim is `undefined`, not the cwd.
         assert_eq!(resolve_configured_oauth_dir("   ", dirs.cwd()), None);
     }
@@ -1506,7 +1633,10 @@ mod tests {
         assert_eq!(stable_stringify(&HashValue::Undefined), "undefined");
         assert_eq!(stable_stringify(&HashValue::Null), "null");
         assert_eq!(stable_stringify(&HashValue::Bool(false)), "false");
-        assert_eq!(stable_stringify(&HashValue::String("a\"b\n".to_string())), "\"a\\\"b\\n\"");
+        assert_eq!(
+            stable_stringify(&HashValue::String("a\"b\n".to_string())),
+            "\"a\\\"b\\n\""
+        );
         assert_eq!(
             stable_stringify(&HashValue::Array(vec![
                 HashValue::Number(1.0),
@@ -1720,11 +1850,17 @@ mod tests {
     /// track `$API_HOST` changes.
     #[test]
     fn resolution_changes_the_digest() {
-        let entry: ServerEntry = serde_json::from_str(r#"{ "url": "https://${HOST}/mcp" }"#).unwrap();
+        let entry: ServerEntry =
+            serde_json::from_str(r#"{ "url": "https://${HOST}/mcp" }"#).unwrap();
         let literal = ResolvedIdentity::verbatim(&entry);
-        let resolved =
-            ResolvedIdentity { url: Some("https://a.example/mcp".to_string()), ..literal.clone() };
-        assert_ne!(compute_server_hash(&entry, &literal), compute_server_hash(&entry, &resolved));
+        let resolved = ResolvedIdentity {
+            url: Some("https://a.example/mcp".to_string()),
+            ..literal.clone()
+        };
+        assert_ne!(
+            compute_server_hash(&entry, &literal),
+            compute_server_hash(&entry, &resolved)
+        );
     }
 
     /// An empty list is not an absent list — the pre-image distinguishes them, so the digest must.
@@ -1751,14 +1887,34 @@ mod tests {
         let now = 1_000_000_000_000;
         let fresh = entry_with("h", now - 1000);
         assert!(is_server_cache_valid_at(&fresh, "h", CACHE_MAX_AGE_MS, now));
-        assert!(!is_server_cache_valid_at(&fresh, "other", CACHE_MAX_AGE_MS, now));
+        assert!(!is_server_cache_valid_at(
+            &fresh,
+            "other",
+            CACHE_MAX_AGE_MS,
+            now
+        ));
         // `!entry.cachedAt` rejects 0 as well as absent.
-        assert!(!is_server_cache_valid_at(&entry_with("h", 0), "h", CACHE_MAX_AGE_MS, now));
+        assert!(!is_server_cache_valid_at(
+            &entry_with("h", 0),
+            "h",
+            CACHE_MAX_AGE_MS,
+            now
+        ));
         // Exactly at the boundary is still valid — upstream's test is `>`, not `>=`.
         let boundary = entry_with("h", now - CACHE_MAX_AGE_MS);
-        assert!(is_server_cache_valid_at(&boundary, "h", CACHE_MAX_AGE_MS, now));
+        assert!(is_server_cache_valid_at(
+            &boundary,
+            "h",
+            CACHE_MAX_AGE_MS,
+            now
+        ));
         let stale = entry_with("h", now - CACHE_MAX_AGE_MS - 1);
-        assert!(!is_server_cache_valid_at(&stale, "h", CACHE_MAX_AGE_MS, now));
+        assert!(!is_server_cache_valid_at(
+            &stale,
+            "h",
+            CACHE_MAX_AGE_MS,
+            now
+        ));
         // `maxAgeMs <= 0` disables the age check entirely.
         assert!(is_server_cache_valid_at(&stale, "h", 0, now));
     }
@@ -1766,7 +1922,9 @@ mod tests {
     fn cache_with(names: &[&str]) -> MetadataCache {
         let mut cache = MetadataCache::default();
         for name in names {
-            cache.servers.insert((*name).to_string(), entry_with("h", 42));
+            cache
+                .servers
+                .insert((*name).to_string(), entry_with("h", 42));
         }
         cache
     }
@@ -1779,18 +1937,29 @@ mod tests {
         save_metadata_cache(&path, &cache_with(&["alpha", "beta"])).unwrap();
         // A second writer that only reconnected `beta` must not erase `alpha`.
         let mut second = MetadataCache::default();
-        second.servers.insert("beta".to_string(), entry_with("h2", 43));
-        second.servers.insert("gamma".to_string(), entry_with("h3", 44));
+        second
+            .servers
+            .insert("beta".to_string(), entry_with("h2", 43));
+        second
+            .servers
+            .insert("gamma".to_string(), entry_with("h3", 44));
         save_metadata_cache(&path, &second).unwrap();
 
         let loaded = load_metadata_cache(&path).unwrap();
         assert_eq!(loaded.version, CACHE_VERSION);
         // Existing keys keep their position; new keys append — JS object-spread order.
         assert_eq!(
-            loaded.servers.keys().map(String::as_str).collect::<Vec<_>>(),
+            loaded
+                .servers
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             ["alpha", "beta", "gamma"]
         );
-        assert_eq!(loaded.servers.get("beta").map(|e| e.config_hash.as_str()), Some("h2"));
+        assert_eq!(
+            loaded.servers.get("beta").map(|e| e.config_hash.as_str()),
+            Some("h2")
+        );
 
         let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
@@ -1805,13 +1974,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(METADATA_CACHE_FILE);
 
-        assert!(load_metadata_cache(&path).is_none(), "a missing file is not an error");
+        assert!(
+            load_metadata_cache(&path).is_none(),
+            "a missing file is not an error"
+        );
         std::fs::write(&path, "{{{").unwrap();
         assert!(load_metadata_cache(&path).is_none());
         std::fs::write(&path, r#"{"version":2,"servers":{}}"#).unwrap();
         assert!(load_metadata_cache(&path).is_none());
         std::fs::write(&path, r#"{"version":1}"#).unwrap();
-        assert!(load_metadata_cache(&path).is_none(), "a missing `servers` is a rejected file");
+        assert!(
+            load_metadata_cache(&path).is_none(),
+            "a missing `servers` is a rejected file"
+        );
     }
 
     /// The on-disk shape `cyrup_ext_subagents::exec::mcp_direct_tools` reads: `version`,
@@ -1916,8 +2091,8 @@ mod tests {
             r#"{}"#,
         ] {
             let entry: ServerEntry = serde_json::from_str(json).unwrap();
-            let resolved = ResolvedIdentity::resolve(&entry, &vector_env(), &vector_home())
-                .expect("hashable");
+            let resolved =
+                ResolvedIdentity::resolve(&entry, &vector_env(), &vector_home()).expect("hashable");
             assert_eq!(resolved, ResolvedIdentity::verbatim(&entry), "{json}");
         }
     }
@@ -2076,7 +2251,10 @@ mod tests {
             "search",
             "find things",
             std::sync::Arc::new(
-                serde_json::json!({ "type": "object" }).as_object().unwrap().clone(),
+                serde_json::json!({ "type": "object" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
             ),
         );
         described.meta = Some(rmcp::model::MetaObject(
@@ -2085,16 +2263,9 @@ mod tests {
                 .unwrap()
                 .clone(),
         ));
-        let bare = rmcp::model::Tool::new(
-            "bare",
-            "",
-            std::sync::Arc::new(serde_json::Map::new()),
-        );
-        let nameless = rmcp::model::Tool::new(
-            "",
-            "dropped",
-            std::sync::Arc::new(serde_json::Map::new()),
-        );
+        let bare = rmcp::model::Tool::new("bare", "", std::sync::Arc::new(serde_json::Map::new()));
+        let nameless =
+            rmcp::model::Tool::new("", "dropped", std::sync::Arc::new(serde_json::Map::new()));
 
         let cached = serialize_tools(&[described, bare, nameless]);
         assert_eq!(cached.len(), 2, "the nameless tool is filtered out");
@@ -2108,11 +2279,17 @@ mod tests {
         // Both Cut-2 fields stay absent — never `null`, and never a bumped CACHE_VERSION.
         assert!(cached[0].ui_resource_uri.is_none());
         assert!(cached[0].ui_stream_mode.is_none());
-        assert!(cached[1].ui_visibility.is_none(), "no `_meta` means visible, not hidden");
+        assert!(
+            cached[1].ui_visibility.is_none(),
+            "no `_meta` means visible, not hidden"
+        );
 
         let json = serde_json::to_string(&cached[1]).unwrap();
         assert!(!json.contains("uiVisibility"), "{json}");
-        assert!(!json.contains("null"), "an absent field is omitted, never written as null: {json}");
+        assert!(
+            !json.contains("null"),
+            "an absent field is omitted, never written as null: {json}"
+        );
     }
 
     /// `extractUiToolVisibility`'s fail-closed arms — the two that answer `Some(vec![])` rather
@@ -2121,9 +2298,16 @@ mod tests {
     fn ui_visibility_extraction_fails_closed_on_anything_unrecognised() {
         let visibility = |value: serde_json::Value| extract_ui_tool_visibility(Some(&value));
         assert_eq!(visibility(serde_json::json!({})), None, "no `ui` key");
-        assert_eq!(visibility(serde_json::json!({ "ui": ["model"] })), None, "`ui` is an array");
+        assert_eq!(
+            visibility(serde_json::json!({ "ui": ["model"] })),
+            None,
+            "`ui` is an array"
+        );
         assert_eq!(visibility(serde_json::json!({ "ui": null })), None);
-        assert_eq!(visibility(serde_json::json!({ "ui": { "other": 1 } })), None);
+        assert_eq!(
+            visibility(serde_json::json!({ "ui": { "other": 1 } })),
+            None
+        );
         assert_eq!(
             visibility(serde_json::json!({ "ui": { "visibility": "model" } })),
             Some(Vec::new()),
@@ -2141,7 +2325,10 @@ mod tests {
         for empty in [Some(Vec::new()), None] {
             assert_eq!(
                 crate::registration::is_ui_tool_visible_to_model(
-                    empty.as_ref().map(|v: &Vec<String>| serde_json::json!(v)).as_ref()
+                    empty
+                        .as_ref()
+                        .map(|v: &Vec<String>| serde_json::json!(v))
+                        .as_ref()
                 ),
                 empty.is_none(),
                 "an empty list must hide, an absent list must show"
@@ -2151,8 +2338,8 @@ mod tests {
 
     #[test]
     fn serialize_resources_needs_both_a_name_and_a_uri() {
-        let good = rmcp::model::Resource::new("file:///a", "My File")
-            .with_description("the a file");
+        let good =
+            rmcp::model::Resource::new("file:///a", "My File").with_description("the a file");
         let no_description = rmcp::model::Resource::new("file:///b", "B");
         let no_name = rmcp::model::Resource::new("file:///c", "");
         let no_uri = rmcp::model::Resource::new("", "D");
@@ -2185,15 +2372,31 @@ mod tests {
         let cached = serialize_prompts(&[no_arguments, empty_arguments, with_arguments, nameless]);
         assert_eq!(cached.len(), 3, "only the nameless prompt is dropped");
         assert!(cached[0].arguments.is_none(), "absent stays absent");
-        assert_eq!(cached[1].arguments.as_deref().map(<[_]>::len), Some(0), "`[]` stays `[]`");
+        assert_eq!(
+            cached[1].arguments.as_deref().map(<[_]>::len),
+            Some(0),
+            "`[]` stays `[]`"
+        );
         let arguments = cached[2].arguments.as_deref().expect("arguments");
-        assert_eq!(arguments.len(), 1, "the nameless argument is dropped, the prompt is not");
+        assert_eq!(
+            arguments.len(),
+            1,
+            "the nameless argument is dropped, the prompt is not"
+        );
         assert_eq!(arguments[0].name, "topic");
         assert_eq!(arguments[0].required, Some(true));
 
         // Absent and empty are different BYTES, which is the only place the difference shows.
-        assert!(!serde_json::to_string(&cached[0]).unwrap().contains("arguments"));
-        assert!(serde_json::to_string(&cached[1]).unwrap().contains(r#""arguments":[]"#));
+        assert!(
+            !serde_json::to_string(&cached[0])
+                .unwrap()
+                .contains("arguments")
+        );
+        assert!(
+            serde_json::to_string(&cached[1])
+                .unwrap()
+                .contains(r#""arguments":[]"#)
+        );
     }
 
     // -------------------------------------------------------------------------------------
@@ -2208,7 +2411,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("mcp-cache.json");
 
-        for corrupt in ["{ not json", "", "null", r#"{"version":9,"servers":{"old":{}}}"#] {
+        for corrupt in [
+            "{ not json",
+            "",
+            "null",
+            r#"{"version":9,"servers":{"old":{}}}"#,
+        ] {
             std::fs::write(&path, corrupt).unwrap();
             save_metadata_cache(&path, &cache_with(&["fresh"])).unwrap();
 
@@ -2216,7 +2424,10 @@ mod tests {
             assert_eq!(loaded.version, CACHE_VERSION);
             assert_eq!(loaded.servers.len(), 1, "{corrupt}");
             assert!(loaded.servers.contains_key("fresh"), "{corrupt}");
-            assert!(!loaded.servers.contains_key("old"), "a foreign version is not merged");
+            assert!(
+                !loaded.servers.contains_key("old"),
+                "a foreign version is not merged"
+            );
             assert!(
                 std::fs::read_dir(temp.path()).unwrap().count() == 1,
                 "the pid-suffixed temp file must be gone"
@@ -2229,8 +2440,14 @@ mod tests {
     fn cached_at_must_be_a_number_and_max_age_zero_disables_the_age_check() {
         let year = 365 * 24 * 60 * 60 * 1000;
         let old = entry_with("h", now_ms() - year);
-        assert!(!is_server_cache_valid(&old, "h", CACHE_MAX_AGE_MS), "a year is older than 7 days");
-        assert!(is_server_cache_valid(&old, "h", 0), "`maxAgeMs = 0` disables the age check");
+        assert!(
+            !is_server_cache_valid(&old, "h", CACHE_MAX_AGE_MS),
+            "a year is older than 7 days"
+        );
+        assert!(
+            is_server_cache_valid(&old, "h", 0),
+            "`maxAgeMs = 0` disables the age check"
+        );
 
         // A JSON string `cachedAt` must invalidate THIS entry without costing the file its others.
         let file = serde_json::json!({
@@ -2241,8 +2458,15 @@ mod tests {
             }
         });
         let parsed: MetadataCache = serde_json::from_str(&file.to_string()).expect("still parses");
-        assert_eq!(parsed.servers.len(), 2, "one bad entry must not lose the whole file");
-        assert_eq!(parsed.servers["bad"].cached_at, 0, "a non-number lands on the falsy value");
+        assert_eq!(
+            parsed.servers.len(),
+            2,
+            "one bad entry must not lose the whole file"
+        );
+        assert_eq!(
+            parsed.servers["bad"].cached_at, 0,
+            "a non-number lands on the falsy value"
+        );
         assert!(!is_server_cache_valid(&parsed.servers["bad"], "h", 0));
         assert!(is_server_cache_valid(&parsed.servers["good"], "h", 0));
     }
@@ -2269,7 +2493,9 @@ mod tests {
 
         // And the lenient reader agrees, which is the invariant that matters.
         let other = crate::registration::load_metadata_cache(&dirs).expect("both readers agree");
-        assert_eq!(other.servers.get("linear").map(|e| e.tools().len()), Some(1));
+        assert_eq!(
+            other.servers.get("linear").map(|e| e.tools().len()),
+            Some(1)
+        );
     }
-
 }

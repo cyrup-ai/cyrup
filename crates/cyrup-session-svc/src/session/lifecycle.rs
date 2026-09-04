@@ -72,7 +72,10 @@ impl AgentSession {
         target_session_file: Option<String>,
     ) {
         self.abort_and_settle().await;
-        self.fanout_emit(AgentSessionEvent::SessionShutdown { reason: reason.to_string() }).await;
+        self.fanout_emit(AgentSessionEvent::SessionShutdown {
+            reason: reason.to_string(),
+        })
+        .await;
         // Notify extensions, then release the long-lived token.
         let cancel = self.session_cancel.child_token();
         self.services

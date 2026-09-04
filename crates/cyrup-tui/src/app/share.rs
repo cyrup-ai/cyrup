@@ -51,7 +51,9 @@ pub fn share_viewer_url(gist_id: &str) -> String {
 /// without `std::env::set_var` (`unsafe` in edition 2024, and this crate is `#![forbid(unsafe_code)]`).
 #[must_use]
 pub fn share_viewer_url_from(env_base: Option<&str>, gist_id: &str) -> String {
-    let base = env_base.filter(|v| !v.is_empty()).unwrap_or(DEFAULT_SHARE_VIEWER_URL);
+    let base = env_base
+        .filter(|v| !v.is_empty())
+        .unwrap_or(DEFAULT_SHARE_VIEWER_URL);
     format!("{base}#{gist_id}")
 }
 

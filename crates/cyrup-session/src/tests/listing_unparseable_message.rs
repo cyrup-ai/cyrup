@@ -8,7 +8,12 @@
 //! demotes a known tag with an unparseable body to `Entry::Unknown` (`entry.rs:277-279`), so the
 //! listing must handle that shape explicitly or such entries vanish from `message_count`, from the
 //! `/resume` search text and from the preview line.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::listing;
 use tempfile::TempDir;
@@ -47,7 +52,10 @@ fn message_count_includes_entries_whose_body_fails_to_type() {
     let path = write_session(&dir, &cwd.display().to_string());
 
     let listed = listing::list_in_dir(&dir, None, None);
-    let info = listed.iter().find(|s| s.path == path).expect("session listed");
+    let info = listed
+        .iter()
+        .find(|s| s.path == path)
+        .expect("session listed");
     assert_eq!(
         info.message_count, 3,
         "Pi counts every `message`-tagged entry; got {} for {:?}",
@@ -70,7 +78,10 @@ fn search_text_includes_untyped_user_message() {
     let path = write_session(&dir, &cwd.display().to_string());
 
     let listed = listing::list_in_dir(&dir, None, None);
-    let info = listed.iter().find(|s| s.path == path).expect("session listed");
+    let info = listed
+        .iter()
+        .find(|s| s.path == path)
+        .expect("session listed");
     assert!(
         info.all_messages_text.contains("typed hello"),
         "typed message text missing: {:?}",
@@ -110,6 +121,12 @@ fn first_message_falls_back_to_an_untyped_user_entry() {
     std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
 
     let listed = listing::list_in_dir(&dir, None, None);
-    let info = listed.iter().find(|s| s.path == path).expect("session listed");
-    assert_eq!(info.first_message, "only untyped", "preview line must use the untyped user entry");
+    let info = listed
+        .iter()
+        .find(|s| s.path == path)
+        .expect("session listed");
+    assert_eq!(
+        info.first_message, "only untyped",
+        "preview line must use the untyped user entry"
+    );
 }

@@ -44,8 +44,8 @@ use crate::{
     ModelEntry, ModelSelector, SelectAction, SelectKeymap, Selector, SelectorKind, SessionRow,
     SessionSelector, SettingRow, SettingsSelector, TextInputSelector, TrustSelector, UiTheme,
 };
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 /// Render `sel` into a `w`×`h` buffer and return its rows as trailing-trimmed strings.
 fn rows_at(sel: &mut dyn Selector, w: u16, h: u16) -> Vec<String> {
@@ -147,15 +147,33 @@ fn extension_selector_envelope_has_the_four_upstream_spacer_rows() {
     let mut sel = extension_select();
     let rows = natural(sel.as_mut_selector(), 60);
     let n = rows.len();
-    assert!(is_rule(&rows[0]), "row 0 is the top DynamicBorder: {rows:?}");
-    assert_eq!(rows[1], "", "Spacer(1) after the top border (:45): {rows:?}");
-    assert!(rows[2].contains("Pick one"), "the title follows it (:47): {rows:?}");
+    assert!(
+        is_rule(&rows[0]),
+        "row 0 is the top DynamicBorder: {rows:?}"
+    );
+    assert_eq!(
+        rows[1], "",
+        "Spacer(1) after the top border (:45): {rows:?}"
+    );
+    assert!(
+        rows[2].contains("Pick one"),
+        "the title follows it (:47): {rows:?}"
+    );
     assert_eq!(rows[3], "", "Spacer(1) after the title (:49): {rows:?}");
-    assert!(rows[4].contains("Alpha"), "the list starts here (:61): {rows:?}");
+    assert!(
+        rows[4].contains("Alpha"),
+        "the list starts here (:61): {rows:?}"
+    );
 
-    assert!(is_rule(&rows[n - 1]), "the last row is the bottom DynamicBorder (:75): {rows:?}");
+    assert!(
+        is_rule(&rows[n - 1]),
+        "the last row is the bottom DynamicBorder (:75): {rows:?}"
+    );
     assert_eq!(rows[n - 2], "", "Spacer(1) after the hint (:74): {rows:?}");
-    assert!(rows[n - 3].contains("navigate"), "the hint row (:63-73): {rows:?}");
+    assert!(
+        rows[n - 3].contains("navigate"),
+        "the hint row (:63-73): {rows:?}"
+    );
     assert_eq!(rows[n - 4], "", "Spacer(1) after the list (:62): {rows:?}");
 
     assert_eq!(
@@ -188,13 +206,26 @@ fn thinking_selector_draws_pis_0_84_3_envelope() {
     assert_eq!(rows[5], "", "Spacer(1) (:82): {rows:?}");
     // `Input.render`'s prompt (`input.ts:380`) is `"> "`; `rows_at` trims the trailing space off
     // the empty query, so the row is a bare `>`.
-    assert_eq!(rows[6], crate::INPUT_PROMPT.trim_end(), "the search Input (:84-86): {rows:?}");
+    assert_eq!(
+        rows[6],
+        crate::INPUT_PROMPT.trim_end(),
+        "the search Input (:84-86): {rows:?}"
+    );
     assert_eq!(rows[7], "", "Spacer(1) (:87): {rows:?}");
-    assert!(rows[8].contains("off"), "the first level row (:92): {rows:?}");
+    assert!(
+        rows[8].contains("off"),
+        "the first level row (:92): {rows:?}"
+    );
     assert!(is_rule(&rows[n - 1]), "bottom rule (:97): {rows:?}");
-    assert!(rows[n - 2].contains("set as default"), "the dim footer (:94): {rows:?}");
+    assert!(
+        rows[n - 2].contains("set as default"),
+        "the dim footer (:94): {rows:?}"
+    );
     assert!(rows[n - 3].is_empty(), "Spacer(1) above it (:93): {rows:?}");
-    assert!(rows[n - 4].contains("max"), "and the last level row above that: {rows:?}");
+    assert!(
+        rows[n - 4].contains("max"),
+        "and the last level row above that: {rows:?}"
+    );
     assert_eq!(
         rows.iter().filter(|r| r.is_empty()).count(),
         5,
@@ -215,14 +246,25 @@ fn oauth_selector_envelope_has_three_spacers_and_no_hint_row() {
     .with_upstream_chrome(SelectorKind::Login, &SelectKeymap::default());
     let rows = natural(sel.as_mut_selector(), 60);
     let n = rows.len();
-    assert_eq!(rows[1], "", "Spacer(1) after the top border (:69): {rows:?}");
+    assert_eq!(
+        rows[1], "",
+        "Spacer(1) after the top border (:69): {rows:?}"
+    );
     assert_eq!(rows[3], "", "Spacer(1) after the title (:74): {rows:?}");
-    assert_eq!(rows[n - 2], "", "Spacer(1) before the bottom border (:93): {rows:?}");
+    assert_eq!(
+        rows[n - 2],
+        "",
+        "Spacer(1) before the bottom border (:93): {rows:?}"
+    );
     assert!(
         !rows.iter().any(|r| r.contains("navigate")),
         "OAuthSelectorComponent contains no keyHint call at all: {rows:?}"
     );
-    assert_eq!(rows.iter().filter(|r| r.is_empty()).count(), 3, "three blanks: {rows:?}");
+    assert_eq!(
+        rows.iter().filter(|r| r.is_empty()).count(),
+        3,
+        "three blanks: {rows:?}"
+    );
 }
 
 #[test]
@@ -258,7 +300,10 @@ fn extension_selector_never_shows_its_hint_row_before_its_options() {
     // The list's first row is child `:61`, i.e. row 4 — the first height that can seat it.
     let mut sel = extension_select();
     let rows = rows_at(sel.as_mut_selector(), 60, 5);
-    assert!(rows[4].contains("Alpha"), "the first option, at the first height that fits: {rows:?}");
+    assert!(
+        rows[4].contains("Alpha"),
+        "the first option, at the first height that fits: {rows:?}"
+    );
 }
 
 /// Envelope stability across a resize (the property the all-or-nothing spacer gate destroyed).
@@ -313,7 +358,10 @@ fn scoped_models_envelope_has_four_spacers_and_a_flush_footer() {
     let rows = natural(sel.as_mut_selector(), 60);
     let n = rows.len();
     assert!(is_rule(&rows[0]), "top border (:130): {rows:?}");
-    assert_eq!(rows[1], "", "Spacer(1) after the top border (:131): {rows:?}");
+    assert_eq!(
+        rows[1], "",
+        "Spacer(1) after the top border (:131): {rows:?}"
+    );
     assert_eq!(rows[2], "Model Configuration", "title (:132): {rows:?}");
     assert_eq!(
         rows[3], "Session-only. ctrl+s to save to settings.",
@@ -322,13 +370,28 @@ fn scoped_models_envelope_has_four_spacers_and_a_flush_footer() {
     assert_eq!(rows[4], "", "Spacer(1) after the subtitle (:136): {rows:?}");
     assert!(rows[5].starts_with('>'), "search Input (:140): {rows:?}");
     assert_eq!(rows[6], "", "Spacer(1) after the Input (:141): {rows:?}");
-    assert_eq!(rows[7], "→ claude [anthropic] ✓", "the one list row (:245-259): {rows:?}");
-    assert_eq!(rows[8], "", "the list container's own Spacer(1) (:271): {rows:?}");
+    assert_eq!(
+        rows[7], "→ claude [anthropic] ✓",
+        "the one list row (:245-259): {rows:?}"
+    );
+    assert_eq!(
+        rows[8], "",
+        "the list container's own Spacer(1) (:271): {rows:?}"
+    );
     assert_eq!(rows[9], "  Model Name: Claude", "(:272-278): {rows:?}");
-    assert_eq!(rows[10], "", "Spacer(1) between list and footer (:148): {rows:?}");
-    assert!(rows[11].starts_with("  enter toggle"), "footer (:153-154): {rows:?}");
+    assert_eq!(
+        rows[10], "",
+        "Spacer(1) between list and footer (:148): {rows:?}"
+    );
+    assert!(
+        rows[11].starts_with("  enter toggle"),
+        "footer (:153-154): {rows:?}"
+    );
     assert!(is_rule(&rows[n - 1]), "bottom border (:156): {rows:?}");
-    assert!(rows[n - 2].contains("enabled"), "the footer is FLUSH against it: {rows:?}");
+    assert!(
+        rows[n - 2].contains("enabled"),
+        "the footer is FLUSH against it: {rows:?}"
+    );
     assert_eq!(
         rows.iter().filter(|r| r.is_empty()).count(),
         5,
@@ -360,26 +423,44 @@ fn scoped_models_envelope_is_a_prefix_on_a_short_slot() {
 fn settings_selector_envelope_is_border_list_border_with_no_title_row() {
     let mut sel = SettingsSelector::new(
         "Settings",
-        vec![SettingRow::toggle("terminal.showImages", "Show images", true)],
+        vec![SettingRow::toggle(
+            "terminal.showImages",
+            "Show images",
+            true,
+        )],
     );
     let rows = natural(sel.as_mut_selector(), 60);
     let n = rows.len();
     assert!(is_rule(&rows[0]), "DynamicBorder (:765): {rows:?}");
     // The list's FIRST line is the search box — nothing between it and the rule (no Spacer, and
     // no title, which is the row cyrup used to invent).
-    assert_eq!(rows[1], ">", "the search Input is flush against the rule (:94): {rows:?}");
+    assert_eq!(
+        rows[1], ">",
+        "the search Input is flush against the rule (:94): {rows:?}"
+    );
     assert!(
         !rows.iter().any(|r| r.trim() == "Settings"),
         "upstream draws no title row for /settings (:765-874): {rows:?}"
     );
-    assert_eq!(rows[2], "", "the blank under the search box (:95): {rows:?}");
-    assert!(rows[3].contains("Show images"), "the first settings row (:143): {rows:?}");
+    assert_eq!(
+        rows[2], "",
+        "the blank under the search box (:95): {rows:?}"
+    );
+    assert!(
+        rows[3].contains("Show images"),
+        "the first settings row (:143): {rows:?}"
+    );
     assert!(is_rule(&rows[n - 1]), "DynamicBorder (:874): {rows:?}");
     assert_eq!(
-        rows[n - 2], "  Type to search · Enter/Space to change · Esc to cancel",
+        rows[n - 2],
+        "  Type to search · Enter/Space to change · Esc to cancel",
         "addHintLine's search-enabled text, flush against the bottom rule (:242): {rows:?}"
     );
-    assert_eq!(rows[n - 3], "", "addHintLine's leading blank (:237): {rows:?}");
+    assert_eq!(
+        rows[n - 3],
+        "",
+        "addHintLine's leading blank (:237): {rows:?}"
+    );
     assert_eq!(
         rows.iter().filter(|r| r.is_empty()).count(),
         2,
@@ -409,8 +490,16 @@ fn settings_list_behaviours_do_not_leak_into_the_shared_select_list() {
     let mut sel = ListSelector::show_images(true)
         .with_upstream_chrome(SelectorKind::ShowImages, &SelectKeymap::default());
     let rows = natural(sel.as_mut_selector(), 60);
-    assert!(!rows.iter().any(|r| r.starts_with("> ") || r.trim_end() == ">"), "no Input: {rows:?}");
-    assert!(!rows.iter().any(|r| r.contains("Type to search")), "no SettingsList hint: {rows:?}");
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.starts_with("> ") || r.trim_end() == ">"),
+        "no Input: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("Type to search")),
+        "no SettingsList hint: {rows:?}"
+    );
 
     // `ColumnLayout::SLASH` still pins the primary column at `[12, 32]` — a 3-column label is
     // padded out to 12 there, which is exactly what `min(30, widest)` must NOT do.
@@ -428,8 +517,14 @@ fn settings_list_behaviours_do_not_leak_into_the_shared_select_list() {
     // And `/trust`, which lives in the same module as `SettingsSelector`, keeps its own shape.
     let mut trust = trust(None);
     let rows = natural(trust.as_mut_selector(), 60);
-    assert!(!rows.iter().any(|r| r.trim_end() == ">"), "no search box on /trust: {rows:?}");
-    assert!(!rows.iter().any(|r| r.contains("Type to search")), "{rows:?}");
+    assert!(
+        !rows.iter().any(|r| r.trim_end() == ">"),
+        "no search box on /trust: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("Type to search")),
+        "{rows:?}"
+    );
 }
 
 /// S16 — the description block: a blank, then the HIGHLIGHTED row's description wrapped at
@@ -446,19 +541,37 @@ fn settings_selector_renders_the_selected_rows_description_block() {
         ],
     );
     let rows = natural(sel.as_mut_selector(), 40);
-    let block: Vec<&String> = rows.iter().filter(|r| r.starts_with("  Automatically")).collect();
-    assert_eq!(block.len(), 1, "the first row's description is shown: {rows:?}");
+    let block: Vec<&String> = rows
+        .iter()
+        .filter(|r| r.starts_with("  Automatically"))
+        .collect();
+    assert_eq!(
+        block.len(),
+        1,
+        "the first row's description is shown: {rows:?}"
+    );
     // width - 4 = 36, and the "  " prefix goes on AFTER wrapping, so a wrapped row is <= 38 cols.
     // The 60-column description therefore spans two rows rather than being clipped.
     assert!(
         rows.iter().any(|r| r == "  Automatically compact the")
-            && rows.iter().any(|r| r == "  conversation when it grows too long"),
+            && rows
+                .iter()
+                .any(|r| r == "  conversation when it grows too long"),
         "the description wraps at width-4 rather than clipping: {rows:?}"
     );
-    for row in rows.iter().filter(|r| r.starts_with("  ") && !r.starts_with("  Type to")) {
-        assert!(row.chars().count() <= 38, "wrapped at width-4 plus the `  ` prefix: {row:?}");
+    for row in rows
+        .iter()
+        .filter(|r| r.starts_with("  ") && !r.starts_with("  Type to"))
+    {
+        assert!(
+            row.chars().count() <= 38,
+            "wrapped at width-4 plus the `  ` prefix: {row:?}"
+        );
     }
-    assert!(!rows.iter().any(|r| r.contains("Render inline")), "only the SELECTED row's: {rows:?}");
+    assert!(
+        !rows.iter().any(|r| r.contains("Render inline")),
+        "only the SELECTED row's: {rows:?}"
+    );
 
     let keymap = crate::SelectKeymap::default();
     sel.handle(
@@ -469,8 +582,14 @@ fn settings_selector_renders_the_selected_rows_description_block() {
         &keymap,
     );
     let rows = natural(sel.as_mut_selector(), 40);
-    assert!(rows.iter().any(|r| r == "  Render inline"), "it follows the highlight: {rows:?}");
-    assert!(!rows.iter().any(|r| r.starts_with("  Automatically")), "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r == "  Render inline"),
+        "it follows the highlight: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.starts_with("  Automatically")),
+        "{rows:?}"
+    );
 }
 
 /// S16 — the search box actually filters, and `Space` is a literal space once the box is non-empty
@@ -492,20 +611,40 @@ fn settings_selector_search_filters_and_space_types_once_the_box_is_dirty() {
         )
     };
     // Space on an empty box activates the row (`data === " " && searchInput.getValue().length === 0`).
-    assert!(matches!(sel.handle(&ch(' '), &keymap), crate::SelectorOutcome::Apply(_)));
+    assert!(matches!(
+        sel.handle(&ch(' '), &keymap),
+        crate::SelectorOutcome::Apply(_)
+    ));
 
     for c in "imag".chars() {
         sel.handle(&ch(c), &keymap);
     }
     let rows = natural(sel.as_mut_selector(), 60);
-    assert_eq!(rows[1], "> imag", "the query is echoed in the Input (:94): {rows:?}");
-    assert!(rows.iter().any(|r| r.contains("Show images")), "the match survives: {rows:?}");
-    assert!(!rows.iter().any(|r| r.contains("Auto-compact")), "the non-match is gone: {rows:?}");
+    assert_eq!(
+        rows[1], "> imag",
+        "the query is echoed in the Input (:94): {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Show images")),
+        "the match survives: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("Auto-compact")),
+        "the non-match is gone: {rows:?}"
+    );
 
     // Now Space is text, not an activation.
     let before = sel.current().map(|r| r.value.clone());
-    assert!(matches!(sel.handle(&ch(' '), &keymap), crate::SelectorOutcome::Redraw));
-    assert_eq!(sel.current().map(|r| r.value.clone()), before, "no cycle (:187): {:?}", sel.query());
+    assert!(matches!(
+        sel.handle(&ch(' '), &keymap),
+        crate::SelectorOutcome::Redraw
+    ));
+    assert_eq!(
+        sel.current().map(|r| r.value.clone()),
+        before,
+        "no cycle (:187): {:?}",
+        sel.query()
+    );
     assert_eq!(sel.query(), "imag ");
 
     // A query that matches nothing takes the `No matching settings` arm (:107-111), which still
@@ -514,8 +653,14 @@ fn settings_selector_search_filters_and_space_types_once_the_box_is_dirty() {
         sel.handle(&ch(c), &keymap);
     }
     let rows = natural(sel.as_mut_selector(), 60);
-    assert!(rows.iter().any(|r| r == "  No matching settings"), "(:108): {rows:?}");
-    assert!(rows.iter().any(|r| r.contains("Type to search")), "addHintLine still runs: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r == "  No matching settings"),
+        "(:108): {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Type to search")),
+        "addHintLine still runs: {rows:?}"
+    );
 }
 
 /// S33 — the label column is `Math.min(30, Math.max(...labels))` (`settings-list.ts:121`), measured
@@ -526,11 +671,20 @@ fn settings_selector_label_column_hugs_short_labels_and_caps_at_thirty() {
     // Widest label is 3 columns. Upstream pads to 3, not to 12.
     let mut sel = SettingsSelector::new(
         "Settings",
-        vec![SettingRow::toggle("a", "abc", true), SettingRow::toggle("b", "xy", false)],
+        vec![
+            SettingRow::toggle("a", "abc", true),
+            SettingRow::toggle("b", "xy", false),
+        ],
     );
     let rows = natural(sel.as_mut_selector(), 60);
-    assert!(rows.iter().any(|r| r == "→ abc  true"), "3-wide column + `  ` separator: {rows:?}");
-    assert!(rows.iter().any(|r| r == "  xy   false"), "`xy` padded to 3: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r == "→ abc  true"),
+        "3-wide column + `  ` separator: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r == "  xy   false"),
+        "`xy` padded to 3: {rows:?}"
+    );
 
     // A 40-column label clamps to 30, not 32.
     let long = "l".repeat(40);
@@ -547,7 +701,11 @@ fn settings_selector_label_column_hugs_short_labels_and_caps_at_thirty() {
         .find(|r| r.contains("short"))
         .unwrap_or_else(|| panic!("no short row: {rows:?}"));
     // `  ` cursor + 30-wide column + `  ` separator ⇒ the value starts at column 34.
-    assert_eq!(short_row.find("false"), Some(34), "min(30, …), not 32: {short_row:?}");
+    assert_eq!(
+        short_row.find("false"),
+        Some(34),
+        "min(30, …), not 32: {short_row:?}"
+    );
 }
 
 fn settings_selector() -> SettingsSelector {
@@ -583,7 +741,10 @@ fn settings_selector_height_ladder_never_renders_the_hint_instead_of_the_dialog(
     // draws no title row, so the row that used to read "Settings" is the search box.
     assert_eq!(full[1], ">", "the search Input (:94): {full:?}");
     assert_eq!(full[2], "", "the blank under it (:95): {full:?}");
-    assert!(full[3].contains("Show images"), "the first settings row (:143): {full:?}");
+    assert!(
+        full[3].contains("Show images"),
+        "the first settings row (:143): {full:?}"
+    );
 
     for h in [1u16, 2, 3, 5, natural_h] {
         let mut sel = settings_selector();
@@ -610,7 +771,11 @@ fn trust(saved: Option<usize>) -> TrustSelector {
         "/home/me/project",
         "trusted (/home/me/project)",
         true,
-        vec!["Trust".to_string(), "Trust parent".to_string(), "Do not trust".to_string()],
+        vec![
+            "Trust".to_string(),
+            "Trust parent".to_string(),
+            "Do not trust".to_string(),
+        ],
         0,
     )
     .with_saved_index(saved)
@@ -629,18 +794,37 @@ fn trust_envelope_has_all_five_upstream_spacer_rows() {
     assert!(is_rule(&rows[0]), "DynamicBorder (:52): {rows:?}");
     assert_eq!(rows[1], "", "Spacer(1) (:53): {rows:?}");
     assert!(rows[2].contains("Project trust"), "title (:54): {rows:?}");
-    assert!(rows[3].contains("/home/me/project"), "the cwd is ADJACENT to the title (:55): {rows:?}");
-    assert_eq!(rows[4], "", "Spacer(1) (:56) — S20's 'cwd runs straight into Saved decision': {rows:?}");
+    assert!(
+        rows[3].contains("/home/me/project"),
+        "the cwd is ADJACENT to the title (:55): {rows:?}"
+    );
+    assert_eq!(
+        rows[4], "",
+        "Spacer(1) (:56) — S20's 'cwd runs straight into Saved decision': {rows:?}"
+    );
     assert!(rows[5].contains("Saved decision:"), "(:57-66): {rows:?}");
-    assert!(rows[6].contains("Current session:"), "ADJACENT to it (:67-69): {rows:?}");
+    assert!(
+        rows[6].contains("Current session:"),
+        "ADJACENT to it (:67-69): {rows:?}"
+    );
     assert_eq!(rows[7], "", "Spacer(1) (:70): {rows:?}");
-    assert!(rows[8].contains("Trust"), "the option list (:72-73): {rows:?}");
+    assert!(
+        rows[8].contains("Trust"),
+        "the option list (:72-73): {rows:?}"
+    );
 
     assert!(is_rule(&rows[n - 1]), "DynamicBorder (:87): {rows:?}");
     assert_eq!(rows[n - 2], "", "Spacer(1) (:86): {rows:?}");
-    assert!(rows[n - 3].contains("navigate"), "the hint row (:75-85): {rows:?}");
+    assert!(
+        rows[n - 3].contains("navigate"),
+        "the hint row (:75-85): {rows:?}"
+    );
     assert_eq!(rows[n - 4], "", "Spacer(1) (:74): {rows:?}");
-    assert_eq!(rows.iter().filter(|r| r.is_empty()).count(), 5, "exactly five: {rows:?}");
+    assert_eq!(
+        rows.iter().filter(|r| r.is_empty()).count(),
+        5,
+        "exactly five: {rows:?}"
+    );
 }
 
 /// S20. `const checkmark = isCurrent ? theme.fg("success", " ✓") : ""` (`trust-selector.ts:110`),
@@ -652,7 +836,11 @@ fn trust_marks_the_saved_decision_with_a_success_checkmark() {
     let mut sel = trust(Some(2));
     let rows = natural(sel.as_mut_selector(), 60);
     let marked: Vec<&String> = rows.iter().filter(|r| r.contains('✓')).collect();
-    assert_eq!(marked.len(), 1, "exactly one option carries the checkmark: {rows:?}");
+    assert_eq!(
+        marked.len(),
+        1,
+        "exactly one option carries the checkmark: {rows:?}"
+    );
     assert!(
         marked[0].contains("Do not trust") && marked[0].ends_with('✓'),
         "the checkmark is appended to the SAVED option's label: {rows:?}"
@@ -678,7 +866,10 @@ fn trust_draws_no_checkmark_when_nothing_is_saved() {
         !rows.iter().any(|r| r.contains('✓')),
         "no saved decision ⇒ no marker anywhere: {rows:?}"
     );
-    assert!(rows.iter().any(|r| r.contains('→')), "the cursor is still drawn: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains('→')),
+        "the cursor is still drawn: {rows:?}"
+    );
 }
 
 #[test]
@@ -710,7 +901,10 @@ fn model_selector_envelope_has_the_four_upstream_spacer_rows() {
     let rows = natural(sel.as_mut_selector(), 70);
     let n = rows.len();
     assert!(is_rule(&rows[0]), "DynamicBorder (:92): {rows:?}");
-    assert_eq!(rows[1], "", "Spacer(1) after the top border (:93): {rows:?}");
+    assert_eq!(
+        rows[1], "",
+        "Spacer(1) after the top border (:93): {rows:?}"
+    );
     // This fixture has no scoped models, so `:101-104`'s `else` branch draws the warning `Text`
     // alone — no scope line, no `getScopeHintText` row (S30). It is a `Text` like any other, so it
     // WRAPS at the dialog width (`text.ts:60-87`) instead of being clipped: the string is 75
@@ -720,9 +914,16 @@ fn model_selector_envelope_has_the_four_upstream_spacer_rows() {
         "the warning `Text` (:102-103), flush at column 0 (S32): {rows:?}"
     );
     assert_eq!(rows[3], "providers.", "…wrapped, not truncated: {rows:?}");
-    assert_eq!(rows[4], "", "Spacer(1) after the whole scope block (:105): {rows:?}");
+    assert_eq!(
+        rows[4], "",
+        "Spacer(1) after the whole scope block (:105): {rows:?}"
+    );
     assert!(is_rule(&rows[n - 1]), "DynamicBorder (:129): {rows:?}");
-    assert_eq!(rows[n - 2], "", "Spacer(1) before the bottom border (:126): {rows:?}");
+    assert_eq!(
+        rows[n - 2],
+        "",
+        "Spacer(1) before the bottom border (:126): {rows:?}"
+    );
 }
 
 #[test]
@@ -754,10 +955,16 @@ fn session_selector_envelope_opens_with_a_spacer_above_its_top_rule() {
     let mut sel = session_selector();
     let rows = natural(sel.as_mut_selector(), 70);
     let n = rows.len();
-    assert_eq!(rows[0], "", "Spacer(1) ABOVE the top border (:737): {rows:?}");
+    assert_eq!(
+        rows[0], "",
+        "Spacer(1) ABOVE the top border (:737): {rows:?}"
+    );
     assert!(is_rule(&rows[1]), "DynamicBorder (:738): {rows:?}");
     assert_eq!(rows[2], "", "Spacer(1) after it (:739): {rows:?}");
-    assert!(rows[3].contains("Resume Session"), "the header's line 1 of 3 (:185): {rows:?}");
+    assert!(
+        rows[3].contains("Resume Session"),
+        "the header's line 1 of 3 (:185): {rows:?}"
+    );
     assert!(is_rule(&rows[n - 1]), "DynamicBorder (:746): {rows:?}");
     assert_eq!(rows[n - 2], "", "Spacer(1) before it (:745): {rows:?}");
 }
@@ -774,10 +981,16 @@ fn session_selector_envelope_opens_with_a_spacer_above_its_top_rule() {
 fn session_selector_header_is_title_then_both_hint_rows_then_the_spacer() {
     let mut sel = session_selector();
     let rows = natural(sel.as_mut_selector(), 70);
-    assert_eq!(rows[0], "", "Spacer(1) ABOVE the top border (:737): {rows:?}");
+    assert_eq!(
+        rows[0], "",
+        "Spacer(1) ABOVE the top border (:737): {rows:?}"
+    );
     assert!(is_rule(&rows[1]), "DynamicBorder (:738): {rows:?}");
     assert_eq!(rows[2], "", "Spacer(1) (:739): {rows:?}");
-    assert!(rows[3].contains("Resume Session"), "the header's line 1 (:185): {rows:?}");
+    assert!(
+        rows[3].contains("Resume Session"),
+        "the header's line 1 (:185): {rows:?}"
+    );
     assert!(
         rows[4].starts_with("tab scope · re:<pattern> regex"),
         "hintLine1, upstream's own text (:169-170): {rows:?}"
@@ -786,14 +999,26 @@ fn session_selector_header_is_title_then_both_hint_rows_then_the_spacer() {
         rows[5].starts_with("ctrl+s sort · ctrl+n named · ctrl+d delete · ctrl+p path (off)"),
         "hintLine2 (:171-180): {rows:?}"
     );
-    assert_eq!(rows[6], "", "Spacer(1) BETWEEN header and content (:742): {rows:?}");
+    assert_eq!(
+        rows[6], "",
+        "Spacer(1) BETWEEN header and content (:742): {rows:?}"
+    );
     // S31: `Input.render`'s prompt is an unstyled `"> "` at column **0** (`input.ts:380`), and
     // `SessionList` splices the `Input`'s own lines in unmodified (`:418`), so nothing insets it.
     // This used to assert `" >"` — cyrup's accent three-column invention. (`natural` trims the
     // row, so the caret cell after the prompt is not visible here.)
-    assert!(rows[7].starts_with('>'), "SessionList's search Input (:418): {rows:?}");
-    assert_eq!(rows[8], "", "SessionList's own blank after it (:419): {rows:?}");
-    assert!(rows[9].contains("Build pipeline"), "then the session rows: {rows:?}");
+    assert!(
+        rows[7].starts_with('>'),
+        "SessionList's search Input (:418): {rows:?}"
+    );
+    assert_eq!(
+        rows[8], "",
+        "SessionList's own blank after it (:419): {rows:?}"
+    );
+    assert!(
+        rows[9].contains("Build pipeline"),
+        "then the session rows: {rows:?}"
+    );
     // And nothing repeats the hints below the list any more.
     assert_eq!(
         rows.iter().filter(|r| r.contains("scope")).count(),
@@ -834,20 +1059,41 @@ fn config_selector_envelope_has_the_four_upstream_spacer_rows() {
     let mut sel = config_selector();
     let rows = natural(sel.as_mut_selector(), 70);
     let n = rows.len();
-    assert_eq!(rows[0], "", "Spacer(1) ABOVE the top border (:901): {rows:?}");
+    assert_eq!(
+        rows[0], "",
+        "Spacer(1) ABOVE the top border (:901): {rows:?}"
+    );
     assert!(is_rule(&rows[1]), "DynamicBorder (:902): {rows:?}");
     assert_eq!(rows[2], "", "Spacer(1) (:903): {rows:?}");
     // Header row 1 (:203-209,216): the bold title, then right-aligned hints. `tab switch mode` is
     // absent because `projectModeAvailable` is off by default (:205).
-    assert!(rows[3].starts_with("Global Resources"), "header row 1 title (:203): {rows:?}");
-    assert!(rows[3].ends_with("space toggle · esc close"), "right-aligned hint (:208): {rows:?}");
-    assert!(!rows[3].contains("switch mode"), "no tab hint without project mode (:205): {rows:?}");
+    assert!(
+        rows[3].starts_with("Global Resources"),
+        "header row 1 title (:203): {rows:?}"
+    );
+    assert!(
+        rows[3].ends_with("space toggle · esc close"),
+        "right-aligned hint (:208): {rows:?}"
+    );
+    assert!(
+        !rows[3].contains("switch mode"),
+        "no tab hint without project mode (:205): {rows:?}"
+    );
     // Header row 2 (:210-213,217): which settings file is being written.
-    assert_eq!(rows[4], "~/.cyrup/agent/settings.json", "header row 2 (:213): {rows:?}");
+    assert_eq!(
+        rows[4], "~/.cyrup/agent/settings.json",
+        "header row 2 (:213): {rows:?}"
+    );
     assert_eq!(rows[5], "", "Spacer(1) (:906): {rows:?}");
     assert_eq!(rows[6], ">", "ResourceList's search Input (:396): {rows:?}");
-    assert_eq!(rows[7], "", "the blank ResourceList pushes under it (:397): {rows:?}");
-    assert!(rows[8].contains("User"), "the resource list starts (:926): {rows:?}");
+    assert_eq!(
+        rows[7], "",
+        "the blank ResourceList pushes under it (:397): {rows:?}"
+    );
+    assert!(
+        rows[8].contains("User"),
+        "the resource list starts (:926): {rows:?}"
+    );
     assert!(is_rule(&rows[n - 1]), "DynamicBorder (:930): {rows:?}");
     assert_eq!(rows[n - 2], "", "Spacer(1) (:929): {rows:?}");
 }
@@ -864,11 +1110,17 @@ fn config_selector_header_switches_title_hint_and_scope_path_with_the_write_scop
         global[3].ends_with("tab switch mode · space toggle · esc close"),
         "all three hints, joined by ` · ` (:204-208): {global:?}"
     );
-    assert_eq!(global[4], "~/.cyrup/agent/settings.json", "(:213): {global:?}");
+    assert_eq!(
+        global[4], "~/.cyrup/agent/settings.json",
+        "(:213): {global:?}"
+    );
 
     sel.set_write_scope(crate::ConfigWriteScope::Project);
     let project = natural(sel.as_mut_selector(), 90);
-    assert!(project[3].starts_with("Project Local Resources"), "(:203): {project:?}");
+    assert!(
+        project[3].starts_with("Project Local Resources"),
+        "(:203): {project:?}"
+    );
     assert!(
         project[3].ends_with("tab switch mode · space cycle inherit/+/- · esc close"),
         "the project arm of the action hint (:207): {project:?}"
@@ -879,7 +1131,11 @@ fn config_selector_header_switches_title_hint_and_scope_path_with_the_write_scop
     );
     // The hint is RIGHT-ALIGNED (`spacing = max(1, width - titleWidth - hintWidth)`, :209), not
     // pinned four columns after the title as cyrup used to draw it.
-    assert_eq!(project[3].chars().count(), 90, "the row fills the width: {project:?}");
+    assert_eq!(
+        project[3].chars().count(),
+        90,
+        "the row fills the width: {project:?}"
+    );
 }
 
 /// S17/S19 — `Tab` flips the write scope, but only when the chrome said project mode exists
@@ -893,13 +1149,21 @@ fn config_selector_tab_switches_write_scope_only_when_project_mode_is_available(
         crate::crossterm::event::KeyModifiers::NONE,
     );
     sel.handle(&tab, &keymap);
-    assert_eq!(sel.write_scope(), crate::ConfigWriteScope::Global, "no project mode, no switch");
+    assert_eq!(
+        sel.write_scope(),
+        crate::ConfigWriteScope::Global,
+        "no project mode, no switch"
+    );
 
     sel.set_project_mode_available(true);
     sel.handle(&tab, &keymap);
     assert_eq!(sel.write_scope(), crate::ConfigWriteScope::Project);
     sel.handle(&tab, &keymap);
-    assert_eq!(sel.write_scope(), crate::ConfigWriteScope::Global, "and back (:934)");
+    assert_eq!(
+        sel.write_scope(),
+        crate::ConfigWriteScope::Global,
+        "and back (:934)"
+    );
 }
 
 #[test]
@@ -967,15 +1231,27 @@ fn config_selector_windows_its_body_to_pis_window_including_pis_own_overshoot() 
         // envelope, which is what pi's `Container` produces before `layout.ts:113` clips it.
         let rows = rows_at(&mut sel, 70, want);
         let n = rows.len();
-        assert_eq!(rows[0], "", "Spacer(1) ABOVE the top border (:901): {rows:?}");
+        assert_eq!(
+            rows[0], "",
+            "Spacer(1) ABOVE the top border (:901): {rows:?}"
+        );
         assert!(is_rule(&rows[1]), "DynamicBorder (:902): {rows:?}");
         assert_eq!(rows[2], "", "Spacer(1) (:903): {rows:?}");
-        assert!(rows[3].starts_with("Global Resources"), "header row 1 (:203): {rows:?}");
-        assert_eq!(rows[4], "~/.cyrup/agent/settings.json", "header row 2 (:213): {rows:?}");
+        assert!(
+            rows[3].starts_with("Global Resources"),
+            "header row 1 (:203): {rows:?}"
+        );
+        assert_eq!(
+            rows[4], "~/.cyrup/agent/settings.json",
+            "header row 2 (:213): {rows:?}"
+        );
         assert_eq!(rows[5], "", "Spacer(1) (:906): {rows:?}");
         assert_eq!(rows[6], ">", "the search Input (:396): {rows:?}");
         assert_eq!(rows[7], "", "the blank under it (:397): {rows:?}");
-        assert!(rows[8].contains("User"), "the resource list starts (:926): {rows:?}");
+        assert!(
+            rows[8].contains("User"),
+            "the resource list starts (:926): {rows:?}"
+        );
         assert_eq!(rows[n - 2], "", "Spacer(1) (:929): {rows:?}");
         assert!(is_rule(&rows[n - 1]), "DynamicBorder (:930): {rows:?}");
         assert_eq!(
@@ -1008,7 +1284,10 @@ fn config_selector_window_floors_at_five_and_then_clips_like_pi() {
          row (:444-449)"
     );
     let rows = rows_at(&mut sel, 70, 8);
-    assert_eq!(rows[0], "", "still opens with :901's Spacer, not a rule: {rows:?}");
+    assert_eq!(
+        rows[0], "",
+        "still opens with :901's Spacer, not a rule: {rows:?}"
+    );
     assert!(is_rule(&rows[1]), "{rows:?}");
     assert_eq!(rows[2], "", "{rows:?}");
 }
@@ -1049,9 +1328,18 @@ fn config_selector_project_scope_dims_inherited_rows_and_shows_override_markers(
 
     // Global scope: no suffixes, no ` · inherited global`, plain `[x]`/`[ ]`.
     let global = natural(sel.as_mut_selector(), 70);
-    assert!(!global.iter().any(|r| r.contains("inherited global")), "{global:?}");
-    assert!(!global.iter().any(|r| r.contains("project load")), "{global:?}");
-    assert!(global.iter().any(|r| r.contains("[x] inherited-skill")), "(:646): {global:?}");
+    assert!(
+        !global.iter().any(|r| r.contains("inherited global")),
+        "{global:?}"
+    );
+    assert!(
+        !global.iter().any(|r| r.contains("project load")),
+        "{global:?}"
+    );
+    assert!(
+        global.iter().any(|r| r.contains("[x] inherited-skill")),
+        "(:646): {global:?}"
+    );
 
     sel.set_write_scope(crate::ConfigWriteScope::Project);
     sel.set_override_state(1, crate::ProjectOverrideState::Load);
@@ -1060,7 +1348,9 @@ fn config_selector_project_scope_dims_inherited_rows_and_shows_override_markers(
 
     // The user group header carries the tail; the project group header does not (:417-418).
     assert!(
-        project.iter().any(|r| r.trim() == "User (/home/me/.cyrup/agent) · inherited global"),
+        project
+            .iter()
+            .any(|r| r.trim() == "User (/home/me/.cyrup/agent) · inherited global"),
         "(:418): {project:?}"
     );
     assert!(
@@ -1069,19 +1359,25 @@ fn config_selector_project_scope_dims_inherited_rows_and_shows_override_markers(
     );
     // Inherit + inherited-global ⇒ dim `[x]` plus the `  inherited global` suffix (:644, :654).
     assert!(
-        project.iter().any(|r| r.contains("[x] inherited-skill  inherited global")),
+        project
+            .iter()
+            .any(|r| r.contains("[x] inherited-skill  inherited global")),
         "(:644,:654): {project:?}"
     );
     // A forced load reports `[+]` and `  project load` even though the resource is disabled
     // globally (:642, :652) — the checkbox tracks the OVERRIDE, not the resolved enable.
     assert!(
-        project.iter().any(|r| r.contains("[+] loaded-skill  project load")),
+        project
+            .iter()
+            .any(|r| r.contains("[+] loaded-skill  project load")),
         "(:642,:652): {project:?}"
     );
     // A forced unload reports `[-]` and `  project unload` (:643, :653), and a project-scope row
     // is never "inherited global".
     assert!(
-        project.iter().any(|r| r.contains("[-] local-skill  project unload")),
+        project
+            .iter()
+            .any(|r| r.contains("[-] local-skill  project unload")),
         "(:643,:653): {project:?}"
     );
 }
@@ -1105,7 +1401,10 @@ fn config_selector_inherited_rows_are_dim_in_project_scope_and_accent_in_global(
     let dim = theme.dim_style().fg.unwrap();
     let accent = theme.accent_style().fg.unwrap();
     let muted = theme.muted_style().fg.unwrap();
-    assert_ne!(dim, accent, "the two colours must actually differ in this theme");
+    assert_ne!(
+        dim, accent,
+        "the two colours must actually differ in this theme"
+    );
     assert_ne!(dim, muted);
 
     // (row index of the group / subgroup / item, colour of a glyph inside each)
@@ -1133,7 +1432,14 @@ fn config_selector_inherited_rows_are_dim_in_project_scope_and_accent_in_global(
     };
 
     let global = colours(&mut sel);
-    assert_eq!(global, vec![("group", accent), ("subgroup", muted), ("item", theme.base_style().fg.unwrap())]);
+    assert_eq!(
+        global,
+        vec![
+            ("group", accent),
+            ("subgroup", muted),
+            ("item", theme.base_style().fg.unwrap())
+        ]
+    );
 
     sel.set_write_scope(crate::ConfigWriteScope::Project);
     let project = colours(&mut sel);
@@ -1163,7 +1469,10 @@ fn config_selector_truncates_long_rows_with_an_ellipsis() {
         .find(|r| r.contains("[x]"))
         .unwrap_or_else(|| panic!("no item row: {rows:?}"));
     assert_eq!(item.chars().count(), 40, "truncated to the width: {item:?}");
-    assert!(item.ends_with("..."), "with the `...` ellipsis (:437): {item:?}");
+    assert!(
+        item.ends_with("..."),
+        "with the `...` ellipsis (:437): {item:?}"
+    );
 }
 
 /// S17 fix #43 — the empty state is `theme.fg("muted", …)` (`config-selector.ts:400`), which cyrup
@@ -1186,7 +1495,11 @@ fn config_selector_empty_state_is_muted_not_dim() {
         .find(|(_, s)| s.contains("No resources found"))
         .unwrap_or_else(|| panic!("no empty state row"));
     let cell = buf.cell((2, y)).unwrap();
-    assert_eq!(cell.fg, theme.muted_style().fg.unwrap(), "muted (:400), not dim");
+    assert_eq!(
+        cell.fg,
+        theme.muted_style().fg.unwrap(),
+        "muted (:400), not dim"
+    );
     assert_ne!(cell.fg, theme.dim_style().fg.unwrap());
 }
 
@@ -1204,7 +1517,10 @@ fn config_selector_scroll_row_counts_resources_not_headers() {
         .find(|r| r.starts_with("  (") && r.ends_with(')'))
         .unwrap_or_else(|| panic!("no scroll readout: {rows:?}"));
     // 240 resources across both scopes; the highlight starts on the first one.
-    assert_eq!(scroll, "  (1/240)", "`  (${{currentItemIndex}}/${{itemCount}})` (:448): {rows:?}");
+    assert_eq!(
+        scroll, "  (1/240)",
+        "`  (${{currentItemIndex}}/${{itemCount}})` (:448): {rows:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1230,14 +1546,26 @@ fn extension_input_envelope_has_four_spacers_and_the_hint_row() {
     // children carrying `paddingX = 1`. cyrup drew a three-column accent `" > "`, one column in.
     // (The trailing space of `"> "` is the reverse-video caret cell and is trimmed off by the row
     // helper, so this pins the `>` at column 0 — E10's actual claim — not the pair's width.)
-    assert!(rows[4].starts_with('>'), "the Input at column 0 (:63-64/input.ts:380): {rows:?}");
+    assert!(
+        rows[4].starts_with('>'),
+        "the Input at column 0 (:63-64/input.ts:380): {rows:?}"
+    );
     assert_eq!(rows[5], "", "Spacer(1) (:65): {rows:?}");
     // E6: `keyHint("tui.select.confirm","submit")  keyHint("tui.select.cancel","cancel")`, in a
     // `new Text(..., 1, 0)` so it is inset one column.
-    assert!(rows[6].starts_with(' '), "the hint is inset one column (paddingX = 1): {rows:?}");
-    assert!(rows[6].contains("submit"), "the hint names submit (:67): {rows:?}");
+    assert!(
+        rows[6].starts_with(' '),
+        "the hint is inset one column (paddingX = 1): {rows:?}"
+    );
+    assert!(
+        rows[6].contains("submit"),
+        "the hint names submit (:67): {rows:?}"
+    );
     assert!(rows[6].contains("cancel"), "…and cancel (:67): {rows:?}");
-    assert!(rows[6].contains("enter"), "…resolved through the live keymap: {rows:?}");
+    assert!(
+        rows[6].contains("enter"),
+        "…resolved through the live keymap: {rows:?}"
+    );
     assert_eq!(rows[7], "", "Spacer(1) (:69): {rows:?}");
     assert!(is_rule(&rows[8]), "DynamicBorder (:70): {rows:?}");
 }
@@ -1282,7 +1610,10 @@ fn extension_input_shows_its_first_five_children_on_a_five_row_slot() {
     assert_eq!(rows[1], "", "Spacer(1) (:48): {rows:?}");
     assert!(rows[2].contains("Name?"), "the title (:50-51): {rows:?}");
     assert_eq!(rows[3], "", "Spacer(1) (:52): {rows:?}");
-    assert!(rows[4].starts_with('>'), "the input FIELD (:63-64): {rows:?}");
+    assert!(
+        rows[4].starts_with('>'),
+        "the input FIELD (:63-64): {rows:?}"
+    );
 }
 
 /// E6, first paint. `keyHint` resolves through `keyText` → `getKeybindings().getKeys(...)` on every
@@ -1300,13 +1631,22 @@ fn extension_input_hint_names_the_users_own_keys_on_the_first_paint() {
 
     let mut stock = TextInputSelector::new("Name?".to_string(), None);
     let stock_rows = natural(&mut stock, 60);
-    assert!(stock_rows[6].contains("enter"), "baseline: the stock table says enter: {stock_rows:?}");
+    assert!(
+        stock_rows[6].contains("enter"),
+        "baseline: the stock table says enter: {stock_rows:?}"
+    );
 
     let mut sel = TextInputSelector::new("Name?".to_string(), None).with_keymap(&rebound);
     // No `handle` call — this is the FIRST paint, before any keystroke.
     let rows = natural(&mut sel, 60);
-    assert!(rows[6].contains("ctrl+j"), "submit names the rebound key (:67): {rows:?}");
-    assert!(rows[6].contains("ctrl+q"), "cancel does too (:67): {rows:?}");
+    assert!(
+        rows[6].contains("ctrl+j"),
+        "submit names the rebound key (:67): {rows:?}"
+    );
+    assert!(
+        rows[6].contains("ctrl+q"),
+        "cancel does too (:67): {rows:?}"
+    );
     assert!(
         !rows[6].contains("enter") && !rows[6].contains("esc"),
         "and the stock defaults are gone: {rows:?}"
@@ -1345,14 +1685,23 @@ fn a_paragraph_keeps_the_first_rows_and_drops_the_rest() {
     use ratatui::widgets::Paragraph;
     let lines: Vec<Line<'static>> = (0..6).map(|i| Line::from(format!("row{i}"))).collect();
     let mut term = Terminal::new(TestBackend::new(8, 3)).unwrap();
-    term.draw(|f| f.render_widget(Paragraph::new(lines), f.area())).unwrap();
+    term.draw(|f| f.render_widget(Paragraph::new(lines), f.area()))
+        .unwrap();
     let buf = term.backend().buffer().clone();
     let rows: Vec<String> = (0..3)
         .map(|y| {
-            (0..8).map(|x| buf[(x, y)].symbol()).collect::<String>().trim_end().to_string()
+            (0..8)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
         })
         .collect();
-    assert_eq!(rows, vec!["row0", "row1", "row2"], "the FIRST rows survive, not the last");
+    assert_eq!(
+        rows,
+        vec!["row0", "row1", "row2"],
+        "the FIRST rows survive, not the last"
+    );
 }
 
 /// **`isInheritedGlobalItem`'s second arm** — `config-selector.ts:781-783`:
@@ -1388,7 +1737,8 @@ fn config_selector_marks_a_project_row_present_in_the_global_resolve_as_inherite
     plain.set_write_scope(crate::ConfigWriteScope::Project);
     let rows = natural(plain.as_mut_selector(), 70);
     assert!(
-        rows.iter().any(|r| r.contains("[x] shared-skill") && !r.contains("inherited global")),
+        rows.iter()
+            .any(|r| r.contains("[x] shared-skill") && !r.contains("inherited global")),
         "a project row absent from the global resolve stays local: {rows:?}"
     );
 
@@ -1398,7 +1748,8 @@ fn config_selector_marks_a_project_row_present_in_the_global_resolve_as_inherite
     sel.set_inherited_global_keys([key]);
     let rows = natural(sel.as_mut_selector(), 70);
     assert!(
-        rows.iter().any(|r| r.contains("[x] shared-skill  inherited global")),
+        rows.iter()
+            .any(|r| r.contains("[x] shared-skill  inherited global")),
         "the OR arm must reach the suffix (:654): {rows:?}"
     );
 
@@ -1418,5 +1769,9 @@ fn config_selector_marks_a_project_row_present_in_the_global_resolve_as_inherite
     let x = (0..buf.area.width)
         .find(|x| buf[(*x, y)].symbol() == "s")
         .expect("the label's first cell");
-    assert_eq!(buf[(x, y)].fg, dim, "and the dim state (:657-663, :430-432)");
+    assert_eq!(
+        buf[(x, y)].fg,
+        dim,
+        "and the dim state (:657-663, :430-432)"
+    );
 }

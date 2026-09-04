@@ -158,5 +158,8 @@ fn mirror_already_trimmed_stdin_concatenates_unchanged() {
 /// emptiness test was already on the trimmed value, and that behavior must not change.
 #[test]
 fn mirror_whitespace_only_stdin_contributes_nothing() {
-    assert_eq!(user_prompt("   \n\t\n", &["summarise this"]), "summarise this");
+    assert_eq!(
+        user_prompt("   \n\t\n", &["summarise this"]),
+        "summarise this"
+    );
 }

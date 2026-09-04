@@ -39,9 +39,14 @@ fn matches_ignores_lock_and_unsupported_modifier_masks() {
     // Pi strips the Caps/Num lock mask (and any unsupported modifier bit) before comparing
     // (keys.ts:361,656,779). crossterm surfaces `HYPER`/`META` as the closest analogues to the JS
     // `LOCK_MASK`; a Ctrl+D chord with a stray lock/hyper bit still resolves to the exit binding.
-    let d_with_hyper =
-        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL | KeyModifiers::HYPER);
-    assert_eq!(Keymap::default().action_for(&d_with_hyper), Some(Action::Quit));
+    let d_with_hyper = KeyEvent::new(
+        KeyCode::Char('d'),
+        KeyModifiers::CONTROL | KeyModifiers::HYPER,
+    );
+    assert_eq!(
+        Keymap::default().action_for(&d_with_hyper),
+        Some(Action::Quit)
+    );
     // A bare key carrying only a lock/hyper bit still matches a no-modifier binding.
     let a_with_meta = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::META);
     assert!(Key::plain(KeyCode::Char('a')).matches(&a_with_meta));
@@ -52,11 +57,17 @@ fn matches_normalizes_shifted_letters() {
     // Pi normalizes a shifted ASCII letter to its lowercase codepoint (keys.ts:360-366): a `shift+a`
     // binding matches a terminal reporting `Char('A')` + SHIFT (the disambiguate/Kitty path).
     let shift_a_upper = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
-    let binding = Key { code: KeyCode::Char('a'), mods: KeyModifiers::SHIFT };
+    let binding = Key {
+        code: KeyCode::Char('a'),
+        mods: KeyModifiers::SHIFT,
+    };
     assert!(binding.matches(&shift_a_upper));
     // Symmetric: a spec written as `shift+A` matches a `Char('a')` + SHIFT event too.
     let shift_a_lower = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT);
-    let binding_upper = Key { code: KeyCode::Char('A'), mods: KeyModifiers::SHIFT };
+    let binding_upper = Key {
+        code: KeyCode::Char('A'),
+        mods: KeyModifiers::SHIFT,
+    };
     assert!(binding_upper.matches(&shift_a_lower));
     // Without shift, an uppercase letter is a distinct key (no spurious collapse).
     let plain_upper = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE);
@@ -98,13 +109,31 @@ fn keymap_rebind_overrides() {
 #[test]
 fn tui008_the_seven_upstream_app_ids_resolve() {
     // `core/keybindings.ts:85, :87-90, :99-102, :115-118` @v0.83.0.
-    assert_eq!(Action::from_id("app.model.select"), Some(Action::ModelSelect));
-    assert_eq!(Action::from_id("app.thinking.toggle"), Some(Action::ThinkingToggle));
-    assert_eq!(Action::from_id("app.message.copy"), Some(Action::MessageCopy));
+    assert_eq!(
+        Action::from_id("app.model.select"),
+        Some(Action::ModelSelect)
+    );
+    assert_eq!(
+        Action::from_id("app.thinking.toggle"),
+        Some(Action::ThinkingToggle)
+    );
+    assert_eq!(
+        Action::from_id("app.message.copy"),
+        Some(Action::MessageCopy)
+    );
     assert_eq!(Action::from_id("app.session.new"), Some(Action::SessionNew));
-    assert_eq!(Action::from_id("app.session.tree"), Some(Action::SessionTree));
-    assert_eq!(Action::from_id("app.session.fork"), Some(Action::SessionFork));
-    assert_eq!(Action::from_id("app.session.resume"), Some(Action::SessionResume));
+    assert_eq!(
+        Action::from_id("app.session.tree"),
+        Some(Action::SessionTree)
+    );
+    assert_eq!(
+        Action::from_id("app.session.fork"),
+        Some(Action::SessionFork)
+    );
+    assert_eq!(
+        Action::from_id("app.session.resume"),
+        Some(Action::SessionResume)
+    );
     // MIRROR — an id that genuinely is not a global app binding must still be `None`, so the arm
     // above is not a catch-all that would make every id "work".
     assert_eq!(Action::from_id("app.thinking.togglee"), None);
@@ -119,9 +148,21 @@ fn tui008_the_seven_upstream_app_ids_resolve() {
 fn tui008_default_chords_match_upstream_including_the_deliberately_unbound_four() {
     let km = Keymap::default();
     let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
-    assert_eq!(km.action_for(&ctrl('l')), Some(Action::ModelSelect), "core/keybindings.ts:85");
-    assert_eq!(km.action_for(&ctrl('t')), Some(Action::ThinkingToggle), "core/keybindings.ts:87-90");
-    assert_eq!(km.action_for(&ctrl('x')), Some(Action::MessageCopy), "core/keybindings.ts:99-102");
+    assert_eq!(
+        km.action_for(&ctrl('l')),
+        Some(Action::ModelSelect),
+        "core/keybindings.ts:85"
+    );
+    assert_eq!(
+        km.action_for(&ctrl('t')),
+        Some(Action::ThinkingToggle),
+        "core/keybindings.ts:87-90"
+    );
+    assert_eq!(
+        km.action_for(&ctrl('x')),
+        Some(Action::MessageCopy),
+        "core/keybindings.ts:99-102"
+    );
     for unbound in [
         Action::SessionNew,
         Action::SessionTree,
@@ -144,10 +185,12 @@ fn tui008_a_keybindings_json_naming_the_new_ids_actually_rebinds_them() {
         r#"{"app.session.tree": "ctrl+alt+t", "app.model.select": ["ctrl+alt+m", "f5"]}"#,
     )
     .expect("valid document");
-    let ctrl_alt = |c| {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT)
-    };
-    assert_eq!(km.action_for(&ctrl_alt('t')), Some(Action::SessionTree), "a `defaultKeys: []` id is bindable");
+    let ctrl_alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    assert_eq!(
+        km.action_for(&ctrl_alt('t')),
+        Some(Action::SessionTree),
+        "a `defaultKeys: []` id is bindable"
+    );
     assert_eq!(km.action_for(&ctrl_alt('m')), Some(Action::ModelSelect));
     assert_eq!(
         km.action_for(&KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
@@ -157,7 +200,10 @@ fn tui008_a_keybindings_json_naming_the_new_ids_actually_rebinds_them() {
     );
     // The rebind REPLACES the default (`packages/tui/src/keybindings.ts:187-191` — user keys are
     // not merged with `defaultKeys`), so Ctrl+L no longer opens the selector.
-    assert_eq!(km.action_for(&KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)), None);
+    assert_eq!(
+        km.action_for(&KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+        None
+    );
 }
 
 /// **Found by TUI-008's round-trip test.** `f1`…`f12` and `insert` are upstream `SpecialKey`s
@@ -183,7 +229,13 @@ fn function_keys_and_insert_parse_and_round_trip_through_label() {
         assert_eq!(Key::parse(&key.label()).unwrap(), key, "{spec}");
     }
     // With modifiers, and the `ins` alias.
-    assert_eq!(Key::parse("ctrl+f4").unwrap(), Key { code: KeyCode::F(4), mods: KeyModifiers::CONTROL });
+    assert_eq!(
+        Key::parse("ctrl+f4").unwrap(),
+        Key {
+            code: KeyCode::F(4),
+            mods: KeyModifiers::CONTROL
+        }
+    );
     assert_eq!(Key::parse("ins").unwrap().code, KeyCode::Insert);
     // MIRROR — the range is real, not a prefix match: `f0` and `f13` have no upstream `KeyId`, and
     // an `f` followed by non-digits is still an ordinary rejected token.

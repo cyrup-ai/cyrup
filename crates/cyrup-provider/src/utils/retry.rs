@@ -159,10 +159,18 @@ pub struct RetryPolicy {
 impl RetryPolicy {
     /// Pi's `retry: undefined` / `enabled: false` — the first response is returned unchanged
     /// (`retry.ts:159-160,168`).
-    pub const DISABLED: Self = Self { enabled: false, max_retries: 0, base_delay_ms: 0 };
+    pub const DISABLED: Self = Self {
+        enabled: false,
+        max_retries: 0,
+        base_delay_ms: 0,
+    };
 
     pub fn new(enabled: bool, max_retries: u32, base_delay_ms: u64) -> Self {
-        Self { enabled, max_retries, base_delay_ms }
+        Self {
+            enabled,
+            max_retries,
+            base_delay_ms,
+        }
     }
 }
 
@@ -216,7 +224,11 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = AssistantMessage>,
 {
-    let max_attempts = if policy.enabled { policy.max_retries } else { 0 };
+    let max_attempts = if policy.enabled {
+        policy.max_retries
+    } else {
+        0
+    };
     let mut attempt: u32 = 0;
     // Pi's `lastRetry`: `onRetryFinished` fires only when at least one retry was scheduled.
     let mut last_retry: Option<u32> = None;
@@ -455,7 +467,11 @@ mod tests {
         }
         fn next(&self) -> AssistantMessage {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.queue.lock().unwrap().pop_front().expect("scripted response")
+            self.queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted response")
         }
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
@@ -473,7 +489,10 @@ mod tests {
 
     impl RetryObserver for Recorder {
         fn on_retry_scheduled(&self, attempt: u32, max: u32, delay: u64, msg: &str) {
-            self.events.lock().unwrap().push(format!("scheduled {attempt}/{max} {delay}ms {msg}"));
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("scheduled {attempt}/{max} {delay}ms {msg}"));
         }
         fn on_retry_attempt_start(&self) {
             self.events.lock().unwrap().push("start".to_string());
@@ -488,7 +507,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_transient_error_is_retried_until_it_succeeds() {
-        let script = Script::new(vec![err(StopReason::Error, Some("terminated")), ok_message()]);
+        let script = Script::new(vec![
+            err(StopReason::Error, Some("terminated")),
+            ok_message(),
+        ]);
         let rec = Recorder::default();
         let out = retry_assistant_call(
             || async { script.next() },
@@ -529,7 +551,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_disabled_policy_returns_the_first_response_unchanged() {
-        let script = Script::new(vec![err(StopReason::Error, Some("terminated")), ok_message()]);
+        let script = Script::new(vec![
+            err(StopReason::Error, Some("terminated")),
+            ok_message(),
+        ]);
         let out = retry_assistant_call(
             || async { script.next() },
             RetryPolicy::DISABLED,
@@ -546,13 +571,14 @@ mod tests {
         let policy = RetryPolicy::new(true, 3, 0);
 
         let aborted = Script::new(vec![err(StopReason::Aborted, None), ok_message()]);
-        let out =
-            retry_assistant_call(|| async { aborted.next() }, policy, None, None).await;
+        let out = retry_assistant_call(|| async { aborted.next() }, policy, None, None).await;
         assert_eq!(aborted.calls(), 1, "an abort is never retried");
         assert_eq!(out.stop_reason, StopReason::Aborted);
 
-        let quota =
-            Script::new(vec![err(StopReason::Error, Some("insufficient_quota")), ok_message()]);
+        let quota = Script::new(vec![
+            err(StopReason::Error, Some("insufficient_quota")),
+            ok_message(),
+        ]);
         let out = retry_assistant_call(|| async { quota.next() }, policy, None, None).await;
         assert_eq!(quota.calls(), 1, "a deterministic error fails fast");
         assert_eq!(out.error_message.as_deref(), Some("insufficient_quota"));
@@ -572,7 +598,11 @@ mod tests {
         )
         .await;
         assert_eq!(script.calls(), 1, "the retried call never starts");
-        assert_eq!(out.stop_reason, StopReason::Aborted, "normalized like a stream abort");
+        assert_eq!(
+            out.stop_reason,
+            StopReason::Aborted,
+            "normalized like a stream abort"
+        );
         assert!(out.error_message.is_none());
         assert_eq!(
             *rec.events.lock().unwrap(),

@@ -1,9 +1,9 @@
 //! Tool-call-id normalization (Pi createMistralToolCallIdNormalizer, :153-183)
 
+use super::MISTRAL_TOOL_CALL_ID_LENGTH;
 use crate::utils::hash::short_hash;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use super::MISTRAL_TOOL_CALL_ID_LENGTH;
 
 /// A deterministic, collision-avoiding 9-char tool-call-id normalizer (Pi
 /// `createMistralToolCallIdNormalizer`). Stateful within one request: stable per source id, and

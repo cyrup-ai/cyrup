@@ -231,7 +231,10 @@ pub struct CommandDescriptor {
 impl CommandDescriptor {
     /// A command with `description` and no static completions.
     pub fn new(description: impl Into<String>) -> Self {
-        Self { description: description.into(), completions: Vec::new() }
+        Self {
+            description: description.into(),
+            completions: Vec::new(),
+        }
     }
 }
 
@@ -310,7 +313,12 @@ pub struct DialogOptions {
     /// Auto-dismiss the dialog after this many milliseconds, with a live countdown. `timeout` on
     /// the wire, with `timeoutMs` accepted as an alias — see EXT-048 in the type doc. Set with
     /// [`Self::timeout`].
-    #[serde(rename = "timeout", alias = "timeoutMs", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "timeout",
+        alias = "timeoutMs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub timeout_ms: Option<u64>,
     /// The id of a programmatic-dismiss signal the host maps to an abort token. Set with
     /// [`Self::signal`].
@@ -321,11 +329,17 @@ pub struct DialogOptions {
 impl DialogOptions {
     /// A dialog that auto-dismisses after `ms` with a live countdown (Pi `{timeout}`).
     pub fn timeout(ms: u64) -> Self {
-        Self { timeout_ms: Some(ms), signal_id: None }
+        Self {
+            timeout_ms: Some(ms),
+            signal_id: None,
+        }
     }
     /// A dialog dismissible via the named programmatic signal (Pi `{signal}`).
     pub fn signal(id: impl Into<String>) -> Self {
-        Self { timeout_ms: None, signal_id: Some(id.into()) }
+        Self {
+            timeout_ms: None,
+            signal_id: Some(id.into()),
+        }
     }
 }
 

@@ -225,9 +225,7 @@ fn render_custom_template(
     let variable = |name: &str| -> Option<String> {
         match name {
             "fullDescription" | "full" => Some(full.to_string()),
-            "compactDescription" | "compact" => {
-                Some(COMPACT_SUBAGENT_TOOL_DESCRIPTION.to_string())
-            }
+            "compactDescription" | "compact" => Some(COMPACT_SUBAGENT_TOOL_DESCRIPTION.to_string()),
             "safetyGuidance" | "safety" => Some(SUBAGENT_SAFETY_GUIDANCE.to_string()),
             "agentDir" => Some(options.agent_dir.display().to_string()),
             "projectConfigDir" => Some(project_config_dir.display().to_string()),
@@ -394,7 +392,12 @@ pub fn build_subagent_tool_description(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -403,7 +406,8 @@ mod tests {
     fn options(dir: &std::path::Path) -> ToolDescriptionOptions {
         let cwd = dir.join("project");
         let agent_dir = dir.join("agent");
-        std::fs::create_dir_all(crate::paths::project_config_dir(&cwd)).expect("project config dir");
+        std::fs::create_dir_all(crate::paths::project_config_dir(&cwd))
+            .expect("project config dir");
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
         ToolDescriptionOptions { cwd, agent_dir }
     }
@@ -545,7 +549,10 @@ mod tests {
             "exactly one copy: {built}"
         );
         assert!(built.ends_with(SUBAGENT_SAFETY_GUIDANCE), "and it is last");
-        assert_eq!(built, format!("Header.\n\nFooter.\n\n{SUBAGENT_SAFETY_GUIDANCE}"));
+        assert_eq!(
+            built,
+            format!("Header.\n\nFooter.\n\n{SUBAGENT_SAFETY_GUIDANCE}")
+        );
 
         // A file that is NOTHING but the guidance collapses to the guidance alone.
         assert_eq!(
@@ -570,7 +577,13 @@ mod tests {
         assert!(rendered.starts_with(&format!("{FULL}|{FULL}|")));
         assert!(rendered.contains(COMPACT_SUBAGENT_TOOL_DESCRIPTION));
         assert!(rendered.contains(&opts.agent_dir.display().to_string()));
-        assert!(rendered.contains(&crate::paths::project_config_dir(&opts.cwd).display().to_string()));
+        assert!(
+            rendered.contains(
+                &crate::paths::project_config_dir(&opts.cwd)
+                    .display()
+                    .to_string()
+            )
+        );
         assert!(rendered.ends_with("|{{nope}}|{{ spaced }}"), "{rendered}");
         assert_eq!(
             warnings,
@@ -587,7 +600,8 @@ mod tests {
     fn an_over_cap_override_is_refused_with_pis_text_and_the_next_path_still_wins() {
         let dir = tempfile::tempdir().expect("tempdir");
         let opts = options(dir.path());
-        let oversized = crate::paths::project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE);
+        let oversized =
+            crate::paths::project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE);
         std::fs::write(
             &oversized,
             "x".repeat(usize::try_from(CUSTOM_TOOL_DESCRIPTION_MAX_BYTES).unwrap() + 1),
@@ -688,7 +702,12 @@ mod tests {
     /// test keep passing with it back in.
     #[test]
     fn the_compact_description_advertises_no_verb_cyrup_cannot_dispatch() {
-        for verb in ["schedule", "schedule-list", "schedule-status", "schedule-cancel"] {
+        for verb in [
+            "schedule",
+            "schedule-list",
+            "schedule-status",
+            "schedule-cancel",
+        ] {
             assert!(
                 !COMPACT_SUBAGENT_TOOL_DESCRIPTION.contains(verb),
                 "compact text advertises unported verb '{verb}'"
@@ -696,8 +715,22 @@ mod tests {
         }
         // …while every verb it DOES name is one this crate answers.
         for verb in [
-            "list", "get", "models", "create", "update", "delete", "eject", "disable", "enable",
-            "reset", "doctor", "status", "interrupt", "resume", "steer", "append-step",
+            "list",
+            "get",
+            "models",
+            "create",
+            "update",
+            "delete",
+            "eject",
+            "disable",
+            "enable",
+            "reset",
+            "doctor",
+            "status",
+            "interrupt",
+            "resume",
+            "steer",
+            "append-step",
         ] {
             assert!(
                 COMPACT_SUBAGENT_TOOL_DESCRIPTION.contains(verb),
@@ -716,10 +749,20 @@ mod tests {
             7,
             "one header plus six bullets"
         );
-        assert_eq!(SUBAGENT_SAFETY_GUIDANCE.len(), 1333, "byte length is pinned");
-        assert!(SUBAGENT_SAFETY_GUIDANCE
-            .contains("ordinary child subagents are not orchestrators and must not run subagents"));
+        assert_eq!(
+            SUBAGENT_SAFETY_GUIDANCE.len(),
+            1333,
+            "byte length is pinned"
+        );
+        assert!(
+            SUBAGENT_SAFETY_GUIDANCE.contains(
+                "ordinary child subagents are not orchestrators and must not run subagents"
+            )
+        );
         assert!(SUBAGENT_SAFETY_GUIDANCE.contains("keep one writer for the same cwd/worktree"));
-        assert!(!SUBAGENT_SAFETY_GUIDANCE.contains("workflowScript"), "v0.34.0, not v0.43.0");
+        assert!(
+            !SUBAGENT_SAFETY_GUIDANCE.contains("workflowScript"),
+            "v0.34.0, not v0.43.0"
+        );
     }
 }

@@ -10,11 +10,11 @@
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, Message, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
+    CancelToken, Content, Message, TerminateHint, Tool, ToolCallId, ToolError, ToolResult,
+    ToolUpdateSink,
 };
 use cyrup_permission_system::PermissionSystemExtension;
-use cyrup_test_support::{create_harness, FauxResponse, HarnessOptions, TestTempDir};
+use cyrup_test_support::{FauxResponse, HarnessOptions, TestTempDir, create_harness};
 
 /// A fake `bash` tool that RECORDS every command it actually executes (overrides the built-in of the
 /// same name, R-08-012). It runs nothing — recording is the observable proof the gate let the call
@@ -54,10 +54,21 @@ impl Tool for RecordingBash {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        let command =
-            params.get("command").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        self.executed.lock().unwrap_or_else(|e| e.into_inner()).push(command);
-        Ok(ToolResult { content: vec![Content::text("EXECUTED")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        let command = params
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        self.executed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(command);
+        Ok(ToolResult {
+            content: vec![Content::text("EXECUTED")],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -66,7 +77,11 @@ impl Tool for RecordingBash {
 async fn harness_for(
     policy: &str,
     command: serde_json::Value,
-) -> (cyrup_test_support::Harness, Arc<Mutex<Vec<String>>>, TestTempDir) {
+) -> (
+    cyrup_test_support::Harness,
+    Arc<Mutex<Vec<String>>>,
+    TestTempDir,
+) {
     let agent_dir = TestTempDir::new().unwrap();
     std::fs::write(agent_dir.path().join("cyrup-permissions.jsonc"), policy).unwrap();
 
@@ -94,7 +109,9 @@ async fn harness_for(
 
 fn has_error_tool_result_containing(msgs: &[Message], needle: &str) -> bool {
     msgs.iter().any(|m| match m {
-        Message::ToolResult { is_error, content, .. } => {
+        Message::ToolResult {
+            is_error, content, ..
+        } => {
             *is_error
                 && content.iter().any(|c| match c {
                     Content::Text { text, .. } => text.contains(needle),
@@ -117,7 +134,10 @@ async fn gate_blocks_a_deny_rule_through_before_tool_call() {
 
     // The denied command NEVER reached the tool (blocked by the gate through the registered hook).
     assert!(
-        executed.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        executed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty(),
         "denied bash command must not execute; run events: {run:?}"
     );
     // The block surfaced as an is_error tool result carrying the policy deny reason.
@@ -140,7 +160,11 @@ async fn gate_allows_an_allow_rule_through_before_tool_call() {
 
     // The allowed command PROCEEDED through the hook and executed exactly once.
     let executed = executed.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    assert_eq!(executed, vec!["echo hello".to_string()], "allowed bash command must execute");
+    assert_eq!(
+        executed,
+        vec!["echo hello".to_string()],
+        "allowed bash command must execute"
+    );
 }
 
 #[tokio::test]
@@ -238,7 +262,10 @@ async fn installed_default_ask_fail_closes_to_block_not_open() {
     let run = harness.run("go").await.unwrap();
 
     assert!(
-        executed.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        executed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty(),
         "an unconfigured (default-ask) command must be blocked when no human is reachable; run: {run:?}"
     );
     let msgs = harness.session().messages().await;

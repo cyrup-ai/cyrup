@@ -44,16 +44,26 @@ impl InputEditor {
     /// The previous grapheme-cluster boundary strictly left of char-column `col` on the current line
     /// (emoji/ZWJ/combining marks — and whole paste markers — step as one unit). `0` if none.
     pub(super) fn prev_grapheme(&self, col: usize) -> usize {
-        let Some(line) = self.lines.get(self.row) else { return col.saturating_sub(1) };
-        self.marker_grapheme_boundaries(line).into_iter().rfind(|&b| b < col).unwrap_or(0)
+        let Some(line) = self.lines.get(self.row) else {
+            return col.saturating_sub(1);
+        };
+        self.marker_grapheme_boundaries(line)
+            .into_iter()
+            .rfind(|&b| b < col)
+            .unwrap_or(0)
     }
 
     /// The next grapheme-cluster boundary strictly right of char-column `col` on the current line.
     /// Clamps to the line length when `col` is already at/after the last cluster.
     pub(super) fn next_grapheme(&self, col: usize) -> usize {
-        let Some(line) = self.lines.get(self.row) else { return col + 1 };
+        let Some(line) = self.lines.get(self.row) else {
+            return col + 1;
+        };
         let len = line.len();
-        self.marker_grapheme_boundaries(line).into_iter().find(|&b| b > col).unwrap_or(len)
+        self.marker_grapheme_boundaries(line)
+            .into_iter()
+            .find(|&b| b > col)
+            .unwrap_or(len)
     }
 
     pub fn move_home(&mut self) {
@@ -129,7 +139,9 @@ impl InputEditor {
     /// single-line analogue — the marker-aware char-column segmentation and the row edge, where col
     /// 0 steps to the previous line's end (`editor.ts:1874-1881`).
     pub(super) fn word_left_target(&self) -> (usize, usize) {
-        let Some(line) = self.lines.get(self.row) else { return (self.row, self.col) };
+        let Some(line) = self.lines.get(self.row) else {
+            return (self.row, self.col);
+        };
         let cursor = self.col.min(line.len());
         if cursor == 0 {
             if self.row > 0 {
@@ -140,15 +152,21 @@ impl InputEditor {
         }
         // `const textBeforeCursor = text.slice(0, cursor)` (`:25`) — segmenting only the PREFIX is
         // why a marker the cursor sits inside is not atomic: it is not whole in this slice.
-        let Some(before) = line.get(..cursor) else { return (self.row, cursor) };
+        let Some(before) = line.get(..cursor) else {
+            return (self.row, cursor);
+        };
         let segs = self.word_segments(before);
         let new_cursor = find_word_backward(
             segs,
             cursor,
             &|seg| Self::seg_is_whitespace(before, seg),
             &|seg| {
-                let s = before.get(seg.start..seg.start.saturating_add(seg.len)).unwrap_or(&[]);
-                s.iter().rposition(|&c| is_punctuation(c)).map(|i| i.saturating_add(1))
+                let s = before
+                    .get(seg.start..seg.start.saturating_add(seg.len))
+                    .unwrap_or(&[]);
+                s.iter()
+                    .rposition(|&c| is_punctuation(c))
+                    .map(|i| i.saturating_add(1))
             },
         );
         (self.row, new_cursor)
@@ -159,7 +177,9 @@ impl InputEditor {
     /// walk is [`find_word_forward`]; the row edge (col ==
     /// line length steps to the next line's start) stays here.
     pub(super) fn word_right_target(&self) -> (usize, usize) {
-        let Some(line) = self.lines.get(self.row) else { return (self.row, self.col) };
+        let Some(line) = self.lines.get(self.row) else {
+            return (self.row, self.col);
+        };
         let len = line.len();
         let cursor = self.col.min(len);
         if cursor >= len {
@@ -169,14 +189,18 @@ impl InputEditor {
             return (self.row, len);
         }
         // `const textAfterCursor = text.slice(cursor)` (`:79`).
-        let Some(after) = line.get(cursor..) else { return (self.row, cursor) };
+        let Some(after) = line.get(cursor..) else {
+            return (self.row, cursor);
+        };
         let segs = self.word_segments(after);
         let new_cursor = find_word_forward(
             &segs,
             cursor,
             &|seg| Self::seg_is_whitespace(after, seg),
             &|seg| {
-                let s = after.get(seg.start..seg.start.saturating_add(seg.len)).unwrap_or(&[]);
+                let s = after
+                    .get(seg.start..seg.start.saturating_add(seg.len))
+                    .unwrap_or(&[]);
                 s.iter().position(|&c| is_punctuation(c))
             },
         );
@@ -213,9 +237,15 @@ impl InputEditor {
                 let line = self.lines.get(idx)?;
                 // `searchFrom = isCurrentLine ? cursorCol + 1 : undefined` (`:2056-2063`) fed to
                 // `String.indexOf` (`:2065`), i.e. an inclusive lower bound.
-                let from = if idx == self.row { self.col.saturating_add(1) } else { 0 };
+                let from = if idx == self.row {
+                    self.col.saturating_add(1)
+                } else {
+                    0
+                };
                 let rest = line.get(from..)?;
-                rest.iter().position(|&c| c == target).map(|off| (idx, from.saturating_add(off)))
+                rest.iter()
+                    .position(|&c| c == target)
+                    .map(|off| (idx, from.saturating_add(off)))
             }),
             JumpDir::Backward => (0..=self.row).rev().find_map(|idx| {
                 let line = self.lines.get(idx)?;
@@ -234,7 +264,10 @@ impl InputEditor {
                     line.len().checked_sub(1)?
                 };
                 let scanned = line.get(..=upper)?;
-                scanned.iter().rposition(|&c| c == target).map(|off| (idx, off))
+                scanned
+                    .iter()
+                    .rposition(|&c| c == target)
+                    .map(|off| (idx, off))
             }),
         };
         if let Some((row, col)) = hit {

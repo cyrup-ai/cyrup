@@ -9,10 +9,15 @@
 //! including in positions cyrup does not model and pi never type-checks. That made a frame pi
 //! serves normally into a disconnect, on a socket every local process can reach.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::transport::framing::from_frame_slice;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[test]
 fn an_overflowing_literal_in_an_unmodelled_key_no_longer_kills_the_frame() {
@@ -66,7 +71,11 @@ fn a_numeric_looking_substring_inside_a_string_is_never_rewritten() {
         json!("the value 1e400 appears here"),
         "a number inside a string must survive verbatim"
     );
-    assert_eq!(v["other"], Value::Null, "but a real numeric literal is nulled");
+    assert_eq!(
+        v["other"],
+        Value::Null,
+        "but a real numeric literal is nulled"
+    );
 }
 
 #[test]

@@ -43,8 +43,7 @@ pub(crate) const INBOUND_MESSAGE_CUSTOM_TYPE: &str = "intercom_message";
 /// is *working* rather than merely unattended, and that it will finish and exit rather than come
 /// back. A supervisor reading the short form has no way to tell "retry in a moment" from "this
 /// worker is gone", so it retries a peer that will never answer.
-const NON_INTERACTIVE_BUSY_NOTICE: &str =
-    "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.";
+const NON_INTERACTIVE_BUSY_NOTICE: &str = "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.";
 
 /// The inbound delivery policy decision (pi `handleIncomingMessage`, `index.ts:745-765`), computed
 /// AFTER the durable surface (`append_entry`) from whether an agent run is in flight (`is_idle`),
@@ -89,10 +88,7 @@ pub enum InboundPolicy {
 /// pi `shouldTriggerInboundMessage` (`index.ts:641-651`): whether a `"trigger"`-mode delivery may
 /// actually drive an agent turn, per the resolved `inboundTrigger` config and the message's shape.
 #[must_use]
-pub fn should_trigger_inbound_message(
-    inbound_trigger: InboundTrigger,
-    message: &Message,
-) -> bool {
+pub fn should_trigger_inbound_message(inbound_trigger: InboundTrigger, message: &Message) -> bool {
     match inbound_trigger {
         InboundTrigger::Always => true,
         InboundTrigger::Replies => message.reply_to.is_some(),
@@ -121,7 +117,9 @@ pub fn decide_inbound_policy(
         }
         return InboundPolicy::Steer;
     }
-    InboundPolicy::Deliver { trigger: should_trigger_inbound_message(inbound_trigger, message) }
+    InboundPolicy::Deliver {
+        trigger: should_trigger_inbound_message(inbound_trigger, message),
+    }
 }
 
 /// pi's two `sendIncomingMessage` delivery modes (`v0.10.1 index.ts:876`).
@@ -152,7 +150,11 @@ pub enum InboundDelivery {
 /// an effective `replyTo` (`:2045`), and both `reply` outcomes — delivered (`:2226`) and
 /// `"Session not found"` (`:2219`).
 pub fn dismiss_incoming_ask(state: &SharedIntercomState, message_id: &str) {
-    state.tracker.lock().unwrap_or_else(|e| e.into_inner()).dismiss_pending_ask(message_id);
+    state
+        .tracker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .dismiss_pending_ask(message_id);
 }
 
 /// `sendIncomingMessage(entry, delivery, generation?, forceTrigger?)`
@@ -227,11 +229,15 @@ pub fn send_incoming_message_at(
     // the INJECTION site, after the liveness guard and before the content is built, so a delivery
     // that the guard above dropped emits nothing.
     state.emit_message_receipt(&message.id, MessageReceiptStatus::Injected, None);
-    state.tracker.lock().unwrap_or_else(|e| e.into_inner()).queue_turn_context(IntercomContext {
-        from: from.clone(),
-        message: message.clone(),
-        received_at: now_ms(),
-    });
+    state
+        .tracker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .queue_turn_context(IntercomContext {
+            from: from.clone(),
+            message: message.clone(),
+            received_at: now_ms(),
+        });
     // `details: deliveredEntry` (`index.ts:1216`) — the SAME entry the content was rendered from,
     // carrying the `injectedAt`-stamped message and the delivery-adjusted reply command.
     let card = build_inline_message_for(state, from, message, delivery);
@@ -273,11 +279,15 @@ pub fn trigger_turn_over_inbound(
     // the INJECTION site, after the liveness guard and before the content is built, so a delivery
     // that the guard above dropped emits nothing.
     state.emit_message_receipt(&message.id, MessageReceiptStatus::Injected, None);
-    state.tracker.lock().unwrap_or_else(|e| e.into_inner()).queue_turn_context(IntercomContext {
-        from: from.clone(),
-        message: message.clone(),
-        received_at: now_ms(),
-    });
+    state
+        .tracker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .queue_turn_context(IntercomContext {
+            from: from.clone(),
+            message: message.clone(),
+            received_at: now_ms(),
+        });
     let card = build_inline_message(state, from, message);
     let content = card.content_markdown();
     let details = serde_json::to_value(&card).ok();
@@ -335,16 +345,19 @@ pub async fn auto_reply_non_interactive_at(
         return false;
     };
     let send = client
-        .send(&from.id, SendOptions {
-            text: NON_INTERACTIVE_BUSY_NOTICE.to_string(),
-            attachments: None,
-            reply_to: Some(message.id.clone()),
-            expects_reply: Some(false),
-            message_id: None,
-            supersedes: None,
-            retry_of: None,
-            provenance: None,
-        })
+        .send(
+            &from.id,
+            SendOptions {
+                text: NON_INTERACTIVE_BUSY_NOTICE.to_string(),
+                attachments: None,
+                reply_to: Some(message.id.clone()),
+                expects_reply: Some(false),
+                message_id: None,
+                supersedes: None,
+                retry_of: None,
+                provenance: None,
+            },
+        )
         .await;
     match send {
         Ok(result) if result.delivered => {
@@ -431,11 +444,15 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                     }
                     // (2) Record the inbound ask (for a future `intercom{reply}` / the ClarifyChannel
                     //     correlation) and (3) surface it to the human.
-                    state.tracker.lock().unwrap_or_else(|e| e.into_inner()).record_incoming_message(
-                        from.clone(),
-                        message.clone(),
-                        receiver_received_at,
-                    );
+                    state
+                        .tracker
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_incoming_message(
+                            from.clone(),
+                            message.clone(),
+                            receiver_received_at,
+                        );
                     state.emit_message_receipt(
                         &message.id,
                         MessageReceiptStatus::Acknowledged,
@@ -557,7 +574,10 @@ pub fn format_attachments(attachments: &[Attachment]) -> String {
                 ));
             }
             None => {
-                text.push_str(&format!("\n\n---\nAttachment: {}\n{}", att.name, att.content));
+                text.push_str(&format!(
+                    "\n\n---\nAttachment: {}\n{}",
+                    att.name, att.content
+                ));
             }
         }
     }
@@ -604,16 +624,17 @@ pub fn build_inline_message_for(
         .map(format_attachments)
         .unwrap_or_default();
     let body_text = format!("{}{attachment_text}", message.content.text);
-    let reply_command = (state.config.reply_hint && message.expects_reply == Some(true)).then(|| {
-        if delivery == InboundDelivery::Steer {
-            format!(
-                "intercom({{ action: \"reply\", replyTo: {}, message: \"...\" }})",
-                serde_json::Value::String(message.id.clone())
-            )
-        } else {
-            REPLY_HINT_COMMAND.to_string()
-        }
-    });
+    let reply_command =
+        (state.config.reply_hint && message.expects_reply == Some(true)).then(|| {
+            if delivery == InboundDelivery::Steer {
+                format!(
+                    "intercom({{ action: \"reply\", replyTo: {}, message: \"...\" }})",
+                    serde_json::Value::String(message.id.clone())
+                )
+            } else {
+                REPLY_HINT_COMMAND.to_string()
+            }
+        });
     InlineMessage {
         from: from.clone(),
         message: message.clone(),
@@ -642,7 +663,10 @@ pub fn surface_incoming_message(
     let mut payload = serde_json::to_value(&card).unwrap_or_else(|_| json!({}));
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("content".into(), json!(card.content_markdown()));
-        obj.insert("card".into(), json!(card.render(&PlainTheme, SURFACE_CARD_WIDTH)));
+        obj.insert(
+            "card".into(),
+            json!(card.render(&PlainTheme, SURFACE_CARD_WIDTH)),
+        );
     }
     match services.append_entry(INBOUND_MESSAGE_CUSTOM_TYPE, &payload) {
         Ok(id) => Some(id),
@@ -667,7 +691,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn state(reply_hint: bool) -> SharedIntercomState {
-        let config = IntercomConfig { reply_hint, ..IntercomConfig::default() };
+        let config = IntercomConfig {
+            reply_hint,
+            ..IntercomConfig::default()
+        };
         SharedIntercomState::new(config, 600_000, PathBuf::from("/w"))
     }
 
@@ -709,7 +736,11 @@ mod tests {
             timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: text.to_string(), attachments: None, ..Default::default() },
+            content: MessageContent {
+                text: text.to_string(),
+                attachments: None,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -721,7 +752,11 @@ mod tests {
         assert!(card.reply_command.is_some());
         // Disabled hint → no reply command even for an ask.
         let s2 = state(false);
-        assert!(build_inline_message(&s2, &from(), &ask("Which DB?")).reply_command.is_none());
+        assert!(
+            build_inline_message(&s2, &from(), &ask("Which DB?"))
+                .reply_command
+                .is_none()
+        );
     }
 
     #[test]
@@ -925,7 +960,13 @@ mod tests {
         crate::connect::begin_runtime(&s, params());
         let stamped = s.connect.generation();
         assert!(
-            send_incoming_message_at(&s, &from(), &ask("first"), InboundDelivery::Trigger, stamped),
+            send_incoming_message_at(
+                &s,
+                &from(),
+                &ask("first"),
+                InboundDelivery::Trigger,
+                stamped
+            ),
             "a delivery at its own generation is live"
         );
         assert_eq!(host.injected().len(), 1);
@@ -933,9 +974,19 @@ mod tests {
 
         // The session runtime is replaced under the in-flight delivery.
         crate::connect::begin_runtime(&s, params());
-        assert_ne!(s.connect.generation(), stamped, "begin_runtime bumps the generation");
+        assert_ne!(
+            s.connect.generation(),
+            stamped,
+            "begin_runtime bumps the generation"
+        );
         assert!(
-            !send_incoming_message_at(&s, &from(), &ask("first"), InboundDelivery::Trigger, stamped),
+            !send_incoming_message_at(
+                &s,
+                &from(),
+                &ask("first"),
+                InboundDelivery::Trigger,
+                stamped
+            ),
             "the stale-generation delivery must be fenced out"
         );
         assert!(
@@ -997,19 +1048,39 @@ mod tests {
         s.set_has_ui(true);
 
         assert_eq!(
-            decide_inbound_policy(s.is_idle(), s.has_ui(), s.config.inbound_trigger, &ask("first")),
+            decide_inbound_policy(
+                s.is_idle(),
+                s.has_ui(),
+                s.config.inbound_trigger,
+                &ask("first")
+            ),
             InboundPolicy::Steer
         );
-        assert!(send_incoming_message(&s, &from(), &ask("first"), InboundDelivery::Steer));
+        assert!(send_incoming_message(
+            &s,
+            &from(),
+            &ask("first"),
+            InboundDelivery::Steer
+        ));
 
         let injected = host.injected();
-        assert_eq!(injected.len(), 1, "the message reaches the running agent at once: {injected:?}");
+        assert_eq!(
+            injected.len(),
+            1,
+            "the message reaches the running agent at once: {injected:?}"
+        );
         assert!(injected[0].0.contains("first"));
         // `{ deliverAs: "steer" }`, never `{ triggerTurn: true }` (`v0.10.1 index.ts:897-899`): the
         // host routes a custom message to `agent.steer` whenever it is streaming, so the flag stays
         // false and a busy session is never handed a competing run.
-        assert!(!injected[0].3, "a steered delivery never drives a second turn");
-        assert!(injected[0].2, "display = true, so the message survives a transcript replay");
+        assert!(
+            !injected[0].3,
+            "a steered delivery never drives a second turn"
+        );
+        assert!(
+            injected[0].2,
+            "display = true, so the message survives a transcript replay"
+        );
     }
 
     /// `v0.10.1 index.ts:880-884` — a STEERED ask rewrites the reply hint to name the message id
@@ -1022,7 +1093,12 @@ mod tests {
         s.set_host_services(host.clone());
         s.set_has_ui(true);
 
-        assert!(send_incoming_message(&s, &from(), &ask("q"), InboundDelivery::Steer));
+        assert!(send_incoming_message(
+            &s,
+            &from(),
+            &ask("q"),
+            InboundDelivery::Steer
+        ));
         let injected = host.injected();
         assert_eq!(injected.len(), 1);
         assert!(
@@ -1035,13 +1111,18 @@ mod tests {
 
         // The trigger path is unchanged: the bare hint, because the message IS the turn context.
         host.clear_injected();
-        assert!(send_incoming_message(&s, &from(), &ask("q"), InboundDelivery::Trigger));
+        assert!(send_incoming_message(
+            &s,
+            &from(),
+            &ask("q"),
+            InboundDelivery::Trigger
+        ));
         let injected = host.injected();
         assert_eq!(injected.len(), 1);
         assert!(
-            injected[0]
-                .0
-                .contains("To reply, use the intercom tool: intercom({ action: \"reply\", message: \"...\" })"),
+            injected[0].0.contains(
+                "To reply, use the intercom tool: intercom({ action: \"reply\", message: \"...\" })"
+            ),
             "trigger hint stays bare: {:?}",
             injected[0].0
         );
@@ -1058,20 +1139,36 @@ mod tests {
         s.set_host_services(host.clone());
         s.set_has_ui(false);
 
-        let policy =
-            decide_inbound_policy(s.is_idle(), s.has_ui(), s.config.inbound_trigger, &ask("ping"));
+        let policy = decide_inbound_policy(
+            s.is_idle(),
+            s.has_ui(),
+            s.config.inbound_trigger,
+            &ask("ping"),
+        );
         assert_eq!(policy, InboundPolicy::Deliver { trigger: true });
         // Drive the real delivery seam the `Deliver` arm routes to, exactly as `spawn_inbound_loop`
         // does, so the assertion lands on an injected message and not merely on the enum.
         let InboundPolicy::Deliver { trigger } = policy else {
             unreachable!("asserted equal to Deliver above")
         };
-        assert!(trigger_turn_over_inbound(&s, &from(), &ask("ping"), trigger));
+        assert!(trigger_turn_over_inbound(
+            &s,
+            &from(),
+            &ask("ping"),
+            trigger
+        ));
 
         let injected = host.injected();
-        assert_eq!(injected.len(), 1, "the message reaches the agent: {injected:?}");
+        assert_eq!(
+            injected.len(),
+            1,
+            "the message reaches the agent: {injected:?}"
+        );
         assert!(injected[0].0.contains("ping"));
-        assert!(injected[0].3, "an idle session gets a real turn-driving delivery");
+        assert!(
+            injected[0].3,
+            "an idle session gets a real turn-driving delivery"
+        );
     }
 
     /// ICOM-022 regression (pi `sendIncomingMessage`, `index.ts:652-672`): the string the model
@@ -1088,7 +1185,12 @@ mod tests {
         s.set_has_ui(true);
 
         let before = now_ms();
-        assert!(trigger_turn_over_inbound(&s, &from(), &ask("Which DB?"), true));
+        assert!(trigger_turn_over_inbound(
+            &s,
+            &from(),
+            &ask("Which DB?"),
+            true
+        ));
         let after = now_ms();
 
         let injected = host.injected();
@@ -1099,10 +1201,15 @@ mod tests {
             "attribution header + sender cwd lead the injected content: {content:?}"
         );
         assert!(
-            content.contains("To reply, use the intercom tool: intercom({ action: \"reply\", message: \"...\" })"),
+            content.contains(
+                "To reply, use the intercom tool: intercom({ action: \"reply\", message: \"...\" })"
+            ),
             "the reply instruction reaches the MODEL, not just the append_entry surface: {content:?}"
         );
-        assert!(content.ends_with("\n\nWhich DB?"), "body last, after a blank line: {content:?}");
+        assert!(
+            content.ends_with("\n\nWhich DB?"),
+            "body last, after a blank line: {content:?}"
+        );
         // The injected string is byte-identical to the card the human surface carries — pi builds
         // it exactly once, off the SAME per-delivery copy it stamps (`v0.10.1 index.ts:878,890-895`:
         // `const injectedMessage = { ...entry.message, injectedAt: Date.now() }`, then
@@ -1142,8 +1249,18 @@ mod tests {
         peer_b.id = "child-9999".to_string();
         peer_b.name = Some("subagent-chat-2".to_string());
         peer_b.cwd = "/other".to_string();
-        assert!(send_incoming_message(&s, &from(), &ask("first"), InboundDelivery::Steer));
-        assert!(send_incoming_message(&s, &peer_b, &ask("second"), InboundDelivery::Steer));
+        assert!(send_incoming_message(
+            &s,
+            &from(),
+            &ask("first"),
+            InboundDelivery::Steer
+        ));
+        assert!(send_incoming_message(
+            &s,
+            &peer_b,
+            &ask("second"),
+            InboundDelivery::Steer
+        ));
 
         let injected = host.injected();
         assert_eq!(injected.len(), 2, "both steers land: {injected:?}");
@@ -1152,12 +1269,15 @@ mod tests {
             "the first steer is attributed: {injected:?}"
         );
         assert!(
-            injected[1].0.starts_with("**From subagent-chat-2** (/other)"),
+            injected[1]
+                .0
+                .starts_with("**From subagent-chat-2** (/other)"),
             "the second steer is attributed to ITS OWN sender: {injected:?}"
         );
         for call in &injected {
             assert!(
-                call.0.contains("To reply, use the intercom tool: intercom("),
+                call.0
+                    .contains("To reply, use the intercom tool: intercom("),
                 "each steered message keeps its reply instruction: {call:?}"
             );
         }
@@ -1182,8 +1302,14 @@ mod tests {
         // line sits between the header and the body. `injected …` carries a live clock, so the
         // clock-independent parts are asserted exactly.
         let content = &injected[0].0;
-        assert!(content.starts_with("**From child-12** (/w)\n\n_id q1 · "), "{content:?}");
+        assert!(
+            content.starts_with("**From child-12** (/w)\n\n_id q1 · "),
+            "{content:?}"
+        );
         assert!(content.ends_with("_\n\nhi"), "{content:?}");
-        assert!(!content.contains("To reply"), "reply hint off ⇒ no instruction: {content:?}");
+        assert!(
+            !content.contains("To reply"),
+            "reply hint off ⇒ no instruction: {content:?}"
+        );
     }
 }

@@ -39,8 +39,7 @@ fn usage_limit_bodies_get_the_friendly_message() {
 fn non_limit_bodies_surface_the_provider_message() {
     let now = 1_700_000_000_000i64;
     // MIRROR: without the limit code and without a 429, `err.message` is what surfaces.
-    let raw =
-        json!({ "error": { "code": "invalid_request", "message": "bad model" } }).to_string();
+    let raw = json!({ "error": { "code": "invalid_request", "message": "bad model" } }).to_string();
     assert_eq!(parse_error_response(400, &raw, now), "bad model");
     // Unparseable body: the raw text.
     assert_eq!(
@@ -50,4 +49,3 @@ fn non_limit_bodies_surface_the_provider_message() {
     // Empty body: `raw || statusText || "Request failed"`.
     assert_eq!(parse_error_response(500, "", now), "Request failed");
 }
-

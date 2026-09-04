@@ -59,8 +59,15 @@ const READ_ONLY_BRANCH_EVIDENCE: [AcceptanceEvidenceKind; 2] = [
 ];
 
 fn assert_read_only_branch(resolved: &ResolvedAcceptanceConfig, reason: &str, case: &str) {
-    assert_ne!(resolved.level, AcceptanceLevel::Checked, "{case}: must not be checked");
-    assert_eq!(resolved.evidence, READ_ONLY_BRANCH_EVIDENCE, "{case}: not the read-only branch");
+    assert_ne!(
+        resolved.level,
+        AcceptanceLevel::Checked,
+        "{case}: must not be checked"
+    );
+    assert_eq!(
+        resolved.evidence, READ_ONLY_BRANCH_EVIDENCE,
+        "{case}: not the read-only branch"
+    );
     assert_eq!(resolved.inferred_reason, vec![reason.to_string()], "{case}");
 }
 
@@ -76,14 +83,22 @@ fn a_declared_read_only_role_replaces_the_agent_name_guess() {
         "control: without a role the name decides, and `explorer` is in no alternation"
     );
     assert_read_only_branch(
-        &infer("explorer", Some(AcceptanceRole::ReadOnly), "Explore the authentication flow"),
+        &infer(
+            "explorer",
+            Some(AcceptanceRole::ReadOnly),
+            "Explore the authentication flow",
+        ),
         "declared read-only acceptance role",
         "explorer + read-only",
     );
     // `worker` + `read-only` on neutral wording: the `\bworker\b` name arm is gated on
     // `role === undefined`, so the declared role wins.
     assert_read_only_branch(
-        &infer("worker", Some(AcceptanceRole::ReadOnly), "Explore the authentication flow"),
+        &infer(
+            "worker",
+            Some(AcceptanceRole::ReadOnly),
+            "Explore the authentication flow",
+        ),
         "declared read-only acceptance role",
         "worker + read-only",
     );
@@ -101,9 +116,17 @@ fn a_declared_read_only_role_replaces_the_agent_name_guess() {
 #[test]
 fn a_declared_writer_role_replaces_the_reviewer_name_guess() {
     let control = infer("reviewer", None, "Handle the authentication flow");
-    assert_read_only_branch(&control, "read-only/reviewer-style agent", "control: reviewer name");
+    assert_read_only_branch(
+        &control,
+        "read-only/reviewer-style agent",
+        "control: reviewer name",
+    );
 
-    let writer = infer("reviewer", Some(AcceptanceRole::Writer), "Handle the authentication flow");
+    let writer = infer(
+        "reviewer",
+        Some(AcceptanceRole::Writer),
+        "Handle the authentication flow",
+    );
     assert_eq!(writer.level, AcceptanceLevel::Checked);
     assert_eq!(
         writer.inferred_reason,
@@ -112,7 +135,11 @@ fn a_declared_writer_role_replaces_the_reviewer_name_guess() {
 
     // With genuine mutation wording the reason is the ordinary one — the role is not what made
     // the task write-capable.
-    let implementing = infer("reviewer", Some(AcceptanceRole::Writer), "Implement the fix");
+    let implementing = infer(
+        "reviewer",
+        Some(AcceptanceRole::Writer),
+        "Implement the fix",
+    );
     assert_eq!(implementing.level, AcceptanceLevel::Checked);
     assert_eq!(
         implementing.inferred_reason,
@@ -180,7 +207,11 @@ fn explicit_mutation_intent_wins_over_a_declared_read_only_role() {
 #[test]
 fn explicit_no_edit_wording_wins_over_a_declared_writer_role() {
     assert_read_only_branch(
-        &infer("worker", Some(AcceptanceRole::Writer), "Review only; do not edit files"),
+        &infer(
+            "worker",
+            Some(AcceptanceRole::Writer),
+            "Review only; do not edit files",
+        ),
         "read-only task wording",
         "worker + writer + review-only wording",
     );
@@ -205,7 +236,11 @@ fn explicit_no_edit_wording_wins_over_a_declared_writer_role() {
 #[test]
 fn a_declared_read_only_role_suppresses_the_risky_keyword_escalation() {
     assert_read_only_branch(
-        &infer("explorer", Some(AcceptanceRole::ReadOnly), "Audit the security posture"),
+        &infer(
+            "explorer",
+            Some(AcceptanceRole::ReadOnly),
+            "Audit the security posture",
+        ),
         "declared read-only acceptance role",
         "explorer + read-only + security keyword",
     );
@@ -292,7 +327,10 @@ fn the_lattice_contract_entry_points_thread_the_role() {
     // The explicit-floor rule is untouched: an explicit `attested` still loses to a role-inferred
     // `checked` by rank.
     let effective = AcceptanceContract::resolve_effective_for_role(
-        Some(AcceptanceContract::explicit_floor(AcceptanceStatus::Attested, Vec::new())),
+        Some(AcceptanceContract::explicit_floor(
+            AcceptanceStatus::Attested,
+            Vec::new(),
+        )),
         "reviewer",
         Some(AcceptanceRole::Writer),
         "Handle the authentication flow",

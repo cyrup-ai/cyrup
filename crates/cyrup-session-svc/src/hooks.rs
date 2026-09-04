@@ -11,8 +11,7 @@ use cyrup_agent::{
     AfterOutcome, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall, HookError, Hooks,
     PostTurn, TurnUpdate,
 };
-use cyrup_core::{
-    TerminateHint,CancelToken, Message};
+use cyrup_core::{CancelToken, Message, TerminateHint};
 use cyrup_tools::{PermissionPolicy, PolicyDecision};
 
 /// The placeholder text Pi substitutes for a blocked image (sdk.ts:270).
@@ -41,7 +40,10 @@ pub(crate) fn coding_agent_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Mes
     for m in msgs {
         match m.as_ref() {
             AgentMessage::User { content, timestamp } => {
-                out.push(Message::User { content: content.clone(), timestamp: timestamp.unwrap_or(0) });
+                out.push(Message::User {
+                    content: content.clone(),
+                    timestamp: timestamp.unwrap_or(0),
+                });
             }
             AgentMessage::Assistant(a) => out.push(Message::Assistant((**a).clone())),
             AgentMessage::ToolResult(t) => out.push(Message::ToolResult {
@@ -60,7 +62,9 @@ pub(crate) fn coding_agent_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Mes
             // execution is an `App { role: AppRole::BashExecution, .. }` from the moment it is
             // recorded (`session/bash.rs`), the same variant the compaction re-seed produces, so
             // the two paths cannot disagree.
-            AgentMessage::Custom { payload, timestamp, .. } => {
+            AgentMessage::Custom {
+                payload, timestamp, ..
+            } => {
                 out.push(cyrup_session::agent_message::custom_to_message(
                     payload,
                     timestamp.unwrap_or(0),
@@ -105,7 +109,13 @@ impl PolicyHooks {
         block_images: bool,
         session: Arc<crate::session::SessionHandle>,
     ) -> Self {
-        Self { policy, inner, has_ui, block_images, session }
+        Self {
+            policy,
+            inner,
+            has_ui,
+            block_images,
+            session,
+        }
     }
 }
 
@@ -120,7 +130,8 @@ fn filter_images(content: &[cyrup_core::Content]) -> Vec<cyrup_core::Content> {
             other => other.clone(),
         };
         // Dedupe consecutive "Image reading is disabled." placeholders.
-        let is_placeholder = matches!(&replaced, Content::Text { text, .. } if text == BLOCKED_IMAGE_TEXT);
+        let is_placeholder =
+            matches!(&replaced, Content::Text { text, .. } if text == BLOCKED_IMAGE_TEXT);
         let prev_placeholder = matches!(
             out.last(),
             Some(Content::Text { text, .. }) if text == BLOCKED_IMAGE_TEXT
@@ -151,7 +162,10 @@ impl Hooks for PolicyHooks {
             .into_iter()
             .map(|m| match m {
                 Message::User { content, timestamp } if content.iter().any(is_image) => {
-                    Message::User { content: filter_images(&content), timestamp }
+                    Message::User {
+                        content: filter_images(&content),
+                        timestamp,
+                    }
                 }
                 Message::ToolResult {
                     tool_call_id,
@@ -200,12 +214,18 @@ impl Hooks for PolicyHooks {
             // hint; that flag belongs to an extension's `BeforeToolCallResult.terminate`
             // (`packages/agent/src/types.ts:61-69` @v0.84.1) and the permission gate never sets it.
             PolicyDecision::Block { reason } => {
-                return BeforeOutcome::Block { reason: Some(reason), terminate: TerminateHint::Unspecified };
+                return BeforeOutcome::Block {
+                    reason: Some(reason),
+                    terminate: TerminateHint::Unspecified,
+                };
             }
             PolicyDecision::Confirm { reason } => {
                 if !self.has_ui {
                     // No UI to prompt: block-by-default (R-12-009).
-                    return BeforeOutcome::Block { reason: Some(reason), terminate: TerminateHint::Unspecified };
+                    return BeforeOutcome::Block {
+                        reason: Some(reason),
+                        terminate: TerminateHint::Unspecified,
+                    };
                 }
                 // With UI the front-end resolves confirmation; absent a wired confirm hook we
                 // proceed (the interactive front-end owns the prompt — arch-10/12).
@@ -215,11 +235,7 @@ impl Hooks for PolicyHooks {
         self.inner.before_tool_call(ctx, cancel).await
     }
 
-    async fn after_tool_call(
-        &self,
-        ctx: AfterToolCall<'_>,
-        cancel: CancelToken,
-    ) -> AfterOutcome {
+    async fn after_tool_call(&self, ctx: AfterToolCall<'_>, cancel: CancelToken) -> AfterOutcome {
         self.inner.after_tool_call(ctx, cancel).await
     }
 
@@ -303,11 +319,23 @@ mod tests {
 
     #[test]
     fn filter_images_replaces_and_dedupes_placeholders() {
-        let img = || Content::Image { data: "AAAA".into(), mime_type: "image/png".into() };
+        let img = || Content::Image {
+            data: "AAAA".into(),
+            mime_type: "image/png".into(),
+        };
         // Two adjacent images collapse to a single placeholder; surrounding text is preserved.
-        let content = vec![Content::text("before"), img(), img(), Content::text("after")];
+        let content = vec![
+            Content::text("before"),
+            img(),
+            img(),
+            Content::text("after"),
+        ];
         let out = filter_images(&content);
-        assert_eq!(out.len(), 3, "two adjacent images dedupe to one placeholder: {out:?}");
+        assert_eq!(
+            out.len(),
+            3,
+            "two adjacent images dedupe to one placeholder: {out:?}"
+        );
         assert!(matches!(&out[0], Content::Text { text, .. } if text == "before"));
         assert!(matches!(&out[1], Content::Text { text, .. } if text == BLOCKED_IMAGE_TEXT));
         assert!(matches!(&out[2], Content::Text { text, .. } if text == "after"));

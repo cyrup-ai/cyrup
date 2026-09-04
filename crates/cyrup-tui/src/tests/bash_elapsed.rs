@@ -12,7 +12,12 @@
 //! These tests drive the assembled `App` through the same transcript calls
 //! `App::ingest_event_rendered_owned` makes for `ToolExecutionStart` / `ToolExecutionUpdate` /
 //! `ToolExecutionEnd` (`app.rs`), and assert on the rendered frame.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
@@ -46,8 +51,10 @@ fn start_running_bash(app: &mut App<TestBackend>, command: &str) {
         json!({ "command": command }),
         None,
     );
-    app.transcript_mut()
-        .push_tool_update(Some("call-1"), Some(json!({ "content": [], "details": null })));
+    app.transcript_mut().push_tool_update(
+        Some("call-1"),
+        Some(json!({ "content": [], "details": null })),
+    );
 }
 
 /// THE regression: a still-running command shows a live `Elapsed …`, never `Took`.
@@ -58,9 +65,18 @@ fn a_running_bash_call_renders_elapsed_not_took() {
     app.draw().unwrap();
 
     let text = all_text(&app);
-    assert!(text.contains("$ cargo build --release"), "bash header missing:\n{text}");
-    assert!(text.contains("Elapsed "), "no live elapsed timer while running:\n{text}");
-    assert!(!text.contains("Took "), "a running call claimed it had finished:\n{text}");
+    assert!(
+        text.contains("$ cargo build --release"),
+        "bash header missing:\n{text}"
+    );
+    assert!(
+        text.contains("Elapsed "),
+        "no live elapsed timer while running:\n{text}"
+    );
+    assert!(
+        !text.contains("Took "),
+        "a running call claimed it had finished:\n{text}"
+    );
 }
 
 /// …and the settled frame flips to `Took` and drops `Elapsed` — Pi's label is a pure function of
@@ -79,8 +95,14 @@ fn a_settled_bash_call_renders_took_not_elapsed() {
     app.draw().unwrap();
 
     let text = all_text(&app);
-    assert!(text.contains("Took "), "settled call has no duration:\n{text}");
-    assert!(!text.contains("Elapsed "), "settled call still shows the live timer:\n{text}");
+    assert!(
+        text.contains("Took "),
+        "settled call has no duration:\n{text}"
+    );
+    assert!(
+        !text.contains("Elapsed "),
+        "settled call still shows the live timer:\n{text}"
+    );
 }
 
 /// MIRROR (green before and after the fix): the `$ command` header and the tool output are unrelated
@@ -97,7 +119,10 @@ fn the_bash_body_renders_independently_of_the_duration_line() {
 
     let text = all_text(&app);
     assert!(text.contains("$ ls -la"), "bash header missing:\n{text}");
-    assert!(text.contains("total 4"), "streamed partial output missing:\n{text}");
+    assert!(
+        text.contains("total 4"),
+        "streamed partial output missing:\n{text}"
+    );
 }
 
 /// The repaint driver: `App::run`'s elapsed tick is `if`-gated on this predicate, which is Pi's

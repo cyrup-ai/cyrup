@@ -23,8 +23,16 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 enum ToolRuntimeMsg {
-    Update { call_id: ToolCallId, partial: ToolUpdate },
-    Finished { call_id: ToolCallId, source_index: usize, tool_name: String, outcome: Result<ToolResult, ToolError> },
+    Update {
+        call_id: ToolCallId,
+        partial: ToolUpdate,
+    },
+    Finished {
+        call_id: ToolCallId,
+        source_index: usize,
+        tool_name: String,
+        outcome: Result<ToolResult, ToolError>,
+    },
 }
 
 /// One prepared-but-not-yet-started call — pi's `PreparedToolCall` (`agent-loop.ts:556-561`:
@@ -58,14 +66,17 @@ impl RunCtx {
         calls: &[ToolCall],
     ) -> Result<Batch, RunFailure> {
         let any_seq = calls.iter().any(|c| {
-            self.find_tool(&c.name).map(|t| t.execution_mode() == ExecMode::Sequential).unwrap_or(false)
+            self.find_tool(&c.name)
+                .map(|t| t.execution_mode() == ExecMode::Sequential)
+                .unwrap_or(false)
         });
         let sequential = any_seq || matches!(self.tool_execution, ToolExecution::Sequential);
         // Snapshot the loop's working transcript once for the per-call hook context view (Pi
         // `currentContext.messages`, agent-loop.ts:691).
         let ctx_messages = self.messages.clone();
         if sequential {
-            self.execute_sequential(assistant, &ctx_messages, calls).await
+            self.execute_sequential(assistant, &ctx_messages, calls)
+                .await
         } else {
             self.execute_parallel(assistant, &ctx_messages, calls).await
         }
@@ -83,7 +94,10 @@ impl RunCtx {
     ///
     /// Per call, in source order, the emitted sequence mirrors Pi exactly:
     /// `tool_execution_start` → `tool_execution_end` (`isError`) → `message_start` / `message_end`.
-    pub(super) async fn fail_truncated_tool_calls(&self, calls: &[ToolCall]) -> Result<Batch, RunFailure> {
+    pub(super) async fn fail_truncated_tool_calls(
+        &self,
+        calls: &[ToolCall],
+    ) -> Result<Batch, RunFailure> {
         let mut tool_results = Vec::new();
         for (idx, call) in calls.iter().enumerate() {
             self.emit(AgentEvent::ToolExecutionStart {
@@ -106,11 +120,17 @@ impl RunCtx {
             self.emit(fin.end_event()).await?;
             let message = fin.into_message();
             let msg = AgentMessage::ToolResult(message.clone());
-            self.emit(AgentEvent::MessageStart { message: msg.clone() }).await?;
+            self.emit(AgentEvent::MessageStart {
+                message: msg.clone(),
+            })
+            .await?;
             self.emit(AgentEvent::MessageEnd { message: msg }).await?;
             tool_results.push(message);
         }
         // Pi `{ messages, terminate: false }` (agent-loop.ts:404).
-        Ok(Batch { messages: tool_results, terminate: false })
+        Ok(Batch {
+            messages: tool_results,
+            terminate: false,
+        })
     }
 }

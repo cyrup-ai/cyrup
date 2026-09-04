@@ -70,14 +70,18 @@ pub enum Role {
 #[must_use]
 pub fn style(role: Role) -> Style {
     match role {
-        Role::Accent => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Role::Accent => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
         Role::Muted => Style::default().fg(Color::Gray),
         Role::Dim => Style::default().add_modifier(Modifier::DIM),
         Role::Success => Style::default().fg(Color::Green),
         Role::Warning => Style::default().fg(Color::Yellow),
         Role::Error => Style::default().fg(Color::Red),
         Role::Border => Style::default().fg(Color::DarkGray),
-        Role::BorderMuted => Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        Role::BorderMuted => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
         Role::ToolTitle => Style::default().fg(Color::Blue),
         Role::ToolOutput => Style::default().fg(Color::Gray),
     }
@@ -212,11 +216,7 @@ pub fn fit(line: &Line<'static>, width: usize) -> Line<'static> {
 /// The `fleet-status.ts:63-69` `rightAlign` is a SEPARATE, subtly different helper — see
 /// [`right_align_status`].
 #[must_use]
-pub fn right_aligned(
-    left: &Line<'static>,
-    right: &Line<'static>,
-    width: usize,
-) -> Line<'static> {
+pub fn right_aligned(left: &Line<'static>, right: &Line<'static>, width: usize) -> Line<'static> {
     let right_width = line_width(right);
     let left_width = width.saturating_sub(right_width.saturating_add(1));
     let gap = width
@@ -397,7 +397,10 @@ fn tokenize(line: &Line<'static>) -> Vec<(String, ratatui::style::Style, bool)> 
 /// carries one.
 #[must_use]
 pub fn line_text(line: &Line<'_>) -> String {
-    line.spans.iter().map(|span| span.content.as_ref()).collect()
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }
 
 /// [`line_text`] over a whole rendered frame, newline-joined.
@@ -522,13 +525,18 @@ pub(crate) fn painted_style_nth_of(
     });
     let buffer = term.buffer();
     let mut seen = 0usize;
-    for (row, painted) in cyrup_test_support::tui::buffer_lines(buffer).iter().enumerate() {
+    for (row, painted) in cyrup_test_support::tui::buffer_lines(buffer)
+        .iter()
+        .enumerate()
+    {
         let mut from = 0usize;
         while let Some(offset) = painted.get(from..).and_then(|rest| rest.find(text)) {
             let byte_col = from + offset;
             if seen == nth {
                 // `find` gives a BYTE offset; cells are indexed by column, so count characters.
-                let col = painted.get(..byte_col).map_or(0, |prefix| prefix.chars().count());
+                let col = painted
+                    .get(..byte_col)
+                    .map_or(0, |prefix| prefix.chars().count());
                 let x = u16::try_from(col).unwrap_or(u16::MAX);
                 let y = u16::try_from(row).unwrap_or(u16::MAX);
                 let cell = buffer.cell((x, y))?;

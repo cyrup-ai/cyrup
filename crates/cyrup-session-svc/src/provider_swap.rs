@@ -42,7 +42,10 @@ pub struct ProviderSwap {
 impl ProviderSwap {
     /// Wrap `initial` as the currently-installed provider, with an optional swap `resolver`.
     pub fn new(initial: Arc<dyn Provider>, resolver: Option<Arc<dyn ProviderResolver>>) -> Self {
-        Self { inner: Mutex::new(initial), resolver }
+        Self {
+            inner: Mutex::new(initial),
+            resolver,
+        }
     }
 
     /// The currently-installed provider (cheap `Arc` clone). Poison-safe (no panic).
@@ -120,9 +123,13 @@ mod tests {
     fn resolve_and_store_swaps_the_current_provider() {
         let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
         let target: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-        let swap =
-            ProviderSwap::new(faux, Some(Arc::new(StubResolver(target.clone())) as Arc<dyn ProviderResolver>));
-        let installed = swap.resolve_and_store("whatever").expect("stub resolver succeeds");
+        let swap = ProviderSwap::new(
+            faux,
+            Some(Arc::new(StubResolver(target.clone())) as Arc<dyn ProviderResolver>),
+        );
+        let installed = swap
+            .resolve_and_store("whatever")
+            .expect("stub resolver succeeds");
         assert!(Arc::ptr_eq(&installed, &swap.current()));
     }
 

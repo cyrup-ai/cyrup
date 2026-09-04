@@ -22,15 +22,15 @@
 //! routing (spec/tui/05 §2) delivers a key to the **topmost** overlay first; an unconsumed key
 //! bubbles. Everything is pure ratatui layout over existing state — no new dependency.
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
-use ratatui::Frame;
 
 use cyrup_ext::{
-    InteractiveOverlay, OverlayOptions, OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine,
+    InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOptions,
     OverlayOutcome as ExtOverlayOutcome, OverlaySpan,
 };
 
@@ -103,11 +103,11 @@ pub struct ExtensionOverlay {
 impl ExtensionOverlay {
     /// Wrap an extension's component and the one-shot that unblocks it.
     #[must_use]
-    pub fn new(
-        inner: Box<dyn InteractiveOverlay>,
-        done: tokio::sync::oneshot::Sender<()>,
-    ) -> Self {
-        Self { inner, done: Some(done) }
+    pub fn new(inner: Box<dyn InteractiveOverlay>, done: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self {
+            inner,
+            done: Some(done),
+        }
     }
 
     /// pi's `{ anchor: "center", width: "95%", minWidth: 60, maxHeight: "85%", margin: 1 }` resolved
@@ -127,15 +127,25 @@ impl ExtensionOverlay {
                 .checked_div(100)
                 .unwrap_or(0),
         };
-        let width = u16::try_from(width).unwrap_or(u16::MAX).max(options.min_width).min(usable_w);
+        let width = u16::try_from(width)
+            .unwrap_or(u16::MAX)
+            .max(options.min_width)
+            .min(usable_w);
         // The height budget is `OverlayOptions::max_rows`, shared with MCP-377's windowing so the
         // adapter and the component cannot disagree about how many rows there are.
         let max_h = options.max_rows(area.height);
         let height = content_rows.clamp(1, max_h);
         // `anchor: "center"`.
         let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-        let y = area.y.saturating_add(area.height.saturating_sub(height) / 2);
-        Rect { x, y, width, height }
+        let y = area
+            .y
+            .saturating_add(area.height.saturating_sub(height) / 2);
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 }
 
@@ -168,7 +178,9 @@ impl Overlay for ExtensionOverlay {
         // see two different answers mid-frame.
         let options = self.inner.options();
         let probe = Self::box_rect(area, area.height, options);
-        let lines = self.inner.render(probe.width as usize, area.height as usize);
+        let lines = self
+            .inner
+            .render(probe.width as usize, area.height as usize);
         let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         let rect = Self::box_rect(area, rows, options);
         let painted: Vec<Line<'static>> = lines
@@ -183,7 +195,9 @@ impl Overlay for ExtensionOverlay {
     fn handle(&mut self, key: &KeyEvent) -> OverlayOutcome {
         // An unmapped key (a media key, a bare modifier press) never reaches the extension: pi's
         // `handleInput(data)` only ever sees bytes a terminal actually produced for a key it knows.
-        let Some(mapped) = to_overlay_key(key) else { return OverlayOutcome::Ignored };
+        let Some(mapped) = to_overlay_key(key) else {
+            return OverlayOutcome::Ignored;
+        };
         match self.inner.handle_key(mapped) {
             ExtOverlayOutcome::Ignored => OverlayOutcome::Ignored,
             ExtOverlayOutcome::Redraw => OverlayOutcome::Redraw,
@@ -208,7 +222,12 @@ impl Overlay for ExtensionOverlay {
 /// One backend-free [`OverlayLine`] as painted ratatui spans.
 #[must_use]
 pub fn to_ratatui_line(line: OverlayLine) -> Line<'static> {
-    Line::from(line.spans.into_iter().map(to_ratatui_span).collect::<Vec<_>>())
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(to_ratatui_span)
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// One backend-free [`OverlaySpan`] as a painted ratatui span, colour and modifiers intact.
@@ -301,11 +320,16 @@ pub fn to_overlay_key(key: &KeyEvent) -> Option<OverlayKey> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     /// A component that records what it was asked to paint and answers a fixed script.
     struct Probe {
@@ -372,7 +396,12 @@ mod tests {
 
     #[test]
     fn geometry_is_upstreams_center_95pct_min60_max85pct() {
-        let area = Rect { x: 0, y: 0, width: 100, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
         // 95% of 100 = 95, inside the margin-2 usable 98.
         let rect = ExtensionOverlay::box_rect(area, 100, OverlayOptions::default());
         assert_eq!(rect.width, 95);
@@ -386,14 +415,32 @@ mod tests {
     #[test]
     fn min_width_60_never_exceeds_the_real_terminal() {
         // 95% of 40 = 38, below `minWidth: 60`; the usable width (40 - 2 margin) caps it.
-        let rect = ExtensionOverlay::box_rect(Rect { x: 0, y: 0, width: 40, height: 20 }, 5, OverlayOptions::default());
+        let rect = ExtensionOverlay::box_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 20,
+            },
+            5,
+            OverlayOptions::default(),
+        );
         assert_eq!(rect.width, 38);
         assert_eq!(rect.height, 5);
     }
 
     #[test]
     fn a_short_component_shrinks_the_box_to_its_own_row_count() {
-        let rect = ExtensionOverlay::box_rect(Rect { x: 0, y: 0, width: 100, height: 40 }, 6, OverlayOptions::default());
+        let rect = ExtensionOverlay::box_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 40,
+            },
+            6,
+            OverlayOptions::default(),
+        );
         assert_eq!(rect.height, 6);
     }
 
@@ -433,7 +480,11 @@ mod tests {
         // The box is 95 wide, 2 tall, centered in 100x40 → x=2, y=19.
         let cell = buffer.cell((2, 19)).expect("first painted cell");
         assert_eq!(cell.symbol(), "r");
-        assert_eq!(cell.fg, Color::Cyan, "the component's fg must survive the seam");
+        assert_eq!(
+            cell.fg,
+            Color::Cyan,
+            "the component's fg must survive the seam"
+        );
         assert!(
             cell.modifier.contains(Modifier::BOLD),
             "the component's bold must survive the seam"
@@ -450,9 +501,24 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                OverlayKey { code: OverlayKeyCode::Char('o'), ctrl: true, alt: false, shift: false },
-                OverlayKey { code: OverlayKeyCode::Char('K'), ctrl: false, alt: false, shift: true },
-                OverlayKey { code: OverlayKeyCode::Char('k'), ctrl: false, alt: false, shift: false },
+                OverlayKey {
+                    code: OverlayKeyCode::Char('o'),
+                    ctrl: true,
+                    alt: false,
+                    shift: false
+                },
+                OverlayKey {
+                    code: OverlayKeyCode::Char('K'),
+                    ctrl: false,
+                    alt: false,
+                    shift: true
+                },
+                OverlayKey {
+                    code: OverlayKeyCode::Char('k'),
+                    ctrl: false,
+                    alt: false,
+                    shift: false
+                },
             ]
         );
     }
@@ -472,9 +538,16 @@ mod tests {
             overlay.handle(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             OverlayOutcome::Close
         );
-        assert!(rx.try_recv().is_err(), "still open ⇒ the task stays blocked");
+        assert!(
+            rx.try_recv().is_err(),
+            "still open ⇒ the task stays blocked"
+        );
         drop(overlay);
-        assert_eq!(rx.try_recv(), Ok(()), "teardown must release the blocked task");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(()),
+            "teardown must release the blocked task"
+        );
     }
 
     #[test]
@@ -487,9 +560,18 @@ mod tests {
 
     #[test]
     fn every_colour_variant_maps_to_its_ratatui_twin() {
-        assert_eq!(to_ratatui_color(OverlayColor::Rgb(9, 8, 7)), Color::Rgb(9, 8, 7));
-        assert_eq!(to_ratatui_color(OverlayColor::Indexed(42)), Color::Indexed(42));
-        assert_eq!(to_ratatui_color(OverlayColor::LightMagenta), Color::LightMagenta);
+        assert_eq!(
+            to_ratatui_color(OverlayColor::Rgb(9, 8, 7)),
+            Color::Rgb(9, 8, 7)
+        );
+        assert_eq!(
+            to_ratatui_color(OverlayColor::Indexed(42)),
+            Color::Indexed(42)
+        );
+        assert_eq!(
+            to_ratatui_color(OverlayColor::LightMagenta),
+            Color::LightMagenta
+        );
         assert_eq!(to_ratatui_color(OverlayColor::DarkGray), Color::DarkGray);
     }
 

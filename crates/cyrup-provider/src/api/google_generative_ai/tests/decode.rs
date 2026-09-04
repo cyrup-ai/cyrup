@@ -71,9 +71,11 @@ async fn decodes_text_thinking_and_tool_stream() {
     let events = collect(raw.as_bytes().to_vec(), &m).await;
 
     assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
-    assert!(events.iter().any(
-        |e| matches!(e, StreamEvent::ThinkingDelta { delta, .. } if delta == "reasoning")
-    ));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ThinkingDelta { delta, .. } if delta == "reasoning"))
+    );
     assert!(
         events
             .iter()

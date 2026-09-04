@@ -10,7 +10,12 @@ impl Ctx {
     /// Spawn a long-lived child (the `proc.spawn` capability grant); returns an opaque handle for
     /// [`Ctx::proc_write_stdin`]/[`Ctx::proc_read_stdout`]/[`Ctx::proc_read_stderr`]/
     /// [`Ctx::proc_poll_exit`]/[`Ctx::proc_kill`]. Denied unless the host granted `proc`.
-    pub fn proc_spawn(&self, cmd: &str, args: &[&str], opts: &ProcSpawnOptions) -> Result<u32, String> {
+    pub fn proc_spawn(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        opts: &ProcSpawnOptions,
+    ) -> Result<u32, String> {
         #[cfg(target_arch = "wasm32")]
         {
             let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -152,8 +157,11 @@ impl ProcSpawnOptions {
         // file-scope `use` would be an unused import on the host target.
         use std::collections::HashMap;
 
-        let map: HashMap<&str, &str> =
-            self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let map: HashMap<&str, &str> = self
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         // Encode failure -> `{}` (unreachable, see the doc comment above).
         serde_json::to_string(&map).unwrap_or_else(|_| "{}".into())
     }

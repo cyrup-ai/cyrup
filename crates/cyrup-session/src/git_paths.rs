@@ -68,14 +68,22 @@ pub fn find_git_paths(cwd: &Path) -> Option<GitPaths> {
                         Ok(c) => resolve_against(&git_dir, c.trim()),
                         Err(_) => git_dir,
                     };
-                    return Some(GitPaths { repo_dir: dir, common_git_dir, head_path });
+                    return Some(GitPaths {
+                        repo_dir: dir,
+                        common_git_dir,
+                        head_path,
+                    });
                 }
             } else if meta.is_dir() {
                 let head_path = git_path.join("HEAD");
                 if !head_path.exists() {
                     return None;
                 }
-                return Some(GitPaths { repo_dir: dir, common_git_dir: git_path, head_path });
+                return Some(GitPaths {
+                    repo_dir: dir,
+                    common_git_dir: git_path,
+                    head_path,
+                });
             }
         }
         if !dir.pop() {
@@ -115,7 +123,11 @@ fn lexically_normalize(p: &Path) -> PathBuf {
             Component::CurDir => {}
             Component::ParentDir => {
                 // Only pop a real directory name; never pop past the prefix/root.
-                if out.components().next_back().is_some_and(|c| matches!(c, Component::Normal(_))) {
+                if out
+                    .components()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, Component::Normal(_)))
+                {
                     out.pop();
                 } else if out.as_os_str().is_empty() {
                     out.push(c.as_os_str());

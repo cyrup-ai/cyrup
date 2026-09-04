@@ -283,10 +283,15 @@ mod tests {
     #[tokio::test]
     async fn cfg042_an_aborted_signal_rejects_the_operation_without_mutating() {
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
-        let kept = ModelsStoreEntry { checked_at: Some(1), ..ModelsStoreEntry::default() };
+        let kept = ModelsStoreEntry {
+            checked_at: Some(1),
+            ..ModelsStoreEntry::default()
+        };
         store.write("groq", kept.clone(), None).await.unwrap();
 
-        let cancelled = ModelsStoreOperationOptions { signal: Some(CancelToken::new()) };
+        let cancelled = ModelsStoreOperationOptions {
+            signal: Some(CancelToken::new()),
+        };
         if let Some(t) = cancelled.signal.as_ref() {
             t.cancel();
         }
@@ -320,10 +325,15 @@ mod tests {
     async fn cfg042_absent_signal_and_live_signal_are_both_no_ops() {
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
         let no_signal = ModelsStoreOperationOptions::default();
-        let live = ModelsStoreOperationOptions { signal: Some(CancelToken::new()) };
+        let live = ModelsStoreOperationOptions {
+            signal: Some(CancelToken::new()),
+        };
 
         for options in [None, Some(&no_signal), Some(&live)] {
-            let entry = ModelsStoreEntry { checked_at: Some(3), ..ModelsStoreEntry::default() };
+            let entry = ModelsStoreEntry {
+                checked_at: Some(3),
+                ..ModelsStoreEntry::default()
+            };
             store.write("groq", entry.clone(), options).await.unwrap();
             assert_eq!(store.read("groq", options).await.unwrap(), Some(entry));
             store.delete("groq", options).await.unwrap();
@@ -340,7 +350,9 @@ mod tests {
     async fn cfg042_the_scoped_wrapper_forwards_the_signal() {
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
         let scoped = ProviderModelsStore::new(store, "groq");
-        let cancelled = ModelsStoreOperationOptions { signal: Some(CancelToken::new()) };
+        let cancelled = ModelsStoreOperationOptions {
+            signal: Some(CancelToken::new()),
+        };
         if let Some(t) = cancelled.signal.as_ref() {
             t.cancel();
         }

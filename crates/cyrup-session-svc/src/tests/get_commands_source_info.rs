@@ -26,19 +26,24 @@
 //!   `description?: string` (`core/extensions/types.ts:1163-1168`) omits the key.
 //!
 //! `SEAM-055` (closed) fixed only `sourceInfo.path`; these are the three divergences that survived it.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::{SessionBuilder, SessionConfig};
 use cyrup_core::ExtensionId;
 use cyrup_ext::{
     CommandDescriptor, ExtError, ExtensionProvenance, HookOutcome, HostCtx, HostEvent, InitApi,
     NativeExtension,
 };
-use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
-use crate::{SessionBuilder, SessionConfig};
+use cyrup_provider::faux::FauxProvider;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -54,7 +59,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 const OWNER: &str = "provenance-probe";
@@ -73,13 +82,19 @@ impl NativeExtension for TwoCommands {
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
         api.register_command(
             "described",
-            CommandDescriptor { description: "has a description".into(), completions: Vec::new() },
+            CommandDescriptor {
+                description: "has a description".into(),
+                completions: Vec::new(),
+            },
         );
         api.register_command(
             "undescribed",
             // The empty string is this port's representation of pi's absent `description?`, which
             // is why the emitter must omit rather than send `""`.
-            CommandDescriptor { description: String::new(), completions: Vec::new() },
+            CommandDescriptor {
+                description: String::new(),
+                completions: Vec::new(),
+            },
         );
         Ok(())
     }
@@ -135,7 +150,10 @@ async fn extension_commands_carry_real_provenance_and_omit_an_absent_description
     // Presence before absence: SEAM-055's `path` and the two `createSyntheticSourceInfo` defaults
     // must survive this change, and the TOP-LEVEL `source` is a different field (pi's
     // `SlashCommandSource`, `core/slash-commands.ts:4`) that really is `"extension"`.
-    assert_eq!(info["path"], OWNER, "SEAM-055's owner id must not regress: {described}");
+    assert_eq!(
+        info["path"], OWNER,
+        "SEAM-055's owner id must not regress: {described}"
+    );
     assert_eq!(info["scope"], "temporary");
     assert_eq!(info["origin"], "top-level");
     assert_eq!(described["source"], "extension");
@@ -181,7 +199,10 @@ async fn a_filesystem_extension_reports_local_and_its_base_dir() {
 
     let catalog = session.slash_command_catalog();
     let info = &entry(&catalog, "described")["sourceInfo"];
-    assert_eq!(info["source"], "local", "a filesystem extension is pi's `else \"local\"` branch");
+    assert_eq!(
+        info["source"], "local",
+        "a filesystem extension is pi's `else \"local\"` branch"
+    );
     assert_eq!(
         info["baseDir"].as_str(),
         Some(dir.to_string_lossy().as_ref()),

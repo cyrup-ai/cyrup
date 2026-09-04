@@ -14,15 +14,15 @@
     clippy::string_slice
 )]
 
-use cyrup_config::login::{AuthCheck, AuthType, LoginProviderOption};
-use cyrup_core::ProviderId;
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
 use crate::{
-    format_status_indicator, login_selector_rows, provider_display_name, provider_rows, App,
-    AppAction, AppCommand, AuthState, OAuthMode, OAuthSelector, SelectorKind, UiTheme,
+    App, AppAction, AppCommand, AuthState, OAuthMode, OAuthSelector, SelectorKind, UiTheme,
+    format_status_indicator, login_selector_rows, provider_display_name, provider_rows,
 };
+use cyrup_config::login::{AuthCheck, AuthType, LoginProviderOption};
+use cyrup_core::ProviderId;
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 /// Open the real `OAuthSelectorComponent` port (`oauth-selector.ts`) in the editor slot — the same
 /// thing `App::execute_command` now does for `/login` and `/logout`. These tests used to open a
@@ -99,15 +99,24 @@ fn login_selector_renders_providers_status_and_borders() {
     }
     // `showAuthTypeLabels` (`oauth-selector.ts:61`): the list mixes both kinds, so each row is
     // tagged.
-    assert!(text.contains("[subscription]"), "missing oauth tag:\n{text}");
+    assert!(
+        text.contains("[subscription]"),
+        "missing oauth tag:\n{text}"
+    );
     assert!(text.contains("[API key]"), "missing api-key tag:\n{text}");
     // `formatStatusIndicator` (`oauth-selector.ts:164-181`).
-    assert!(text.contains("✓ configured"), "missing stored status:\n{text}");
+    assert!(
+        text.contains("✓ configured"),
+        "missing stored status:\n{text}"
+    );
     assert!(
         text.contains("✓ env: OPENAI_API_KEY"),
         "env-var sources render as `env: …`:\n{text}"
     );
-    assert!(text.contains("• unconfigured"), "missing unconfigured:\n{text}");
+    assert!(
+        text.contains("• unconfigured"),
+        "missing unconfigured:\n{text}"
+    );
 }
 
 #[test]
@@ -119,7 +128,11 @@ fn login_confirm_routes_the_row_index_not_the_provider_id() {
     open_oauth(&mut app, OAuthMode::Login, &login_options());
     app.handle_input(&key(KeyCode::Down)); // → Anthropic [API key], index 1
     let action = app.handle_input(&key(KeyCode::Enter));
-    assert_eq!(app.active_selector_kind(), None, "confirm closes the picker");
+    assert_eq!(
+        app.active_selector_kind(),
+        None,
+        "confirm closes the picker"
+    );
     match action {
         crate::AppAction::Command(AppCommand::ConfirmSelection { kind, value }) => {
             assert_eq!(kind, SelectorKind::Login);
@@ -189,8 +202,14 @@ fn logout_selector_lists_stored_providers_only() {
         text.contains("Select provider to logout:"),
         "missing logout title:\n{text}"
     );
-    assert!(text.contains("Anthropic"), "missing stored provider:\n{text}");
-    assert!(text.contains("✓ configured"), "stored cred shows configured:\n{text}");
+    assert!(
+        text.contains("Anthropic"),
+        "missing stored provider:\n{text}"
+    );
+    assert!(
+        text.contains("✓ configured"),
+        "stored cred shows configured:\n{text}"
+    );
 }
 
 #[test]
@@ -229,7 +248,9 @@ fn id_only_row_builder_still_sorts_by_display_name() {
 
 /// The fg colour of the buffer cell at the first column of `needle` within row `y`.
 fn fg_at(app: &App<TestBackend>, y: u16, row: &str, needle: &str) -> ratatui::style::Color {
-    let byte = row.find(needle).unwrap_or_else(|| panic!("{needle:?} not in {row:?}"));
+    let byte = row
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} not in {row:?}"));
     let x = row[..byte].chars().count() as u16;
     app.terminal().backend().buffer().cell((x, y)).unwrap().fg
 }
@@ -250,7 +271,10 @@ fn mixed_status_options() -> Vec<LoginProviderOption> {
             "anthropic",
             "Anthropic",
             AuthType::ApiKey,
-            Some(AuthCheck { auth_type: AuthType::Oauth, source: Some("stored".to_string()) }),
+            Some(AuthCheck {
+                auth_type: AuthType::Oauth,
+                source: Some("stored".to_string()),
+            }),
         ),
         option("groq", "Groq", AuthType::ApiKey, None),
     ]
@@ -333,7 +357,10 @@ fn login_has_a_search_input_that_filters_the_provider_list() {
     open_oauth(&mut app, OAuthMode::Login, &mixed_status_options());
     app.draw().unwrap();
     let (_, row) = row_with(&app, "> ");
-    assert!(row.starts_with("> "), "`input.ts:380` prompt at column 0: {row:?}");
+    assert!(
+        row.starts_with("> "),
+        "`input.ts:380` prompt at column 0: {row:?}"
+    );
 
     for c in "groq".chars() {
         app.handle_input(&key(KeyCode::Char(c)));
@@ -343,9 +370,18 @@ fn login_has_a_search_input_that_filters_the_provider_list() {
     // The dialog is shorter once the list is filtered, so re-find the input row rather than
     // reusing the pre-filter y.
     let (_, typed) = row_with(&app, "> ");
-    assert!(typed.starts_with("> groq"), "the query is echoed in the box: {typed:?}");
-    assert!(text.contains("Groq"), "the match survives the filter:\n{text}");
-    assert!(!text.contains("Anthropic"), "non-matching providers are filtered out:\n{text}");
+    assert!(
+        typed.starts_with("> groq"),
+        "the query is echoed in the box: {typed:?}"
+    );
+    assert!(
+        text.contains("Groq"),
+        "the match survives the filter:\n{text}"
+    );
+    assert!(
+        !text.contains("Anthropic"),
+        "non-matching providers are filtered out:\n{text}"
+    );
 }
 
 /// The filter reorders rows, so the confirm value must be resolved through the FILTERED view —
@@ -386,7 +422,6 @@ fn login_empty_states_use_upstreams_two_distinct_messages() {
     assert!(buf_text(&empty).contains("No providers logged in. Use /login first."));
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // Behaviours the new `OAuthSelector` added and nothing asserted — each was verified by disabling
 // it and watching the whole suite stay green.
@@ -395,7 +430,14 @@ fn login_empty_states_use_upstreams_two_distinct_messages() {
 /// A catalog longer than `maxVisible = 8` (`oauth-selector.ts:117`).
 fn many_options(n: usize) -> Vec<LoginProviderOption> {
     (0..n)
-        .map(|i| option(&format!("p{i:02}"), &format!("Provider {i:02}"), AuthType::ApiKey, None))
+        .map(|i| {
+            option(
+                &format!("p{i:02}"),
+                &format!("Provider {i:02}"),
+                AuthType::ApiKey,
+                None,
+            )
+        })
         .collect()
 }
 
@@ -410,7 +452,10 @@ fn login_reports_its_scroll_position_past_the_eight_row_window() {
     open_oauth(&mut app, OAuthMode::Login, &many_options(12));
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("   (1/12)"), "no scroll row (:147-150):\n{text}");
+    assert!(
+        text.contains("   (1/12)"),
+        "no scroll row (:147-150):\n{text}"
+    );
     assert_eq!(
         text.lines().filter(|l| l.contains("Provider ")).count(),
         8,

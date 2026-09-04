@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::run_rpc;
-use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use cyrup_session_svc::{AgentSessionRuntime, SessionConfig, SessionFactory, SessionTarget};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -27,7 +27,11 @@ pub(super) fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 pub(super) fn base_config(fx: &Fixture) -> SessionConfig {
@@ -57,8 +61,13 @@ impl cyrup_session_svc::ProviderResolver for AnyFauxResolver {
 
 /// The one place a test runtime is actually built: every per-file builder is a thin wrapper that
 /// only differs in how it dresses the [`SessionFactory`] before handing it over.
-pub(super) async fn create_runtime(factory: SessionFactory, target: SessionTarget) -> Arc<AgentSessionRuntime> {
-    AgentSessionRuntime::create(Arc::new(factory), target).await.expect("build runtime")
+pub(super) async fn create_runtime(
+    factory: SessionFactory,
+    target: SessionTarget,
+) -> Arc<AgentSessionRuntime> {
+    AgentSessionRuntime::create(Arc::new(factory), target)
+        .await
+        .expect("build runtime")
 }
 
 /// Build the multi-session runtime host the RPC adapter drives (Pi `rpc-mode.ts` `runtimeHost`).
@@ -71,12 +80,16 @@ pub(super) async fn create_runtime(factory: SessionFactory, target: SessionTarge
 /// It matters here because these fixtures are NOT hermetic against the ambient environment: a
 /// `TOGETHER_API_KEY` in the developer's shell makes `together` a configured provider and puts its
 /// whole catalog in the available set, exactly as it would for a real user.
-pub(super) async fn build_runtime(fx: &Fixture, faux: Arc<FauxProvider>) -> Arc<AgentSessionRuntime> {
+pub(super) async fn build_runtime(
+    fx: &Fixture,
+    faux: Arc<FauxProvider>,
+) -> Arc<AgentSessionRuntime> {
     let provider: Arc<dyn Provider> = faux;
     let cfg = base_config(fx);
     let target = cfg.target.clone();
-    let factory = SessionFactory::new(provider, cfg)
-        .provider_resolver(Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>);
+    let factory = SessionFactory::new(provider, cfg).provider_resolver(
+        Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>
+    );
     create_runtime(factory, target).await
 }
 
@@ -104,9 +117,12 @@ pub(super) async fn build_runtime_hermetic_auth(
         cyrup_config::AuthStore::at(fx.agent_dir.join("auth.json"))
             .with_ambient_env(std::collections::HashMap::new()),
     );
-    let factory = SessionFactory::new(provider, cfg)
-        .provider_resolver(Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>)
-        .auth(auth);
+    let factory =
+        SessionFactory::new(provider, cfg)
+            .provider_resolver(
+                Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>
+            )
+            .auth(auth);
     create_runtime(factory, target).await
 }
 
@@ -119,7 +135,11 @@ pub(super) async fn build_runtime_with_ext(
     let provider: Arc<dyn Provider> = faux;
     let cfg = base_config(fx);
     let target = cfg.target.clone();
-    create_runtime(SessionFactory::new(provider, cfg).with_native_extension(ext), target).await
+    create_runtime(
+        SessionFactory::new(provider, cfg).with_native_extension(ext),
+        target,
+    )
+    .await
 }
 
 /// Parse the produced sink bytes into one `serde_json::Value` per non-empty LF-delimited line.
@@ -172,7 +192,9 @@ pub(super) fn spawn_rpc_duplex(
     let handle = tokio::spawn(async move {
         let reader = tokio::io::BufReader::new(server_rx);
         let mut writer = server_tx;
-        run_rpc(&runtime, reader, &mut writer).await.expect("rpc mode runs");
+        run_rpc(&runtime, reader, &mut writer)
+            .await
+            .expect("rpc mode runs");
     });
     (client_tx, tokio::io::BufReader::new(client_rx), handle)
 }

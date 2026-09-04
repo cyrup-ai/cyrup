@@ -35,17 +35,22 @@
 //! is an after-the-fact notification (cyrup's stand-in for pi's `setRebindSession`, and what
 //! `cyrup-tui`'s `rebind_session` is driven by), so a watcher only wakes once the outgoing session
 //! is already gone.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cyrup_core::ExtensionId;
-use cyrup_ext::{EventKind, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension};
-use cyrup_provider::faux::FauxProvider;
-use cyrup_provider::Provider;
 use crate::{AgentSessionRuntime, SessionConfig, SessionFactory, SessionTarget};
+use cyrup_core::ExtensionId;
+use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use tempfile::TempDir;
 
 // ------------------------------------------------------------------------------- harness ----
@@ -97,7 +102,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -110,12 +119,16 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 /// Build a runtime whose only extension is a [`PhaseRecorder`], and hand back the shared log.
 async fn runtime_with_recorder(fx: &Fixture) -> (Arc<AgentSessionRuntime>, Phases) {
     let phases: Phases = Arc::new(Mutex::new(Vec::new()));
-    let rec = PhaseRecorder { phases: phases.clone() };
+    let rec = PhaseRecorder {
+        phases: phases.clone(),
+    };
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
     let factory = Arc::new(
         SessionFactory::new(provider, base_config(fx)).with_native_extension(Arc::new(rec)),
     );
-    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap();
     // Drop the initial `session_start{startup}` so each test reads only its own teardown window —
     // pi's test does the same with `events.length = 0`.
     phases.lock().unwrap().clear();
@@ -147,7 +160,11 @@ async fn hook_runs_after_session_shutdown_and_before_the_session_is_invalidated(
     let fx = fixture();
     let (runtime, phases) = runtime_with_recorder(&fx).await;
 
-    assert_eq!(runtime.generation().await, 0, "precondition: the initial session is generation 0");
+    assert_eq!(
+        runtime.generation().await,
+        0,
+        "precondition: the initial session is generation 0"
+    );
 
     let gen_at_hook: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     {
@@ -156,7 +173,9 @@ async fn hook_runs_after_session_shutdown_and_before_the_session_is_invalidated(
         let rx = runtime.watch_generation();
         runtime
             .set_before_session_invalidate(Some(Arc::new(move || {
-                p.lock().unwrap().push("before_session_invalidate".to_string());
+                p.lock()
+                    .unwrap()
+                    .push("before_session_invalidate".to_string());
                 g.lock().unwrap().push(*rx.borrow());
             })))
             .await;
@@ -182,7 +201,11 @@ async fn hook_runs_after_session_shutdown_and_before_the_session_is_invalidated(
          installed and live, which is the whole point of the callback being synchronous \
          (Pi agent-session-runtime.ts:122-127)"
     );
-    assert_eq!(runtime.generation().await, 1, "the replacement did install after the hook ran");
+    assert_eq!(
+        runtime.generation().await,
+        1,
+        "the replacement did install after the hook ran"
+    );
 }
 
 /// MIRROR — stays GREEN with or without the fix.
@@ -200,7 +223,10 @@ async fn mirror_teardown_ordering_without_a_hook_is_unchanged() {
 
     assert_eq!(
         log(&phases),
-        vec!["session_shutdown:new".to_string(), "session_start:new".to_string()],
+        vec![
+            "session_shutdown:new".to_string(),
+            "session_start:new".to_string()
+        ],
         "with no hook registered a replacement is still shutdown-then-start"
     );
 }
@@ -231,13 +257,19 @@ async fn hook_fires_on_reload_and_on_runtime_dispose() {
         runtime
             .set_before_session_invalidate(Some(Arc::new(move || {
                 f.fetch_add(1, Ordering::SeqCst);
-                p.lock().unwrap().push("before_session_invalidate".to_string());
+                p.lock()
+                    .unwrap()
+                    .push("before_session_invalidate".to_string());
             })))
             .await;
     }
 
     runtime.reload(None).await.unwrap();
-    assert_eq!(fired.load(Ordering::SeqCst), 1, "reload replaces the session object → hook fires");
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "reload replaces the session object → hook fires"
+    );
     assert_eq!(
         log(&phases),
         vec![
@@ -257,7 +289,10 @@ async fn hook_fires_on_reload_and_on_runtime_dispose() {
     );
     assert_eq!(
         log(&phases),
-        vec!["session_shutdown:quit".to_string(), "before_session_invalidate".to_string()],
+        vec![
+            "session_shutdown:quit".to_string(),
+            "before_session_invalidate".to_string()
+        ],
         "on quit the hook still lands after session_shutdown, with no replacement to announce"
     );
 }
@@ -288,7 +323,11 @@ async fn hook_is_clearable_and_replaceable() {
     // Cleared: the next teardown must not call it.
     runtime.set_before_session_invalidate(None).await;
     runtime.new_session().await.unwrap();
-    assert_eq!(first.load(Ordering::SeqCst), 1, "a cleared hook is not called again");
+    assert_eq!(
+        first.load(Ordering::SeqCst),
+        1,
+        "a cleared hook is not called again"
+    );
 
     // Replaced: only the new one fires.
     {
@@ -300,8 +339,16 @@ async fn hook_is_clearable_and_replaceable() {
             .await;
     }
     runtime.new_session().await.unwrap();
-    assert_eq!(second.load(Ordering::SeqCst), 1, "the replacement hook fired");
-    assert_eq!(first.load(Ordering::SeqCst), 1, "the replaced hook stayed replaced");
+    assert_eq!(
+        second.load(Ordering::SeqCst),
+        1,
+        "the replacement hook fired"
+    );
+    assert_eq!(
+        first.load(Ordering::SeqCst),
+        1,
+        "the replaced hook stayed replaced"
+    );
 }
 
 /// A hook that re-enters `set_before_session_invalidate` must not deadlock against the lock its own

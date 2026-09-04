@@ -11,20 +11,25 @@
 //!   * §08 ledger row — `LiveHostServices` injected as the live capability backend: a loaded
 //!     extension's `control` capability (Pi `createCommandContext`, agent-session.ts:1158) reaches
 //!     a REAL session effect via the command-tier control channel.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cyrup_core::{Content, ExtensionId, Message, StopReason};
-use cyrup_ext::{
-    CommandDescriptor, ControlOp, EventKind, HostCtx, HostEvent, HookOutcome, HostServices, InitApi,
-    InputEventSource, InputStreamingBehavior, NativeExtension,
-};
-use cyrup_ext::ExtError;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
-use cyrup_provider::Provider;
 use crate::{InputSource, SessionBuilder, SessionConfig, UserInput};
+use cyrup_core::{Content, ExtensionId, Message, StopReason};
+use cyrup_ext::ExtError;
+use cyrup_ext::{
+    CommandDescriptor, ControlOp, EventKind, HookOutcome, HostCtx, HostEvent, HostServices,
+    InitApi, InputEventSource, InputStreamingBehavior, NativeExtension,
+};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -39,7 +44,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -50,7 +59,10 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 
 fn faux_with_ok() -> Arc<FauxProvider> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     faux
 }
 
@@ -89,7 +101,12 @@ impl NativeExtension for InputProbe {
         Ok(())
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        if let HostEvent::Input { source, streaming_behavior, .. } = ev {
+        if let HostEvent::Input {
+            source,
+            streaming_behavior,
+            ..
+        } = ev
+        {
             self.0.lock().unwrap().push((*source, *streaming_behavior));
         }
         HookOutcome::Noop
@@ -109,7 +126,10 @@ async fn input_event_delivers_source_and_streaming_behavior() {
         .unwrap();
 
     // An RPC-sourced submission while idle.
-    let _ = session.prompt(UserInput::text("hi", InputSource::Rpc)).await.unwrap();
+    let _ = session
+        .prompt(UserInput::text("hi", InputSource::Rpc))
+        .await
+        .unwrap();
     session.wait_for_idle().await;
 
     let seen = probe.lock().unwrap().clone();
@@ -124,7 +144,11 @@ async fn input_event_delivers_source_and_streaming_behavior() {
     let _ = session.prompt("again").await.unwrap();
     session.wait_for_idle().await;
     let seen = probe.lock().unwrap().clone();
-    assert_eq!(seen[1].0, InputEventSource::Interactive, "non-rpc source -> interactive");
+    assert_eq!(
+        seen[1].0,
+        InputEventSource::Interactive,
+        "non-rpc source -> interactive"
+    );
 }
 
 // =============================================================== #13 native slash command exec ====
@@ -139,7 +163,10 @@ impl NativeExtension for GreetCommand {
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
         api.register_command(
             "greet",
-            CommandDescriptor { description: "greet someone".into(), completions: vec![] },
+            CommandDescriptor {
+                description: "greet someone".into(),
+                completions: vec![],
+            },
         );
         Ok(())
     }
@@ -181,7 +208,9 @@ async fn native_slash_command_executes_and_short_circuits_the_prompt() {
         "the native command handler ran with the parsed args"
     );
     assert!(
-        user_texts(&session.messages().await).iter().all(|t| !t.contains("/greet")),
+        user_texts(&session.messages().await)
+            .iter()
+            .all(|t| !t.contains("/greet")),
         "the slash command was consumed — no user message was sent to the model"
     );
 
@@ -189,7 +218,9 @@ async fn native_slash_command_executes_and_short_circuits_the_prompt() {
     let _ = session.prompt("/unknown stuff").await.unwrap();
     session.wait_for_idle().await;
     assert!(
-        user_texts(&session.messages().await).iter().any(|t| t.contains("/unknown stuff")),
+        user_texts(&session.messages().await)
+            .iter()
+            .any(|t| t.contains("/unknown stuff")),
         "an unmatched slash command falls through to normal prompt handling"
     );
 }
@@ -223,7 +254,9 @@ async fn live_host_services_control_reaches_a_real_session_effect() {
     session.wait_for_idle().await;
 
     assert!(
-        user_texts(&session.messages().await).iter().any(|t| t.contains("from-extension")),
+        user_texts(&session.messages().await)
+            .iter()
+            .any(|t| t.contains("from-extension")),
         "the extension-driven control op produced a real session effect (the user message ran)"
     );
 
@@ -247,14 +280,20 @@ async fn live_host_services_control_reaches_a_real_session_effect() {
         .expect("control routes to the channel");
     session.apply_pending_control().await;
     assert!(
-        session.services().host_services.take_pending_control().is_empty(),
+        session
+            .services()
+            .host_services
+            .take_pending_control()
+            .is_empty(),
         "the drain CONSUMED the runtime-tier op (it is not left queued for a caller that never comes)"
     );
     // The session is unharmed by a runtime-tier op it cannot service.
     let _ = session.prompt("still alive").await.unwrap();
     session.wait_for_idle().await;
     assert!(
-        user_texts(&session.messages().await).iter().any(|t| t.contains("still alive")),
+        user_texts(&session.messages().await)
+            .iter()
+            .any(|t| t.contains("still alive")),
         "a runtime-tier op with no runtime host installed degrades cleanly"
     );
 }

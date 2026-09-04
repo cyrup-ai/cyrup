@@ -1,11 +1,11 @@
 //! The streaming event model + per-request options (arch-01 §8 / func-01 §8).
 
-use std::sync::Arc;
 use cyrup_core::{
     AssistantMessage, CancelToken, EventStream, ModelThinkingLevel, ProviderId, SessionId,
     StopReason, ToolCall,
 };
 use futures::StreamExt;
+use std::sync::Arc;
 
 mod framer;
 pub mod sse;
@@ -46,7 +46,10 @@ pub struct ProviderResponse {
 /// is async; the hook is invoked with `.await` in the (already async) wire `run` fns. It is NOT
 /// bridged sync→async via `block_on` (that panics on a current-thread runtime — no-panic DENY).
 pub type OnPayload = std::sync::Arc<
-    dyn Fn(serde_json::Value, crate::model::Model) -> futures::future::BoxFuture<'static, Option<serde_json::Value>>
+    dyn Fn(
+            serde_json::Value,
+            crate::model::Model,
+        ) -> futures::future::BoxFuture<'static, Option<serde_json::Value>>
         + Send
         + Sync,
 >;
@@ -90,20 +93,33 @@ impl ResponseCapture {
     pub fn sse_hook(&self, opts: &StreamOptions) -> Option<self::sse::OnResponse> {
         opts.on_response.as_ref()?;
         let cell = self.0.clone();
-        Some(std::sync::Arc::new(move |status: u16, headers: &reqwest::header::HeaderMap| {
-            let map = headers
-                .iter()
-                .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
-                .collect();
-            *cell.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(ProviderResponse { status, headers: map });
-        }))
+        Some(std::sync::Arc::new(
+            move |status: u16, headers: &reqwest::header::HeaderMap| {
+                let map = headers
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        v.to_str()
+                            .ok()
+                            .map(|s| (k.as_str().to_string(), s.to_string()))
+                    })
+                    .collect();
+                *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(ProviderResponse {
+                    status,
+                    headers: map,
+                });
+            },
+        ))
     }
 
     /// Fire the async `on_response` hook with the captured metadata (no-op when unset).
     pub async fn fire(&self, opts: &StreamOptions, model: &crate::model::Model) {
         if let Some(h) = &opts.on_response {
-            let resp = self.0.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+            let resp = self
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_default();
             h(resp, model.clone()).await;
         }
     }
@@ -144,9 +160,7 @@ impl ToolChoice {
 /// `(headers) => ProviderHeaders | Promise<ProviderHeaders>` and its production consumer awaits an
 /// extension dispatch.
 pub type TransformHeadersFn = std::sync::Arc<
-    dyn Fn(crate::HeaderMap) -> futures::future::BoxFuture<'static, crate::HeaderMap>
-        + Send
-        + Sync,
+    dyn Fn(crate::HeaderMap) -> futures::future::BoxFuture<'static, crate::HeaderMap> + Send + Sync,
 >;
 
 /// Per-request options (func-01 §13). Errors never throw; cancellation is delivered as a terminal
@@ -393,7 +407,9 @@ impl StreamOptions {
 
     /// The carried `mistral-conversations` per-API options, if any.
     pub fn mistral_options(&self) -> Option<&crate::api::mistral_conversations::MistralOptions> {
-        self.api_options.as_ref().and_then(ApiStreamOptions::mistral)
+        self.api_options
+            .as_ref()
+            .and_then(ApiStreamOptions::mistral)
     }
 }
 
@@ -597,7 +613,10 @@ impl StreamEvent {
             }
         }
         match DoneReason::try_from(message.stop_reason) {
-            Ok(reason) => StreamEvent::Done { reason, message: Arc::new(message) },
+            Ok(reason) => StreamEvent::Done {
+                reason,
+                message: Arc::new(message),
+            },
             Err(reason) => StreamEvent::Error {
                 reason,
                 error: Arc::new(message),

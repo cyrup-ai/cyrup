@@ -11,7 +11,12 @@
 //! every local process can reach; cyrup STRICTER is a disconnect pi would never have had. Each
 //! rejection case below is paired with an acceptance case that must stay green.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::transport::protocol::BrokerMessage;
 
@@ -58,12 +63,15 @@ fn extension_state_revision_is_bounded_by_max_safe_integer() {
         "pi rejects a non-safe integer via Number.isSafeInteger"
     );
     assert!(
-        decode(r#"{"type":"extension_state","namespace":"ns","revision":-1,"payload":{}}"#).is_err(),
+        decode(r#"{"type":"extension_state","namespace":"ns","revision":-1,"payload":{}}"#)
+            .is_err(),
         "pi requires revision >= 0"
     );
     // MIRROR: the boundary value itself must still be accepted.
-    decode(r#"{"type":"extension_state","namespace":"ns","revision":9007199254740991,"payload":{}}"#)
-        .expect("MAX_SAFE_INTEGER is itself safe");
+    decode(
+        r#"{"type":"extension_state","namespace":"ns","revision":9007199254740991,"payload":{}}"#,
+    )
+    .expect("MAX_SAFE_INTEGER is itself safe");
 }
 
 #[test]
@@ -133,6 +141,7 @@ fn owner_id_and_owner_epoch_must_be_both_present_or_both_absent() {
         r#"{"type":"extension_message","namespace":"ns","fromSessionId":"s1","ownerId":"o1","ownerEpoch":"e1"}"#,
         r#"{"type":"extension_message","namespace":"ns","fromSessionId":"s1"}"#,
     ] {
-        decode(legal).unwrap_or_else(|e| panic!("a legal ownership shape must decode: {legal} -> {e}"));
+        decode(legal)
+            .unwrap_or_else(|e| panic!("a legal ownership shape must decode: {legal} -> {e}"));
     }
 }

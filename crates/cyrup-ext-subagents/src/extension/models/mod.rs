@@ -21,7 +21,10 @@ use crate::exec::fallback::INHERIT_MODEL_SENTINEL;
 /// id. No suffix present -> empty suffix, base = the whole string.
 fn split_thinking_suffix(model: &str) -> (&str, &str) {
     match model.rfind(':') {
-        Some(idx) => (model.get(..idx).unwrap_or(model), model.get(idx..).unwrap_or("")),
+        Some(idx) => (
+            model.get(..idx).unwrap_or(model),
+            model.get(idx..).unwrap_or(""),
+        ),
         None => (model, ""),
     }
 }
@@ -93,8 +96,10 @@ fn resolve_model_candidate(
         return Some(model.to_string());
     }
     let (base_model, thinking_suffix) = split_thinking_suffix(model);
-    let matches: Vec<&AvailableModelEntry> =
-        available.iter().filter(|entry| entry.id == base_model).collect();
+    let matches: Vec<&AvailableModelEntry> = available
+        .iter()
+        .filter(|entry| entry.id == base_model)
+        .collect();
     if let Some(preferred) = preferred_provider
         && let Some(m) = matches.iter().find(|entry| entry.provider == preferred)
     {
@@ -133,7 +138,9 @@ pub(crate) fn resolve_subagent_model_override(
 /// precedence resolves to (any override that changes `model` also resets `model_source` away from
 /// `SettingsDefault`) — so [`format_model_source`] only needs the WINNING SCOPE from here, not the
 /// value itself, to render pi's scope-qualified `"{scope} defaultModel"` provenance.
-pub(crate) fn resolve_default_model_scope(settings: &LayeredOverrideSettings) -> Option<&'static str> {
+pub(crate) fn resolve_default_model_scope(
+    settings: &LayeredOverrideSettings,
+) -> Option<&'static str> {
     if settings.project_settings_path.is_some() && settings.project.default_model.is_some() {
         return Some("project");
     }
@@ -183,7 +190,12 @@ pub(crate) fn format_model_source(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::host::SubagentsExtension;
@@ -223,12 +235,13 @@ mod tests {
             }],
             ..usable_catalog
         };
-        let ranked_after_unavailable =
-            SubagentsExtension::provider_ranked_full_ids_from_catalog("anthropic", &unusable_catalog);
+        let ranked_after_unavailable = SubagentsExtension::provider_ranked_full_ids_from_catalog(
+            "anthropic",
+            &unusable_catalog,
+        );
         assert!(
             ranked_after_unavailable.is_empty(),
             "an unavailable-probe model must be filtered out of the ranked list entirely"
         );
     }
-
 }

@@ -53,13 +53,15 @@ pub(crate) fn spawn_session_bash(
         let sink: cyrup_session_svc::BashChunkSink = Some(Box::new(move |delta: &str| {
             let _ = chunk_tx.send(BashMsg::Chunk(delta.to_string()));
         }));
-        let options =
-            cyrup_session_svc::BashOptions {
+        let options = cyrup_session_svc::BashOptions {
             exclude_from_context: excluded,
             id: None,
             operations: None,
         };
-        let done = match session.execute_bash_with_user_event(&command, options, sink).await {
+        let done = match session
+            .execute_bash_with_user_event(&command, options, sink)
+            .await
+        {
             Ok(result) => BashMsg::Done {
                 exit_code: result.exit_code,
                 cancelled: result.cancelled,

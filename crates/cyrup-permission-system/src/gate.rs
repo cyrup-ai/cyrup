@@ -37,8 +37,9 @@ fn truthy(value: &Option<String>) -> Option<&str> {
 
 /// pi `FILESYSTEM_TOOL_NAME_SUFFIXES` (`index.ts:141`): the filesystem-ish suffixes a tool name is
 /// matched against by [`is_likely_filesystem_tool_name`].
-const FILESYSTEM_TOOL_NAME_SUFFIXES: [&str; 8] =
-    ["read", "write", "edit", "find", "grep", "search", "list", "ls"];
+const FILESYSTEM_TOOL_NAME_SUFFIXES: [&str; 8] = [
+    "read", "write", "edit", "find", "grep", "search", "list", "ls",
+];
 
 /// pi `isLikelyFilesystemToolName` (`index.ts:206-217`): heuristic recognition of a filesystem-like
 /// tool name. Lowercases + trims, splits on any run of non-alphanumeric characters (pi's
@@ -90,7 +91,10 @@ pub fn has_structured_edit_payload(input: &Map<String, Value>) -> bool {
     get_structured_edit_payloads(input).iter().any(|edit| {
         let record = to_record(edit);
         // pi `typeof editRecord.op === "string" ? editRecord.op : "replace_text"`.
-        let op = record.get("op").and_then(Value::as_str).unwrap_or("replace_text");
+        let op = record
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("replace_text");
         STRUCTURED_EDIT_OPERATION_NAMES.contains(&op)
             || (record.get("oldText").and_then(Value::as_str).is_some()
                 && record.get("newText").and_then(Value::as_str).is_some())
@@ -161,8 +165,11 @@ pub fn get_pattern_approval_subject(result: &PermissionCheckResult, input: &Valu
         return target.to_string();
     }
     if let Some(path) = get_path_bearing_tool_path(&result.tool_name, input) {
-        let cwd = get_non_empty_string(to_record(input).get("cwd"))
-            .unwrap_or_else(|| std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default());
+        let cwd = get_non_empty_string(to_record(input).get("cwd")).unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        });
         let resource = common::normalize_path_resource_for_permission(&path, &cwd);
         return if resource.is_empty() { path } else { resource };
     }
@@ -176,7 +183,9 @@ pub fn get_pattern_approval_subject(result: &PermissionCheckResult, input: &Valu
     // pi `return result.command || result.toolName;` — an empty `command` falls through to the tool
     // name, so an "Allow Always" on a malformed bash call still persists a `bash`/`bash` rule
     // instead of being dropped by `apply_decision`'s `!subject.is_empty()` guard.
-    truthy(&result.command).unwrap_or(&result.tool_name).to_string()
+    truthy(&result.command)
+        .unwrap_or(&result.tool_name)
+        .to_string()
 }
 
 /// pi `createConfigEvaluationRule` (`index.ts:841-848`): reuse the matched pattern only for
@@ -193,7 +202,11 @@ pub fn create_config_evaluation_rule(result: &PermissionCheckResult) -> PatternR
         (Some(p), true) => p.to_string(),
         _ => "*".to_string(),
     };
-    PatternRule { tool: result.tool_name.clone(), pattern, action: result.state }
+    PatternRule {
+        tool: result.tool_name.clone(),
+        pattern,
+        action: result.state,
+    }
 }
 
 /// pi `applyPatternApprovalState` (v0.8.0 `index.ts:557-579`): fold the config result with the
@@ -276,7 +289,9 @@ pub fn format_user_denied_reason(
         }
         _ => format!("User denied tool '{}'.", result.tool_name),
     };
-    let suffix = denial_reason.map(|r| format!(" Reason: {r}.")).unwrap_or_default();
+    let suffix = denial_reason
+        .map(|r| format!(" Reason: {r}."))
+        .unwrap_or_default();
     format!("{base}{suffix} {}", hard_stop_hint(result))
 }
 
@@ -393,7 +408,10 @@ fn format_edit_reference(value: Option<&Value>) -> String {
 /// pi `STRUCTURED_EDIT_OPERATION_NAMES`-adjacent op-default: `edit.op` if a string, else
 /// `"replace_text"` (`index.ts:441`).
 fn structured_edit_op(edit: &Map<String, Value>) -> String {
-    edit.get("op").and_then(Value::as_str).unwrap_or("replace_text").to_string()
+    edit.get("op")
+        .and_then(Value::as_str)
+        .unwrap_or("replace_text")
+        .to_string()
 }
 
 /// pi `formatStructuredEditSummary` (`index.ts:439-470`): the human-readable summary of a single
@@ -402,9 +420,10 @@ fn format_structured_edit_summary(edit: &Map<String, Value>, index: usize) -> Op
     let ordinal = format!("edit #{}", index + 1);
     let op = structured_edit_op(edit);
 
-    if let (Some(old_text), Some(new_text)) =
-        (edit.get("oldText").and_then(Value::as_str), edit.get("newText").and_then(Value::as_str))
-        && op == "replace_text"
+    if let (Some(old_text), Some(new_text)) = (
+        edit.get("oldText").and_then(Value::as_str),
+        edit.get("newText").and_then(Value::as_str),
+    ) && op == "replace_text"
     {
         return Some(format!(
             "{ordinal} replaces {} with {}",
@@ -418,7 +437,9 @@ fn format_structured_edit_summary(edit: &Map<String, Value>, index: usize) -> Op
         "replace" => {
             let start = format_edit_reference(edit.get("pos"));
             let end = match edit.get("end").and_then(Value::as_str) {
-                Some(e) if !e.trim().is_empty() => format!(" through {}", format_edit_reference(edit.get("end"))),
+                Some(e) if !e.trim().is_empty() => {
+                    format!(" through {}", format_edit_reference(edit.get("end")))
+                }
                 _ => String::new(),
             };
             Some(format!("{ordinal} replaces {line_count} at {start}{end}"))
@@ -440,7 +461,9 @@ fn format_structured_edit_summary(edit: &Map<String, Value>, index: usize) -> Op
         "delete" => {
             let start = format_edit_reference(edit.get("pos"));
             let end = match edit.get("end").and_then(Value::as_str) {
-                Some(e) if !e.trim().is_empty() => format!(" through {}", format_edit_reference(edit.get("end"))),
+                Some(e) if !e.trim().is_empty() => {
+                    format!(" through {}", format_edit_reference(edit.get("end")))
+                }
                 _ => String::new(),
             };
             Some(format!("{ordinal} deletes at {start}{end}"))
@@ -455,9 +478,10 @@ fn get_structured_edit_payloads(input: &Map<String, Value>) -> Vec<Value> {
     if let Some(Value::Array(edits)) = input.get("edits") {
         return edits.clone();
     }
-    if let (Some(old_text), Some(new_text)) =
-        (input.get("oldText").and_then(Value::as_str), input.get("newText").and_then(Value::as_str))
-    {
+    if let (Some(old_text), Some(new_text)) = (
+        input.get("oldText").and_then(Value::as_str),
+        input.get("newText").and_then(Value::as_str),
+    ) {
         return vec![serde_json::json!({
             "op": "replace_text",
             "oldText": old_text,
@@ -491,7 +515,10 @@ fn format_structured_edit_input_for_prompt(
     }
 
     let extra_edits = if summaries.len() > 1 {
-        format!(", plus {}", format_count(summaries.len() - 1, "additional edit", "additional edits"))
+        format!(
+            ", plus {}",
+            format_count(summaries.len() - 1, "additional edit", "additional edits")
+        )
     } else {
         String::new()
     };
@@ -499,8 +526,11 @@ fn format_structured_edit_input_for_prompt(
     // always yields `Some`; `unwrap_or_default` just avoids an indexing-slicing panic path for a case
     // that cannot occur, without reaching for `unwrap`/`expect`.
     let first_summary = summaries.first().cloned().unwrap_or_default();
-    let summary =
-        format!("({}: {}{extra_edits})", format_count(summaries.len(), "edit", "edits"), first_summary);
+    let summary = format!(
+        "({}: {}{extra_edits})",
+        format_count(summaries.len(), "edit", "edits"),
+        first_summary
+    );
     Some(match &path_part {
         Some(pp) => format!("{pp} {summary}"),
         None => summary,
@@ -547,7 +577,11 @@ fn format_read_input_for_prompt(input: &Map<String, Value>) -> String {
     {
         parts.push(format!("limit {limit}"));
     }
-    if parts.is_empty() { String::new() } else { format!("for {}", parts.join(", ")) }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("for {}", parts.join(", "))
+    }
 }
 
 /// pi `formatSearchInputForPrompt` (`index.ts:514-533`).
@@ -558,10 +592,16 @@ fn format_search_input_for_prompt(tool_name: &str, input: &Map<String, Value>) -
     let glob = get_non_empty_string(input.get("glob"));
 
     if let Some(p) = &pattern {
-        parts.push(format!("pattern '{}'", sanitize_inline_text(p, TOOL_TEXT_SUMMARY_MAX_LENGTH)));
+        parts.push(format!(
+            "pattern '{}'",
+            sanitize_inline_text(p, TOOL_TEXT_SUMMARY_MAX_LENGTH)
+        ));
     }
     if let Some(g) = &glob {
-        parts.push(format!("glob '{}'", sanitize_inline_text(g, TOOL_TEXT_SUMMARY_MAX_LENGTH)));
+        parts.push(format!(
+            "glob '{}'",
+            sanitize_inline_text(g, TOOL_TEXT_SUMMARY_MAX_LENGTH)
+        ));
     }
     if let Some(p) = &path {
         parts.push(format!("path '{p}'"));
@@ -569,7 +609,11 @@ fn format_search_input_for_prompt(tool_name: &str, input: &Map<String, Value>) -
         parts.push("current working directory".to_string());
     }
 
-    if parts.is_empty() { String::new() } else { format!("for {}", parts.join(", ")) }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("for {}", parts.join(", "))
+    }
 }
 
 /// pi `serializeToolInputPreview` (`index.ts:535-542`): a whitespace-collapsed JSON one-liner; empty
@@ -594,7 +638,10 @@ fn format_json_input_for_prompt(input: &Value) -> String {
     if inline.is_empty() {
         String::new()
     } else {
-        format!("with input {}", truncate_inline_text(&inline, TOOL_INPUT_PREVIEW_MAX_LENGTH))
+        format!(
+            "with input {}",
+            truncate_inline_text(&inline, TOOL_INPUT_PREVIEW_MAX_LENGTH)
+        )
     }
 }
 
@@ -620,14 +667,19 @@ fn format_tool_input_for_prompt(tool_name: &str, input: &Value) -> String {
 /// [`format_tool_input_for_prompt`] for the per-tool structured input preview (edit/write/read/find/
 /// grep/ls), falling back to the compact JSON preview for every other tool.
 #[must_use]
-pub fn format_ask_prompt(result: &PermissionCheckResult, agent_name: Option<&str>, input: &Value) -> String {
+pub fn format_ask_prompt(
+    result: &PermissionCheckResult,
+    agent_name: Option<&str>,
+    input: &Value,
+) -> String {
     let subject = match agent_name {
         Some(agent) => format!("Agent '{agent}'"),
         None => "Current agent".to_string(),
     };
     // pi `result.matchedPattern ? ` (matched '…')` : ""` — truthiness, so an empty pattern is omitted.
-    let pattern_info =
-        truthy(&result.matched_pattern).map(|p| format!(" (matched '{p}')")).unwrap_or_default();
+    let pattern_info = truthy(&result.matched_pattern)
+        .map(|p| format!(" (matched '{p}')"))
+        .unwrap_or_default();
 
     if result.tool_name == "bash" {
         // pi `${result.command || ""}` — the bash ask prompt DOES render an empty command inline.
@@ -649,15 +701,23 @@ pub fn format_ask_prompt(result: &PermissionCheckResult, agent_name: Option<&str
                 "{subject} requested bash command '{whole}'; '{command}'{pattern_info} requires approval. Allow this command?"
             );
         }
-        return format!("{subject} requested bash command '{command}'{pattern_info}. Allow this command?");
+        return format!(
+            "{subject} requested bash command '{command}'{pattern_info}. Allow this command?"
+        );
     }
     if (result.source == CheckSource::Mcp || result.tool_name == "mcp")
         && let Some(target) = truthy(&result.target)
     {
-        return format!("{subject} requested MCP target '{target}'{pattern_info}. Allow this call?");
+        return format!(
+            "{subject} requested MCP target '{target}'{pattern_info}. Allow this call?"
+        );
     }
     let input_preview = format_tool_input_for_prompt(&result.tool_name, input);
-    let input_suffix = if input_preview.is_empty() { String::new() } else { format!(" {input_preview}") };
+    let input_suffix = if input_preview.is_empty() {
+        String::new()
+    } else {
+        format!(" {input_preview}")
+    };
     format!(
         "{subject} requested tool '{}'{pattern_info}{input_suffix}. Allow this call?",
         result.tool_name
@@ -676,9 +736,13 @@ pub fn format_ask_unavailable_reason(result: &PermissionCheckResult) -> String {
         );
     }
     if result.tool_name == "mcp" {
-        return "Using tool 'mcp' requires approval, but no interactive UI is available.".to_string();
+        return "Using tool 'mcp' requires approval, but no interactive UI is available."
+            .to_string();
     }
-    format!("Using tool '{}' requires approval, but no interactive UI is available.", result.tool_name)
+    format!(
+        "Using tool '{}' requires approval, but no interactive UI is available.",
+        result.tool_name
+    )
 }
 
 /// pi `formatMissingToolNameReason` (v0.8.0 `permission-prompts.ts:32-34`; v0.7.1
@@ -724,11 +788,22 @@ pub fn check_requested_tool_registration(requested: &str, registered: &[String])
 #[must_use]
 pub fn format_unknown_tool_reason(tool_name: &str, available_tool_names: &[String]) -> String {
     let preview: Vec<&String> = available_tool_names.iter().take(10).collect();
-    let suffix = if available_tool_names.len() > preview.len() { ", ..." } else { "" };
+    let suffix = if available_tool_names.len() > preview.len() {
+        ", ..."
+    } else {
+        ""
+    };
     let available_list = if preview.is_empty() {
         "none".to_string()
     } else {
-        format!("{}{suffix}", preview.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+        format!(
+            "{}{suffix}",
+            preview
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
     let mcp_hint = if tool_name == "mcp" {
         ""
@@ -800,7 +875,9 @@ pub fn format_external_directory_user_denied_reason(
     path_value: &str,
     denial_reason: Option<&str>,
 ) -> String {
-    let reason_suffix = denial_reason.map(|r| format!(" Reason: {r}.")).unwrap_or_default();
+    let reason_suffix = denial_reason
+        .map(|r| format!(" Reason: {r}."))
+        .unwrap_or_default();
     format!(
         "User denied external directory access for tool '{tool_name}' path '{path_value}'.{reason_suffix} {}",
         external_directory_hard_stop_hint()
@@ -836,7 +913,10 @@ mod tests {
         assert_eq!("a\u{1F600}b".chars().count(), 3);
         assert_eq!("a\u{1F600}b".encode_utf16().count(), 4);
         let out = truncate_inline_text("a\u{1F600}b", 3);
-        assert!(out.ends_with('…'), "3 UTF-16 units < 4 ⇒ pi truncates; got {out:?}");
+        assert!(
+            out.ends_with('…'),
+            "3 UTF-16 units < 4 ⇒ pi truncates; got {out:?}"
+        );
         // "a" costs 1 unit and the emoji costs 2, so the pair fits a 3-unit budget EXACTLY — pi's
         // `"a😀b".slice(0, 3)` keeps both code units of the surrogate pair and yields "a😀", the
         // only character dropped being the trailing "b".
@@ -906,7 +986,11 @@ mod tests {
             target: None,
             source: CheckSource::Bash,
         };
-        let session = [PatternRule { tool: "bash".into(), pattern: "git *".into(), action: PermissionState::Allow }];
+        let session = [PatternRule {
+            tool: "bash".into(),
+            pattern: "git *".into(),
+            action: PermissionState::Allow,
+        }];
         let out = apply_pattern_approval_state(ask, &serde_json::json!({}), &session);
         assert_eq!(out.state, PermissionState::Allow);
     }
@@ -935,7 +1019,8 @@ mod tests {
         // A non-builtin filesystem tool name (`read_file`) carrying a `path` is recognized as
         // path-bearing purely by the heuristic — this is the enforcement input the external-dir
         // guard keys on, so failing to recognize it would leave the path ungated.
-        let path = get_path_bearing_tool_path("read_file", &serde_json::json!({ "path": "/x/secret" }));
+        let path =
+            get_path_bearing_tool_path("read_file", &serde_json::json!({ "path": "/x/secret" }));
         assert_eq!(path.as_deref(), Some("/x/secret"));
         // A non-filesystem tool with a `path`-shaped field is NOT treated as path-bearing.
         assert!(get_path_bearing_tool_path("bash", &serde_json::json!({ "path": "/x" })).is_none());
@@ -977,9 +1062,9 @@ mod tests {
     #[test]
     fn an_edits_key_alone_is_not_a_structured_edit_payload() {
         for edits in [
-            serde_json::json!("replace"),          // not an array
-            serde_json::json!({ "op": "replace" }), // not an array
-            serde_json::json!([]),                  // empty array — `.some()` is false
+            serde_json::json!("replace"),                // not an array
+            serde_json::json!({ "op": "replace" }),      // not an array
+            serde_json::json!([]),                       // empty array — `.some()` is false
             serde_json::json!([{ "op": "frobnicate" }]), // unrecognized op, no oldText/newText
         ] {
             let input = serde_json::json!({ "path": "/x/f.txt", "edits": edits });
@@ -1001,7 +1086,10 @@ mod tests {
     fn recognized_structured_edit_ops_and_the_replace_text_default() {
         for op in ["replace", "append", "prepend", "delete", "replace_text"] {
             let input = serde_json::json!({ "edits": [{ "op": op }] });
-            assert!(has_structured_edit_payload(to_record(&input)), "op {op} is recognized");
+            assert!(
+                has_structured_edit_payload(to_record(&input)),
+                "op {op} is recognized"
+            );
         }
         // Missing `op` defaults to "replace_text", which IS in the set.
         let defaulted = serde_json::json!({ "edits": [{ "lines": ["x"] }] });
@@ -1010,8 +1098,7 @@ mod tests {
         let non_string_op = serde_json::json!({ "edits": [{ "op": 7 }] });
         assert!(has_structured_edit_payload(to_record(&non_string_op)));
         // An unrecognized op still counts when it carries both texts (pi's `||` arm).
-        let escape_hatch =
-            serde_json::json!({ "edits": [{ "op": "frobnicate", "oldText": "a", "newText": "b" }] });
+        let escape_hatch = serde_json::json!({ "edits": [{ "op": "frobnicate", "oldText": "a", "newText": "b" }] });
         assert!(has_structured_edit_payload(to_record(&escape_hatch)));
         // `.some()` — one recognized entry among unrecognized ones is enough.
         let mixed = serde_json::json!({ "edits": [{ "op": "frobnicate" }, { "op": "delete" }] });
@@ -1035,7 +1122,10 @@ mod tests {
             "newText": "b",
         });
         let subject = get_pattern_approval_subject(&ask_result("patch_document"), &input);
-        assert_ne!(subject, "patch_document", "the path must win, as it does upstream");
+        assert_ne!(
+            subject, "patch_document",
+            "the path must win, as it does upstream"
+        );
         assert!(subject.contains("a.rs"), "got {subject}");
     }
 
@@ -1044,7 +1134,11 @@ mod tests {
         let out = apply_pattern_approval_state(
             bash_deny(),
             &serde_json::json!({}),
-            &[PatternRule { tool: "bash".into(), pattern: "*".into(), action: PermissionState::Allow }],
+            &[PatternRule {
+                tool: "bash".into(),
+                pattern: "*".into(),
+                action: PermissionState::Allow,
+            }],
         );
         assert_eq!(out.state, PermissionState::Deny);
     }
@@ -1074,7 +1168,10 @@ mod tests {
             prompt.contains("for 'src/lib.rs' (1 edit: edit #1 replaces 2 lines with 3 lines)"),
             "prompt was: {prompt}"
         );
-        assert!(!prompt.contains("oldText"), "prompt leaked raw JSON: {prompt}");
+        assert!(
+            !prompt.contains("oldText"),
+            "prompt leaked raw JSON: {prompt}"
+        );
     }
 
     /// pi `formatWriteInputForPrompt` (`index.ts:495-500`): shows path + line/char counts.
@@ -1086,7 +1183,10 @@ mod tests {
             prompt.contains("for 'notes.txt' (2 lines, 11 characters)"),
             "prompt was: {prompt}"
         );
-        assert!(!prompt.contains("\"content\""), "prompt leaked raw JSON: {prompt}");
+        assert!(
+            !prompt.contains("\"content\""),
+            "prompt leaked raw JSON: {prompt}"
+        );
     }
 
     /// pi `formatReadInputForPrompt` (`index.ts:502-512`): shows path/offset/limit.

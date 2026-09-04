@@ -36,12 +36,18 @@ fn normalize_cache() -> &'static Mutex<HashMap<String, String>> {
 ///   rather than propagating, so a stale peer cwd never breaks a `list`.
 #[must_use]
 pub fn normalize_cwd(cwd: &str) -> String {
-    if let Some(hit) = normalize_cache().lock().unwrap_or_else(|e| e.into_inner()).get(cwd) {
+    if let Some(hit) = normalize_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(cwd)
+    {
         return hit.clone();
     }
     let resolved = resolve_lexical(Path::new(cwd));
-    let normalized = std::fs::canonicalize(&resolved)
-        .map_or_else(|_| resolved.to_string_lossy().to_string(), |p| p.to_string_lossy().to_string());
+    let normalized = std::fs::canonicalize(&resolved).map_or_else(
+        |_| resolved.to_string_lossy().to_string(),
+        |p| p.to_string_lossy().to_string(),
+    );
     normalize_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -64,14 +70,20 @@ pub fn same_cwd(a: &str, b: &str) -> bool {
 #[must_use]
 pub fn resolve_path(base: &Path, segment: &str) -> PathBuf {
     let candidate = Path::new(segment);
-    if candidate.is_absolute() { resolve_lexical(candidate) } else { resolve_lexical(&base.join(candidate)) }
+    if candidate.is_absolute() {
+        resolve_lexical(candidate)
+    } else {
+        resolve_lexical(&base.join(candidate))
+    }
 }
 
 fn resolve_lexical(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")).join(path)
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
     };
     let mut out = PathBuf::new();
     for component in absolute.components() {
@@ -84,7 +96,11 @@ fn resolve_lexical(path: &Path) -> PathBuf {
             other => out.push(other.as_os_str()),
         }
     }
-    if out.as_os_str().is_empty() { PathBuf::from("/") } else { out }
+    if out.as_os_str().is_empty() {
+        PathBuf::from("/")
+    } else {
+        out
+    }
 }
 
 #[cfg(test)]
@@ -122,7 +138,10 @@ mod tests {
     /// propagating — a peer whose cwd was deleted must still be comparable, not an error.
     #[test]
     fn a_missing_directory_falls_back_to_the_resolved_path() {
-        assert_eq!(normalize_cwd("/definitely/not/here/../here/"), "/definitely/not/here");
+        assert_eq!(
+            normalize_cwd("/definitely/not/here/../here/"),
+            "/definitely/not/here"
+        );
         assert!(same_cwd("/definitely/not/here", "/definitely/not/here/"));
     }
 
@@ -130,8 +149,17 @@ mod tests {
     /// resolves against the CURRENT session's cwd, not the process cwd.
     #[test]
     fn resolve_path_absolutizes_relative_segments_against_the_base() {
-        assert_eq!(resolve_path(Path::new("/w/project"), "sub"), PathBuf::from("/w/project/sub"));
-        assert_eq!(resolve_path(Path::new("/w/project"), "../other"), PathBuf::from("/w/other"));
-        assert_eq!(resolve_path(Path::new("/w/project"), "/abs"), PathBuf::from("/abs"));
+        assert_eq!(
+            resolve_path(Path::new("/w/project"), "sub"),
+            PathBuf::from("/w/project/sub")
+        );
+        assert_eq!(
+            resolve_path(Path::new("/w/project"), "../other"),
+            PathBuf::from("/w/other")
+        );
+        assert_eq!(
+            resolve_path(Path::new("/w/project"), "/abs"),
+            PathBuf::from("/abs")
+        );
     }
 }

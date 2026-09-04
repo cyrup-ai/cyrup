@@ -455,8 +455,14 @@ mod tests {
         // `https_proxy` too keeps SOCKS the resolved proxy whichever key wins, and `no_proxy` names
         // a host that is not the target so an ambient exemption cannot skip proxying altogether.
         let env: crate::auth::types::ProviderEnv = [
-            ("all_proxy".to_string(), "socks5://proxy.local:1080".to_string()),
-            ("https_proxy".to_string(), "socks5://proxy.local:1080".to_string()),
+            (
+                "all_proxy".to_string(),
+                "socks5://proxy.local:1080".to_string(),
+            ),
+            (
+                "https_proxy".to_string(),
+                "socks5://proxy.local:1080".to_string(),
+            ),
             ("no_proxy".to_string(), "never-matches.invalid".to_string()),
         ]
         .into_iter()

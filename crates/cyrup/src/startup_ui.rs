@@ -210,8 +210,8 @@ pub async fn run_resume_picker(
     current_id: Option<&str>,
 ) -> anyhow::Result<(ResumeChoice, Vec<String>)> {
     let rows = session_rows(current_sessions, current_id);
-    let mut selector = SessionSelector::new(rows)
-        .with_keymaps(&keymaps.1, &cyrup_tui::EditorKeymap::default());
+    let mut selector =
+        SessionSelector::new(rows).with_keymaps(&keymaps.1, &cyrup_tui::EditorKeymap::default());
     // SEAM-061 — pi hands `selectSession` BOTH loaders (`cli/session-picker.ts:15-19`), and `Tab`
     // swaps the list between them (`session-selector.ts:551-556` → `:1003-1026`). Wiring only the
     // current-folder set leaves the toggle with nowhere to go.
@@ -238,10 +238,9 @@ pub async fn run_resume_picker(
                 }
             }
             Some(SessionSelectorOutcome::Rename { path, name }) => {
-                if let Err(e) = cyrup_session_svc::rename_session_file_at(
-                    std::path::Path::new(&path),
-                    &name,
-                ) {
+                if let Err(e) =
+                    cyrup_session_svc::rename_session_file_at(std::path::Path::new(&path), &name)
+                {
                     status.push(format!("Failed to rename: {e}"));
                 }
             }
@@ -300,7 +299,10 @@ pub fn trust_needs_prompt(
 /// folder's normalized trust path. `TrustStore::nearest` walks to ancestors, so a decision saved two
 /// levels up used to render identically to one made for this folder, on the one prompt whose job is
 /// to say which folder is being changed. SEAM-069.
-pub fn format_saved_trust(trust_path: Option<&std::path::Path>, saved: &Option<TrustEntry>) -> String {
+pub fn format_saved_trust(
+    trust_path: Option<&std::path::Path>,
+    saved: &Option<TrustEntry>,
+) -> String {
     match saved {
         None => "none".to_string(),
         Some(entry) => {
@@ -326,7 +328,8 @@ pub fn format_saved_trust(trust_path: Option<&std::path::Path>, saved: &Option<T
 pub fn trust_saved_index(options: &[TrustOption], saved: &Option<TrustEntry>) -> Option<usize> {
     options.iter().position(|o| {
         saved.as_ref().is_some_and(|s| {
-            s.decision.is_trusted() == o.trusted && o.saved_path.as_deref() == Some(s.path.as_path())
+            s.decision.is_trusted() == o.trusted
+                && o.saved_path.as_deref() == Some(s.path.as_path())
         })
     })
 }
@@ -384,13 +387,17 @@ pub fn interpret_trust(outcome: &SelectorOutcome, options: &[TrustOption]) -> Tr
 /// "…(this session only)" answer leave exactly the permanent trace the row exists to avoid: an
 /// otherwise-untouched agent dir gained a `trust.json` (`{}`) plus a `trust.json.lock`, and a
 /// pre-seeded store was rewritten byte-for-byte-differently. SEAM-064.
-async fn persist_trust_choice(trust_store: &TrustStore, option: &TrustOption) -> anyhow::Result<()> {
+async fn persist_trust_choice(
+    trust_store: &TrustStore,
+    option: &TrustOption,
+) -> anyhow::Result<()> {
     if option.updates.is_empty() {
         return Ok(());
     }
     trust_store
         .set_many(&option.updates)
-        .await.map_err(|e| anyhow::anyhow!("writing project trust: {e}"))
+        .await
+        .map_err(|e| anyhow::anyhow!("writing project trust: {e}"))
 }
 
 /// Run the project-trust prompt over a real terminal (Pi `createProjectTrustContext`'s
@@ -819,7 +826,11 @@ mod tests {
             .filter(|(_, o)| o.label.contains("this session only"))
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(session_only.len(), 2, "both session-only rows must be present");
+        assert_eq!(
+            session_only.len(),
+            2,
+            "both session-only rows must be present"
+        );
 
         // 1. A folder with NO trust store: a session-only answer must not CREATE one — no `{}`
         //    trust.json, and no `trust.json.lock` from the lock the writer would have taken.
@@ -863,7 +874,8 @@ mod tests {
         assert!(
             store
                 .nearest(&cwd)
-                .await.unwrap()
+                .await
+                .unwrap()
                 .is_some_and(|e| e.decision.is_trusted()),
             "the seed must be a store the reader actually accepts"
         );
@@ -897,7 +909,9 @@ mod tests {
             .iter()
             .position(|o| o.label == "Do not trust")
             .expect("the `Do not trust` row");
-        persist_trust_choice(&store, &real[do_not_trust]).await.unwrap();
+        persist_trust_choice(&store, &real[do_not_trust])
+            .await
+            .unwrap();
         let after = std::fs::read(&store_path).expect("trust.json after a persisting row");
         assert_ne!(
             after, before,
@@ -906,7 +920,8 @@ mod tests {
         assert!(
             store
                 .nearest(&cwd)
-                .await.unwrap()
+                .await
+                .unwrap()
                 .is_some_and(|e| !e.decision.is_trusted()),
             "the persisting row's verdict must be readable back from the store"
         );

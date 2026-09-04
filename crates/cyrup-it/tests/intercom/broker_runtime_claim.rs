@@ -14,14 +14,19 @@
 //! but still reclaim a runtime dir whose broker was SIGKILLed (`stale_socket_and_pid_are_...`) — a
 //! presence check on `broker.pid` would deadlock intercom until a human deleted the file.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::common::{registration, spawn_broker};
 use cyrup_intercom::transport::client::IntercomClient;
 use cyrup_intercom::transport::spawn::wait_for_broker;
-use crate::common::{registration, spawn_broker};
 
 fn broker_bin() -> PathBuf {
     crate::support::bins::intercom_broker()
@@ -49,13 +54,22 @@ async fn a_live_incumbent_broker_is_not_replaced_and_keeps_serving_its_clients()
 
     // --- The incumbent, with a client already attached. ---
     let mut incumbent = spawn_broker(agent_dir.path());
-    wait_for_broker(&socket_path, Duration::from_secs(5)).await.expect("incumbent broker up");
-    assert!(pid_path.exists(), "the incumbent published its pid file");
-    let incumbent_pid = std::fs::read_to_string(&pid_path).expect("pid file").trim().to_string();
-
-    let client = IntercomClient::connect(&socket_path, registration("early"), Some("early-session".to_string()))
+    wait_for_broker(&socket_path, Duration::from_secs(5))
         .await
-        .expect("the early client registers with the incumbent");
+        .expect("incumbent broker up");
+    assert!(pid_path.exists(), "the incumbent published its pid file");
+    let incumbent_pid = std::fs::read_to_string(&pid_path)
+        .expect("pid file")
+        .trim()
+        .to_string();
+
+    let client = IntercomClient::connect(
+        &socket_path,
+        registration("early"),
+        Some("early-session".to_string()),
+    )
+    .await
+    .expect("the early client registers with the incumbent");
 
     // --- The usurper: same runtime dir, live incumbent. ---
     let usurper = spawn_broker_capturing(agent_dir.path());
@@ -73,10 +87,16 @@ async fn a_live_incumbent_broker_is_not_replaced_and_keeps_serving_its_clients()
         stderr.contains("Refusing to replace live intercom broker process"),
         "the refusal must name upstream's reason; stderr was: {stderr}"
     );
-    assert!(stderr.contains(&incumbent_pid), "the refusal names the incumbent's pid; stderr: {stderr}");
+    assert!(
+        stderr.contains(&incumbent_pid),
+        "the refusal names the incumbent's pid; stderr: {stderr}"
+    );
 
     // --- The incumbent's runtime is untouched: socket + pid file still its own. ---
-    assert!(socket_path.exists(), "the refused broker must not have unlinked the incumbent's socket");
+    assert!(
+        socket_path.exists(),
+        "the refused broker must not have unlinked the incumbent's socket"
+    );
     assert_eq!(
         std::fs::read_to_string(&pid_path).expect("pid file").trim(),
         incumbent_pid,
@@ -84,16 +104,23 @@ async fn a_live_incumbent_broker_is_not_replaced_and_keeps_serving_its_clients()
     );
 
     // --- THE POINT: the already-attached client is still served, over the same socket. ---
-    let sessions = client.list_sessions().await.expect("the early client's broker still answers");
+    let sessions = client
+        .list_sessions()
+        .await
+        .expect("the early client's broker still answers");
     assert!(
         sessions.iter().any(|s| s.id == "early-session"),
         "the incumbent still knows its registered session: {sessions:?}"
     );
 
     // --- And a NEW client reaching that socket name lands on the SAME broker, not a usurper. ---
-    let late = IntercomClient::connect(&socket_path, registration("late"), Some("late-session".to_string()))
-        .await
-        .expect("a new client registers with the surviving incumbent");
+    let late = IntercomClient::connect(
+        &socket_path,
+        registration("late"),
+        Some("late-session".to_string()),
+    )
+    .await
+    .expect("a new client registers with the surviving incumbent");
     let sessions = late.list_sessions().await.expect("list");
     let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
     assert!(
@@ -117,21 +144,34 @@ async fn a_stale_socket_and_pid_file_are_reclaimed_by_the_next_broker() {
     let pid_path = intercom_dir.join("broker.pid");
 
     let mut crashed = spawn_broker(agent_dir.path());
-    wait_for_broker(&socket_path, Duration::from_secs(5)).await.expect("first broker up");
-    let dead_pid = std::fs::read_to_string(&pid_path).expect("pid file").trim().to_string();
+    wait_for_broker(&socket_path, Duration::from_secs(5))
+        .await
+        .expect("first broker up");
+    let dead_pid = std::fs::read_to_string(&pid_path)
+        .expect("pid file")
+        .trim()
+        .to_string();
 
     // SIGKILL: no shutdown handler runs, so the socket and pid file survive their owner.
     // `kill()` also reaps the child, so its pid is genuinely gone (a zombie would still answer
     // `kill(pid, 0)`, which is precisely what makes reaping part of this precondition).
     crashed.kill().await.expect("kill the first broker");
-    assert!(socket_path.exists(), "precondition: a SIGKILLed broker leaves its socket behind");
-    assert!(pid_path.exists(), "precondition: a SIGKILLed broker leaves its pid file behind");
+    assert!(
+        socket_path.exists(),
+        "precondition: a SIGKILLed broker leaves its socket behind"
+    );
+    assert!(
+        pid_path.exists(),
+        "precondition: a SIGKILLed broker leaves its pid file behind"
+    );
 
     // The successor must start anyway.
     let mut successor = spawn_broker(agent_dir.path());
     wait_for_broker(&socket_path, Duration::from_secs(5))
         .await
-        .expect("a stale socket + pid file must be reclaimable, or a crash wedges intercom forever");
+        .expect(
+            "a stale socket + pid file must be reclaimable, or a crash wedges intercom forever",
+        );
 
     assert!(
         successor.try_wait().expect("try_wait").is_none(),
@@ -143,11 +183,18 @@ async fn a_stale_socket_and_pid_file_are_reclaimed_by_the_next_broker() {
         "the successor published its own pid over the stale one"
     );
 
-    let client = IntercomClient::connect(&socket_path, registration("after"), Some("after-session".to_string()))
-        .await
-        .expect("the reclaimed socket serves new clients");
+    let client = IntercomClient::connect(
+        &socket_path,
+        registration("after"),
+        Some("after-session".to_string()),
+    )
+    .await
+    .expect("the reclaimed socket serves new clients");
     let sessions = client.list_sessions().await.expect("list");
-    assert!(sessions.iter().any(|s| s.id == "after-session"), "{sessions:?}");
+    assert!(
+        sessions.iter().any(|s| s.id == "after-session"),
+        "{sessions:?}"
+    );
 
     client.disconnect();
     let _ = successor.kill().await;

@@ -31,7 +31,10 @@ pub fn format_no_models_available_message() -> String {
 /// Thrown by `prompt`/`compact` when the session has no model (agent-session.ts:1178-1180,
 /// :1790-1792) — the error a first-run user sees if they type before running `/login` + `/model`.
 pub fn format_no_model_selected_message() -> String {
-    format!("No model selected.\n\n{}\n\nThen use /model to select a model.", get_provider_login_help())
+    format!(
+        "No model selected.\n\n{}\n\nThen use /model to select a model.",
+        get_provider_login_help()
+    )
 }
 
 /// pi `UNKNOWN_PROVIDER` (auth-guidance.ts:4). A model whose provider could not be identified is
@@ -48,8 +51,15 @@ pub const UNKNOWN_PROVIDER: &str = "unknown";
 /// cyrup previously answered all of these with its own `no configured auth for model: p/m`, which
 /// named no remedy — `grep -rn 'No API key found' crates/` returned zero.
 pub fn format_no_api_key_found_message(provider: &str) -> String {
-    let provider_display = if provider == UNKNOWN_PROVIDER { "the selected model" } else { provider };
-    format!("No API key found for {provider_display}.\n\n{}", get_provider_login_help())
+    let provider_display = if provider == UNKNOWN_PROVIDER {
+        "the selected model"
+    } else {
+        provider
+    };
+    format!(
+        "No API key found for {provider_display}.\n\n{}",
+        get_provider_login_help()
+    )
 }
 
 /// The OAuth-expiry variant of the same refusal — pi's inline template at
@@ -124,7 +134,11 @@ mod tests {
     fn prov037_preflight_error_renders_pi_text_with_no_prefix() {
         let msg = format_no_api_key_found_message("groq");
         let err = crate::error::SessionServiceError::AuthPreflightRefused(msg.clone());
-        assert_eq!(err.to_string(), msg, "the Display must be `{{0}}`, not a labelled variant");
+        assert_eq!(
+            err.to_string(),
+            msg,
+            "the Display must be `{{0}}`, not a labelled variant"
+        );
 
         // And the sibling variant deliberately still carries cyrup's own label.
         let other = crate::error::SessionServiceError::NoConfiguredAuth("groq/x".to_string());

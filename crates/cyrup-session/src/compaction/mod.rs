@@ -25,31 +25,32 @@ use crate::entry::{Entry, KnownEntry};
 use crate::manager::SessionManager;
 
 pub use branch::{
+    BRANCH_SUMMARY_EMPTY_PLACEHOLDER, BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT,
+    BranchCollection, BranchPreparation, BranchSummaryOutput, DEFAULT_BRANCH_CONTEXT_WINDOW,
     branch_token_budget, collect_entries_for_branch_summary, generate_branch_summary,
-    generate_branch_summary_with_instructions, prepare_branch_entries, BranchCollection,
-    BranchPreparation, BranchSummaryOutput, BRANCH_SUMMARY_EMPTY_PLACEHOLDER,
-    BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT, DEFAULT_BRANCH_CONTEXT_WINDOW,
+    generate_branch_summary_with_instructions, prepare_branch_entries,
 };
-pub use cutpoint::{find_cut_point, find_turn_start, find_valid_cut_points, CutPoint};
+pub use cutpoint::{CutPoint, find_cut_point, find_turn_start, find_valid_cut_points};
 pub use error::CompactionError;
-pub use files::{format_file_operations, CompactionDetails, FileOps};
+pub use files::{CompactionDetails, FileOps, format_file_operations};
 pub use hooks::{
     BeforeCompactDecision, BeforeCompactEvent, BeforeTreeDecision, BeforeTreeEvent,
     BeforeTreeOverrides, BranchSummaryEntry, CompactionEntry, CompactionHooks, CompactionOverride,
     CompactionReason, NoHooks, PostCompactEvent, PostTreeEvent,
 };
-pub use prepare::{prepare_compaction, CompactionPreparation};
+pub use prepare::{CompactionPreparation, prepare_compaction};
 pub use serialize::serialize_conversation;
 pub use settings::{BranchSummarySettings, CompactionSettings};
 pub use summarize::{
-    combine_usage, compact_default, complete_summarization, generate_summary,
-    generate_turn_prefix_summary, summarization_reasoning, DefaultCompaction, ProviderSummarizer,
-    SummarizationRequest, SummaryOutput, Summarizer, PENDING_SUMMARY, SUMMARIZATION_PROMPT,
-    SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
+    DefaultCompaction, PENDING_SUMMARY, ProviderSummarizer, SUMMARIZATION_PROMPT,
+    SUMMARIZATION_SYSTEM_PROMPT, SummarizationRequest, Summarizer, SummaryOutput,
+    TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT, combine_usage, compact_default,
+    complete_summarization, generate_summary, generate_turn_prefix_summary,
+    summarization_reasoning,
 };
 pub use tokens::{
-    context_tokens_from_usage, estimate_context_tokens, estimate_context_tokens_raw,
-    estimate_tokens, ContextUsageEstimate, TokenCache,
+    ContextUsageEstimate, TokenCache, context_tokens_from_usage, estimate_context_tokens,
+    estimate_context_tokens_raw, estimate_tokens,
 };
 
 /// Orchestrates compaction + branch summarization against a [`SessionManager`], wiring the pure
@@ -162,7 +163,15 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
             None => return Ok(None),
         };
         self.finish_compaction(
-            session, model, settings, reason, custom_instructions, will_retry, &prep, path, None,
+            session,
+            model,
+            settings,
+            reason,
+            custom_instructions,
+            will_retry,
+            &prep,
+            path,
+            None,
             cancel,
         )
         .await
@@ -219,73 +228,78 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
         external_override: Option<CompactionOverride>,
         cancel: CancelToken,
     ) -> Result<Option<CompactionEntry>, CompactionError> {
-        let (summary, first_kept, tokens_before, details, usage, from_hook) = match external_override
-        {
-            // An external extension override (Pi `SessionBeforeCompactResult.compaction`) wins over
-            // the internal `CompactionHooks` seam: its summary/details land in the entry (fromExtension).
-            Some(ov) => (
-                ov.summary,
-                ov.first_kept_entry_id.unwrap_or_else(|| prep.first_kept_entry_id.clone()),
-                ov.tokens_before.unwrap_or(u64::from(prep.tokens_before)),
-                ov.details.unwrap_or_else(|| serde_json::json!({})),
-                ov.usage,
-                true,
-            ),
-            None => {
-                let event = BeforeCompactEvent {
-                    messages_to_summarize: prep.messages_to_summarize.clone(),
-                    turn_prefix_messages: prep.turn_prefix_messages.clone(),
-                    previous_summary: prep.previous_summary.clone(),
-                    file_ops: prep.file_ops.to_details(),
-                    tokens_before: u64::from(prep.tokens_before),
-                    first_kept_entry_id: prep.first_kept_entry_id.clone(),
-                    settings: settings.clone(),
-                    branch_entries,
-                    custom_instructions: custom_instructions.clone(),
-                    reason,
-                    will_retry,
-                };
-                // before-compact hook: cancel / supply custom summary / proceed (R-05-019/020).
-                match self.hooks.before_compact(&event, cancel.child_token()).await? {
-                    BeforeCompactDecision::Cancel => return Ok(None),
-                    BeforeCompactDecision::Custom {
-                        summary,
-                        first_kept_entry_id,
-                        tokens_before,
-                        details,
-                        usage,
-                    } => (
-                        summary,
-                        first_kept_entry_id,
-                        tokens_before,
-                        details.unwrap_or_else(|| serde_json::json!({})),
-                        usage,
-                        true,
-                    ),
-                    BeforeCompactDecision::Proceed => {
-                        let produced = compact_default(
-                            &self.summarizer,
-                            prep,
-                            model,
-                            custom_instructions.as_deref(),
-                            self.thinking,
-                            cancel.clone(),
-                        )
-                        .await?;
-                        let details = serde_json::to_value(prep.file_ops.to_details())
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        (
-                            produced.summary,
-                            prep.first_kept_entry_id.clone(),
-                            u64::from(prep.tokens_before),
+        let (summary, first_kept, tokens_before, details, usage, from_hook) =
+            match external_override {
+                // An external extension override (Pi `SessionBeforeCompactResult.compaction`) wins over
+                // the internal `CompactionHooks` seam: its summary/details land in the entry (fromExtension).
+                Some(ov) => (
+                    ov.summary,
+                    ov.first_kept_entry_id
+                        .unwrap_or_else(|| prep.first_kept_entry_id.clone()),
+                    ov.tokens_before.unwrap_or(u64::from(prep.tokens_before)),
+                    ov.details.unwrap_or_else(|| serde_json::json!({})),
+                    ov.usage,
+                    true,
+                ),
+                None => {
+                    let event = BeforeCompactEvent {
+                        messages_to_summarize: prep.messages_to_summarize.clone(),
+                        turn_prefix_messages: prep.turn_prefix_messages.clone(),
+                        previous_summary: prep.previous_summary.clone(),
+                        file_ops: prep.file_ops.to_details(),
+                        tokens_before: u64::from(prep.tokens_before),
+                        first_kept_entry_id: prep.first_kept_entry_id.clone(),
+                        settings: settings.clone(),
+                        branch_entries,
+                        custom_instructions: custom_instructions.clone(),
+                        reason,
+                        will_retry,
+                    };
+                    // before-compact hook: cancel / supply custom summary / proceed (R-05-019/020).
+                    match self
+                        .hooks
+                        .before_compact(&event, cancel.child_token())
+                        .await?
+                    {
+                        BeforeCompactDecision::Cancel => return Ok(None),
+                        BeforeCompactDecision::Custom {
+                            summary,
+                            first_kept_entry_id,
+                            tokens_before,
                             details,
-                            produced.usage,
-                            false,
-                        )
+                            usage,
+                        } => (
+                            summary,
+                            first_kept_entry_id,
+                            tokens_before,
+                            details.unwrap_or_else(|| serde_json::json!({})),
+                            usage,
+                            true,
+                        ),
+                        BeforeCompactDecision::Proceed => {
+                            let produced = compact_default(
+                                &self.summarizer,
+                                prep,
+                                model,
+                                custom_instructions.as_deref(),
+                                self.thinking,
+                                cancel.clone(),
+                            )
+                            .await?;
+                            let details = serde_json::to_value(prep.file_ops.to_details())
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                            (
+                                produced.summary,
+                                prep.first_kept_entry_id.clone(),
+                                u64::from(prep.tokens_before),
+                                details,
+                                produced.usage,
+                                false,
+                            )
+                        }
                     }
                 }
-            }
-        };
+            };
 
         // Pi re-tests the abort signal IMMEDIATELY before the append, unconditionally, covering all
         // three summary sources (extension override, hook `Custom`, default summarizer) — the
@@ -337,10 +351,16 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
         cancel: CancelToken,
     ) -> Result<Option<BranchSummaryEntry>, CompactionError> {
         let old_leaf = old_leaf_id.or_else(|| session.leaf_id().cloned());
-        let old_path: Vec<Entry> =
-            session.branch_path(old_leaf.as_ref()).into_iter().cloned().collect();
-        let target_path: Vec<Entry> =
-            session.branch_path(Some(&target_id)).into_iter().cloned().collect();
+        let old_path: Vec<Entry> = session
+            .branch_path(old_leaf.as_ref())
+            .into_iter()
+            .cloned()
+            .collect();
+        let target_path: Vec<Entry> = session
+            .branch_path(Some(&target_id))
+            .into_iter()
+            .cloned()
+            .collect();
         let collection = collect_entries_for_branch_summary(&old_path, &target_path);
 
         let event = BeforeTreeEvent {
@@ -362,55 +382,59 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
             BeforeTreeDecision::Proceed { overrides }
             | BeforeTreeDecision::CustomSummary { overrides, .. } => overrides.clone(),
         };
-        let (summary_and_details, from_hook): (SummaryPayload, bool) =
-            match decision {
-                BeforeTreeDecision::Cancel => return Ok(None),
-                BeforeTreeDecision::CustomSummary { summary, details, .. }
-                    if user_wants_summary =>
-                {
-                    (Some((summary, details.unwrap_or_else(|| serde_json::json!({})), None)), true)
+        let (summary_and_details, from_hook): (SummaryPayload, bool) = match decision {
+            BeforeTreeDecision::Cancel => return Ok(None),
+            BeforeTreeDecision::CustomSummary {
+                summary, details, ..
+            } if user_wants_summary => (
+                Some((
+                    summary,
+                    details.unwrap_or_else(|| serde_json::json!({})),
+                    None,
+                )),
+                true,
+            ),
+            // Proceed, or a custom summary the user did not ask for → default path.
+            BeforeTreeDecision::Proceed { .. } | BeforeTreeDecision::CustomSummary { .. } => {
+                // Pi's gate is the USER's choice alone: `if (options.summarize &&
+                // entriesToSummarize.length > 0 && !extensionSummary)`
+                // (`agent-session.ts:2983`). `skipPrompt` is a front-end-only setting upstream
+                // — it never appears in `agent-session.ts`; its sole consumer repo-wide is
+                // `interactive-mode.ts:4672`, which uses it to decide whether to ASK, not
+                // whether to summarize. Consulting it here made an embedder's
+                // `summarize: false` still pay for a summarization call.
+                if !user_wants_summary {
+                    (None, false)
+                } else if collection.entries.is_empty() {
+                    // Pi gates the default summarizer on `entriesToSummarize.length > 0`
+                    // (`agent-session.ts:2983`): with NO abandoned entries, produce nothing.
+                    (None, false)
+                } else {
+                    // Budget = (context window || 128000) − reserve (Pi
+                    // `branch-summarization.ts:312-313`), NOT a flat reserve_tokens — this
+                    // keeps far more branch history than a bare reserve would.
+                    let budget = branch_token_budget(model, settings.reserve_tokens);
+                    let prep = prepare_branch_entries(&collection.entries, budget);
+                    // `generate_branch_summary` returns the "No content to summarize" placeholder
+                    // when the abandoned branch filtered to no messages (all `toolResult` / over
+                    // budget). Pi's caller still appends it — `if (summaryText)` is truthy on the
+                    // non-empty placeholder (`agent-session.ts:3038`) — so we append it too rather
+                    // than silently dropping an explored branch.
+                    let produced = generate_branch_summary_with_instructions(
+                        &self.summarizer,
+                        &prep,
+                        model,
+                        overrides.custom_instructions.as_deref(),
+                        overrides.replace_instructions.unwrap_or(false),
+                        cancel.clone(),
+                    )
+                    .await?;
+                    let details = serde_json::to_value(prep.file_ops.to_details())
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    (Some((produced.text, details, produced.usage)), false)
                 }
-                // Proceed, or a custom summary the user did not ask for → default path.
-                BeforeTreeDecision::Proceed { .. } | BeforeTreeDecision::CustomSummary { .. } => {
-                    // Pi's gate is the USER's choice alone: `if (options.summarize &&
-                    // entriesToSummarize.length > 0 && !extensionSummary)`
-                    // (`agent-session.ts:2983`). `skipPrompt` is a front-end-only setting upstream
-                    // — it never appears in `agent-session.ts`; its sole consumer repo-wide is
-                    // `interactive-mode.ts:4672`, which uses it to decide whether to ASK, not
-                    // whether to summarize. Consulting it here made an embedder's
-                    // `summarize: false` still pay for a summarization call.
-                    if !user_wants_summary {
-                        (None, false)
-                    } else if collection.entries.is_empty() {
-                        // Pi gates the default summarizer on `entriesToSummarize.length > 0`
-                        // (`agent-session.ts:2983`): with NO abandoned entries, produce nothing.
-                        (None, false)
-                    } else {
-                        // Budget = (context window || 128000) − reserve (Pi
-                        // `branch-summarization.ts:312-313`), NOT a flat reserve_tokens — this
-                        // keeps far more branch history than a bare reserve would.
-                        let budget = branch_token_budget(model, settings.reserve_tokens);
-                        let prep = prepare_branch_entries(&collection.entries, budget);
-                        // `generate_branch_summary` returns the "No content to summarize" placeholder
-                        // when the abandoned branch filtered to no messages (all `toolResult` / over
-                        // budget). Pi's caller still appends it — `if (summaryText)` is truthy on the
-                        // non-empty placeholder (`agent-session.ts:3038`) — so we append it too rather
-                        // than silently dropping an explored branch.
-                        let produced = generate_branch_summary_with_instructions(
-                            &self.summarizer,
-                            &prep,
-                            model,
-                            overrides.custom_instructions.as_deref(),
-                            overrides.replace_instructions.unwrap_or(false),
-                            cancel.clone(),
-                        )
-                        .await?;
-                        let details = serde_json::to_value(prep.file_ops.to_details())
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        (Some((produced.text, details, produced.usage)), false)
-                    }
-                }
-            };
+            }
+        };
 
         let entry = match summary_and_details {
             Some((summary, details, usage)) => {
@@ -439,7 +463,9 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
         // Pi attaches the hook-supplied label to the SUMMARY entry when one was produced, and to the
         // navigation TARGET otherwise (`agent-session.ts:3050-3052` / `:3062-3064`).
         if let Some(label) = overrides.label.filter(|l| !l.is_empty()) {
-            let target = entry.as_ref().map_or_else(|| target_id.clone(), |e| e.id.clone());
+            let target = entry
+                .as_ref()
+                .map_or_else(|| target_id.clone(), |e| e.id.clone());
             session.append_label(&target, Some(label.as_str()))?;
         }
 

@@ -83,7 +83,9 @@ struct MockOrigin {
 
 impl MockOrigin {
     async fn spawn(responses: Vec<Canned>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let accepts = Arc::new(AtomicUsize::new(0));
@@ -214,7 +216,11 @@ async fn first_refresh_fetches_and_persists_body_etag_and_timestamps() {
     // No cached body yet, so no validator may be sent.
     assert!(!head.to_lowercase().contains("if-none-match"));
 
-    let stored = store.read("groq", None).await.unwrap().expect("entry persisted");
+    let stored = store
+        .read("groq", None)
+        .await
+        .unwrap()
+        .expect("entry persisted");
     assert_eq!(stored.models.len(), 1);
     assert_eq!(stored.models[0].id.as_str(), "remote-only");
     // The etag is stored VERBATIM, quotes included.
@@ -326,7 +332,9 @@ async fn a_304_is_never_requested_without_a_cached_body() {
         .await
         .unwrap();
     assert!(
-        !origin.request_heads()[0].to_lowercase().contains("if-none-match"),
+        !origin.request_heads()[0]
+            .to_lowercase()
+            .contains("if-none-match"),
         "validator must be suppressed when no cached body backs it"
     );
 }
@@ -376,7 +384,8 @@ async fn a_404_or_501_clears_the_overlay_and_never_errors() {
 
 #[tokio::test]
 async fn a_500_keeps_the_etag_and_surfaces_an_error() {
-    let origin = MockOrigin::spawn(vec![Canned::status("HTTP/1.1 500 Internal Server Error")]).await;
+    let origin =
+        MockOrigin::spawn(vec![Canned::status("HTTP/1.1 500 Internal Server Error")]).await;
     let store = Arc::new(InMemoryModelsStore::new());
     let before = ModelsStoreEntry {
         models: vec![serde_json::from_value(model_json("cached", 9)).unwrap()],
@@ -642,19 +651,14 @@ fn a_none_overlay_is_byte_identical_to_the_pre_drift_007_registry() {
             })
             .collect()
     };
-    let store: Arc<dyn crate::CredentialStore> =
-        Arc::new(crate::InMemoryCredentialStore::new());
+    let store: Arc<dyn crate::CredentialStore> = Arc::new(crate::InMemoryCredentialStore::new());
     let registry = Arc::new(crate::builtin_registry());
-    let legacy = ids(crate::all_providers_with(
-        store.clone(),
-        registry.clone(),
-    ));
+    let legacy = ids(crate::all_providers_with(store.clone(), registry.clone()));
     let overlaid = ids(all_providers_with_overlay(store, registry, None));
     assert_eq!(legacy, overlaid);
 
     // An EMPTY overlay is likewise inert.
-    let store2: Arc<dyn crate::CredentialStore> =
-        Arc::new(crate::InMemoryCredentialStore::new());
+    let store2: Arc<dyn crate::CredentialStore> = Arc::new(crate::InMemoryCredentialStore::new());
     let empty = CatalogOverlay::default();
     let inert = ids(all_providers_with_overlay(
         store2,
@@ -678,19 +682,34 @@ async fn an_overlay_not_newer_than_the_builtin_manifest_is_discarded_whole() {
     };
 
     // Older than the embedded catalogs (an overlay persisted BEFORE an upgrade): discarded.
-    store.write("groq", entry(generated_at - 1), None).await.unwrap();
-    let catalog = Arc::new(
-        RemoteCatalog::new(store.clone()).with_local_generated_at(Some(generated_at)),
-    );
+    store
+        .write("groq", entry(generated_at - 1), None)
+        .await
+        .unwrap();
+    let catalog =
+        Arc::new(RemoteCatalog::new(store.clone()).with_local_generated_at(Some(generated_at)));
     assert!(catalog.load_overlay(&["groq"]).await.is_empty());
 
     // Exactly equal: still discarded (Pi uses `<=`).
-    store.write("groq", entry(generated_at), None).await.unwrap();
+    store
+        .write("groq", entry(generated_at), None)
+        .await
+        .unwrap();
     assert!(catalog.load_overlay(&["groq"]).await.is_empty());
 
     // Strictly newer: kept.
-    store.write("groq", entry(generated_at + 1), None).await.unwrap();
-    assert_eq!(catalog.load_overlay(&["groq"]).await.models_for("groq").len(), 1);
+    store
+        .write("groq", entry(generated_at + 1), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .load_overlay(&["groq"])
+            .await
+            .models_for("groq")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -753,7 +772,8 @@ async fn concurrent_refreshes_of_one_provider_collapse_onto_a_single_fetch() {
 
 #[tokio::test]
 async fn refresh_providers_is_best_effort_and_collects_per_provider_errors() {
-    let origin = MockOrigin::spawn(vec![Canned::status("HTTP/1.1 500 Internal Server Error")]).await;
+    let origin =
+        MockOrigin::spawn(vec![Canned::status("HTTP/1.1 500 Internal Server Error")]).await;
     let store = Arc::new(InMemoryModelsStore::new());
     let errors = catalog(store, &origin.base_url)
         .refresh_providers(&["groq", "xai"], RefreshOptions::forced())
@@ -789,8 +809,7 @@ fn merge_is_the_floor_guarantee() {
     // Whatever the dynamic side is — empty, or a disjoint set — every baseline id survives.
     for dynamic in [Vec::new(), vec![baseline[0].clone()]] {
         let merged = merge_models(&baseline, &dynamic);
-        let merged_ids: BTreeMap<&str, ()> =
-            merged.iter().map(|m| (m.id.as_str(), ())).collect();
+        let merged_ids: BTreeMap<&str, ()> = merged.iter().map(|m| (m.id.as_str(), ())).collect();
         for m in &baseline {
             assert!(merged_ids.contains_key(m.id.as_str()));
         }

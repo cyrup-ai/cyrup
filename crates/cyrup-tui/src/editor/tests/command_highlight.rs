@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::editor::*;
 
@@ -6,7 +11,10 @@ use crate::editor::*;
 
 /// A registry seeded with one dynamic prompt template carrying an `argument_hint`, mirroring
 /// what `dynamic_commands_from_catalog_gated` produces for a real `/flux/aug`-shaped command.
-pub(super) fn registry_with_hinted_dynamic(name: &'static str, hint: &'static str) -> CommandRegistry {
+pub(super) fn registry_with_hinted_dynamic(
+    name: &'static str,
+    hint: &'static str,
+) -> CommandRegistry {
     CommandRegistry::with_dynamic(vec![crate::commands::SlashCommand {
         name: std::borrow::Cow::Borrowed(name),
         description: std::borrow::Cow::Borrowed("test command"),
@@ -33,9 +41,14 @@ fn registry_with_hintless_dynamic(name: &'static str) -> CommandRegistry {
 fn still_typing_a_valid_prefix_highlights_the_whole_line_with_no_ghost() {
     let mut ed = InputEditor::new();
     ed.set_text("/mod");
-    let h = ed.command_highlight().expect("\"/mod\" is a live prefix of \"model\"");
+    let h = ed
+        .command_highlight()
+        .expect("\"/mod\" is a live prefix of \"model\"");
     assert_eq!(h.token, 0..4);
-    assert_eq!(h.ghost, None, "the popup is open; the ghost only appears after an exact match");
+    assert_eq!(
+        h.ghost, None,
+        "the popup is open; the ghost only appears after an exact match"
+    );
 }
 
 #[test]
@@ -49,7 +62,11 @@ fn a_non_prefix_query_does_not_highlight() {
 fn a_bare_slash_does_not_highlight() {
     let mut ed = InputEditor::new();
     ed.set_text("/");
-    assert_eq!(ed.command_highlight(), None, "an empty query is never a prefix confirmation");
+    assert_eq!(
+        ed.command_highlight(),
+        None,
+        "an empty query is never a prefix confirmation"
+    );
 }
 
 #[test]
@@ -62,9 +79,13 @@ fn text_not_starting_with_slash_never_highlights() {
 #[test]
 fn the_highlight_grows_per_keystroke_while_still_a_prefix() {
     let mut ed = InputEditor::new();
-    for (text, expect_some) in
-        [("/", false), ("/m", true), ("/mo", true), ("/mod", true), ("/model", true)]
-    {
+    for (text, expect_some) in [
+        ("/", false),
+        ("/m", true),
+        ("/mo", true),
+        ("/mod", true),
+        ("/model", true),
+    ] {
         ed.set_text(text);
         assert_eq!(
             ed.command_highlight().is_some(),
@@ -81,8 +102,14 @@ fn the_highlight_grows_per_keystroke_while_still_a_prefix() {
 fn whitespace_after_an_exact_match_freezes_the_token_and_shows_the_ghost() {
     let mut ed = InputEditor::new();
     ed.set_text("/model ");
-    let h = ed.command_highlight().expect("exact match on a known builtin");
-    assert_eq!(h.token, 0..6, "token is just \"/model\", not the trailing space");
+    let h = ed
+        .command_highlight()
+        .expect("exact match on a known builtin");
+    assert_eq!(
+        h.token,
+        0..6,
+        "token is just \"/model\", not the trailing space"
+    );
     assert_eq!(h.ghost.as_deref(), Some("<provider/model>"));
 }
 
@@ -92,8 +119,14 @@ fn the_ghost_disappears_once_a_real_argument_character_is_typed() {
     ed.set_text("/model ");
     assert!(ed.command_highlight().unwrap().ghost.is_some());
     ed.set_text("/model o");
-    let h = ed.command_highlight().expect("the token itself is still an exact match");
-    assert_eq!(h.token, 0..6, "the highlight survives continued argument typing");
+    let h = ed
+        .command_highlight()
+        .expect("the token itself is still an exact match");
+    assert_eq!(
+        h.token,
+        0..6,
+        "the highlight survives continued argument typing"
+    );
     assert_eq!(h.ghost, None, "the argument zone is no longer empty");
 }
 
@@ -105,14 +138,20 @@ fn the_ghost_reappears_when_the_buffer_is_edited_back_to_empty() {
     ed.set_text("/model o");
     assert_eq!(ed.command_highlight().unwrap().ghost, None);
     ed.set_text("/model ");
-    assert_eq!(ed.command_highlight().unwrap().ghost.as_deref(), Some("<provider/model>"));
+    assert_eq!(
+        ed.command_highlight().unwrap().ghost.as_deref(),
+        Some("<provider/model>")
+    );
 }
 
 #[test]
 fn two_spaces_still_count_as_an_empty_argument_zone() {
     let mut ed = InputEditor::new();
     ed.set_text("/model  ");
-    assert_eq!(ed.command_highlight().unwrap().ghost.as_deref(), Some("<provider/model>"));
+    assert_eq!(
+        ed.command_highlight().unwrap().ghost.as_deref(),
+        Some("<provider/model>")
+    );
 }
 
 #[test]
@@ -128,7 +167,11 @@ fn a_prefix_that_is_not_an_exact_command_shows_nothing_after_whitespace() {
 fn an_unknown_command_followed_by_an_argument_shows_nothing() {
     let mut ed = InputEditor::new();
     ed.set_text("/bogus");
-    assert_eq!(ed.command_highlight(), None, "\"bogus\" is not a prefix of any builtin");
+    assert_eq!(
+        ed.command_highlight(),
+        None,
+        "\"bogus\" is not a prefix of any builtin"
+    );
     ed.set_text("/bogus thing");
     assert_eq!(ed.command_highlight(), None);
 }
@@ -175,9 +218,14 @@ fn a_soft_newline_terminates_the_token_exactly_like_whitespace() {
     let mut ed = InputEditor::new();
     ed.set_registry(registry_with_hinted_dynamic("flux/aug", "<hint>"));
     ed.set_text("/flux/aug\nNOTIFS");
-    let h = ed.command_highlight().expect("exact match via the newline boundary");
+    let h = ed
+        .command_highlight()
+        .expect("exact match via the newline boundary");
     assert_eq!(h.token, 0..9, "token is \"/flux/aug\" only");
-    assert_eq!(h.ghost, None, "line 1 holds a non-whitespace argument, so the zone is not empty");
+    assert_eq!(
+        h.ghost, None,
+        "line 1 holds a non-whitespace argument, so the zone is not empty"
+    );
 }
 
 #[test]

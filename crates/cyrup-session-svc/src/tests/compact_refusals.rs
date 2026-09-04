@@ -14,21 +14,25 @@
 //! (rpc-mode.ts:530-532 + the surrounding handler). Pre-fix cyrup returned `Ok(None)` for all three,
 //! which the RPC adapter serialized as `{"success":true,"data":null}` — three different refusals
 //! collapsed into one indistinguishable "success".
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cyrup_core::{
-    TerminateHint,AssistantMessage, ExtensionId, StopReason};
-use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_assistant_message_with, faux_text, FauxConfig, FauxMessageOptions,
-    FauxProvider,
-};
-use cyrup_provider::Provider;
 use crate::{AgentSessionEvent, SessionBuilder, SessionConfig};
+use cyrup_core::{AssistantMessage, ExtensionId, StopReason, TerminateHint};
+use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{
+    FauxConfig, FauxMessageOptions, FauxProvider, faux_assistant_message,
+    faux_assistant_message_with, faux_text,
+};
 use futures::StreamExt;
 use tempfile::TempDir;
 
@@ -48,7 +52,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -82,9 +90,10 @@ impl NativeExtension for CompactionVetoer {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::SessionBeforeCompact { .. } => {
-                HookOutcome::Block { reason: Some("not now".to_string()), terminate: TerminateHint::Unspecified }
-            }
+            HostEvent::SessionBeforeCompact { .. } => HookOutcome::Block {
+                reason: Some("not now".to_string()),
+                terminate: TerminateHint::Unspecified,
+            },
             _ => HookOutcome::Noop,
         }
     }
@@ -96,7 +105,10 @@ impl NativeExtension for CompactionVetoer {
 async fn compact_on_a_tiny_session_errors_nothing_to_compact() {
     let fx = fixture();
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.expect("build");
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .expect("build");
 
     let err = session
         .compact(None)
@@ -137,8 +149,14 @@ async fn compact_twice_errors_already_compacted() {
     let _ = session.prompt("tell me two").await.expect("prompt 2");
     session.wait_for_idle().await;
 
-    let first = session.compact(None).await.expect("the first compaction succeeds");
-    assert!(!first.summary.is_empty(), "the first compaction produced a summary");
+    let first = session
+        .compact(None)
+        .await
+        .expect("the first compaction succeeds");
+    assert!(
+        !first.summary.is_empty(),
+        "the first compaction produced a summary"
+    );
 
     let err = session.compact(None).await.expect_err(
         "compacting an already-compacted branch must be an Err (Pi agent-session.ts:1803-1805)",
@@ -173,7 +191,11 @@ async fn compact_vetoed_by_an_extension_errors_compaction_cancelled() {
         .compact(None)
         .await
         .expect_err("an extension veto must be an Err (Pi agent-session.ts:1824)");
-    assert_eq!(err.to_string(), "Compaction cancelled", "verbatim Pi message");
+    assert_eq!(
+        err.to_string(),
+        "Compaction cancelled",
+        "verbatim Pi message"
+    );
 }
 
 /// Aborting an IN-FLIGHT compaction (Esc during `/compact` ⇒ `abort_compaction`) is the same refusal
@@ -256,7 +278,12 @@ async fn compact_aborted_in_flight_errors_with_pi_s_bare_compaction_cancelled() 
     // (agent-session.ts:1909-1916).
     let mut end: Option<(bool, Option<String>)> = None;
     while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
-        if let AgentSessionEvent::CompactionEnd { aborted, error_message, .. } = &ev {
+        if let AgentSessionEvent::CompactionEnd {
+            aborted,
+            error_message,
+            ..
+        } = &ev
+        {
             end = Some((*aborted, error_message.clone()));
             break;
         }
@@ -404,7 +431,10 @@ async fn abort_compaction_also_cancels_an_auto_compaction() {
         ..FauxConfig::default()
     }));
     faux.set_responses(vec![
-        faux_assistant_message(vec![faux_text("a real answer worth some tokens")], StopReason::Stop),
+        faux_assistant_message(
+            vec![faux_text("a real answer worth some tokens")],
+            StopReason::Stop,
+        ),
         faux_assistant_message(
             vec![faux_text(
                 "this auto-compaction summary is deliberately long so that it is still streaming \
@@ -444,14 +474,22 @@ async fn abort_compaction_also_cancels_an_auto_compaction() {
             break;
         }
     }
-    assert!(started_auto, "the post-run threshold auto-compaction must start");
+    assert!(
+        started_auto,
+        "the post-run threshold auto-compaction must start"
+    );
     // Let the summarization stream actually open before cancelling it.
     tokio::time::sleep(Duration::from_millis(300)).await;
     session.abort_compaction();
 
     let mut end: Option<(bool, Option<String>)> = None;
     while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(15), stream.next()).await {
-        if let AgentSessionEvent::CompactionEnd { aborted, error_message, .. } = &ev {
+        if let AgentSessionEvent::CompactionEnd {
+            aborted,
+            error_message,
+            ..
+        } = &ev
+        {
             end = Some((*aborted, error_message.clone()));
             break;
         }
@@ -539,16 +577,27 @@ async fn a_failed_overflow_compaction_leaves_the_agent_transcript_untouched() {
             AgentSessionEvent::CompactionStart { reason } if *reason == crate::CompactionReason::Overflow
         )
     });
-    assert!(started_overflow, "the overflow compaction must start: {:?}", kinds(&events));
+    assert!(
+        started_overflow,
+        "the overflow compaction must start: {:?}",
+        kinds(&events)
+    );
     // …and really FAILED: no result on the end event.
-    let failed = events.iter().any(|e| {
-        matches!(e, AgentSessionEvent::CompactionEnd { result, .. } if result.is_none())
-    });
-    assert!(failed, "the summarization error must fail the compaction: {:?}", kinds(&events));
+    let failed = events
+        .iter()
+        .any(|e| matches!(e, AgentSessionEvent::CompactionEnd { result, .. } if result.is_none()));
+    assert!(
+        failed,
+        "the summarization error must fail the compaction: {:?}",
+        kinds(&events)
+    );
 
     let transcript = session.agent_messages().await;
     assert!(
-        !matches!(transcript.last(), Some(cyrup_agent::AgentMessage::Assistant(_))),
+        !matches!(
+            transcript.last(),
+            Some(cyrup_agent::AgentMessage::Assistant(_))
+        ),
         "a failed compaction must not resurrect the overflow response `drop_trailing_assistant` \
          had just removed (agent-session.ts:2275-2280 puts the re-seed on the success path only); \
          transcript = {transcript:?}"

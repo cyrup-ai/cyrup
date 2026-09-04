@@ -23,8 +23,7 @@ fn describe_validation_value(value: Option<&Value>) -> String {
             } else {
                 s.clone()
             };
-            serde_json::to_string(&Value::String(short))
-                .unwrap_or_else(|_| format!("\"{s}\""))
+            serde_json::to_string(&Value::String(short)).unwrap_or_else(|_| format!("\"{s}\""))
         }
         Some(Value::Number(n)) => format!("number {n}"),
         Some(Value::Bool(b)) => format!("boolean {b}"),
@@ -116,8 +115,10 @@ pub(crate) fn validate_acceptance_report(
                     _ => {}
                 }
                 let status = obj.get("status").and_then(Value::as_str);
-                if !matches!(status, Some("satisfied") | Some("not-satisfied") | Some("not-applicable"))
-                {
+                if !matches!(
+                    status,
+                    Some("satisfied") | Some("not-satisfied") | Some("not-applicable")
+                ) {
                     push_type_error(
                         &mut errors,
                         &format!("{ipath}.status"),
@@ -220,24 +221,26 @@ pub(crate) fn validate_acceptance_report(
         );
     }
     if let Some(no_staged) = map.get("noStagedFiles")
-        && !no_staged.is_boolean() {
-            push_type_error(
-                &mut errors,
-                &path_for(path_label, "noStagedFiles"),
-                "boolean",
-                Some(no_staged),
-            );
-        }
+        && !no_staged.is_boolean()
+    {
+        push_type_error(
+            &mut errors,
+            &path_for(path_label, "noStagedFiles"),
+            "boolean",
+            Some(no_staged),
+        );
+    }
     // `acceptance.ts:890` @v0.43.0 — non-empty (v0.34.0 accepted `""`).
     if let Some(diff) = map.get("diffSummary")
-        && !diff.as_str().is_some_and(|s| !s.trim().is_empty()) {
-            push_type_error(
-                &mut errors,
-                &path_for(path_label, "diffSummary"),
-                "non-empty string",
-                Some(diff),
-            );
-        }
+        && !diff.as_str().is_some_and(|s| !s.trim().is_empty())
+    {
+        push_type_error(
+            &mut errors,
+            &path_for(path_label, "diffSummary"),
+            "non-empty string",
+            Some(diff),
+        );
+    }
     if map.contains_key("reviewFindings") {
         validate_string_array_field(
             &mut errors,
@@ -246,23 +249,25 @@ pub(crate) fn validate_acceptance_report(
         );
     }
     if let Some(notes) = map.get("manualNotes")
-        && !notes.is_string() {
-            push_type_error(
-                &mut errors,
-                &path_for(path_label, "manualNotes"),
-                "string",
-                Some(notes),
-            );
-        }
+        && !notes.is_string()
+    {
+        push_type_error(
+            &mut errors,
+            &path_for(path_label, "manualNotes"),
+            "string",
+            Some(notes),
+        );
+    }
     if let Some(notes) = map.get("notes")
-        && !notes.is_string() {
-            push_type_error(
-                &mut errors,
-                &path_for(path_label, "notes"),
-                "string",
-                Some(notes),
-            );
-        }
+        && !notes.is_string()
+    {
+        push_type_error(
+            &mut errors,
+            &path_for(path_label, "notes"),
+            "string",
+            Some(notes),
+        );
+    }
 
     if !errors.is_empty() {
         return (Option::None, errors);
@@ -290,7 +295,9 @@ pub(crate) fn validate_acceptance_report(
         };
         return (
             Option::None,
-            vec![format!("{label}: expected at least one acceptance report field")],
+            vec![format!(
+                "{label}: expected at least one acceptance report field"
+            )],
         );
     }
     // Validation passed: deserialize the known fields into the typed report (unknown fields are

@@ -195,9 +195,10 @@ fn to_wit(o: RawOutcome) -> types::HookOutcome {
     match o {
         RawOutcome::Noop => types::HookOutcome::Noop,
         // EXT-049: `block` is a record now, carrying pi's `ToolCallEventResult.terminate`.
-        RawOutcome::Block(r, terminate) => {
-            types::HookOutcome::Block(types::BlockResult { reason: r, terminate })
-        }
+        RawOutcome::Block(r, terminate) => types::HookOutcome::Block(types::BlockResult {
+            reason: r,
+            terminate,
+        }),
         RawOutcome::Mutate(s) => types::HookOutcome::Mutate(s),
         RawOutcome::Handled(s) => types::HookOutcome::Handled(s),
     }
@@ -205,11 +206,7 @@ fn to_wit(o: RawOutcome) -> types::HookOutcome {
 
 /// Stringify a bool for the ordered-arg seam.
 pub fn b(v: bool) -> &'static str {
-    if v {
-        "true"
-    } else {
-        "false"
-    }
+    if v { "true" } else { "false" }
 }
 
 /// A block/mutate/handled hook export: dispatch + lower to the WIT outcome (macro entry point).
@@ -241,7 +238,9 @@ pub fn prepare_arguments(name: String, args_json: String) -> Option<String> {
         return Some(v.to_string());
     }
     API.with(|c| {
-        c.borrow().as_ref().and_then(|api| api.prepare_tool_arguments(&name, &args))
+        c.borrow()
+            .as_ref()
+            .and_then(|api| api.prepare_tool_arguments(&name, &args))
     })
     .map(|v| v.to_string())
 }
@@ -257,7 +256,10 @@ pub fn run_tool(
     // A late-registered tool (registered from a live handler) is not in `API.tools`; check that
     // table first so a dynamically-registered tool is genuinely executable, not just announced.
     let late = LATE_TOOLS.with(|c| {
-        c.borrow().iter().find(|t| t.descriptor.name == name).map(|t| t.exec.execute(call.clone()))
+        c.borrow()
+            .iter()
+            .find(|t| t.descriptor.name == name)
+            .map(|t| t.exec.execute(call.clone()))
     });
     let out = match late {
         Some(r) => r?,
@@ -295,7 +297,10 @@ pub fn run_shortcut(key: String) -> Result<(), String> {
 /// `get-argument-completions` export body (Pi `getArgumentCompletions`).
 pub fn completions(name: String, prefix: String) -> Vec<String> {
     API.with(|c| {
-        c.borrow().as_ref().map(|api| api.argument_completions(&name, &prefix)).unwrap_or_default()
+        c.borrow()
+            .as_ref()
+            .map(|api| api.argument_completions(&name, &prefix))
+            .unwrap_or_default()
     })
 }
 
@@ -303,7 +308,10 @@ pub fn completions(name: String, prefix: String) -> Vec<String> {
 pub fn render_call(custom_type: String, call_json: String) -> Option<String> {
     let call = serde_json::from_str(&call_json).unwrap_or(Value::Null);
     API.with(|c| {
-        c.borrow().as_ref().and_then(|api| api.render_call(&custom_type, &call)).map(|v| v.to_string())
+        c.borrow()
+            .as_ref()
+            .and_then(|api| api.render_call(&custom_type, &call))
+            .map(|v| v.to_string())
     })
 }
 
@@ -333,7 +341,11 @@ pub fn transform_markdown(markdown: String, ctx_json: String) -> String {
 /// `on-terminal-input` export body (EXT-021; Pi `TerminalInputHandler`, types.ts:113 @v0.83.0).
 /// `None` when this guest registered no handler, so an unexpected call is harmless.
 pub fn on_terminal_input(data: String) -> Option<crate::api::TerminalInputResult> {
-    API.with(|c| c.borrow().as_ref().and_then(|api| api.handle_terminal_input(&data)))
+    API.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|api| api.handle_terminal_input(&data))
+    })
 }
 
 /// `provider-login` export body (Pi `oauth.login`): returns the credentials JSON to persist.
@@ -348,7 +360,9 @@ pub fn provider_login(id: String) -> Result<String, String> {
 pub fn provider_refresh_token(id: String, credentials_json: String) -> Result<String, String> {
     let creds = serde_json::from_str(&credentials_json).unwrap_or(Value::Null);
     API.with(|c| match c.borrow().as_ref() {
-        Some(api) => api.provider_refresh_token(&id, creds).map(|c| c.to_string()),
+        Some(api) => api
+            .provider_refresh_token(&id, creds)
+            .map(|c| c.to_string()),
         None => Err("extension not initialized".into()),
     })
 }
@@ -371,7 +385,9 @@ pub fn provider_modify_models(
     let models = serde_json::from_str(&models_json).unwrap_or(Value::Null);
     let creds = serde_json::from_str(&credentials_json).unwrap_or(Value::Null);
     API.with(|c| match c.borrow().as_ref() {
-        Some(api) => api.provider_modify_models(&id, models, &creds).map(|m| m.to_string()),
+        Some(api) => api
+            .provider_modify_models(&id, models, &creds)
+            .map(|m| m.to_string()),
         None => Err("extension not initialized".into()),
     })
 }
@@ -422,7 +438,11 @@ pub fn autocomplete_suggest(base_json: String, query_json: String) -> String {
     let query: crate::autocomplete::AutocompleteQuery =
         serde_json::from_str(&query_json).unwrap_or_default();
     API.with(|c| {
-        let folded = c.borrow().as_ref().and_then(|api| api.autocomplete_suggest(base, &query));
-        serde_json::to_string(&folded.unwrap_or_default()).unwrap_or_else(|_| "{\"items\":[],\"prefix\":\"\"}".into())
+        let folded = c
+            .borrow()
+            .as_ref()
+            .and_then(|api| api.autocomplete_suggest(base, &query));
+        serde_json::to_string(&folded.unwrap_or_default())
+            .unwrap_or_else(|_| "{\"items\":[],\"prefix\":\"\"}".into())
     })
 }

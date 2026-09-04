@@ -41,7 +41,8 @@ impl<B: Backend> App<B> {
         ev: &AgentSessionEvent,
         ext_host: &Arc<cyrup_ext::ExtensionHost>,
     ) {
-        self.ingest_event_with_extensions_owned(ev.clone(), ext_host).await;
+        self.ingest_event_with_extensions_owned(ev.clone(), ext_host)
+            .await;
     }
 
     /// [`Self::ingest_event_with_extensions`] taking the event BY VALUE (TUI-092 F8) — the
@@ -72,7 +73,8 @@ impl<B: Backend> App<B> {
         // runs inside `App::draw`, one run-loop arm later.
         let first_pending = self.state.transcript.pending_len();
         self.ingest_event_rendered_owned(ev, rendered, entry);
-        self.apply_markdown_transformers(ext_host, first_pending).await;
+        self.apply_markdown_transformers(ext_host, first_pending)
+            .await;
     }
 
     /// Run the extension-registered markdown transformers over everything the fold just put on
@@ -118,8 +120,9 @@ impl<B: Backend> App<B> {
         // — the only difference is that they have the frame width and this has the last drawn one
         // ([`AppState::term_cols`]).
         let pad = u32::try_from(self.state.transcript.output_pad()).unwrap_or(u32::MAX);
-        let available_width =
-            u32::from(self.state.term_cols).saturating_sub(pad.saturating_mul(2)).max(1);
+        let available_width = u32::from(self.state.term_cols)
+            .saturating_sub(pad.saturating_mul(2))
+            .max(1);
         // Snapshotted rather than borrowed: the guest call is awaited, and a `&mut String` pointing
         // into the transcript cannot straddle that await while `self` is also the receiver.
         let committed: Vec<(usize, crate::markdown::MessageType, String)> = self
@@ -132,8 +135,9 @@ impl<B: Backend> App<B> {
             // `isStreaming: false`: a committed entry is by definition no longer streaming — the
             // turn that produced it has ended (`assistant-message.ts:111`, whose `this.isStreaming`
             // is false for every finalized message).
-            let out =
-                ext_host.transform_markdown(&text, kind.as_pi_str(), false, available_width).await;
+            let out = ext_host
+                .transform_markdown(&text, kind.as_pi_str(), false, available_width)
+                .await;
             if out != text {
                 self.state.transcript.set_pending_markdown(index, out);
             }
@@ -150,7 +154,9 @@ impl<B: Backend> App<B> {
                     available_width,
                 )
                 .await;
-            self.state.transcript.set_thinking_display((out != raw).then_some(out));
+            self.state
+                .transcript
+                .set_thinking_display((out != raw).then_some(out));
         }
         if let Some(raw) = self.state.transcript.streaming().map(str::to_string) {
             let out = ext_host
@@ -161,7 +167,9 @@ impl<B: Backend> App<B> {
                     available_width,
                 )
                 .await;
-            self.state.transcript.set_streaming_display((out != raw).then_some(out));
+            self.state
+                .transcript
+                .set_streaming_display((out != raw).then_some(out));
         }
     }
 
@@ -270,11 +278,11 @@ impl<B: Backend> App<B> {
                 Some(usage.context_window),
                 session.auto_compaction_enabled(),
             ),
-            None => self.state.status.set_context_usage(
-                None,
-                None,
-                session.auto_compaction_enabled(),
-            ),
+            None => {
+                self.state
+                    .status
+                    .set_context_usage(None, None, session.auto_compaction_enabled())
+            }
         }
     }
 
@@ -285,7 +293,9 @@ impl<B: Backend> App<B> {
     /// Sync and cheap: `auto_compaction_enabled()` is an override-or-default `bool` read, no session
     /// walk. Any future auto-compaction toggle in cyrup's settings selector calls THIS.
     pub fn refresh_auto_compact(&mut self, session: &Arc<AgentSession>) {
-        self.state.status.set_auto_compact(session.auto_compaction_enabled());
+        self.state
+            .status
+            .set_auto_compact(session.auto_compaction_enabled());
     }
 
     /// Pi `message_end`'s finalization of an assistant message (`interactive-mode.ts:3183-3214`):

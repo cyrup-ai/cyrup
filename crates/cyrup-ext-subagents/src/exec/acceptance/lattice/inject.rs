@@ -53,7 +53,10 @@ pub fn inject_acceptance_contract(task: &str, contract: &AcceptanceContract) -> 
     // — so no cyrup agent can declare one and the predicate is `false` for every run. It is a
     // parameter rather than a hardcoded `false` inside the prompt builder so that porting
     // `agent-contract.ts` is a change at THIS seam only.
-    let block = crate::exec::acceptance::model::format_acceptance_prompt(&contract.to_resolved_config(), false);
+    let block = crate::exec::acceptance::model::format_acceptance_prompt(
+        &contract.to_resolved_config(),
+        false,
+    );
     // `format_acceptance_prompt`'s first line is deliberately empty (upstream's `lines[0] = ""`);
     // strip it, since the join below supplies the separator.
     let block = block.strip_prefix('\n').unwrap_or(&block);
@@ -77,7 +80,6 @@ mod tests {
     use crate::exec::acceptance::lattice::contract::ReviewerResult;
     use crate::exec::acceptance::lattice::testsupport::vc;
 
-
     // ---------------------------------------------------------------------------------------
     // inject_acceptance_contract (R-SA-023)
     // ---------------------------------------------------------------------------------------
@@ -94,7 +96,6 @@ mod tests {
         assert_eq!(out, "Investigate the bug");
     }
 
-
     /// The converse, and the actual regression this pairs with: a research/read-only child DOES
     /// get pi's `## Acceptance Contract` block, naming the criterion it will be judged on and the
     /// evidence its `acceptance-report` must carry (`formatAcceptancePrompt`,
@@ -110,10 +111,10 @@ mod tests {
         assert!(out.contains("review-findings"));
     }
 
-
     #[test]
     fn required_contract_appends_a_machine_parseable_acceptance_contract_block() {
-        let contract = AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("cargo test")]);
+        let contract =
+            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("cargo test")]);
         let out = inject_acceptance_contract("Fix the bug", &contract);
         assert!(out.starts_with("Fix the bug"));
         assert!(out.contains(ACCEPTANCE_CONTRACT_HEADING));
@@ -123,14 +124,12 @@ mod tests {
         assert!(out.contains("verified"));
     }
 
-
     #[test]
     fn contract_block_appended_to_empty_task_has_no_leading_blank_lines() {
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]);
         let out = inject_acceptance_contract("", &contract);
         assert!(out.starts_with(ACCEPTANCE_CONTRACT_HEADING));
     }
-
 
     /// G78 — [`AcceptanceContract::to_resolved_config`]'s `Reviewed | Rejected -> Checked` arm,
     /// asserted through its LIVE consumer [`inject_acceptance_contract`] (the other one is
@@ -157,7 +156,10 @@ mod tests {
         );
 
         let resolved = contract.to_resolved_config();
-        assert_eq!(resolved.level, crate::exec::acceptance::model::AcceptanceLevel::Checked);
+        assert_eq!(
+            resolved.level,
+            crate::exec::acceptance::model::AcceptanceLevel::Checked
+        );
         assert!(
             resolved.verify.is_empty(),
             "and it declares no verify[] commands, which is exactly why `Verified` would be wrong"
@@ -186,5 +188,4 @@ mod tests {
             crate::exec::acceptance::model::AcceptanceLevel::Checked
         );
     }
-
 }

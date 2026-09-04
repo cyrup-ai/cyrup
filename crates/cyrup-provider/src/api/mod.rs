@@ -185,7 +185,10 @@ pub fn register_builtins(reg: &mut ApiRegistry) {
         ApiId::from(crate::known_api::GOOGLE_VERTEX),
         google_vertex::factory,
     );
-    reg.register(ApiId::from(crate::known_api::PI_MESSAGES), pi_messages::factory);
+    reg.register(
+        ApiId::from(crate::known_api::PI_MESSAGES),
+        pi_messages::factory,
+    );
     reg.register(
         ApiId::from(crate::known_api::BEDROCK_CONVERSE_STREAM),
         bedrock_converse_stream::factory,
@@ -284,11 +287,18 @@ mod tests {
             crate::known_api::PI_MESSAGES,
         ];
         expected.sort_unstable();
-        assert_eq!(registered, expected, "registered wire-api ids drifted from pi's KnownApi");
+        assert_eq!(
+            registered, expected,
+            "registered wire-api ids drifted from pi's KnownApi"
+        );
 
         // Nothing is constructed by building the registry — pi's `lazyApi` likewise runs no
         // `import()` until a stream call.
-        assert_eq!(reg.live.len(), 0, "builtin_registry() constructed an impl eagerly");
+        assert_eq!(
+            reg.live.len(),
+            0,
+            "builtin_registry() constructed an impl eagerly"
+        );
 
         // `contains` answers from the factory table, so a capability probe stays free.
         for id in &expected {
@@ -300,7 +310,11 @@ mod tests {
         let anthropic = ApiId::from(crate::known_api::ANTHROPIC_MESSAGES);
         let imp = reg.get(&anthropic).expect("anthropic-messages registered");
         assert_eq!(imp.api(), &anthropic);
-        assert_eq!(reg.live.len(), 1, "a single get constructed more than its own impl");
+        assert_eq!(
+            reg.live.len(),
+            1,
+            "a single get constructed more than its own impl"
+        );
     }
 
     #[test]

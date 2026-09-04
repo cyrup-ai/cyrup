@@ -43,12 +43,10 @@ use std::time::{Duration, Instant};
 
 use cyrup_core::{CancelToken, Tool, ToolCallId};
 use cyrup_ext::host::HostServices;
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::SpawnCommand;
-
-
 
 /// pi `SUBAGENT_CONTROL_MESSAGE_TYPE` (`extension/control-notices.ts:5`).
 const CONTROL_NOTICE_CUSTOM_TYPE: &str = "subagent_control_notice";
@@ -237,7 +235,10 @@ async fn run_single_with_control_and_debounce(
     extension.executor().set_host_services(services.clone());
     extension.executor().capture_parent_session_anchor();
     if let Some(debounce) = debounce {
-        extension.executor().set_control_notice_debounce(debounce).await;
+        extension
+            .executor()
+            .set_control_notice_debounce(debounce)
+            .await;
     }
 
     let mut params = serde_json::json!({ "agent": "worker", "task": "idle for a while" });
@@ -310,7 +311,6 @@ fn control_events(details: &serde_json::Value) -> Vec<serde_json::Value> {
 ///   `None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_single_call_carrying_control_fires_the_real_notice_pipeline() {
-
     let outcome =
         run_single_with_control(Some(serde_json::json!({ "needsAttentionAfterMs": 1 }))).await;
 
@@ -325,8 +325,14 @@ async fn a_single_call_carrying_control_fires_the_real_notice_pipeline() {
         .iter()
         .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("needs_attention"))
         .unwrap_or_else(|| panic!("no needs_attention event among {events:?}"));
-    assert_eq!(attention.get("agent").and_then(|a| a.as_str()), Some("worker"));
-    assert_eq!(attention.get("reason").and_then(|r| r.as_str()), Some("idle"));
+    assert_eq!(
+        attention.get("agent").and_then(|a| a.as_str()),
+        Some("worker")
+    );
+    assert_eq!(
+        attention.get("reason").and_then(|r| r.as_str()),
+        Some("idle")
+    );
 
     // (2) The notice reached the transcript, through the production sink.
     assert_eq!(
@@ -336,7 +342,10 @@ async fn a_single_call_carrying_control_fires_the_real_notice_pipeline() {
         outcome.notices
     );
     let (body, display, trigger_turn) = &outcome.notices[0];
-    assert!(*display, "a control notice is a visible transcript entry (R-SA-121)");
+    assert!(
+        *display,
+        "a control notice is a visible transcript entry (R-SA-121)"
+    );
     assert!(
         !*trigger_turn,
         "a FOREGROUND notice must not force a new orchestrator turn (R-SA-118 / pi \
@@ -353,7 +362,10 @@ async fn a_single_call_carrying_control_fires_the_real_notice_pipeline() {
         "Status: subagent({ action: \"status\"",
         "Interrupt: subagent({ action: \"interrupt\"",
     ] {
-        assert!(body.contains(expected), "notice body missing {expected:?}; got:\n{body}");
+        assert!(
+            body.contains(expected),
+            "notice body missing {expected:?}; got:\n{body}"
+        );
     }
 
     // (4) `childIntercomTarget` is resolved, not hardcoded `None`.
@@ -364,7 +376,8 @@ async fn a_single_call_carrying_control_fires_the_real_notice_pipeline() {
     );
     // `index: 0` on the foreground SINGLE path renders pi's 1-based step suffix.
     assert!(
-        body.lines().any(|l| l.starts_with("Direct intercom target: ") && l.ends_with("-1")),
+        body.lines()
+            .any(|l| l.starts_with("Direct intercom target: ") && l.ends_with("-1")),
         "the target must carry the `-{{index + 1}}` step suffix; got:\n{body}"
     );
 }
@@ -378,7 +391,6 @@ async fn a_single_call_carrying_control_fires_the_real_notice_pipeline() {
 /// thing that can turn the notice on is the per-call override actually taking effect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_same_run_without_control_raises_nothing_and_injects_nothing() {
-
     let outcome = run_single_with_control(None).await;
 
     assert!(
@@ -403,7 +415,6 @@ async fn the_same_run_without_control_raises_nothing_and_injects_nothing() {
 /// still produced a transcript notice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_channels_without_event_raises_the_event_but_delivers_no_transcript_notice() {
-
     let outcome = run_single_with_control(Some(serde_json::json!({
         "needsAttentionAfterMs": 1,
         "notifyChannels": ["intercom"]
@@ -433,7 +444,6 @@ async fn notify_channels_without_event_raises_the_event_but_delivers_no_transcri
 /// than `notifyChannels` and the two must not be conflated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_on_without_needs_attention_suppresses_the_raise_itself() {
-
     let outcome = run_single_with_control(Some(serde_json::json!({
         "needsAttentionAfterMs": 1,
         "notifyOn": ["active_long_running"]
@@ -447,7 +457,11 @@ async fn notify_on_without_needs_attention_suppresses_the_raise_itself() {
         "`notifyOn` excludes needs_attention, so it must never be raised; details were {}",
         outcome.details
     );
-    assert!(outcome.notices.is_empty(), "and no notice; got {:?}", outcome.notices);
+    assert!(
+        outcome.notices.is_empty(),
+        "and no notice; got {:?}",
+        outcome.notices
+    );
 }
 
 /// ADVERSARIAL — "can a control notice be LOST if the child exits promptly after emitting?"
@@ -484,7 +498,6 @@ async fn notify_on_without_needs_attention_suppresses_the_raise_itself() {
 /// `live_runs`. Deterministic loss is a behaviour; a race is a bug.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_notice_still_debouncing_when_the_child_exits_is_dropped_exactly_as_pi_drops_it() {
-
     let outcome = run_single_with_control_and_debounce(
         Some(serde_json::json!({ "needsAttentionAfterMs": 1 })),
         Some(Duration::from_secs(30)),
@@ -512,7 +525,6 @@ async fn a_notice_still_debouncing_when_the_child_exits_is_dropped_exactly_as_pi
 /// `ResolvedControlConfig.enabled`, checked at the top of every raise path).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_enabled_false_disables_every_raise_path_for_the_run() {
-
     let outcome = run_single_with_control(Some(serde_json::json!({
         "enabled": false,
         "needsAttentionAfterMs": 1
@@ -524,5 +536,9 @@ async fn control_enabled_false_disables_every_raise_path_for_the_run() {
         "`enabled: false` must win over an aggressive threshold; details were {}",
         outcome.details
     );
-    assert!(outcome.notices.is_empty(), "and no notice; got {:?}", outcome.notices);
+    assert!(
+        outcome.notices.is_empty(),
+        "and no notice; got {:?}",
+        outcome.notices
+    );
 }

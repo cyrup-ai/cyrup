@@ -46,7 +46,9 @@ fn the_swap_arm_outranks_the_events_arm_and_every_ticker_and_the_events_pattern_
     let mut checked = 0usize;
     for (offset, _) in APP_SRC.match_indices("tokio::select! {") {
         let body = &APP_SRC[offset..];
-        let end = body[1..].find("tokio::select! {").map_or(body.len(), |i| i + 1);
+        let end = body[1..]
+            .find("tokio::select! {")
+            .map_or(body.len(), |i| i + 1);
         let block = &body[..end];
         if !block.contains("cancel.cancelled()") || !block.contains("events.next()") {
             continue;

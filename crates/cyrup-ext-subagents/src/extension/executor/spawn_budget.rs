@@ -10,7 +10,6 @@ use crate::extension::executor::SubagentExecutor;
 /// grant nor "unlimited", which is why an exhausted cap was terminal for the whole session.
 pub(crate) type SpawnBudget = crate::exec::spawn_budget::SpawnBudgetCounters;
 impl SubagentExecutor {
-
     /// Reserve `requested` subagent spawns against THIS session's budget (pi `reserveSubagentSpawns`,
     /// `runs/foreground/subagent-executor.ts:266-282`), returning pi's exact over-limit text on
     /// breach and `Ok(())` otherwise.
@@ -113,11 +112,7 @@ impl SubagentExecutor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         budget_ops::session_state(&mut budget, session_id.as_deref(), max_spawns);
-        budget_ops::grant_spawn_budget(
-            &mut budget,
-            additional,
-            crate::time::now_epoch_millis(),
-        )
+        budget_ops::grant_spawn_budget(&mut budget, additional, crate::time::now_epoch_millis())
     }
 
     /// SUBA-046 / pi `hasActiveSubagentChildren` (`subagent-executor.ts:433-437` @v0.43.0) — is any
@@ -165,14 +160,21 @@ impl SubagentExecutor {
         *self
             .spawn_budget
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            SpawnBudget { session_id, ..SpawnBudget::default() };
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SpawnBudget {
+            session_id,
+            ..SpawnBudget::default()
+        };
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use crate::background::RunMode;
     use crate::error::SubagentError;
@@ -232,16 +234,18 @@ mod tests {
                 2,
             ),
             (
-                vec![RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
-                    steps: vec![
-                        bare_single_step("ghost", "a"),
-                        bare_single_step("ghost", "b"),
-                        bare_single_step("ghost", "c"),
-                    ],
-                    concurrency: 3,
-                    fail_fast: false,
-                    worktree: false,
-                })],
+                vec![RunnerStep::ParallelGroup(
+                    crate::spawn::chain_graph::ParallelGroupSpec {
+                        steps: vec![
+                            bare_single_step("ghost", "a"),
+                            bare_single_step("ghost", "b"),
+                            bare_single_step("ghost", "c"),
+                        ],
+                        concurrency: 3,
+                        fail_fast: false,
+                        worktree: false,
+                    },
+                )],
                 3,
             ),
             (vec![dynamic(Some(5))], 5),
@@ -299,5 +303,4 @@ mod tests {
             "an empty graph must not have consumed the session's spawn"
         );
     }
-
 }

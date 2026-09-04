@@ -53,7 +53,10 @@ impl EventStreamDecoder {
         if self.buffer.len() < total_len {
             return Ok(None);
         }
-        let prelude = self.buffer.get(..8).ok_or("truncated event-stream prelude")?;
+        let prelude = self
+            .buffer
+            .get(..8)
+            .ok_or("truncated event-stream prelude")?;
         if crc32(prelude) != prelude_crc {
             return Err("event-stream prelude checksum mismatch".to_string());
         }

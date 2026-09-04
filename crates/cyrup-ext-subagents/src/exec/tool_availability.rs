@@ -161,7 +161,12 @@ pub fn read_child_tool_diagnostic(
     if !file_path.exists() {
         return Ok(None);
     }
-    let malformed = || format!("Malformed child tool diagnostic at '{}'.", file_path.display());
+    let malformed = || {
+        format!(
+            "Malformed child tool diagnostic at '{}'.",
+            file_path.display()
+        )
+    };
     let bytes = std::fs::read(file_path).map_err(|_| malformed())?;
     let parsed: ChildToolDiagnostic = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
     // pi's `stringArray` guard: every entry must be a non-empty string. serde has already enforced
@@ -296,7 +301,10 @@ mod tests {
             write_child_tool_diagnostic(&path, &names(&["read"]), &names(&["read"]), None, None)
                 .is_none()
         );
-        assert!(!path.exists(), "a stale diagnostic must be removed, not left");
+        assert!(
+            !path.exists(),
+            "a stale diagnostic must be removed, not left"
+        );
     }
 
     /// pi's `PI_CORE_CHILD_TOOLS` floor: the seven builtins count as available even when the
@@ -336,15 +344,26 @@ mod tests {
             "only the MISSING mcp name belongs in the subset"
         );
         let text = format_child_tool_diagnostic(&with_mcp);
-        assert!(text.starts_with("Agent 'worker' requested unavailable child tools: mcp__srv__a, ext_tool."), "{text}");
-        assert!(text.contains("host/pi-mcp-adapter registration problem"), "{text}");
+        assert!(
+            text.starts_with(
+                "Agent 'worker' requested unavailable child tools: mcp__srv__a, ext_tool."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("host/pi-mcp-adapter registration problem"),
+            "{text}"
+        );
 
         // Round-trip: what the child wrote is what the parent reads and formats.
         let read = read_child_tool_diagnostic(Some(&path))
             .expect("well-formed")
             .expect("present");
         assert_eq!(read, with_mcp);
-        assert_eq!(read_child_tool_diagnostic_error(Some(&path)).as_deref(), Some(text.as_str()));
+        assert_eq!(
+            read_child_tool_diagnostic_error(Some(&path)).as_deref(),
+            Some(text.as_str())
+        );
 
         // No MCP overlap: the key is absent and the extra line is gone.
         let no_mcp = write_child_tool_diagnostic(
@@ -357,10 +376,16 @@ mod tests {
         .expect("one missing tool");
         assert_eq!(no_mcp.missing_mcp_direct_tools, None);
         let text = format_child_tool_diagnostic(&no_mcp);
-        assert!(text.starts_with("Subagent requested unavailable child tools: ext_tool."), "{text}");
+        assert!(
+            text.starts_with("Subagent requested unavailable child tools: ext_tool."),
+            "{text}"
+        );
         assert!(!text.contains("pi-mcp-adapter"), "{text}");
         let raw = std::fs::read_to_string(&path).expect("readable");
-        assert!(!raw.contains("missingMcpDirectTools"), "an empty subset is an ABSENT key: {raw}");
+        assert!(
+            !raw.contains("missingMcpDirectTools"),
+            "an empty subset is an ABSENT key: {raw}"
+        );
     }
 
     /// No path configured, and a configured path with no file, are both "nothing to report" —
@@ -372,9 +397,13 @@ mod tests {
         assert_eq!(read_child_tool_diagnostic_error(None), None);
         assert_eq!(read_child_tool_diagnostic_error(Some(&path)), None);
 
-        std::fs::write(&path, b"{\"required\": [\"\"], \"available\": [], \"missing\": [\"x\"]}")
-            .expect("write");
-        let reported = read_child_tool_diagnostic_error(Some(&path)).expect("malformed is reported");
+        std::fs::write(
+            &path,
+            b"{\"required\": [\"\"], \"available\": [], \"missing\": [\"x\"]}",
+        )
+        .expect("write");
+        let reported =
+            read_child_tool_diagnostic_error(Some(&path)).expect("malformed is reported");
         assert!(
             reported.starts_with("Failed to read child tool availability diagnostic: Malformed child tool diagnostic at "),
             "{reported}"
@@ -397,7 +426,10 @@ mod tests {
         assert_eq!(read_mcp_direct_child_tools(&get(Some("  "))), None);
         assert_eq!(read_mcp_direct_child_tools(&get(Some("not json"))), None);
         assert_eq!(read_mcp_direct_child_tools(&get(Some("[1,2]"))), None);
-        assert_eq!(read_mcp_direct_child_tools(&get(Some("[\"a\",\"\"]"))), None);
+        assert_eq!(
+            read_mcp_direct_child_tools(&get(Some("[\"a\",\"\"]"))),
+            None
+        );
         assert_eq!(
             read_mcp_direct_child_tools(&get(Some("[\"a\",\"b\"]"))),
             Some(names(&["a", "b"]))

@@ -23,22 +23,27 @@
 //!
 //! These tests drive REAL runs through the extension seam and read the anchor off the finalized
 //! transcript message, never off a tool's return value.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use crate::{AgentSession, SessionBuilder, SessionConfig};
 use cyrup_core::{
     CancelToken, Content, ExtensionId, StopReason, Tool, ToolCallId, ToolError, ToolResult,
     ToolUpdateSink,
 };
-use cyrup_ext::{ExtError, HostCtx, HookOutcome, HostEvent, InitApi, NativeExtension};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
-};
+use cyrup_ext::{ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
 use cyrup_provider::Provider;
-use crate::{AgentSession, SessionBuilder, SessionConfig};
+use cyrup_provider::faux::{
+    FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
+};
 use tempfile::TempDir;
 
 // ------------------------------------------------------------------------------ fixtures ----
@@ -55,7 +60,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -104,8 +113,11 @@ impl Tool for ExtLoaderTool {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        let session =
-            self.slot.get().and_then(Weak::upgrade).ok_or_else(|| ToolError::new("no session"))?;
+        let session = self
+            .slot
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| ToolError::new("no session"))?;
         let mut names = session.active_tool_names();
         match self.what {
             Widen::AddLate => names.push("late".to_string()),
@@ -117,7 +129,10 @@ impl Tool for ExtLoaderTool {
             Widen::Nothing => {}
         }
         session.set_active_tools_by_name(&names).await;
-        Ok(ToolResult { content: vec![Content::text("loaded")], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("loaded")],
+            ..Default::default()
+        })
     }
 }
 
@@ -143,7 +158,10 @@ impl Tool for LateTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.ran.fetch_add(1, Ordering::SeqCst);
-        Ok(ToolResult { content: vec![Content::text("late-ran")], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("late-ran")],
+            ..Default::default()
+        })
     }
 }
 
@@ -192,7 +210,9 @@ fn faux_script(offered: &OfferedTools, script: Vec<Reply>) -> Arc<FauxProvider> 
         .map(|reply| {
             let cap = offered.clone();
             FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-                cap.lock().unwrap().push(ctx.tools.iter().map(|t| t.name.clone()).collect());
+                cap.lock()
+                    .unwrap()
+                    .push(ctx.tools.iter().map(|t| t.name.clone()).collect());
                 match reply {
                     Reply::Call(name) => faux_assistant_message(
                         vec![faux_tool_call(name.to_string(), serde_json::json!({}))],
@@ -232,14 +252,26 @@ async fn session_with_ext(
     let _ = slot.set(Arc::downgrade(&session));
     // Start from a known active set: the built-ins plus `ext_loader`, with `late` left
     // registered-but-inactive — the state Pi's `dynamic-tools.ts` example leaves a tool in.
-    let mut names: Vec<String> =
-        session.active_tool_names().into_iter().filter(|n| n != "late").collect();
+    let mut names: Vec<String> = session
+        .active_tool_names()
+        .into_iter()
+        .filter(|n| n != "late")
+        .collect();
     names.push("ext_loader".to_string());
     session.set_active_tools_by_name(&names).await;
     let active = session.active_tool_names();
-    assert!(active.iter().any(|n| n == "ext_loader"), "the extension tool is active: {active:?}");
-    assert!(active.iter().any(|n| n == "read"), "a built-in is active too: {active:?}");
-    assert!(!active.iter().any(|n| n == "late"), "`late` is inactive: {active:?}");
+    assert!(
+        active.iter().any(|n| n == "ext_loader"),
+        "the extension tool is active: {active:?}"
+    );
+    assert!(
+        active.iter().any(|n| n == "read"),
+        "a built-in is active too: {active:?}"
+    );
+    assert!(
+        !active.iter().any(|n| n == "late"),
+        "`late` is inactive: {active:?}"
+    );
     (session, late_ran)
 }
 
@@ -269,7 +301,11 @@ async fn the_host_derives_added_tool_names_for_an_extension_tool_that_widens_the
     let offered: OfferedTools = Arc::new(Mutex::new(Vec::new()));
     let faux = faux_script(
         &offered,
-        vec![Reply::Call("ext_loader"), Reply::Call("late"), Reply::Text("done")],
+        vec![
+            Reply::Call("ext_loader"),
+            Reply::Call("late"),
+            Reply::Text("done"),
+        ],
     );
     let (session, late_ran) = session_with_ext(&fx, faux, Widen::AddLate).await;
 
@@ -286,10 +322,25 @@ async fn the_host_derives_added_tool_names_for_an_extension_tool_that_widens_the
 
     // And the derivation is not cosmetic: the anchored tool was genuinely callable afterwards.
     let turns = offered.lock().unwrap().clone();
-    assert!(turns.len() >= 2, "the run drove at least two turns: {turns:?}");
-    assert!(!turns[0].iter().any(|t| t == "late"), "turn 1 did not offer `late`: {:?}", turns[0]);
-    assert!(turns[1].iter().any(|t| t == "late"), "turn 2 offered `late`: {:?}", turns[1]);
-    assert_eq!(late_ran.load(Ordering::SeqCst), 1, "`late` actually executed");
+    assert!(
+        turns.len() >= 2,
+        "the run drove at least two turns: {turns:?}"
+    );
+    assert!(
+        !turns[0].iter().any(|t| t == "late"),
+        "turn 1 did not offer `late`: {:?}",
+        turns[0]
+    );
+    assert!(
+        turns[1].iter().any(|t| t == "late"),
+        "turn 2 offered `late`: {:?}",
+        turns[1]
+    );
+    assert_eq!(
+        late_ran.load(Ordering::SeqCst),
+        1,
+        "`late` actually executed"
+    );
 }
 
 /// Pi's bail-out: a change that REMOVES a previously-active tool invalidates the model's cached
@@ -299,17 +350,29 @@ async fn the_host_derives_added_tool_names_for_an_extension_tool_that_widens_the
 async fn a_non_additive_change_records_no_anchor_even_though_a_tool_was_added() {
     let fx = fixture();
     let offered: OfferedTools = Arc::new(Mutex::new(Vec::new()));
-    let faux = faux_script(&offered, vec![Reply::Call("ext_loader"), Reply::Text("done")]);
+    let faux = faux_script(
+        &offered,
+        vec![Reply::Call("ext_loader"), Reply::Text("done")],
+    );
     let (session, _) = session_with_ext(&fx, faux, Widen::SwapForLate).await;
 
     let _ = session.prompt("go").await.unwrap();
     session.wait_for_idle().await;
 
-    assert!(anchors(&session).await.is_empty(), "a removal suppresses the anchor entirely");
+    assert!(
+        anchors(&session).await.is_empty(),
+        "a removal suppresses the anchor entirely"
+    );
     // The swap really did happen — otherwise this test would pass for the wrong reason.
     let after = session.active_tool_names();
-    assert!(after.iter().any(|n| n == "late"), "`late` was added: {after:?}");
-    assert!(!after.iter().any(|n| n == "read"), "`read` was removed: {after:?}");
+    assert!(
+        after.iter().any(|n| n == "late"),
+        "`late` was added: {after:?}"
+    );
+    assert!(
+        !after.iter().any(|n| n == "read"),
+        "`read` was removed: {after:?}"
+    );
 }
 
 /// An ordinary tool call changes nothing, so no result carries an anchor. This is the shape of
@@ -318,14 +381,26 @@ async fn a_non_additive_change_records_no_anchor_even_though_a_tool_was_added() 
 async fn an_unchanged_active_set_records_no_anchor() {
     let fx = fixture();
     let offered: OfferedTools = Arc::new(Mutex::new(Vec::new()));
-    let faux = faux_script(&offered, vec![Reply::Call("ext_loader"), Reply::Text("done")]);
+    let faux = faux_script(
+        &offered,
+        vec![Reply::Call("ext_loader"), Reply::Text("done")],
+    );
     let (session, _) = session_with_ext(&fx, faux, Widen::Nothing).await;
 
-    let session_file = session.session_file().await.expect("the session persists to a file");
+    let session_file = session
+        .session_file()
+        .await
+        .expect("the session persists to a file");
     let _ = session.prompt("go").await.unwrap();
     session.wait_for_idle().await;
 
-    assert!(anchors(&session).await.is_empty(), "no anchor when nothing changed");
+    assert!(
+        anchors(&session).await.is_empty(),
+        "no anchor when nothing changed"
+    );
     let raw = std::fs::read_to_string(&session_file).unwrap();
-    assert!(!raw.contains("addedToolNames"), "and no key on disk either:\n{raw}");
+    assert!(
+        !raw.contains("addedToolNames"),
+        "and no key on disk either:\n{raw}"
+    );
 }

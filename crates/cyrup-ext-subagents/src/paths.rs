@@ -346,8 +346,10 @@ mod tests {
     /// `unsafe` under Rust 2024 and this crate is `#![forbid(unsafe_code)]`, which is precisely why
     /// every resolver above takes a lookup.
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
-        let owned: Vec<(String, std::ffi::OsString)> =
-            pairs.iter().map(|(k, v)| ((*k).to_string(), std::ffi::OsString::from(*v))).collect();
+        let owned: Vec<(String, std::ffi::OsString)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), std::ffi::OsString::from(*v)))
+            .collect();
         move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
@@ -388,7 +390,11 @@ mod tests {
             )
             .expect("the fixture names a home");
 
-            assert_eq!(dirs.home, PathBuf::from("/home/u"), "{key}: the fixture home must win");
+            assert_eq!(
+                dirs.home,
+                PathBuf::from("/home/u"),
+                "{key}: the fixture home must win"
+            );
             assert_eq!(
                 resolve_agent_dir_from(&dirs.home, &lookup),
                 dirs.agent_dir,
@@ -426,7 +432,11 @@ mod tests {
         )
         .expect("the fixture names a home");
 
-        assert_eq!(dirs.home, PathBuf::from("/sandbox"), "CYRUP_HOME must beat HOME");
+        assert_eq!(
+            dirs.home,
+            PathBuf::from("/sandbox"),
+            "CYRUP_HOME must beat HOME"
+        );
         assert_eq!(
             dirs.agent_dir,
             PathBuf::from("/sandbox/agents"),
@@ -448,7 +458,10 @@ mod tests {
     fn the_home_ladder_is_cyrup_configs_with_a_library_terminal() {
         let lookup = env(&[("CYRUP_HOME", "/sandbox"), ("HOME", "/real")]);
         assert_eq!(home_dir_from(&lookup), PathBuf::from("/sandbox"));
-        assert_eq!(home_dir_from(&env(&[("HOME", "/real")])), PathBuf::from("/real"));
+        assert_eq!(
+            home_dir_from(&env(&[("HOME", "/real")])),
+            PathBuf::from("/real")
+        );
     }
 
     /// `Roots::from_lookup` resolves every root from ONE lookup, and each lands where its own
@@ -483,7 +496,10 @@ mod tests {
             "the run scratch must never be relative, got {:?}",
             roots.run_scratch()
         );
-        assert!(!roots.run_scratch().starts_with("/real"), "and never under the real home");
+        assert!(
+            !roots.run_scratch().starts_with("/real"),
+            "and never under the real home"
+        );
     }
 
     /// The parent -> child sandbox handoff, which is the invariant that could break silently when

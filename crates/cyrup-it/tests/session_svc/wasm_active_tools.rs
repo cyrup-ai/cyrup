@@ -16,14 +16,19 @@
 // always true here. Re-spelled in cyrup-it it would name THIS crate's `wasm-host`, which
 // `--features it` does not enable, and every test below would SILENTLY not compile in.
 // See the `[[test]]` note in crates/cyrup-it/Cargo.toml.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{ExtensionId, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
 use cyrup_session_svc::{SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 
@@ -47,7 +52,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -103,16 +112,32 @@ async fn wasm_guest_set_active_tools_restricts_the_live_agent() {
 
     // The guest registered `/planmode`.
     assert!(
-        session.services().ext_host.registry().command_names().unwrap().iter().any(|n| n == "planmode"),
+        session
+            .services()
+            .ext_host
+            .registry()
+            .command_names()
+            .unwrap()
+            .iter()
+            .any(|n| n == "planmode"),
         "the guest-registered `/planmode` command is in the host command registry"
     );
 
     // Baseline: the full built-in tool set is active (more than one tool, and `write` is present —
     // it is what `/planmode` will restrict AWAY).
     let baseline = session.active_tool_names();
-    assert!(baseline.len() > 1, "more than one tool active by default: {baseline:?}");
-    assert!(baseline.contains(&"read".to_string()), "read active by default: {baseline:?}");
-    assert!(baseline.contains(&"write".to_string()), "write active by default: {baseline:?}");
+    assert!(
+        baseline.len() > 1,
+        "more than one tool active by default: {baseline:?}"
+    );
+    assert!(
+        baseline.contains(&"read".to_string()),
+        "read active by default: {baseline:?}"
+    );
+    assert!(
+        baseline.contains(&"write".to_string()),
+        "write active by default: {baseline:?}"
+    );
 
     // Drive the guest command through the REAL run path: prompt -> _tryExecuteExtensionCommand ->
     // execute-command -> the guest's `pi.setActiveTools(["read"])` -> apply_pending_control.
@@ -137,7 +162,10 @@ async fn wasm_guest_set_active_tools_restricts_the_live_agent() {
     session.wait_for_idle().await;
 
     let turns = captured.lock().unwrap().clone();
-    assert!(!turns.is_empty(), "the agent drove at least one real turn against the provider");
+    assert!(
+        !turns.is_empty(),
+        "the agent drove at least one real turn against the provider"
+    );
     let last = turns.last().unwrap();
     assert_eq!(
         last,

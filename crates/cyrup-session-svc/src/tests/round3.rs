@@ -2,21 +2,27 @@
 //! toggles, the immediate-bash seam, dynamic tools + custom tools, `setModel(Model)` + the typed
 //! `cycleModel`/scoped models, the `prompt` ordering fix + skill/template expansion, `clone_at`, and
 //! the runtime `modelFallbackMessage` getter.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cyrup_core::{
-    TerminateHint,
-    AssistantMessage, Content, StopReason, Tool, ToolError, ToolResult, ToolUpdateSink,
-};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxConfig, FauxModelDefinition, FauxProvider,
-};
-use cyrup_provider::Provider;
 use crate::{
     BashOptions, ScopedModel, SessionBuilder, SessionConfig, SessionFactory, SessionTarget,
+};
+use cyrup_core::{
+    AssistantMessage, Content, StopReason, TerminateHint, Tool, ToolError, ToolResult,
+    ToolUpdateSink,
+};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{
+    FauxConfig, FauxModelDefinition, FauxProvider, faux_assistant_message, faux_text,
+    faux_tool_call,
 };
 use tempfile::TempDir;
 
@@ -32,7 +38,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -67,7 +77,9 @@ struct EchoTool {
 }
 impl EchoTool {
     fn new() -> Self {
-        Self { params: serde_json::json!({"type": "object", "properties": {}}) }
+        Self {
+            params: serde_json::json!({"type": "object", "properties": {}}),
+        }
     }
 }
 #[async_trait::async_trait]
@@ -91,7 +103,12 @@ impl Tool for EchoTool {
         _cancel: cyrup_core::CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("echo")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("echo")],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -102,13 +119,23 @@ async fn retry_toggles_classification_and_backoff() {
     let fx = fixture();
     // Fast backoff so the success path completes quickly.
     let mut cli = cyrup_config::Settings::new();
-    cli.set_field("retry", serde_json::json!({"enabled": true, "maxRetries": 2, "baseDelayMs": 3}))
-        .unwrap();
+    cli.set_field(
+        "retry",
+        serde_json::json!({"enabled": true, "maxRetries": 2, "baseDelayMs": 3}),
+    )
+    .unwrap();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux, base_config(&fx)).cli_settings(cli).build().await.unwrap();
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .cli_settings(cli)
+        .build()
+        .await
+        .unwrap();
 
     // Toggle mirrors the settings default, then the override.
-    assert!(session.auto_retry_enabled(), "settings default retry.enabled = true");
+    assert!(
+        session.auto_retry_enabled(),
+        "settings default retry.enabled = true"
+    );
     session.set_auto_retry_enabled(false);
     assert!(!session.auto_retry_enabled());
     session.set_auto_retry_enabled(true);
@@ -121,25 +148,51 @@ async fn retry_toggles_classification_and_backoff() {
         StopReason::Error,
         "overloaded: please retry",
     );
-    assert!(session.is_retryable_error(&transient), "overloaded is retryable");
+    assert!(
+        session.is_retryable_error(&transient),
+        "overloaded is retryable"
+    );
     let clean = faux_assistant_message(vec![faux_text("done")], StopReason::Stop);
-    assert!(!session.is_retryable_error(&clean), "a clean stop is never retryable");
+    assert!(
+        !session.is_retryable_error(&clean),
+        "a clean stop is never retryable"
+    );
 
     // will_retry_after_agent_end scans the last assistant message.
-    assert!(session
-        .will_retry_after_agent_end(&[Arc::new(cyrup_agent::AgentMessage::Assistant(Arc::new(transient.clone())))]));
-    assert!(!session
-        .will_retry_after_agent_end(&[Arc::new(cyrup_agent::AgentMessage::Assistant(Arc::new(clean.clone())))]));
+    assert!(
+        session.will_retry_after_agent_end(&[Arc::new(cyrup_agent::AgentMessage::Assistant(
+            Arc::new(transient.clone())
+        ))])
+    );
+    assert!(!session.will_retry_after_agent_end(&[Arc::new(
+        cyrup_agent::AgentMessage::Assistant(Arc::new(clean.clone()))
+    )]));
 
     // prepare_retry: first attempt waits the backoff and signals continue; the budget then exhausts.
     assert_eq!(session.retry_attempt(), 0);
-    assert!(session.prepare_retry(&transient).await, "attempt 1 continues");
+    assert!(
+        session.prepare_retry(&transient).await,
+        "attempt 1 continues"
+    );
     assert_eq!(session.retry_attempt(), 1);
-    assert!(session.prepare_retry(&transient).await, "attempt 2 continues");
+    assert!(
+        session.prepare_retry(&transient).await,
+        "attempt 2 continues"
+    );
     assert_eq!(session.retry_attempt(), 2);
-    assert!(!session.prepare_retry(&transient).await, "budget exhausted at maxRetries");
-    assert_eq!(session.retry_attempt(), 2, "attempt count is preserved on exhaustion");
-    assert!(!session.is_retrying(), "no backoff is in flight after prepare returns");
+    assert!(
+        !session.prepare_retry(&transient).await,
+        "budget exhausted at maxRetries"
+    );
+    assert_eq!(
+        session.retry_attempt(),
+        2,
+        "attempt count is preserved on exhaustion"
+    );
+    assert!(
+        !session.is_retrying(),
+        "no backoff is in flight after prepare returns"
+    );
 }
 
 // -------------------------------------------------------------------------- auto-compaction ----
@@ -148,19 +201,31 @@ async fn retry_toggles_classification_and_backoff() {
 async fn auto_compaction_toggle_and_is_compacting() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
-    assert!(session.auto_compaction_enabled(), "settings default compaction.enabled = true");
+    assert!(
+        session.auto_compaction_enabled(),
+        "settings default compaction.enabled = true"
+    );
     assert!(!session.is_compacting(), "nothing compacting at rest");
     session.set_auto_compaction_enabled(false);
     assert!(!session.auto_compaction_enabled());
 
     // With auto-compaction disabled, check_compaction is a no-op.
     let small = faux_assistant_message(vec![faux_text("hi")], StopReason::Stop);
-    assert!(!session.check_compaction(&small, false).await.unwrap(), "disabled = never compacts");
+    assert!(
+        !session.check_compaction(&small, false).await.unwrap(),
+        "disabled = never compacts"
+    );
     session.set_auto_compaction_enabled(true);
     // A tiny session is well under threshold → still no compaction.
-    assert!(!session.check_compaction(&small, false).await.unwrap(), "small session under threshold");
+    assert!(
+        !session.check_compaction(&small, false).await.unwrap(),
+        "small session under threshold"
+    );
 }
 
 // ------------------------------------------------------------------------------ bash seam ----
@@ -169,7 +234,10 @@ async fn auto_compaction_toggle_and_is_compacting() {
 async fn execute_bash_records_result_and_persists() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     assert!(!session.is_bash_running());
     assert!(!session.has_pending_bash_messages());
@@ -178,14 +246,27 @@ async fn execute_bash_records_result_and_persists() {
         .await
         .expect("a well-formed local echo command succeeds");
     assert_eq!(result.exit_code, Some(0), "echo exits 0");
-    assert!(result.output.contains("hello-bash"), "captured stdout: {:?}", result.output);
+    assert!(
+        result.output.contains("hello-bash"),
+        "captured stdout: {:?}",
+        result.output
+    );
     assert!(!result.cancelled);
-    assert!(!session.is_bash_running(), "bash slot cleared after completion");
+    assert!(
+        !session.is_bash_running(),
+        "bash slot cleared after completion"
+    );
 
     // The bash result landed in the agent transcript (not streaming) as a bashExecution message.
     let msgs = session.agent_messages().await;
     assert!(
-        msgs.iter().any(|m| matches!(m, cyrup_agent::AgentMessage::App { role: cyrup_agent::AppRole::BashExecution, .. })),
+        msgs.iter().any(|m| matches!(
+            m,
+            cyrup_agent::AgentMessage::App {
+                role: cyrup_agent::AppRole::BashExecution,
+                ..
+            }
+        )),
         "bash result recorded in transcript"
     );
     // abort_bash is idempotent when nothing runs.
@@ -229,8 +310,12 @@ fn blocking_command(started: &std::path::Path, go: &std::path::Path) -> String {
 async fn drift029_abort_bash_cancels_every_in_flight_command() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session =
-        Arc::new(SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap());
+    let session = Arc::new(
+        SessionBuilder::new(faux, base_config(&fx))
+            .build()
+            .await
+            .unwrap(),
+    );
 
     let started_a = fx.cwd.join("started-a");
     let started_b = fx.cwd.join("started-b");
@@ -251,11 +336,23 @@ async fn drift029_abort_bash_cancels_every_in_flight_command() {
 
     session.abort_bash();
 
-    let a = task_a.await.unwrap().expect("the cancelled command still returns a result");
-    let b = task_b.await.unwrap().expect("the cancelled command still returns a result");
-    assert!(a.cancelled, "the FIRST command must be cancelled too (it was orphaned): {a:?}");
+    let a = task_a
+        .await
+        .unwrap()
+        .expect("the cancelled command still returns a result");
+    let b = task_b
+        .await
+        .unwrap()
+        .expect("the cancelled command still returns a result");
+    assert!(
+        a.cancelled,
+        "the FIRST command must be cancelled too (it was orphaned): {a:?}"
+    );
     assert!(b.cancelled, "the second command must be cancelled: {b:?}");
-    assert!(!session.is_bash_running(), "the set drains as each call's guard drops");
+    assert!(
+        !session.is_bash_running(),
+        "the set drains as each call's guard drops"
+    );
 }
 
 /// DRIFT-029, second half — `is_bash_running` must answer on the whole set (pi's
@@ -268,8 +365,12 @@ async fn drift029_abort_bash_cancels_every_in_flight_command() {
 async fn drift029_is_bash_running_answers_on_the_whole_set() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session =
-        Arc::new(SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap());
+    let session = Arc::new(
+        SessionBuilder::new(faux, base_config(&fx))
+            .build()
+            .await
+            .unwrap(),
+    );
 
     let started_a = fx.cwd.join("started-a");
     let started_b = fx.cwd.join("started-b");
@@ -290,7 +391,10 @@ async fn drift029_is_bash_running_answers_on_the_whole_set() {
 
     // Release ONLY the first command and wait for it to actually return.
     std::fs::write(&go_a, b"").unwrap();
-    let a = task_a.await.unwrap().expect("the released command completes");
+    let a = task_a
+        .await
+        .unwrap()
+        .expect("the released command completes");
     assert_eq!(a.exit_code, Some(0));
     assert!(
         session.is_bash_running(),
@@ -298,9 +402,15 @@ async fn drift029_is_bash_running_answers_on_the_whole_set() {
     );
 
     std::fs::write(&go_b, b"").unwrap();
-    let b = task_b.await.unwrap().expect("the released command completes");
+    let b = task_b
+        .await
+        .unwrap()
+        .expect("the released command completes");
     assert_eq!(b.exit_code, Some(0));
-    assert!(!session.is_bash_running(), "both handles removed once both calls returned");
+    assert!(
+        !session.is_bash_running(),
+        "both handles removed once both calls returned"
+    );
 }
 
 /// The immediate-bash (`!!`/RPC) seam must prepend the managed `agent_dir/bin` onto the child
@@ -312,7 +422,10 @@ async fn drift029_is_bash_running_answers_on_the_whole_set() {
 async fn execute_bash_prepends_agent_bin_dir_to_path() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     let result = session
         .execute_bash(r#"printf '%s' "$PATH""#, BashOptions::default(), None)
@@ -321,7 +434,9 @@ async fn execute_bash_prepends_agent_bin_dir_to_path() {
     assert_eq!(result.exit_code, Some(0));
     let bin_dir = fx.agent_dir.join("bin");
     assert!(
-        result.output.starts_with(&bin_dir.to_string_lossy().into_owned()),
+        result
+            .output
+            .starts_with(&bin_dir.to_string_lossy().into_owned()),
         "expected PATH to start with the managed bin dir {bin_dir:?}, got: {:?}",
         result.output
     );
@@ -335,7 +450,10 @@ async fn execute_bash_prepends_agent_bin_dir_to_path() {
 async fn execute_bash_sanitizes_real_ansi_and_cr_from_a_live_child() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     // `printf` with a real ESC byte (\033) driving an SGR color code, plus a bare CR — exactly the
     // kind of raw terminal control bytes a real command can legitimately emit.
@@ -353,17 +471,26 @@ async fn execute_bash_sanitizes_real_ansi_and_cr_from_a_live_child() {
         "no raw ESC byte may reach the recorded output: {:?}",
         result.output
     );
-    assert!(!result.output.contains('\r'), "no raw CR may reach the recorded output: {:?}", result.output);
-    assert_eq!(result.output, "redtext\n", "the plain text survives, decorations stripped");
+    assert!(
+        !result.output.contains('\r'),
+        "no raw CR may reach the recorded output: {:?}",
+        result.output
+    );
+    assert_eq!(
+        result.output, "redtext\n",
+        "the plain text survives, decorations stripped"
+    );
 
     // The SAME sanitized text is what actually lands in the persisted transcript entry.
     let msgs = session.agent_messages().await;
     let bash_msg = msgs
         .iter()
         .find_map(|m| match m {
-            cyrup_agent::AgentMessage::App { role: cyrup_agent::AppRole::BashExecution, payload, .. } => {
-                Some(serde_json::Value::Object(payload.clone()))
-            }
+            cyrup_agent::AgentMessage::App {
+                role: cyrup_agent::AppRole::BashExecution,
+                payload,
+                ..
+            } => Some(serde_json::Value::Object(payload.clone())),
             _ => None,
         })
         .expect("a bashExecution message was recorded");
@@ -377,10 +504,17 @@ async fn execute_bash_sanitizes_real_ansi_and_cr_from_a_live_child() {
 async fn execute_bash_applies_shell_command_prefix_setting() {
     let fx = fixture();
     let mut cli = cyrup_config::Settings::new();
-    cli.set_field("shellCommandPrefix", serde_json::json!("export L4_PREFIX_TEST=from-prefix"))
-        .unwrap();
+    cli.set_field(
+        "shellCommandPrefix",
+        serde_json::json!("export L4_PREFIX_TEST=from-prefix"),
+    )
+    .unwrap();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux, base_config(&fx)).cli_settings(cli).build().await.unwrap();
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .cli_settings(cli)
+        .build()
+        .await
+        .unwrap();
 
     let result = session
         .execute_bash("echo $L4_PREFIX_TEST", BashOptions::default(), None)
@@ -399,9 +533,11 @@ async fn execute_bash_applies_shell_command_prefix_setting() {
     let bash_msg = msgs
         .iter()
         .find_map(|m| match m {
-            cyrup_agent::AgentMessage::App { role: cyrup_agent::AppRole::BashExecution, payload, .. } => {
-                Some(serde_json::Value::Object(payload.clone()))
-            }
+            cyrup_agent::AgentMessage::App {
+                role: cyrup_agent::AppRole::BashExecution,
+                payload,
+                ..
+            } => Some(serde_json::Value::Object(payload.clone())),
             _ => None,
         })
         .expect("a bashExecution message was recorded");
@@ -417,15 +553,24 @@ async fn execute_bash_applies_shell_command_prefix_setting() {
 async fn execute_bash_missing_custom_shell_path_setting_errors() {
     let fx = fixture();
     let mut cli = cyrup_config::Settings::new();
-    cli.set_field("shellPath", serde_json::json!("/no/such/shell/l4-round13-finding1-test"))
-        .unwrap();
+    cli.set_field(
+        "shellPath",
+        serde_json::json!("/no/such/shell/l4-round13-finding1-test"),
+    )
+    .unwrap();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux, base_config(&fx)).cli_settings(cli).build().await.unwrap();
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .cli_settings(cli)
+        .build()
+        .await
+        .unwrap();
 
     let err = session
         .execute_bash("echo hi", BashOptions::default(), None)
         .await
-        .expect_err("a nonexistent custom shellPath must surface as a real error, not a fabricated success");
+        .expect_err(
+            "a nonexistent custom shellPath must surface as a real error, not a fabricated success",
+        );
     assert!(
         err.to_string().contains("Custom shell path not found"),
         "expected Pi's exact error text, got: {err}"
@@ -444,18 +589,28 @@ async fn execute_bash_missing_custom_shell_path_setting_errors() {
 async fn agent_loop_bash_tool_applies_shell_command_prefix_setting() {
     let fx = fixture();
     let mut cli = cyrup_config::Settings::new();
-    cli.set_field("shellCommandPrefix", serde_json::json!("export L4_TOOL_PREFIX_TEST=from-tool-prefix"))
-        .unwrap();
+    cli.set_field(
+        "shellCommandPrefix",
+        serde_json::json!("export L4_TOOL_PREFIX_TEST=from-tool-prefix"),
+    )
+    .unwrap();
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![
         faux_assistant_message(
-            vec![faux_tool_call("bash", serde_json::json!({"command": "echo $L4_TOOL_PREFIX_TEST"}))],
+            vec![faux_tool_call(
+                "bash",
+                serde_json::json!({"command": "echo $L4_TOOL_PREFIX_TEST"}),
+            )],
             StopReason::ToolUse,
         ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let provider: Arc<dyn Provider> = faux;
-    let session = SessionBuilder::new(provider, base_config(&fx)).cli_settings(cli).build().await.unwrap();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(cli)
+        .build()
+        .await
+        .unwrap();
 
     let _ = session.prompt("run the bash tool").await.unwrap();
     session.wait_for_idle().await;
@@ -490,7 +645,10 @@ async fn agent_loop_bash_tool_applies_shell_command_prefix_setting() {
 async fn execute_bash_truncates_and_spills_large_real_output() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     // ~3000 lines x ~40 bytes ≈ 120KB, comfortably over both the 50KB byte cap and the 2000-line cap.
     let result = session
@@ -502,14 +660,20 @@ async fn execute_bash_truncates_and_spills_large_real_output() {
         .await
         .expect("the loop runs");
     assert_eq!(result.exit_code, Some(0));
-    assert!(result.truncated, "120KB of output must be reported as truncated");
+    assert!(
+        result.truncated,
+        "120KB of output must be reported as truncated"
+    );
     assert!(
         result.output.len() <= 2 * 50 * 1024,
         "the returned preview must be tail-truncated, not the full 120KB: {} bytes",
         result.output.len()
     );
 
-    let full_path = result.full_output_path.clone().expect("a temp file path must be recorded");
+    let full_path = result
+        .full_output_path
+        .clone()
+        .expect("a temp file path must be recorded");
     let full_contents = std::fs::read_to_string(&full_path)
         .unwrap_or_else(|e| panic!("full output temp file must be readable at {full_path}: {e}"));
     assert!(
@@ -528,9 +692,11 @@ async fn execute_bash_truncates_and_spills_large_real_output() {
     let bash_msg = msgs
         .iter()
         .find_map(|m| match m {
-            cyrup_agent::AgentMessage::App { role: cyrup_agent::AppRole::BashExecution, payload, .. } => {
-                Some(serde_json::Value::Object(payload.clone()))
-            }
+            cyrup_agent::AgentMessage::App {
+                role: cyrup_agent::AppRole::BashExecution,
+                payload,
+                ..
+            } => Some(serde_json::Value::Object(payload.clone())),
             _ => None,
         })
         .expect("a bashExecution message was recorded");
@@ -550,9 +716,15 @@ async fn dynamic_tools_toggle_active_set_and_register_custom() {
 
     // The default active set is the built-in selection; the custom tool is enable-able but inactive.
     let active = session.active_tool_names();
-    assert!(active.contains(&"read".to_string()), "read active by default: {active:?}");
+    assert!(
+        active.contains(&"read".to_string()),
+        "read active by default: {active:?}"
+    );
     let all: Vec<String> = session.all_tools().into_iter().map(|t| t.name).collect();
-    assert!(all.contains(&"echo".to_string()), "custom tool registered: {all:?}");
+    assert!(
+        all.contains(&"echo".to_string()),
+        "custom tool registered: {all:?}"
+    );
     assert!(session.tool_definition("echo").is_some());
     assert!(
         !session.active_tool_names().contains(&"echo".to_string()),
@@ -560,17 +732,30 @@ async fn dynamic_tools_toggle_active_set_and_register_custom() {
     );
 
     // Toggle the active set down to just read + echo; the agent's tool array follows.
-    session.set_active_tools_by_name(&["read".to_string(), "echo".to_string()]).await;
+    session
+        .set_active_tools_by_name(&["read".to_string(), "echo".to_string()])
+        .await;
     let active = session.active_tool_names();
     assert_eq!(active, vec!["read".to_string(), "echo".to_string()]);
     let snap = session.agent_messages().await; // force a snapshot to ensure no panic
     let _ = snap;
     // The agent's tool set now reflects the toggle.
-    assert!(session.tool_definition("echo").unwrap().active, "echo is active after toggle");
-    assert!(!session.tool_definition("write").map(|t| t.active).unwrap_or(false), "write toggled off");
+    assert!(
+        session.tool_definition("echo").unwrap().active,
+        "echo is active after toggle"
+    );
+    assert!(
+        !session
+            .tool_definition("write")
+            .map(|t| t.active)
+            .unwrap_or(false),
+        "write toggled off"
+    );
 
     // Unknown names are ignored.
-    session.set_active_tools_by_name(&["read".to_string(), "nope".to_string()]).await;
+    session
+        .set_active_tools_by_name(&["read".to_string(), "nope".to_string()])
+        .await;
     assert_eq!(session.active_tool_names(), vec!["read".to_string()]);
 }
 
@@ -596,31 +781,60 @@ async fn set_model_resolved_auth_precheck_and_typed_cycle() {
         .unwrap();
 
     // set_model_resolved on an in-catalog model succeeds.
-    let faux2 = provider.models().iter().find(|m| m.id.as_str() == "faux-2").unwrap().clone();
+    let faux2 = provider
+        .models()
+        .iter()
+        .find(|m| m.id.as_str() == "faux-2")
+        .unwrap()
+        .clone();
     assert!(session.has_configured_auth(&faux2));
     session.set_model_resolved(faux2.clone()).await.unwrap();
-    assert_eq!(session.model().expect("session must have a resolved model").model.as_str(), "faux-2");
+    assert_eq!(
+        session
+            .model()
+            .expect("session must have a resolved model")
+            .model
+            .as_str(),
+        "faux-2"
+    );
 
     // A fabricated model not in the catalog fails the auth-proxy precheck.
     let mut bogus = faux2.clone();
     bogus.id = "ghost".into();
     assert!(!session.has_configured_auth(&bogus));
-    assert!(session.set_model_resolved(bogus).await.is_err(), "out-of-catalog model rejected");
+    assert!(
+        session.set_model_resolved(bogus).await.is_err(),
+        "out-of-catalog model rejected"
+    );
 
     // Scoped set with a per-model thinking level reports is_scoped = true. Asserted BEFORE the
     // available arm because that arm now legitimately leaves the session on ANOTHER provider (it
     // walks every configured provider, Pi `_modelRuntime.getAvailable()`), which would put this
     // fixture's two scoped models out of the newly installed provider's catalog.
     session.set_scoped_models(vec![
-        ScopedModel { model: provider.models()[0].clone(), thinking_level: None },
-        ScopedModel { model: faux2.clone(), thinking_level: Some(cyrup_core::ModelThinkingLevel::High) },
+        ScopedModel {
+            model: provider.models()[0].clone(),
+            thinking_level: None,
+        },
+        ScopedModel {
+            model: faux2.clone(),
+            thinking_level: Some(cyrup_core::ModelThinkingLevel::High),
+        },
     ]);
-    let r = session.cycle_model(true).await.unwrap().expect("scoped cycle");
+    let r = session
+        .cycle_model(true)
+        .await
+        .unwrap()
+        .expect("scoped cycle");
     assert!(r.is_scoped, "scoped set configured → scoped path");
 
     // Typed cycle over the available (auth-filtered) registry reports is_scoped = false.
     session.set_scoped_models(Vec::new());
-    let r = session.cycle_model(true).await.unwrap().expect("two models cycle");
+    let r = session
+        .cycle_model(true)
+        .await
+        .unwrap()
+        .expect("two models cycle");
     assert!(!r.is_scoped, "no scoped set configured → available path");
 }
 
@@ -640,7 +854,10 @@ async fn prompt_injects_next_turn_after_user_and_expands_skill() {
 
     let faux = Arc::new(FauxProvider::new());
     let provider: Arc<dyn Provider> = faux.clone();
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     // Stage a next-turn custom message; it must be injected AFTER the user message (Pi ordering).
     session
@@ -654,17 +871,28 @@ async fn prompt_injects_next_turn_after_user_and_expands_skill() {
         .await
         .unwrap();
 
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let _ = session.prompt("/skill:demo extra args").await.unwrap();
     session.wait_for_idle().await;
 
     let msgs = session.agent_messages().await;
-    let user_idx = msgs.iter().position(|m| matches!(m, cyrup_agent::AgentMessage::User { .. }));
-    let custom_idx = msgs
+    let user_idx = msgs
         .iter()
-        .position(|m| matches!(m, cyrup_agent::AgentMessage::Custom { kind, .. } if kind == "note"));
-    let (u, c) = (user_idx.expect("user message present"), custom_idx.expect("next-turn custom present"));
-    assert!(u < c, "user message must precede the injected next-turn message (Pi ordering): {u} < {c}");
+        .position(|m| matches!(m, cyrup_agent::AgentMessage::User { .. }));
+    let custom_idx = msgs.iter().position(
+        |m| matches!(m, cyrup_agent::AgentMessage::Custom { kind, .. } if kind == "note"),
+    );
+    let (u, c) = (
+        user_idx.expect("user message present"),
+        custom_idx.expect("next-turn custom present"),
+    );
+    assert!(
+        u < c,
+        "user message must precede the injected next-turn message (Pi ordering): {u} < {c}"
+    );
 
     // The skill command expanded into the user message body.
     if let cyrup_agent::AgentMessage::User { content, .. } = &msgs[u] {
@@ -675,8 +903,14 @@ async fn prompt_injects_next_turn_after_user_and_expands_skill() {
                 _ => None,
             })
             .collect();
-        assert!(text.contains("SKILL_BODY_MARKER"), "skill body expanded: {text}");
-        assert!(text.contains("<skill name=\"demo\""), "skill block wrapper present");
+        assert!(
+            text.contains("SKILL_BODY_MARKER"),
+            "skill body expanded: {text}"
+        );
+        assert!(
+            text.contains("<skill name=\"demo\""),
+            "skill block wrapper present"
+        );
         assert!(text.contains("extra args"), "trailing args preserved");
     } else {
         panic!("expected a user message at index {u}");
@@ -690,22 +924,34 @@ async fn clone_at_creates_new_file_and_runtime_surfaces_fallback() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
     let provider: Arc<dyn Provider> = faux.clone();
-    let session = SessionBuilder::new(provider.clone(), base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(provider.clone(), base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let _ = session.prompt("hi").await.unwrap();
     session.wait_for_idle().await;
 
     let original = session.session_id().clone();
     let cloned = session.clone_at(None).await.unwrap();
-    assert_ne!(cloned, original, "clone_at branches into a distinct session id");
+    assert_ne!(
+        cloned, original,
+        "clone_at branches into a distinct session id"
+    );
 
     // Runtime re-surfaces the (absent) model-fallback message of its active session.
     let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
     let runtime = crate::AgentSessionRuntime::create(factory, SessionTarget::New)
         .await
         .unwrap();
-    assert!(runtime.model_fallback_message().await.is_none(), "clean model resolve = no fallback");
+    assert!(
+        runtime.model_fallback_message().await.is_none(),
+        "clean model resolve = no fallback"
+    );
 }
 
 /// The bash tool the MODEL calls must get the same PATH as the user-facing `/bash` seam.
@@ -734,15 +980,20 @@ async fn the_agent_loop_bash_tool_also_prepends_the_agent_bin_dir_to_path() {
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let provider: Arc<dyn Provider> = faux;
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     let _ = session.prompt("print the path").await.expect("prompt");
     session.wait_for_idle().await;
 
     let bin_dir = fx.agent_dir.join("bin").to_string_lossy().into_owned();
-    let saw_bin_dir = session.messages().await.iter().any(|m| {
-        format!("{m:?}").contains(&bin_dir)
-    });
+    let saw_bin_dir = session
+        .messages()
+        .await
+        .iter()
+        .any(|m| format!("{m:?}").contains(&bin_dir));
     assert!(
         saw_bin_dir,
         "the agent-loop bash tool's PATH must contain the managed bin dir {bin_dir:?}"

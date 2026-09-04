@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::error::SubagentError;
 use crate::exec::ResolvedAgentPersona;
 use crate::fork_context::{
-    resolve_effective_context, ContextMode, ContextRequest, ForkContextResolver,
+    ContextMode, ContextRequest, ForkContextResolver, resolve_effective_context,
 };
 use crate::spawn::chain_graph::{GroupStepResult, RunnerStep, SingleStepSpec, StepResult};
 
@@ -92,7 +92,11 @@ fn describe_chain_step(step: &RunnerStep) -> String {
 /// The full `chainDesc` pi joins with `" -> "` (`async-execution.ts:1183-1197`) to build the async-start
 /// headline for a CHAIN/PARALLEL run.
 pub(crate) fn describe_chain(graph: &[RunnerStep]) -> String {
-    graph.iter().map(describe_chain_step).collect::<Vec<_>>().join(" -> ")
+    graph
+        .iter()
+        .map(describe_chain_step)
+        .collect::<Vec<_>>()
+        .join(" -> ")
 }
 
 /// Resolve every step's effective fork-context and, for each forking step, mint its OWN per-index
@@ -268,7 +272,11 @@ pub(crate) fn seed_first_step_task(mut steps: Vec<RunnerStep>, task: &str) -> Ve
 /// Render [`StepResult`]s from a foreground `/chain`/`/parallel`/`/run-chain` run as human-readable
 /// text — one line per step, in chain order (R-SA-051's ordering guarantee, restated at this
 /// command's own text-rendering layer).
-pub(crate) fn render_chain_results(results: &[StepResult], is_group: &[bool], groups: &[GroupStepResult]) -> String {
+pub(crate) fn render_chain_results(
+    results: &[StepResult],
+    is_group: &[bool],
+    groups: &[GroupStepResult],
+) -> String {
     let mut out = String::new();
     let mut group_cursor = 0usize;
     for (i, result) in results.iter().enumerate() {
@@ -285,8 +293,14 @@ pub(crate) fn render_chain_results(results: &[StepResult], is_group: &[bool], gr
             if result.success {
                 out.push_str(&format!("step {}: ok (parallel group)\n", i + 1));
             } else {
-                let err = result.error.clone().unwrap_or_else(|| "unknown error".to_string());
-                out.push_str(&format!("step {}: FAILED (parallel group) — {err}\n", i + 1));
+                let err = result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string());
+                out.push_str(&format!(
+                    "step {}: FAILED (parallel group) — {err}\n",
+                    i + 1
+                ));
             }
             if let Some(group) = group {
                 for (child_i, child) in group.children.iter().enumerate() {
@@ -299,7 +313,10 @@ pub(crate) fn render_chain_results(results: &[StepResult], is_group: &[bool], gr
                             out.push_str(&format!("  child {}: ok\n  {text}\n", child_i + 1));
                         }
                         Some(child_result) => {
-                            let err = child_result.error.clone().unwrap_or_else(|| "unknown error".to_string());
+                            let err = child_result
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "unknown error".to_string());
                             out.push_str(&format!("  child {}: FAILED — {err}\n", child_i + 1));
                         }
                         None => {
@@ -315,7 +332,10 @@ pub(crate) fn render_chain_results(results: &[StepResult], is_group: &[bool], gr
                 .unwrap_or_else(|| "(no text output)".to_string());
             out.push_str(&format!("step {}: ok\n{text}\n", i + 1));
         } else {
-            let err = result.error.clone().unwrap_or_else(|| "unknown error".to_string());
+            let err = result
+                .error
+                .clone()
+                .unwrap_or_else(|| "unknown error".to_string());
             out.push_str(&format!("step {}: FAILED — {err}\n", i + 1));
         }
         if i + 1 != results.len() {
@@ -347,7 +367,12 @@ pub(crate) const BUILTIN_AGENT_NAMES: [&str; 7] = [
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::testsupport::fork_assistant_msg;
@@ -403,10 +428,15 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let cwd = root.path().join("proj");
         let layout = cyrup_session::SessionLayout::new(root.path().to_path_buf(), cwd.clone());
-        let mut parent =
-            cyrup_session::SessionManager::create(&cwd, &layout, cyrup_session::NewSessionOpts::default())
-                .expect("create persisted parent session");
-        parent.append_message(fork_user_msg("hello")).expect("append user");
+        let mut parent = cyrup_session::SessionManager::create(
+            &cwd,
+            &layout,
+            cyrup_session::NewSessionOpts::default(),
+        )
+        .expect("create persisted parent session");
+        parent
+            .append_message(fork_user_msg("hello"))
+            .expect("append user");
         parent
             .append_message(fork_assistant_msg("hi there"))
             .expect("append assistant");
@@ -552,10 +582,15 @@ mod tests {
             worktree: false,
         });
 
-        let (graph, _first) =
-            apply_fork_contexts(&resolver, Some(ContextRequest::Fork), None, &personas, vec![group])
-                .await
-                .expect("both parallel fork tasks resolve");
+        let (graph, _first) = apply_fork_contexts(
+            &resolver,
+            Some(ContextRequest::Fork),
+            None,
+            &personas,
+            vec![group],
+        )
+        .await
+        .expect("both parallel fork tasks resolve");
 
         let steps = match &graph[0] {
             RunnerStep::ParallelGroup(g) => &g.steps,
@@ -573,7 +608,9 @@ mod tests {
             first, second,
             "two parallel fork tasks must get two DISTINCT branch session files, not one shared branch"
         );
-        assert!(first.exists() && second.exists(), "both branch files must exist on disk");
+        assert!(
+            first.exists() && second.exists(),
+            "both branch files must exist on disk"
+        );
     }
-
 }

@@ -6,9 +6,14 @@
 //! `<agentDir>/extensions/mytool.wasm`, or `cyrup --extension ./mytool.wasm` — must be discovered.
 //! Before the fix `scan_dir` only ever considered directory entries, so every one of these was
 //! silently skipped and the extension simply never existed as far as the session was concerned.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
-use crate::loader::{discover, DiscoveredExtension, DiscoveryRoots, ExtOrigin};
+use crate::loader::{DiscoveredExtension, DiscoveryRoots, ExtOrigin, discover};
 use std::path::{Path, PathBuf};
 
 /// A stand-in component artifact. Discovery never validates the bytes (the wasm header is here only
@@ -21,7 +26,10 @@ fn unique_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("cyrup-ext-directfile-{tag}-{nanos}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "cyrup-ext-directfile-{tag}-{nanos}-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -60,13 +68,26 @@ fn bare_artifact_directly_in_each_discovery_root_is_discovered() {
 
     let proj = find(&found, "proj-tool").expect("bare artifact in the PROJECT root is discovered");
     assert_eq!(proj.origin, ExtOrigin::Project);
-    assert!(proj.wasm.as_deref().map(|w| w.ends_with("proj-tool.wasm")).unwrap_or(false));
+    assert!(
+        proj.wasm
+            .as_deref()
+            .map(|w| w.ends_with("proj-tool.wasm"))
+            .unwrap_or(false)
+    );
 
-    let global = find(&found, "global-tool").expect("bare artifact in the GLOBAL root is discovered");
+    let global =
+        find(&found, "global-tool").expect("bare artifact in the GLOBAL root is discovered");
     assert_eq!(global.origin, ExtOrigin::Global);
-    assert!(global.wasm.as_deref().map(|w| w.ends_with("global-tool.wasm")).unwrap_or(false));
+    assert!(
+        global
+            .wasm
+            .as_deref()
+            .map(|w| w.ends_with("global-tool.wasm"))
+            .unwrap_or(false)
+    );
 
-    let cfg = find(&found, "cfg-tool").expect("a configured path naming an artifact file is discovered");
+    let cfg =
+        find(&found, "cfg-tool").expect("a configured path naming an artifact file is discovered");
     assert_eq!(cfg.origin, ExtOrigin::Configured);
     assert_eq!(cfg.wasm.as_deref(), Some(cfg_artifact.as_path()));
 
@@ -89,7 +110,10 @@ fn multiple_bare_artifacts_and_dirs_coexist_in_one_root() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("extension.json"),
-        format!(r#"{{ "id": "gamma", "version": "1.0.0", "world": "{}" }}"#, crate::HOST_WORLD),
+        format!(
+            r#"{{ "id": "gamma", "version": "1.0.0", "world": "{}" }}"#,
+            crate::HOST_WORLD
+        ),
     )
     .unwrap();
     std::fs::write(dir.join("gamma.wasm"), ARTIFACT).unwrap();
@@ -106,12 +130,25 @@ fn multiple_bare_artifacts_and_dirs_coexist_in_one_root() {
     let ids: Vec<String> = found.iter().map(|d| d.manifest.id.clone()).collect();
 
     assert!(ids.contains(&"alpha".to_string()), "got {ids:?}");
-    assert!(ids.contains(&"beta".to_string()), "second bare artifact not collapsed: {ids:?}");
-    assert!(ids.contains(&"gamma".to_string()), "directory-shaped extension still found: {ids:?}");
+    assert!(
+        ids.contains(&"beta".to_string()),
+        "second bare artifact not collapsed: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"gamma".to_string()),
+        "directory-shaped extension still found: {ids:?}"
+    );
     assert_eq!(found.len(), 3, "README.md is not an extension: {ids:?}");
 
     // Each bare artifact points at its OWN file (not `first_wasm`'s alphabetical winner).
-    assert!(find(&found, "beta").unwrap().wasm.as_deref().unwrap().ends_with("beta.wasm"));
+    assert!(
+        find(&found, "beta")
+            .unwrap()
+            .wasm
+            .as_deref()
+            .unwrap()
+            .ends_with("beta.wasm")
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -137,12 +174,20 @@ async fn bare_artifact_reaches_discover_and_load() {
         configured: vec![],
         disabled: Vec::new(),
     };
-    let cfg = HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: cwd.clone() };
+    let cfg = HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: cwd.clone(),
+    };
     let host = ExtensionHost::with_wasm(cfg).expect("host with wasm");
     let services: Arc<dyn crate::host::HostServices> = Arc::new(DenyServices);
 
     let res = host.discover_and_load(&roots, false, services).await;
-    assert!(res.loaded.is_empty(), "untrusted project loads nothing: {:?}", res.loaded);
+    assert!(
+        res.loaded.is_empty(),
+        "untrusted project loads nothing: {:?}",
+        res.loaded
+    );
     assert_eq!(
         res.errors.len(),
         1,

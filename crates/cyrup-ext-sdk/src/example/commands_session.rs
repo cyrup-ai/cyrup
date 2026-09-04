@@ -60,7 +60,11 @@ pub(super) fn install(api: &mut ExtensionApi) {
         CommandDescriptor::new("Report ctx.mode + ctx.hasUI (demo)."),
         |_args: &str, ctx: &crate::CommandCtx| {
             let base = ctx.ctx();
-            Ok(Some(format!("mode={} has_ui={}", base.mode().as_str(), base.has_ui())))
+            Ok(Some(format!(
+                "mode={} has_ui={}",
+                base.mode().as_str(),
+                base.has_ui()
+            )))
         },
     );
 
@@ -69,9 +73,14 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // session, then label the just-appended entry. Proves each no-op FIRES against the real session.
     api.register_command(
         "statedemo",
-        CommandDescriptor::new("Append a custom entry, rename the session, label the entry (demo)."),
+        CommandDescriptor::new(
+            "Append a custom entry, rename the session, label the entry (demo).",
+        ),
         |_args: &str, ctx: &crate::CommandCtx| {
-            let id = ctx.ctx().session().append_entry("demoNote", json!({ "note": "from guest" }))?;
+            let id = ctx
+                .ctx()
+                .session()
+                .append_entry("demoNote", json!({ "note": "from guest" }))?;
             ctx.ctx().session().set_session_name("renamed-by-guest");
             ctx.ctx().session().set_label(&id, Some("guest-label"));
             // EXT-046: `None` CLEARS (pi `setLabel(entryId, label: string | undefined)`,
@@ -90,7 +99,11 @@ pub(super) fn install(api: &mut ExtensionApi) {
         "thinkdemo",
         CommandDescriptor::new("Set the thinking level from a command (demo, parity gap #12)."),
         |args: &str, ctx: &crate::CommandCtx| {
-            let level = if args.trim().is_empty() { "high" } else { args.trim() };
+            let level = if args.trim().is_empty() {
+                "high"
+            } else {
+                args.trim()
+            };
             match ctx.models().set_thinking_level(level) {
                 Ok(()) => {
                     ctx.ui().notify(&format!("thinking level set: {level}"));
@@ -146,7 +159,8 @@ pub(super) fn install(api: &mut ExtensionApi) {
             ctx.new_session_with_callback(
                 &NewSessionOptions::default(),
                 |rsc: &ReplacedSessionContext| {
-                    rsc.ui().notify("withSession ran on the replacement session");
+                    rsc.ui()
+                        .notify("withSession ran on the replacement session");
                     Ok(())
                 },
             )?;

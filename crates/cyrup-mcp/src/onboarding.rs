@@ -98,8 +98,10 @@ pub fn load_onboarding_state(path: &Path) -> OnboardingState {
 /// file against a hand-edited copy stays clean.
 pub fn save_onboarding_state(path: &Path, state: &OnboardingState) -> McpResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|source| McpError::Io { path: parent.to_path_buf(), source })?;
+        std::fs::create_dir_all(parent).map_err(|source| McpError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
     let body = serde_json::to_string_pretty(state)
         .map_err(|e| McpError::Config(format!("serialising onboarding state: {e}")))?;
@@ -109,13 +111,18 @@ pub fn save_onboarding_state(path: &Path, state: &OnboardingState) -> McpResult<
     temp.push(format!(".{}.tmp", std::process::id()));
     let temp = std::path::PathBuf::from(temp);
 
-    std::fs::write(&temp, format!("{body}\n"))
-        .map_err(|source| McpError::Io { path: temp.clone(), source })?;
+    std::fs::write(&temp, format!("{body}\n")).map_err(|source| McpError::Io {
+        path: temp.clone(),
+        source,
+    })?;
     std::fs::rename(&temp, path).map_err(|source| {
         // A failed rename leaves the temp file behind; upstream's `renameSync` throw does too, but
         // there is no reason to keep it.
         let _ = std::fs::remove_file(&temp);
-        McpError::Io { path: path.to_path_buf(), source }
+        McpError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
     })
 }
 
@@ -184,9 +191,15 @@ mod tests {
         .unwrap();
         let state = load_onboarding_state(&path);
         assert_eq!(state.version, 1, "version is forced, not read");
-        assert!(!state.shared_config_hint_shown, "`=== true`, so a truthy string is false");
+        assert!(
+            !state.shared_config_hint_shown,
+            "`=== true`, so a truthy string is false"
+        );
         assert!(state.setup_completed);
-        assert_eq!(state.last_discovery_fingerprint, None, "a non-string fingerprint is dropped");
+        assert_eq!(
+            state.last_discovery_fingerprint, None,
+            "a non-string fingerprint is dropped"
+        );
     }
 
     #[test]

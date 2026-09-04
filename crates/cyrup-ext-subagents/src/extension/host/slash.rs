@@ -8,11 +8,6 @@ use cyrup_core::{CancelToken, ModelId};
 use crate::background::RunMode;
 use crate::discovery::types::AgentReadScope;
 use crate::error::SubagentError;
-use crate::fork_context::ContextMode;
-use crate::registration::prompt_workflows;
-use crate::registration::slash_commands::{self, SlashCommandName};
-use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
-use crate::spawn::depth::resolve_effective_depth;
 use crate::extension::executor::paths::format_slash_run_completion;
 use crate::extension::executor::requests::{
     BackgroundSingleRequest, ForegroundRunRequest, GraphRunOutcome, SingleRunOverrides,
@@ -22,6 +17,11 @@ use crate::extension::host::SubagentsExtension;
 use crate::extension::host::slash_render::{render_chain_results, seed_first_step_task};
 use crate::extension::models::classify::render_profile_check_report;
 use crate::extension::tool::task_items::count_graph_requested_spawns;
+use crate::fork_context::ContextMode;
+use crate::registration::prompt_workflows;
+use crate::registration::slash_commands::{self, SlashCommandName};
+use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
+use crate::spawn::depth::resolve_effective_depth;
 
 impl SubagentsExtension {
     /// The single shared dispatch body [`cyrup_ext::NativeExtension::execute_command`] calls into
@@ -65,7 +65,7 @@ impl SubagentsExtension {
     async fn show_fleet(&self, cwd: &Path, has_ui: bool) -> Result<String, SubagentError> {
         use std::sync::atomic::Ordering;
 
-        use crate::tui::fleet::{open_subagent_fleet, FleetOpenOutcome, FleetViewOptions};
+        use crate::tui::fleet::{FleetOpenOutcome, FleetViewOptions, open_subagent_fleet};
 
         // pi reads `fleetOpen` BEFORE it touches anything else that could change it.
         let already_open = self.fleet_open.load(Ordering::Acquire);
@@ -102,7 +102,10 @@ impl SubagentsExtension {
             FleetOpenOutcome::AlreadyOpen => {
                 Ok("Subagent fleet inspector is already open.".to_string())
             }
-            FleetOpenOutcome::Opened { component, clear_widget_key } => {
+            FleetOpenOutcome::Opened {
+                component,
+                clear_widget_key,
+            } => {
                 self.fleet_open.store(true, Ordering::Release);
                 self.fleet_inspector_open.store(true, Ordering::Release);
                 // pi `ctx.ui.setWidget(FLEET_STATUS_WIDGET_KEY, undefined)` (`tui/fleet.ts:846`):
@@ -183,14 +186,22 @@ impl SubagentsExtension {
         if !self.fleet_view_enabled {
             return;
         }
-        let Some(services) = self.executor.host_services() else { return };
+        let Some(services) = self.executor.host_services() else {
+            return;
+        };
         let state = self
             .executor
-            .fleet_state(cwd, false, self.fleet_inspector_open.load(Ordering::Acquire))
+            .fleet_state(
+                cwd,
+                false,
+                self.fleet_inspector_open.load(Ordering::Acquire),
+            )
             .await;
         let now = crate::time::now_epoch_millis();
         let payload = {
-            let Ok(mut widget) = self.fleet_status.lock() else { return };
+            let Ok(mut widget) = self.fleet_status.lock() else {
+                return;
+            };
             widget.set_ui_available(has_ui);
             if !widget.refresh(&state, now) {
                 return;
@@ -279,7 +290,11 @@ impl SubagentsExtension {
     async fn slash_run(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
         let parsed = slash_commands::parse_run_command(args)
             .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-        let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
+        let context = if parsed.flags.fork {
+            Some(ContextMode::Fork)
+        } else {
+            None
+        };
         let model = parsed.config.model.clone().map(ModelId::from);
         // SUBA-002 — charge the per-SESSION spawn budget on the SLASH surface too. Upstream
         // gets this for free: `/run`'s handler calls `runSlashSubagent` -> `requestSlashRun`
@@ -499,11 +514,22 @@ impl SubagentsExtension {
     async fn slash_chain(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
         let parsed = slash_commands::parse_chain_command(args)
             .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-        let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
+        let context = if parsed.flags.fork {
+            Some(ContextMode::Fork)
+        } else {
+            None
+        };
         // `/chain` carries no separate top-level task arg — the first step's task seeds the
         // chain, so `{task}` falls back to it (`first_step_task`).
-        self.run_or_background_chain(cwd, parsed.chain, RunMode::Chain, context, parsed.flags.background, None)
-            .await
+        self.run_or_background_chain(
+            cwd,
+            parsed.chain,
+            RunMode::Chain,
+            context,
+            parsed.flags.background,
+            None,
+        )
+        .await
     }
 
     /// /parallel — a single static-width fan-out group (R-SA-129/§5.3). Represented as a
@@ -513,7 +539,11 @@ impl SubagentsExtension {
     async fn slash_parallel(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
         let parsed = slash_commands::parse_parallel_command(args)
             .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-        let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
+        let context = if parsed.flags.fork {
+            Some(ContextMode::Fork)
+        } else {
+            None
+        };
         let cfg = self.executor.config_snapshot().await;
         let group = RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
             steps: parsed.tasks,
@@ -523,8 +553,15 @@ impl SubagentsExtension {
         });
         // `/parallel` carries no separate top-level task arg — `{task}` falls back to the
         // group's first task (`first_step_task`).
-        self.run_or_background_chain(cwd, vec![group], RunMode::Parallel, context, parsed.flags.background, None)
-            .await
+        self.run_or_background_chain(
+            cwd,
+            vec![group],
+            RunMode::Parallel,
+            context,
+            parsed.flags.background,
+            None,
+        )
+        .await
     }
 
     /// /run-chain — invoke a saved chain (`.chain.md`/`.chain.json`) by name (R-SA-129).
@@ -533,7 +570,11 @@ impl SubagentsExtension {
     async fn slash_run_chain(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
         let parsed = slash_commands::parse_run_chain_command(args)
             .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-        let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
+        let context = if parsed.flags.fork {
+            Some(ContextMode::Fork)
+        } else {
+            None
+        };
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before `resolve_chain`
         // below, which is a real discovery filesystem scan (R-SA-019/020) — so a blocked
         // call never touches discovery at all, not even for the saved-chain lookup this
@@ -580,8 +621,15 @@ impl SubagentsExtension {
         // `/run-chain <name> -- <task>`: the supplied task seeds the first step AND is the
         // run-wide `{task}` value (pi `originalTask = params.task`).
         let task = (!parsed.task.trim().is_empty()).then(|| parsed.task.clone());
-        self.run_or_background_chain(cwd, steps, RunMode::Chain, context, parsed.flags.background, task)
-            .await
+        self.run_or_background_chain(
+            cwd,
+            steps,
+            RunMode::Chain,
+            context,
+            parsed.flags.background,
+            task,
+        )
+        .await
     }
 
     /// /subagents-models — report the RUNTIME builtin-agent -> model mapping (pi
@@ -591,7 +639,9 @@ impl SubagentsExtension {
     fn slash_models(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
         let parsed = slash_commands::parse_subagents_models_command(args)
             .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-        Ok(self.executor.run_models_report(cwd, parsed.agent.as_deref()))
+        Ok(self
+            .executor
+            .run_models_report(cwd, parsed.agent.as_deref()))
     }
 
     /// /subagents-refresh-provider-models — R-SA-129/142. The catalog-refresh ALGORITHM
@@ -664,7 +714,11 @@ impl SubagentsExtension {
     /// crate ships were discovered, unit-tested, and invocable by nothing.
     async fn slash_prompt_workflow(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
         let mut words = prompt_workflows::shell_words(args);
-        let name = if words.is_empty() { None } else { Some(words.remove(0)) };
+        let name = if words.is_empty() {
+            None
+        } else {
+            Some(words.remove(0))
+        };
         let workflows = prompt_workflows::discover_prompt_workflows(cwd);
         // pi `:275-278`: a bare `/prompt-workflow`, or the literal `list`, prints the list.
         let Some(name) = name.filter(|n| n != "list") else {
@@ -713,14 +767,9 @@ impl SubagentsExtension {
                 "Usage: /chain-prompts prompt-a -> prompt-b -- args".to_string(),
             ));
         }
-        let steps = prompt_workflows::build_chain_steps(
-            &workflows,
-            &names,
-            &runtime.args,
-            &runtime,
-            None,
-        )
-        .map_err(SubagentError::MalformedSettings)?;
+        let steps =
+            prompt_workflows::build_chain_steps(&workflows, &names, &runtime.args, &runtime, None)
+                .map_err(SubagentError::MalformedSettings)?;
         self.run_prompt_workflow_chain(cwd, steps, &runtime).await
     }
 
@@ -744,7 +793,11 @@ impl SubagentsExtension {
             None => cwd.to_path_buf(),
             Some(child) => {
                 let child = Path::new(child);
-                if child.is_absolute() { child.to_path_buf() } else { cwd.join(child) }
+                if child.is_absolute() {
+                    child.to_path_buf()
+                } else {
+                    cwd.join(child)
+                }
             }
         };
         let model = run.model.clone().map(ModelId::from);
@@ -996,7 +1049,12 @@ impl SubagentsExtension {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::testsupport::seed_running_run;
@@ -1025,7 +1083,12 @@ mod tests {
         let paths = seed_running_run(dir.path(), "stopslash001", &["scout"]);
         let extension = SubagentsExtension::new();
         let rendered = extension
-            .dispatch_slash(SlashCommandName::SubagentsStop, "stopslash001", dir.path(), false)
+            .dispatch_slash(
+                SlashCommandName::SubagentsStop,
+                "stopslash001",
+                dir.path(),
+                false,
+            )
             .await
             .expect("/subagents-stop must dispatch");
         assert_eq!(rendered, "Stop requested for async run stopslash001.");
@@ -1034,5 +1097,4 @@ mod tests {
             "the slash command must write the same real stop request the tool action does"
         );
     }
-
 }

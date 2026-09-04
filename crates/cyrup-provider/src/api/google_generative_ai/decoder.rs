@@ -4,8 +4,8 @@
 use crate::model::Model;
 use crate::usage::compute_cost;
 use crate::utils::provider_plumbing::now_millis;
-use std::sync::Arc;
 use cyrup_core::{ApiId, AssistantMessage, Content, StopReason, Usage};
+use std::sync::Arc;
 
 /// The in-progress text/thinking block being accumulated (Pi `currentBlock`,
 /// google-generative-ai.ts:89).

@@ -14,7 +14,12 @@
 //! MIGRATION: the file-level `#![cfg(unix)]` this carried in `crates/cyrup/tests/` is now the
 //! `#[cfg(unix)]` on this module's declaration in `main.rs` — same predicate, one place, and
 //! greppable from the target's inventory.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -42,7 +47,13 @@ fn spawn_rpc() -> (Child, ChildStdin, ChildStdout, TempDir) {
         .env_remove("CYRUP_INTERCOM")
         .env_remove("CYRUP_SUBAGENTS")
         .env_remove("CYRUP_PERMISSION_SYSTEM")
-        .args(["--mode", "rpc", "--offline", "--no-session", "--no-extensions"])
+        .args([
+            "--mode",
+            "rpc",
+            "--offline",
+            "--no-session",
+            "--no-extensions",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

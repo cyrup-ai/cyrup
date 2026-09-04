@@ -17,11 +17,10 @@
 
 use std::sync::Arc;
 
-
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
-use cyrup_test_support::harness::{create_harness_with_extensions, HarnessOptions};
+use cyrup_test_support::harness::{HarnessOptions, create_harness_with_extensions};
 use cyrup_test_support::response::FauxResponse;
 
 fn tool_starts(events: &[cyrup_session_svc::AgentSessionEvent]) -> Vec<&str> {
@@ -99,10 +98,17 @@ async fn the_wait_tool_is_registered_and_dispatches_on_a_real_session() {
     );
 
     let ends = tool_ends(&events);
-    assert_eq!(ends.len(), 1, "expected exactly one tool_execution_end; got: {events:#?}");
+    assert_eq!(
+        ends.len(),
+        1,
+        "expected exactly one tool_execution_end; got: {events:#?}"
+    );
     let (tool_name, result, is_error) = ends[0];
     assert_eq!(tool_name, "wait");
-    assert!(!is_error, "an empty async root is not an error condition; result: {result:#?}");
+    assert!(
+        !is_error,
+        "an empty async root is not an error condition; result: {result:#?}"
+    );
     let text = result.to_string();
     assert!(
         text.contains("No active async runs in this session. Nothing to wait for."),
@@ -136,10 +142,14 @@ async fn a_fanout_child_does_not_get_the_wait_tool() {
         RegistrationMode::ChildSafe,
     );
     let mut api = InitApi::new();
-    child.init(&mut api).await.expect("child-safe init succeeds");
+    child
+        .init(&mut api)
+        .await
+        .expect("child-safe init succeeds");
 
     assert!(
-        !api.subscriptions().contains(cyrup_ext::EventKind::SessionStart),
+        !api.subscriptions()
+            .contains(cyrup_ext::EventKind::SessionStart),
         "sanity: this really is the restricted ChildSafe surface, which installs no lifecycle \
          subscriptions"
     );

@@ -39,20 +39,26 @@ impl IntercomTool {
         // confirm dialog, so there is nothing to order it against; it is still first, so a flag
         // typo costs no roster fetch.
         if open_pane && cwd.is_none() {
-            return Err(ToolError::new("openProjectPaneIfMissing requires a target cwd."));
+            return Err(ToolError::new(
+                "openProjectPaneIfMissing requires a target cwd.",
+            ));
         }
         // `v0.10.1 index.ts:2103-2114`. With a `cwd` the target is resolved inside that
         // directory, and `resolveCwdDeliveryTarget`'s own "no session there" error already
         // says what happened — the offline refusal below belongs to the `to`-only branch.
         let delivery = match cwd.as_deref() {
             Some(cwd) => {
-                resolve_cwd_delivery_target(&self.state, client, CwdDeliveryOptions {
-                    to: to.as_deref(),
-                    cwd,
-                    open_project_pane_if_missing: open_pane,
-                    focus: params.focus.unwrap_or(true),
-                    cancel,
-                })
+                resolve_cwd_delivery_target(
+                    &self.state,
+                    client,
+                    CwdDeliveryOptions {
+                        to: to.as_deref(),
+                        cwd,
+                        open_project_pane_if_missing: open_pane,
+                        focus: params.focus.unwrap_or(true),
+                        cancel,
+                    },
+                )
                 .await?
             }
             None => {
@@ -62,20 +68,35 @@ impl IntercomTool {
                 // `Session not found: "x"` the shared resolver produces — a blocking ask is
                 // not queued anywhere, so the model has to be told to use `send` or to retry
                 // after the peer reconnects.
-                let Some(resolved) =
-                    self.state.resolve_target(client, &to_value).await.map_err(to_tool_err)?
+                let Some(resolved) = self
+                    .state
+                    .resolve_target(client, &to_value)
+                    .await
+                    .map_err(to_tool_err)?
                 else {
                     return Err(ToolError::new(format!(
                         "Session \"{to_value}\" is not currently connected. Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects."
                     )));
                 };
-                DeliveryTarget { id: resolved, label: to_value, project_pane: None }
+                DeliveryTarget {
+                    id: resolved,
+                    label: to_value,
+                    project_pane: None,
+                }
             }
         };
-        let DeliveryTarget { id: target, label, project_pane } = delivery;
+        let DeliveryTarget {
+            id: target,
+            label,
+            project_pane,
+        } = delivery;
         // `const targetDisplay = target.projectPane ? target.label : to ?? target.label;`
         // (`v0.12.0 index.ts:2457`) — same rule as `send`: a launched session's own name wins.
-        let to = if project_pane.is_some() { label } else { to.unwrap_or(label) };
+        let to = if project_pane.is_some() {
+            label
+        } else {
+            to.unwrap_or(label)
+        };
         // `v0.10.1 index.ts:2122-2127` — pi's single self-target string, shared with `send`
         // and `reply`.
         if client.session_id().as_deref() == Some(target.as_str()) {

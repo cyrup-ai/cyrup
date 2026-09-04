@@ -48,25 +48,24 @@ use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-
 use cyrup_core::{CancelToken, Content, ModelId, Tool, ToolCallId};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
 use cyrup_ext_subagents::background::runner_main::{RunnerConfig, RunnerOverrides, run_with};
 use cyrup_ext_subagents::background::{
     ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus, StepState,
 };
-use cyrup_ext_subagents::exec::ResolvedAgentPersona;
-use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
+use cyrup_ext_subagents::exec::ResolvedAgentPersona;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions};
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::fork_context::ForkContext;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
+use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 use cyrup_ext_subagents::spawn::nested_events::{
     NestedEventInput, NestedRunSummary, create_nested_route_in, write_nested_event_in,
@@ -75,8 +74,6 @@ use cyrup_ext_subagents::tui::intercom::{
     DeliveryChannel, IntercomPayload, NoOpClarifyChannel, NoTransportSteerChannel,
     SubagentResultStatus, resolve_single_result_status,
 };
-
-
 
 /// One `message_end` NDJSON record on the real child wire shape (`exec/ndjson.rs`).
 fn message_end_line(text: &str) -> String {
@@ -184,7 +181,10 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         runtime_cwd: None,
         include_progress: None,
         agent_scope: None,
-        acceptance: Some(AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![])),
+        acceptance: Some(AcceptanceContract::explicit(
+            AcceptanceStatus::NotRequired,
+            vec![],
+        )),
         fork_context: ForkContext::fresh(),
         live_events: None,
         parent_session_id: None,
@@ -231,7 +231,10 @@ async fn a_signal_killed_child_publishes_its_real_process_signal_and_resolves_st
     // This run names its own child instead of moving `CYRUP_SUBAGENT_BINARY` on a process every
     // other test in this binary shares. `run_sync` is a foreground path, which is what
     // `spawn_command` reaches.
-    opts.spawn_command = Some(SpawnCommand { binary: child, base_args: Vec::new() });
+    opts.spawn_command = Some(SpawnCommand {
+        binary: child,
+        base_args: Vec::new(),
+    });
     let result = tokio::time::timeout(
         Duration::from_secs(20),
         cyrup_ext_subagents::exec::run_sync(&agent, "die by signal", &opts),
@@ -247,10 +250,19 @@ async fn a_signal_killed_child_publishes_its_real_process_signal_and_resolves_st
     );
     // The four lifecycle verdicts that would EXPLAIN the signal are all false, which is precisely
     // what makes it "unexplained" (`runs/shared/process-signal.ts:5-19`).
-    assert!(!result.interrupted, "no interrupt was requested: {result:?}");
+    assert!(
+        !result.interrupted,
+        "no interrupt was requested: {result:?}"
+    );
     assert!(!result.timed_out, "no deadline was set: {result:?}");
-    assert!(!result.stopped, "the foreground executor never sets `stopped`: {result:?}");
-    assert!(!result.detached, "the child never asked to detach: {result:?}");
+    assert!(
+        !result.stopped,
+        "the foreground executor never sets `stopped`: {result:?}"
+    );
+    assert!(
+        !result.detached,
+        "the child never asked to detach: {result:?}"
+    );
     assert_ne!(
         result.exit_code, 0,
         "a signal death has no numeric exit code and is attributed exit 1 \
@@ -330,7 +342,6 @@ fn tool_result_text(result: &cyrup_core::ToolResult) -> String {
 /// `DeliveryChannel`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_mode_out_of_band_delivery_reports_a_signal_killed_child_as_stopped() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir for the persona + cwd");
     let home_dir = tempfile::tempdir().expect("real tempdir to isolate CYRUP_HOME artifacts");
     write_fixture_persona(work_dir.path(), "worker");
@@ -349,7 +360,10 @@ async fn single_mode_out_of_band_delivery_reports_a_signal_killed_child_as_stopp
         // left alone — it never reaches the launch-mode decision.
         SubagentExtensionConfig {
             async_by_default: false,
-            spawn_command: Some(SpawnCommand { binary: child, base_args: Vec::new() }),
+            spawn_command: Some(SpawnCommand {
+                binary: child,
+                base_args: Vec::new(),
+            }),
             roots: Roots::sandboxed(home_dir.path()),
             ..SubagentExtensionConfig::default()
         },
@@ -491,7 +505,10 @@ async fn stopping_a_nested_run_gets_pis_own_scope_refusal_not_the_not_found_text
     .expect("publish the nested-started record");
 
     let extension = SubagentsExtension::with_config_and_cwd(
-        SubagentExtensionConfig { roots: roots.clone(), ..SubagentExtensionConfig::default() },
+        SubagentExtensionConfig {
+            roots: roots.clone(),
+            ..SubagentExtensionConfig::default()
+        },
         dir.path().to_path_buf(),
     );
     let tool = extension.subagent_tool();
@@ -623,12 +640,18 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
-    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async root");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results dir");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results dir");
 
     let run_id = RunId::from_token("stopvstime01");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run dir");
 
     let config = RunnerConfig {
         turn_budget: None,
@@ -643,7 +666,10 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("only", "sleep a long time"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "only",
+            "sleep a long time",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -665,7 +691,9 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         include_progress: None,
     };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write runner config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write runner config");
 
     // BOTH verbs, planted through the real parent-side writers, before the runner starts.
     cyrup_ext_subagents::background::control::deliver_timeout_request(
@@ -691,20 +719,27 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         RunnerOverrides {
             spawn_command: Some(SpawnCommand {
                 binary: fixture,
-                base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
             }),
             ..Default::default()
-            },
+        },
     )
     .await;
     outcome.expect("run() itself never returns Err");
 
     let status: RunStatus = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.status).await.expect("status.json exists"),
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json exists"),
     )
     .expect("parse status.json");
     let result: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result).await.expect("ResultFile exists"),
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile exists"),
     )
     .expect("parse ResultFile");
 
@@ -738,7 +773,10 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         "a terminal stopped run always explains itself with at least one child record: {result:?}"
     );
     assert!(
-        result.results.iter().all(|r| r.stopped && !r.interrupted && !r.timed_out),
+        result
+            .results
+            .iter()
+            .all(|r| r.stopped && !r.interrupted && !r.timed_out),
         "every child record of a stopped run reads `stopped`, and neither `interrupted` \
          (resumable) nor `timed_out` may survive alongside it: {:?}",
         result.results
@@ -801,7 +839,10 @@ async fn a_rejected_acceptance_ledger_outranks_a_clean_exit_code_in_the_single_r
     let mut opts = base_run_options(dir.path(), "fixture-model");
     opts.spawn_command = Some(SpawnCommand {
         binary: crate::support::bins::subagent_fixture(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     // The point of the test: NO explicit contract, so the heuristic one applies exactly as it does
     // for any ordinary persona that declares no acceptance policy.

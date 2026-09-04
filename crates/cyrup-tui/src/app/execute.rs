@@ -34,10 +34,15 @@ impl<B: Backend> App<B> {
                 self.execute_selector_command(cmd, session, runtime).await
             }
             // session lifecycle — app/execute_session.rs
-            C::NewSession | C::Reload | C::Import(_) | C::Compact(_) | C::Clone
-            | C::DeleteSession(_) | C::RenameSession { .. } | C::Export(_) | C::SessionInfo => {
-                self.execute_session_command(cmd, session, runtime).await
-            }
+            C::NewSession
+            | C::Reload
+            | C::Import(_)
+            | C::Compact(_)
+            | C::Clone
+            | C::DeleteSession(_)
+            | C::RenameSession { .. }
+            | C::Export(_)
+            | C::SessionInfo => self.execute_session_command(cmd, session, runtime).await,
             // app/execute_misc.rs — LISTED, not `_`, so a new variant is a compile error until it
             // is deliberately bucketed. This alone does not prevent the cc19b87 defect: that was a
             // variant routed to a dispatcher with no arm for it, which still compiles. The loud
@@ -85,16 +90,30 @@ impl<B: Backend> App<B> {
                     .model_catalog()
                     .iter()
                     .map(|m| {
-                        (m.id.to_string(), m.name.clone(), m.provider.to_string(), Some(m.provider.to_string()))
+                        (
+                            m.id.to_string(),
+                            m.name.clone(),
+                            m.provider.to_string(),
+                            Some(m.provider.to_string()),
+                        )
                     })
                     .collect();
                 if catalog.is_empty() {
-                    self.state.transcript.push_status("no models available (configure providers)");
+                    self.state
+                        .transcript
+                        .push_status("no models available (configure providers)");
                 } else {
-                    let scoped: Vec<String> =
-                        session.scoped_models().into_iter().map(|sm| sm.model.id.to_string()).collect();
+                    let scoped: Vec<String> = session
+                        .scoped_models()
+                        .into_iter()
+                        .map(|sm| sm.model.id.to_string())
+                        .collect();
                     // Empty scope ⇒ "all enabled" (None); otherwise the explicit ordered set.
-                    let enabled = if scoped.is_empty() { None } else { Some(scoped) };
+                    let enabled = if scoped.is_empty() {
+                        None
+                    } else {
+                        Some(scoped)
+                    };
                     self.open_checkbox_selector(catalog, enabled);
                 }
             }
@@ -115,7 +134,9 @@ impl<B: Backend> App<B> {
                     })
                     .collect();
                 if rows.is_empty() {
-                    self.state.transcript.push_status("no user messages to fork from");
+                    self.state
+                        .transcript
+                        .push_status("no user messages to fork from");
                 } else {
                     // `initialSelectedId` is unset here, so the constructor preselects the most
                     // recent message (`:24-26`) — the same row the old `last` index picked.
@@ -132,10 +153,11 @@ impl<B: Backend> App<B> {
                 // "data-starved" so the selector renders the actual branch tree.
                 let dag = session.session_dag().await;
                 if dag.is_empty() {
-                    self.state.transcript.push_status("no session history to navigate");
+                    self.state
+                        .transcript
+                        .push_status("no session history to navigate");
                 } else {
-                    let nodes: Vec<TreeNode> =
-                        dag.iter().map(tree_node_from_dag).collect();
+                    let nodes: Vec<TreeNode> = dag.iter().map(tree_node_from_dag).collect();
                     let mut tree = TreeSelector::new(nodes);
                     tree.set_keymap(self.state.tree_keymap.clone());
                     // `treeFilterMode` — the filter `/tree` OPENS with (Pi reads
@@ -171,7 +193,9 @@ impl<B: Backend> App<B> {
                     match cyrup_config::login::stored_credentials(&session.services().auth).await {
                         Ok(stored) => stored,
                         Err(e) => {
-                            self.state.transcript.push_status(format!("logout error: {e}"));
+                            self.state
+                                .transcript
+                                .push_status(format!("logout error: {e}"));
                             return;
                         }
                     };
@@ -185,8 +209,7 @@ impl<B: Backend> App<B> {
                 }
                 // S5/S21 — same component as `/login`, in `logout` mode (`:52`), which changes the
                 // title (`:72`) and the empty-catalog copy (`:155-158`).
-                let selector =
-                    crate::OAuthSelector::new(crate::OAuthMode::Logout, &options, None);
+                let selector = crate::OAuthSelector::new(crate::OAuthMode::Logout, &options, None);
                 self.state.logout_options = options;
                 self.open_boxed_selector(SelectorKind::Logout, Box::new(selector));
             }
@@ -372,7 +395,9 @@ impl<B: Backend> App<B> {
                 // say so and hand the model list back — the same recovery the empty-catalog branch
                 // of step 1 above uses.
                 if rows.is_empty() {
-                    self.state.transcript.push_status(format!("{model_key} is unavailable"));
+                    self.state
+                        .transcript
+                        .push_status(format!("{model_key} is unavailable"));
                     if let Some(parent) = parent {
                         self.state.selector = Some(*parent);
                     }
@@ -382,9 +407,10 @@ impl<B: Backend> App<B> {
                 // (`settings-selector.ts:616-619`), where `modelDisplayLabel` is
                 // `` `${id} [${provider}]` `` (`:178-180`) — which is what `model_key`'s
                 // `provider/id` resolves to, falling back to the raw key when the model is gone.
-                let title = match catalog.iter().find(|m| {
-                    format!("{}/{}", m.provider, m.id) == model_key
-                }) {
+                let title = match catalog
+                    .iter()
+                    .find(|m| format!("{}/{}", m.provider, m.id) == model_key)
+                {
                     Some(m) => format!("Thinking Level for {} [{}]", m.id, m.provider),
                     None => format!("Thinking Level for {model_key}"),
                 };
@@ -408,10 +434,15 @@ impl<B: Backend> App<B> {
 
             C::OpenSelector(other) => {
                 // Any remaining kind has no in-crate sourcing yet; surface the request (no silent drop).
-                self.state.transcript.push_status(format!("{} selector unavailable", other.title()));
+                self.state
+                    .transcript
+                    .push_status(format!("{} selector unavailable", other.title()));
             }
 
-            C::ConfirmSelection { kind: SelectorKind::Tree, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::Tree,
+                value,
+            } => {
                 // Confirming a tree row ASKS ABOUT SUMMARIZATION FIRST (Pi
                 // `interactive-mode.ts:4744-4779`), then navigates. Before SESS-023 this arm called
                 // `navigate_tree(.., NavigateTreeOptions::default())` — `summarize` hard-false — so
@@ -420,43 +451,68 @@ impl<B: Backend> App<B> {
                 //
                 // Pi's `getBranchSummarySkipPrompt()` gate (`:4753`) is a FRONT-END decision: when
                 // set, skip the prompt entirely and navigate with `wantsSummary = false`.
-                if session.services().settings.effective().branch_summary_skip_prompt() {
-                    self.begin_tree_navigation(session, value, false, None).await;
+                if session
+                    .services()
+                    .settings
+                    .effective()
+                    .branch_summary_skip_prompt()
+                {
+                    self.begin_tree_navigation(session, value, false, None)
+                        .await;
                 } else {
                     self.state.pending_tree_nav = Some(PendingTreeNav { target: value });
                     self.open_branch_summary_prompt();
                 }
             }
 
-            C::ConfirmSelection { kind: SelectorKind::BranchSummary, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::BranchSummary,
+                value,
+            } => {
                 // The three-option answer (Pi `:4755-4777`). `custom` opens the instructions editor
                 // and keeps the pending target; the other two dispatch the navigation directly.
                 // `wantsSummary = summaryChoice !== "No summary"` (`:4767`).
                 if value == BRANCH_SUMMARY_CUSTOM {
                     self.open_branch_summary_instructions();
                 } else {
-                    let Some(pending) = self.state.pending_tree_nav.take() else { return };
+                    let Some(pending) = self.state.pending_tree_nav.take() else {
+                        return;
+                    };
                     let summarize = value != BRANCH_SUMMARY_NONE;
-                    self.begin_tree_navigation(session, pending.target, summarize, None).await;
+                    self.begin_tree_navigation(session, pending.target, summarize, None)
+                        .await;
                 }
             }
 
-            C::ConfirmSelection { kind: SelectorKind::BranchSummaryInstructions, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::BranchSummaryInstructions,
+                value,
+            } => {
                 // Pi `showExtensionEditor` returned a string (`:4769`): a complete choice, so the
                 // prompt loop breaks and the navigation runs with `summarize: true`. An EMPTY string
                 // is still a value (only `undefined`/Escape loops back), so it is forwarded as
                 // `None` custom instructions rather than an empty override.
-                let Some(pending) = self.state.pending_tree_nav.take() else { return };
+                let Some(pending) = self.state.pending_tree_nav.take() else {
+                    return;
+                };
                 let instructions = (!value.trim().is_empty()).then_some(value);
-                self.begin_tree_navigation(session, pending.target, true, instructions).await;
+                self.begin_tree_navigation(session, pending.target, true, instructions)
+                    .await;
             }
 
-            C::ConfirmSelection { kind: SelectorKind::Model, value } => {
-                match session.set_model(&value).await {
-                    Ok(_) => self.state.transcript.push_status(format!("model → {value}")),
-                    Err(e) => self.state.transcript.push_status(format!("model error: {e}")),
-                }
-            }
+            C::ConfirmSelection {
+                kind: SelectorKind::Model,
+                value,
+            } => match session.set_model(&value).await {
+                Ok(_) => self
+                    .state
+                    .transcript
+                    .push_status(format!("model → {value}")),
+                Err(e) => self
+                    .state
+                    .transcript
+                    .push_status(format!("model error: {e}")),
+            },
 
             C::SetEntryLabel { entry_id, label } => {
                 // Persist the `/tree` label edit via the SAME live `set_label` path a loaded
@@ -465,10 +521,10 @@ impl<B: Backend> App<B> {
                 // matching Pi's `value || undefined`. Silently degrades (unknown id / busy), like Pi.
                 // `set_label` takes pi's optional label (`setLabel(entryId, label?)`): an EMPTY
                 // edit clears it, which is pi's `value || undefined`.
-                session.services().host_services.set_label(
-                    &entry_id,
-                    (!label.is_empty()).then_some(label.as_str()),
-                );
+                session
+                    .services()
+                    .host_services
+                    .set_label(&entry_id, (!label.is_empty()).then_some(label.as_str()));
                 let msg = if label.is_empty() {
                     "label removed".to_string()
                 } else {
@@ -477,7 +533,10 @@ impl<B: Backend> App<B> {
                 self.state.transcript.push_status(msg);
             }
 
-            C::ConfirmSelection { kind: SelectorKind::ScopedModels, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::ScopedModels,
+                value,
+            } => {
                 // The checkbox selector confirms with the ordered enabled ids (`\n`-joined), or the
                 // `SCOPED_MODELS_ALL` sentinel for "all enabled". Rebuild the scoped set from the
                 // catalog and persist via `set_scoped_models` (`scoped-models-selector.ts onPersist`).
@@ -485,7 +544,11 @@ impl<B: Backend> App<B> {
                 let ordered_ids: Vec<String> = if value == crate::SCOPED_MODELS_ALL {
                     catalog.iter().map(|m| m.id.to_string()).collect()
                 } else {
-                    value.split('\n').filter(|s| !s.is_empty()).map(str::to_string).collect()
+                    value
+                        .split('\n')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
                 };
                 let scoped: Vec<cyrup_session_svc::ScopedModel> = ordered_ids
                     .iter()
@@ -533,11 +596,17 @@ impl<B: Backend> App<B> {
                         .state
                         .transcript
                         .push_status(format!("scoped models → {n} enabled")),
-                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
+                    Err(e) => self
+                        .state
+                        .transcript
+                        .push_status(format!("settings error: {e}")),
                 }
             }
 
-            C::ConfirmSelection { kind: SelectorKind::Logout, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::Logout,
+                value,
+            } => {
                 // `/logout` onSelect (`interactive-mode.ts:5149-5166`): `modelRuntime.logout(id)` —
                 // the ported `cyrup_config::login::logout`, which wraps a store failure as
                 // `Credential store delete failed for …` (`ai/src/models.ts:446-452`). Env vars and
@@ -581,7 +650,10 @@ impl<B: Backend> App<B> {
                 }
             }
 
-            C::ConfirmSelection { kind: SelectorKind::Login, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::Login,
+                value,
+            } => {
                 // `OAuthSelectorComponent`'s onSelect (`interactive-mode.ts:5106-5117`): re-find the
                 // chosen option and `startProviderLogin(providerOption)`. The value is the row INDEX
                 // (see `SelectorKind::Login`), which is what `(providerId, authType)` collapses to.
@@ -597,7 +669,10 @@ impl<B: Backend> App<B> {
                 self.begin_provider_login(session, option);
             }
 
-            C::ConfirmSelection { kind: SelectorKind::LoginAuthType, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::LoginAuthType,
+                value,
+            } => {
                 // `showLoginAuthTypeSelector`'s onSelect (`interactive-mode.ts:5063-5073`): with a
                 // pinned provider, start ITS option of the chosen kind; otherwise open the provider
                 // picker filtered to that kind.
@@ -623,7 +698,10 @@ impl<B: Backend> App<B> {
                 }
             }
 
-            C::ConfirmSelection { kind: SelectorKind::Trust, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::Trust,
+                value,
+            } => {
                 // The trust selector confirms with the chosen option INDEX; re-derive the options and
                 // persist that option's store updates (Pi `/trust` `onSelect` → trust-store write).
                 let options = session.project_trust_options();
@@ -635,19 +713,31 @@ impl<B: Backend> App<B> {
                                 "project trust → {label} (/reload to apply to this session)"
                             ));
                         }
-                        Err(e) => self.state.transcript.push_status(format!("trust error: {e}")),
+                        Err(e) => self
+                            .state
+                            .transcript
+                            .push_status(format!("trust error: {e}")),
                     },
-                    None => self.state.transcript.push_status("trust selection cancelled"),
+                    None => self
+                        .state
+                        .transcript
+                        .push_status("trust selection cancelled"),
                 }
             }
 
-            C::ConfirmSelection { kind: SelectorKind::Session, .. }
-            | C::ConfirmSelection { kind: SelectorKind::UserMessage, .. } => {
-                self.execute_session_switch(cmd, session, runtime).await
+            C::ConfirmSelection {
+                kind: SelectorKind::Session,
+                ..
             }
+            | C::ConfirmSelection {
+                kind: SelectorKind::UserMessage,
+                ..
+            } => self.execute_session_switch(cmd, session, runtime).await,
 
             C::ConfirmSelection { kind, value } => {
-                self.state.transcript.push_status(format!("{} → {value}", kind.title()));
+                self.state
+                    .transcript
+                    .push_status(format!("{} → {value}", kind.title()));
             }
 
             // NOT unreachable by construction — nothing enforced that. `execute_command` decides
@@ -655,7 +745,10 @@ impl<B: Backend> App<B> {
             // this branch. Silence is the one failure mode that hides a misrouted arm, so report it.
             // See the `execute_misc_command` twin for the defect that made this necessary (cc19b87).
             other => {
-                debug_assert!(false, "unrouted command in execute_selector_command: {other:?}");
+                debug_assert!(
+                    false,
+                    "unrouted command in execute_selector_command: {other:?}"
+                );
                 self.state
                     .transcript
                     .push_error(format!("internal: unrouted command {other:?}"));
@@ -681,8 +774,9 @@ pub(crate) fn model_thinking_rows(
         (Some(p), Some(m)) => Some(format!("{p}/{m}")),
         _ => None,
     };
-    let current_key =
-        session.model().map(|c| format!("{}/{}", c.provider.as_str(), c.model.as_str()));
+    let current_key = session
+        .model()
+        .map(|c| format!("{}/{}", c.provider.as_str(), c.model.as_str()));
     let mut entries: Vec<(String, String, Option<String>)> = session
         .available_model_catalog()
         .iter()
@@ -691,8 +785,9 @@ pub(crate) fn model_thinking_rows(
             // `label: modelItemLabel(model)` = `` `${id} [${provider}]` ``
             // (`settings-selector.ts:190-192`); `description: override ?? undefined`.
             let label = format!("{} [{}]", m.id, m.provider);
-            let desc =
-                overrides.get(&key).map(|l| crate::app::thinking_level_str(*l).to_string());
+            let desc = overrides
+                .get(&key)
+                .map(|l| crate::app::thinking_level_str(*l).to_string());
             (key, label, desc)
         })
         .collect();

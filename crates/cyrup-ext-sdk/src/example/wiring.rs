@@ -4,7 +4,7 @@
 //! it).
 
 use crate::{CommandDescriptor, ExtensionApi, FlagSpec};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub(super) fn install(api: &mut ExtensionApi) {
     // A CLI-overridable flag (Pi `registerFlag`, loader.ts:257-266) + a command that READS it back
@@ -14,11 +14,17 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // is the CLI-supplied one, not the registered default (gap-08 §5.6).
     api.register_flag(
         "demo-flag",
-        FlagSpec { r#type: "string".into(), default: Some(json!("off")), description: String::new() },
+        FlagSpec {
+            r#type: "string".into(),
+            default: Some(json!("off")),
+            description: String::new(),
+        },
     );
     api.register_command(
         "flagdemo",
-        CommandDescriptor::new("Report the resolved value of --demo-flag (demo, getFlag override)."),
+        CommandDescriptor::new(
+            "Report the resolved value of --demo-flag (demo, getFlag override).",
+        ),
         |_args: &str, ctx: &crate::CommandCtx| {
             let value = ctx
                 .ctx()
@@ -34,13 +40,18 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // `/buspub <msg>` EMITS on the shared bus; the `on_bus` handler below (registered by EVERY loaded
     // instance of this extension) RECEIVES a topic another instance emitted and surfaces it via
     // `notify` — the observable proof a published event reached a subscribed handler cross-extension.
-    api.on_bus("demo:bus", |topic: &str, payload: Value, ctx: &crate::Ctx| {
-        let msg = payload.get("msg").and_then(|v| v.as_str()).unwrap_or("");
-        ctx.notify(&format!("bus recv {topic}: {msg}"));
-    });
+    api.on_bus(
+        "demo:bus",
+        |topic: &str, payload: Value, ctx: &crate::Ctx| {
+            let msg = payload.get("msg").and_then(|v| v.as_str()).unwrap_or("");
+            ctx.notify(&format!("bus recv {topic}: {msg}"));
+        },
+    );
     api.register_command(
         "buspub",
-        CommandDescriptor::new("Emit a message on the inter-extension event bus (demo). args: <msg>"),
+        CommandDescriptor::new(
+            "Emit a message on the inter-extension event bus (demo). args: <msg>",
+        ),
         |args: &str, ctx: &crate::CommandCtx| {
             let msg = args.trim();
             ctx.ctx().emit("demo:bus", json!({ "msg": msg }));

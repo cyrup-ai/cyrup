@@ -21,14 +21,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::{AgentSession, SessionBuilder, SessionConfig};
 use base64::Engine;
-use cyrup_core::message::{Content, Message};
 use cyrup_core::StopReason;
+use cyrup_core::message::{Content, Message};
+use cyrup_provider::Provider;
 use cyrup_provider::faux::{
     FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
 };
-use cyrup_provider::Provider;
-use crate::{AgentSession, SessionBuilder, SessionConfig};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -58,10 +58,16 @@ fn fixture() -> Fixture {
             image::Rgb([(x % 251) as u8, (y % 241) as u8, 0])
         });
     let path = cwd.join("big.png");
-    img.save_with_format(&path, image::ImageFormat::Png).unwrap();
+    img.save_with_format(&path, image::ImageFormat::Png)
+        .unwrap();
     let png_bytes = std::fs::read(&path).unwrap();
 
-    Fixture { _tmp: tmp, cwd, agent_dir, png_bytes }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+        png_bytes,
+    }
 }
 
 /// Write `{"images":{"autoResize":<v>}}` into the GLOBAL settings file the session will read.
@@ -113,7 +119,9 @@ async fn read_tool_result(session: &AgentSession) -> (String, String) {
     let content = messages
         .iter()
         .find_map(|m| match m {
-            Message::ToolResult { tool_name, content, .. } if tool_name == "read" => Some(content),
+            Message::ToolResult {
+                tool_name, content, ..
+            } if tool_name == "read" => Some(content),
             _ => None,
         })
         .unwrap_or_else(|| {
@@ -183,7 +191,9 @@ async fn auto_resize_default_still_downscales() {
     let (text, data) = run_read(&fx).await;
 
     assert!(
-        text.contains(&format!("[Image: original {FIXTURE_W}x{FIXTURE_H}, displayed at 2000x")),
+        text.contains(&format!(
+            "[Image: original {FIXTURE_W}x{FIXTURE_H}, displayed at 2000x"
+        )),
         "the default (autoResize on) still runs the 2000px downscale + dimension note. Got: {text}"
     );
     assert_ne!(

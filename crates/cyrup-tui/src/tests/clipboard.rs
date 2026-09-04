@@ -17,10 +17,15 @@
 //! [`clipboard_write_plan`] takes the target and the environment as arguments, so the Windows chain,
 //! the macOS chain and all four Linux chains are asserted from whatever host runs the suite — the
 //! only shape of test that could have caught the original.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::clipboard::{
-    clipboard_write_plan, osc52_sequence, ClipboardEnv, ClipboardWrite, MAX_OSC52_ENCODED_LENGTH,
+    ClipboardEnv, ClipboardWrite, MAX_OSC52_ENCODED_LENGTH, clipboard_write_plan, osc52_sequence,
 };
 
 /// A headless, non-remote desktop with no display server at all.
@@ -33,7 +38,10 @@ fn bare() -> ClipboardEnv {
 #[test]
 fn windows_has_a_write_chain_and_it_is_pis() {
     let plan = clipboard_write_plan("windows", &bare());
-    assert!(!plan.is_empty(), "the not(unix) arm used to be a silent no-op");
+    assert!(
+        !plan.is_empty(),
+        "the not(unix) arm used to be a silent no-op"
+    );
     assert_eq!(
         plan,
         vec![ClipboardWrite::Native, ClipboardWrite::Command("clip", &[])],
@@ -46,7 +54,10 @@ fn windows_has_a_write_chain_and_it_is_pis() {
 fn macos_chain_is_native_then_pbcopy() {
     assert_eq!(
         clipboard_write_plan("macos", &bare()),
-        vec![ClipboardWrite::Native, ClipboardWrite::Command("pbcopy", &[])],
+        vec![
+            ClipboardWrite::Native,
+            ClipboardWrite::Command("pbcopy", &[])
+        ],
     );
 }
 
@@ -63,8 +74,15 @@ fn no_x11_platform_uses_the_native_backend() {
     for os in ["linux", "freebsd"] {
         for env in [
             bare(),
-            ClipboardEnv { x11_display: true, ..bare() },
-            ClipboardEnv { wayland_display: true, wayland_session: true, ..bare() },
+            ClipboardEnv {
+                x11_display: true,
+                ..bare()
+            },
+            ClipboardEnv {
+                wayland_display: true,
+                wayland_session: true,
+                ..bare()
+            },
         ] {
             let plan = clipboard_write_plan(os, &env);
             assert!(
@@ -99,17 +117,34 @@ fn linux_wayland_prefers_wl_copy_then_falls_back_to_x11() {
 /// (`clipboard.ts:126` `if (isWayland && hasWaylandDisplay)`) and otherwise goes straight to X11.
 #[test]
 fn linux_wayland_session_without_a_socket_does_not_run_wl_copy() {
-    let env = ClipboardEnv { wayland_session: true, x11_display: true, ..bare() };
+    let env = ClipboardEnv {
+        wayland_session: true,
+        x11_display: true,
+        ..bare()
+    };
     let plan = clipboard_write_plan("linux", &env);
-    assert!(!plan.contains(&ClipboardWrite::Command("wl-copy", &[])), "{plan:?}");
-    assert_eq!(plan.first(), Some(&ClipboardWrite::Command("xclip", &["-selection", "clipboard"])));
+    assert!(
+        !plan.contains(&ClipboardWrite::Command("wl-copy", &[])),
+        "{plan:?}"
+    );
+    assert_eq!(
+        plan.first(),
+        Some(&ClipboardWrite::Command(
+            "xclip",
+            &["-selection", "clipboard"]
+        ))
+    );
 }
 
 /// Termux goes first when `TERMUX_VERSION` is set (`clipboard.ts:113-121`), with the ordinary
 /// Wayland/X11 tools still queued behind it as Pi's `if (!copied)` fallthrough.
 #[test]
 fn linux_termux_is_tried_before_the_display_server_tools() {
-    let env = ClipboardEnv { termux: true, x11_display: true, ..bare() };
+    let env = ClipboardEnv {
+        termux: true,
+        x11_display: true,
+        ..bare()
+    };
     assert_eq!(
         clipboard_write_plan("linux", &env),
         vec![
@@ -153,15 +188,24 @@ fn osc52_refuses_an_oversized_payload() {
 /// anyway.
 #[test]
 fn osc52_is_emitted_when_remote_even_after_a_local_success() {
-    assert!(crate::clipboard::osc52_required(true, true), "remote + copied still emits");
-    assert!(crate::clipboard::osc52_required(false, false), "nothing worked locally");
+    assert!(
+        crate::clipboard::osc52_required(true, true),
+        "remote + copied still emits"
+    );
+    assert!(
+        crate::clipboard::osc52_required(false, false),
+        "nothing worked locally"
+    );
     assert!(crate::clipboard::osc52_required(true, false));
-    assert!(!crate::clipboard::osc52_required(false, true), "local success, local session");
+    assert!(
+        !crate::clipboard::osc52_required(false, true),
+        "local success, local session"
+    );
 }
 
 // ------------------------------------------------------------------ the READ side (DRIFT-045) --
 
-use crate::clipboard::{clipboard_read_plan, ClipboardRead};
+use crate::clipboard::{ClipboardRead, clipboard_read_plan};
 
 /// A Wayland session: `WAYLAND_DISPLAY` set (which also makes `isWaylandSession()` true).
 fn wayland() -> ClipboardEnv {
@@ -188,10 +232,18 @@ fn the_wayland_read_branch_is_gated_on_pis_three_way_conjunction() {
     );
 
     // Each conjunct removed in turn drops the branch and leaves the native read alone.
-    let x11 = ClipboardEnv { x11_display: true, ..ClipboardEnv::default() };
-    assert_eq!(clipboard_read_plan("linux", &x11), vec![ClipboardRead::Native]);
-    let session_but_no_socket =
-        ClipboardEnv { wayland_session: true, ..ClipboardEnv::default() };
+    let x11 = ClipboardEnv {
+        x11_display: true,
+        ..ClipboardEnv::default()
+    };
+    assert_eq!(
+        clipboard_read_plan("linux", &x11),
+        vec![ClipboardRead::Native]
+    );
+    let session_but_no_socket = ClipboardEnv {
+        wayland_session: true,
+        ..ClipboardEnv::default()
+    };
     assert_eq!(
         clipboard_read_plan("linux", &session_but_no_socket),
         vec![ClipboardRead::Native],
@@ -213,7 +265,10 @@ fn the_wayland_read_branch_is_gated_on_pis_three_way_conjunction() {
 /// gates are not "made consistent" by a later reader.
 #[test]
 fn the_read_gate_and_the_write_gate_are_allowed_to_disagree_on_freebsd() {
-    assert_eq!(clipboard_read_plan("freebsd", &wayland()), vec![ClipboardRead::Native]);
+    assert_eq!(
+        clipboard_read_plan("freebsd", &wayland()),
+        vec![ClipboardRead::Native]
+    );
     assert!(
         !clipboard_write_plan("freebsd", &wayland()).contains(&ClipboardWrite::Native),
         "the write side excludes freebsd from the native step; the read side does not",
@@ -221,12 +276,12 @@ fn the_read_gate_and_the_write_gate_are_allowed_to_disagree_on_freebsd() {
 }
 
 mod clipboard_paste_tests {
+    use crate::InputEvent;
+    use crate::UiTheme;
     use crate::app::*;
+    use cyrup_session_svc::{InputSource, UserInput};
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use crate::UiTheme;
-    use crate::InputEvent;
-    use cyrup_session_svc::{InputSource, UserInput};
 
     /// Pi's clipboard paste inserts the materialized temp-file PATH into the editor as ordinary text
     /// (`this.editor.insertTextAtCursor(filePath)`, interactive-mode.ts:2552) — NOT an inline image.
@@ -249,7 +304,11 @@ mod clipboard_paste_tests {
         app.insert_clipboard_image_path(&path);
 
         // Pi mechanism: the bare path is now editable text in the buffer …
-        assert_eq!(app.state().editor.text(), path_str, "path must land in the editor as text");
+        assert_eq!(
+            app.state().editor.text(),
+            path_str,
+            "path must land in the editor as text"
+        );
         // … and is NOT embedded as an inline image (the former `pending_images` embed is gone), so the
         // potentially-huge raster never floods context.
         assert!(
@@ -271,7 +330,10 @@ mod clipboard_paste_tests {
         // (app.rs:3158): the LLM receives the path AS TEXT with an EMPTY image set. `into_agent_message`
         // then yields a single text content block (Pi's `[{type:text,text}]` + no images).
         let outgoing = UserInput::text(path_str.clone(), InputSource::Tui);
-        assert_eq!(outgoing.text, path_str, "outgoing message text is the pasted path");
+        assert_eq!(
+            outgoing.text, path_str,
+            "outgoing message text is the pasted path"
+        );
         assert!(
             outgoing.images.is_empty(),
             "outgoing user message must carry no image content block"
@@ -328,4 +390,3 @@ mod clipboard_paste_tests {
         assert_eq!(app.state().editor.text(), "");
     }
 }
-

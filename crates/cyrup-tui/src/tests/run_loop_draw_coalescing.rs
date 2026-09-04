@@ -51,9 +51,9 @@ const ACTION_SRC: &str = include_str!("../app/run_action.rs");
 /// anchors must resolve — a terminator that no longer matches (an arm renamed, a fn moved to
 /// another file by a re-split) is a lost check, not a licence to read on.
 fn arm_body<'a>(src: &'a str, arm: &str, next_arm: &str) -> &'a str {
-    let start = src
-        .find(arm)
-        .unwrap_or_else(|| panic!("run-loop arm `{arm}` not found — if the loop moved, move this guard with it"));
+    let start = src.find(arm).unwrap_or_else(|| {
+        panic!("run-loop arm `{arm}` not found — if the loop moved, move this guard with it")
+    });
     let rest = &src[start..];
     let end = rest.find(next_arm).unwrap_or_else(|| {
         panic!("terminator `{next_arm}` not found after `{arm}` — if the loop was re-split, re-anchor this guard rather than reading to EOF")
@@ -65,9 +65,9 @@ fn arm_body<'a>(src: &'a str, arm: &str, next_arm: &str) -> &'a str {
 /// where there is genuinely no following anchor, so slice-to-EOF is stated here rather than
 /// reached by an `arm_body` terminator quietly failing to match.
 fn arm_body_to_end<'a>(src: &'a str, arm: &str) -> &'a str {
-    let start = src
-        .find(arm)
-        .unwrap_or_else(|| panic!("run-loop arm `{arm}` not found — if the loop moved, move this guard with it"));
+    let start = src.find(arm).unwrap_or_else(|| {
+        panic!("run-loop arm `{arm}` not found — if the loop moved, move this guard with it")
+    });
     &src[start..]
 }
 
@@ -92,7 +92,11 @@ fn the_run_loop_is_labelled_so_a_drained_quit_can_exit_it() {
     // `AppAction::Quit` to `RunFlow::Break` (run_action.rs), and the select! arm maps
     // `RunFlow::Break` to `break 'run` (run.rs) — still no further draw, still mid-drain.
     // Terminator `swapped = session_swapped` lives in app/run.rs (APP_SRC), the next select! arm.
-    let input = arm_body(APP_SRC, "maybe_in = input.next()", "swapped = session_swapped");
+    let input = arm_body(
+        APP_SRC,
+        "maybe_in = input.next()",
+        "swapped = session_swapped",
+    );
     assert!(
         input.contains("RunFlow::Break => break 'run"),
         "a drained `Quit` must leave the run loop mid-drain with no further draw:\n{input}"
@@ -137,17 +141,28 @@ fn the_events_arm_drains_every_ready_event_then_draws_once() {
     // TUI-092 F8 (landed): the ingest is the BY-VALUE one, so each dequeued event's payloads move
     // into the transcript instead of being cloned per event — and the two `matches!` booleans are
     // therefore read ahead of it, because the call consumes `ev`.
-    let info = pos(arm, "let info_changed = matches!(ev, AgentSessionEvent::SessionInfoChanged { .. });");
-    let settled = pos(arm, "let settled = matches!(ev, AgentSessionEvent::AgentSettled);");
-    let ingest = pos(arm, "self.ingest_session_event_owned(ev, &ctx.session).await;");
+    let info = pos(
+        arm,
+        "let info_changed = matches!(ev, AgentSessionEvent::SessionInfoChanged { .. });",
+    );
+    let settled = pos(
+        arm,
+        "let settled = matches!(ev, AgentSessionEvent::AgentSettled);",
+    );
+    let ingest = pos(
+        arm,
+        "self.ingest_session_event_owned(ev, &ctx.session).await;",
+    );
     assert!(
         info < ingest && settled < ingest,
         "the event-kind booleans must be computed BEFORE the ingest call:\n{arm}"
     );
     // A guest's shutdown is still honored the moment it is detected, mid-drain.
     assert!(
-        pos(arm, "should_honor_extension_shutdown(&ctx.session, settled)")
-            < pos(arm, "return Ok(RunFlow::ReturnOk);"),
+        pos(
+            arm,
+            "should_honor_extension_shutdown(&ctx.session, settled)"
+        ) < pos(arm, "return Ok(RunFlow::ReturnOk);"),
         "the extension-shutdown return stays immediate:\n{arm}"
     );
 }
@@ -212,7 +227,10 @@ fn the_bash_arm_drains_with_try_recv_then_draws_once() {
     );
     let drain = pos(arm, "rx.try_recv()");
     let draw = pos(arm, "frames.request");
-    assert!(drain < draw, "the try_recv drain precedes the single draw:\n{arm}");
+    assert!(
+        drain < draw,
+        "the try_recv drain precedes the single draw:\n{arm}"
+    );
     assert!(
         arm.contains("ctx.bash_rx = None;") && arm.contains("break;"),
         "the terminal `Done` still clears the receiver and ends the drain:\n{arm}"
@@ -226,7 +244,11 @@ fn one_wakeup_one_frame_across_the_three_high_frequency_arms() {
     for (src, arm, next) in [
         // Each terminator lives in the same file as the arm body it follows: the next fn in
         // app/run_action.rs (ACTION_SRC) and app/run_arms.rs (ARMS_SRC) respectively.
-        (ACTION_SRC, "fn on_input_event(", Some("fn on_session_event(")),
+        (
+            ACTION_SRC,
+            "fn on_input_event(",
+            Some("fn on_session_event("),
+        ),
         (ARMS_SRC, "fn on_bash_msg(", Some("fn on_overlay_ticked(")),
         // `on_session_event` is the last fn in app/run_action.rs — no following anchor, so this
         // one runs to EOF by design.

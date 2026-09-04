@@ -12,11 +12,16 @@
 //! `bash` output is already sanitized at capture time (`cyrup-session-svc/src/bash.rs:292`
 //! `sanitize_chunk`); every OTHER tool — `read`, `ls`, `find`, `grep`, and any extension tool —
 //! reaches the transcript raw, which is the path these tests cover.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
+use crate::{App, UiTheme};
 use cyrup_core::ToolCallId;
 use cyrup_session_svc::AgentSessionEvent;
-use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
 use serde_json::json;
 
@@ -51,9 +56,15 @@ fn sgr_sequences_do_not_survive_as_literal_text() {
     assert!(text.contains("README.md"), "content lost:\n{text}");
     assert!(text.contains("Cargo.toml"), "content lost:\n{text}");
 
-    assert!(!text.contains("[1;31m"), "SGR parameters rendered as text:\n{text}");
+    assert!(
+        !text.contains("[1;31m"),
+        "SGR parameters rendered as text:\n{text}"
+    );
     assert!(!text.contains("[0m"), "SGR reset rendered as text:\n{text}");
-    assert!(!text.contains("[?25l"), "cursor-hide sequence rendered as text:\n{text}");
+    assert!(
+        !text.contains("[?25l"),
+        "cursor-hide sequence rendered as text:\n{text}"
+    );
 }
 
 /// `stripAnsi` — the OSC half (`ESC ] … BEL` / `ESC ] … ESC \`). An OSC-8 hyperlink is what a
@@ -64,12 +75,18 @@ fn osc_sequences_do_not_survive_as_literal_text() {
     assert!(bel.contains("linked"), "content lost:\n{bel}");
     assert!(bel.contains("plain.txt"), "content lost:\n{bel}");
     assert!(!bel.contains("8;;"), "OSC payload rendered as text:\n{bel}");
-    assert!(!bel.contains("file:///tmp/x"), "OSC URL rendered as text:\n{bel}");
+    assert!(
+        !bel.contains("file:///tmp/x"),
+        "OSC URL rendered as text:\n{bel}"
+    );
 
     // String terminator form `ESC \` rather than BEL.
     let st = ls_result_text("\u{1b}]0;window title\u{1b}\\kept.txt");
     assert!(st.contains("kept.txt"), "content lost:\n{st}");
-    assert!(!st.contains("window title"), "OSC payload rendered as text:\n{st}");
+    assert!(
+        !st.contains("window title"),
+        "OSC payload rendered as text:\n{st}"
+    );
 }
 
 /// `sanitizeBinaryOutput` (`utils/shell.ts:144-174`). U+FFF9..U+FFFB are Unicode *format*
@@ -80,7 +97,11 @@ fn unicode_format_characters_are_filtered() {
     let text = ls_result_text("before\u{fff9}mid\u{fffa}dle\u{fffb}after.txt");
     assert!(text.contains("after.txt"), "content lost:\n{text}");
     for bad in ['\u{fff9}', '\u{fffa}', '\u{fffb}'] {
-        assert!(!text.contains(bad), "U+{:04X} survived:\n{text}", bad as u32);
+        assert!(
+            !text.contains(bad),
+            "U+{:04X} survived:\n{text}",
+            bad as u32
+        );
     }
 }
 
@@ -92,7 +113,13 @@ fn unicode_format_characters_are_filtered() {
 fn mirror_ordinary_text_is_untouched() {
     let text = ls_result_text("items[0m1].rs\nsrc/main.rs\nnotes ]8;; draft.md");
 
-    assert!(text.contains("items[0m1].rs"), "bracket text mangled:\n{text}");
+    assert!(
+        text.contains("items[0m1].rs"),
+        "bracket text mangled:\n{text}"
+    );
     assert!(text.contains("src/main.rs"), "path mangled:\n{text}");
-    assert!(text.contains("notes ]8;; draft.md"), "literal ]8;; mangled:\n{text}");
+    assert!(
+        text.contains("notes ]8;; draft.md"),
+        "literal ]8;; mangled:\n{text}"
+    );
 }

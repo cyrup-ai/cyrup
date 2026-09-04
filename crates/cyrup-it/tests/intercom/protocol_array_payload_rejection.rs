@@ -25,7 +25,12 @@
 //! while being a worse bug than the one it fixes — pi does not disconnect over a well-formed frame,
 //! and neither may cyrup.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -34,10 +39,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use cyrup_intercom::transport::client::{IntercomClient, InboundEvent};
+use crate::common::Broker;
+use cyrup_intercom::transport::client::{InboundEvent, IntercomClient};
 use cyrup_intercom::transport::framing::{FrameReader, encode_json};
 use cyrup_intercom::transport::protocol::{SessionRegistration, now_ms};
-use crate::common::Broker;
 
 // ---------------------------------------------------------------------------------------------
 // Side A — the real broker subprocess, driven by a raw framed client.
@@ -55,7 +60,9 @@ struct RawClient {
 impl RawClient {
     async fn connect(socket: &Path) -> Self {
         Self {
-            stream: UnixStream::connect(socket).await.expect("connect to the broker socket"),
+            stream: UnixStream::connect(socket)
+                .await
+                .expect("connect to the broker socket"),
             reader: FrameReader::new(),
             queued: VecDeque::new(),
             buf: vec![0u8; 16 * 1024],
@@ -73,16 +80,21 @@ impl RawClient {
             if let Some(v) = self.queued.pop_front() {
                 return Some(v);
             }
-            let n = match tokio::time::timeout(Duration::from_secs(5), self.stream.read(&mut self.buf))
-                .await
-                .expect("broker responds or closes within 5s")
-            {
-                Ok(0) | Err(_) => return None,
-                Ok(n) => n,
-            };
-            let frames = self.reader.push(&self.buf[..n]).expect("broker frames are well-formed");
+            let n =
+                match tokio::time::timeout(Duration::from_secs(5), self.stream.read(&mut self.buf))
+                    .await
+                    .expect("broker responds or closes within 5s")
+                {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => n,
+                };
+            let frames = self
+                .reader
+                .push(&self.buf[..n])
+                .expect("broker frames are well-formed");
             for payload in frames {
-                self.queued.push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
+                self.queued
+                    .push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
             }
         }
     }
@@ -112,7 +124,10 @@ impl RawClient {
             },
         }))
         .await;
-        assert_eq!(self.expect_frame("registered").await["sessionId"], session_id);
+        assert_eq!(
+            self.expect_frame("registered").await["sessionId"],
+            session_id
+        );
     }
 
     /// Assert the broker destroyed this connection. A `list` is queued first so a broker that
@@ -176,7 +191,8 @@ async fn register_with_an_array_shaped_session_is_fatal() {
         "type": "register", "sessionId": "s1", "session": array_shaped_registration(),
     }))
     .await;
-    c.assert_destroyed("an array-shaped `register.session`").await;
+    c.assert_destroyed("an array-shaped `register.session`")
+        .await;
 }
 
 /// `MessageReceipt` — the confirmed hole. `isMessageReceipt` bails on `Array.isArray`
@@ -187,8 +203,10 @@ async fn message_receipt_with_an_array_shaped_receipt_is_fatal() {
     let broker = Broker::start().await;
     let mut c = RawClient::connect(&broker.socket).await;
     c.register("alpha-session").await;
-    c.send(&serde_json::json!({ "type": "message_receipt", "receipt": array_shaped_receipt() })).await;
-    c.assert_destroyed("an array-shaped `message_receipt.receipt`").await;
+    c.send(&serde_json::json!({ "type": "message_receipt", "receipt": array_shaped_receipt() }))
+        .await;
+    c.assert_destroyed("an array-shaped `message_receipt.receipt`")
+        .await;
 }
 
 /// `ExtensionCapability` via `register` — `validateExtensionCapability` rejects an array because
@@ -208,7 +226,8 @@ async fn register_with_an_array_shaped_extension_capability_is_fatal() {
         },
     }))
     .await;
-    c.assert_destroyed("an array-shaped `register.session.extensions[0]`").await;
+    c.assert_destroyed("an array-shaped `register.session.extensions[0]`")
+        .await;
 }
 
 /// `ExtensionCapability` via `extension_capabilities_update`
@@ -266,7 +285,10 @@ async fn well_formed_map_payloads_are_still_served() {
         },
     }))
     .await;
-    assert_eq!(c.expect_frame("registered").await["sessionId"], "alpha-session");
+    assert_eq!(
+        c.expect_frame("registered").await["sessionId"],
+        "alpha-session"
+    );
 
     c.send(&serde_json::json!({
         "type": "message_receipt",
@@ -279,7 +301,8 @@ async fn well_formed_map_payloads_are_still_served() {
     }))
     .await;
 
-    c.send(&serde_json::json!({ "type": "list", "requestId": "r1" })).await;
+    c.send(&serde_json::json!({ "type": "list", "requestId": "r1" }))
+        .await;
     let sessions = c.expect_frame("sessions").await;
     assert_eq!(sessions["requestId"], "r1");
     assert_eq!(sessions["sessions"][0]["id"], "alpha-session");
@@ -323,11 +346,15 @@ impl HostileBroker {
             let mut reader = FrameReader::new();
             let mut buf = vec![0u8; 16 * 1024];
             loop {
-                let Ok(n) = stream.read(&mut buf).await else { return };
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
                 if n == 0 {
                     return;
                 }
-                let Ok(got) = reader.push(&buf[..n]) else { return };
+                let Ok(got) = reader.push(&buf[..n]) else {
+                    return;
+                };
                 if !got.is_empty() {
                     break;
                 }
@@ -347,7 +374,11 @@ impl HostileBroker {
             // Hold the socket open so a client disconnect can only come from the client itself.
             std::future::pending::<()>().await;
         });
-        Self { _dir: dir, socket, release }
+        Self {
+            _dir: dir,
+            socket,
+            release,
+        }
     }
 }
 
@@ -400,31 +431,55 @@ async fn the_client_destroys_the_connection_on_array_shaped_broker_payloads() {
     });
     for (what, frame) in [
         // SessionInfo, in each of the four places a broker can put one.
-        ("`session_joined.session`", serde_json::json!({ "type": "session_joined", "session": array_shaped_session_info() })),
-        ("`presence_update.session`", serde_json::json!({ "type": "presence_update", "session": array_shaped_session_info() })),
-        ("`sessions[0]`", serde_json::json!({ "type": "sessions", "requestId": "r1", "sessions": [array_shaped_session_info()] })),
-        ("`message.from`", serde_json::json!({
-            "type": "message",
-            "from": array_shaped_session_info(),
-            "message": { "id": "m1", "timestamp": 1, "content": { "text": "hi" } },
-        })),
+        (
+            "`session_joined.session`",
+            serde_json::json!({ "type": "session_joined", "session": array_shaped_session_info() }),
+        ),
+        (
+            "`presence_update.session`",
+            serde_json::json!({ "type": "presence_update", "session": array_shaped_session_info() }),
+        ),
+        (
+            "`sessions[0]`",
+            serde_json::json!({ "type": "sessions", "requestId": "r1", "sessions": [array_shaped_session_info()] }),
+        ),
+        (
+            "`message.from`",
+            serde_json::json!({
+                "type": "message",
+                "from": array_shaped_session_info(),
+                "message": { "id": "m1", "timestamp": 1, "content": { "text": "hi" } },
+            }),
+        ),
         // MessageControl.
-        ("`message_control.control`", serde_json::json!({
-            "type": "message_control", "from": good_from.clone(), "control": array_shaped_control(),
-        })),
+        (
+            "`message_control.control`",
+            serde_json::json!({
+                "type": "message_control", "from": good_from.clone(), "control": array_shaped_control(),
+            }),
+        ),
         // MessageReceipt, broker -> client.
-        ("`message_receipt.receipt`", serde_json::json!({
-            "type": "message_receipt", "from": good_from.clone(), "receipt": array_shaped_receipt(),
-        })),
+        (
+            "`message_receipt.receipt`",
+            serde_json::json!({
+                "type": "message_receipt", "from": good_from.clone(), "receipt": array_shaped_receipt(),
+            }),
+        ),
         // Message / Attachment, which were map-only only by accident before the invariant existed.
-        ("`message.message`", serde_json::json!({
-            "type": "message", "from": good_from.clone(),
-            "message": ["m1", 1, null, null, null, null, null, null, null, null, null, { "text": "hi" }],
-        })),
-        ("`message.content.attachments[0]`", serde_json::json!({
-            "type": "message", "from": good_from.clone(),
-            "message": { "id": "m1", "timestamp": 1, "content": { "text": "hi", "attachments": [["snippet", "n", "c", null]] } },
-        })),
+        (
+            "`message.message`",
+            serde_json::json!({
+                "type": "message", "from": good_from.clone(),
+                "message": ["m1", 1, null, null, null, null, null, null, null, null, null, { "text": "hi" }],
+            }),
+        ),
+        (
+            "`message.content.attachments[0]`",
+            serde_json::json!({
+                "type": "message", "from": good_from.clone(),
+                "message": { "id": "m1", "timestamp": 1, "content": { "text": "hi", "attachments": [["snippet", "n", "c", null]] } },
+            }),
+        ),
     ] {
         assert!(
             client_disconnects_on(frame).await,
@@ -443,25 +498,37 @@ async fn the_client_survives_well_formed_broker_payloads_with_unmodelled_keys() 
         "contextPct": 42, "contextTokens": 100, "contextWindow": 200,
     });
     for (what, frame) in [
-        ("session_joined", serde_json::json!({ "type": "session_joined", "session": good_from.clone() })),
-        ("message_control", serde_json::json!({
-            "type": "message_control",
-            "from": good_from.clone(),
-            "control": { "messageId": "m1", "action": "cancel", "timestamp": 1, "piFutureKey": 7 },
-        })),
-        ("message_receipt", serde_json::json!({
-            "type": "message_receipt",
-            "from": good_from.clone(),
-            "receipt": { "messageId": "m1", "status": "queued", "timestamp": 1, "piFutureKey": 7 },
-        })),
-        ("message", serde_json::json!({
-            "type": "message",
-            "from": good_from.clone(),
-            "message": {
-                "id": "m1", "timestamp": 1, "piFutureKey": 7,
-                "content": { "text": "hi", "attachments": [{ "type": "snippet", "name": "n", "content": "c", "piFutureKey": 7 }] },
-            },
-        })),
+        (
+            "session_joined",
+            serde_json::json!({ "type": "session_joined", "session": good_from.clone() }),
+        ),
+        (
+            "message_control",
+            serde_json::json!({
+                "type": "message_control",
+                "from": good_from.clone(),
+                "control": { "messageId": "m1", "action": "cancel", "timestamp": 1, "piFutureKey": 7 },
+            }),
+        ),
+        (
+            "message_receipt",
+            serde_json::json!({
+                "type": "message_receipt",
+                "from": good_from.clone(),
+                "receipt": { "messageId": "m1", "status": "queued", "timestamp": 1, "piFutureKey": 7 },
+            }),
+        ),
+        (
+            "message",
+            serde_json::json!({
+                "type": "message",
+                "from": good_from.clone(),
+                "message": {
+                    "id": "m1", "timestamp": 1, "piFutureKey": 7,
+                    "content": { "text": "hi", "attachments": [{ "type": "snippet", "name": "n", "content": "c", "piFutureKey": 7 }] },
+                },
+            }),
+        ),
     ] {
         assert!(
             !client_disconnects_on(frame).await,

@@ -213,4 +213,3 @@ pub enum AppCommand {
     /// `rename_session_file`). Carries the session path + new name.
     RenameSession { path: String, name: String },
 }
-

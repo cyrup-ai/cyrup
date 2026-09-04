@@ -79,7 +79,9 @@ impl ReplacedSessionContext {
     /// through WIT imports, so this binds nothing and is what [`run_with_session`] hands the stored
     /// closure.
     pub fn new() -> Self {
-        Self { cmd: CommandCtx::new() }
+        Self {
+            cmd: CommandCtx::new(),
+        }
     }
     /// The underlying command-tier context bound to the replacement session.
     pub fn command(&self) -> &CommandCtx {

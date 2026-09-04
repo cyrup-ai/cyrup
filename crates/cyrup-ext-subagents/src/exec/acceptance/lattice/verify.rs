@@ -89,8 +89,13 @@ pub async fn run_verify_commands_memoized_with_cancel(
     let mut results = Vec::with_capacity(commands.len());
     for command in commands {
         results.push(
-            crate::exec::acceptance::model::run_memoized_verify_command_with_cancel(command, default_cwd, memo, cancel)
-                .await,
+            crate::exec::acceptance::model::run_memoized_verify_command_with_cancel(
+                command,
+                default_cwd,
+                memo,
+                cancel,
+            )
+            .await,
         );
         // pi `if (input.signal?.aborted) break;` (`acceptance.ts:1295`).
         if cancel.is_cancelled() {
@@ -99,7 +104,6 @@ pub async fn run_verify_commands_memoized_with_cancel(
     }
     results
 }
-
 
 /// Read one of a child's piped streams to EOF on its own task, so neither stream can fill its
 /// kernel pipe buffer and deadlock the `child.wait()` the timeout races against.
@@ -203,7 +207,6 @@ mod tests {
     use crate::exec::acceptance::lattice::testsupport::vc_timeout;
     use std::time::Duration;
 
-
     /// SUBA-028 — the loop-level half (pi `if (input.signal?.aborted) break;`,
     /// `acceptance.ts:1295`): once cancelled, the REMAINING verify commands do not run at all.
     ///
@@ -227,14 +230,21 @@ mod tests {
         )
         .await;
 
-        assert_eq!(results.len(), 1, "only the interrupted command is recorded: {results:?}");
-        assert_eq!(results[0].status, crate::exec::acceptance::model::VerifyRunStatus::TimedOut, "{results:?}");
+        assert_eq!(
+            results.len(),
+            1,
+            "only the interrupted command is recorded: {results:?}"
+        );
+        assert_eq!(
+            results[0].status,
+            crate::exec::acceptance::model::VerifyRunStatus::TimedOut,
+            "{results:?}"
+        );
         assert!(
             !marker.exists(),
             "the second command must never have run after the abort"
         );
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_verify_commands_executes_every_command_in_order_and_never_short_circuits() {
@@ -244,9 +254,12 @@ mod tests {
             vc("exit 0"), // still runs, passes
         ];
         let results = run_verify_commands(&commands, dir.path()).await;
-        assert_eq!(results.len(), 2, "both commands must run even though the first failed");
+        assert_eq!(
+            results.len(),
+            2,
+            "both commands must run even though the first failed"
+        );
         assert!(!passed(&results[0]));
         assert!(passed(&results[1]));
     }
-
 }

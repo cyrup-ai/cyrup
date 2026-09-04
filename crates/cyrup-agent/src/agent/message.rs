@@ -3,9 +3,8 @@
 
 use super::util::now_millis;
 use cyrup_core::{
-    TerminateHint,
-    ApiId, AssistantMessage, Content, ModelRef, ProviderId, StopReason, ToolCall, ToolUpdate, Usage,
-    UNRESOLVED_API,
+    ApiId, AssistantMessage, Content, ModelRef, ProviderId, StopReason, TerminateHint, ToolCall,
+    ToolUpdate, UNRESOLVED_API, Usage,
 };
 use serde_json::Value;
 
@@ -35,7 +34,10 @@ pub(super) fn empty_assistant(model: &ModelRef) -> AssistantMessage {
         model: model.model.to_string(),
         // Pi: AssistantMessage.api is required (types.ts:386). A ModelRef built from a not-yet-
         // resolved user selection may carry no api; fall back to the sentinel so the field is set.
-        api: model.api.clone().unwrap_or_else(|| ApiId::from(UNRESOLVED_API)),
+        api: model
+            .api
+            .clone()
+            .unwrap_or_else(|| ApiId::from(UNRESOLVED_API)),
         response_model: None,
         response_id: None,
         diagnostics: None,
@@ -56,7 +58,13 @@ pub(super) fn empty_assistant(model: &ModelRef) -> AssistantMessage {
 pub(super) fn tool_calls(a: &AssistantMessage) -> Vec<ToolCall> {
     a.content
         .iter()
-        .filter_map(|c| if let Content::ToolCall(tc) = c { Some(tc.clone()) } else { None })
+        .filter_map(|c| {
+            if let Content::ToolCall(tc) = c {
+                Some(tc.clone())
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -80,12 +88,18 @@ pub(super) fn result_value_of(
     terminate: TerminateHint,
 ) -> Value {
     let mut obj = serde_json::Map::new();
-    obj.insert("content".to_string(), serde_json::to_value(content).unwrap_or(Value::Null));
+    obj.insert(
+        "content".to_string(),
+        serde_json::to_value(content).unwrap_or(Value::Null),
+    );
     if let Some(d) = details {
         obj.insert("details".to_string(), d.clone());
     }
     if let Some(u) = usage {
-        obj.insert("usage".to_string(), serde_json::to_value(u).unwrap_or(Value::Null));
+        obj.insert(
+            "usage".to_string(),
+            serde_json::to_value(u).unwrap_or(Value::Null),
+        );
     }
     if !added_tool_names.is_empty() {
         obj.insert(
@@ -105,7 +119,10 @@ pub(super) fn result_value_of(
 /// Mirror that: include `details`/`terminate` only when `Some`, never as a `null`.
 pub(super) fn update_value(u: &ToolUpdate) -> Value {
     let mut obj = serde_json::Map::new();
-    obj.insert("content".to_string(), serde_json::to_value(&u.content).unwrap_or(Value::Null));
+    obj.insert(
+        "content".to_string(),
+        serde_json::to_value(&u.content).unwrap_or(Value::Null),
+    );
     if let Some(d) = &u.details {
         obj.insert("details".to_string(), d.clone());
     }

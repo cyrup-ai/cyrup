@@ -36,11 +36,11 @@
 
 use std::io::{Read, Write};
 
-use cyrup_core::{CancelToken, Content, Message, StopReason};
 use crate::{
-    ApiImpl, AnthropicMessagesApi, AuthResult, Context, Modality, Model, ModelCost, ProviderEnv,
+    AnthropicMessagesApi, ApiImpl, AuthResult, Context, Modality, Model, ModelCost, ProviderEnv,
     StreamEvent, StreamOptions, channel,
 };
+use cyrup_core::{CancelToken, Content, Message, StopReason};
 
 // ------------------------------------------------------------------------------ loopback server --
 

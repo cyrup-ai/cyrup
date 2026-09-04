@@ -220,7 +220,13 @@ fn default_script_from_env_fallback() -> FixtureScript {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let echo_env = std::env::var(ECHO_ENV_ENV_VAR)
-        .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     FixtureScript {
         echo_argv,
@@ -274,7 +280,8 @@ fn emit_argv_echo(out: &mut impl Write) {
 fn emit_env_echo(names: &[String], out: &mut impl Write) {
     for name in names {
         if let Ok(value) = std::env::var(name) {
-            let line = serde_json::json!({"type": "unknown", "env": name, "value": value}).to_string();
+            let line =
+                serde_json::json!({"type": "unknown", "env": name, "value": value}).to_string();
             let _ = writeln!(out, "{line}");
         }
     }

@@ -57,8 +57,11 @@ pub(super) fn create_slot(
                 .to_string();
             // A slot can open with arguments already present; the buffer carries them, and there
             // is no derived scanner to seed alongside it (PERF-001).
-            let partial_json: SharedStr =
-                item.get("arguments").and_then(Value::as_str).unwrap_or("").into();
+            let partial_json: SharedStr = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .into();
             (
                 RBlock::Tool {
                     call_id,

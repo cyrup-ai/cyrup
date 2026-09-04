@@ -1,5 +1,10 @@
 //! arch-06 acceptance tests (A-06-1..8). Tolerant of clippy no-panic lints in test code.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,7 +16,7 @@ use super::builder::{DocsPointers, PromptInputs, SystemPromptBuilder};
 use super::cache::{ContextError, ContextStore};
 use super::context_files::{ContextFile, ContextFileLoader, ContextScope, TrustQuery};
 use super::hook::{
-    apply_before_agent_start, BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput,
+    BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput, apply_before_agent_start,
 };
 use super::overrides::ResolvedOverride;
 use super::tool_prompts::ToolPromptContribution;
@@ -35,11 +40,18 @@ fn skill(name: &str, desc: &str, path: &str) -> SkillPointer {
 
 /// Same as [`skill`] but with `disable-model-invocation: true` frontmatter.
 fn disabled_skill(name: &str, desc: &str, path: &str) -> SkillPointer {
-    SkillPointer { disable_model_invocation: true, ..skill(name, desc, path) }
+    SkillPointer {
+        disable_model_invocation: true,
+        ..skill(name, desc, path)
+    }
 }
 
 fn base_inputs() -> PromptInputs {
-    PromptInputs { cwd: PathBuf::from("/work/proj"), today: date(), ..PromptInputs::default() }
+    PromptInputs {
+        cwd: PathBuf::from("/work/proj"),
+        today: date(),
+        ..PromptInputs::default()
+    }
 }
 
 struct Stub(bool);
@@ -62,17 +74,30 @@ fn a06_1_default_composition() {
             readme: Some(PathBuf::from("/usr/share/cyrup/README.md")),
             ..DocsPointers::default()
         },
-        skills: Arc::from(vec![skill("rustfmt", "format rust", "/skills/rustfmt/SKILL.md")]),
+        skills: Arc::from(vec![skill(
+            "rustfmt",
+            "format rust",
+            "/skills/rustfmt/SKILL.md",
+        )]),
         ..base_inputs()
     };
     let out = SystemPromptBuilder::new().build(&inp);
 
-    assert!(out.contains("operating inside cyrup"), "identity line\n{out}");
+    assert!(
+        out.contains("operating inside cyrup"),
+        "identity line\n{out}"
+    );
     assert!(out.contains("Available tools:"), "tools header");
-    assert!(out.contains("- read: Read a file from disk"), "read snippet");
+    assert!(
+        out.contains("- read: Read a file from disk"),
+        "read snippet"
+    );
     assert!(out.contains("- bash: Run a shell command"), "bash snippet");
     assert!(out.contains("Guidelines:"));
-    assert!(out.contains("- Be concise in your responses"), "baseline guideline");
+    assert!(
+        out.contains("- Be concise in your responses"),
+        "baseline guideline"
+    );
     assert!(out.contains("cyrup documentation"), "docs pointer");
     assert!(out.contains("- Main documentation: /usr/share/cyrup/README.md"));
     // skills present because `read` is available
@@ -82,9 +107,16 @@ fn a06_1_default_composition() {
     // (`system-prompt.ts:159`); `Current date:` is absent from `packages/coding-agent/src` at
     // v0.83.0, so asserting it pinned a stale port.
     assert!(!out.contains("Current date"), "pi emits no date line");
-    assert!(out.ends_with("\nCurrent working directory: /work/proj"), "cwd footer\n{out}");
+    assert!(
+        out.ends_with("\nCurrent working directory: /work/proj"),
+        "cwd footer\n{out}"
+    );
     // compact-ish: DI-1 sanity (well under a few KB for this tiny input)
-    assert!(out.len() < 2048, "default prompt should stay compact, got {}", out.len());
+    assert!(
+        out.len() < 2048,
+        "default prompt should stay compact, got {}",
+        out.len()
+    );
 }
 
 // ── A-06-2: --system-prompt replaces body but keeps append + context + skills + footer ───────────
@@ -104,22 +136,34 @@ fn a06_2_custom_prompt_keeps_tail() {
     };
     let out = SystemPromptBuilder::new().build(&inp);
 
-    assert!(out.starts_with("REPLACED BODY ONLY"), "custom body first\n{out}");
-    assert!(!out.contains("operating inside cyrup"), "default identity removed");
+    assert!(
+        out.starts_with("REPLACED BODY ONLY"),
+        "custom body first\n{out}"
+    );
+    assert!(
+        !out.contains("operating inside cyrup"),
+        "default identity removed"
+    );
     assert!(!out.contains("Available tools:"), "default tools removed");
     // tail still present
     assert!(out.contains("APPENDED EXTRA"), "append kept");
     assert!(out.contains("<project_context>"), "context kept");
     assert!(out.contains("project rules"));
     assert!(out.contains("<available_skills>"), "skills kept");
-    assert!(out.ends_with("\nCurrent working directory: /work/proj"), "footer kept");
+    assert!(
+        out.ends_with("\nCurrent working directory: /work/proj"),
+        "footer kept"
+    );
     // Pi's custom-prompt branch emits the same `<project_context>` wording and the same
     // `</project_context>\n` close as the default body (`system-prompt.ts:55-60` vs `:146-151`).
     assert!(
         out.contains("<project_context>\n\nProject-specific instructions and guidelines:\n\n"),
         "project_context wording matches system-prompt.ts:146-147\n{out}"
     );
-    assert!(out.contains("</project_context>\n"), "close carries pi's trailing newline");
+    assert!(
+        out.contains("</project_context>\n"),
+        "close carries pi's trailing newline"
+    );
 }
 
 // ── A-06-3: APPEND_SYSTEM.md + repeatable --append-system-prompt all appended (no body removal) ──
@@ -169,7 +213,11 @@ fn a06_4_context_discovery_order_and_nc() {
     let loader = ContextFileLoader::new(cwd.clone(), global.clone(), true, false);
     let (files, _diags) = loader.load();
     let contents: Vec<&str> = files.iter().map(|f| &*f.content).collect();
-    assert_eq!(contents, vec!["GLOBAL", "PARENT", "CWD_AGENTS"], "global→parent→cwd, AGENTS wins");
+    assert_eq!(
+        contents,
+        vec!["GLOBAL", "PARENT", "CWD_AGENTS"],
+        "global→parent→cwd, AGENTS wins"
+    );
     assert_eq!(files[0].scope, ContextScope::Global);
     assert_eq!(files[2].scope, ContextScope::Cwd);
 
@@ -223,8 +271,14 @@ fn a06_4b_agents_override_wins_over_agents_md() {
         files.iter().all(|f| f.content.as_ref() != "CWD_AGENTS"),
         "AGENTS.md must be shadowed by AGENTS.override.md, not appended alongside it"
     );
-    assert!(files[0].path.ends_with("AGENTS.override.md"), "global resolved to the override");
-    assert!(files[2].path.ends_with("AGENTS.override.md"), "cwd resolved to the override");
+    assert!(
+        files[0].path.ends_with("AGENTS.override.md"),
+        "global resolved to the override"
+    );
+    assert!(
+        files[2].path.ends_with("AGENTS.override.md"),
+        "cwd resolved to the override"
+    );
 }
 
 // ── A-06-4c: MIRROR — `AGENTS.override.md` does not outrank a NEARER scope ───────────────────────
@@ -270,7 +324,11 @@ fn a06_5_untrusted_skips_project_keeps_global() {
     let loader = ContextFileLoader::from_trust(cwd, global, &trust, false);
     let (files, _diags) = loader.load();
     let contents: Vec<&str> = files.iter().map(|f| &*f.content).collect();
-    assert_eq!(contents, vec!["GLOBAL"], "only global loaded for untrusted project");
+    assert_eq!(
+        contents,
+        vec!["GLOBAL"],
+        "only global loaded for untrusted project"
+    );
 }
 
 // ── A-06-6: read-tool gates skills section; empty skills (--no-skills) removes it regardless ─────
@@ -284,7 +342,11 @@ fn a06_6_read_gates_skills() {
         skills: Arc::from(with_skills.clone()),
         ..base_inputs()
     };
-    assert!(SystemPromptBuilder::new().build(&inp).contains("<available_skills>"));
+    assert!(
+        SystemPromptBuilder::new()
+            .build(&inp)
+            .contains("<available_skills>")
+    );
 
     // read NOT available -> no skills section even with skills loaded
     let inp_no_read = PromptInputs {
@@ -292,7 +354,11 @@ fn a06_6_read_gates_skills() {
         skills: Arc::from(with_skills),
         ..base_inputs()
     };
-    assert!(!SystemPromptBuilder::new().build(&inp_no_read).contains("<available_skills>"));
+    assert!(
+        !SystemPromptBuilder::new()
+            .build(&inp_no_read)
+            .contains("<available_skills>")
+    );
 
     // read available but --no-skills (empty set) -> no section
     let inp_no_skills = PromptInputs {
@@ -300,7 +366,11 @@ fn a06_6_read_gates_skills() {
         skills: Arc::from(Vec::new()),
         ..base_inputs()
     };
-    assert!(!SystemPromptBuilder::new().build(&inp_no_skills).contains("<available_skills>"));
+    assert!(
+        !SystemPromptBuilder::new()
+            .build(&inp_no_skills)
+            .contains("<available_skills>")
+    );
 }
 
 // ── SESS-003: `disable-model-invocation` skills are excluded from `<available_skills>` ───────────
@@ -312,14 +382,28 @@ fn sess003_disabled_skills_are_not_advertised_to_the_model() {
     let inp = PromptInputs {
         selected_tools: Some(vec![arc("read")]),
         skills: Arc::from(vec![
-            skill("visible-skill", "the model may use this", "/s/visible/SKILL.md"),
-            disabled_skill("hidden-skill", "explicit invocation only", "/s/hidden/SKILL.md"),
+            skill(
+                "visible-skill",
+                "the model may use this",
+                "/s/visible/SKILL.md",
+            ),
+            disabled_skill(
+                "hidden-skill",
+                "explicit invocation only",
+                "/s/hidden/SKILL.md",
+            ),
         ]),
         ..base_inputs()
     };
     let out = SystemPromptBuilder::new().build(&inp);
-    assert!(out.contains("<available_skills>"), "section emitted for the enabled skill");
-    assert!(out.contains("<name>visible-skill</name>"), "enabled skill advertised");
+    assert!(
+        out.contains("<available_skills>"),
+        "section emitted for the enabled skill"
+    );
+    assert!(
+        out.contains("<name>visible-skill</name>"),
+        "enabled skill advertised"
+    );
     assert!(
         !out.contains("hidden-skill"),
         "disable-model-invocation skill must not appear in the prompt; got:\n{out}"
@@ -368,14 +452,26 @@ fn sess016_explicitly_empty_tool_set_emits_no_skills_and_no_tool_guidelines() {
         ..base_inputs()
     };
     let out = SystemPromptBuilder::new().build(&empty);
-    assert!(!out.contains("<available_skills>"), "no skills without `read`; got:\n{out}");
-    assert!(!out.contains("- read: Read a file from disk"), "no snippet for an unselected tool");
-    assert!(!out.contains("Quote your bash arguments"), "no guideline for an unselected tool");
+    assert!(
+        !out.contains("<available_skills>"),
+        "no skills without `read`; got:\n{out}"
+    );
+    assert!(
+        !out.contains("- read: Read a file from disk"),
+        "no snippet for an unselected tool"
+    );
+    assert!(
+        !out.contains("Quote your bash arguments"),
+        "no guideline for an unselected tool"
+    );
     assert!(
         !out.contains("Use bash for file operations"),
         "the bash-fallback guideline needs `bash` selected, and it is not"
     );
-    assert!(out.contains("(none)"), "empty tool list renders pi's `(none)` placeholder");
+    assert!(
+        out.contains("(none)"),
+        "empty tool list renders pi's `(none)` placeholder"
+    );
 
     // None == UNSET == pi's four-tool default, which DOES include `read`.
     let unset = PromptInputs {
@@ -385,9 +481,15 @@ fn sess016_explicitly_empty_tool_set_emits_no_skills_and_no_tool_guidelines() {
         ..base_inputs()
     };
     let out_unset = SystemPromptBuilder::new().build(&unset);
-    assert!(out_unset.contains("<available_skills>"), "unset falls back to pi's default set");
+    assert!(
+        out_unset.contains("<available_skills>"),
+        "unset falls back to pi's default set"
+    );
     assert!(out_unset.contains("- read: Read a file from disk"));
-    assert!(out_unset.contains("Quote your bash arguments"), "`bash` is in pi's default set");
+    assert!(
+        out_unset.contains("Quote your bash arguments"),
+        "`bash` is in pi's default set"
+    );
     // ...but `grep` is not, so an unset set must not select an arbitrary name.
     let grep_only = PromptInputs {
         selected_tools: None,
@@ -395,7 +497,9 @@ fn sess016_explicitly_empty_tool_set_emits_no_skills_and_no_tool_guidelines() {
         ..base_inputs()
     };
     assert!(
-        !SystemPromptBuilder::new().build(&grep_only).contains("- grep: search"),
+        !SystemPromptBuilder::new()
+            .build(&grep_only)
+            .contains("- grep: search"),
         "the default set is exactly [read, bash, edit, write] (system-prompt.ts:81)"
     );
 }
@@ -422,11 +526,16 @@ fn sess024_skills_preamble_carries_pi_relative_path_rule() {
         "skills.ts:343"
     );
     assert!(
-        out.contains("Use the read tool to load a skill's file when the task matches its description."),
+        out.contains(
+            "Use the read tool to load a skill's file when the task matches its description."
+        ),
         "skills.ts:344"
     );
     // `:346` is the empty string, i.e. a blank line immediately before the block.
-    assert!(out.contains("\n\n<available_skills>\n"), "blank line before the block (skills.ts:346)");
+    assert!(
+        out.contains("\n\n<available_skills>\n"),
+        "blank line before the block (skills.ts:346)"
+    );
 }
 
 // ── SESS-035: the docs section carries pi's three behavioural bullets ────────────────────────────
@@ -468,8 +577,15 @@ fn sess035_docs_section_emits_pi_resolution_and_cross_reference_rules() {
     );
 
     // All-absent stays silent (the guard is only reachable while SESS-035's wiring is missing).
-    let none = PromptInputs { selected_tools: Some(vec![arc("read")]), ..base_inputs() };
-    assert!(!SystemPromptBuilder::new().build(&none).contains("cyrup documentation"));
+    let none = PromptInputs {
+        selected_tools: Some(vec![arc("read")]),
+        ..base_inputs()
+    };
+    assert!(
+        !SystemPromptBuilder::new()
+            .build(&none)
+            .contains("cyrup documentation")
+    );
 }
 
 // ── SESS-033: the fingerprint covers `disable_model_invocation` ──────────────────────────────────
@@ -494,9 +610,18 @@ fn sess033_fingerprint_tracks_disable_model_invocation() {
     );
 
     // UNSET vs explicitly-EMPTY tools are different prompts and must hash differently (SESS-016).
-    let unset = PromptInputs { selected_tools: None, ..visible.clone() };
-    let empty = PromptInputs { selected_tools: Some(Vec::new()), ..visible };
-    assert_ne!(builder.inputs_fingerprint(&unset), builder.inputs_fingerprint(&empty));
+    let unset = PromptInputs {
+        selected_tools: None,
+        ..visible.clone()
+    };
+    let empty = PromptInputs {
+        selected_tools: Some(Vec::new()),
+        ..visible
+    };
+    assert_ne!(
+        builder.inputs_fingerprint(&unset),
+        builder.inputs_fingerprint(&empty)
+    );
 
     // `today` no longer affects any byte, so it must NOT force a daily rebuild (SESS-019/033).
     let d1 = PromptInputs {
@@ -507,8 +632,15 @@ fn sess033_fingerprint_tracks_disable_model_invocation() {
         today: time::Date::from_calendar_date(2027, time::Month::January, 1).expect("date"),
         ..base_inputs()
     };
-    assert_eq!(builder.build(&d1), builder.build(&d2), "no date reaches the prompt");
-    assert_eq!(builder.inputs_fingerprint(&d1), builder.inputs_fingerprint(&d2));
+    assert_eq!(
+        builder.build(&d1),
+        builder.build(&d2),
+        "no date reaches the prompt"
+    );
+    assert_eq!(
+        builder.inputs_fingerprint(&d1),
+        builder.inputs_fingerprint(&d2)
+    );
 }
 
 // ── A-06-7: dynamic tool snippet/guideline appears then disappears; fingerprint changes ──────────
@@ -527,8 +659,14 @@ fn a06_7_dynamic_tool_snippet() {
         ..base_inputs()
     };
     let out_with = builder.build(&with_tool);
-    assert!(out_with.contains("- mytool: does a dynamic thing"), "dynamic snippet present");
-    assert!(out_with.contains("- Prefer mytool for dynamic things"), "dynamic guideline present");
+    assert!(
+        out_with.contains("- mytool: does a dynamic thing"),
+        "dynamic snippet present"
+    );
+    assert!(
+        out_with.contains("- Prefer mytool for dynamic things"),
+        "dynamic guideline present"
+    );
 
     // tool disabled: removed from active set AND contributions
     let without_tool = PromptInputs {
@@ -538,7 +676,10 @@ fn a06_7_dynamic_tool_snippet() {
     };
     let out_without = builder.build(&without_tool);
     assert!(!out_without.contains("mytool"), "dynamic tool gone");
-    assert!(!out_without.contains("dynamic things"), "dynamic guideline gone");
+    assert!(
+        !out_without.contains("dynamic things"),
+        "dynamic guideline gone"
+    );
 
     assert_ne!(
         builder.inputs_fingerprint(&with_tool),
@@ -571,7 +712,10 @@ impl BeforeAgentStartHook for KeepHook {
 
 #[test]
 fn a06_8_before_agent_start_replaces_prompt() {
-    let inp = PromptInputs { selected_tools: Some(vec![arc("read")]), ..base_inputs() };
+    let inp = PromptInputs {
+        selected_tools: Some(vec![arc("read")]),
+        ..base_inputs()
+    };
     let built = SystemPromptBuilder::new().build(&inp);
 
     // replacement wins
@@ -598,7 +742,10 @@ async fn context_store_reload_caches_snapshot() {
     std::fs::write(cwd.join("AGENTS.md"), "PROJECT RULES").unwrap();
 
     let store = ContextStore::new();
-    assert!(store.snapshot().context_files.is_empty(), "empty before reload");
+    assert!(
+        store.snapshot().context_files.is_empty(),
+        "empty before reload"
+    );
 
     let loader = ContextFileLoader::new(cwd, global, true, false);
     let skills: Arc<[SkillPointer]> = Arc::from(vec![skill("s", "d", "/s/SKILL.md")]);
@@ -617,11 +764,21 @@ async fn context_store_reload_caches_snapshot() {
 #[tokio::test]
 async fn context_store_reload_cancelled() {
     let tmp = tempfile::tempdir().unwrap();
-    let loader = ContextFileLoader::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), true, false);
+    let loader = ContextFileLoader::new(
+        tmp.path().to_path_buf(),
+        tmp.path().to_path_buf(),
+        true,
+        false,
+    );
     let cancel = RunCancel::new();
     cancel.cancel();
     let err = ContextStore::new()
-        .reload(&cancel, loader, Arc::from(Vec::new()), ResolvedOverride::default())
+        .reload(
+            &cancel,
+            loader,
+            Arc::from(Vec::new()),
+            ResolvedOverride::default(),
+        )
         .await
         .expect_err("cancelled");
     assert!(matches!(err, ContextError::Cancelled));
@@ -633,8 +790,10 @@ async fn context_store_reload_cancelled() {
 #[test]
 fn the_file_exploration_fallback_names_whichever_shells_are_selected() {
     const BASH_ONLY: &str = "Use bash for file operations like ls, rg, find";
-    const PS_ONLY: &str = "Use PowerShell for file operations like listing, searching, and finding files";
-    const BOTH: &str = "Use bash or PowerShell for file operations like listing, searching, and finding files";
+    const PS_ONLY: &str =
+        "Use PowerShell for file operations like listing, searching, and finding files";
+    const BOTH: &str =
+        "Use bash or PowerShell for file operations like listing, searching, and finding files";
 
     let build = |tools: &[&str]| {
         SystemPromptBuilder::new().build(&PromptInputs {
@@ -649,7 +808,10 @@ fn the_file_exploration_fallback_names_whichever_shells_are_selected() {
         (&["bash", "powershell"][..], BOTH, [BASH_ONLY, PS_ONLY]),
     ] {
         let out = build(tools);
-        assert!(out.contains(want), "{tools:?} must emit `{want}`; got:\n{out}");
+        assert!(
+            out.contains(want),
+            "{tools:?} must emit `{want}`; got:\n{out}"
+        );
         for other in unwanted {
             assert!(
                 !out.contains(other),
@@ -660,7 +822,11 @@ fn the_file_exploration_fallback_names_whichever_shells_are_selected() {
 
     // Any of grep/find/ls closes the gate for every shell combination (`system-prompt.ts:105`).
     for extra in ["grep", "find", "ls"] {
-        for shells in [&["bash"][..], &["powershell"][..], &["bash", "powershell"][..]] {
+        for shells in [
+            &["bash"][..],
+            &["powershell"][..],
+            &["bash", "powershell"][..],
+        ] {
             let mut tools = shells.to_vec();
             tools.push(extra);
             let out = build(&tools);
@@ -676,6 +842,9 @@ fn the_file_exploration_fallback_names_whichever_shells_are_selected() {
     // Neither shell selected ⇒ no fallback at all.
     let out = build(&["read"]);
     for g in [BASH_ONLY, PS_ONLY, BOTH] {
-        assert!(!out.contains(g), "no shell selected ⇒ no fallback; got `{g}`");
+        assert!(
+            !out.contains(g),
+            "no shell selected ⇒ no fallback; got `{g}`"
+        );
     }
 }

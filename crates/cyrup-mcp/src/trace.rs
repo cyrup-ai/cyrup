@@ -11,11 +11,11 @@
 //! fail a connect is worse than no tracer.
 
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex, PoisonError};
 use std::sync::Arc;
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use regex::{Regex, NoExpand};
+use regex::{NoExpand, Regex};
 use serde::Serialize;
 
 /// `MCP_TRACE_SCHEMA_VERSION` (`mcp-trace.ts:7`).
@@ -154,14 +154,20 @@ pub fn redact_trace_text(value: &str, max_length: usize) -> String {
     }
     let mut redacted = value.to_string();
     if let Some(re) = URL_LIKE.as_ref() {
-        redacted = re.replace_all(&redacted, NoExpand(REDACTED_URL)).into_owned();
+        redacted = re
+            .replace_all(&redacted, NoExpand(REDACTED_URL))
+            .into_owned();
     }
     if let Some(re) = AUTH_SCHEME.as_ref() {
-        redacted = re.replace_all(&redacted, NoExpand(REDACTED_AUTH)).into_owned();
+        redacted = re
+            .replace_all(&redacted, NoExpand(REDACTED_AUTH))
+            .into_owned();
     }
     if let Some(re) = SECRET_ASSIGNMENT.as_ref() {
         // `NoExpand` is the whole point — see trap 1 above.
-        redacted = re.replace_all(&redacted, NoExpand("$1=[REDACTED]")).into_owned();
+        redacted = re
+            .replace_all(&redacted, NoExpand("$1=[REDACTED]"))
+            .into_owned();
     }
     truncate_utf16(&redacted, max_length)
 }
@@ -244,9 +250,7 @@ pub fn trace_event<M: Serialize>(
 
     // `if ("id" in message) event.id = traceId(message.id) ?? null` — present-but-unmappable is
     // `null`, absent is omitted entirely.
-    let id = object
-        .and_then(|map| map.get("id"))
-        .map(trace_id);
+    let id = object.and_then(|map| map.get("id")).map(trace_id);
 
     let error_code = object
         .and_then(|map| map.get("error"))
@@ -345,7 +349,10 @@ impl TraceFs for RealTraceFs {
     }
     fn append(&self, path: &Path, line: &str) -> std::io::Result<()> {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         file.write_all(line.as_bytes())
     }
 }
@@ -503,7 +510,11 @@ pub fn is_mcp_trace_enabled(
 /// `settings.file` verbatim when absolute, resolved against the session cwd when relative; otherwise
 /// `<cwd>/.cyrup/mcp-traces/mcp-<ISO with `:` and `.` mapped to `-`>-<suffix>.jsonl`.
 #[must_use]
-pub fn trace_file_path(dirs: &crate::dirs::McpDirs, settings: &crate::config::TraceSettings, suffix: &str) -> PathBuf {
+pub fn trace_file_path(
+    dirs: &crate::dirs::McpDirs,
+    settings: &crate::config::TraceSettings,
+    suffix: &str,
+) -> PathBuf {
     if let Some(configured) = settings.file.as_deref().filter(|file| !file.is_empty()) {
         let path = Path::new(configured);
         return if path.is_absolute() {
@@ -564,8 +575,18 @@ pub struct TracingTransport<T> {
 
 impl<T> TracingTransport<T> {
     #[must_use]
-    pub fn new(inner: T, server: impl Into<Arc<str>>, kind: TraceTransportKind, writer: Arc<TraceWriter>) -> Self {
-        Self { inner, server: server.into(), kind, writer }
+    pub fn new(
+        inner: T,
+        server: impl Into<Arc<str>>,
+        kind: TraceTransportKind,
+        writer: Arc<TraceWriter>,
+    ) -> Self {
+        Self {
+            inner,
+            server: server.into(),
+            kind,
+            writer,
+        }
     }
 }
 
@@ -617,7 +638,9 @@ where
 
     /// `receive` replaces upstream's `onmessage` interception — rmcp **pulls** where the TS SDK
     /// pushes, so there is no property to define and the `defineProperty` try/catch has no analogue.
-    async fn receive(&mut self) -> Option<rmcp::service::RxJsonRpcMessage<rmcp::service::RoleClient>> {
+    async fn receive(
+        &mut self,
+    ) -> Option<rmcp::service::RxJsonRpcMessage<rmcp::service::RoleClient>> {
         let message = self.inner.receive().await;
         if let Some(message) = message.as_ref() {
             self.writer.write(&trace_event(
@@ -685,12 +708,16 @@ where
         // must name a single return type across the two arms.
         match self {
             Self::Plain(inner) => Box::pin(inner.send(item))
-                as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send>>,
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send>,
+                >,
             Self::Traced(inner) => Box::pin(inner.send(item)),
         }
     }
 
-    async fn receive(&mut self) -> Option<rmcp::service::RxJsonRpcMessage<rmcp::service::RoleClient>> {
+    async fn receive(
+        &mut self,
+    ) -> Option<rmcp::service::RxJsonRpcMessage<rmcp::service::RoleClient>> {
         match self {
             Self::Plain(inner) => inner.receive().await,
             Self::Traced(inner) => inner.receive().await,
@@ -720,10 +747,16 @@ mod tests {
 
     impl FakeFs {
         fn calls(&self) -> Vec<String> {
-            self.calls.lock().unwrap_or_else(PoisonError::into_inner).clone()
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
         }
         fn record(&self, entry: String) {
-            self.calls.lock().unwrap_or_else(PoisonError::into_inner).push(entry);
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(entry);
         }
     }
 
@@ -838,9 +871,15 @@ mod tests {
             )
             .kind
         };
-        assert_eq!(kind(json!({"method": "m", "id": 1})), TraceMessageKind::Request);
+        assert_eq!(
+            kind(json!({"method": "m", "id": 1})),
+            TraceMessageKind::Request
+        );
         assert_eq!(kind(json!({"method": "m"})), TraceMessageKind::Notification);
-        assert_eq!(kind(json!({"id": 1, "result": {}})), TraceMessageKind::Response);
+        assert_eq!(
+            kind(json!({"id": 1, "result": {}})),
+            TraceMessageKind::Response
+        );
         // rmcp models errors as their own variant; upstream calls them responses.
         assert_eq!(
             kind(json!({"id": 1, "error": {"code": -32601}})),
@@ -862,7 +901,10 @@ mod tests {
             )
             .id
         };
-        assert_eq!(id(json!({"id": 7, "result": {}})), Some(Some(TraceId::Number(7))));
+        assert_eq!(
+            id(json!({"id": 7, "result": {}})),
+            Some(Some(TraceId::Number(7)))
+        );
         assert_eq!(
             id(json!({"id": "abc", "result": {}})),
             Some(Some(TraceId::Redacted(REDACTED_ID)))
@@ -897,7 +939,16 @@ mod tests {
         let head: Vec<&str> = keys.into_iter().take(8).collect();
         assert_eq!(
             head,
-            vec!["version", "timestamp", "direction", "server", "transport", "kind", "status", "bytes"]
+            vec![
+                "version",
+                "timestamp",
+                "direction",
+                "server",
+                "transport",
+                "kind",
+                "status",
+                "bytes"
+            ]
         );
     }
 
@@ -913,7 +964,11 @@ mod tests {
         );
         assert_eq!(event.error_code, Some(-32601));
         assert_eq!(event.duration_ms, Some(1234.57));
-        assert_eq!(round_2dp(-5.0), 0.0, "clamped at zero, as `Math.max(0, …)` does");
+        assert_eq!(
+            round_2dp(-5.0),
+            0.0,
+            "clamped at zero, as `Math.max(0, …)` does"
+        );
     }
 
     // ---- the writer ----
@@ -928,14 +983,21 @@ mod tests {
         writer.write(&event());
         let calls = fs.calls();
         assert!(
-            calls.first().is_some_and(|c| c.starts_with("mkdir /traces")),
+            calls
+                .first()
+                .is_some_and(|c| c.starts_with("mkdir /traces")),
             "got {calls:?}"
         );
         assert!(
-            calls.get(1).is_some_and(|c| c.starts_with("truncate /traces/mcp.jsonl")),
+            calls
+                .get(1)
+                .is_some_and(|c| c.starts_with("truncate /traces/mcp.jsonl")),
             "got {calls:?}"
         );
-        assert_eq!(calls.iter().filter(|c| c.starts_with("truncate")).count(), 1);
+        assert_eq!(
+            calls.iter().filter(|c| c.starts_with("truncate")).count(),
+            1
+        );
         assert_eq!(calls.iter().filter(|c| c.starts_with("append")).count(), 2);
     }
 
@@ -946,11 +1008,20 @@ mod tests {
         let fs = Arc::new(FakeFs::default());
         let writer = writer(&fs, 10, 100);
         writer.write(&event());
-        assert!(writer.is_disabled(), "a line over the cap must latch, not skip");
+        assert!(
+            writer.is_disabled(),
+            "a line over the cap must latch, not skip"
+        );
         assert_eq!(writer.stats(), (0, 0), "a refused line spends no budget");
         // And it stays off for a line that would have fitted.
         writer.write(&event());
-        assert_eq!(fs.calls().iter().filter(|c| c.starts_with("append")).count(), 0);
+        assert_eq!(
+            fs.calls()
+                .iter()
+                .filter(|c| c.starts_with("append"))
+                .count(),
+            0
+        );
     }
 
     /// The event cap is `>=`, checked before the line is even built.
@@ -962,7 +1033,13 @@ mod tests {
             writer.write(&event());
         }
         assert_eq!(writer.stats().1, 2);
-        assert_eq!(fs.calls().iter().filter(|c| c.starts_with("append")).count(), 2);
+        assert_eq!(
+            fs.calls()
+                .iter()
+                .filter(|c| c.starts_with("append"))
+                .count(),
+            2
+        );
         // Reaching the cap is not a latch — the writer is merely full.
         assert!(!writer.is_disabled());
     }
@@ -971,7 +1048,10 @@ mod tests {
     /// and `write` still returns normally.
     #[test]
     fn an_initialisation_failure_is_silent_and_latches() {
-        let fs = Arc::new(FakeFs { calls: Mutex::default(), fail_dir: true });
+        let fs = Arc::new(FakeFs {
+            calls: Mutex::default(),
+            fail_dir: true,
+        });
         let writer = writer(&fs, 1_000_000, 100);
         writer.write(&event());
         assert!(writer.is_disabled());
@@ -1028,9 +1108,16 @@ mod tests {
 
         let default = crate::config::TraceSettings::default();
         let path = trace_file_path(&dirs, &default, "abcd1234");
-        assert!(path.starts_with("/work/.cyrup/mcp-traces"), "got {}", path.display());
+        assert!(
+            path.starts_with("/work/.cyrup/mcp-traces"),
+            "got {}",
+            path.display()
+        );
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(name.starts_with("mcp-") && name.ends_with("-abcd1234.jsonl"), "got {name}");
+        assert!(
+            name.starts_with("mcp-") && name.ends_with("-abcd1234.jsonl"),
+            "got {name}"
+        );
         // `:` and `.` are mapped out of the ISO stamp so the name is portable.
         assert!(!name.trim_end_matches(".jsonl").contains(':'), "got {name}");
     }
@@ -1039,7 +1126,12 @@ mod tests {
     fn the_random_suffix_is_eight_base36_characters() {
         let suffix = random_suffix();
         assert_eq!(suffix.len(), 8);
-        assert!(suffix.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()), "got {suffix}");
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "got {suffix}"
+        );
         assert_ne!(random_suffix(), suffix, "two draws should differ");
     }
 }

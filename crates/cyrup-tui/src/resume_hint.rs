@@ -108,9 +108,8 @@ pub fn resume_hint_line(command: &str) -> String {
 /// `value.length > 0` guard and so comes back as `''` — which is correct, and is what makes an empty
 /// argument survive as an argument at all rather than vanishing.
 pub fn quote_if_needed(value: &str) -> String {
-    let safe = |c: char| {
-        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | ':' | '@')
-    };
+    let safe =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | ':' | '@');
     if !value.is_empty() && value.chars().all(safe) {
         return value.to_string();
     }
@@ -119,7 +118,12 @@ pub fn quote_if_needed(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -161,7 +165,10 @@ mod tests {
             "a session outside the default dir is not reachable from a bare relaunch, so the \
              directory must be printed: {command}"
         );
-        assert_eq!(command, format!("cyrup --session-dir {} --session abc", dir.path().display()));
+        assert_eq!(
+            command,
+            format!("cyrup --session-dir {} --session abc", dir.path().display())
+        );
     }
 
     /// A directory a shell would mangle is quoted Pi's way.
@@ -179,13 +186,19 @@ mod tests {
             default_session_dir: Path::new("/elsewhere"),
         };
         let command = format_resume_command(&target, true).unwrap();
-        assert!(command.contains(&format!("'{}'", spaced.display())), "{command}");
+        assert!(
+            command.contains(&format!("'{}'", spaced.display())),
+            "{command}"
+        );
     }
 
     /// `quoteIfNeeded`'s full contract, including the `'\''` escape and the empty-string case.
     #[test]
     fn quoting_matches_pi() {
-        assert_eq!(quote_if_needed("/home/u/.cyrup/sessions"), "/home/u/.cyrup/sessions");
+        assert_eq!(
+            quote_if_needed("/home/u/.cyrup/sessions"),
+            "/home/u/.cyrup/sessions"
+        );
         assert_eq!(quote_if_needed("a-b_c.d~e:f@g"), "a-b_c.d~e:f@g");
         assert_eq!(quote_if_needed("with space"), "'with space'");
         assert_eq!(quote_if_needed("it's"), r"'it'\''s'");

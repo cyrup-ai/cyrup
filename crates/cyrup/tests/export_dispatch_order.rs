@@ -95,18 +95,25 @@ fn plain_export_writes_the_sibling_html_and_exits_zero() {
 fn export_runs_upstream_of_the_api_key_requires_a_model_bail() {
     let tmp = TempDir::new().unwrap();
     let session = session_file(tmp.path());
-    let run = export_run(tmp.path(), &[
-        "--export",
-        session.to_str().unwrap(),
-        "--api-key",
-        "sk-not-used",
-    ]);
+    let run = export_run(
+        tmp.path(),
+        &[
+            "--export",
+            session.to_str().unwrap(),
+            "--api-key",
+            "sk-not-used",
+        ],
+    );
     assert_eq!(
         run.code, 0,
         "the export must not be refused by a guard pi runs after it; stderr: {}",
         run.stderr
     );
-    assert!(!run.stderr.contains("--api-key requires a model"), "{}", run.stderr);
+    assert!(
+        !run.stderr.contains("--api-key requires a model"),
+        "{}",
+        run.stderr
+    );
     assert!(session.with_extension("html").exists());
 }
 
@@ -115,13 +122,16 @@ fn export_runs_upstream_of_the_api_key_requires_a_model_bail() {
 fn export_runs_upstream_of_the_conflicting_session_flag_guards() {
     let tmp = TempDir::new().unwrap();
     let session = session_file(tmp.path());
-    let run = export_run(tmp.path(), &[
-        "--export",
-        session.to_str().unwrap(),
-        "--fork",
-        "deadbeef",
-        "--continue",
-    ]);
+    let run = export_run(
+        tmp.path(),
+        &[
+            "--export",
+            session.to_str().unwrap(),
+            "--fork",
+            "deadbeef",
+            "--continue",
+        ],
+    );
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     assert!(session.with_extension("html").exists());
 }
@@ -133,7 +143,10 @@ fn the_output_path_comes_from_messages_not_from_file_args() {
     let tmp = TempDir::new().unwrap();
     let session = session_file(tmp.path());
     let work = tmp.path().join("work");
-    let run = export_run(tmp.path(), &["--export", session.to_str().unwrap(), "@notes.md"]);
+    let run = export_run(
+        tmp.path(),
+        &["--export", session.to_str().unwrap(), "@notes.md"],
+    );
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     assert!(
         !work.join("@notes.md").exists(),
@@ -142,11 +155,10 @@ fn the_output_path_comes_from_messages_not_from_file_args() {
     assert!(session.with_extension("html").exists());
 
     // Presence before absence: a real message positional IS the destination (pi `messages[0]`).
-    let named = export_run(tmp.path(), &[
-        "--export",
-        session.to_str().unwrap(),
-        "out.html",
-    ]);
+    let named = export_run(
+        tmp.path(),
+        &["--export", session.to_str().unwrap(), "out.html"],
+    );
     assert_eq!(named.code, 0, "stderr: {}", named.stderr);
     assert!(work.join("out.html").exists(), "{}", named.stdout);
 }

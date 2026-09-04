@@ -4,17 +4,15 @@
 use cyrup_core::{CancelToken, EntryId, Message};
 
 use crate::compaction::error::CompactionError;
-use crate::compaction::files::{format_file_operations, FileOps};
+use crate::compaction::files::{FileOps, format_file_operations};
 use crate::compaction::serialize::serialize_conversation;
-use crate::compaction::summarize::{
-    SummarizationRequest, Summarizer, SUMMARIZATION_SYSTEM_PROMPT,
-};
-use cyrup_core::Usage;
+use crate::compaction::summarize::{SUMMARIZATION_SYSTEM_PROMPT, SummarizationRequest, Summarizer};
 use crate::compaction::tokens::{
     estimate_agent_message, estimate_custom_message_content, estimate_summary_text,
 };
 use crate::context::{branch_summary_message, compaction_summary_message};
 use crate::entry::{Entry, KnownEntry};
+use cyrup_core::Usage;
 use cyrup_core::{ModelRef, ModelThinkingLevel};
 use cyrup_provider::Model;
 
@@ -50,11 +48,19 @@ fn branch_contribution(entry: &Entry) -> Option<(Vec<Message>, u32, bool)> {
             ))
         }
         Entry::Known(KnownEntry::BranchSummary { summary, base, .. }) => Some((
-            vec![branch_summary_message(summary, crate::context::parse_entry_ts(&base.timestamp))],
+            vec![branch_summary_message(
+                summary,
+                crate::context::parse_entry_ts(&base.timestamp),
+            )],
             estimate_summary_text(summary),
             true,
         )),
-        Entry::Known(KnownEntry::Compaction { summary, tokens_before, base, .. }) => Some((
+        Entry::Known(KnownEntry::Compaction {
+            summary,
+            tokens_before,
+            base,
+            ..
+        }) => Some((
             vec![compaction_summary_message(
                 summary,
                 *tokens_before,
@@ -76,14 +82,14 @@ pub const BRANCH_SUMMARY_EMPTY_PLACEHOLDER: &str = "No content to summarize";
 
 /// Preamble prepended to a branch summary so it reads as abandoned-branch context. Byte-1:1 with Pi
 /// `BRANCH_SUMMARY_PREAMBLE` (`branch-summarization.ts:247-250`).
-pub const BRANCH_SUMMARY_PREAMBLE: &str =
-    "The user explored a different conversation branch before returning here.\nSummary of that \
+pub const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that \
 exploration:\n\n";
 
 /// Branch-summary prompt (R-05-016). Byte-1:1 with Pi `BRANCH_SUMMARY_PROMPT`
 /// (`branch-summarization.ts:252-279`). Note: Pi's branch prompt has NO `## Critical Context`
 /// section (unlike the compaction prompt).
-pub const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for \
+pub const BRANCH_SUMMARY_PROMPT: &str =
+    "Create a structured summary of this conversation branch for \
 context when returning later.
 
 Use this EXACT format:
@@ -129,7 +135,11 @@ pub const DEFAULT_BRANCH_CONTEXT_WINDOW: u32 = 128_000;
 /// goes negative and `tokenBudget > 0` is likewise false, so both treat that case as "no limit".
 pub fn branch_token_budget(model: &Model, reserve_tokens: u32) -> u32 {
     let window = u32::try_from(model.context_window).unwrap_or(u32::MAX);
-    let window = if window == 0 { DEFAULT_BRANCH_CONTEXT_WINDOW } else { window };
+    let window = if window == 0 {
+        DEFAULT_BRANCH_CONTEXT_WINDOW
+    } else {
+        window
+    };
     window.saturating_sub(reserve_tokens)
 }
 
@@ -154,10 +164,15 @@ pub fn collect_entries_for_branch_summary(
             break;
         }
     }
-    let common_ancestor_id =
-        common_len.checked_sub(1).and_then(|i| old_path.get(i)).map(Entry::id);
+    let common_ancestor_id = common_len
+        .checked_sub(1)
+        .and_then(|i| old_path.get(i))
+        .map(Entry::id);
     let entries = old_path.get(common_len..).unwrap_or(&[]).to_vec();
-    BranchCollection { entries, common_ancestor_id }
+    BranchCollection {
+        entries,
+        common_ancestor_id,
+    }
 }
 
 /// Newest-first selection of branch messages within `budget`, plus cumulative file tracking seeded
@@ -187,17 +202,24 @@ pub fn prepare_branch_entries(entries: &[Entry], budget: u32) -> BranchPreparati
     // `prepare.rs`. cyrup keeps the field (`entry.rs:105`), so it keeps the guard.
     // Pinned by `tests/compaction.rs::g21_prepare_branch_entries_ignores_from_hook_details`.
     for e in entries {
-        if let Entry::Known(KnownEntry::BranchSummary { details: Some(d), from_hook, .. }) = e
-            && !from_hook.unwrap_or(false) {
-                file_ops.absorb_prev_details(d);
-            }
+        if let Entry::Known(KnownEntry::BranchSummary {
+            details: Some(d),
+            from_hook,
+            ..
+        }) = e
+            && !from_hook.unwrap_or(false)
+        {
+            file_ops.absorb_prev_details(d);
+        }
     }
 
     let mut selected: Vec<Message> = Vec::new();
     let mut total: u64 = 0;
     let budget = u64::from(budget);
     for e in entries.iter().rev() {
-        let Some((msgs, est, is_summary)) = branch_contribution(e) else { continue };
+        let Some((msgs, est, is_summary)) = branch_contribution(e) else {
+            continue;
+        };
         // File ops are extracted for every contributing entry (Pi extracts BEFORE the budget check).
         for m in &msgs {
             file_ops.absorb_message(m);
@@ -214,7 +236,10 @@ pub fn prepare_branch_entries(entries: &[Entry], budget: u32) -> BranchPreparati
         total += cost;
     }
 
-    BranchPreparation { messages: selected, file_ops }
+    BranchPreparation {
+        messages: selected,
+        file_ops,
+    }
 }
 
 /// Prepend `head` before `selected` (keeps the final order oldest→newest as we walk backward).
@@ -293,16 +318,18 @@ pub async fn generate_branch_summary_with_instructions<S: Summarizer>(
     };
     let resp = summarizer.complete(req, cancel).await?;
     match resp.stop_reason {
-        cyrup_core::StopReason::Error => {
-            Err(CompactionError::Summarization(resp.error_message.unwrap_or_default()))
-        }
+        cyrup_core::StopReason::Error => Err(CompactionError::Summarization(
+            resp.error_message.unwrap_or_default(),
+        )),
         cyrup_core::StopReason::Aborted => Err(CompactionError::Aborted),
         // An unsettled response is NOT a summary — see the same guard, and the `Deferred`
         // rationale, in `summarize.rs`.
-        cyrup_core::StopReason::Pending | cyrup_core::StopReason::Deferred => Err(CompactionError::Summarization(
-            resp.error_message
-                .unwrap_or_else(|| crate::compaction::summarize::PENDING_SUMMARY.to_string()),
-        )),
+        cyrup_core::StopReason::Pending | cyrup_core::StopReason::Deferred => {
+            Err(CompactionError::Summarization(
+                resp.error_message
+                    .unwrap_or_else(|| crate::compaction::summarize::PENDING_SUMMARY.to_string()),
+            ))
+        }
         cyrup_core::StopReason::Stop
         | cyrup_core::StopReason::Length
         | cyrup_core::StopReason::ToolUse => {

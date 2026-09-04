@@ -8,16 +8,21 @@
 //! — only to be discarded by `fold_project_trust`.
 //!
 //! The assertion is about handler INVOCATION, not the returned decision.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use cyrup_core::{CancelToken, ExtensionId};
 use crate::{
     EventKind, ExtError, ExtensionHost, HandledValue, HookOutcome, HostConfig, HostCtx, HostEvent,
     InitApi, NativeExtension,
 };
+use cyrup_core::{CancelToken, ExtensionId};
 use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A `project_trust` voter with an observable invocation counter.
 struct Voter {
@@ -28,7 +33,11 @@ struct Voter {
 
 impl Voter {
     fn new(id: &'static str, verdict: &'static str) -> Arc<Self> {
-        Arc::new(Self { id, verdict, calls: AtomicUsize::new(0) })
+        Arc::new(Self {
+            id,
+            verdict,
+            calls: AtomicUsize::new(0),
+        })
     }
     fn calls(&self) -> usize {
         self.calls.load(Ordering::Acquire)
@@ -99,6 +108,10 @@ async fn no_decision_when_every_extension_is_undecided() {
     let host = ExtensionHost::new(HostConfig::default());
     let only = Voter::new("only", "undecided");
     host.load_native(only.clone()).await.expect("load");
-    assert!(host.aggregate_project_trust(&CancelToken::new()).await.is_none());
+    assert!(
+        host.aggregate_project_trust(&CancelToken::new())
+            .await
+            .is_none()
+    );
     assert_eq!(only.calls(), 1);
 }

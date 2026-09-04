@@ -89,11 +89,16 @@ fn custom_content_chars(content: &serde_json::Value) -> usize {
         serde_json::Value::String(s) => utf16_len(s),
         serde_json::Value::Array(blocks) => blocks
             .iter()
-            .map(|b| match b.get("type").and_then(serde_json::Value::as_str) {
-                Some("text") => b.get("text").and_then(serde_json::Value::as_str).map_or(0, utf16_len),
-                Some("image") => ESTIMATED_IMAGE_CHARS,
-                _ => 0,
-            })
+            .map(
+                |b| match b.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text") => b
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map_or(0, utf16_len),
+                    Some("image") => ESTIMATED_IMAGE_CHARS,
+                    _ => 0,
+                },
+            )
             .sum(),
         _ => 0,
     }
@@ -118,7 +123,9 @@ fn assistant_content_chars(c: &Content) -> usize {
         Content::Thinking { thinking, .. } => utf16_len(thinking),
         Content::ToolCall(tc) => {
             utf16_len(&tc.name)
-                + serde_json::to_string(&tc.arguments).map(|s| utf16_len(&s)).unwrap_or(0)
+                + serde_json::to_string(&tc.arguments)
+                    .map(|s| utf16_len(&s))
+                    .unwrap_or(0)
         }
         Content::Image { .. } => 0,
     }
@@ -248,9 +255,10 @@ impl TokenCache {
     fn cached(&self, entry: &Entry, kind: EstimateKind, compute: impl FnOnce() -> u32) -> u32 {
         let key = (entry.id(), kind);
         if let Ok(map) = self.map.lock()
-            && let Some(v) = map.get(&key) {
-                return *v;
-            }
+            && let Some(v) = map.get(&key)
+        {
+            return *v;
+        }
         let est = compute();
         if let Ok(mut map) = self.map.lock() {
             map.insert(key, est);
@@ -263,7 +271,9 @@ impl TokenCache {
         self.cached(entry, EstimateKind::Rendered, || {
             let mut msgs = Vec::new();
             push_as_message(&mut msgs, entry);
-            msgs.iter().map(estimate_tokens).fold(0u32, |a, b| a.saturating_add(b))
+            msgs.iter()
+                .map(estimate_tokens)
+                .fold(0u32, |a, b| a.saturating_add(b))
         })
     }
 

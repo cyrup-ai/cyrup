@@ -9,17 +9,22 @@
 //! instead, so the first run AFTER a `/tools` toggle reverted the prompt to the startup tool set —
 //! but only once some extension subscribed to `BeforeAgentStart` (without a subscriber the fast
 //! path returns early and the rebuild survives), which made it look like an extension bug.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cyrup_core::ExtensionId;
-use cyrup_ext::{EventKind, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension};
-use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
-use cyrup_provider::Provider;
 use crate::{SessionBuilder, SessionConfig};
+use cyrup_core::ExtensionId;
+use cyrup_core::StopReason;
+use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use futures::StreamExt;
 use tempfile::TempDir;
 
@@ -57,7 +62,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -72,7 +81,10 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 async fn tool_rebuild_updates_the_base_prompt_the_next_run_resets_to() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
 
     let provider: Arc<dyn Provider> = faux.clone();
     let session = SessionBuilder::new(provider, base_config(&fx))
@@ -85,13 +97,26 @@ async fn tool_rebuild_updates_the_base_prompt_the_next_run_resets_to() {
 
     // Narrow the active set to a single tool (Pi `setActiveToolsByName`, agent-session.ts:939).
     let all = session.all_tools();
-    assert!(all.len() > 1, "fixture must expose more than one enable-able tool: {}", all.len());
+    assert!(
+        all.len() > 1,
+        "fixture must expose more than one enable-able tool: {}",
+        all.len()
+    );
     let keep = all[0].name.clone();
-    session.set_active_tools_by_name(std::slice::from_ref(&keep)).await;
+    session
+        .set_active_tools_by_name(std::slice::from_ref(&keep))
+        .await;
 
     let rebuilt = session.current_system_prompt().await;
-    assert_ne!(rebuilt, startup, "narrowing the tool set must change the assembled prompt");
-    assert_eq!(session.base_system_prompt(), rebuilt, "the rebuild is the new live base");
+    assert_ne!(
+        rebuilt, startup,
+        "narrowing the tool set must change the assembled prompt"
+    );
+    assert_eq!(
+        session.base_system_prompt(),
+        rebuilt,
+        "the rebuild is the new live base"
+    );
 
     // A run with a `before_agent_start` subscriber that replaces nothing.
     let stream = session.prompt("hello").await.expect("prompt accepted");
@@ -103,6 +128,14 @@ async fn tool_rebuild_updates_the_base_prompt_the_next_run_resets_to() {
         rebuilt,
         "before_agent_start reverted the agent to the STARTUP prompt, discarding the tool rebuild"
     );
-    assert_eq!(session.base_system_prompt(), rebuilt, "the live base must still be the rebuild");
-    assert_eq!(session.active_tool_names(), vec![keep], "the active tool set must be unchanged");
+    assert_eq!(
+        session.base_system_prompt(),
+        rebuilt,
+        "the live base must still be the rebuild"
+    );
+    assert_eq!(
+        session.active_tool_names(),
+        vec![keep],
+        "the active tool set must be unchanged"
+    );
 }

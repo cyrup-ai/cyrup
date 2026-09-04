@@ -51,7 +51,11 @@ pub(super) async fn init_ext(ext: &PermissionSystemExtension) {
 /// is load-bearing for the pins — a thread-local pin does not reach a multi-thread worker.
 pub(super) fn block_on<F: std::future::Future>(body: F) -> F::Output {
     #[allow(clippy::unwrap_used)]
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body)
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(body)
 }
 
 pub(super) fn bash_call(call_id: &str) -> HostEvent {
@@ -83,7 +87,10 @@ pub(super) struct NotifyRecorder {
 
 impl NotifyRecorder {
     pub(super) fn new() -> Self {
-        Self { names: vec!["bash".to_string()], notifications: Mutex::new(Vec::new()) }
+        Self {
+            names: vec!["bash".to_string()],
+            notifications: Mutex::new(Vec::new()),
+        }
     }
     pub(super) fn warnings(&self) -> Vec<String> {
         guard(&self.notifications)

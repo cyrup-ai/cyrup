@@ -77,11 +77,13 @@ fn payload_hash(payload_json: &str) -> String {
 /// Lowercase hex, matching node's `digest("hex")`. A local helper rather than a `hex` crate edge.
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-        // `write!` to a String is infallible; the Result is discarded deliberately.
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+            // `write!` to a String is infallible; the Result is discarded deliberately.
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
 }
 
 /// `ExtensionStateManager` (`extension-state.ts:48-197`).
@@ -115,13 +117,19 @@ impl ExtensionStateManager {
                 "intercom broker: could not restrict extension state dir to 0700"
             );
         }
-        Self { states: HashMap::new(), state_dir }
+        Self {
+            states: HashMap::new(),
+            state_dir,
+        }
     }
 
     /// `statePath` (`extension-state.ts:59-62`) — the file is NAMED by the namespace's hash, so a
     /// namespace containing `/` or `..` can never escape the directory.
     fn state_path(&self, namespace: &str) -> PathBuf {
-        self.state_dir.join(format!("{}.json", hex(&Sha256::digest(namespace.as_bytes()))))
+        self.state_dir.join(format!(
+            "{}.json",
+            hex(&Sha256::digest(namespace.as_bytes()))
+        ))
     }
 
     /// `backupPath` (`extension-state.ts:64-66`) — `${statePath}.bak`.
@@ -155,7 +163,8 @@ impl ExtensionStateManager {
         }
         let revision = super::js::js_safe_u64(obj.get("revision"))?;
         // `typeof envelope.updatedAt !== "number"` — the value is not otherwise used on read.
-        obj.get("updatedAt").and_then(serde_json::Value::as_number)?;
+        obj.get("updatedAt")
+            .and_then(serde_json::Value::as_number)?;
         let stored_hash = obj.get("payloadSha256").and_then(|v| v.as_str())?;
 
         // An ABSENT `payload` key is `undefined` upstream, and `JSON.stringify(undefined)` is
@@ -173,7 +182,10 @@ impl ExtensionStateManager {
         if payload_hash(&payload_json) != stored_hash {
             return None;
         }
-        Some(NamespaceState { revision, payload: payload.clone() })
+        Some(NamespaceState {
+            revision,
+            payload: payload.clone(),
+        })
     }
 
     /// `loadState` (`extension-state.ts:110-121`): the cache, then the primary file, then the
@@ -211,7 +223,8 @@ impl ExtensionStateManager {
         payload: Option<&serde_json::Value>,
         now: u64,
     ) -> StateCommitResult {
-        let payload_json = serialize_payload(payload).filter(|j| j.len() <= MAX_EXTENSION_STATE_BYTES);
+        let payload_json =
+            serialize_payload(payload).filter(|j| j.len() <= MAX_EXTENSION_STATE_BYTES);
         let current = self.load_state(namespace).cloned();
         let current_revision = current.as_ref().map_or(0, |s| s.revision);
 
@@ -245,9 +258,19 @@ impl ExtensionStateManager {
 
         match self.persist(namespace, &envelope) {
             Ok(()) => {
-                self.states
-                    .insert(namespace.to_string(), NamespaceState { revision, payload: payload_value });
-                StateCommitResult { committed: true, revision, reason: None, payload: None }
+                self.states.insert(
+                    namespace.to_string(),
+                    NamespaceState {
+                        revision,
+                        payload: payload_value,
+                    },
+                );
+                StateCommitResult {
+                    committed: true,
+                    revision,
+                    reason: None,
+                    payload: None,
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -272,7 +295,11 @@ impl ExtensionStateManager {
     fn persist(&self, namespace: &str, envelope: &StateEnvelope) -> std::io::Result<()> {
         let state_path = self.state_path(namespace);
         let mut tmp = state_path.clone().into_os_string();
-        tmp.push(format!(".tmp.{}.{}", std::process::id(), uuid::Uuid::new_v4()));
+        tmp.push(format!(
+            ".tmp.{}.{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         let tmp = PathBuf::from(tmp);
 
         let result = self.persist_inner(&state_path, &tmp, namespace, envelope);

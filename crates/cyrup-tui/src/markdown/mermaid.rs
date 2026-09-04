@@ -151,7 +151,11 @@ impl MermaidContext {
         message_type: MessageType,
         is_streaming: bool,
     ) -> Self {
-        MermaidContext { mode, message_type, is_streaming }
+        MermaidContext {
+            mode,
+            message_type,
+            is_streaming,
+        }
     }
 
     /// pi's gate, inverted (`mermaid.ts:63-70` returns the markdown UNTOUCHED when any of the three
@@ -277,7 +281,10 @@ fn is_structural(ch: char) -> bool {
 /// their rotations), which the renderer writes INTO an outline run: `└────────△────────┘`. They are
 /// structure for outline-matching purposes even though they live outside the Box Drawing block.
 fn is_relationship_marker(ch: char) -> bool {
-    matches!(ch, '△' | '▲' | '▽' | '▼' | '◇' | '◆' | '◁' | '◀' | '▷' | '▶')
+    matches!(
+        ch,
+        '△' | '▲' | '▽' | '▼' | '◇' | '◆' | '◁' | '◀' | '▷' | '▶'
+    )
 }
 
 /// A glyph allowed inside the horizontal run between two matching corners.
@@ -370,7 +377,12 @@ fn rect_from(grid: &[Vec<Option<char>>], top: usize, left: usize) -> Option<Rect
         if TOP_RIGHT.contains(&ch)
             && let Some(bottom) = find_bottom(grid, top, left, right)
         {
-            return Some(Rect { top, bottom, left, right });
+            return Some(Rect {
+                top,
+                bottom,
+                left,
+                right,
+            });
         }
         if !is_border_run(ch) {
             return None;
@@ -480,7 +492,11 @@ fn class_of(
     if in_title_row {
         return SpanClass::Title;
     }
-    if text_report { SpanClass::Text } else { SpanClass::EdgeLabel }
+    if text_report {
+        SpanClass::Text
+    } else {
+        SpanClass::EdgeLabel
+    }
 }
 
 /// Render one mermaid fence body, applying pi's width and warning rules (`mermaid.ts:75-82`).
@@ -526,7 +542,11 @@ pub(crate) fn render_diagram(
         }
     };
 
-    let rows: Vec<String> = text.trim_end_matches('\n').lines().map(str::to_string).collect();
+    let rows: Vec<String> = text
+        .trim_end_matches('\n')
+        .lines()
+        .map(str::to_string)
+        .collect();
     // `if (!art || …) return token.raw` (`:76`) — nothing to draw.
     if rows.is_empty() || rows.iter().all(|row| row.trim().is_empty()) {
         return DiagramOutcome::Raw;
@@ -534,7 +554,11 @@ pub(crate) fn render_diagram(
     // `art.width > context.availableWidth` (`:76`). `mermaid_text` returns text rather than an
     // `art` with a `width`, so the width is measured off the rendered rows in display columns —
     // the same unit the pane width is in.
-    let width = rows.iter().map(|row| crate::text_width::str_width(row)).max().unwrap_or(0);
+    let width = rows
+        .iter()
+        .map(|row| crate::text_width::str_width(row))
+        .max()
+        .unwrap_or(0);
     if width > available_width {
         return DiagramOutcome::Raw;
     }

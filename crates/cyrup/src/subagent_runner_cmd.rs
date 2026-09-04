@@ -286,9 +286,8 @@ mod tests {
         // C7 regression: the provisional ResultFile dir must be the SIBLING
         // <home>/.cyrup/subagents/results/<cwd_key> (preserving the cwd key), never the pre-fix
         // <home>/.cyrup/subagents/async/results that dropped the key and nested results under async.
-        let cfg = PathBuf::from(
-            "/home/me/.cyrup/subagents/async/abcd1234/run00099/runner-config.json",
-        );
+        let cfg =
+            PathBuf::from("/home/me/.cyrup/subagents/async/abcd1234/run00099/runner-config.json");
         let paths = derive_run_paths(&cfg).expect("derives");
         assert_eq!(
             paths.run_dir,
@@ -301,9 +300,7 @@ mod tests {
              orchestrator's own run_artifact_roots derivation (C7)"
         );
         assert!(
-            !paths
-                .result
-                .starts_with("/home/me/.cyrup/subagents/async"),
+            !paths.result.starts_with("/home/me/.cyrup/subagents/async"),
             "the results dir must never be nested under the async tree"
         );
     }

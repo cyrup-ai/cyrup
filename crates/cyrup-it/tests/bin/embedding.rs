@@ -4,15 +4,20 @@
 //! and exercise the documented embedding surface: run a prompt to completion and collect the final
 //! assistant text; stream typed events and assert their order; abort a running tool; and read state
 //! (messages / last_assistant_text / session_id).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text, faux_tool_call};
 use cyrup_sdk::{AgentSessionEvent, Cyrup, InputSource, Session, SessionConfig, UserInput};
 use futures::StreamExt;
 use tempfile::TempDir;
@@ -33,7 +38,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn config(fx: &Fixture) -> SessionConfig {
@@ -44,7 +53,10 @@ fn config(fx: &Fixture) -> SessionConfig {
 
 async fn build_session(fx: &Fixture, faux: Arc<FauxProvider>) -> Session {
     let provider: Arc<dyn Provider> = faux;
-    Cyrup::builder().build_session(provider, config(fx)).await.expect("build session")
+    Cyrup::builder()
+        .build_session(provider, config(fx))
+        .await
+        .expect("build session")
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -62,7 +74,10 @@ async fn run_collects_final_assistant_text() {
     )]);
 
     let session = build_session(&fx, faux).await;
-    let text = session.run("what is the answer?").await.expect("run completes");
+    let text = session
+        .run("what is the answer?")
+        .await
+        .expect("run completes");
     assert_eq!(text, "the answer is 42");
 }
 
@@ -83,10 +98,18 @@ async fn streamed_events_arrive_in_order() {
         .expect("run_collecting completes");
 
     let kinds: Vec<&str> = events.iter().map(AgentSessionEvent::kind).collect();
-    assert_eq!(kinds.first(), Some(&"agent_start"), "must start with agent_start: {kinds:?}");
+    assert_eq!(
+        kinds.first(),
+        Some(&"agent_start"),
+        "must start with agent_start: {kinds:?}"
+    );
     // SEAM-005: the session event stream closes with `agent_settled` (the whole run, including any
     // auto-retry / post-run compaction, is done), immediately after the last `agent_end`.
-    assert_eq!(kinds.last(), Some(&"agent_settled"), "must end with agent_settled: {kinds:?}");
+    assert_eq!(
+        kinds.last(),
+        Some(&"agent_settled"),
+        "must end with agent_settled: {kinds:?}"
+    );
     assert_eq!(
         kinds.iter().rev().nth(1),
         Some(&"agent_end"),
@@ -95,12 +118,18 @@ async fn streamed_events_arrive_in_order() {
 
     // turn_start precedes message_start precedes message_end precedes agent_end.
     let pos = |k: &str| kinds.iter().position(|x| *x == k);
-    assert!(pos("turn_start") < pos("message_end"), "turn_start before message_end: {kinds:?}");
+    assert!(
+        pos("turn_start") < pos("message_end"),
+        "turn_start before message_end: {kinds:?}"
+    );
     assert!(
         pos("message_start") < pos("message_end"),
         "message_start before message_end: {kinds:?}"
     );
-    assert!(pos("message_end") < pos("agent_end"), "message_end before agent_end: {kinds:?}");
+    assert!(
+        pos("message_end") < pos("agent_end"),
+        "message_end before agent_end: {kinds:?}"
+    );
 
     assert_eq!(text.as_deref(), Some("hello there"));
 }
@@ -121,11 +150,19 @@ async fn reads_state_after_a_run() {
     let _ = session.run("remember this").await.expect("run completes");
 
     // last_assistant_text reflects the run.
-    assert_eq!(session.last_assistant_text().await.as_deref(), Some("stateful reply"));
+    assert_eq!(
+        session.last_assistant_text().await.as_deref(),
+        Some("stateful reply")
+    );
 
     // messages: user prompt then assistant reply persisted on the branch.
     let msgs = session.messages().await;
-    assert_eq!(msgs.len(), 2, "expected user + assistant, got {}", msgs.len());
+    assert_eq!(
+        msgs.len(),
+        2,
+        "expected user + assistant, got {}",
+        msgs.len()
+    );
     assert!(
         matches!(msgs[0], cyrup_core::Message::User { .. }),
         "first message is the user prompt"
@@ -137,8 +174,14 @@ async fn reads_state_after_a_run() {
 
     // session_id is stable; the system prompt is assembled (non-empty).
     assert_eq!(session.session_id(), &id_before);
-    assert!(!session.system_prompt().is_empty(), "system prompt should be assembled");
-    assert!(!session.is_streaming().await, "session must be idle after the run");
+    assert!(
+        !session.system_prompt().is_empty(),
+        "system prompt should be assembled"
+    );
+    assert!(
+        !session.is_streaming().await,
+        "session must be idle after the run"
+    );
 }
 
 /// Aborting a running tool unblocks the run (no deadlock). The faux provider schedules a long
@@ -158,7 +201,10 @@ async fn abort_cancels_a_running_tool() {
     )]);
 
     let session = build_session(&fx, faux).await;
-    let mut stream = session.prompt("run the sleeper").await.expect("prompt accepted");
+    let mut stream = session
+        .prompt("run the sleeper")
+        .await
+        .expect("prompt accepted");
 
     // Wait until the tool starts executing, then abort the run via the SDK handle.
     loop {
@@ -177,5 +223,8 @@ async fn abort_cancels_a_running_tool() {
     tokio::time::timeout(Duration::from_secs(5), session.wait_for_idle())
         .await
         .expect("wait_for_idle must complete after abort");
-    assert!(!session.is_streaming().await, "session must be idle after abort");
+    assert!(
+        !session.is_streaming().await,
+        "session must be idle after abort"
+    );
 }

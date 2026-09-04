@@ -35,9 +35,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::AppMode;
-use crate::provider::{
-    mode_refreshes_catalogs, spawn_model_catalog_refresh_with,
-};
+use crate::provider::{mode_refreshes_catalogs, spawn_model_catalog_refresh_with};
 use cyrup_config::policy::NetworkPolicy;
 use cyrup_provider::auth::AuthContext;
 use cyrup_provider::models_store::{InMemoryModelsStore, ModelsStore};
@@ -71,7 +69,9 @@ impl MockOrigin {
                 // 404 is Pi's "this provider has no remote catalog" branch: it clears the overlay
                 // and is explicitly NOT an error, so the task always completes cleanly.
                 let _ = sock
-                    .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
                     .await;
                 let _ = sock.flush().await;
             }

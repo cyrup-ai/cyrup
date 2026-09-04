@@ -39,8 +39,8 @@ pub mod paths;
 pub mod project_pane;
 pub mod project_target;
 pub mod relay;
-pub mod resources;
 pub mod reply_tracker;
+pub mod resources;
 pub mod seams;
 pub mod session_state;
 pub mod tools;
@@ -51,4 +51,6 @@ pub mod ui;
 mod tests;
 
 pub use error::{IntercomError, Result};
-pub use extension::{IntercomExtension, intercom_extension_for_env, intercom_extension_for_env_concrete};
+pub use extension::{
+    IntercomExtension, intercom_extension_for_env, intercom_extension_for_env_concrete,
+};

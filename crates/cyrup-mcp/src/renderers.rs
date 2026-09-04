@@ -180,7 +180,11 @@ fn byte_length(text: &str) -> usize {
 /// `mcp-output-guard.ts:382-384` `textStats`. Note the empty string is **0** lines, not 1.
 #[must_use]
 fn text_stats(text: &str) -> (usize, usize) {
-    let lines = if text.is_empty() { 0 } else { text.split('\n').count() };
+    let lines = if text.is_empty() {
+        0
+    } else {
+        text.split('\n').count()
+    };
     (byte_length(text), lines)
 }
 
@@ -259,7 +263,10 @@ fn is_truthy(value: Option<&Value>) -> bool {
 /// A non-empty string field, JS `if (args.tool)` style.
 #[must_use]
 fn truthy_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 /// JS `typeof`. `typeof null === "object"` is deliberate, not a bug being ported.
@@ -317,7 +324,10 @@ impl<'de> serde::Deserialize<'de> for OrderedJson {
             fn visit_none<E: serde::de::Error>(self) -> Result<OrderedJson, E> {
                 Ok(OrderedJson::Null)
             }
-            fn visit_some<D2: serde::Deserializer<'d>>(self, d: D2) -> Result<OrderedJson, D2::Error> {
+            fn visit_some<D2: serde::Deserializer<'d>>(
+                self,
+                d: D2,
+            ) -> Result<OrderedJson, D2::Error> {
                 d.deserialize_any(AnyJson)
             }
             fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<OrderedJson, E> {
@@ -373,14 +383,19 @@ impl OrderedJson {
             Value::Null => Self::Null,
             Value::Bool(b) => Self::Bool(*b),
             Value::Number(n) => n.as_u64().map_or_else(
-                || n.as_i64().map_or_else(|| Self::Float(n.as_f64().unwrap_or(0.0)), Self::Int),
+                || {
+                    n.as_i64()
+                        .map_or_else(|| Self::Float(n.as_f64().unwrap_or(0.0)), Self::Int)
+                },
                 Self::UInt,
             ),
             Value::String(s) => Self::Str(s.clone()),
             Value::Array(items) => Self::Array(items.iter().map(Self::from_value).collect()),
-            Value::Object(map) => {
-                Self::Object(map.iter().map(|(k, v)| (k.clone(), Self::from_value(v))).collect())
-            }
+            Value::Object(map) => Self::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Self::from_value(v)))
+                    .collect(),
+            ),
         }
     }
 
@@ -518,7 +533,10 @@ pub fn format_jsonish(value: &Value, max_chars: usize) -> String {
             None => truncate_text(text, max_chars),
         };
     }
-    truncate_text(&OrderedJson::from_value(value).stringify(Some(2)), max_chars)
+    truncate_text(
+        &OrderedJson::from_value(value).stringify(Some(2)),
+        max_chars,
+    )
 }
 
 /// `tool-result-renderer.ts:210-212` `hasUsefulObjectContent` — a non-array object with ≥1 key.
@@ -554,7 +572,10 @@ impl McpContentBlock {
     #[must_use]
     pub fn into_core(self) -> cyrup_core::Content {
         match self {
-            Self::Text(text) => cyrup_core::Content::Text { text: text.into(), text_signature: None },
+            Self::Text(text) => cyrup_core::Content::Text {
+                text: text.into(),
+                text_signature: None,
+            },
             Self::Image { data, mime_type } => cyrup_core::Content::Image { data, mime_type },
         }
     }
@@ -571,9 +592,10 @@ impl McpContentBlock {
             cyrup_core::Content::Text { text, .. } => Self::Text(text.to_string()),
             cyrup_core::Content::Thinking { thinking, .. } => Self::Text(thinking.to_string()),
             cyrup_core::Content::ToolCall(_) => Self::Text(String::new()),
-            cyrup_core::Content::Image { data, mime_type } => {
-                Self::Image { data: data.clone(), mime_type: mime_type.clone() }
-            }
+            cyrup_core::Content::Image { data, mime_type } => Self::Image {
+                data: data.clone(),
+                mime_type: mime_type.clone(),
+            },
         }
     }
 
@@ -599,10 +621,20 @@ impl McpContentBlock {
     #[must_use]
     fn from_result_value(value: &Value) -> Self {
         if value.get("type").and_then(Value::as_str) == Some("text") {
-            return Self::Text(value.get("text").and_then(Value::as_str).unwrap_or("").to_string());
+            return Self::Text(
+                value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            );
         }
         Self::Image {
-            data: value.get("data").and_then(Value::as_str).unwrap_or("").to_string(),
+            data: value
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             // JS interpolates a missing `mimeType` as the literal `undefined`; reproduced so a
             // malformed block is visibly malformed rather than silently blank.
             mime_type: value
@@ -632,11 +664,18 @@ pub fn transform_mcp_content(
     content
         .iter()
         .map(|c| match c.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                McpContentBlock::Text(c.get("text").and_then(Value::as_str).unwrap_or("").to_string())
-            }
+            Some("text") => McpContentBlock::Text(
+                c.get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
             Some("image") => McpContentBlock::Image {
-                data: c.get("data").and_then(Value::as_str).unwrap_or("").to_string(),
+                data: c
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 mime_type: c
                     .get("mimeType")
                     .and_then(Value::as_str)
@@ -668,7 +707,11 @@ pub fn transform_mcp_content(
             }
             Some("resource_link") => {
                 let uri = c.get("uri").and_then(Value::as_str);
-                let name = c.get("name").and_then(Value::as_str).or(uri).unwrap_or("unknown");
+                let name = c
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or(uri)
+                    .unwrap_or("unknown");
                 McpContentBlock::Text(format!(
                     "[Resource Link: {name}]\nURI: {}",
                     uri.unwrap_or("(no URI)")
@@ -676,7 +719,9 @@ pub fn transform_mcp_content(
             }
             Some("audio") => McpContentBlock::Text(format!(
                 "[Audio content: {}]",
-                c.get("mimeType").and_then(Value::as_str).unwrap_or("audio/*")
+                c.get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("audio/*")
             )),
             _ => McpContentBlock::Text(safe_stringify(c)),
         })
@@ -715,14 +760,19 @@ pub fn resolve_mcp_result_content(
     result: &Value,
     scope: Option<&MaterializedResources>,
 ) -> Vec<McpContentBlock> {
-    let content = result.get("content").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let content = result
+        .get("content")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
     let blocks = transform_mcp_content(content, scope);
     if !blocks.is_empty() {
         return blocks;
     }
     match result.get("structuredContent").filter(|v| !v.is_null()) {
         Some(value) => {
-            vec![McpContentBlock::Text(OrderedJson::from_value(value).stringify(Some(2)))]
+            vec![McpContentBlock::Text(
+                OrderedJson::from_value(value).stringify(Some(2)),
+            )]
         }
         None => Vec::new(),
     }
@@ -799,7 +849,11 @@ impl MaterializedResources {
     #[must_use]
     pub fn materialize(&self, uri: Option<&str>, mime: Option<&str>, blob: &str) -> String {
         // 1. An aborted scope has no session (`getMaterializedResourceSession` → `undefined`).
-        if self.cancel.as_ref().is_some_and(cyrup_core::CancelToken::is_cancelled) {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(cyrup_core::CancelToken::is_cancelled)
+        {
             return omit_binary_resource(uri, mime, "runtime stopped");
         }
         // 2. `Buffer.byteLength(blob, "base64")` — the DECODED size, measured without decoding.
@@ -927,7 +981,10 @@ struct PendingCleanup {
 /// [`MaterializedResources::cleanup`] still retries it — but no longer earns a timer, which is what
 /// makes the retry loop quiesce instead of spinning on a genuinely undeletable path.
 fn has_retryable_cleanup_directory(pending: &PendingCleanup) -> bool {
-    pending.directories.values().any(|attempts| *attempts < MAX_CLEANUP_RETRY_ATTEMPTS)
+    pending
+        .directories
+        .values()
+        .any(|attempts| *attempts < MAX_CLEANUP_RETRY_ATTEMPTS)
 }
 
 /// `tool-registrar.ts:68-82` `schedulePendingCleanupRetry`.
@@ -1082,7 +1139,9 @@ impl std::error::Error for MaterializedCleanupError {
     /// The first failure, so `source()` chains reach a real `io::Error`; the rest are in
     /// [`MaterializedCleanupError::failures`] and in the `Display` above.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.failures.first().map(|failure| failure as &(dyn std::error::Error + 'static))
+        self.failures
+            .first()
+            .map(|failure| failure as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -1142,7 +1201,10 @@ fn make_private_temp_dir(prefix: &str) -> Result<PathBuf, std::io::Error> {
         }
     }
     Err(last.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::AlreadyExists, "could not create a temp directory")
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a temp directory",
+        )
     }))
 }
 
@@ -1160,12 +1222,19 @@ fn create_private_dir(path: &Path) -> Result<(), std::io::Error> {
 #[cfg(unix)]
 fn create_private_file(path: &Path) -> Result<std::fs::File, std::io::Error> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
 }
 
 #[cfg(not(unix))]
 fn create_private_file(path: &Path) -> Result<std::fs::File, std::io::Error> {
-    std::fs::OpenOptions::new().write(true).create_new(true).open(path)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// `randomBytes(n).toString("hex")`. `uuid` is already a crate dependency and its v7 layout carries
@@ -1269,7 +1338,12 @@ pub fn guard_mcp_output(
 ) -> GuardedMcpOutput {
     // 1. Normalize: sanitize image mimes, then apply the empty-text fallback.
     let normalized = if content.is_empty() {
-        vec![McpContentBlock::Text(options.empty_text_fallback.unwrap_or("(empty result)").to_string())]
+        vec![McpContentBlock::Text(
+            options
+                .empty_text_fallback
+                .unwrap_or("(empty result)")
+                .to_string(),
+        )]
     } else {
         sanitize_content(content)
     };
@@ -1286,8 +1360,11 @@ pub fn guard_mcp_output(
     }
 
     // 3. Compose the model-facing text and measure it.
-    let image_blocks: Vec<McpContentBlock> =
-        normalized.iter().filter(|b| b.is_image()).cloned().collect();
+    let image_blocks: Vec<McpContentBlock> = normalized
+        .iter()
+        .filter(|b| b.is_image())
+        .cloned()
+        .collect();
     let text_output = normalized
         .iter()
         .filter_map(|b| match b {
@@ -1306,9 +1383,14 @@ pub fn guard_mcp_output(
     // 5. Truncate.
     if original_bytes > options.max_bytes || original_lines > options.max_lines {
         let (full_output_path, write_error) = save_artifact("output", &composed);
-        let notice =
-            format_truncation_notice(original_bytes, original_lines, full_output_path.as_deref(), write_error.as_deref());
-        let (budget_bytes, budget_lines) = reserve_budget(options.max_bytes, options.max_lines, &notice);
+        let notice = format_truncation_notice(
+            original_bytes,
+            original_lines,
+            full_output_path.as_deref(),
+            write_error.as_deref(),
+        );
+        let (budget_bytes, budget_lines) =
+            reserve_budget(options.max_bytes, options.max_lines, &notice);
         let preview = truncate_head(&composed, budget_bytes, budget_lines);
         let final_text = format!("{preview}\n\n{notice}");
         let (returned_bytes, returned_lines) = text_stats(&final_text);
@@ -1326,7 +1408,10 @@ pub fn guard_mcp_output(
         guard.insert("originalLines".to_string(), Value::from(original_lines));
         guard.insert("returnedLines".to_string(), Value::from(returned_lines));
         if !image_blocks.is_empty() {
-            guard.insert("imageBlocksPassedThrough".to_string(), Value::from(image_blocks.len()));
+            guard.insert(
+                "imageBlocksPassedThrough".to_string(),
+                Value::from(image_blocks.len()),
+            );
         }
         if let Some(path) = full_output_path {
             guard.insert("fullOutputPath".to_string(), Value::String(path));
@@ -1338,9 +1423,15 @@ pub fn guard_mcp_output(
     }
 
     // 6. Bound `details.mcpResult`. Direct tools pass none, so this is proxy-only.
-    let mcp_result = options.raw_mcp_result.map(|raw| bound_mcp_result(raw, options.details_max_bytes));
+    let mcp_result = options
+        .raw_mcp_result
+        .map(|raw| bound_mcp_result(raw, options.details_max_bytes));
 
-    GuardedMcpOutput { content: guarded_content, output_guard, mcp_result }
+    GuardedMcpOutput {
+        content: guarded_content,
+        output_guard,
+        mcp_result,
+    }
 }
 
 /// `mcp-output-guard.ts:157-165` `sanitizeContent` — image blocks only: a non-blank mime is trimmed
@@ -1359,7 +1450,10 @@ fn sanitize_content(content: &[McpContentBlock]) -> Vec<McpContentBlock> {
                 } else {
                     take_utf16(trimmed, 100).to_string()
                 };
-                McpContentBlock::Image { data: data.clone(), mime_type: mime }
+                McpContentBlock::Image {
+                    data: data.clone(),
+                    mime_type: mime,
+                }
             }
             McpContentBlock::Text(_) => block.clone(),
         })
@@ -1426,7 +1520,10 @@ fn add_affixes(
 /// at zero, and it is measured with its own leading `"\n\n"`.
 fn reserve_budget(max_bytes: usize, max_lines: usize, notice: &str) -> (usize, usize) {
     let (bytes, lines) = text_stats(&format!("\n\n{notice}"));
-    (max_bytes.saturating_sub(bytes), max_lines.saturating_sub(lines))
+    (
+        max_bytes.saturating_sub(bytes),
+        max_lines.saturating_sub(lines),
+    )
 }
 
 /// `mcp-output-guard.ts:218-241` `truncateHead`.
@@ -1534,7 +1631,10 @@ fn summarize_mcp_result(result: &Value, raw: &str, raw_bytes: usize) -> Value {
         Value::Bool(record.and_then(|r| r.get("isError")) == Some(&Value::Bool(true))),
     );
     summary.insert("contentBlocks".to_string(), Value::from(content.len()));
-    summary.insert("contentSummary".to_string(), Value::Array(summarize_content(content)));
+    summary.insert(
+        "contentSummary".to_string(),
+        Value::Array(summarize_content(content)),
+    );
     summary.insert("rawResultBytes".to_string(), Value::from(raw_bytes));
     if let Some(path) = full_result_path {
         summary.insert("fullResultPath".to_string(), Value::String(path));
@@ -1551,8 +1651,9 @@ fn summarize_mcp_result(result: &Value, raw: &str, raw_bytes: usize) -> Value {
         if let Some(value) = record.get("_meta") {
             summary.insert("meta".to_string(), summarize_value(value));
         }
-        let standard: HashSet<&str> =
-            ["content", "isError", "structuredContent", "_meta"].into_iter().collect();
+        let standard: HashSet<&str> = ["content", "isError", "structuredContent", "_meta"]
+            .into_iter()
+            .collect();
         let extra: Vec<Value> = record
             .iter()
             .filter(|(k, _)| !standard.contains(k.as_str()))
@@ -1561,7 +1662,10 @@ fn summarize_mcp_result(result: &Value, raw: &str, raw_bytes: usize) -> Value {
                 let mut field = Map::new();
                 field.insert("key".to_string(), Value::String(truncate_key(k)));
                 field.insert("type".to_string(), Value::String(js_typeof(v).to_string()));
-                field.insert("estimatedBytes".to_string(), Value::from(estimate_value_bytes(v, 0)));
+                field.insert(
+                    "estimatedBytes".to_string(),
+                    Value::from(estimate_value_bytes(v, 0)),
+                );
                 field.insert("omitted".to_string(), Value::Bool(true));
                 Value::Object(field)
             })
@@ -1583,7 +1687,10 @@ fn summarize_content(content: &[Value]) -> Vec<Value> {
         .map(|block| {
             let Some(record) = block.as_object() else {
                 let mut map = Map::new();
-                map.insert("type".to_string(), Value::String(js_typeof(block).to_string()));
+                map.insert(
+                    "type".to_string(),
+                    Value::String(js_typeof(block).to_string()),
+                );
                 map.insert("omitted".to_string(), Value::Bool(true));
                 return Value::Object(map);
             };
@@ -1627,7 +1734,10 @@ fn summarize_content(content: &[Value]) -> Vec<Value> {
     if content.len() > CONTENT_SUMMARY_LIMIT {
         let mut tail = Map::new();
         tail.insert("type".to_string(), Value::String("omitted".to_string()));
-        tail.insert("count".to_string(), Value::from(content.len() - CONTENT_SUMMARY_LIMIT));
+        tail.insert(
+            "count".to_string(),
+            Value::from(content.len() - CONTENT_SUMMARY_LIMIT),
+        );
         summaries.push(Value::Object(tail));
     }
     summaries
@@ -1646,10 +1756,18 @@ fn summarize_value(value: &Value) -> Value {
             map.insert(
                 "type".to_string(),
                 Value::String(
-                    if value.is_null() { "null" } else { js_typeof(value) }.to_string(),
+                    if value.is_null() {
+                        "null"
+                    } else {
+                        js_typeof(value)
+                    }
+                    .to_string(),
                 ),
             );
-            map.insert("estimatedBytes".to_string(), Value::from(estimate_value_bytes(value, 0)));
+            map.insert(
+                "estimatedBytes".to_string(),
+                Value::from(estimate_value_bytes(value, 0)),
+            );
             map.insert("omitted".to_string(), Value::Bool(true));
             return Value::Object(map);
         }
@@ -1658,12 +1776,18 @@ fn summarize_value(value: &Value) -> Value {
         "type".to_string(),
         Value::String(if value.is_array() { "array" } else { "object" }.to_string()),
     );
-    map.insert("estimatedBytes".to_string(), Value::from(estimate_value_bytes(value, 0)));
+    map.insert(
+        "estimatedBytes".to_string(),
+        Value::from(estimate_value_bytes(value, 0)),
+    );
     map.insert("keyCount".to_string(), Value::from(keys.len()));
     map.insert(
         "keysPreview".to_string(),
         Value::Array(
-            keys.iter().take(KEY_PREVIEW_LIMIT).map(|k| Value::String(truncate_key(k))).collect(),
+            keys.iter()
+                .take(KEY_PREVIEW_LIMIT)
+                .map(|k| Value::String(truncate_key(k)))
+                .collect(),
         ),
     );
     map.insert("omitted".to_string(), Value::Bool(true));
@@ -1815,7 +1939,10 @@ pub fn format_mcp_direct_tool_call_lines(
     if !has_useful_object_content(args) {
         return vec![display_name.to_string()];
     }
-    vec![display_name.to_string(), format_jsonish(args, max_input_chars)]
+    vec![
+        display_name.to_string(),
+        format_jsonish(args, max_input_chars),
+    ]
 }
 
 /// `tool-result-renderer.ts:253-259` `renderToolCallLines` — the first line is the title (defaulting
@@ -1907,7 +2034,8 @@ pub fn collect_collapsed_result_lines(
                 return false;
             }
             if length > self.remaining {
-                self.lines.push(take_utf16(line, self.remaining).to_string());
+                self.lines
+                    .push(take_utf16(line, self.remaining).to_string());
                 self.truncated = true;
                 self.remaining = 0;
                 return false;
@@ -1924,12 +2052,18 @@ pub fn collect_collapsed_result_lines(
         }
     }
 
-    let mut state =
-        Collector { lines: Vec::new(), remaining: max_chars, truncated: false, max_lines };
+    let mut state = Collector {
+        lines: Vec::new(),
+        remaining: max_chars,
+        truncated: false,
+        max_lines,
+    };
 
     for block in content {
         let McpContentBlock::Text(text) = block else {
-            let McpContentBlock::Image { mime_type, .. } = block else { continue };
+            let McpContentBlock::Image { mime_type, .. } = block else {
+                continue;
+            };
             if !state.append_line(&format!("[image: {mime_type}]")) {
                 break;
             }
@@ -1957,9 +2091,20 @@ pub fn collect_collapsed_result_lines(
         }
     }
 
-    let Collector { mut lines, truncated, .. } = state;
+    let Collector {
+        mut lines,
+        truncated,
+        ..
+    } = state;
     if lines.is_empty() {
-        lines.push(if truncated { "(leading blank output omitted)" } else { "" }.to_string());
+        lines.push(
+            if truncated {
+                "(leading blank output omitted)"
+            } else {
+                ""
+            }
+            .to_string(),
+        );
     }
     if truncated && lines.len() >= max_lines {
         lines.push("…".to_string());
@@ -1979,8 +2124,15 @@ pub fn format_mcp_tool_result_lines(
         return collect_collapsed_result_lines(content, max_collapsed_lines, max_collapsed_chars);
     }
     let all: Vec<String> = content.iter().flat_map(block_to_lines).collect();
-    let lines = if all.is_empty() { vec!["(empty result)".to_string()] } else { all };
-    McpToolResultDisplay { lines, truncated: false }
+    let lines = if all.is_empty() {
+        vec!["(empty result)".to_string()]
+    } else {
+        all
+    };
+    McpToolResultDisplay {
+        lines,
+        truncated: false,
+    }
 }
 
 /// `tool-result-renderer.ts:389-401` `formatMcpToolResultIdentity` (MCP-240).
@@ -2042,21 +2194,34 @@ pub fn render_mcp_tool_result(
     let content: Vec<McpContentBlock> = result
         .get("content")
         .and_then(Value::as_array)
-        .map(|blocks| blocks.iter().map(McpContentBlock::from_result_value).collect())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .map(McpContentBlock::from_result_value)
+                .collect()
+        })
         .unwrap_or_default();
     let collapsed_lines = usize::from(options.collapsed_result_lines);
 
     // 2. Compact, settled, not expanded — upstream's `CompactMcpToolResult`.
     if !expanded && options.is_compact() {
-        let display =
-            format_mcp_tool_result_lines(&content, false, collapsed_lines, DEFAULT_MAX_COLLAPSED_CHARS);
+        let display = format_mcp_tool_result_lines(
+            &content,
+            false,
+            collapsed_lines,
+            DEFAULT_MAX_COLLAPSED_CHARS,
+        );
         let title = format_mcp_tool_result_identity(details).unwrap_or_default();
         return compact_result_widget(&title, &display);
     }
 
     // 3. Boxed, or expanded — upstream's `CollapsibleText`.
-    let display =
-        format_mcp_tool_result_lines(&content, expanded, collapsed_lines, DEFAULT_MAX_COLLAPSED_CHARS);
+    let display = format_mcp_tool_result_lines(
+        &content,
+        expanded,
+        collapsed_lines,
+        DEFAULT_MAX_COLLAPSED_CHARS,
+    );
     let identity = format_mcp_tool_result_identity(details);
     let mut lines: Vec<String> = identity.iter().cloned().collect();
     lines.extend(display.lines.iter().cloned());
@@ -2127,7 +2292,10 @@ fn text_widget(text: &str) -> Value {
 /// `{"widget":"truncated-text","text":…}` — the node that tells the host it may clip.
 fn truncated_text_widget(text: &str) -> Value {
     let mut map = Map::new();
-    map.insert("widget".to_string(), Value::String("truncated-text".to_string()));
+    map.insert(
+        "widget".to_string(),
+        Value::String("truncated-text".to_string()),
+    );
     map.insert("text".to_string(), Value::String(text.to_string()));
     Value::Object(map)
 }
@@ -2166,13 +2334,23 @@ pub fn render_result(
     tools_expanded: bool,
 ) -> Option<Value> {
     let _ = key; // Every MCP tool — gateway and direct — renders its result identically.
-    Some(render_mcp_tool_result(result, false, tools_expanded, options))
+    Some(render_mcp_tool_result(
+        result,
+        false,
+        tools_expanded,
+        options,
+    ))
 }
 
 #[cfg(test)]
 // Same posture as the crate's other test modules (`runtime.rs:1408`): a failed assertion in a test
 // IS a panic, and the no-panic policy is about the shipped surface.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -2243,21 +2421,33 @@ mod tests {
             vec!["mcp search x (schemas hidden)".to_string()]
         );
         assert_eq!(
-            format_mcp_proxy_tool_call_lines(&json!({ "connect": "cf-portal" }), DEFAULT_MAX_CALL_INPUT_CHARS),
+            format_mcp_proxy_tool_call_lines(
+                &json!({ "connect": "cf-portal" }),
+                DEFAULT_MAX_CALL_INPUT_CHARS
+            ),
             vec!["mcp connect cf-portal".to_string()]
         );
         assert_eq!(
-            format_mcp_proxy_tool_call_lines(&json!({ "describe": "cf-portal" }), DEFAULT_MAX_CALL_INPUT_CHARS),
+            format_mcp_proxy_tool_call_lines(
+                &json!({ "describe": "cf-portal" }),
+                DEFAULT_MAX_CALL_INPUT_CHARS
+            ),
             vec!["mcp describe cf-portal".to_string()]
         );
         assert_eq!(
-            format_mcp_proxy_tool_call_lines(&json!({ "server": "cf-portal" }), DEFAULT_MAX_CALL_INPUT_CHARS),
+            format_mcp_proxy_tool_call_lines(
+                &json!({ "server": "cf-portal" }),
+                DEFAULT_MAX_CALL_INPUT_CHARS
+            ),
             vec!["mcp list cf-portal".to_string()]
         );
         // Cut 2 removed upstream's first-position `ui-messages` arm (`:218`), so a bare
         // `ui-messages` still renders identically through the generic `action` arm …
         assert_eq!(
-            format_mcp_proxy_tool_call_lines(&json!({ "action": "ui-messages" }), DEFAULT_MAX_CALL_INPUT_CHARS),
+            format_mcp_proxy_tool_call_lines(
+                &json!({ "action": "ui-messages" }),
+                DEFAULT_MAX_CALL_INPUT_CHARS
+            ),
             vec!["mcp ui-messages".to_string()]
         );
         // … while one paired with a higher-precedence key now takes that key's arm. Unreachable in
@@ -2290,7 +2480,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            format_mcp_direct_tool_call_lines("cf-portal_status", &json!({}), DEFAULT_MAX_CALL_INPUT_CHARS),
+            format_mcp_direct_tool_call_lines(
+                "cf-portal_status",
+                &json!({}),
+                DEFAULT_MAX_CALL_INPUT_CHARS
+            ),
             vec!["cf-portal_status".to_string()]
         );
         // An ARRAY is not "useful object content".
@@ -2357,8 +2551,7 @@ mod tests {
     #[test]
     fn empty_content_is_the_empty_result_placeholder() {
         // `:123-127`.
-        let display =
-            format_mcp_tool_result_lines(&[], false, 3, DEFAULT_MAX_COLLAPSED_CHARS);
+        let display = format_mcp_tool_result_lines(&[], false, 3, DEFAULT_MAX_COLLAPSED_CHARS);
         assert_eq!(display.lines, vec!["(empty result)"]);
         assert!(!display.truncated);
     }
@@ -2366,13 +2559,18 @@ mod tests {
     #[test]
     fn leading_blank_lines_are_skipped_then_bounded() {
         // `:184-198` — both arms.
-        let display =
-            format_mcp_tool_result_lines(&[text("\n\nuseful\nextra")], false, 1, DEFAULT_MAX_COLLAPSED_CHARS);
+        let display = format_mcp_tool_result_lines(
+            &[text("\n\nuseful\nextra")],
+            false,
+            1,
+            DEFAULT_MAX_COLLAPSED_CHARS,
+        );
         assert_eq!(display.lines, vec!["useful", "…"]);
         assert!(display.truncated);
 
         let blanks = "\n".repeat(100);
-        let display = format_mcp_tool_result_lines(&[text(&format!("{blanks}useful"))], false, 1, 50);
+        let display =
+            format_mcp_tool_result_lines(&[text(&format!("{blanks}useful"))], false, 1, 50);
         assert_eq!(display.lines, vec!["(leading blank output omitted)", "…"]);
         assert!(display.truncated);
     }
@@ -2399,9 +2597,9 @@ mod tests {
     #[test]
     fn five_blocks_of_three_lines_with_max_three_yields_four_lines() {
         // gap-analysis 13e MCP-239's own `verify` line.
-        let content: Vec<McpContentBlock> = (0..5).map(|i| text(&format!("a{i}\nb{i}\nc{i}"))).collect();
-        let display =
-            format_mcp_tool_result_lines(&content, false, 3, DEFAULT_MAX_COLLAPSED_CHARS);
+        let content: Vec<McpContentBlock> =
+            (0..5).map(|i| text(&format!("a{i}\nb{i}\nc{i}"))).collect();
+        let display = format_mcp_tool_result_lines(&content, false, 3, DEFAULT_MAX_COLLAPSED_CHARS);
         assert_eq!(display.lines.len(), 4);
         assert_eq!(display.lines.last().map(String::as_str), Some("…"));
     }
@@ -2444,7 +2642,9 @@ mod tests {
         );
         // A DIRECT tool's details carry server/tool but no `mode`, so it never renders an identity.
         assert_eq!(
-            format_mcp_tool_result_identity(Some(&json!({ "server": "figma", "tool": "get_nodes" }))),
+            format_mcp_tool_result_identity(Some(
+                &json!({ "server": "figma", "tool": "get_nodes" })
+            )),
             None
         );
     }
@@ -2475,11 +2675,17 @@ mod tests {
 
         let seven: McpSettings =
             serde_json::from_value(json!({ "collapsedResultLines": 7 })).unwrap_or_default();
-        assert_eq!(resolve_mcp_tool_render_options(&seven).collapsed_result_lines, 1);
+        assert_eq!(
+            resolve_mcp_tool_render_options(&seven).collapsed_result_lines,
+            1
+        );
 
         let two: McpSettings =
             serde_json::from_value(json!({ "collapsedResultLines": 2 })).unwrap_or_default();
-        assert_eq!(resolve_mcp_tool_render_options(&two).collapsed_result_lines, 2);
+        assert_eq!(
+            resolve_mcp_tool_render_options(&two).collapsed_result_lines,
+            2
+        );
     }
 
     // --- MCP-241 / MCP-242 / MCP-243: the emitted widget trees ----------------------------------
@@ -2488,8 +2694,14 @@ mod tests {
     fn compact_result_is_one_truncated_text_node_with_the_affordance() {
         let result = result_value(json!([{ "type": "text", "text": "one\ntwo\nthree" }]));
         let widget = render_mcp_tool_result(&result, false, false, McpToolRenderOptions::default());
-        assert_eq!(widget.get("widget").and_then(Value::as_str), Some("truncated-text"));
-        let drawn = widget.get("text").and_then(Value::as_str).unwrap_or_default();
+        assert_eq!(
+            widget.get("widget").and_then(Value::as_str),
+            Some("truncated-text")
+        );
+        let drawn = widget
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert_eq!(drawn, "one … (Ctrl+O to expand)");
     }
 
@@ -2531,7 +2743,10 @@ mod tests {
             collapsed_result_lines: 3,
         };
         let widget = render_mcp_tool_result(&result, false, false, options);
-        let drawn = widget.get("text").and_then(Value::as_str).unwrap_or_default();
+        let drawn = widget
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(drawn.contains("MCP figma/get_nodes"));
         assert!(drawn.contains("one") && drawn.contains("two") && drawn.contains("three"));
         assert!(!drawn.contains("four"));
@@ -2541,12 +2756,16 @@ mod tests {
     #[test]
     fn details_error_forces_the_expanded_form_even_when_collapsed() {
         // `:292-302` and MCP-242's `verify`.
-        let mut result = result_value(json!([{ "type": "text", "text": "line 1\nline 2\nline 3\nline 4" }]));
+        let mut result =
+            result_value(json!([{ "type": "text", "text": "line 1\nline 2\nline 3\nline 4" }]));
         if let Some(map) = result.as_object_mut() {
             map.insert("details".to_string(), json!({ "error": "tool_error" }));
         }
         let widget = render_mcp_tool_result(&result, false, false, McpToolRenderOptions::default());
-        let drawn = widget.get("text").and_then(Value::as_str).unwrap_or_default();
+        let drawn = widget
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(drawn.contains("line 4"));
         assert!(!drawn.contains("Ctrl+O to expand"));
         assert_eq!(widget.get("widget").and_then(Value::as_str), Some("text"));
@@ -2557,7 +2776,10 @@ mod tests {
         // MCP-242's second `verify` clause.
         let result = result_value(json!([{ "type": "text", "text": "a\nb\nc\nd" }]));
         let widget = render_mcp_tool_result(&result, false, true, McpToolRenderOptions::default());
-        assert_eq!(widget.get("text").and_then(Value::as_str), Some("a\nb\nc\nd"));
+        assert_eq!(
+            widget.get("text").and_then(Value::as_str),
+            Some("a\nb\nc\nd")
+        );
     }
 
     #[test]
@@ -2570,14 +2792,21 @@ mod tests {
             }
             let widget =
                 render_mcp_tool_result(&result, false, false, McpToolRenderOptions::default());
-            assert_eq!(widget.get("widget").and_then(Value::as_str), Some("truncated-text"));
+            assert_eq!(
+                widget.get("widget").and_then(Value::as_str),
+                Some("truncated-text")
+            );
         }
     }
 
     #[test]
     fn both_rows_are_drawn_in_compact_mode() {
         // MCP-243's `verify`: neither row is empty.
-        let call = render_call("srv_search", &json!({ "q": "x" }), McpToolRenderOptions::default());
+        let call = render_call(
+            "srv_search",
+            &json!({ "q": "x" }),
+            McpToolRenderOptions::default(),
+        );
         let result = render_result(
             "srv_search",
             &result_value(json!([{ "type": "text", "text": "found" }])),
@@ -2585,11 +2814,16 @@ mod tests {
             false,
         );
         assert_eq!(
-            call.as_ref().and_then(|v| v.get("text")).and_then(Value::as_str),
+            call.as_ref()
+                .and_then(|v| v.get("text"))
+                .and_then(Value::as_str),
             Some("srv_search\n{\n  \"q\": \"x\"\n}")
         );
         assert_eq!(
-            result.as_ref().and_then(|v| v.get("text")).and_then(Value::as_str),
+            result
+                .as_ref()
+                .and_then(|v| v.get("text"))
+                .and_then(Value::as_str),
             Some("found")
         );
     }
@@ -2602,7 +2836,10 @@ mod tests {
             McpToolRenderOptions::default(),
         );
         assert_eq!(
-            widget.as_ref().and_then(|v| v.get("text")).and_then(Value::as_str),
+            widget
+                .as_ref()
+                .and_then(|v| v.get("text"))
+                .and_then(Value::as_str),
             Some("mcp connect srv")
         );
     }
@@ -2611,7 +2848,10 @@ mod tests {
     fn the_partial_arm_is_ported_even_though_the_seam_never_takes_it() {
         let widget =
             render_mcp_tool_result(&json!({}), true, false, McpToolRenderOptions::default());
-        assert_eq!(widget.get("text").and_then(Value::as_str), Some("Running MCP tool..."));
+        assert_eq!(
+            widget.get("text").and_then(Value::as_str),
+            Some("Running MCP tool...")
+        );
     }
 
     #[test]
@@ -2619,7 +2859,10 @@ mod tests {
         // MCP-244's `verify`: the plainTheme path emits no SGR.
         let result = result_value(json!([{ "type": "text", "text": "plain" }]));
         let widget = render_mcp_tool_result(&result, false, false, McpToolRenderOptions::default());
-        let drawn = widget.get("text").and_then(Value::as_str).unwrap_or_default();
+        let drawn = widget
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(!drawn.contains('\u{1b}'));
     }
 
@@ -2650,17 +2893,28 @@ mod tests {
             })
         );
         assert_eq!(blocks.get(2), Some(&text("[Resource: file://a]\nbody")));
-        assert_eq!(blocks.get(3), Some(&text("[Resource: (no URI)]\n(no content)")));
-        assert_eq!(blocks.get(4), Some(&text("[Resource Link: B]\nURI: file://b")));
-        assert_eq!(blocks.get(5), Some(&text("[Resource Link: unknown]\nURI: (no URI)")));
+        assert_eq!(
+            blocks.get(3),
+            Some(&text("[Resource: (no URI)]\n(no content)"))
+        );
+        assert_eq!(
+            blocks.get(4),
+            Some(&text("[Resource Link: B]\nURI: file://b"))
+        );
+        assert_eq!(
+            blocks.get(5),
+            Some(&text("[Resource Link: unknown]\nURI: (no URI)"))
+        );
         assert_eq!(blocks.get(6), Some(&text("[Audio content: audio/*]")));
         assert_eq!(blocks.get(7), Some(&text("{\"type\":\"video\",\"x\":1}")));
     }
 
     #[test]
     fn a_resource_without_text_stringifies_the_whole_record() {
-        let blocks =
-            transform_mcp_content(&[json!({ "type": "resource", "resource": { "uri": "u", "mimeType": "m" } })], None);
+        let blocks = transform_mcp_content(
+            &[json!({ "type": "resource", "resource": { "uri": "u", "mimeType": "m" } })],
+            None,
+        );
         assert_eq!(
             blocks.first(),
             Some(&text("[Resource: u]\n{\"mimeType\":\"m\",\"uri\":\"u\"}"))
@@ -2670,17 +2924,25 @@ mod tests {
     #[test]
     fn resource_contents_prefer_text_then_stringify_the_record() {
         let blocks = transform_mcp_resource_contents(
-            &[json!({ "uri": "u", "text": "body" }), json!({ "uri": "u2", "mimeType": "m" })],
+            &[
+                json!({ "uri": "u", "text": "body" }),
+                json!({ "uri": "u2", "mimeType": "m" }),
+            ],
             None,
         );
         assert_eq!(blocks.first(), Some(&text("body")));
-        assert_eq!(blocks.get(1), Some(&text("{\"mimeType\":\"m\",\"uri\":\"u2\"}")));
+        assert_eq!(
+            blocks.get(1),
+            Some(&text("{\"mimeType\":\"m\",\"uri\":\"u2\"}"))
+        );
     }
 
     #[test]
     fn structured_content_is_the_fallback_only_for_an_empty_block_list() {
-        let blocks =
-            resolve_mcp_result_content(&json!({ "content": [], "structuredContent": { "a": 1 } }), None);
+        let blocks = resolve_mcp_result_content(
+            &json!({ "content": [], "structuredContent": { "a": 1 } }),
+            None,
+        );
         assert_eq!(blocks, vec![text("{\n  \"a\": 1\n}")]);
 
         let blocks = resolve_mcp_result_content(
@@ -2689,7 +2951,10 @@ mod tests {
         );
         assert_eq!(blocks, vec![text("x")]);
 
-        assert!(resolve_mcp_result_content(&json!({ "content": [], "structuredContent": null }), None).is_empty());
+        assert!(
+            resolve_mcp_result_content(&json!({ "content": [], "structuredContent": null }), None)
+                .is_empty()
+        );
         assert!(resolve_mcp_result_content(&json!({ "content": [] }), None).is_empty());
     }
 
@@ -2749,7 +3014,13 @@ mod tests {
 
     /// The queued attempt count for `directory`, or `None` when it is no longer queued.
     fn queued_attempts(session: &MaterializedResources, directory: &Path) -> Option<u32> {
-        session.pending.lock().unwrap().directories.get(directory).copied()
+        session
+            .pending
+            .lock()
+            .unwrap()
+            .directories
+            .get(directory)
+            .copied()
     }
 
     fn retry_is_armed(session: &MaterializedResources) -> bool {
@@ -2799,8 +3070,8 @@ mod tests {
     fn a_directory_that_already_vanished_counts_as_cleaned() {
         // `rmSync(..., { force: true })` — a missing path is done, not a failure, so a temp reaper
         // between the queue and the drain does not burn an attempt.
-        let gone = std::env::temp_dir()
-            .join(format!("{RESOURCE_DIR_PREFIX}vanished-{}", random_hex(6)));
+        let gone =
+            std::env::temp_dir().join(format!("{RESOURCE_DIR_PREFIX}vanished-{}", random_hex(6)));
         let session = session_pointing_at(&gone, None);
         assert!(session.cleanup().is_ok());
         assert_eq!(queued_attempts(&session, &gone), None);
@@ -2819,7 +3090,9 @@ mod tests {
             .unwrap();
         assert_eq!(aggregate.failures().len(), 1);
         assert!(
-            error.to_string().starts_with("Failed to clean materialized MCP resources: "),
+            error
+                .to_string()
+                .starts_with("Failed to clean materialized MCP resources: "),
             "{error}"
         );
         // `schedulePendingCleanupRetry` spends the attempt when it arms the timer, not when the
@@ -2912,7 +3185,10 @@ mod tests {
         options.prefix = "Error: ";
         let guarded = guard_mcp_output(
             &[
-                McpContentBlock::Image { data: "d".to_string(), mime_type: "image/png".to_string() },
+                McpContentBlock::Image {
+                    data: "d".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
                 text("body"),
             ],
             &options,
@@ -2921,7 +3197,10 @@ mod tests {
         assert_eq!(guarded.content.get(1), Some(&text("Error: body")));
 
         let guarded = guard_mcp_output(
-            &[McpContentBlock::Image { data: "d".to_string(), mime_type: "image/png".to_string() }],
+            &[McpContentBlock::Image {
+                data: "d".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
             &options,
         );
         assert_eq!(guarded.content.first(), Some(&text("Error: ")));
@@ -2935,7 +3214,10 @@ mod tests {
                     data: "d".to_string(),
                     mime_type: format!("  {}  ", "x".repeat(300)),
                 },
-                McpContentBlock::Image { data: "d".to_string(), mime_type: "   ".to_string() },
+                McpContentBlock::Image {
+                    data: "d".to_string(),
+                    mime_type: "   ".to_string(),
+                },
             ],
             &guard_options(),
         );
@@ -2978,17 +3260,29 @@ mod tests {
             panic!("expected truncation");
         };
         assert_eq!(guard.get("truncated"), Some(&Value::Bool(true)));
-        assert_eq!(guard.get("originalBytes").and_then(Value::as_u64), Some(61440));
+        assert_eq!(
+            guard.get("originalBytes").and_then(Value::as_u64),
+            Some(61440)
+        );
         assert_eq!(guard.get("originalLines").and_then(Value::as_u64), Some(1));
-        let returned = guard.get("returnedBytes").and_then(Value::as_u64).unwrap_or(u64::MAX);
-        assert!(returned <= 1024, "returnedBytes {returned} must fit maxBytes");
+        let returned = guard
+            .get("returnedBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        assert!(
+            returned <= 1024,
+            "returnedBytes {returned} must fit maxBytes"
+        );
         let Some(McpContentBlock::Text(body)) = guarded.content.first() else {
             panic!("expected a text block");
         };
         assert!(body.contains("[MCP text output truncated:"));
         assert!(body.contains("Full text saved to:"));
         // The spilled file OUTLIVES the guard call — that is the whole point of the notice.
-        let path = guard.get("fullOutputPath").and_then(Value::as_str).unwrap_or_default();
+        let path = guard
+            .get("fullOutputPath")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(Path::new(path).exists());
         if let Some(dir) = Path::new(path).parent() {
             let _ = std::fs::remove_dir_all(dir);
@@ -3030,12 +3324,20 @@ mod tests {
         let guarded = guard_mcp_output(
             &[
                 text(&"q".repeat(4096)),
-                McpContentBlock::Image { data: "d".to_string(), mime_type: "image/png".to_string() },
+                McpContentBlock::Image {
+                    data: "d".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
             ],
             &options,
         );
         assert_eq!(guarded.content.len(), 2);
-        assert!(guarded.content.get(1).is_some_and(McpContentBlock::is_image));
+        assert!(
+            guarded
+                .content
+                .get(1)
+                .is_some_and(McpContentBlock::is_image)
+        );
         let count = guarded
             .output_guard
             .as_ref()
@@ -3061,7 +3363,10 @@ mod tests {
         let guarded = guard_mcp_output(
             &[
                 text(""),
-                McpContentBlock::Image { data: "d".to_string(), mime_type: "image/png".to_string() },
+                McpContentBlock::Image {
+                    data: "d".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
             ],
             &options,
         );
@@ -3084,8 +3389,9 @@ mod tests {
     #[test]
     fn an_oversized_raw_result_becomes_a_summary_with_a_21st_omitted_entry() {
         // MCP-229's `verify`: 25 content blocks ⇒ 21 summary entries, the last `{omitted, count:5}`.
-        let blocks: Vec<Value> =
-            (0..25).map(|i| json!({ "type": "text", "text": format!("block {i}") })).collect();
+        let blocks: Vec<Value> = (0..25)
+            .map(|i| json!({ "type": "text", "text": format!("block {i}") }))
+            .collect();
         let raw = json!({
             "content": blocks,
             "isError": true,
@@ -3096,29 +3402,53 @@ mod tests {
         let summary = bound_mcp_result(&raw, 16 * 1024);
         assert_eq!(summary.get("omitted"), Some(&Value::Bool(true)));
         assert_eq!(summary.get("isError"), Some(&Value::Bool(true)));
-        assert_eq!(summary.get("contentBlocks").and_then(Value::as_u64), Some(25));
+        assert_eq!(
+            summary.get("contentBlocks").and_then(Value::as_u64),
+            Some(25)
+        );
         assert_eq!(
             summary.get("reason").and_then(Value::as_str),
-            Some("Raw MCP result exceeded the details size limit and was replaced with this summary to keep session context bounded.")
+            Some(
+                "Raw MCP result exceeded the details size limit and was replaced with this summary to keep session context bounded."
+            )
         );
-        let content_summary =
-            summary.get("contentSummary").and_then(Value::as_array).cloned().unwrap_or_default();
+        let content_summary = summary
+            .get("contentSummary")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         assert_eq!(content_summary.len(), 21);
         assert_eq!(
             content_summary.get(20),
             Some(&json!({ "type": "omitted", "count": 5 }))
         );
         assert_eq!(
-            summary.get("structuredContent").and_then(|v| v.get("type")).and_then(Value::as_str),
+            summary
+                .get("structuredContent")
+                .and_then(|v| v.get("type"))
+                .and_then(Value::as_str),
             Some("object")
         );
         assert_eq!(
-            summary.get("meta").and_then(|v| v.get("keyCount")).and_then(Value::as_u64),
+            summary
+                .get("meta")
+                .and_then(|v| v.get("keyCount"))
+                .and_then(Value::as_u64),
             Some(1)
         );
-        let extra = summary.get("extraFields").and_then(Value::as_array).cloned().unwrap_or_default();
+        let extra = summary
+            .get("extraFields")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         assert_eq!(extra.len(), 1);
-        assert_eq!(extra.first().and_then(|f| f.get("key")).and_then(Value::as_str), Some("vendorField"));
+        assert_eq!(
+            extra
+                .first()
+                .and_then(|f| f.get("key"))
+                .and_then(Value::as_str),
+            Some("vendorField")
+        );
         if let Some(dir) = summary
             .get("fullResultPath")
             .and_then(Value::as_str)
@@ -3132,17 +3462,27 @@ mod tests {
     #[test]
     fn summarize_value_treats_an_array_as_an_object_with_index_keys() {
         let summarized = summarize_value(&json!(["a", "bb"]));
-        assert_eq!(summarized.get("type").and_then(Value::as_str), Some("array"));
+        assert_eq!(
+            summarized.get("type").and_then(Value::as_str),
+            Some("array")
+        );
         assert_eq!(summarized.get("keyCount").and_then(Value::as_u64), Some(2));
         assert_eq!(summarized.get("keysPreview"), Some(&json!(["0", "1"])));
-        assert_eq!(summarized.get("estimatedBytes").and_then(Value::as_u64), Some(3));
+        assert_eq!(
+            summarized.get("estimatedBytes").and_then(Value::as_u64),
+            Some(3)
+        );
 
         assert_eq!(
-            summarize_value(&Value::Null).get("type").and_then(Value::as_str),
+            summarize_value(&Value::Null)
+                .get("type")
+                .and_then(Value::as_str),
             Some("null")
         );
         assert_eq!(
-            summarize_value(&json!(12)).get("estimatedBytes").and_then(Value::as_u64),
+            summarize_value(&json!(12))
+                .get("estimatedBytes")
+                .and_then(Value::as_u64),
             Some(2)
         );
     }
@@ -3150,7 +3490,10 @@ mod tests {
     #[test]
     fn estimate_value_bytes_stops_at_depth_two() {
         // depth 0 = the outer object, depth 1 = the inner object, depth 2 = nothing counted.
-        assert_eq!(estimate_value_bytes(&json!({ "a": { "b": { "c": "xxxx" } } }), 0), 0);
+        assert_eq!(
+            estimate_value_bytes(&json!({ "a": { "b": { "c": "xxxx" } } }), 0),
+            0
+        );
         assert_eq!(estimate_value_bytes(&json!({ "a": { "b": "xxxx" } }), 0), 4);
         assert_eq!(estimate_value_bytes(&json!({ "a": true }), 0), 4);
     }

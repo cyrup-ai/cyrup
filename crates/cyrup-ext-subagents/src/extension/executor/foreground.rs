@@ -7,14 +7,8 @@ use cyrup_core::{CancelToken, ModelId, ToolUpdateSink};
 use crate::background::RunId;
 use crate::discovery::types::{AgentDefinition, AgentReadScope, OutputMode};
 use crate::error::SubagentError;
-use crate::exec::{AgentConfig, RunOptions, SingleResult};
 use crate::exec::fallback::resolve_model_inheritance;
-use crate::fork_context::{
-    forked_child_requires_thinking_off, resolve_effective_context, ContextMode, ContextRequest,
-    ForkContext,
-};
-use crate::registration::SubagentExtensionConfig;
-use crate::spawn::depth::{resolve_effective_depth, DepthEnvelope};
+use crate::exec::{AgentConfig, RunOptions, SingleResult};
 use crate::extension::EXTENSION_ID;
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::notices::{ForegroundControlEntry, ForegroundControlNotifier};
@@ -26,6 +20,12 @@ use crate::extension::tool::task_items::{
     normalize_single_output_override, parse_tool_output_mode, resolve_single_output_path,
     resolve_single_run_output_base_dir, resolve_single_run_session_root,
 };
+use crate::fork_context::{
+    ContextMode, ContextRequest, ForkContext, forked_child_requires_thinking_off,
+    resolve_effective_context,
+};
+use crate::registration::SubagentExtensionConfig;
+use crate::spawn::depth::{DepthEnvelope, resolve_effective_depth};
 
 /// The persona-and-model half of [`SubagentExecutor::run_foreground_impl`]'s prologue, as resolved
 /// by [`SubagentExecutor::resolve_run_agent`].
@@ -136,7 +136,6 @@ struct ForegroundRunOptionsInput<'a> {
 }
 
 impl SubagentExecutor {
-
     // ---------------------------------------------------------------------------------------
     // Foreground single-run dispatch (the tool's synchronous shape; exec::run_sync end to end)
     // ---------------------------------------------------------------------------------------
@@ -259,7 +258,12 @@ impl SubagentExecutor {
             effective_override,
         } = self.resolve_run_agent(&req, &cfg, depth).await?;
         let ForegroundRunRequest {
-            overrides, cwd, task, timeout_ms, cancel, ..
+            overrides,
+            cwd,
+            task,
+            timeout_ms,
+            cancel,
+            ..
         } = req;
 
         let RunChannels {
@@ -299,7 +303,8 @@ impl SubagentExecutor {
             art_dir: &art_dir,
         });
 
-        self.register_foreground_controls(&run_id, &run_options, &agent, task).await;
+        self.register_foreground_controls(&run_id, &run_options, &agent, task)
+            .await;
 
         let art_paths =
             write_foreground_input_artifact(&art_cfg, &art_dir, &run_id, &agent.name, task);
@@ -358,13 +363,12 @@ impl SubagentExecutor {
         cfg: &SubagentExtensionConfig,
         depth: DepthEnvelope,
     ) -> Result<ResolvedRunAgent, SubagentError> {
-        let (agent, model_scope, max_thinking) =
-            self.resolve_agent_with_model_scope(
-                req.cwd,
-                req.agent_name,
-                req.agent_scope,
-                &cfg.roots,
-            )?;
+        let (agent, model_scope, max_thinking) = self.resolve_agent_with_model_scope(
+            req.cwd,
+            req.agent_name,
+            req.agent_scope,
+            &cfg.roots,
+        )?;
         // Fork default-mode (Tier-2, pi `resolveAgentDefaultContextPolicy`): an OMITTED call-site
         // `context` (`None`) takes the defaults ladder rather than being forced to `Fresh`; an
         // explicit call-site value still wins (`resolve_effective_context`).
@@ -564,8 +568,11 @@ impl SubagentExecutor {
         );
         // pi `createForegroundControlNotifier(data, deps)` (`:1222` @v0.34.0), plus the ordered pump its
         // Rust equivalent needs; see the method doc.
-        let control_notifier =
-            self.foreground_control_notifier(run_id.clone(), agent.name.clone(), resolved_control.clone());
+        let control_notifier = self.foreground_control_notifier(
+            run_id.clone(),
+            agent.name.clone(),
+            resolved_control.clone(),
+        );
 
         // T6 artifact quadruple config + root (pi `subagent-executor.ts:3387-3391`). Resolved HERE,
         // ahead of `run_options`, because pi derives the single-run output base directory from the
@@ -581,7 +588,9 @@ impl SubagentExecutor {
         // temp root and made all three `artifactDir` preferences — including upstream's `project`
         // DEFAULT — unreachable.
         let art_dir = crate::artifacts::resolve_artifacts_dir(
-            self.host_services().and_then(|s| s.session_file()).as_deref(),
+            self.host_services()
+                .and_then(|s| s.session_file())
+                .as_deref(),
             Some(cwd),
             cwd,
             cfg.artifact_dir_preference(),
@@ -591,8 +600,7 @@ impl SubagentExecutor {
         // configured `singleRunOutputBaseDir` (tilde-expanded, `path.resolve`d) wins, else
         // `<artifactsDir>/outputs/<runId>`. This is the base a RELATIVE `output` resolves against —
         // deliberately NOT the run cwd, so a bare `report.md` never lands in the user's repo.
-        let output_base_dir =
-            resolve_single_run_output_base_dir(cfg, &art_dir, &run_id);
+        let output_base_dir = resolve_single_run_output_base_dir(cfg, &art_dir, &run_id);
         // pi `runSinglePath` (`subagent-executor.ts:3562-3564,3666`): the persona's own `output:` is
         // the fallback for an omitted param and the referent of `output: true`; `outputMode` defaults
         // to `inline` from the PARAM alone (pi never consults the persona's own mode here).
@@ -1000,7 +1008,12 @@ fn write_foreground_input_artifact(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::testsupport::seed_scope_fixture;
@@ -1105,7 +1118,11 @@ mod tests {
     /// parent to inherit from, has nothing to judge and takes the conservative arm.
     #[test]
     fn an_empty_ladder_forces_thinking_off() {
-        assert!(fork_requires_thinking_off(&gate_agent(None, &[]), None, None));
+        assert!(fork_requires_thinking_off(
+            &gate_agent(None, &[]),
+            None,
+            None
+        ));
     }
 
     /// The `inherit` sentinel is a REQUEST, never a model id. pi resolves it through
@@ -1186,7 +1203,14 @@ mod tests {
         let executor = SubagentExecutor::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
-            .run_foreground(dir.path(), "ghost", "do something", Some(ContextRequest::Fresh), None, None)
+            .run_foreground(
+                dir.path(),
+                "ghost",
+                "do something",
+                Some(ContextRequest::Fresh),
+                None,
+                None,
+            )
             .await
             .expect_err("unresolvable agent must fail before any subprocess spawn");
         assert!(matches!(err, SubagentError::AgentNotFound(_)));
@@ -1214,7 +1238,14 @@ mod tests {
         // exact same "ghost" name as the sibling discovery-failure test isolates this test's
         // assertion to purely WHICH error surfaces first.
         let err = executor
-            .run_foreground(dir.path(), "ghost", "do something", Some(ContextRequest::Fresh), None, None)
+            .run_foreground(
+                dir.path(),
+                "ghost",
+                "do something",
+                Some(ContextRequest::Fresh),
+                None,
+                None,
+            )
             .await
             .expect_err("a blocked depth ceiling must reject before agent discovery runs");
         assert!(
@@ -1266,5 +1297,4 @@ mod tests {
             "the caller must see pi's verbatim violation text, naming the model AND the patterns"
         );
     }
-
 }

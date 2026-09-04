@@ -37,7 +37,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-
 use cyrup_ext_subagents::background::spawn_detached::spawn_detached_runner_with_command;
 use cyrup_ext_subagents::spawn::SpawnCommand;
 
@@ -50,10 +49,12 @@ use cyrup_ext_subagents::spawn::SpawnCommand;
 fn fixture_cmd(script_path: &std::path::Path) -> SpawnCommand {
     SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     }
 }
-
 
 const FIXTURE_SCRIPT_ENV_VAR: &str = "CYRUP_SUBAGENT_FIXTURE_SCRIPT";
 
@@ -128,7 +129,9 @@ fn kill_zero_succeeds(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn kill_pid_for_cleanup(pid: u32) {
-    let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status();
 }
 
 /// THE core proof this whole subsystem exists for: [`spawn_detached_runner`] returns a real, live
@@ -155,7 +158,6 @@ async fn spawned_detached_runner_process_keeps_running_independent_of_this_proce
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-
 
     let cfg_path = dir.path().join("runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
@@ -216,7 +218,6 @@ async fn detached_runner_gets_its_own_process_group() {
     let script = serde_json::json!({"steps": [{"kind": "sleep_ms", "ms": 2000}], "exit_code": 0});
     let script_path = write_script(dir.path(), "script.json", &script);
 
-
     let cfg_path = dir.path().join("runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
     let stdout_log = dir.path().join("runner.stdout.log");
@@ -238,13 +239,17 @@ async fn detached_runner_gets_its_own_process_group() {
         .args(["-o", "pgid=", "-p", &std::process::id().to_string()])
         .output()
         .expect("ps runs for our own pid");
-    let own_pgid = String::from_utf8_lossy(&own_pgid_output.stdout).trim().to_string();
+    let own_pgid = String::from_utf8_lossy(&own_pgid_output.stdout)
+        .trim()
+        .to_string();
 
     let child_pgid_output = std::process::Command::new("ps")
         .args(["-o", "pgid=", "-p", &pid.to_string()])
         .output()
         .expect("ps runs for the detached child's pid");
-    let child_pgid = String::from_utf8_lossy(&child_pgid_output.stdout).trim().to_string();
+    let child_pgid = String::from_utf8_lossy(&child_pgid_output.stdout)
+        .trim()
+        .to_string();
 
     assert!(
         !child_pgid.is_empty(),
@@ -279,7 +284,6 @@ async fn stdio_is_redirected_to_the_given_log_files_not_inherited() {
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-
 
     let cfg_path = dir.path().join("runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
@@ -327,7 +331,6 @@ async fn passes_the_subcommand_and_config_flag_with_the_exact_path() {
     let dir = tempfile::tempdir().expect("real tempdir");
     let script = serde_json::json!({"echo_argv": true, "exit_code": 0});
     let script_path = write_script(dir.path(), "script.json", &script);
-
 
     let cfg_path = dir.path().join("a-particular-runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
@@ -391,7 +394,6 @@ async fn a_quickly_exiting_detached_child_eventually_disappears_on_its_own() {
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-
 
     let cfg_path = dir.path().join("runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
@@ -583,7 +585,10 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "do the thing",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -600,14 +605,14 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)
         .await
@@ -617,7 +622,6 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     let orchestrator_stderr_log = dir.path().join("orchestrator.stderr.log");
     let runner_stdout_log = run_paths.runner_stdout_log.clone();
     let runner_stderr_log = run_paths.runner_stderr_log.clone();
-
 
     // Spawn the orchestrator-sim as a REAL, separate OS process (not a tokio::process::Command
     // held inside this test's own async task, so this test's own process is genuinely the OS
@@ -635,7 +639,8 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::from(
-            std::fs::File::create(&orchestrator_stderr_log).expect("create orchestrator stderr log"),
+            std::fs::File::create(&orchestrator_stderr_log)
+                .expect("create orchestrator stderr log"),
         ));
     let _ = &orchestrator_stdout_log; // reserved for debugging; stdout is piped and read directly below.
 
@@ -648,7 +653,8 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     let stdout = orchestrator_child.stdout.take().expect("piped stdout");
     let mut reader = std::io::BufReader::new(stdout);
     let mut first_line = String::new();
-    std::io::BufRead::read_line(&mut reader, &mut first_line).expect("read orchestrator-sim stdout");
+    std::io::BufRead::read_line(&mut reader, &mut first_line)
+        .expect("read orchestrator-sim stdout");
     let trimmed = first_line.trim();
     assert!(
         !trimmed.starts_with("SPAWN_FAILED"),
@@ -704,14 +710,12 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
 
     // Both terminal files exist and are individually well-formed, valid, and mutually consistent
     // — proving the runner didn't just "survive" but actually ran its step and completed cleanly.
-    let status: cyrup_ext_subagents::background::RunStatus = serde_json::from_slice(
-        &std::fs::read(&run_paths.status).expect("status.json exists"),
-    )
-    .expect("status.json parses");
-    let result_file: cyrup_ext_subagents::background::ResultFile = serde_json::from_slice(
-        &std::fs::read(&run_paths.result).expect("ResultFile exists"),
-    )
-    .expect("ResultFile parses");
+    let status: cyrup_ext_subagents::background::RunStatus =
+        serde_json::from_slice(&std::fs::read(&run_paths.status).expect("status.json exists"))
+            .expect("status.json parses");
+    let result_file: cyrup_ext_subagents::background::ResultFile =
+        serde_json::from_slice(&std::fs::read(&run_paths.result).expect("ResultFile exists"))
+            .expect("ResultFile parses");
 
     let stdout_contents = std::fs::read_to_string(&runner_stdout_log).unwrap_or_default();
     let stderr_contents = std::fs::read_to_string(&runner_stderr_log).unwrap_or_default();
@@ -720,7 +724,11 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
         RunState::Complete,
         "status.json: {status:?}\nresult_file: {result_file:?}\nrunner stdout:\n{stdout_contents}\nrunner stderr:\n{stderr_contents}"
     );
-    assert_eq!(result_file.state, RunState::Complete, "ResultFile: {result_file:?}");
+    assert_eq!(
+        result_file.state,
+        RunState::Complete,
+        "ResultFile: {result_file:?}"
+    );
     assert!(result_file.success, "ResultFile: {result_file:?}");
     assert_eq!(result_file.run_id, run_id);
     assert_eq!(
@@ -817,14 +825,14 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)
         .await
@@ -901,10 +909,9 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     );
 
     // THE core A-SA-14 assertion: the terminal state is Paused, never Failed.
-    let status: cyrup_ext_subagents::background::RunStatus = serde_json::from_slice(
-        &std::fs::read(&run_paths.status).expect("status.json exists"),
-    )
-    .expect("status.json parses");
+    let status: cyrup_ext_subagents::background::RunStatus =
+        serde_json::from_slice(&std::fs::read(&run_paths.status).expect("status.json exists"))
+            .expect("status.json parses");
     assert_eq!(
         status.state,
         RunState::Paused,
@@ -939,7 +946,11 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
         &std::fs::read(&run_paths.result).expect("ResultFile exists (R-SA-077 covers Paused too)"),
     )
     .expect("ResultFile parses");
-    assert_eq!(result_file.state, RunState::Paused, "ResultFile: {result_file:?}");
+    assert_eq!(
+        result_file.state,
+        RunState::Paused,
+        "ResultFile: {result_file:?}"
+    );
     assert!(
         !result_file.success,
         "a paused run is not a success: {result_file:?}"
@@ -979,7 +990,6 @@ async fn detached_runner_process_inherits_the_published_parent_session_anchor() 
         "exit_code": 0
     });
     let script_path = write_script(dir.path(), "script.json", &script);
-
 
     let cfg_path = dir.path().join("runner-config.json");
     std::fs::write(&cfg_path, "{}").expect("write placeholder config");
@@ -1049,7 +1059,9 @@ async fn detached_runner_process_inherits_the_published_parent_session_anchor() 
     kill_pid_for_cleanup(pid);
 
     assert!(
-        entries.iter().any(|e| e == "CYRUP_SUBAGENT_PARENT_SESSION=session-perm001-e2e"),
+        entries
+            .iter()
+            .any(|e| e == "CYRUP_SUBAGENT_PARENT_SESSION=session-perm001-e2e"),
         "the detached runner's own environment must carry the published R-SA-P1 anchor so every \
          child it spawns can address the root's ask-forwarding inbox; got: {entries:?}"
     );

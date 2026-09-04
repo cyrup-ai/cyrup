@@ -6,14 +6,13 @@ use std::path::{Path, PathBuf};
 use crate::background::atomic::write_atomic_json;
 use crate::error::SubagentError;
 use crate::extension::host::SubagentsExtension;
-use crate::extension::models::registry_models;
 use crate::extension::models::classify::{
-    build_classification_context, classify_model, combined_cost, filter_dominated, RankedCandidate,
+    RankedCandidate, build_classification_context, classify_model, combined_cost, filter_dominated,
 };
 use crate::extension::models::probe::{probe_model, probe_status_is_usable};
+use crate::extension::models::registry_models;
 
 impl SubagentsExtension {
-
     // ---------------------------------------------------------------------------------------
     // /subagents-models, /subagents-refresh-provider-models, /subagents-generate-profiles,
     // /subagents-check-profile: cyrup-provider model-registry backed, with REAL live-probe
@@ -68,7 +67,9 @@ impl SubagentsExtension {
         }
         let mut candidates = filter_dominated(candidates);
         candidates.sort_by(|a, b| {
-            a.profile_rank.cmp(&b.profile_rank).then_with(|| a.full_id.cmp(&b.full_id))
+            a.profile_rank
+                .cmp(&b.profile_rank)
+                .then_with(|| a.full_id.cmp(&b.full_id))
         });
         candidates.into_iter().map(|c| c.full_id).collect()
     }
@@ -80,8 +81,11 @@ impl SubagentsExtension {
     /// `profileRank` ascending then `fullId` (pi profiles.ts:542), plus refreshing the shared
     /// doctor freshness marker. Returns the model count.
     async fn write_provider_catalog_file(&self, provider: &str) -> Result<usize, SubagentError> {
-        let matches: Vec<cyrup_provider::Model> =
-            registry_models().iter().filter(|m| m.provider.as_str() == provider).cloned().collect();
+        let matches: Vec<cyrup_provider::Model> = registry_models()
+            .iter()
+            .filter(|m| m.provider.as_str() == provider)
+            .cloned()
+            .collect();
         let ctx = build_classification_context(&matches);
         let mut models: Vec<crate::registration::profiles::ProviderCatalogModel> =
             Vec::with_capacity(matches.len());
@@ -90,7 +94,11 @@ impl SubagentsExtension {
             let classification = classify_model(m, &ctx);
             let probe = probe_model(
                 &full_id,
-                self.executor().config_snapshot().await.spawn_command.as_ref(),
+                self.executor()
+                    .config_snapshot()
+                    .await
+                    .spawn_command
+                    .as_ref(),
             )
             .await;
             models.push(crate::registration::profiles::ProviderCatalogModel {
@@ -102,7 +110,11 @@ impl SubagentsExtension {
         }
         // pi `models.sort((a,b) => a.derived.profileRank - b.derived.profileRank ||
         // a.fullId.localeCompare(b.fullId))`, profiles.ts:567.
-        models.sort_by(|a, b| a.profile_rank.cmp(&b.profile_rank).then_with(|| a.full_id.cmp(&b.full_id)));
+        models.sort_by(|a, b| {
+            a.profile_rank
+                .cmp(&b.profile_rank)
+                .then_with(|| a.full_id.cmp(&b.full_id))
+        });
         let model_count = models.len();
         let file = crate::registration::profiles::ProviderModelCatalog {
             provider: provider.to_string(),
@@ -124,7 +136,9 @@ impl SubagentsExtension {
         // Also touch the shared freshness marker `registration/doctor.rs` stats (R-SA-131 item f).
         let cache_path = self.provider_catalog_cache_path(Path::new("."));
         if let Some(parent) = cache_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(SubagentError::Spawn)?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(SubagentError::Spawn)?;
         }
         let marker = serde_json::json!({
             "provider": provider,
@@ -177,7 +191,9 @@ impl SubagentsExtension {
 
         // pi `if (availableModels.length === 0) throw new Error(...)` (profiles.ts:530-532) — a
         // command ERROR, not an informational success string.
-        let has_models = registry_models().iter().any(|m| m.provider.as_str() == provider);
+        let has_models = registry_models()
+            .iter()
+            .any(|m| m.provider.as_str() == provider);
         if !has_models {
             return Err(SubagentError::MalformedSettings(format!(
                 "No models found in the current registry for provider '{provider}'."
@@ -198,12 +214,17 @@ impl SubagentsExtension {
     /// and `<provider>.quality` profiles — EACH carrying the full 8-agent tier map PLUS a
     /// representative `subagents.defaultModel` (the medium tier, the fallback for non-builtin
     /// agents) ([`crate::registration::profiles::build_profile_file`]).
-    pub(crate) async fn generate_provider_profiles(&self, provider: &str) -> Result<String, SubagentError> {
+    pub(crate) async fn generate_provider_profiles(
+        &self,
+        provider: &str,
+    ) -> Result<String, SubagentError> {
         crate::registration::profiles::validate_profile_name(provider)?;
         // pi's refreshProviderModelCatalog (called internally by generateProfilesForProvider,
         // profiles.ts:586) throws BEFORE any probing when the registry has zero models
         // (profiles.ts:530-532) — checked here, up front, so this mirrors that ordering exactly.
-        let has_models = registry_models().iter().any(|m| m.provider.as_str() == provider);
+        let has_models = registry_models()
+            .iter()
+            .any(|m| m.provider.as_str() == provider);
         if !has_models {
             return Err(SubagentError::MalformedSettings(format!(
                 "No models found in the current registry for provider '{provider}'."
@@ -213,12 +234,13 @@ impl SubagentsExtension {
         self.write_provider_catalog_file(provider).await?;
 
         let profiles_dir = self.profiles_dir();
-        let catalog = crate::registration::profiles::read_provider_catalog(&profiles_dir, provider)?
-            .ok_or_else(|| {
-                SubagentError::MalformedSettings(format!(
-                    "provider catalog for '{provider}' is missing immediately after refresh"
-                ))
-            })?;
+        let catalog =
+            crate::registration::profiles::read_provider_catalog(&profiles_dir, provider)?
+                .ok_or_else(|| {
+                    SubagentError::MalformedSettings(format!(
+                        "provider catalog for '{provider}' is missing immediately after refresh"
+                    ))
+                })?;
         let ranked = Self::provider_ranked_full_ids_from_catalog(provider, &catalog);
         // pi `if (profileModels.length === 0) throw new Error(...)` (profiles.ts:593-595) — a
         // command ERROR, not an informational success string.
@@ -261,7 +283,10 @@ impl SubagentsExtension {
     }
 
     pub(crate) fn profiles_dir(&self) -> PathBuf {
-        self.home().join(".cyrup").join("subagents").join("profiles")
+        self.home()
+            .join(".cyrup")
+            .join("subagents")
+            .join("profiles")
     }
 
     /// The user-scope `settings.json` the extension's discovery reads its `subagents.*` layer back
@@ -289,7 +314,10 @@ impl SubagentsExtension {
     /// interactive `confirm` today (that live session-model switch is the outer-layer UI tier,
     /// tracked separately) — so this reproduces pi's exact non-interactive branch: settings are
     /// written for real, and the worker model is reported.
-    pub(crate) async fn load_profile_into_settings(&self, name: &str) -> Result<String, SubagentError> {
+    pub(crate) async fn load_profile_into_settings(
+        &self,
+        name: &str,
+    ) -> Result<String, SubagentError> {
         let profiles_dir = self.profiles_dir();
         let profile = crate::registration::profiles::load_profile(&profiles_dir, name)?;
         let worker_model = crate::registration::profiles::profile_worker_model(&profile);
@@ -311,7 +339,12 @@ impl SubagentsExtension {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -348,7 +381,9 @@ mod tests {
     #[tokio::test]
     async fn generate_provider_profiles_errors_for_an_unknown_provider() {
         let ext = SubagentsExtension::new();
-        let result = ext.generate_provider_profiles("totally-unknown-provider-xyz").await;
+        let result = ext
+            .generate_provider_profiles("totally-unknown-provider-xyz")
+            .await;
         match result {
             Err(SubagentError::MalformedSettings(msg)) => {
                 assert!(
@@ -361,5 +396,4 @@ mod tests {
             ),
         }
     }
-
 }

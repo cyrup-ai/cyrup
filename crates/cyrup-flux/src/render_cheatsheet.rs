@@ -128,7 +128,9 @@ fn parse_pipelines(md_text: &str) -> Vec<Pipeline> {
             if cur.trim().starts_with("```") {
                 i += 1; // enter the fence
                 while i < n {
-                    let Some(fence_line) = lines.get(i) else { break };
+                    let Some(fence_line) = lines.get(i) else {
+                        break;
+                    };
                     if fence_line.trim().starts_with("```") {
                         break;
                     }

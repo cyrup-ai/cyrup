@@ -779,7 +779,11 @@ mod tests {
             all_cwds.contains(&other.to_string_lossy().into_owned()),
             "the all-projects scope must reach the other project's session: {all_cwds:?}"
         );
-        assert_eq!(all.len(), 2, "listAll(sessionDir) scans the shared dir unfiltered");
+        assert_eq!(
+            all.len(),
+            2,
+            "listAll(sessionDir) scans the shared dir unfiltered"
+        );
         let current_cwds: Vec<String> = current.iter().map(|i| i.cwd.clone()).collect();
         assert_eq!(
             current_cwds,
@@ -811,8 +815,16 @@ mod tests {
 
         let dirs = config_dirs(&root, agent_dir.join("sessions"), false, here.clone());
         let (locals, globals) = super::gather_session_refs(&dirs);
-        assert_eq!(locals.len(), 1, "the encoded dir holds only this cwd's session");
-        assert_eq!(globals.len(), 2, "listAll() walks every project dir under the root");
+        assert_eq!(
+            locals.len(),
+            1,
+            "the encoded dir holds only this cwd's session"
+        );
+        assert_eq!(
+            globals.len(),
+            2,
+            "listAll() walks every project dir under the root"
+        );
     }
 
     /// One session file: a v3 header line, which is all the listing scanner needs.
@@ -821,7 +833,11 @@ mod tests {
             "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"{}\"}}\n",
             cwd.to_string_lossy()
         );
-        std::fs::write(dir.join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl")), line).unwrap();
+        std::fs::write(
+            dir.join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl")),
+            line,
+        )
+        .unwrap();
     }
 
     fn config_dirs(

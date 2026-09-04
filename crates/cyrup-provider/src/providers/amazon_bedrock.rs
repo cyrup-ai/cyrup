@@ -94,7 +94,8 @@ pub const BEDROCK_US_EAST_1_BASE_URL: &str = "https://bedrock-runtime.us-east-1.
 
 /// The `eu-central-1` Bedrock runtime endpoint — the `baseUrl` of the nine `eu.*` inference
 /// profiles (pi `amazon-bedrock.models.ts`).
-pub const BEDROCK_EU_CENTRAL_1_BASE_URL: &str = "https://bedrock-runtime.eu-central-1.amazonaws.com";
+pub const BEDROCK_EU_CENTRAL_1_BASE_URL: &str =
+    "https://bedrock-runtime.eu-central-1.amazonaws.com";
 
 /// The three `bedrockAuth.login` option ids (pi `amazon-bedrock.ts:18-20`).
 const METHOD_BEARER_TOKEN: &str = "bearer-token";
@@ -490,10 +491,7 @@ mod tests {
     }
 
     /// Resolve against a fixed env + optional credential, returning the [`AuthResult`].
-    async fn resolve_with(
-        env: &[(&str, &str)],
-        cred: Option<&Credential>,
-    ) -> Option<AuthResult> {
+    async fn resolve_with(env: &[(&str, &str)], cred: Option<&Credential>) -> Option<AuthResult> {
         AmazonBedrockApiKeyAuth
             .resolve(&a_model(), &MapEnv::new(env), cred)
             .await
@@ -614,7 +612,10 @@ mod tests {
         assert_eq!(m.cost.output, 25.0);
         assert_eq!(m.cost.cache_read, 0.5);
         assert_eq!(m.cost.cache_write, 6.25);
-        assert!(m.cost.tiers.is_none(), "Bedrock ships no long-context tiers");
+        assert!(
+            m.cost.tiers.is_none(),
+            "Bedrock ships no long-context tiers"
+        );
         let map = m.thinking_level_map.as_ref().expect("thinkingLevelMap");
         assert_eq!(map.get("max"), Some(&Some("max".to_string())));
         assert_eq!(map.get("xhigh"), None, "4.6 has no native xhigh rung");
@@ -749,7 +750,10 @@ mod tests {
 
         // The IAM pair is the one rung needing two vars.
         let pair = resolve_with(
-            &[("AWS_ACCESS_KEY_ID", "AKIA"), ("AWS_SECRET_ACCESS_KEY", "s")],
+            &[
+                ("AWS_ACCESS_KEY_ID", "AKIA"),
+                ("AWS_SECRET_ACCESS_KEY", "s"),
+            ],
             None,
         )
         .await
@@ -801,9 +805,12 @@ mod tests {
         );
         // An empty id is falsy → the pair fails even with a real secret.
         assert!(
-            resolve_with(&[("AWS_ACCESS_KEY_ID", ""), ("AWS_SECRET_ACCESS_KEY", "s")], None)
-                .await
-                .is_none()
+            resolve_with(
+                &[("AWS_ACCESS_KEY_ID", ""), ("AWS_SECRET_ACCESS_KEY", "s")],
+                None
+            )
+            .await
+            .is_none()
         );
 
         // The short-circuit itself: with no id in the env, `AWS_SECRET_ACCESS_KEY` is not looked up.
@@ -917,7 +924,10 @@ mod tests {
             .await
             .expect("a stored profile configures Bedrock");
         assert_eq!(result.source.as_deref(), Some("stored credential"));
-        assert!(result.auth.api_key.is_none(), "the profile arm carries no key");
+        assert!(
+            result.auth.api_key.is_none(),
+            "the profile arm carries no key"
+        );
         let env = result.env.as_ref().expect("credential env forwarded");
         assert_eq!(env.get("AWS_PROFILE"), Some(&"stored-prof".to_string()));
         assert_eq!(env.get("AWS_REGION"), Some(&"us-west-2".to_string()));

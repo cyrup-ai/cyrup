@@ -83,8 +83,10 @@ pub async fn check_keyboard_setup() -> Option<&'static str> {
         return None;
     }
     // Pi issues both `tmux show -gv` calls concurrently (`Promise.all`, `:970-973`).
-    let (extended_keys, extended_keys_format) =
-        tokio::join!(tmux_option("extended-keys"), tmux_option("extended-keys-format"));
+    let (extended_keys, extended_keys_format) = tokio::join!(
+        tmux_option("extended-keys"),
+        tmux_option("extended-keys-format")
+    );
     keyboard_warning(extended_keys.as_deref(), extended_keys_format.as_deref())
 }
 
@@ -102,7 +104,10 @@ async fn tmux_option(option: &str) -> Option<String> {
         .kill_on_drop(true)
         .spawn()
         .ok()?;
-    let output = tokio::time::timeout(TMUX_QUERY_TIMEOUT, child.wait_with_output()).await.ok()?.ok()?;
+    let output = tokio::time::timeout(TMUX_QUERY_TIMEOUT, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -111,14 +116,25 @@ async fn tmux_option(option: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     #[test]
     fn decision_table_matches_pis() {
         // `off` (tmux's default) and any other value ⇒ the extended-keys warning.
-        assert_eq!(keyboard_warning(Some("off"), Some("csi-u")), Some(EXTENDED_KEYS_OFF_WARNING));
-        assert_eq!(keyboard_warning(Some(""), None), Some(EXTENDED_KEYS_OFF_WARNING));
+        assert_eq!(
+            keyboard_warning(Some("off"), Some("csi-u")),
+            Some(EXTENDED_KEYS_OFF_WARNING)
+        );
+        assert_eq!(
+            keyboard_warning(Some(""), None),
+            Some(EXTENDED_KEYS_OFF_WARNING)
+        );
         // Both accepted values silence it (`extendedKeys !== "on" && … !== "always"`).
         assert_eq!(keyboard_warning(Some("on"), Some("csi-u")), None);
         assert_eq!(keyboard_warning(Some("always"), Some("csi-u")), None);
@@ -127,7 +143,11 @@ mod tests {
             keyboard_warning(Some("on"), Some("xterm")),
             Some(EXTENDED_KEYS_FORMAT_WARNING)
         );
-        assert_eq!(keyboard_warning(Some("always"), None), None, "an unknown format is not xterm");
+        assert_eq!(
+            keyboard_warning(Some("always"), None),
+            None,
+            "an unknown format is not xterm"
+        );
     }
 
     #[test]
@@ -135,7 +155,11 @@ mod tests {
         // Pi `:979`: a timeout / sandbox / missing binary must not produce a warning — a false
         // alarm on every non-tmux-aware environment would be worse than the missing diagnostic.
         assert_eq!(keyboard_warning(None, None), None);
-        assert_eq!(keyboard_warning(None, Some("xterm")), None, "the format is not even reached");
+        assert_eq!(
+            keyboard_warning(None, Some("xterm")),
+            None,
+            "the format is not even reached"
+        );
     }
 
     /// Outside tmux the check must be a prompt no-op: it may not spawn anything, and it may not
@@ -148,6 +172,9 @@ mod tests {
         }
         let started = std::time::Instant::now();
         assert_eq!(check_keyboard_setup().await, None);
-        assert!(started.elapsed() < TMUX_QUERY_TIMEOUT, "must short-circuit on $TMUX, not spawn");
+        assert!(
+            started.elapsed() < TMUX_QUERY_TIMEOUT,
+            "must short-circuit on $TMUX, not spawn"
+        );
     }
 }

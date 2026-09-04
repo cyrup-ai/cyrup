@@ -2874,7 +2874,14 @@ async fn find_returns_fd_sorted_order_not_readdir_order() {
     for rel in ["z.txt", "a/b.txt", "a.txt"] {
         std::fs::write(cwd.join(rel), "x").unwrap();
     }
-    let find = FindTool::new(fs(), cwd, FindOpts { limit: 1000, max_bytes: 50 * 1024 });
+    let find = FindTool::new(
+        fs(),
+        cwd,
+        FindOpts {
+            limit: 1000,
+            max_bytes: 50 * 1024,
+        },
+    );
     let r = find
         .execute(
             cid(),

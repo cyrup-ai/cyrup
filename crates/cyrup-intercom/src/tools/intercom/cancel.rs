@@ -22,8 +22,7 @@ impl IntercomTool {
         params: &IntercomParams,
         client: &Arc<IntercomClient>,
     ) -> Result<ToolResult, ToolError> {
-        let Some(message_id) = params.message_id.clone().filter(|v| !v.trim().is_empty())
-        else {
+        let Some(message_id) = params.message_id.clone().filter(|v| !v.trim().is_empty()) else {
             // Upstream answers `{ text: "Missing 'messageId' parameter", details: { error:
             // true } }` — a non-error RESULT. cyrup renders every such arm as a `ToolError`
             // (see the identical `Missing 'to' or 'cwd', or missing 'message' parameter`

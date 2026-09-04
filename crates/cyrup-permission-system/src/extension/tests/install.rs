@@ -56,12 +56,18 @@ fn agent_markdown_frontmatter_alone_installs_the_gate() {
         let cwd = dir.path().join("work");
         std::fs::create_dir_all(&cwd).unwrap();
         // No policy file, no config.json, no env var — before the fix this is `false`.
-        assert!(!is_installed(&agent_dir, &cwd), "control: nothing authored yet");
+        assert!(
+            !is_installed(&agent_dir, &cwd),
+            "control: nothing authored yet"
+        );
 
         let agents = agent_dir.join("agents");
         std::fs::create_dir_all(&agents).unwrap();
         // An EMPTY agents dir is not an authored policy.
-        assert!(!is_installed(&agent_dir, &cwd), "an empty agents/ is not an install signal");
+        assert!(
+            !is_installed(&agent_dir, &cwd),
+            "an empty agents/ is not an install signal"
+        );
 
         std::fs::write(
             agents.join("coder.md"),
@@ -83,11 +89,17 @@ fn project_scoped_agent_markdown_also_installs_the_gate() {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().join("agent");
         let cwd = dir.path().join("work");
-        let project_agents =
-            PROJECT_AGENT_SUBDIR.iter().fold(cwd.clone(), |acc, seg| acc.join(seg)).join("agents");
+        let project_agents = PROJECT_AGENT_SUBDIR
+            .iter()
+            .fold(cwd.clone(), |acc, seg| acc.join(seg))
+            .join("agents");
         std::fs::create_dir_all(&project_agents).unwrap();
         assert!(!is_installed(&agent_dir, &cwd));
-        std::fs::write(project_agents.join("reviewer.md"), "---\npermission: {}\n---\n").unwrap();
+        std::fs::write(
+            project_agents.join("reviewer.md"),
+            "---\npermission: {}\n---\n",
+        )
+        .unwrap();
         assert!(is_installed(&agent_dir, &cwd));
     });
 }
@@ -129,15 +141,25 @@ fn the_policy_agent_dir_override_moves_both_the_probe_and_the_engine() {
             )
         };
 
-        assert!(installed, "the probe must follow the override, or it fails OPEN");
+        assert!(
+            installed,
+            "the probe must follow the override, or it fails OPEN"
+        );
         assert_eq!(paths.global_config_path, elsewhere.join(POLICY_FILE));
         assert_eq!(paths.agents_dir, elsewhere.join("agents"));
-        assert_eq!(paths.legacy_global_settings_path, elsewhere.join("settings.json"));
+        assert_eq!(
+            paths.legacy_global_settings_path,
+            elsewhere.join("settings.json")
+        );
         assert_eq!(paths.global_mcp_config_path, elsewhere.join("mcp.json"));
         // The PROJECT paths are supplied explicitly upstream too and must NOT be relocated.
-        let project =
-            PROJECT_AGENT_SUBDIR.iter().fold(cwd.clone(), |acc, seg| acc.join(seg));
-        assert_eq!(paths.project_global_config_path, Some(project.join(POLICY_FILE)));
+        let project = PROJECT_AGENT_SUBDIR
+            .iter()
+            .fold(cwd.clone(), |acc, seg| acc.join(seg));
+        assert_eq!(
+            paths.project_global_config_path,
+            Some(project.join(POLICY_FILE))
+        );
     });
 }
 
@@ -151,7 +173,11 @@ fn a_blank_policy_agent_dir_override_is_not_an_override() {
         let _pin = crate::envx::pin(POLICY_AGENT_DIR_ENV_KEY, Some("   "));
         policy_agent_dir(dir.path())
     };
-    assert_eq!(resolved, dir.path(), "a whitespace-only value is falsy in pi and inert here");
+    assert_eq!(
+        resolved,
+        dir.path(),
+        "a whitespace-only value is falsy in pi and inert here"
+    );
 }
 
 // ----------------------------------------------- PERM-028: `decisionScope` trims like pi's
@@ -183,7 +209,10 @@ fn auto_materialized_config_does_not_latch_the_gate_on() {
         std::fs::create_dir_all(&cwd).unwrap();
         let config_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
 
-        assert!(!is_installed(&agent_dir, &cwd), "clean agent dir must not be installed");
+        assert!(
+            !is_installed(&agent_dir, &cwd),
+            "clean agent dir must not be installed"
+        );
 
         // The opt-in run: build the extension exactly as the binary wiring does. This is the
         // step that writes `config.json`.
@@ -216,10 +245,19 @@ fn auto_materialized_config_does_not_latch_the_gate_on() {
         // ...and reverting it to the pristine template turns it back off: the switch is
         // two-way, which is the whole point.
         std::fs::write(&config_path, ExtensionConfig::default_config_content()).unwrap();
-        assert!(!is_installed(&agent_dir, &cwd), "reverting the config must turn the gate off");
+        assert!(
+            !is_installed(&agent_dir, &cwd),
+            "reverting the config must turn the gate off"
+        );
 
         // A policy file remains an install signal regardless of the config file.
-        write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "deny" } }"#);
-        assert!(is_installed(&agent_dir, &cwd), "a policy file must still install the gate");
+        write_file(
+            &agent_dir.join(POLICY_FILE),
+            r#"{ "bash": { "*": "deny" } }"#,
+        );
+        assert!(
+            is_installed(&agent_dir, &cwd),
+            "a policy file must still install the gate"
+        );
     });
 }

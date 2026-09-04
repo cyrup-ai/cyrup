@@ -60,12 +60,12 @@ use std::path::{Path, PathBuf};
 
 use cyrup_core::ModelId;
 
+use super::package_name::{collapse_repeated_char, is_valid_package_identifier};
 use super::types::{
-    AgentDefinition, AgentDiscoveryDiagnostic, AgentSource, OutputMode, OutputSpec, SystemPromptMode,
-    ToolRef,
+    AgentDefinition, AgentDiscoveryDiagnostic, AgentSource, OutputMode, OutputSpec,
+    SystemPromptMode, ToolRef,
 };
 use crate::fork_context::ContextMode;
-use super::package_name::{collapse_repeated_char, is_valid_package_identifier};
 
 /// The two frontmatter keys whose absence causes the entire agent file to be silently skipped
 /// (R-SA-005). Exposed as constants so both this module and any diagnostic/test surface reference
@@ -228,7 +228,11 @@ impl ParsedFrontmatter {
 fn match_key_value(line: &str) -> Option<(&str, &str)> {
     let colon_idx = line.find(':')?;
     let key = &line[..colon_idx];
-    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return None;
     }
     let rest = &line[colon_idx + 1..];
@@ -290,7 +294,10 @@ fn first_non_whitespace_offset(line: &str) -> usize {
 /// require a non-whitespace char" is the regex's exact behaviour.
 fn block_indent_prefix(raw_block: &str) -> String {
     for line in raw_block.split('\n') {
-        let ws: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        let ws: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
         if ws.is_empty() {
             continue;
         }
@@ -322,7 +329,9 @@ fn dedent_block(raw_lines: &[String]) -> String {
         .join("\n");
     // Mirror source's final `.replace(/^\n/, "")`: drop exactly one leading newline left over
     // from the strip, if present.
-    stripped.strip_prefix('\n').map_or(stripped.clone(), str::to_string)
+    stripped
+        .strip_prefix('\n')
+        .map_or(stripped.clone(), str::to_string)
 }
 
 /// Fold a YAML folded block scalar (`>` / `>-`), a line-for-line port of
@@ -506,11 +515,11 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
     let mut current_literal = false;
 
     let flush_block = |fields: &mut Vec<(String, String)>,
-                        current_key: &mut Option<String>,
-                        current_block_lines: &mut Vec<String>,
-                        current_indent: &mut Option<usize>,
-                        current_folded: &mut bool,
-                        current_literal: &mut bool| {
+                       current_key: &mut Option<String>,
+                       current_block_lines: &mut Vec<String>,
+                       current_indent: &mut Option<usize>,
+                       current_folded: &mut bool,
+                       current_literal: &mut bool| {
         if let Some(key) = current_key.take() {
             let stripped = dedent_block(current_block_lines);
             // pi `frontmatter[currentKey] = currentFolded ? foldBlock(stripped) : stripped`
@@ -678,8 +687,6 @@ fn parse_package_name(raw: Option<&str>) -> Result<Option<String>, ()> {
     Ok(Some(final_name))
 }
 
-
-
 /// R-SA-018: discovery-time defaults for `systemPromptMode`/`inheritProjectContext`, computed from
 /// the agent's **local (pre-packaging) name** — `Append`/`true` only when `local_name ==
 /// "delegate"`, else `Replace`/`false`. Applies even when the agent is packaged (a packaged agent
@@ -784,8 +791,14 @@ fn parse_output_spec(raw: &str) -> Option<OutputSpec> {
 /// only need "did this parse". DISCOVERY must call [`parse_agent_file_checked`] instead so a
 /// malformed file is reported by name rather than vanishing (pi surfaces it under
 /// `Invalid agent definitions:`, `agent-management.ts:818-825` @v0.64.0).
-pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) -> Option<AgentDefinition> {
-    parse_agent_file_checked(content, source, file_path).ok().flatten()
+pub fn parse_agent_file(
+    content: &str,
+    source: AgentSource,
+    file_path: &Path,
+) -> Option<AgentDefinition> {
+    parse_agent_file_checked(content, source, file_path)
+        .ok()
+        .flatten()
 }
 
 /// Parse one agent `.md` file's contents into an [`AgentDefinition`].
@@ -1081,12 +1094,23 @@ pub fn parse_agent_file_checked(
     // then whichever ONE is present is parsed through `validate_permission_rules` exactly like an
     // agent-level `toolBudget:`/`turnBudget:` block above. Same `[CYRUP-DELTA]` as those: a
     // per-file skip + warn instead of aborting the whole directory scan.
-    let has_permission = parsed.get("permission").filter(|v| !v.trim().is_empty()).is_some();
-    let has_permissions = parsed.get("permissions").filter(|v| !v.trim().is_empty()).is_some();
+    let has_permission = parsed
+        .get("permission")
+        .filter(|v| !v.trim().is_empty())
+        .is_some();
+    let has_permissions = parsed
+        .get("permissions")
+        .filter(|v| !v.trim().is_empty())
+        .is_some();
     if has_permission && has_permissions {
-        return Err(fail(format!("Agent '{local_name}' cannot declare both permission and permissions frontmatter.")));
+        return Err(fail(format!(
+            "Agent '{local_name}' cannot declare both permission and permissions frontmatter."
+        )));
     }
-    let permission_rules = match parsed.get("permissions").or_else(|| parsed.get("permission")) {
+    let permission_rules = match parsed
+        .get("permissions")
+        .or_else(|| parsed.get("permission"))
+    {
         None => None,
         Some(raw) if raw.trim().is_empty() => None,
         Some(raw) => {
@@ -1113,20 +1137,18 @@ pub fn parse_agent_file_checked(
     // parse the block, reject a contradictory external profile, then enforce the reserved
     // selection names. Same `[CYRUP-DELTA]` as `toolBudget`/`turnBudget`/`permission` above: a
     // per-file skip + warn instead of aborting the whole directory scan.
-    let runner = match crate::runner::parse_agent_runner_frontmatter(
-        parsed.get("runner"),
-        &local_name,
-    ) {
-        Ok(runner) => runner,
-        Err(message) => {
-            return Err(fail(message));
-        }
-    };
-    if let Err(message) = crate::runner::validate_external_runner_profile(
-        &local_name,
-        runner.as_ref(),
-        |field| parsed.contains_key(field),
-    ) {
+    let runner =
+        match crate::runner::parse_agent_runner_frontmatter(parsed.get("runner"), &local_name) {
+            Ok(runner) => runner,
+            Err(message) => {
+                return Err(fail(message));
+            }
+        };
+    if let Err(message) =
+        crate::runner::validate_external_runner_profile(&local_name, runner.as_ref(), |field| {
+            parsed.contains_key(field)
+        })
+    {
         return Err(fail(message));
     }
     // SUBA-074 / pi `validateCodeOwnedProfileRunner` (`agents.ts:1951`): a reserved read-only
@@ -1154,7 +1176,9 @@ pub fn parse_agent_file_checked(
         Some("true") => Some(true),
         Some("false") => Some(false),
         Some(_) => {
-            return Err(fail(format!("Agent '{local_name}' has invalid async frontmatter; expected true or false.")));
+            return Err(fail(format!(
+                "Agent '{local_name}' has invalid async frontmatter; expected true or false."
+            )));
         }
     };
 
@@ -1168,7 +1192,9 @@ pub fn parse_agent_file_checked(
         Some("true") => Some(true),
         Some("false") => Some(false),
         Some(_) => {
-            return Err(fail(format!("Agent '{local_name}' has invalid allowNestedSubagents frontmatter; expected true or false.")));
+            return Err(fail(format!(
+                "Agent '{local_name}' has invalid allowNestedSubagents frontmatter; expected true or false."
+            )));
         }
     };
 
@@ -1178,7 +1204,9 @@ pub fn parse_agent_file_checked(
         Some(raw) => match raw.trim().parse::<u64>() {
             Ok(ms) if ms > 0 => Some(ms),
             _ => {
-                return Err(fail(format!("Agent '{local_name}' has invalid timeoutMs frontmatter; expected a positive integer.")));
+                return Err(fail(format!(
+                    "Agent '{local_name}' has invalid timeoutMs frontmatter; expected a positive integer."
+                )));
             }
         },
     };
@@ -1250,7 +1278,9 @@ pub fn parse_agent_file_checked(
         Some(raw) => match crate::exec::acceptance::model::AcceptanceRole::parse_exact(raw) {
             Some(role) => Some(role),
             None => {
-                return Err(fail(format!("Agent '{local_name}' has invalid acceptanceRole frontmatter; expected 'read-only' or 'writer'.")));
+                return Err(fail(format!(
+                    "Agent '{local_name}' has invalid acceptanceRole frontmatter; expected 'read-only' or 'writer'."
+                )));
             }
         },
     };
@@ -1335,12 +1365,17 @@ mod tests {
     fn no_frontmatter_delimiter_returns_empty_map_and_whole_body() {
         let parsed = parse_frontmatter_block("Just a plain markdown file.\nNo frontmatter here.");
         assert!(parsed.fields.is_empty());
-        assert_eq!(parsed.body, "Just a plain markdown file.\nNo frontmatter here.");
+        assert_eq!(
+            parsed.body,
+            "Just a plain markdown file.\nNo frontmatter here."
+        );
     }
 
     #[test]
     fn unclosed_frontmatter_block_returns_empty_map_and_whole_body() {
-        let parsed = parse_frontmatter_block("---\nname: worker\ndescription: Worker\n\nNo closing delimiter.");
+        let parsed = parse_frontmatter_block(
+            "---\nname: worker\ndescription: Worker\n\nNo closing delimiter.",
+        );
         assert!(parsed.fields.is_empty());
     }
 
@@ -1357,19 +1392,25 @@ mod tests {
 
     #[test]
     fn quoted_values_are_unwrapped() {
-        let parsed = parse_frontmatter_block("---\nname: worker\ndescription: \"A worker agent\"\n---\n\nBody\n");
+        let parsed = parse_frontmatter_block(
+            "---\nname: worker\ndescription: \"A worker agent\"\n---\n\nBody\n",
+        );
         assert_eq!(parsed.get("description"), Some("A worker agent"));
     }
 
     #[test]
     fn single_quoted_values_are_unwrapped() {
-        let parsed = parse_frontmatter_block("---\nname: worker\ndescription: 'A worker agent'\n---\n\nBody\n");
+        let parsed = parse_frontmatter_block(
+            "---\nname: worker\ndescription: 'A worker agent'\n---\n\nBody\n",
+        );
         assert_eq!(parsed.get("description"), Some("A worker agent"));
     }
 
     #[test]
     fn crlf_line_endings_are_normalized() {
-        let parsed = parse_frontmatter_block("---\r\nname: worker\r\ndescription: Worker\r\n---\r\n\r\nBody\r\n");
+        let parsed = parse_frontmatter_block(
+            "---\r\nname: worker\r\ndescription: Worker\r\n---\r\n\r\nBody\r\n",
+        );
         assert_eq!(parsed.get("name"), Some("worker"));
         assert_eq!(parsed.body, "Body");
     }
@@ -1403,7 +1444,8 @@ mod tests {
 
     #[test]
     fn block_value_at_end_of_frontmatter_with_no_trailing_flat_key_is_flushed() {
-        let content = "---\nname: worker\ndescription: Worker\npermission:\n  read: allow\n---\n\nBody\n";
+        let content =
+            "---\nname: worker\ndescription: Worker\npermission:\n  read: allow\n---\n\nBody\n";
         let parsed = parse_frontmatter_block(content);
         assert_eq!(parsed.get("permission"), Some("read: allow"));
     }
@@ -1419,7 +1461,11 @@ mod tests {
         let parsed = parse_frontmatter_block(content);
         assert_eq!(parsed.get("name"), Some("worker"));
         assert_eq!(parsed.get("description"), Some("Worker"));
-        assert_eq!(parsed.get("orphan"), None, "an indented orphan line must not become a field");
+        assert_eq!(
+            parsed.get("orphan"),
+            None,
+            "an indented orphan line must not become a field"
+        );
         assert!(!parsed.fields.iter().any(|(k, _)| k == "orphan"));
     }
 
@@ -1476,7 +1522,10 @@ mod tests {
         assert_eq!(def.completion_guard, Some(false));
         assert_eq!(
             def.fallback_models,
-            vec![ModelId::from("openai/gpt-5-mini"), ModelId::from("anthropic/claude-sonnet-4")]
+            vec![
+                ModelId::from("openai/gpt-5-mini"),
+                ModelId::from("anthropic/claude-sonnet-4")
+            ]
         );
         assert_eq!(def.default_context, Some(ContextMode::Fork));
         assert_eq!(def.system_prompt_body, "You are a scouting subagent.");
@@ -1490,7 +1539,8 @@ mod tests {
     #[test]
     fn mcp_prefixed_tools_split_into_mcp_variant() {
         let content = "---\nname: worker\ndescription: Worker\ntools: read, mcp:filesystem.list, edit\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/a.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/a.md")).expect("parses");
         assert_eq!(
             def.tools,
             Some(vec![
@@ -1504,7 +1554,8 @@ mod tests {
     #[test]
     fn packaged_agent_gets_qualified_runtime_name() {
         let content = "---\nname: scout\npackage: code-analysis\ndescription: Fast recon\n---\n\nInspect code\n";
-        let def = parse_agent_file(content, AgentSource::Package, Path::new("/pkg/scout.md")).expect("parses");
+        let def = parse_agent_file(content, AgentSource::Package, Path::new("/pkg/scout.md"))
+            .expect("parses");
         assert_eq!(def.name, "code-analysis.scout");
         assert_eq!(def.local_name, "scout");
         assert_eq!(def.package_name, Some("code-analysis".to_string()));
@@ -1513,8 +1564,10 @@ mod tests {
     #[test]
     fn package_name_is_normalized_before_validation() {
         // pi-subagents' own "normalizes package frontmatter consistently" fixture.
-        let content = "---\nname: scout\npackage: Code Analysis!\ndescription: Fast recon\n---\n\nInspect\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/a.md")).expect("parses");
+        let content =
+            "---\nname: scout\npackage: Code Analysis!\ndescription: Fast recon\n---\n\nInspect\n";
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/a.md")).expect("parses");
         assert_eq!(def.package_name, Some("code-analysis".to_string()));
         assert_eq!(def.name, "code-analysis.scout");
     }
@@ -1559,7 +1612,8 @@ mod tests {
             "a plain agent named `claude-code` must not shadow the reserved read-only adapter"
         );
         // The same reservation applies through an ALIAS, not just the name.
-        let via_alias = "---\nname: helper\ndescription: Squatter\naliases: codex-exec\n---\n\nbody\n";
+        let via_alias =
+            "---\nname: helper\ndescription: Squatter\naliases: codex-exec\n---\n\nbody\n";
         assert!(
             parse_agent_file(via_alias, AgentSource::Project, Path::new("/w.md")).is_none(),
             "a reserved name claimed via an alias must be refused too"
@@ -1642,14 +1696,16 @@ mod tests {
         use crate::watchdog::permission_arbiter::PermissionRuleDecision;
 
         let content = "---\nname: worker\ndescription: Worker\npermissions: {\"write\": \"deny\", \"edit\": \"ask\"}\n---\n\nDo work\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         let rules = def.permission_rules.expect("permission_rules parsed");
         assert_eq!(rules.get("write"), Some(&PermissionRuleDecision::Deny));
         assert_eq!(rules.get("edit"), Some(&PermissionRuleDecision::Ask));
 
         // The singular spelling works identically.
         let content_singular = "---\nname: worker\ndescription: Worker\npermission: {\"write\": \"deny\"}\n---\n\nDo work\n";
-        let def2 = parse_agent_file(content_singular, AgentSource::Project, Path::new("/w2.md")).expect("parses");
+        let def2 = parse_agent_file(content_singular, AgentSource::Project, Path::new("/w2.md"))
+            .expect("parses");
         assert_eq!(
             def2.permission_rules.expect("parsed").get("write"),
             Some(&PermissionRuleDecision::Deny)
@@ -1657,7 +1713,8 @@ mod tests {
 
         // An agent declaring NEITHER spelling has no policy of its own.
         let bare = "---\nname: bare\ndescription: Bare\n---\n\nDo work\n";
-        let def3 = parse_agent_file(bare, AgentSource::Project, Path::new("/b.md")).expect("parses");
+        let def3 =
+            parse_agent_file(bare, AgentSource::Project, Path::new("/b.md")).expect("parses");
         assert_eq!(def3.permission_rules, None);
     }
 
@@ -1720,14 +1777,16 @@ mod tests {
 
     #[test]
     fn package_name_that_normalizes_to_empty_skips_whole_file() {
-        let content = "---\nname: scout\npackage: \"   ---   \"\ndescription: Fast recon\n---\n\nInspect\n";
+        let content =
+            "---\nname: scout\npackage: \"   ---   \"\ndescription: Fast recon\n---\n\nInspect\n";
         assert!(parse_agent_file(content, AgentSource::Project, Path::new("/x.md")).is_none());
     }
 
     #[test]
     fn absent_package_field_is_fine_and_parses_unqualified() {
         let content = "---\nname: scout\ndescription: Fast recon\n---\n\nInspect\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/x.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/x.md")).expect("parses");
         assert_eq!(def.package_name, None);
         assert_eq!(def.name, "scout");
     }
@@ -1736,7 +1795,8 @@ mod tests {
     fn empty_package_field_is_treated_as_absent_not_invalid() {
         // Source: `value === "" -> { packageName: undefined }` (not an error path).
         let content = "---\nname: scout\npackage:\ndescription: Fast recon\n---\n\nInspect\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/x.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/x.md")).expect("parses");
         assert_eq!(def.package_name, None);
     }
 
@@ -1747,7 +1807,8 @@ mod tests {
     #[test]
     fn ordinary_agent_defaults_to_replace_mode_with_no_inherited_context() {
         let content = "---\nname: worker\ndescription: Worker\n---\n\nDo work\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.system_prompt_mode, SystemPromptMode::Replace);
         assert!(!def.inherit_project_context);
         assert!(!def.inherit_skills);
@@ -1756,7 +1817,8 @@ mod tests {
     #[test]
     fn delegate_local_name_defaults_to_append_mode_with_inherited_context() {
         let content = "---\nname: delegate\ndescription: Delegate\n---\n\nDo work\n";
-        let def = parse_agent_file(content, AgentSource::Builtin, Path::new("/delegate.md")).expect("parses");
+        let def = parse_agent_file(content, AgentSource::Builtin, Path::new("/delegate.md"))
+            .expect("parses");
         assert_eq!(def.system_prompt_mode, SystemPromptMode::Append);
         assert!(def.inherit_project_context);
         assert!(!def.inherit_skills);
@@ -1768,7 +1830,8 @@ mod tests {
         // agent literally locally named `delegate` gets the same defaults as the unpackaged
         // builtin."
         let content = "---\nname: delegate\npackage: acme\ndescription: Delegate\n---\n\nDo work\n";
-        let def = parse_agent_file(content, AgentSource::Package, Path::new("/pkg/delegate.md")).expect("parses");
+        let def = parse_agent_file(content, AgentSource::Package, Path::new("/pkg/delegate.md"))
+            .expect("parses");
         assert_eq!(def.name, "acme.delegate");
         assert_eq!(def.system_prompt_mode, SystemPromptMode::Append);
         assert!(def.inherit_project_context);
@@ -1777,14 +1840,16 @@ mod tests {
     #[test]
     fn explicit_system_prompt_mode_overrides_name_sensitive_default() {
         let content = "---\nname: delegate\ndescription: Delegate\nsystemPromptMode: replace\n---\n\nDo work\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/d.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/d.md")).expect("parses");
         assert_eq!(def.system_prompt_mode, SystemPromptMode::Replace);
     }
 
     #[test]
     fn explicit_inherit_project_context_overrides_name_sensitive_default() {
         let content = "---\nname: delegate\ndescription: Delegate\ninheritProjectContext: false\n---\n\nDo work\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/d.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/d.md")).expect("parses");
         assert!(!def.inherit_project_context);
     }
 
@@ -1796,8 +1861,10 @@ mod tests {
     fn unknown_thinking_string_survives_and_does_not_skip_the_file() {
         // pi `thinking` is an OPEN string: an arbitrary (future/provider-specific) value is preserved
         // verbatim, never dropped, and never causes the file to be skipped.
-        let content = "---\nname: worker\ndescription: Worker\nthinking: super-duper\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let content =
+            "---\nname: worker\ndescription: Worker\nthinking: super-duper\n---\n\nBody\n";
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.thinking, Some("super-duper".to_string()));
         assert!(def.present_fields.contains("thinking"));
         // It is a KNOWN field, so it does NOT leak into extra_fields even though it is unrecognized.
@@ -1823,7 +1890,10 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(unset.thinking, None);
-        assert_ne!(off.thinking, unset.thinking, "off must not be conflated with unset");
+        assert_ne!(
+            off.thinking, unset.thinking,
+            "off must not be conflated with unset"
+        );
     }
 
     #[test]
@@ -1831,7 +1901,8 @@ mod tests {
         // pi treats an empty `thinking` value as falsy/no-op; it collapses to `None` (unset), while
         // the key's literal presence is still tracked for the serializer's preserve round-trip.
         let content = "---\nname: worker\ndescription: Worker\nthinking:\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.thinking, None);
         assert!(def.present_fields.contains("thinking"));
     }
@@ -1843,8 +1914,12 @@ mod tests {
         // and leaves the typed `disabled` flag untouched (`None`) — a handcrafted file cannot disable
         // itself.
         let content = "---\nname: worker\ndescription: Worker\ndisabled: true\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
-        assert_eq!(def.disabled, None, "disabled: in a file must NOT set the honored flag");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(
+            def.disabled, None,
+            "disabled: in a file must NOT set the honored flag"
+        );
         assert_eq!(
             def.extra_fields.get("disabled").map(String::as_str),
             Some("true"),
@@ -1856,35 +1931,43 @@ mod tests {
     #[test]
     fn negative_max_subagent_depth_is_dropped_not_fatal() {
         let content = "---\nname: worker\ndescription: Worker\nmaxSubagentDepth: -1\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.max_subagent_depth, None);
     }
 
     #[test]
     fn non_numeric_max_subagent_depth_is_dropped_not_fatal() {
-        let content = "---\nname: worker\ndescription: Worker\nmaxSubagentDepth: soon\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let content =
+            "---\nname: worker\ndescription: Worker\nmaxSubagentDepth: soon\n---\n\nBody\n";
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.max_subagent_depth, None);
     }
 
     #[test]
     fn unrecognized_boolean_value_falls_through_to_default_not_fatal() {
         let content = "---\nname: worker\ndescription: Worker\ninheritSkills: maybe\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert!(!def.inherit_skills);
     }
 
     #[test]
     fn unrecognized_system_prompt_mode_falls_back_to_name_sensitive_default() {
-        let content = "---\nname: worker\ndescription: Worker\nsystemPromptMode: sideways\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let content =
+            "---\nname: worker\ndescription: Worker\nsystemPromptMode: sideways\n---\n\nBody\n";
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.system_prompt_mode, SystemPromptMode::Replace);
     }
 
     #[test]
     fn unrecognized_default_context_falls_back_to_none() {
-        let content = "---\nname: worker\ndescription: Worker\ndefaultContext: sideways\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let content =
+            "---\nname: worker\ndescription: Worker\ndefaultContext: sideways\n---\n\nBody\n";
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.default_context, None);
     }
 
@@ -1895,24 +1978,30 @@ mod tests {
     #[test]
     fn skill_singular_and_skills_plural_are_aliases_singular_wins_when_both_present() {
         let content = "---\nname: worker\ndescription: Worker\nskill: one, two\nskills: three, four\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.skills, vec!["one".to_string(), "two".to_string()]);
     }
 
     #[test]
     fn skills_plural_used_when_singular_absent() {
         let content = "---\nname: worker\ndescription: Worker\nskills: alpha, beta\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.skills, vec!["alpha".to_string(), "beta".to_string()]);
     }
 
     #[test]
     fn subagent_only_extensions_parses_paths_with_slashes() {
         let content = "---\nname: worker\ndescription: Worker\nsubagentOnlyExtensions: ./tools/child-search.ts, /opt/pi/child-only.ts\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(
             def.subagent_only_extensions,
-            vec!["./tools/child-search.ts".to_string(), "/opt/pi/child-only.ts".to_string()]
+            vec![
+                "./tools/child-search.ts".to_string(),
+                "/opt/pi/child-only.ts".to_string()
+            ]
         );
     }
 
@@ -1940,7 +2029,10 @@ mod tests {
             Path::new("/w.md"),
         )
         .expect("parses");
-        assert_eq!(populated.extensions, Some(vec!["foo".to_string(), "bar".to_string()]));
+        assert_eq!(
+            populated.extensions,
+            Some(vec!["foo".to_string(), "bar".to_string()])
+        );
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1972,7 +2064,8 @@ mod tests {
     fn an_absent_tools_key_parses_to_none() {
         // The MIRROR of the case above — the distinction only exists if BOTH sides hold.
         let content = "---\nname: scribe\ndescription: Scribe\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/s.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/s.md")).expect("parses");
         assert_eq!(def.tools, None);
         assert!(!def.present_fields.contains("tools"));
     }
@@ -1984,7 +2077,8 @@ mod tests {
     #[test]
     fn present_fields_tracks_exactly_the_literal_frontmatter_keys() {
         let content = "---\nname: worker\ndescription: Worker\nthinking: high\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert!(def.present_fields.contains("name"));
         assert!(def.present_fields.contains("description"));
         assert!(def.present_fields.contains("thinking"));
@@ -1994,10 +2088,14 @@ mod tests {
 
     #[test]
     fn unknown_keys_round_trip_into_extra_fields_and_are_also_present() {
-        let content = "---\nname: worker\ndescription: Worker\ncustomVendorField: some-value\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let content =
+            "---\nname: worker\ndescription: Worker\ncustomVendorField: some-value\n---\n\nBody\n";
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(
-            def.extra_fields.get("customVendorField").map(String::as_str),
+            def.extra_fields
+                .get("customVendorField")
+                .map(String::as_str),
             Some("some-value")
         );
         assert!(def.present_fields.contains("customVendorField"));
@@ -2010,7 +2108,8 @@ mod tests {
         // the typed `interactive` slot (not `extra_fields`, which is reserved for genuinely
         // unknown keys) — this test pins that it is not lost either way.
         let content = "---\nname: worker\ndescription: Worker\ninteractive: true\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.interactive, Some(true));
         assert!(!def.extra_fields.contains_key("interactive"));
         assert!(def.present_fields.contains("interactive"));
@@ -2019,7 +2118,8 @@ mod tests {
     #[test]
     fn known_fields_never_leak_into_extra_fields() {
         let content = "---\nname: worker\ndescription: Worker\nmodel: anthropic/claude-sonnet-4\nthinking: high\ncompletionGuard: true\n---\n\nBody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         for key in KNOWN_FIELDS {
             assert!(
                 !def.extra_fields.contains_key(*key),
@@ -2101,8 +2201,14 @@ mod tests {
         }
         // The parse the file-level skip is built on, pinned on its own so the exact-spelling rule
         // is visible: no trimming, no case folding (`agents.ts:2013`).
-        assert_eq!(AcceptanceRole::parse_exact("read-only"), Some(AcceptanceRole::ReadOnly));
-        assert_eq!(AcceptanceRole::parse_exact("writer"), Some(AcceptanceRole::Writer));
+        assert_eq!(
+            AcceptanceRole::parse_exact("read-only"),
+            Some(AcceptanceRole::ReadOnly)
+        );
+        assert_eq!(
+            AcceptanceRole::parse_exact("writer"),
+            Some(AcceptanceRole::Writer)
+        );
         assert_eq!(AcceptanceRole::parse_exact(" writer"), None);
         assert_eq!(AcceptanceRole::parse_exact("Writer"), None);
     }
@@ -2119,7 +2225,10 @@ mod tests {
             Path::new("/x.md"),
         )
         .expect("parses");
-        assert_eq!(scalar.default_acceptance, Some(serde_json::json!("checked")));
+        assert_eq!(
+            scalar.default_acceptance,
+            Some(serde_json::json!("checked"))
+        );
         assert!(!scalar.extra_fields.contains_key("acceptance"));
         assert!(scalar.present_fields.contains("acceptance"));
 
@@ -2142,7 +2251,9 @@ mod tests {
         .expect("a YAML flow map with unquoted keys is the documented form, not JSON");
         assert_eq!(
             flow_map.default_acceptance,
-            Some(serde_json::json!({ "level": "checked", "evidence": ["commands-run", "changed-files"] }))
+            Some(
+                serde_json::json!({ "level": "checked", "evidence": ["commands-run", "changed-files"] })
+            )
         );
 
         let disabled = parse_agent_file(
@@ -2205,7 +2316,10 @@ mod tests {
             "{yaml_error}"
         );
         assert_eq!(parse_agent_acceptance_frontmatter(None, "x"), Ok(None));
-        assert_eq!(parse_agent_acceptance_frontmatter(Some("   "), "x"), Ok(None));
+        assert_eq!(
+            parse_agent_acceptance_frontmatter(Some("   "), "x"),
+            Ok(None)
+        );
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2240,7 +2354,8 @@ mod tests {
 
     #[test]
     fn real_worker_md_fixture_parses_with_fork_default_context() {
-        let def = parse_agent_file(WORKER_MD, AgentSource::Builtin, Path::new("worker.md")).expect("parses");
+        let def = parse_agent_file(WORKER_MD, AgentSource::Builtin, Path::new("worker.md"))
+            .expect("parses");
         assert_eq!(def.name, "worker");
         assert_eq!(def.default_context, Some(ContextMode::Fork));
         assert_eq!(
@@ -2251,7 +2366,8 @@ mod tests {
 
     #[test]
     fn real_delegate_md_fixture_gets_name_sensitive_defaults() {
-        let def = parse_agent_file(DELEGATE_MD, AgentSource::Builtin, Path::new("delegate.md")).expect("parses");
+        let def = parse_agent_file(DELEGATE_MD, AgentSource::Builtin, Path::new("delegate.md"))
+            .expect("parses");
         assert_eq!(def.system_prompt_mode, SystemPromptMode::Append);
         assert!(def.inherit_project_context);
     }
@@ -2281,8 +2397,9 @@ mod tests {
 
     #[test]
     fn folded_scalar_strip_chomp_indicator_is_accepted_too() {
-        let parsed =
-            parse_frontmatter_block("---\nname: worker\ndescription: >-\n  one\n  two\n---\n\nBody\n");
+        let parsed = parse_frontmatter_block(
+            "---\nname: worker\ndescription: >-\n  one\n  two\n---\n\nBody\n",
+        );
         assert_eq!(parsed.get("description"), Some("one two"));
     }
 
@@ -2325,7 +2442,8 @@ mod tests {
 
     #[test]
     fn a_quoted_gt_is_a_literal_string_not_a_folded_block_indicator() {
-        let parsed = parse_frontmatter_block("---\nname: worker\ndescription: \">\"\n---\n\nBody\n");
+        let parsed =
+            parse_frontmatter_block("---\nname: worker\ndescription: \">\"\n---\n\nBody\n");
         assert_eq!(parsed.get("description"), Some(">"));
     }
 
@@ -2334,7 +2452,10 @@ mod tests {
         let parsed = parse_frontmatter_block(
             "---\nname: worker\ndescription: Worker\npermission:\n  \"*\": ask\n  bash:\n    \"*\": ask\n---\n\nBody\n",
         );
-        assert_eq!(parsed.get("permission"), Some("\"*\": ask\nbash:\n  \"*\": ask"));
+        assert_eq!(
+            parsed.get("permission"),
+            Some("\"*\": ask\nbash:\n  \"*\": ask")
+        );
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2376,7 +2497,8 @@ mod tests {
         }
 
         // A PLAIN scalar is untouched by either arm.
-        let plain = parse_frontmatter_block("---\nname: worker\ndescription: just text\n---\n\nBody\n");
+        let plain =
+            parse_frontmatter_block("---\nname: worker\ndescription: just text\n---\n\nBody\n");
         assert_eq!(plain.get("description"), Some("just text"));
     }
 
@@ -2384,7 +2506,8 @@ mod tests {
     /// one-character string — the mirror of the existing `">"` test.
     #[test]
     fn a_quoted_pipe_is_a_literal_string_not_a_literal_block_indicator() {
-        let parsed = parse_frontmatter_block("---\nname: worker\ndescription: \"|\"\n---\n\nBody\n");
+        let parsed =
+            parse_frontmatter_block("---\nname: worker\ndescription: \"|\"\n---\n\nBody\n");
         assert_eq!(parsed.get("description"), Some("|"));
     }
 
@@ -2488,9 +2611,11 @@ mod tests {
             Path::new("worker.md"),
         )
         .expect("parses");
-        assert_eq!(def.description, "Reviews Rust changes for correctness and style.");
+        assert_eq!(
+            def.description,
+            "Reviews Rust changes for correctness and style."
+        );
     }
-
 
     /// SUBA-092 — `excludeTools:` (pi `agents.ts:1988` @v0.64.0, `parseFrontmatterList`) and
     /// `allowNestedSubagents:` (`agents.ts:2061-2066`, strictly `true`/`false`) parse onto the
@@ -2500,7 +2625,8 @@ mod tests {
     fn exclude_tools_and_allow_nested_subagents_parse_onto_the_definition_and_are_never_demoted() {
         let content = "---\nname: worker\ndescription: W\nexcludeTools: bash, write\n\
                        allowNestedSubagents: true\n---\n\nbody\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(
             def.exclude_tools,
             Some(vec!["bash".to_string(), "write".to_string()]),
@@ -2517,9 +2643,14 @@ mod tests {
         assert!(def.present_fields.contains("allowNestedSubagents"));
 
         // Block-list syntax is the same grammar `tools:` uses (pi's shared `parseFrontmatterList`).
-        let block = "---\nname: worker\ndescription: W\nexcludeTools:\n  - bash\n  - edit\n---\n\nbody\n";
-        let def = parse_agent_file(block, AgentSource::Project, Path::new("/w.md")).expect("parses");
-        assert_eq!(def.exclude_tools, Some(vec!["bash".to_string(), "edit".to_string()]));
+        let block =
+            "---\nname: worker\ndescription: W\nexcludeTools:\n  - bash\n  - edit\n---\n\nbody\n";
+        let def =
+            parse_agent_file(block, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(
+            def.exclude_tools,
+            Some(vec!["bash".to_string(), "edit".to_string()])
+        );
 
         // An explicit `false` is carried as `Some(false)`, distinct from the key being absent.
         let off = "---\nname: worker\ndescription: W\nallowNestedSubagents: false\n---\n\nbody\n";
@@ -2528,7 +2659,8 @@ mod tests {
 
         // Absent keys: `None` on both, exactly pi's `undefined`.
         let plain = "---\nname: worker\ndescription: W\n---\n\nbody\n";
-        let def = parse_agent_file(plain, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let def =
+            parse_agent_file(plain, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.exclude_tools, None);
         assert_eq!(def.allow_nested_subagents, None);
     }
@@ -2539,15 +2671,15 @@ mod tests {
     #[test]
     fn an_invalid_allow_nested_subagents_value_skips_the_agent_file() {
         for bad in ["yes", "1", "TRUE", "maybe"] {
-            let content =
-                format!("---\nname: worker\ndescription: W\nallowNestedSubagents: {bad}\n---\n\nbody\n");
+            let content = format!(
+                "---\nname: worker\ndescription: W\nallowNestedSubagents: {bad}\n---\n\nbody\n"
+            );
             assert!(
                 parse_agent_file(&content, AgentSource::Project, Path::new("/w.md")).is_none(),
                 "allowNestedSubagents: {bad} must skip the file, not parse leniently"
             );
         }
     }
-
 
     // -----------------------------------------------------------------------------------------
     // SUBA-086: per-file diagnostics — pi `loadAgentsFromDefinitionFiles`' catch
@@ -2571,7 +2703,10 @@ mod tests {
         assert_eq!(diag.name.as_deref(), Some("worker"));
         assert_eq!(diag.file_path, Path::new("/w.md"));
         assert_eq!(diag.source, AgentSource::Project);
-        assert_eq!(diag.runtime_name, None, "an unpackaged agent carries no runtimeName (`:2151`)");
+        assert_eq!(
+            diag.runtime_name, None,
+            "an unpackaged agent carries no runtimeName (`:2151`)"
+        );
         assert!(!diag.package_specified);
         assert_eq!(diag.discovery_priority, None);
         assert_eq!(diag.label(), "worker");
@@ -2594,12 +2729,18 @@ mod tests {
                 "toolTimeoutMs: 2147483648",
                 "Agent 'worker' has invalid toolTimeoutMs frontmatter; expected a positive integer no larger than 2147483647.",
             ),
-            ("fast: yes", "Agent 'worker' has invalid fast frontmatter; expected true or false."),
+            (
+                "fast: yes",
+                "Agent 'worker' has invalid fast frontmatter; expected true or false.",
+            ),
             (
                 "allowNestedSubagents: maybe",
                 "Agent 'worker' has invalid allowNestedSubagents frontmatter; expected true or false.",
             ),
-            ("async: sometimes", "Agent 'worker' has invalid async frontmatter; expected true or false."),
+            (
+                "async: sometimes",
+                "Agent 'worker' has invalid async frontmatter; expected true or false.",
+            ),
             (
                 "permission: {\"read\":\"allow\"}\npermissions: {\"read\":\"allow\"}",
                 "Agent 'worker' cannot declare both permission and permissions frontmatter.",
@@ -2614,10 +2755,15 @@ mod tests {
             ),
         ];
         for (frontmatter, expected) in cases {
-            let content = format!("---\nname: worker\ndescription: d\n{frontmatter}\n---\n\nBody\n");
+            let content =
+                format!("---\nname: worker\ndescription: d\n{frontmatter}\n---\n\nBody\n");
             let diag = checked_err(&content);
             assert_eq!(diag.error, expected, "frontmatter {frontmatter:?}");
-            assert_eq!(diag.name.as_deref(), Some("worker"), "frontmatter {frontmatter:?}");
+            assert_eq!(
+                diag.name.as_deref(),
+                Some("worker"),
+                "frontmatter {frontmatter:?}"
+            );
         }
     }
 
@@ -2632,23 +2778,40 @@ mod tests {
         )
         .expect("valid values are not diagnostics")
         .expect("the file parses");
-        assert_eq!(def.extra_fields.get("toolTimeoutMs").map(String::as_str), Some("5000"));
-        assert_eq!(def.extra_fields.get("outputMode").map(String::as_str), Some("file-only"));
-        assert_eq!(def.extra_fields.get("fast").map(String::as_str), Some("false"));
+        assert_eq!(
+            def.extra_fields.get("toolTimeoutMs").map(String::as_str),
+            Some("5000")
+        );
+        assert_eq!(
+            def.extra_fields.get("outputMode").map(String::as_str),
+            Some("file-only")
+        );
+        assert_eq!(
+            def.extra_fields.get("fast").map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]
     fn invalid_package_diagnostic_carries_upstreams_message_and_package_specified() {
         let diag = checked_err("---\nname: worker\ndescription: d\npackage: $$$\n---\n\nBody\n");
-        assert_eq!(diag.error, "Agent 'worker' package is invalid after sanitization.");
+        assert_eq!(
+            diag.error,
+            "Agent 'worker' package is invalid after sanitization."
+        );
         assert_eq!(diag.name.as_deref(), Some("worker"));
         assert!(diag.package_specified);
-        assert_eq!(diag.runtime_name, None, "upstream binds runtimeName only after the package parses");
+        assert_eq!(
+            diag.runtime_name, None,
+            "upstream binds runtimeName only after the package parses"
+        );
     }
 
     #[test]
     fn a_packaged_agents_diagnostic_carries_its_runtime_name() {
-        let diag = checked_err("---\nname: worker\npackage: acme\ndescription: d\ntimeoutMs: 30s\n---\n\nBody\n");
+        let diag = checked_err(
+            "---\nname: worker\npackage: acme\ndescription: d\ntimeoutMs: 30s\n---\n\nBody\n",
+        );
         assert_eq!(diag.name.as_deref(), Some("worker"));
         assert_eq!(diag.runtime_name.as_deref(), Some("acme.worker"));
         assert!(diag.package_specified);
@@ -2659,7 +2822,11 @@ mod tests {
     #[test]
     fn missing_description_is_still_a_silent_skip_not_a_diagnostic() {
         assert!(matches!(
-            parse_agent_file_checked("---\nname: worker\ntimeoutMs: 30s\n---\n\nBody\n", AgentSource::Project, Path::new("/w.md")),
+            parse_agent_file_checked(
+                "---\nname: worker\ntimeoutMs: 30s\n---\n\nBody\n",
+                AgentSource::Project,
+                Path::new("/w.md")
+            ),
             Ok(None)
         ));
     }

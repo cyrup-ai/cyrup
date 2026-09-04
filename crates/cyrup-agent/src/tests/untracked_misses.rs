@@ -15,18 +15,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    Agent, AgentEvent, AgentMessage, EventSubscriber, HookError, Hooks, PostTurn,
-    StreamFn, TurnUpdate,
+    Agent, AgentEvent, AgentMessage, EventSubscriber, HookError, Hooks, PostTurn, StreamFn,
+    TurnUpdate,
 };
 use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, EventStream, Message, ModelRef, StopReason, Tool, ToolCallId, ToolError,
-    ToolResult, ToolUpdate, ToolUpdateSink,
+    CancelToken, Content, EventStream, Message, ModelRef, StopReason, TerminateHint, Tool,
+    ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
 use cyrup_provider::{Context, StreamEvent, StreamOptions};
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::support::*;
 
@@ -61,7 +60,11 @@ struct ContextOverrideHook {
 
 #[async_trait::async_trait]
 impl Hooks for ContextOverrideHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<Option<TurnUpdate>, HookError> {
         // After the FIRST turn only, replace the loop's working context with a sentinel transcript.
         // Pi `currentContext = snapshot.context` (agent-loop.ts:228) replaces only the loop copy.
         if self.turns.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -73,7 +76,11 @@ impl Hooks for ContextOverrideHook {
             Ok(None)
         }
     }
-    async fn should_stop_after_turn(&self, ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<bool, HookError> {
+    async fn should_stop_after_turn(
+        &self,
+        ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<bool, HookError> {
         Ok(ctx.turn_index >= 2)
     }
 }
@@ -88,7 +95,9 @@ async fn miss1_context_override_isolated_from_observable_state() {
     let tool = EchoTool::named("echo");
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![tool])
-        .hooks(Arc::new(ContextOverrideHook { turns: AtomicUsize::new(0) }))
+        .hooks(Arc::new(ContextOverrideHook {
+            turns: AtomicUsize::new(0),
+        }))
         .build();
     agent.prompt("go").await.unwrap().finished().await;
 
@@ -98,7 +107,10 @@ async fn miss1_context_override_isolated_from_observable_state() {
     // turn1's payload must reflect the override — Pi reads the loop's `currentContext.messages`.
     let turn1 = &captured[1];
     assert!(
-        turn1.iter().filter_map(user_text_of).any(|t| t == "CTXOVERRIDE"),
+        turn1
+            .iter()
+            .filter_map(user_text_of)
+            .any(|t| t == "CTXOVERRIDE"),
         "the prepare_next_turn context override must reach the NEXT turn's LLM payload"
     );
     assert!(
@@ -110,15 +122,26 @@ async fn miss1_context_override_isolated_from_observable_state() {
     // event-driven transcript (Pi `_state.messages` via processEvents, agent.ts:519-522).
     let snap = agent.snapshot().await;
     assert!(
-        snap.messages.iter().filter_map(agent_user_text_of).any(|t| t == "go"),
+        snap.messages
+            .iter()
+            .filter_map(agent_user_text_of)
+            .any(|t| t == "go"),
         "the original prompt must remain in observable agent.state.messages (override must NOT leak)"
     );
     assert!(
-        !snap.messages.iter().filter_map(agent_user_text_of).any(|t| t == "CTXOVERRIDE"),
+        !snap
+            .messages
+            .iter()
+            .filter_map(agent_user_text_of)
+            .any(|t| t == "CTXOVERRIDE"),
         "the context override must NOT appear in observable agent.state.messages"
     );
     // Natural transcript: user prompt + assistant(toolcall) + toolResult + assistant(done) = 4.
-    assert_eq!(snap.messages.len(), 4, "observable state holds the full natural transcript");
+    assert_eq!(
+        snap.messages.len(),
+        4,
+        "observable state holds the full natural transcript"
+    );
 }
 
 #[tokio::test]
@@ -133,12 +156,15 @@ async fn miss1_mid_run_set_messages_does_not_leak_into_loop_payload() {
     #[async_trait::async_trait]
     impl EventSubscriber for Meddler {
         async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
-            if let AgentEvent::MessageEnd { message: AgentMessage::Assistant(_) } = event
+            if let AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(_),
+            } = event
                 && self.fired.fetch_add(1, Ordering::SeqCst) == 0
             {
                 let a = self.agent.lock().unwrap().clone();
                 if let Some(a) = a {
-                    a.set_messages(vec![AgentMessage::user_text("INJECTED")]).await;
+                    a.set_messages(vec![AgentMessage::user_text("INJECTED")])
+                        .await;
                 }
             }
         }
@@ -150,7 +176,10 @@ async fn miss1_mid_run_set_messages_does_not_leak_into_loop_payload() {
     ]);
     let tool = EchoTool::named("echo");
     let agent = Arc::new(Agent::builder(model_ref(), sf).tools(vec![tool]).build());
-    let meddler = Arc::new(Meddler { agent: Mutex::new(Some(agent.clone())), fired: AtomicUsize::new(0) });
+    let meddler = Arc::new(Meddler {
+        agent: Mutex::new(Some(agent.clone())),
+        fired: AtomicUsize::new(0),
+    });
     agent.subscribe(meddler);
     agent.prompt("go").await.unwrap().finished().await;
 
@@ -159,11 +188,17 @@ async fn miss1_mid_run_set_messages_does_not_leak_into_loop_payload() {
     // The loop's working copy is isolated; the external set_messages must NOT appear in turn1's
     // payload (it stays the natural prompt+assistant+toolResult transcript).
     assert!(
-        !payloads[1].iter().filter_map(user_text_of).any(|t| t == "INJECTED"),
+        !payloads[1]
+            .iter()
+            .filter_map(user_text_of)
+            .any(|t| t == "INJECTED"),
         "a mid-run external set_messages must NOT leak into the loop's LLM payload"
     );
     assert!(
-        payloads[1].iter().filter_map(user_text_of).any(|t| t == "go"),
+        payloads[1]
+            .iter()
+            .filter_map(user_text_of)
+            .any(|t| t == "go"),
         "the loop's working transcript keeps the original prompt"
     );
 }
@@ -205,8 +240,14 @@ async fn miss3_timestamps_reach_llm_payload() {
         })
         .expect("a tool-result message in the payload");
 
-    assert!(user_ts >= before, "prompt user timestamp must be a real Date.now() (was None/0): {user_ts}");
-    assert!(tool_ts >= before, "tool-result timestamp must be a real Date.now() (was 0): {tool_ts}");
+    assert!(
+        user_ts >= before,
+        "prompt user timestamp must be a real Date.now() (was None/0): {user_ts}"
+    );
+    assert!(
+        tool_ts >= before,
+        "tool-result timestamp must be a real Date.now() (was 0): {tool_ts}"
+    );
 }
 
 // ===========================================================================
@@ -219,9 +260,13 @@ async fn miss2_3_synthetic_failure_has_empty_text_block_and_timestamp() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    let (sf, _payloads) =
-        payload_recording(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]);
-    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(PanicHook::new("boom"))).build();
+    let (sf, _payloads) = payload_recording(vec![faux_assistant_message(
+        vec![faux_text("a1")],
+        StopReason::Stop,
+    )]);
+    let agent = Agent::builder(model_ref(), sf)
+        .hooks(Arc::new(PanicHook::new("boom")))
+        .build();
     let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     let new = agent.prompt("go").await.unwrap().finished().await;
@@ -239,16 +284,22 @@ async fn miss2_3_synthetic_failure_has_empty_text_block_and_timestamp() {
         vec![Content::text("")],
         "Pi handleRunFailure content is [{{type:text, text:\"\"}}], NOT empty content"
     );
-    assert!(failure.timestamp >= before, "failure message carries a Date.now() timestamp");
+    assert!(
+        failure.timestamp >= before,
+        "failure message carries a Date.now() timestamp"
+    );
 
     // The same shape must appear on the wire-bound message_end event.
     let end_ok = rec.snapshot().into_iter().any(|e| match e {
-        AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) } => {
-            a.stop_reason == StopReason::Error && a.content == vec![Content::text("")]
-        }
+        AgentEvent::MessageEnd {
+            message: AgentMessage::Assistant(a),
+        } => a.stop_reason == StopReason::Error && a.content == vec![Content::text("")],
         _ => false,
     });
-    assert!(end_ok, "the failure message_end carries the single empty text block");
+    assert!(
+        end_ok,
+        "the failure message_end carries the single empty text block"
+    );
 }
 
 // ===========================================================================
@@ -269,8 +320,14 @@ impl StreamFn for HangingStreamFn {
         let empty = faux_assistant_message(vec![], StopReason::Stop);
         let with_text = faux_assistant_message(vec![faux_text("hello")], StopReason::Stop);
         let head = futures::stream::iter(vec![
-            StreamEvent::Start { partial: Arc::new(empty.clone()) },
-            StreamEvent::TextDelta { content_index: 0, delta: "hello".into(), partial: Arc::new(with_text) },
+            StreamEvent::Start {
+                partial: Arc::new(empty.clone()),
+            },
+            StreamEvent::TextDelta {
+                content_index: 0,
+                delta: "hello".into(),
+                partial: Arc::new(with_text),
+            },
         ]);
         Box::pin(head.chain(futures::stream::pending()))
     }
@@ -293,7 +350,10 @@ async fn miss4_abort_carries_streamed_partial_content() {
             _ => None,
         })
         .expect("an aborted assistant message");
-    let has_hello = aborted.content.iter().any(|c| matches!(c, Content::Text { text, .. } if text == "hello"));
+    let has_hello = aborted
+        .content
+        .iter()
+        .any(|c| matches!(c, Content::Text { text, .. } if text == "hello"));
     assert!(
         has_hello,
         "the aborted assistant must carry the ACCUMULATED partial content (was empty): {:?}",
@@ -329,11 +389,21 @@ impl StreamFn for PostTerminalStreamFn {
         let ok = faux_assistant_message(vec![faux_text("ok")], StopReason::Stop);
         let leak = faux_assistant_message(vec![faux_text("LEAK")], StopReason::Stop);
         let events = vec![
-            StreamEvent::Start { partial: Arc::new(empty.clone()) },
-            StreamEvent::TextDelta { content_index: 0, delta: "ok".into(), partial: Arc::new(ok.clone()) },
+            StreamEvent::Start {
+                partial: Arc::new(empty.clone()),
+            },
+            StreamEvent::TextDelta {
+                content_index: 0,
+                delta: "ok".into(),
+                partial: Arc::new(ok.clone()),
+            },
             StreamEvent::terminal(ok),
             // Post-terminal stray event — must be ignored.
-            StreamEvent::TextDelta { content_index: 0, delta: "LEAK".into(), partial: Arc::new(leak) },
+            StreamEvent::TextDelta {
+                content_index: 0,
+                delta: "LEAK".into(),
+                partial: Arc::new(leak),
+            },
         ];
         Box::pin(futures::stream::iter(events))
     }
@@ -348,12 +418,19 @@ async fn miss6_no_message_update_after_terminal() {
 
     // No message_update may carry the post-terminal "LEAK" partial.
     let leaked = rec.snapshot().into_iter().any(|e| match e {
-        AgentEvent::MessageUpdate { message: AgentMessage::Assistant(a), .. } => {
-            a.content.iter().any(|c| matches!(c, Content::Text { text, .. } if text == "LEAK"))
-        }
+        AgentEvent::MessageUpdate {
+            message: AgentMessage::Assistant(a),
+            ..
+        } => a
+            .content
+            .iter()
+            .any(|c| matches!(c, Content::Text { text, .. } if text == "LEAK")),
         _ => false,
     });
-    assert!(!leaked, "a post-terminal event must NOT produce a stray message_update (Pi returns on done)");
+    assert!(
+        !leaked,
+        "a post-terminal event must NOT produce a stray message_update (Pi returns on done)"
+    );
 
     // The final assistant message is the `done` message, not the post-terminal partial.
     let last = new.iter().rev().find_map(|m| match m {
@@ -361,13 +438,24 @@ async fn miss6_no_message_update_after_terminal() {
         _ => None,
     });
     let text = last
-        .map(|a| a.content.iter().filter_map(|c| match c {
-            Content::Text { text, .. } => Some(text.to_string()),
-            _ => None,
-        }).collect::<Vec<_>>())
+        .map(|a| {
+            a.content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text { text, .. } => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
-    assert!(text.iter().any(|t| t == "ok"), "final message is the done terminal");
-    assert!(!text.iter().any(|t| t == "LEAK"), "final message must not be overwritten by post-terminal partial");
+    assert!(
+        text.iter().any(|t| t == "ok"),
+        "final message is the done terminal"
+    );
+    assert!(
+        !text.iter().any(|t| t == "LEAK"),
+        "final message must not be overwritten by post-terminal partial"
+    );
 }
 
 // ===========================================================================
@@ -409,7 +497,12 @@ impl Tool for UpdatingTool {
             details: None,
             terminate: TerminateHint::Unspecified,
         });
-        Ok(ToolResult { content: vec![Content::text("done")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("done")],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -419,7 +512,10 @@ async fn residual1_tool_update_partial_result_carries_terminate_byte_for_byte() 
         faux_assistant_message(vec![faux_tool_call("upd", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("ok")], StopReason::Stop),
     ]);
-    let tool = Arc::new(UpdatingTool { name: "upd".into(), params: obj_schema() });
+    let tool = Arc::new(UpdatingTool {
+        name: "upd".into(),
+        params: obj_schema(),
+    });
     let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
     agent.subscribe(rec.clone());

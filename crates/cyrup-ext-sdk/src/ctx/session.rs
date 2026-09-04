@@ -45,7 +45,10 @@ impl Session {
         let data_json = serde_json::to_string(&data).map_err(|e| format!("append_entry: {e}"))?;
         #[cfg(target_arch = "wasm32")]
         {
-            return crate::guest::bindings::cyrup::ext::session::append_entry(custom_type, &data_json);
+            return crate::guest::bindings::cyrup::ext::session::append_entry(
+                custom_type,
+                &data_json,
+            );
         }
         #[cfg(not(target_arch = "wasm32"))]
         {

@@ -9,7 +9,12 @@
 //!
 //! Every assertion here is on the REAL binary, which is the only place the exit code and the stderr
 //! text can be observed together. Fully offline, hermetic tempdir HOME/agent dir.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::process::{Command, Stdio};
 
@@ -158,8 +163,9 @@ fn help_lists_tui_mode_at_pis_position() {
     let (r, _tmp) = run_with(&["--help"], true);
     assert_eq!(r.code, 0, "stderr was: {}", r.stderr);
     assert!(
-        r.stdout
-            .contains("  --tui-mode <mode>              TUI mode: regular (default) or fullscreen\n"),
+        r.stdout.contains(
+            "  --tui-mode <mode>              TUI mode: regular (default) or fullscreen\n"
+        ),
         "stdout was: {}",
         r.stdout
     );

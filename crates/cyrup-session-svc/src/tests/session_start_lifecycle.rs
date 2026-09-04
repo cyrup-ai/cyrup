@@ -12,20 +12,21 @@
 //! of every process was never announced: the permission gate never cleared its approval store or
 //! started the ask-forwarding watcher, subagents never reset background-run tracking, intercom never
 //! saw its `SessionStart` arm.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::{AgentSessionRuntime, SessionBuilder, SessionConfig, SessionFactory, SessionTarget};
 use cyrup_core::ExtensionId;
-use cyrup_ext::{
-    EventKind, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension,
-};
+use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
 use cyrup_provider::Provider;
 use cyrup_provider::faux::FauxProvider;
-use crate::{
-    AgentSessionRuntime, SessionBuilder, SessionConfig, SessionFactory, SessionTarget,
-};
 use tempfile::TempDir;
 
 /// A native extension that records the `reason` of every `session_start` it is notified of, in
@@ -66,7 +67,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -90,9 +95,8 @@ async fn runtime_create_announces_the_initial_session_to_extensions() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
     let cfg = base_config(&fx);
     let target = cfg.target.clone();
-    let factory = Arc::new(
-        SessionFactory::new(provider, cfg).with_native_extension(Arc::new(rec.clone())),
-    );
+    let factory =
+        Arc::new(SessionFactory::new(provider, cfg).with_native_extension(Arc::new(rec.clone())));
 
     let _runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
 
@@ -114,9 +118,8 @@ async fn replacement_appends_its_own_reason_without_double_announcing() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
     let cfg = base_config(&fx);
     let target = cfg.target.clone();
-    let factory = Arc::new(
-        SessionFactory::new(provider, cfg).with_native_extension(Arc::new(rec.clone())),
-    );
+    let factory =
+        Arc::new(SessionFactory::new(provider, cfg).with_native_extension(Arc::new(rec.clone())));
 
     let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
     runtime.new_session().await.unwrap();
@@ -161,10 +164,11 @@ async fn runtime_session_is_not_reannounced_by_a_host_bind() {
     let rec = StartRecorder::default();
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
     let cfg = base_config(&fx);
-    let factory = Arc::new(
-        SessionFactory::new(provider, cfg).with_native_extension(Arc::new(rec.clone())),
-    );
-    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+    let factory =
+        Arc::new(SessionFactory::new(provider, cfg).with_native_extension(Arc::new(rec.clone())));
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap();
 
     runtime.session().await.bind_extensions().await;
 

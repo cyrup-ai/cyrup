@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 //! TUI-063 — `CYRUP_SHARE_VIEWER_URL` actually reaches `/share`'s viewer link.
 //!
 //! ```ts

@@ -1564,7 +1564,12 @@ mod tests {
 
 #[cfg(test)]
 mod upstream_normalization_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::parse_http_href;
 
@@ -1578,9 +1583,15 @@ mod upstream_normalization_tests {
         let raw = "https://github.com/login/\u{1b}]8;;evil";
         let href = parse_http_href(raw).expect("an https URI parses");
 
-        assert_ne!(href, raw, "href must differ from the raw input (upstream asserts exactly this)");
+        assert_ne!(
+            href, raw,
+            "href must differ from the raw input (upstream asserts exactly this)"
+        );
         assert_eq!(href, "https://github.com/login/%1B]8;;evil");
-        assert!(!href.contains('\u{1b}'), "no C0 control survives into the prompt");
+        assert!(
+            !href.contains('\u{1b}'),
+            "no C0 control survives into the prompt"
+        );
     }
 
     /// MIRROR: an ordinary URI is untouched, so the assertion above is about the escape and not
@@ -1592,6 +1603,9 @@ mod upstream_normalization_tests {
             "https://github.com/login/device"
         );
         // `new URL("https://host").href === "https://host/"`
-        assert_eq!(parse_http_href("https://github.com").unwrap(), "https://github.com/");
+        assert_eq!(
+            parse_http_href("https://github.com").unwrap(),
+            "https://github.com/"
+        );
     }
 }

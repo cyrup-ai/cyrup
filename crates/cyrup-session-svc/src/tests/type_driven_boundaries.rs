@@ -3,7 +3,12 @@
 //! that reconstitutes a persisted `bashExecution` custom entry as the `App` message a live
 //! execution produces.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::builder::parse_queue_mode;
 use crate::event::raw_message_to_agent;
@@ -19,7 +24,11 @@ fn parse_queue_mode_is_lenient_over_the_strict_parser() {
     assert_eq!(parse_queue_mode("all"), QueueMode::All);
     assert_eq!(parse_queue_mode("one-at-a-time"), QueueMode::OneAtATime);
     for bad in ["ALL", "", "steer", "one_at_a_time"] {
-        assert_eq!(parse_queue_mode(bad), QueueMode::OneAtATime, "{bad:?} falls back as pi does");
+        assert_eq!(
+            parse_queue_mode(bad),
+            QueueMode::OneAtATime,
+            "{bad:?} falls back as pi does"
+        );
     }
 }
 
@@ -38,7 +47,10 @@ fn raw_custom(custom_type: &str, content: serde_json::Value) -> Raw {
 /// with the enum's tag — so the model never reads a bash result as a custom entry.
 #[test]
 fn resume_bridge_reconstitutes_bash_execution_as_app() {
-    let raw = raw_custom("bashExecution", json!({ "command": "ls", "output": "a\nb" }));
+    let raw = raw_custom(
+        "bashExecution",
+        json!({ "command": "ls", "output": "a\nb" }),
+    );
     match raw_message_to_agent(&raw) {
         AgentMessage::App { role, payload } => {
             assert_eq!(role, AppRole::BashExecution);
@@ -55,7 +67,9 @@ fn resume_bridge_reconstitutes_bash_execution_as_app() {
 #[test]
 fn resume_bridge_leaves_extension_messages_custom() {
     let memo = raw_custom("memo", json!({ "note": "keep" }));
-    assert!(matches!(raw_message_to_agent(&memo), AgentMessage::Custom { kind, .. } if kind == "memo"));
+    assert!(
+        matches!(raw_message_to_agent(&memo), AgentMessage::Custom { kind, .. } if kind == "memo")
+    );
     let non_object = raw_custom("bashExecution", json!("not an object"));
     assert!(matches!(
         raw_message_to_agent(&non_object),

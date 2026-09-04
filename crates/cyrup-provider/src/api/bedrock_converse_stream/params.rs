@@ -54,11 +54,8 @@ pub(super) fn build_params(
     }
 
     // pi `:229`: `options.maxTokens ?? (isAnthropicClaudeModel(model) ? model.maxTokens : undefined)`.
-    let inference_max_tokens = effective_max_tokens.or(if claude {
-        Some(model.max_tokens)
-    } else {
-        None
-    });
+    let inference_max_tokens =
+        effective_max_tokens.or(if claude { Some(model.max_tokens) } else { None });
 
     let mut obj = Map::new();
     obj.insert("modelId".to_string(), json!(model.id.as_str()));
@@ -66,7 +63,9 @@ pub(super) fn build_params(
         "messages".to_string(),
         Value::Array(convert_messages(ctx, model, cache_retention, env)?),
     );
-    if let Some(system) = build_system_prompt(ctx.system_prompt.as_deref(), model, cache_retention, env) {
+    if let Some(system) =
+        build_system_prompt(ctx.system_prompt.as_deref(), model, cache_retention, env)
+    {
         obj.insert("system".to_string(), Value::Array(system));
     }
 
@@ -85,9 +84,12 @@ pub(super) fn build_params(
         .as_ref()
         .and_then(|c| c.supports_strict_mode)
         .unwrap_or(false);
-    if let Some(tool_config) =
-        convert_tool_config(&ctx.tools, bedrock.tool_choice.as_ref(), supports_strict_mode)
-            .map_err(|e| e.0)?
+    if let Some(tool_config) = convert_tool_config(
+        &ctx.tools,
+        bedrock.tool_choice.as_ref(),
+        supports_strict_mode,
+    )
+    .map_err(|e| e.0)?
     {
         obj.insert("toolConfig".to_string(), tool_config);
     }

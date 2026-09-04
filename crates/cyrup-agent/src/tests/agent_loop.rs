@@ -6,19 +6,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
-    AfterOutcome, AfterOverride, Agent, AgentEvent, AgentMessage, ApiKeyResolver, BeforeOutcome, BeforeToolCall,
-    Hooks, StreamFn, ToolExecution,
+    AfterOutcome, AfterOverride, Agent, AgentEvent, AgentMessage, ApiKeyResolver, BeforeOutcome,
+    BeforeToolCall, Hooks, StreamFn, ToolExecution,
 };
 use crate::{AfterToolCall, EventSubscriber};
 use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, EventStream, ExecMode, ModelRef, ProviderId, StopReason, Tool, ToolCallId,
-    ToolError, ToolResult, ToolUpdateSink,
+    CancelToken, Content, EventStream, ExecMode, ModelRef, ProviderId, StopReason, TerminateHint,
+    Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
 use cyrup_provider::{Context, StreamEvent, StreamOptions};
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::support::*;
 
@@ -27,7 +26,10 @@ fn names(events: &[AgentEvent]) -> Vec<String> {
 }
 
 fn count_turn_starts(events: &[AgentEvent]) -> usize {
-    events.iter().filter(|e| matches!(e, AgentEvent::TurnStart)).count()
+    events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::TurnStart))
+        .count()
 }
 
 // ----------------------------------------------------------------------------
@@ -41,7 +43,10 @@ struct FailTool {
 
 impl FailTool {
     fn new(name: &str) -> Arc<Self> {
-        Arc::new(Self { name: name.into(), params: obj_schema() })
+        Arc::new(Self {
+            name: name.into(),
+            params: obj_schema(),
+        })
     }
 }
 
@@ -79,7 +84,13 @@ impl SpanTool {
         mode: ExecMode,
         spans: Arc<Mutex<Vec<(String, Instant, Instant)>>>,
     ) -> Arc<Self> {
-        Arc::new(Self { name: name.into(), params: obj_schema(), ms, mode, spans })
+        Arc::new(Self {
+            name: name.into(),
+            params: obj_schema(),
+            ms,
+            mode,
+            spans,
+        })
     }
 }
 
@@ -107,8 +118,16 @@ impl Tool for SpanTool {
             _ = tokio::time::sleep(Duration::from_millis(self.ms)) => {}
         }
         let end = Instant::now();
-        self.spans.lock().unwrap().push((self.name.clone(), start, end));
-        Ok(ToolResult { content: vec![Content::text(format!("done:{}", self.name))], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        self.spans
+            .lock()
+            .unwrap()
+            .push((self.name.clone(), start, end));
+        Ok(ToolResult {
+            content: vec![Content::text(format!("done:{}", self.name))],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -132,18 +151,30 @@ async fn a_02_1_no_tool_ordering() {
 
     let n = names(&recorder.snapshot());
     let mut i = 0;
-    assert_eq!(n[i], "agent_start"); i += 1;
-    assert_eq!(n[i], "turn_start"); i += 1;
-    assert_eq!(n[i], "message_start:user"); i += 1;
-    assert_eq!(n[i], "message_end:user"); i += 1;
-    assert_eq!(n[i], "message_start:assistant"); i += 1;
-    assert!(n[i] == "message_update:assistant", "expected >=1 update, got {}", n[i]);
+    assert_eq!(n[i], "agent_start");
+    i += 1;
+    assert_eq!(n[i], "turn_start");
+    i += 1;
+    assert_eq!(n[i], "message_start:user");
+    i += 1;
+    assert_eq!(n[i], "message_end:user");
+    i += 1;
+    assert_eq!(n[i], "message_start:assistant");
+    i += 1;
+    assert!(
+        n[i] == "message_update:assistant",
+        "expected >=1 update, got {}",
+        n[i]
+    );
     while n[i] == "message_update:assistant" {
         i += 1;
     }
-    assert_eq!(n[i], "message_end:assistant"); i += 1;
-    assert_eq!(n[i], "turn_end"); i += 1;
-    assert_eq!(n[i], "agent_end"); i += 1;
+    assert_eq!(n[i], "message_end:assistant");
+    i += 1;
+    assert_eq!(n[i], "turn_end");
+    i += 1;
+    assert_eq!(n[i], "agent_end");
+    i += 1;
     assert_eq!(i, n.len(), "no trailing events: {n:?}");
 
     // prompt() resolves to the NEW messages (user + assistant).
@@ -224,7 +255,10 @@ impl Tool for OverlapTool {
             let _ = rx.await;
         }
         let end = Instant::now();
-        self.spans.lock().unwrap().push((self.name.clone(), start, end));
+        self.spans
+            .lock()
+            .unwrap()
+            .push((self.name.clone(), start, end));
         Ok(ToolResult {
             content: vec![Content::text(format!("done:{}", self.name))],
             details: None,
@@ -269,10 +303,15 @@ async fn a_02_2_parallel_completion_vs_source_order() {
     let fast = OverlapTool::new("fast", ExecMode::Parallel, spans.clone(), barrier, None);
 
     let (_faux, sf) = faux_stream_fn(vec![faux_assistant_message(
-        vec![faux_tool_call("slow", json!({})), faux_tool_call("fast", json!({}))],
+        vec![
+            faux_tool_call("slow", json!({})),
+            faux_tool_call("fast", json!({})),
+        ],
         StopReason::ToolUse,
     )]);
-    let agent = Agent::builder(model_ref(), sf).tools(vec![slow, fast]).build();
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![slow, fast])
+        .build();
     let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(Arc::new(ReleaseOnEnd {
         after: "fast".to_string(),
@@ -299,7 +338,11 @@ async fn a_02_2_parallel_completion_vs_source_order() {
             _ => None,
         })
         .collect();
-    assert_eq!(starts, vec!["slow", "fast"], "tool_execution_start in source order");
+    assert_eq!(
+        starts,
+        vec!["slow", "fast"],
+        "tool_execution_start in source order"
+    );
 
     let ends: Vec<String> = events
         .iter()
@@ -308,19 +351,30 @@ async fn a_02_2_parallel_completion_vs_source_order() {
             _ => None,
         })
         .collect();
-    assert_eq!(ends, vec!["fast", "slow"], "tool_execution_end in completion order");
-    assert_ne!(ends, starts, "completion order provably differs from source order");
+    assert_eq!(
+        ends,
+        vec!["fast", "slow"],
+        "tool_execution_end in completion order"
+    );
+    assert_ne!(
+        ends, starts,
+        "completion order provably differs from source order"
+    );
 
     let result_msgs: Vec<String> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::MessageStart { message: AgentMessage::ToolResult(t) } => {
-                Some(t.tool_name.clone())
-            }
+            AgentEvent::MessageStart {
+                message: AgentMessage::ToolResult(t),
+            } => Some(t.tool_name.clone()),
             _ => None,
         })
         .collect();
-    assert_eq!(result_msgs, vec!["slow", "fast"], "tool-result messages in source order");
+    assert_eq!(
+        result_msgs,
+        vec!["slow", "fast"],
+        "tool-result messages in source order"
+    );
 
     let turn_end_order: Vec<String> = events
         .iter()
@@ -331,7 +385,11 @@ async fn a_02_2_parallel_completion_vs_source_order() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(turn_end_order, vec!["slow", "fast"], "turn_end.toolResults in source order");
+    assert_eq!(
+        turn_end_order,
+        vec!["slow", "fast"],
+        "turn_end.toolResults in source order"
+    );
 
     // TRUE concurrency, asserted structurally: sorted by start, the first interval must still be
     // open when the second begins. This is the dual of `a_02_3`'s `s[0].2 <= s[1].1` non-overlap
@@ -441,7 +499,10 @@ async fn a_02_3_one_sequential_forces_batch_sequential() {
     let b = SpanTool::new("b", 30, ExecMode::Parallel, spans.clone());
 
     let (_faux, sf) = faux_stream_fn(vec![faux_assistant_message(
-        vec![faux_tool_call("a", json!({})), faux_tool_call("b", json!({}))],
+        vec![
+            faux_tool_call("a", json!({})),
+            faux_tool_call("b", json!({})),
+        ],
         StopReason::ToolUse,
     )]);
     let agent = Agent::builder(model_ref(), sf).tools(vec![a, b]).build();
@@ -470,7 +531,10 @@ impl Hooks for BlockHook {
         _ctx: BeforeToolCall<'_>,
         _cancel: CancelToken,
     ) -> BeforeOutcome {
-        BeforeOutcome::Block { reason: Some("nope".into()), terminate: TerminateHint::Unspecified }
+        BeforeOutcome::Block {
+            reason: Some("nope".into()),
+            terminate: TerminateHint::Unspecified,
+        }
     }
 }
 
@@ -491,11 +555,17 @@ async fn a_02_4_before_tool_call_block() {
     agent.prompt("go").await.unwrap();
     agent.wait_for_idle().await;
 
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "blocked tool must not execute");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "blocked tool must not execute"
+    );
 
     let events = recorder.snapshot();
     let blocked = events.iter().find_map(|e| match e {
-        AgentEvent::MessageStart { message: AgentMessage::ToolResult(t) } => Some(t.clone()),
+        AgentEvent::MessageStart {
+            message: AgentMessage::ToolResult(t),
+        } => Some(t.clone()),
         _ => None,
     });
     let blocked = blocked.expect("a tool-result message");
@@ -515,12 +585,11 @@ struct DetailsHook;
 
 #[async_trait::async_trait]
 impl Hooks for DetailsHook {
-    async fn after_tool_call(
-        &self,
-        _ctx: AfterToolCall<'_>,
-        _cancel: CancelToken,
-    ) -> AfterOutcome {
-        AfterOutcome::Override(AfterOverride { details: Some(json!({ "k": "v" })), ..Default::default() })
+    async fn after_tool_call(&self, _ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
+        AfterOutcome::Override(AfterOverride {
+            details: Some(json!({ "k": "v" })),
+            ..Default::default()
+        })
     }
 }
 
@@ -528,7 +597,10 @@ impl Hooks for DetailsHook {
 async fn a_02_5_after_tool_call_details_only_replace() {
     let (echo, _calls) = EchoTool::new("echo");
     let (_faux, sf) = faux_stream_fn(vec![
-        faux_assistant_message(vec![faux_tool_call("echo", json!({ "x": 1 }))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("echo", json!({ "x": 1 }))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let agent = Agent::builder(model_ref(), sf)
@@ -545,7 +617,9 @@ async fn a_02_5_after_tool_call_details_only_replace() {
     let tr = events
         .iter()
         .find_map(|e| match e {
-            AgentEvent::MessageStart { message: AgentMessage::ToolResult(t) } => Some(t.clone()),
+            AgentEvent::MessageStart {
+                message: AgentMessage::ToolResult(t),
+            } => Some(t.clone()),
             _ => None,
         })
         .expect("tool result");
@@ -564,16 +638,15 @@ struct TerminateHook {
 
 #[async_trait::async_trait]
 impl Hooks for TerminateHook {
-    async fn after_tool_call(
-        &self,
-        ctx: AfterToolCall<'_>,
-        _cancel: CancelToken,
-    ) -> AfterOutcome {
+    async fn after_tool_call(&self, ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
         let terminate = match &self.only {
             None => true,
             Some(name) => ctx.tool_name == name,
         };
-        AfterOutcome::Override(AfterOverride { terminate: Some(TerminateHint::from_wire(Some(terminate))), ..Default::default() })
+        AfterOutcome::Override(AfterOverride {
+            terminate: Some(TerminateHint::from_wire(Some(terminate))),
+            ..Default::default()
+        })
     }
 }
 
@@ -582,7 +655,10 @@ async fn a_02_5_terminate_all_stops() {
     let (a, _) = EchoTool::new("a");
     let (b, _) = EchoTool::new("b");
     let (faux, sf) = faux_stream_fn(vec![faux_assistant_message(
-        vec![faux_tool_call("a", json!({})), faux_tool_call("b", json!({}))],
+        vec![
+            faux_tool_call("a", json!({})),
+            faux_tool_call("b", json!({})),
+        ],
         StopReason::ToolUse,
     )]);
     let agent = Agent::builder(model_ref(), sf)
@@ -595,7 +671,11 @@ async fn a_02_5_terminate_all_stops() {
     agent.prompt("go").await.unwrap();
     agent.wait_for_idle().await;
 
-    assert_eq!(count_turn_starts(&recorder.snapshot()), 1, "all-terminate stops after one turn");
+    assert_eq!(
+        count_turn_starts(&recorder.snapshot()),
+        1,
+        "all-terminate stops after one turn"
+    );
     assert_eq!(faux.call_count(), 1);
 }
 
@@ -605,14 +685,19 @@ async fn a_02_5_terminate_mixed_continues() {
     let (b, _) = EchoTool::new("b");
     let (faux, sf) = faux_stream_fn(vec![
         faux_assistant_message(
-            vec![faux_tool_call("a", json!({})), faux_tool_call("b", json!({}))],
+            vec![
+                faux_tool_call("a", json!({})),
+                faux_tool_call("b", json!({})),
+            ],
             StopReason::ToolUse,
         ),
         faux_assistant_message(vec![faux_text("more")], StopReason::Stop),
     ]);
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![a, b])
-        .hooks(Arc::new(TerminateHook { only: Some("a".into()) }))
+        .hooks(Arc::new(TerminateHook {
+            only: Some("a".into()),
+        }))
         .build();
     let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
@@ -620,7 +705,11 @@ async fn a_02_5_terminate_mixed_continues() {
     agent.prompt("go").await.unwrap();
     agent.wait_for_idle().await;
 
-    assert_eq!(count_turn_starts(&recorder.snapshot()), 2, "mixed batch continues");
+    assert_eq!(
+        count_turn_starts(&recorder.snapshot()),
+        2,
+        "mixed batch continues"
+    );
     assert_eq!(faux.call_count(), 2);
 }
 
@@ -638,9 +727,10 @@ impl EventSubscriber for SteerOnToolStart {
     async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         if let AgentEvent::ToolExecutionStart { .. } = event
             && let Some(a) = self.agent.upgrade()
-                && let Some(m) = self.msg.lock().unwrap().take() {
-                    a.steer(m);
-                }
+            && let Some(m) = self.msg.lock().unwrap().take()
+        {
+            a.steer(m);
+        }
     }
 }
 
@@ -663,15 +753,29 @@ async fn a_02_6_steering_injected_after_batch() {
     agent.wait_for_idle().await;
 
     let events = recorder.snapshot();
-    assert_eq!(count_turn_starts(&events), 2, "steering produced an additional turn");
+    assert_eq!(
+        count_turn_starts(&events),
+        2,
+        "steering produced an additional turn"
+    );
     assert_eq!(faux.call_count(), 2);
 
     // The steered user message appears in the event stream as a fresh injected message.
-    let injected = events.iter().filter(|e| matches!(
-        e,
-        AgentEvent::MessageStart { message: AgentMessage::User { .. } }
-    )).count();
-    assert_eq!(injected, 2, "original prompt + steered message both injected");
+    let injected = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageStart {
+                    message: AgentMessage::User { .. }
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        injected, 2,
+        "original prompt + steered message both injected"
+    );
 }
 
 #[tokio::test]
@@ -692,19 +796,36 @@ async fn a_02_6_follow_up_only_when_stopping() {
     agent.wait_for_idle().await;
 
     let events = recorder.snapshot();
-    assert_eq!(count_turn_starts(&events), 2, "follow-up produced a second turn");
+    assert_eq!(
+        count_turn_starts(&events),
+        2,
+        "follow-up produced a second turn"
+    );
     assert_eq!(faux.call_count(), 2);
 
     // The follow-up user message_start occurs AFTER the first turn_end.
-    let first_turn_end = events.iter().position(|e| matches!(e, AgentEvent::TurnEnd { .. })).unwrap();
+    let first_turn_end = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TurnEnd { .. }))
+        .unwrap();
     let follow_pos = events
         .iter()
         .enumerate()
-        .filter(|(_, e)| matches!(e, AgentEvent::MessageStart { message: AgentMessage::User { .. } }))
+        .filter(|(_, e)| {
+            matches!(
+                e,
+                AgentEvent::MessageStart {
+                    message: AgentMessage::User { .. }
+                }
+            )
+        })
         .map(|(i, _)| i)
         .next_back()
         .unwrap();
-    assert!(follow_pos > first_turn_end, "follow-up injected after the first turn ended");
+    assert!(
+        follow_pos > first_turn_end,
+        "follow-up injected after the first turn ended"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -766,7 +887,10 @@ async fn a_02_7_abort_closing_sequence_and_idle_settlement() {
     );
 
     let events = recorder.snapshot();
-    assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })), "ends with agent_end");
+    assert!(
+        matches!(events.last(), Some(AgentEvent::AgentEnd { .. })),
+        "ends with agent_end"
+    );
     let aborted = events.iter().any(|e| matches!(
         e,
         AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) } if a.stop_reason == StopReason::Aborted
@@ -776,7 +900,10 @@ async fn a_02_7_abort_closing_sequence_and_idle_settlement() {
         e,
         AgentEvent::TurnEnd { message: AgentMessage::Assistant(a), .. } if a.stop_reason == StopReason::Aborted
     ));
-    assert!(turn_end_aborted, "turn_end carries the aborted assistant message");
+    assert!(
+        turn_end_aborted,
+        "turn_end carries the aborted assistant message"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -812,8 +939,10 @@ async fn a_02_8_thrown_tool_is_error_and_loop_continues() {
         faux_assistant_message(vec![faux_text("recovered")], StopReason::Stop),
     ]);
     let captured = Arc::new(Mutex::new(Vec::new()));
-    let sf: Arc<dyn StreamFn> =
-        Arc::new(RecordingStreamFn { inner, captured: captured.clone() });
+    let sf: Arc<dyn StreamFn> = Arc::new(RecordingStreamFn {
+        inner,
+        captured: captured.clone(),
+    });
     let agent = Agent::builder(model_ref(), sf).tools(vec![fail]).build();
     let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
@@ -825,22 +954,31 @@ async fn a_02_8_thrown_tool_is_error_and_loop_continues() {
     let tr = events
         .iter()
         .find_map(|e| match e {
-            AgentEvent::MessageStart { message: AgentMessage::ToolResult(t) } => Some(t.clone()),
+            AgentEvent::MessageStart {
+                message: AgentMessage::ToolResult(t),
+            } => Some(t.clone()),
             _ => None,
         })
         .expect("tool result");
     assert!(tr.is_error, "thrown execute ⇒ isError result");
 
-    assert_eq!(count_turn_starts(&events), 2, "loop continues after a thrown tool");
+    assert_eq!(
+        count_turn_starts(&events),
+        2,
+        "loop continues after a thrown tool"
+    );
 
     // The model's SECOND request includes the error tool-result.
     let reqs = captured.lock().unwrap();
     assert_eq!(reqs.len(), 2);
-    let saw_error_result = reqs[1].messages.iter().any(|m| matches!(
-        m,
-        cyrup_core::Message::ToolResult { is_error: true, .. }
-    ));
-    assert!(saw_error_result, "model sees the error tool-result on the next request");
+    let saw_error_result = reqs[1]
+        .messages
+        .iter()
+        .any(|m| matches!(m, cyrup_core::Message::ToolResult { is_error: true, .. }));
+    assert!(
+        saw_error_result,
+        "model sees the error tool-result on the next request"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -849,11 +987,15 @@ async fn a_02_8_thrown_tool_is_error_and_loop_continues() {
 
 #[tokio::test]
 async fn a_02_9_custom_message_dropped_from_llm_visible_in_events() {
-    let (_faux, inner) =
-        faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let (_faux, inner) = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let captured = Arc::new(Mutex::new(Vec::new()));
-    let sf: Arc<dyn StreamFn> =
-        Arc::new(RecordingStreamFn { inner, captured: captured.clone() });
+    let sf: Arc<dyn StreamFn> = Arc::new(RecordingStreamFn {
+        inner,
+        captured: captured.clone(),
+    });
     let agent = Agent::builder(model_ref(), sf).build();
     let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
@@ -871,19 +1013,24 @@ async fn a_02_9_custom_message_dropped_from_llm_visible_in_events() {
     agent.wait_for_idle().await;
 
     let events = recorder.snapshot();
-    let custom_visible = events.iter().any(|e| matches!(
-        e,
-        AgentEvent::MessageStart { message: AgentMessage::Custom { .. } }
-    ));
+    let custom_visible = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::MessageStart {
+                message: AgentMessage::Custom { .. }
+            }
+        )
+    });
     assert!(custom_visible, "custom message appears in the event stream");
 
     let reqs = captured.lock().unwrap();
     assert_eq!(reqs.len(), 1);
     // No custom role can exist in Message; just assert the custom payload never reached the model.
-    let any_hidden = reqs[0]
-        .messages
-        .iter()
-        .any(|m| serde_json::to_string(m).map(|s| s.contains("hidden")).unwrap_or(false));
+    let any_hidden = reqs[0].messages.iter().any(|m| {
+        serde_json::to_string(m)
+            .map(|s| s.contains("hidden"))
+            .unwrap_or(false)
+    });
     assert!(!any_hidden, "custom message excluded from the LLM request");
 }
 
@@ -893,8 +1040,10 @@ async fn a_02_9_custom_message_dropped_from_llm_visible_in_events() {
 
 #[tokio::test]
 async fn a_02_10_state_copy_on_assign() {
-    let (_faux, sf) =
-        faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let (_faux, sf) = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let agent = Agent::builder(model_ref(), sf).build();
 
     let mut x = vec![AgentMessage::user_text("a")];
@@ -903,7 +1052,11 @@ async fn a_02_10_state_copy_on_assign() {
     x.push(AgentMessage::user_text("b"));
 
     let snap = agent.snapshot().await;
-    assert_eq!(snap.messages.len(), 1, "state decoupled from caller's array");
+    assert_eq!(
+        snap.messages.len(),
+        1,
+        "state decoupled from caller's array"
+    );
 
     // The snapshot is a copy too: mutating it does not change state.
     let mut snap_msgs = snap.messages.clone();
@@ -969,11 +1122,18 @@ async fn agent033_panicking_subscriber_fails_the_run_and_never_deadlocks() {
         .iter()
         .rev()
         .find_map(|e| match e {
-            AgentEvent::TurnEnd { message: AgentMessage::Assistant(a), .. } => Some(a.clone()),
+            AgentEvent::TurnEnd {
+                message: AgentMessage::Assistant(a),
+                ..
+            } => Some(a.clone()),
             _ => None,
         })
         .expect("a turn_end carrying the failure assistant");
-    assert_eq!(failure.stop_reason, StopReason::Error, "not cancelled ⇒ `error`, not `aborted`");
+    assert_eq!(
+        failure.stop_reason,
+        StopReason::Error,
+        "not cancelled ⇒ `error`, not `aborted`"
+    );
     assert_eq!(
         failure.error_message.as_deref(),
         Some("subscriber boom"),
@@ -1012,16 +1172,23 @@ impl ApiKeyResolver for KeyResolver {
 
 #[tokio::test]
 async fn run_active_guard_and_continue_validation() {
-    let (_faux, sf) =
-        faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
-    let agent = Agent::builder(model_ref(), sf).key_resolver(Arc::new(KeyResolver)).build();
+    let (_faux, sf) = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
+    let agent = Agent::builder(model_ref(), sf)
+        .key_resolver(Arc::new(KeyResolver))
+        .build();
 
     // continue with no messages => error
     // AGENT-034 — pi's `Agent.continue()` throws the literal `"No messages to continue from"`
     // (`packages/agent/src/agent.ts:357` @v0.83.0, `:368` @v0.84.1), which is NOT the string the
     // low-level `agentLoopContinue` uses for the same condition.
     let no_msgs = agent.continue_run().await;
-    assert!(matches!(no_msgs, Err(crate::AgentError::NoMessages(crate::ContinueSurface::Agent))));
+    assert!(matches!(
+        no_msgs,
+        Err(crate::AgentError::NoMessages(crate::ContinueSurface::Agent))
+    ));
     assert_eq!(
         no_msgs.err().map(|e| e.to_string()).unwrap_or_default(),
         "No messages to continue from"
@@ -1051,7 +1218,11 @@ impl TripwireTool {
     fn new(name: &str) -> (Arc<Self>, Arc<AtomicBool>) {
         let executed = Arc::new(AtomicBool::new(false));
         (
-            Arc::new(Self { name: name.into(), params: obj_schema(), executed: executed.clone() }),
+            Arc::new(Self {
+                name: name.into(),
+                params: obj_schema(),
+                executed: executed.clone(),
+            }),
             executed,
         )
     }
@@ -1073,7 +1244,12 @@ impl Tool for TripwireTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.executed.store(true, Ordering::SeqCst);
-        Ok(ToolResult { content: vec![Content::text("ran")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("ran")],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -1083,7 +1259,10 @@ async fn agent_001_length_stop_fails_tool_batch_without_executing() {
     let (_faux, sf) = faux_stream_fn(vec![
         // Turn 1: truncated by the output token limit, but still carrying a tool call.
         faux_assistant_message(
-            vec![faux_tool_call("danger", json!({ "command": "rm -rf /tmp/build" }))],
+            vec![faux_tool_call(
+                "danger",
+                json!({ "command": "rm -rf /tmp/build" }),
+            )],
             StopReason::Length,
         ),
         // Turn 2: the model gets its chance to re-issue; end cleanly.
@@ -1098,7 +1277,10 @@ async fn agent_001_length_stop_fails_tool_batch_without_executing() {
     agent.wait_for_idle().await;
 
     // 1. The tool was NEVER executed.
-    assert!(!executed.load(Ordering::SeqCst), "truncated tool call must not be executed");
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "truncated tool call must not be executed"
+    );
 
     let events = recorder.snapshot();
 
@@ -1107,14 +1289,28 @@ async fn agent_001_length_stop_fails_tool_batch_without_executing() {
         .iter()
         .filter(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }))
         .collect();
-    assert_eq!(starts.len(), 1, "exactly one tool_execution_start: {:?}", names(&events));
+    assert_eq!(
+        starts.len(),
+        1,
+        "exactly one tool_execution_start: {:?}",
+        names(&events)
+    );
     let ends: Vec<&AgentEvent> = events
         .iter()
         .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
         .collect();
-    assert_eq!(ends.len(), 1, "exactly one tool_execution_end: {:?}", names(&events));
+    assert_eq!(
+        ends.len(),
+        1,
+        "exactly one tool_execution_end: {:?}",
+        names(&events)
+    );
     match ends[0] {
-        AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } => {
+        AgentEvent::ToolExecutionEnd {
+            tool_name,
+            is_error,
+            ..
+        } => {
             assert_eq!(tool_name, "danger");
             assert!(*is_error, "truncated batch end must be isError");
         }
@@ -1142,7 +1338,9 @@ async fn agent_001_length_stop_fails_tool_batch_without_executing() {
     let result_msg = events
         .iter()
         .find_map(|e| match e {
-            AgentEvent::MessageEnd { message: AgentMessage::ToolResult(m) } => Some(m.clone()),
+            AgentEvent::MessageEnd {
+                message: AgentMessage::ToolResult(m),
+            } => Some(m.clone()),
             _ => None,
         })
         .expect("a tool-result message_end");
@@ -1154,7 +1352,11 @@ async fn agent_001_length_stop_fails_tool_batch_without_executing() {
     assert_eq!(text, expected, "must match Pi's message byte-for-byte");
 
     // 5. The batch did NOT terminate — the loop ran a second turn so the model can re-issue.
-    assert_eq!(count_turn_starts(&events), 2, "loop must continue after a truncated batch: {n:?}");
+    assert_eq!(
+        count_turn_starts(&events),
+        2,
+        "loop must continue after a truncated batch: {n:?}"
+    );
     assert_eq!(n.last().map(String::as_str), Some("agent_end"));
 }
 
@@ -1181,7 +1383,12 @@ impl RendezvousTool {
         log: Arc<Mutex<Vec<String>>>,
         rendezvous: Arc<tokio::sync::Barrier>,
     ) -> Arc<Self> {
-        Arc::new(Self { name: name.into(), params: obj_schema(), log, rendezvous })
+        Arc::new(Self {
+            name: name.into(),
+            params: obj_schema(),
+            log,
+            rendezvous,
+        })
     }
 }
 
@@ -1200,12 +1407,26 @@ impl Tool for RendezvousTool {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        self.log.lock().unwrap().push(format!("exec_start:{}", self.name));
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("exec_start:{}", self.name));
         // Both bodies must be in flight at the same time for this to release.
-        if tokio::time::timeout(Duration::from_secs(5), self.rendezvous.wait()).await.is_ok() {
-            self.log.lock().unwrap().push(format!("rendezvous:{}", self.name));
+        if tokio::time::timeout(Duration::from_secs(5), self.rendezvous.wait())
+            .await
+            .is_ok()
+        {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("rendezvous:{}", self.name));
         }
-        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("ok")],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -1243,7 +1464,10 @@ async fn agent_002_parallel_defers_execution_until_whole_batch_is_prepared() {
 
     let (_faux, sf) = faux_stream_fn(vec![
         faux_assistant_message(
-            vec![faux_tool_call("first", json!({})), faux_tool_call("second", json!({}))],
+            vec![
+                faux_tool_call("first", json!({})),
+                faux_tool_call("second", json!({})),
+            ],
             StopReason::ToolUse,
         ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
@@ -1262,7 +1486,9 @@ async fn agent_002_parallel_defers_execution_until_whole_batch_is_prepared() {
 
     let seen = log.lock().unwrap().clone();
     let pos = |needle: &str| {
-        seen.iter().position(|s| s == needle).unwrap_or_else(|| panic!("missing {needle}: {seen:?}"))
+        seen.iter()
+            .position(|s| s == needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {seen:?}"))
     };
 
     // The gate for call #2 must close BEFORE call #1's body starts.
@@ -1334,7 +1560,11 @@ impl Tool for GateTool {
     }
 }
 
-fn gate_tool() -> (Arc<GateTool>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+fn gate_tool() -> (
+    Arc<GateTool>,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+) {
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     (
@@ -1366,7 +1596,10 @@ async fn agent020_rejected_continue_keeps_the_steering_message() {
     agent.steer(AgentMessage::user_text("keep-me"));
     let rejected = agent.continue_run().await;
     assert!(
-        matches!(rejected, Err(crate::AgentError::RunActive(crate::BusyEntry::Continue))),
+        matches!(
+            rejected,
+            Err(crate::AgentError::RunActive(crate::BusyEntry::Continue))
+        ),
         "a continuation during an active run is refused, as pi throws at agent.ts:351-353"
     );
     // AGENT-034 — and it is `continue()`'s OWN message, not the latch's or `prompt()`'s.
@@ -1385,7 +1618,10 @@ async fn agent020_rejected_continue_keeps_the_steering_message() {
     let _ = handle.finished().await;
     agent.wait_for_idle().await;
     // ...and because it survived, the running loop still delivers it.
-    assert!(!agent.has_queued_messages(), "the surviving message was delivered by the loop");
+    assert!(
+        !agent.has_queued_messages(),
+        "the surviving message was delivered by the loop"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1404,7 +1640,10 @@ async fn agent020_rejected_continue_keeps_the_follow_up_message() {
     // (pi `followUpQueue.drain()`, agent.ts:367).
     agent.follow_up(AgentMessage::user_text("keep-me-too"));
     let rejected = agent.continue_run().await;
-    assert!(matches!(rejected, Err(crate::AgentError::RunActive(crate::BusyEntry::Continue))));
+    assert!(matches!(
+        rejected,
+        Err(crate::AgentError::RunActive(crate::BusyEntry::Continue))
+    ));
     assert!(
         agent.has_queued_messages(),
         "a REFUSED continuation must leave the follow-up queue intact too"
@@ -1436,7 +1675,10 @@ struct PanicTool {
 
 impl PanicTool {
     fn new(name: &str) -> Arc<Self> {
-        Arc::new(Self { name: name.into(), params: obj_schema() })
+        Arc::new(Self {
+            name: name.into(),
+            params: obj_schema(),
+        })
     }
 }
 
@@ -1463,7 +1705,10 @@ async fn agent016_batch(execution: ToolExecution) {
     let (echo, _) = EchoTool::new("ok");
     let (_faux, sf) = faux_stream_fn(vec![
         faux_assistant_message(
-            vec![faux_tool_call("boom", json!({})), faux_tool_call("ok", json!({}))],
+            vec![
+                faux_tool_call("boom", json!({})),
+                faux_tool_call("ok", json!({})),
+            ],
             StopReason::ToolUse,
         ),
         faux_assistant_message(vec![faux_text("after")], StopReason::Stop),
@@ -1482,16 +1727,28 @@ async fn agent016_batch(execution: ToolExecution) {
     let ends: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::ToolExecutionEnd { tool_name, result, is_error, .. } => {
-                Some((tool_name.clone(), result.clone(), *is_error))
-            }
+            AgentEvent::ToolExecutionEnd {
+                tool_name,
+                result,
+                is_error,
+                ..
+            } => Some((tool_name.clone(), result.clone(), *is_error)),
             _ => None,
         })
         .collect();
-    assert_eq!(ends.len(), 2, "both calls in the batch report a tool_execution_end: {ends:?}");
-    let (_, boom_result, boom_is_error) =
-        ends.iter().find(|(n, _, _)| n == "boom").expect("the panicking call reported an end");
-    assert!(*boom_is_error, "a panicking tool is an ERROR result, as pi's catch produces");
+    assert_eq!(
+        ends.len(),
+        2,
+        "both calls in the batch report a tool_execution_end: {ends:?}"
+    );
+    let (_, boom_result, boom_is_error) = ends
+        .iter()
+        .find(|(n, _, _)| n == "boom")
+        .expect("the panicking call reported an end");
+    assert!(
+        *boom_is_error,
+        "a panicking tool is an ERROR result, as pi's catch produces"
+    );
     assert!(
         boom_result.to_string().contains("boom-42"),
         "the panic payload becomes the error text (pi surfaces the thrown message): {boom_result}"
@@ -1500,9 +1757,19 @@ async fn agent016_batch(execution: ToolExecution) {
     // The invariant that actually breaks the conversation: one tool_result message per tool_use.
     let tool_result_ends = events
         .iter()
-        .filter(|e| matches!(e, AgentEvent::MessageEnd { message: AgentMessage::ToolResult(_) }))
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageEnd {
+                    message: AgentMessage::ToolResult(_)
+                }
+            )
+        })
         .count();
-    assert_eq!(tool_result_ends, 2, "two tool_use blocks ⇒ two tool_result messages");
+    assert_eq!(
+        tool_result_ends, 2,
+        "two tool_use blocks ⇒ two tool_result messages"
+    );
     let turn_end_results = events
         .iter()
         .find_map(|e| match e {
@@ -1543,7 +1810,11 @@ struct DeclaringTool {
 
 impl DeclaringTool {
     fn new(name: &str, declared: Option<cyrup_core::ConstrainedSampling>) -> Arc<Self> {
-        Arc::new(Self { name: name.into(), params: obj_schema(), declared })
+        Arc::new(Self {
+            name: name.into(),
+            params: obj_schema(),
+            declared,
+        })
     }
 }
 
@@ -1597,10 +1868,15 @@ async fn prov011_a_tools_constrained_sampling_declaration_reaches_the_provider()
     // indistinguishable from stamping a constant onto every tool.
     let silent = DeclaringTool::new("silent", None);
 
-    let (_faux, inner) =
-        faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let (_faux, inner) = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let captured = Arc::new(Mutex::new(Vec::new()));
-    let sf: Arc<dyn StreamFn> = Arc::new(RecordingStreamFn { inner, captured: captured.clone() });
+    let sf: Arc<dyn StreamFn> = Arc::new(RecordingStreamFn {
+        inner,
+        captured: captured.clone(),
+    });
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![opting, opting_out, silent])
         .build();
@@ -1615,7 +1891,10 @@ async fn prov011_a_tools_constrained_sampling_declaration_reaches_the_provider()
     // `is_none()` assertion below would pass vacuously.
     assert_eq!(tools.len(), 3, "all three tools reached the request");
     let find = |n: &str| {
-        tools.iter().find(|t| t.name == n).unwrap_or_else(|| panic!("tool {n} in Context.tools"))
+        tools
+            .iter()
+            .find(|t| t.name == n)
+            .unwrap_or_else(|| panic!("tool {n} in Context.tools"))
     };
 
     assert_eq!(

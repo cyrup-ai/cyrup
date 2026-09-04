@@ -12,19 +12,24 @@
 //! them, because trust was frozen in builder step 1 while the `ExtensionHost` was not built until
 //! step 4b. These tests assert on the ASSEMBLED SESSION's trust, and on whether the handler ran at
 //! all — never on a registration returning `Ok`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::{SessionBuilder, SessionConfig};
 use cyrup_core::ExtensionId;
 use cyrup_ext::{
     EventKind, ExtError, HandledValue, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
 };
-use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
-use crate::{SessionBuilder, SessionConfig};
+use cyrup_provider::faux::FauxProvider;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -40,7 +45,10 @@ struct TrustVoter {
 }
 
 impl TrustVoter {
-    fn new(verdict: &'static str, remember: bool) -> (Arc<Self>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    fn new(
+        verdict: &'static str,
+        remember: bool,
+    ) -> (Arc<Self>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let asked = Arc::new(AtomicUsize::new(0));
         let inits = Arc::new(AtomicUsize::new(0));
         let v = Arc::new(TrustVoter {
@@ -94,7 +102,11 @@ fn fixture_with_trust_requiring_resources() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(cwd.join(".cyrup/skills")).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn fixture_bare() -> Fixture {
@@ -103,7 +115,11 @@ fn fixture_bare() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 async fn build_with(
@@ -131,11 +147,19 @@ async fn an_extension_can_deny_project_trust() {
 
     let session = build_with(&fx, None, voter).await;
 
-    assert_eq!(asked.load(Ordering::Acquire), 1, "the project_trust handler was actually asked");
+    assert_eq!(
+        asked.load(Ordering::Acquire),
+        1,
+        "the project_trust handler was actually asked"
+    );
     // The bootstrap pass and the real load are two DIFFERENT hosts, but the same `Arc`, so `init`
     // runs twice — the hazard `decides_project_trust` exists to make opt-in. Pinned here so the
     // cost is visible to anyone who overrides it.
-    assert_eq!(inits.load(Ordering::Acquire), 2, "an opted-in native pays a second `init`");
+    assert_eq!(
+        inits.load(Ordering::Acquire),
+        2,
+        "an opted-in native pays a second `init`"
+    );
     assert!(
         !session.services().settings.project_trusted(),
         "the extension's `no` verdict decided the assembled session's trust"
@@ -173,8 +197,15 @@ async fn an_explicit_trust_override_never_asks_the_extensions() {
         0,
         "an explicit --approve must not consult the extensions"
     );
-    assert_eq!(inits.load(Ordering::Acquire), 1, "and pays no second `init`");
-    assert!(session.services().settings.project_trusted(), "--approve wins");
+    assert_eq!(
+        inits.load(Ordering::Acquire),
+        1,
+        "and pays no second `init`"
+    );
+    assert!(
+        session.services().settings.project_trusted(),
+        "--approve wins"
+    );
 }
 
 /// The other half of the guard: a cwd with nothing to gate is trusted without asking anyone.
@@ -190,7 +221,11 @@ async fn a_project_with_nothing_to_gate_never_asks_the_extensions() {
         0,
         "no trust-requiring resources => no extension pass (Pi main.ts:676-678)"
     );
-    assert_eq!(inits.load(Ordering::Acquire), 1, "and pays no second `init`");
+    assert_eq!(
+        inits.load(Ordering::Acquire),
+        1,
+        "and pays no second `init`"
+    );
     assert!(session.services().settings.project_trusted());
 }
 
@@ -288,8 +323,16 @@ async fn an_opted_out_native_does_not_suppress_an_opted_in_voter() {
         .await
         .unwrap();
 
-    assert_eq!(inits.load(Ordering::Acquire), 1, "the bystander was still initialized once");
-    assert_eq!(asked.load(Ordering::Acquire), 1, "the opted-in voter was still asked");
+    assert_eq!(
+        inits.load(Ordering::Acquire),
+        1,
+        "the bystander was still initialized once"
+    );
+    assert_eq!(
+        asked.load(Ordering::Acquire),
+        1,
+        "the opted-in voter was still asked"
+    );
     assert!(
         !session.services().settings.project_trusted(),
         "and its verdict still decided the session's trust"
@@ -337,7 +380,11 @@ async fn an_extension_verdict_pre_empts_the_prompt_entirely() {
         .await
         .unwrap();
 
-    assert_eq!(asked.load(Ordering::Acquire), 1, "the extension was consulted");
+    assert_eq!(
+        asked.load(Ordering::Acquire),
+        1,
+        "the extension was consulted"
+    );
     assert_eq!(
         prompted.load(Ordering::Acquire),
         0,
@@ -358,7 +405,8 @@ async fn an_extension_verdict_pre_empts_the_prompt_entirely() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn with_no_extension_verdict_the_prompt_runs_and_decides() {
     let fx = fixture_with_trust_requiring_resources();
-    let seen_labels: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_labels: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = seen_labels.clone();
 
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
@@ -380,7 +428,9 @@ async fn with_no_extension_verdict_the_prompt_runs_and_decides() {
     let labels = seen_labels.lock().unwrap().clone();
     assert!(
         labels.iter().any(|l| l == "Trust (this session only)")
-            && labels.iter().any(|l| l == "Do not trust (this session only)"),
+            && labels
+                .iter()
+                .any(|l| l == "Do not trust (this session only)"),
         "the pre-launch option set is `includeSessionOnly: true` (project-trust.ts:32) — SEAM-064: \
          {labels:?}"
     );

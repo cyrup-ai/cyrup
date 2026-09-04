@@ -8,9 +8,8 @@
 use crate::error::HookError;
 use crate::event::{AgentMessage, ToolResultMessage};
 use cyrup_core::{
-    TerminateHint,
-    AssistantMessage, CancelToken, Content, Message, ModelRef, ModelThinkingLevel, Tool, ToolCall,
-    ToolCallId, Usage,
+    AssistantMessage, CancelToken, Content, Message, ModelRef, ModelThinkingLevel, TerminateHint,
+    Tool, ToolCall, ToolCallId, Usage,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -208,9 +207,10 @@ impl std::fmt::Debug for TurnUpdate {
 pub fn default_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Message> {
     msgs.iter()
         .filter_map(|m| match m.as_ref() {
-            AgentMessage::User { content, timestamp } => {
-                Some(Message::User { content: content.clone(), timestamp: timestamp.unwrap_or(0) })
-            }
+            AgentMessage::User { content, timestamp } => Some(Message::User {
+                content: content.clone(),
+                timestamp: timestamp.unwrap_or(0),
+            }),
             AgentMessage::Assistant(a) => Some(Message::Assistant((**a).clone())),
             AgentMessage::ToolResult(t) => Some(Message::ToolResult {
                 tool_call_id: t.tool_call_id.clone(),
@@ -257,7 +257,11 @@ pub trait Hooks: Send + Sync {
 
     /// After validation, before execute (func-02 R-02-021). Cannot abort the run — every outcome,
     /// [`BeforeOutcome::Failed`] included, is a per-call result (func-02 R-02-050).
-    async fn before_tool_call(&self, _ctx: BeforeToolCall<'_>, _cancel: CancelToken) -> BeforeOutcome {
+    async fn before_tool_call(
+        &self,
+        _ctx: BeforeToolCall<'_>,
+        _cancel: CancelToken,
+    ) -> BeforeOutcome {
         BeforeOutcome::Proceed
     }
 

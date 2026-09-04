@@ -4,7 +4,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cyrup_core::{ApiId, AssistantMessage, Content, Cost, ProviderId, StopReason, ToolCall, ToolCallId, Usage};
+use cyrup_core::{
+    ApiId, AssistantMessage, Content, Cost, ProviderId, StopReason, ToolCall, ToolCallId, Usage,
+};
 use cyrup_provider::faux::FauxModelDefinition;
 use cyrup_provider::{Modality, Model, ModelCost};
 
@@ -42,7 +44,10 @@ pub fn faux_model() -> Model {
 /// drive a small window through the harness while keeping every other field identical to
 /// [`faux_model`].
 pub fn faux_model_with_context_window(context_window: u64) -> Model {
-    Model { context_window, ..faux_model() }
+    Model {
+        context_window,
+        ..faux_model()
+    }
 }
 
 /// Map a declarative [`FauxModelDefinition`] (Pi `models?: FauxModelDefinition[]`,
@@ -80,7 +85,11 @@ pub struct FauxToolCall {
 
 impl FauxToolCall {
     pub fn new(name: impl Into<String>, args: serde_json::Value) -> Self {
-        Self { id: None, name: name.into(), args }
+        Self {
+            id: None,
+            name: name.into(),
+            args,
+        }
     }
 }
 
@@ -129,17 +138,26 @@ pub struct FauxResponse {
 impl FauxResponse {
     /// A text-only response (shorthand).
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: Some(s.into()), ..Default::default() }
+        Self {
+            text: Some(s.into()),
+            ..Default::default()
+        }
     }
 
     /// A response with a single tool call.
     pub fn tool_call(name: impl Into<String>, args: serde_json::Value) -> Self {
-        Self { tool_calls: vec![FauxToolCall::new(name, args)], ..Default::default() }
+        Self {
+            tool_calls: vec![FauxToolCall::new(name, args)],
+            ..Default::default()
+        }
     }
 
     /// An error response.
     pub fn error(message: impl Into<String>) -> Self {
-        Self { error: Some(message.into()), ..Default::default() }
+        Self {
+            error: Some(message.into()),
+            ..Default::default()
+        }
     }
 }
 
@@ -169,7 +187,9 @@ pub fn build_usage(partial: Option<&UsageOverride>) -> Usage {
         cache_write,
         cache_write_1h: None,
         reasoning: None,
-        total_tokens: p.total_tokens.unwrap_or(input + output + cache_read + cache_write),
+        total_tokens: p
+            .total_tokens
+            .unwrap_or(input + output + cache_read + cache_write),
         cost: Cost::default(),
     }
 }

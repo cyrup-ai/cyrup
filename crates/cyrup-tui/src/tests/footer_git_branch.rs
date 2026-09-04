@@ -11,13 +11,18 @@
 //! These tests drive the **assembled `App`** through the same call the binary's `seed_footer` makes
 //! (`App::set_footer_git_cwd`, `crates/cyrup/src/main.rs`) and assert on the rendered footer, plus
 //! the live-refresh path (`App::poll_footer_git_branch`) the run loop's poll tick drives.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::Path;
 
+use super::harness::*;
 use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 /// A temp dir that deletes itself when dropped, derefing to [`Path`] so it is still used
 /// directly as one. The guard MUST stay bound for the whole test.
@@ -84,7 +89,10 @@ fn a_cwd_outside_any_repo_renders_no_branch_segment() {
     app.draw().unwrap();
 
     let live = live_text(&app);
-    assert!(live.contains("~/src/cyrup"), "footer location line missing entirely:\n{live}");
+    assert!(
+        live.contains("~/src/cyrup"),
+        "footer location line missing entirely:\n{live}"
+    );
     assert!(
         !live.contains("~/src/cyrup ("),
         "a non-repo cwd invented a branch segment:\n{live}"
@@ -104,8 +112,14 @@ fn a_detached_head_renders_the_word_detached() {
     app.draw().unwrap();
 
     let live = live_text(&app);
-    assert!(live.contains("~/w (detached)"), "detached HEAD not shown:\n{live}");
-    assert!(!live.contains("9f8c1a2b"), "raw sha leaked into the footer:\n{live}");
+    assert!(
+        live.contains("~/w (detached)"),
+        "detached HEAD not shown:\n{live}"
+    );
+    assert!(
+        !live.contains("9f8c1a2b"),
+        "raw sha leaked into the footer:\n{live}"
+    );
 }
 
 /// The live-refresh half: a `git checkout` in another terminal repaints the footer. This is the body
@@ -120,16 +134,31 @@ fn a_branch_change_on_disk_is_picked_up_by_the_poll() {
     app.status_mut().set_cwd("~/w");
     app.set_footer_git_cwd(&repo);
     app.draw().unwrap();
-    assert!(live_text(&app).contains("~/w (main)"), "initial branch missing");
+    assert!(
+        live_text(&app).contains("~/w (main)"),
+        "initial branch missing"
+    );
 
     // Nothing moved ⇒ the loop must NOT redraw (Pi repaints only inside
     // `if (this.cachedBranch !== nextBranch)`).
-    assert!(!app.poll_footer_git_branch(), "an unchanged repo asked for a repaint");
+    assert!(
+        !app.poll_footer_git_branch(),
+        "an unchanged repo asked for a repaint"
+    );
 
     write_head(&repo, "ref: refs/heads/feature/x\n");
-    assert!(app.poll_footer_git_branch(), "a real checkout did not ask for a repaint");
+    assert!(
+        app.poll_footer_git_branch(),
+        "a real checkout did not ask for a repaint"
+    );
     app.draw().unwrap();
     let live = live_text(&app);
-    assert!(live.contains("~/w (feature/x)"), "footer kept the stale branch:\n{live}");
-    assert!(!live.contains("(main)"), "stale branch still rendered:\n{live}");
+    assert!(
+        live.contains("~/w (feature/x)"),
+        "footer kept the stale branch:\n{live}"
+    );
+    assert!(
+        !live.contains("(main)"),
+        "stale branch still rendered:\n{live}"
+    );
 }

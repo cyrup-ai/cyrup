@@ -144,7 +144,10 @@ pub trait Provider: Send + Sync {
     /// `:297-303`). Before this the method took nothing, so `allowNetwork`, `force` and the abort
     /// signal could not reach an implementation at all. An implementation that performs network I/O
     /// **must** honour all three; see [`RefreshModelsContext`].
-    async fn refresh_models(&self, _ctx: &RefreshModelsContext) -> Option<Result<(), ProviderError>> {
+    async fn refresh_models(
+        &self,
+        _ctx: &RefreshModelsContext,
+    ) -> Option<Result<(), ProviderError>> {
         None
     }
 

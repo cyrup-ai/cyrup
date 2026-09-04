@@ -15,19 +15,21 @@
 //!
 //! Gated on the `test-fixtures` Cargo feature, matching every sibling integration test here.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::PathBuf;
 
-
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::artifacts::project_artifacts_dir;
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::SpawnCommand;
-
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -76,7 +78,9 @@ fn tool_result_text(result: &cyrup_core::ToolResult) -> String {
 
 /// Every file under `dir`, recursively, as absolute paths.
 fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -96,7 +100,6 @@ fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 /// with `subagent SINGLE mode does not yet support the following param(s): output, outputMode`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_mode_output_and_output_mode_write_a_file_and_return_a_concise_reference() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
     let home_dir = tempfile::tempdir().expect("real tempdir to isolate CYRUP_HOME artifacts");
     write_fixture_persona(work_dir.path(), "worker");
@@ -164,7 +167,11 @@ async fn single_mode_output_and_output_mode_write_a_file_and_return_a_concise_re
     let report = files
         .iter()
         .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("report.md"))
-        .unwrap_or_else(|| panic!("report.md must exist somewhere under the run's output base dir; found: {files:?}"));
+        .unwrap_or_else(|| {
+            panic!(
+                "report.md must exist somewhere under the run's output base dir; found: {files:?}"
+            )
+        });
     let written = std::fs::read_to_string(report).expect("read report.md");
     assert!(
         written.contains(CHILD_OUTPUT),
@@ -204,7 +211,6 @@ async fn single_mode_output_and_output_mode_write_a_file_and_return_a_concise_re
 /// param being accepted and ignored.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_mode_output_without_file_only_still_inlines_the_full_output() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let home_dir = tempfile::tempdir().expect("real tempdir for CYRUP_HOME");
     write_fixture_persona(work_dir.path(), "worker");
@@ -458,12 +464,8 @@ async fn an_agent_async_default_backgrounds_a_call_that_omits_async() {
     );
 
     // ... and an EXPLICIT `async: false` at the call site beats the agent's `true`.
-    let foreground = run_single_with(
-        "async: true\n",
-        serde_json::json!({ "async": false }),
-        50,
-    )
-    .await;
+    let foreground =
+        run_single_with("async: true\n", serde_json::json!({ "async": false }), 50).await;
     assert!(
         foreground.contains("G98_CHILD_FINISHED"),
         "an explicit `async: false` must override the agent default, got: {foreground:?}"
@@ -527,7 +529,9 @@ async fn run_slash_run_with(extra_frontmatter: &str, sleep_ms: u64) -> String {
         work_dir.path().to_path_buf(),
     );
     let ctx = HostCtx::command(ExtMode::Tui, false, work_dir.path().to_path_buf());
-    let result = extension.execute_command("run", "slowpoke answer slowly", &ctx).await;
+    let result = extension
+        .execute_command("run", "slowpoke answer slowly", &ctx)
+        .await;
 
     match result {
         Ok(Some(text)) => text,

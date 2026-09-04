@@ -39,8 +39,8 @@ fn sdk_api_rs() -> PathBuf {
 #[test]
 fn every_sdk_kind_const_names_the_host_event_kind_with_that_discriminant() {
     let path = sdk_api_rs();
-    let src = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let body = src
         .split_once("\nmod kind {\n")
         .and_then(|(_, rest)| rest.split_once("\n}\n"))
@@ -50,8 +50,10 @@ fn every_sdk_kind_const_names_the_host_event_kind_with_that_discriminant() {
     let mut wrong: Vec<String> = Vec::new();
     let mut checked = 0usize;
     for line in body.lines() {
-        let Some((name, value)) =
-            line.trim().strip_prefix("pub const ").and_then(|rest| rest.split_once(": u8 = "))
+        let Some((name, value)) = line
+            .trim()
+            .strip_prefix("pub const ")
+            .and_then(|rest| rest.split_once(": u8 = "))
         else {
             continue;
         };

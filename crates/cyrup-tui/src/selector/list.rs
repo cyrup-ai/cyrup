@@ -93,7 +93,11 @@ impl ListSelector {
     /// Continue/Cancel-style selector the bin mounts before the agent runtime is built (e.g. the
     /// missing-session-cwd prompt). Rows are `(value, label, description)`; confirming yields the
     /// highlighted row's value. `selected` preselects a row; `maxVisible` is the row count.
-    pub fn prompt(title: String, rows: Vec<(String, String, Option<String>)>, selected: usize) -> Self {
+    pub fn prompt(
+        title: String,
+        rows: Vec<(String, String, Option<String>)>,
+        selected: usize,
+    ) -> Self {
         let count = rows.len().clamp(1, u16::MAX as usize) as u16;
         let mut selector = ListSelector::new(rows, count, selected, false);
         selector.title = Some(title);
@@ -192,7 +196,10 @@ impl ListSelector {
 
     /// The value of the currently-highlighted row (empty string if the list is empty — never panics).
     fn current_value(&self) -> String {
-        self.values.get(self.list.selected()).cloned().unwrap_or_default()
+        self.values
+            .get(self.list.selected())
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Read-only access to the inner list (tests / chrome inspection).
@@ -206,8 +213,16 @@ impl ListSelector {
     /// `Yes` when currently on, else `No`.
     pub fn show_images(current: bool) -> Self {
         let rows = vec![
-            ("yes".to_string(), "Yes".to_string(), Some("Show images inline in terminal".to_string())),
-            ("no".to_string(), "No".to_string(), Some("Show text placeholder instead".to_string())),
+            (
+                "yes".to_string(),
+                "Yes".to_string(),
+                Some("Show images inline in terminal".to_string()),
+            ),
+            (
+                "no".to_string(),
+                "No".to_string(),
+                Some("Show text placeholder instead".to_string()),
+            ),
         ];
         let selected = if current { 0 } else { 1 };
         ListSelector::new(rows, 5, selected, false)
@@ -237,7 +252,10 @@ impl Selector for ListSelector {
         // Top `DynamicBorder` + optional (now auto-sizing, wrapped) title + list body + the hint row
         // **when this kind draws one** + bottom `DynamicBorder` (spec/tui/05 §3;
         // `extension-selector.ts:44-75`).
-        let title_h = self.title.as_deref().map_or(0, |t| title_wrapped_height(t, width));
+        let title_h = self
+            .title
+            .as_deref()
+            .map_or(0, |t| title_wrapped_height(t, width));
         let hint_h = u16::from(self.hints);
         self.list
             .rendered_height()
@@ -248,7 +266,10 @@ impl Selector for ListSelector {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let title_h = self.title.as_deref().map_or(0, |t| title_wrapped_height(t, area.width));
+        let title_h = self
+            .title
+            .as_deref()
+            .map_or(0, |t| title_wrapped_height(t, area.width));
         let hint_h = u16::from(self.hints);
         // L4/SYS-3. The envelope row order is `ExtensionSelectorComponent`'s, counted from its
         // constructor (`extension-selector.ts:44-75`): `DynamicBorder`(:44) · `Spacer`(:45) ·
@@ -272,11 +293,23 @@ impl Selector for ListSelector {
         let body_h = self.list.rendered_height();
         let [top, _, title_area, _, body, _, hint, _, bottom] = stack_rows(
             area,
-            [1, sp, title_h, sp, body_h, sp_before_hint, hint_h, sp_after_hint, 1],
+            [
+                1,
+                sp,
+                title_h,
+                sp,
+                body_h,
+                sp_before_hint,
+                hint_h,
+                sp_after_hint,
+                1,
+            ],
         );
         frame.render_widget(border_rule(top.width, theme), top);
         if let Some(title) = &self.title {
-            let style = theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD);
+            let style = theme
+                .accent_style()
+                .add_modifier(ratatui::style::Modifier::BOLD);
             frame.render_widget(
                 Paragraph::new(title_lines(title))
                     .style(style)

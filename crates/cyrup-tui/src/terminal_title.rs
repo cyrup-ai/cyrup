@@ -39,7 +39,10 @@ pub const APP_TITLE: &str = "cyrup";
 /// Lossy UTF-8 for a non-UTF-8 component: the title is a display string, and the OSC writer strips
 /// control characters anyway ([`crate::app::write_terminal_title`]).
 pub fn session_terminal_title(session_name: Option<&str>, cwd: &Path) -> String {
-    let base = cwd.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let base = cwd
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     match session_name.filter(|n| !n.is_empty()) {
         Some(name) => format!("{APP_TITLE} - {name} - {base}"),
         None => format!("{APP_TITLE} - {base}"),
@@ -48,7 +51,12 @@ pub fn session_terminal_title(session_name: Option<&str>, cwd: &Path) -> String 
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use std::path::PathBuf;
 
     use super::*;
@@ -72,8 +80,14 @@ mod tests {
     #[test]
     fn basename_follows_node_semantics() {
         // Trailing separator is ignored, and a root path has no final component (Node: `""`).
-        assert_eq!(session_terminal_title(None, &PathBuf::from("/a/b/")), "cyrup - b");
-        assert_eq!(session_terminal_title(None, &PathBuf::from("/")), "cyrup - ");
+        assert_eq!(
+            session_terminal_title(None, &PathBuf::from("/a/b/")),
+            "cyrup - b"
+        );
+        assert_eq!(
+            session_terminal_title(None, &PathBuf::from("/")),
+            "cyrup - "
+        );
         assert_eq!(session_terminal_title(None, &PathBuf::from("")), "cyrup - ");
     }
 }

@@ -31,9 +31,9 @@
 //! this text is concatenated into markup and read back by a model, so the order is load-bearing.
 
 use super::types::{
-    WatchdogCategory, WatchdogConfidence, WatchdogSeverity, WatchdogWarning,
-    WatchdogWarningDetails, WatchdogWarningMessage, WatchdogWarningSource, WatchdogWarningState,
-    SUBAGENT_WATCHDOG_WARNING_TYPE,
+    SUBAGENT_WATCHDOG_WARNING_TYPE, WatchdogCategory, WatchdogConfidence, WatchdogSeverity,
+    WatchdogWarning, WatchdogWarningDetails, WatchdogWarningMessage, WatchdogWarningSource,
+    WatchdogWarningState,
 };
 
 /// `Partial<WatchdogWarningDetails>` — the `extras` argument of
@@ -207,7 +207,10 @@ pub fn format_watchdog_warning_content_from_details(details: &WatchdogWarningDet
     let mut lines = vec![
         format!("<subagent_watchdog {}>", attrs.join(" ")),
         format!("<summary>{}</summary>", escape_xml_text(&details.summary)),
-        format!("<evidence>{}</evidence>", escape_xml_text(&details.evidence)),
+        format!(
+            "<evidence>{}</evidence>",
+            escape_xml_text(&details.evidence)
+        ),
         format!(
             "<recommended_action>{}</recommended_action>",
             escape_xml_text(&details.recommended_action)
@@ -315,10 +318,8 @@ mod tests {
 
     #[test]
     fn normalization_defaults_category_to_other_and_source_to_main() {
-        let details = normalize_watchdog_warning_details(
-            &warning(),
-            &WatchdogWarningDetailsPatch::default(),
-        );
+        let details =
+            normalize_watchdog_warning_details(&warning(), &WatchdogWarningDetailsPatch::default());
         assert_eq!(details.category, WatchdogCategory::Other);
         assert_eq!(details.source, WatchdogWarningSource::Main);
         assert_eq!(details.state, None);
@@ -361,7 +362,10 @@ mod tests {
     #[test]
     fn content_escapes_amp_before_the_angle_brackets() {
         let content = format_watchdog_warning_content(&warning());
-        assert!(content.contains("<summary>summary &lt;one&gt;</summary>"), "{content}");
+        assert!(
+            content.contains("<summary>summary &lt;one&gt;</summary>"),
+            "{content}"
+        );
         assert!(
             content.contains("<evidence>evidence &amp; more</evidence>"),
             "{content}"
@@ -402,10 +406,8 @@ mod tests {
 
     #[test]
     fn the_message_carries_the_custom_type_the_renderer_registers() {
-        let details = normalize_watchdog_warning_details(
-            &warning(),
-            &WatchdogWarningDetailsPatch::default(),
-        );
+        let details =
+            normalize_watchdog_warning_details(&warning(), &WatchdogWarningDetailsPatch::default());
         let message = create_watchdog_warning_message_from_details(&details, true);
         assert_eq!(message.custom_type, SUBAGENT_WATCHDOG_WARNING_TYPE);
         assert!(message.display);

@@ -6,28 +6,27 @@ use std::sync::Arc;
 
 use cyrup_core::CancelToken;
 
-use crate::background::{RunId, RunMode};
 use crate::background::runner_main::ExecSingleStepExecutor;
+use crate::background::{RunId, RunMode};
 use crate::discovery::discover_agents;
 use crate::discovery::types::AgentReadScope;
 use crate::error::SubagentError;
 use crate::exec::ResolvedAgentPersona;
-use crate::fork_context::ContextRequest;
-use crate::spawn::chain_graph::{
-    walk_chain, ChainRunContext, GroupStepResult, OutputRegistry, RunnerStep, SingleStepExecutor,
-    StepResult,
-};
-use crate::spawn::depth::resolve_effective_depth;
-use crate::spawn::parallel::GlobalConcurrencyLimit;
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::requests::{BackgroundStepsSpec, GraphRunOutcome};
 use crate::extension::host::slash_render::{
     apply_fork_contexts, first_step_task, plan_step_agent_names,
 };
 use crate::extension::tool::task_items::resolve_chain_dir;
+use crate::fork_context::ContextRequest;
+use crate::spawn::chain_graph::{
+    ChainRunContext, GroupStepResult, OutputRegistry, RunnerStep, SingleStepExecutor, StepResult,
+    walk_chain,
+};
+use crate::spawn::depth::resolve_effective_depth;
+use crate::spawn::parallel::GlobalConcurrencyLimit;
 
 impl SubagentExecutor {
-
     // ---------------------------------------------------------------------------------------
     // Foreground chain/parallel dispatch (R-SA-130: `/chain`, `/parallel`, `/run-chain`'s
     // synchronous shape — the SAME `walk_chain`/`ExecSingleStepExecutor` machinery
@@ -129,41 +128,44 @@ impl SubagentExecutor {
         // this orchestrator's own presence target so each foreground-spawned child registers its
         // `contact_supervisor` bridge addressed at the live human orchestrator — the SAME activation
         // the background path gets via `RunnerConfig`. `None` target leaves each child un-bridged.
-        let executor: Arc<dyn SingleStepExecutor> = Arc::new(ExecSingleStepExecutor::foreground(
-            depth,
-            Arc::new(resolved_agents),
-            self.orchestrator_intercom_target(),
-            Some(RunId::new()),
-            // Session-model inheritance for foreground `/chain`//`/parallel` steps (pi's
-            // `data.parentModel`, read at `subagent-executor.ts:3165,3549` @v0.43.0 and fed by the
-            // same `requestParentModel`): an inheriting step (no persona `model:`, no per-step
-            // override) runs the parent's model, the SAME inheritance — through the SAME
-            // [`SubagentExecutor::remembered_parent_model`] memory — the foreground single-run path
-            // applies.
-            self.remembered_parent_model(),
-            // SUBA-003: the cwd's `subagents.modelScope` policy, so a foreground chain/parallel
-            // step's own `model:` is policed exactly as a single run's `model` is.
-            Self::resolve_model_scope(cwd, &cfg.roots)?,
-            // The extension config's in-process binary override, from the same snapshot this
-            // function already took. `None` for every ordinary configuration, which leaves each
-            // step resolving its command from the environment as before.
-            cfg.spawn_command.clone(),
-        )
-        // SUBA-N05 (pi `controlConfig: input.controlConfig` on every per-step `runSync`,
-        // `chain-execution.ts:322,491,733` @v0.34.0): the extension-level `subagents.control`
-        // block folded with this call's own override, so a foreground chain/parallel step's child
-        // stream is judged against the CONFIGURED attention thresholds instead of the hardcoded
-        // defaults this path used to fall back to.
-        .with_control(Some(crate::exec::control::resolve_control_config(
-            cfg.control.as_ref(),
-            control_override.as_ref(),
-        )))
-        // SUBA-N06 (pi `chain-execution.ts:167`, gated on the same `includeProgress` the SINGLE
-        // path uses): each foreground chain/parallel step's own `SingleResult` carries its
-        // progress snapshot, which is where cyrup's [CYRUP-DELTA] on placement puts pi's
-        // `details.progress` array.
-        .with_include_progress(include_progress));
-        let global_limit = GlobalConcurrencyLimit::new(cfg.global_concurrency_limit.max(1) as usize);
+        let executor: Arc<dyn SingleStepExecutor> = Arc::new(
+            ExecSingleStepExecutor::foreground(
+                depth,
+                Arc::new(resolved_agents),
+                self.orchestrator_intercom_target(),
+                Some(RunId::new()),
+                // Session-model inheritance for foreground `/chain`//`/parallel` steps (pi's
+                // `data.parentModel`, read at `subagent-executor.ts:3165,3549` @v0.43.0 and fed by the
+                // same `requestParentModel`): an inheriting step (no persona `model:`, no per-step
+                // override) runs the parent's model, the SAME inheritance — through the SAME
+                // [`SubagentExecutor::remembered_parent_model`] memory — the foreground single-run path
+                // applies.
+                self.remembered_parent_model(),
+                // SUBA-003: the cwd's `subagents.modelScope` policy, so a foreground chain/parallel
+                // step's own `model:` is policed exactly as a single run's `model` is.
+                Self::resolve_model_scope(cwd, &cfg.roots)?,
+                // The extension config's in-process binary override, from the same snapshot this
+                // function already took. `None` for every ordinary configuration, which leaves each
+                // step resolving its command from the environment as before.
+                cfg.spawn_command.clone(),
+            )
+            // SUBA-N05 (pi `controlConfig: input.controlConfig` on every per-step `runSync`,
+            // `chain-execution.ts:322,491,733` @v0.34.0): the extension-level `subagents.control`
+            // block folded with this call's own override, so a foreground chain/parallel step's child
+            // stream is judged against the CONFIGURED attention thresholds instead of the hardcoded
+            // defaults this path used to fall back to.
+            .with_control(Some(crate::exec::control::resolve_control_config(
+                cfg.control.as_ref(),
+                control_override.as_ref(),
+            )))
+            // SUBA-N06 (pi `chain-execution.ts:167`, gated on the same `includeProgress` the SINGLE
+            // path uses): each foreground chain/parallel step's own `SingleResult` carries its
+            // progress snapshot, which is where cyrup's [CYRUP-DELTA] on placement puts pi's
+            // `details.progress` array.
+            .with_include_progress(include_progress),
+        );
+        let global_limit =
+            GlobalConcurrencyLimit::new(cfg.global_concurrency_limit.max(1) as usize);
         // R-SA-035/036 (pi `chain-execution.ts:606`): the chain-wide deadline is computed ONCE here,
         // before the walk starts, from the nominal `timeout_ms` budget the caller resolved
         // (`resolve_foreground_timeout`) — never re-derived per step, so it monotonically shrinks
@@ -330,13 +332,12 @@ impl SubagentExecutor {
         // T0.1/C13: resolve every named persona up front (also the upfront agent-name validation —
         // an unresolvable agent fails here, before any child is spawned, matching pi's `/chain`//
         // `/parallel` name check).
-        let resolved_agents =
-            self.resolve_plan_personas(
-                cwd,
-                plan_step_agent_names(&graph),
-                AgentReadScope::Both,
-                &cfg.roots,
-            )?;
+        let resolved_agents = self.resolve_plan_personas(
+            cwd,
+            plan_step_agent_names(&graph),
+            AgentReadScope::Both,
+            &cfg.roots,
+        )?;
         // Fork default-mode + per-index branch (Tier-2, R-SA-137/R-SA-138, pi
         // `resolveAgentDefaultContextPolicy` + `preflightForkSessionsForStaticTasks`): resolve EACH
         // step's effective context independently (an omitted call-site `context` defers to THAT
@@ -351,11 +352,15 @@ impl SubagentExecutor {
         // SUBA-079: the `subagents.defaultSubagentContext` rung, validated here — this is the only
         // side of the graph path holding the live extension config.
         let config_default = crate::fork_context::resolve_default_subagent_context(
-            self.config_snapshot().await.default_subagent_context.as_ref(),
+            self.config_snapshot()
+                .await
+                .default_subagent_context
+                .as_ref(),
         )
         .map_err(SubagentError::Management)?;
         let (graph, first_session_file) =
-            apply_fork_contexts(&resolver, context, config_default, &resolved_agents, graph).await?;
+            apply_fork_contexts(&resolver, context, config_default, &resolved_agents, graph)
+                .await?;
 
         if background {
             let run_id = self
@@ -411,7 +416,12 @@ impl SubagentExecutor {
             // per-group child detail to zip them back together.
             let is_group: Vec<bool> = graph
                 .iter()
-                .map(|s| matches!(s, RunnerStep::ParallelGroup(_) | RunnerStep::DynamicGroup(_)))
+                .map(|s| {
+                    matches!(
+                        s,
+                        RunnerStep::ParallelGroup(_) | RunnerStep::DynamicGroup(_)
+                    )
+                })
                 .collect();
             let (results, groups) = self
                 .run_chain_foreground_with_control(
@@ -466,7 +476,12 @@ impl SubagentExecutor {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::spawn::chain_graph::SingleStepSpec;
@@ -538,26 +553,28 @@ mod tests {
             cfg.max_subagent_depth = 0;
         }
         let dir = tempfile::tempdir().expect("tempdir");
-        let graph = vec![RunnerStep::SingleStep(crate::spawn::chain_graph::SingleStepSpec {
-            skills: None,
-            session_dir: None,
-            agent: "worker".to_string(),
-            task: "do something".to_string(),
-            cwd: None,
-            model: None,
-            tools: None,
-            extensions: None,
-            session_file: None,
-            max_depth_override: None,
-            structured_output_schema: None,
-            output: None,
-            output_path: None,
-            output_mode: None,
-            reads: None,
-            acceptance: None,
-            context: None,
-            agent_scope: None,
-        })];
+        let graph = vec![RunnerStep::SingleStep(
+            crate::spawn::chain_graph::SingleStepSpec {
+                skills: None,
+                session_dir: None,
+                agent: "worker".to_string(),
+                task: "do something".to_string(),
+                cwd: None,
+                model: None,
+                tools: None,
+                extensions: None,
+                session_file: None,
+                max_depth_override: None,
+                structured_output_schema: None,
+                output: None,
+                output_path: None,
+                output_mode: None,
+                reads: None,
+                acceptance: None,
+                context: None,
+                agent_scope: None,
+            },
+        )];
 
         let err = executor
             .run_chain_foreground(
@@ -576,5 +593,4 @@ mod tests {
             "got: {err:?}"
         );
     }
-
 }

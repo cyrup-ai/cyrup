@@ -2,7 +2,12 @@
 //!
 //! Every test here would be RED before its named item's change and GREEN after; the "before" state
 //! is stated per test so a reviewer can revert one edit and watch exactly one test flip.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::{
     CommandDescriptor, Dispatcher, EventKind, ExtError, ExtKind, ExtMode, Extension,
@@ -10,14 +15,17 @@ use crate::{
     InitApi, NativeExtension, Reduced, Subscriptions, ToolDescriptor,
 };
 use cyrup_agent::AgentEvent;
-use cyrup_core::{
-    TerminateHint,CancelToken, ExtensionId};
-use serde_json::{json, Value};
+use cyrup_core::{CancelToken, ExtensionId, TerminateHint};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: std::path::PathBuf::from("/tmp/cyrup-t") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: std::path::PathBuf::from("/tmp/cyrup-t"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,13 +153,26 @@ async fn a_real_fault_on_the_fail_closed_seam_still_reports_and_still_names_the_
         sink.lock().unwrap().push(e.clone());
     }));
 
-    let ev = HostEvent::ToolCall { call_id: "tc".into(), name: "bash".into(), input: json!({}) };
-    let reduced = dispatcher.dispatch_block_mutate(ev, &CancelToken::new()).await;
+    let ev = HostEvent::ToolCall {
+        call_id: "tc".into(),
+        name: "bash".into(),
+        input: json!({}),
+    };
+    let reduced = dispatcher
+        .dispatch_block_mutate(ev, &CancelToken::new())
+        .await;
 
-    assert_eq!(errors.lock().unwrap().len(), 1, "a genuine trap is still surfaced");
+    assert_eq!(
+        errors.lock().unwrap().len(),
+        1,
+        "a genuine trap is still surfaced"
+    );
     match reduced {
         Reduced::Blocked { reason, .. } => assert!(
-            reason.as_deref().unwrap_or_default().contains("Extension failed, blocking execution"),
+            reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Extension failed, blocking execution"),
             "pi's text (agent-session.ts:475-487 @v0.83.0) still wins for a real fault: {reason:?}"
         ),
         other => panic!("expected Blocked, got {other:?}"),
@@ -185,20 +206,38 @@ async fn a_blocking_handler_can_hint_terminate_and_it_survives_the_reduction() {
             _ev: &HostEvent,
             _cancel: &CancelToken,
         ) -> Result<HookOutcome, ExtError> {
-            Ok(HookOutcome::Block { reason: Some("denied by policy".into()), terminate: TerminateHint::Terminate })
+            Ok(HookOutcome::Block {
+                reason: Some("denied by policy".into()),
+                terminate: TerminateHint::Terminate,
+            })
         }
     }
 
     let dispatcher = Dispatcher::new();
     dispatcher
-        .add(Arc::new(Denier("deny".into(), Subscriptions::empty().with(EventKind::ToolCall))))
+        .add(Arc::new(Denier(
+            "deny".into(),
+            Subscriptions::empty().with(EventKind::ToolCall),
+        )))
         .unwrap();
-    let ev = HostEvent::ToolCall { call_id: "tc".into(), name: "bash".into(), input: json!({}) };
-    match dispatcher.dispatch_block_mutate(ev, &CancelToken::new()).await {
-        Reduced::Blocked { reason, terminate, .. } => {
+    let ev = HostEvent::ToolCall {
+        call_id: "tc".into(),
+        name: "bash".into(),
+        input: json!({}),
+    };
+    match dispatcher
+        .dispatch_block_mutate(ev, &CancelToken::new())
+        .await
+    {
+        Reduced::Blocked {
+            reason, terminate, ..
+        } => {
             assert_eq!(reason.as_deref(), Some("denied by policy"));
-            assert!(terminate.requested(), "pi's terminate hint must survive to the agent, which applies the \
-                                every()-rule (agent-loop.ts:583 @v0.84.1)");
+            assert!(
+                terminate.requested(),
+                "pi's terminate hint must survive to the agent, which applies the \
+                                every()-rule (agent-loop.ts:583 @v0.84.1)"
+            );
         }
         other => panic!("expected Blocked, got {other:?}"),
     }
@@ -223,7 +262,12 @@ fn tool_execution_update_and_end_carry_the_tool_name_and_the_update_carries_args
     })
     .expect("tool_execution_update maps to a HostEvent");
     match upd {
-        HostEvent::ToolExecUpdate { call_id, name, args, chunk } => {
+        HostEvent::ToolExecUpdate {
+            call_id,
+            name,
+            args,
+            chunk,
+        } => {
             assert_eq!(call_id.as_str(), "tc1");
             assert_eq!(name, "bash");
             assert_eq!(args, json!({ "command": "ls -la" }));
@@ -240,10 +284,18 @@ fn tool_execution_update_and_end_carry_the_tool_name_and_the_update_carries_args
     })
     .expect("tool_execution_end maps to a HostEvent");
     match end {
-        HostEvent::ToolExecEnd { call_id, name, is_error, .. } => {
+        HostEvent::ToolExecEnd {
+            call_id,
+            name,
+            is_error,
+            ..
+        } => {
             assert_eq!(call_id.as_str(), "tc1");
-            assert_eq!(name, "bash", "an observer that missed tool_execution_start must still be \
-                                      able to filter by tool");
+            assert_eq!(
+                name, "bash",
+                "an observer that missed tool_execution_start must still be \
+                                      able to filter by tool"
+            );
             assert!(!is_error);
         }
         other => panic!("wrong arm: {other:?}"),
@@ -259,9 +311,19 @@ fn tool_execution_update_and_end_carry_the_tool_name_and_the_update_carries_args
 /// event did not exist at all — 31 kinds ending at `AgentSettled = 30`.
 #[test]
 fn before_provider_headers_patches_in_place_and_a_null_value_deletes_the_header() {
-    assert_eq!(EventKind::COUNT, 33, "31 + before_provider_headers + session_info_changed");
-    assert_eq!(EventKind::from_u8(31), Some(EventKind::BeforeProviderHeaders));
-    assert_eq!(EventKind::BeforeProviderHeaders.name(), "before_provider_headers");
+    assert_eq!(
+        EventKind::COUNT,
+        33,
+        "31 + before_provider_headers + session_info_changed"
+    );
+    assert_eq!(
+        EventKind::from_u8(31),
+        Some(EventKind::BeforeProviderHeaders)
+    );
+    assert_eq!(
+        EventKind::BeforeProviderHeaders.name(),
+        "before_provider_headers"
+    );
     assert_eq!(EventKind::from_u8(32), Some(EventKind::SessionInfoChanged));
     assert_eq!(EventKind::SessionInfoChanged.name(), "session_info_changed");
     assert_eq!(EventKind::from_u8(33), None, "COUNT is the exclusive bound");
@@ -274,9 +336,15 @@ fn before_provider_headers_patches_in_place_and_a_null_value_deletes_the_header(
     ));
     match ev {
         HostEvent::BeforeProviderHeaders { headers } => {
-            assert!(headers.get("authorization").is_none(), "a null value DELETES");
+            assert!(
+                headers.get("authorization").is_none(),
+                "a null value DELETES"
+            );
             assert_eq!(headers.get("x-added").and_then(|v| v.as_str()), Some("1"));
-            assert_eq!(headers.get("x-trace").and_then(|v| v.as_str()), Some("keep"));
+            assert_eq!(
+                headers.get("x-trace").and_then(|v| v.as_str()),
+                Some("keep")
+            );
         }
         other => panic!("wrong arm: {other:?}"),
     }
@@ -310,7 +378,10 @@ impl NativeExtension for TrustProbe {
                 HookOutcome::Handled(crate::HandledValue(json!({ "trusted": "yes" })))
             }
             HostEvent::ResourcesDiscover { cwd, reason } => {
-                self.seen.lock().unwrap().push(format!("resources:{cwd}:{reason}"));
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(format!("resources:{cwd}:{reason}"));
                 HookOutcome::Handled(crate::HandledValue(json!({})))
             }
             _ => HookOutcome::Noop,
@@ -327,9 +398,12 @@ impl NativeExtension for TrustProbe {
 async fn project_trust_and_resources_discover_carry_the_cwd_they_are_asked_about() {
     let host = ExtensionHost::new(cfg());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    host.load_native(Arc::new(TrustProbe { id: "trust".into(), seen: seen.clone() }))
-        .await
-        .unwrap();
+    host.load_native(Arc::new(TrustProbe {
+        id: "trust".into(),
+        seen: seen.clone(),
+    }))
+    .await
+    .unwrap();
 
     let cancel = CancelToken::new();
     let _ = host.aggregate_project_trust(&cancel).await;
@@ -338,7 +412,10 @@ async fn project_trust_and_resources_discover_carry_the_cwd_they_are_asked_about
     let got = seen.lock().unwrap().clone();
     assert_eq!(
         got,
-        vec!["trust:/tmp/cyrup-t".to_string(), "resources:/tmp/cyrup-t:startup".to_string()],
+        vec![
+            "trust:/tmp/cyrup-t".to_string(),
+            "resources:/tmp/cyrup-t:startup".to_string()
+        ],
         "both hooks see the host's cwd, and resources_discover distinguishes startup from reload"
     );
 }
@@ -361,7 +438,8 @@ fn a_registration_during_a_materialization_pass_is_not_swallowed() {
     reg.mark_tools_dirty();
     assert!(reg.take_tools_dirty());
     // … then registers what it materialized. QUIETLY (EXT-030) — this is not new signal.
-    reg.register_materialized_tool("a".into(), Arc::new(NoopTool::new("alpha"))).unwrap();
+    reg.register_materialized_tool("a".into(), Arc::new(NoopTool::new("alpha")))
+        .unwrap();
     assert!(
         !reg.take_tools_dirty(),
         "the materializer's OWN re-registrations must not re-dirty the flag it is already consuming"
@@ -370,7 +448,8 @@ fn a_registration_during_a_materialization_pass_is_not_swallowed() {
     // A concurrent registration DURING the pass, and a deliberate re-arm for a not-yet-live owner,
     // both survive: nothing clears them wholesale afterwards.
     reg.mark_tools_dirty(); // the not-yet-live re-arm
-    reg.register_tool("b".into(), Arc::new(NoopTool::new("beta"))).unwrap(); // concurrent arrival
+    reg.register_tool("b".into(), Arc::new(NoopTool::new("beta")))
+        .unwrap(); // concurrent arrival
     assert!(
         reg.take_tools_dirty(),
         "a mark raised while the materializer ran must survive it — otherwise the tool is dropped \
@@ -424,8 +503,10 @@ impl cyrup_core::Tool for NoopTool {
 #[test]
 fn a_second_extension_cannot_steal_a_tool_renderer_and_the_drop_is_diagnosable() {
     let reg = ExtensionRegistry::new();
-    reg.register_tool_renderer(ExtensionId::from("first"), "bash").unwrap();
-    reg.register_tool_renderer(ExtensionId::from("second"), "bash").unwrap();
+    reg.register_tool_renderer(ExtensionId::from("first"), "bash")
+        .unwrap();
+    reg.register_tool_renderer(ExtensionId::from("second"), "bash")
+        .unwrap();
 
     assert_eq!(
         reg.tool_renderer_owner("bash").unwrap(),
@@ -433,12 +514,17 @@ fn a_second_extension_cannot_steal_a_tool_renderer_and_the_drop_is_diagnosable()
         "whoever wins the tool wins its renderer"
     );
     let conflicts = reg.conflicts().unwrap();
-    assert_eq!(conflicts.len(), 1, "the drop is recorded, not silent: {conflicts:?}");
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "the drop is recorded, not silent: {conflicts:?}"
+    );
     assert_eq!(conflicts[0].path, ExtensionId::from("second"));
     assert!(conflicts[0].message.contains("bash") && conflicts[0].message.contains("first"));
 
     // The SAME owner re-registering is not a conflict (hot reload / re-declaration).
-    reg.register_tool_renderer(ExtensionId::from("first"), "bash").unwrap();
+    reg.register_tool_renderer(ExtensionId::from("first"), "bash")
+        .unwrap();
     assert_eq!(reg.conflicts().unwrap().len(), 1);
 }
 
@@ -463,23 +549,36 @@ fn shortcut_resolution_refuses_reserved_keys_warns_on_the_rest_and_records_every
         ("app.help".to_string(), vec!["ctrl+h".to_string()]),
     ];
 
-    reg.register_shortcut("ext-a".into(), "Ctrl+C", Some("steal interrupt".into())).unwrap();
-    reg.register_shortcut("ext-a".into(), "ctrl+h", Some("override help".into())).unwrap();
-    reg.register_shortcut("ext-a".into(), "ctrl+t", None).unwrap();
-    reg.register_shortcut("ext-b".into(), "CTRL+T", Some("also ctrl+t".into())).unwrap();
+    reg.register_shortcut("ext-a".into(), "Ctrl+C", Some("steal interrupt".into()))
+        .unwrap();
+    reg.register_shortcut("ext-a".into(), "ctrl+h", Some("override help".into()))
+        .unwrap();
+    reg.register_shortcut("ext-a".into(), "ctrl+t", None)
+        .unwrap();
+    reg.register_shortcut("ext-b".into(), "CTRL+T", Some("also ctrl+t".into()))
+        .unwrap();
 
     let resolved = reg.resolve_shortcuts(&keymap).unwrap();
     let keys: Vec<&str> = resolved.iter().map(|(k, _)| k.as_str()).collect();
 
     // Rule 2 (runner.ts:513-520): a reserved collision is SKIPPED — it never enters the map.
-    assert!(!keys.contains(&"ctrl+c"), "a reserved key must be refused, not silently dead: {keys:?}");
+    assert!(
+        !keys.contains(&"ctrl+c"),
+        "a reserved key must be refused, not silently dead: {keys:?}"
+    );
     // Rule 3 (runner.ts:522-528): a NON-reserved built-in collision warns but the extension WINS.
-    assert!(keys.contains(&"ctrl+h"), "a non-reserved built-in key is overridable: {keys:?}");
+    assert!(
+        keys.contains(&"ctrl+h"),
+        "a non-reserved built-in key is overridable: {keys:?}"
+    );
     // Rule 4 (runner.ts:530-536): extension-vs-extension is LAST-wins — deliberately NOT the
     // first-wins rule the tool/command/renderer tables use; pi's own warning says
     // "Using ${shortcut.extensionPath}".
     assert_eq!(
-        resolved.iter().find(|(k, _)| k == "ctrl+t").map(|(_, o)| o.clone()),
+        resolved
+            .iter()
+            .find(|(k, _)| k == "ctrl+t")
+            .map(|(_, o)| o.clone()),
         Some(ExtensionId::from("ext-b")),
         "last registrant wins the key, matching pi's unconditional `extensionShortcuts.set`"
     );
@@ -488,9 +587,20 @@ fn shortcut_resolution_refuses_reserved_keys_warns_on_the_rest_and_records_every
 
     let diags = reg.shortcut_diagnostics().unwrap();
     assert_eq!(diags.len(), 3, "one per rule that fired: {diags:?}");
-    assert!(diags.iter().any(|d| d.message.contains("conflicts with built-in shortcut. Skipping.")));
-    assert!(diags.iter().any(|d| d.message.contains("is built-in shortcut for app.help")));
-    assert!(diags.iter().any(|d| d.message.contains("registered by both")));
+    assert!(diags.iter().any(|d| {
+        d.message
+            .contains("conflicts with built-in shortcut. Skipping.")
+    }));
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message.contains("is built-in shortcut for app.help"))
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message.contains("registered by both"))
+    );
 }
 
 /// EXT-040. BEFORE: `register_shortcut` took only `(owner, key)` and the host discarded `desc` one
@@ -501,9 +611,14 @@ fn shortcut_resolution_refuses_reserved_keys_warns_on_the_rest_and_records_every
 #[test]
 fn a_shortcut_description_survives_registration_and_falls_back_to_the_extension_id() {
     let reg = ExtensionRegistry::new();
-    reg.register_shortcut("fleet".into(), "ctrl+alt+f", Some("Show the subagent fleet".into()))
+    reg.register_shortcut(
+        "fleet".into(),
+        "ctrl+alt+f",
+        Some("Show the subagent fleet".into()),
+    )
+    .unwrap();
+    reg.register_shortcut("plain".into(), "ctrl+alt+g", None)
         .unwrap();
-    reg.register_shortcut("plain".into(), "ctrl+alt+g", None).unwrap();
 
     let specs = reg.shortcut_specs().unwrap();
     assert_eq!(specs[0].0, "ctrl+alt+f");
@@ -546,7 +661,10 @@ impl NativeExtension for BusNative {
         if self.fail {
             return Err(ExtError::Panicked("bus listener exploded".into()));
         }
-        self.got.lock().unwrap().push((topic.to_string(), payload.clone()));
+        self.got
+            .lock()
+            .unwrap()
+            .push((topic.to_string(), payload.clone()));
         Ok(())
     }
 }
@@ -567,7 +685,8 @@ async fn a_native_extension_receives_inter_extension_bus_events() {
     .await
     .unwrap();
 
-    host.bus().emit("demo:bus".into(), json!({ "hello": "world" }));
+    host.bus()
+        .emit("demo:bus".into(), json!({ "hello": "world" }));
     host.deliver_bus_events(&CancelToken::new()).await;
 
     let got = got.lock().unwrap().clone();
@@ -601,7 +720,11 @@ async fn a_faulting_bus_listener_reaches_the_error_listener_channel() {
     host.deliver_bus_events(&CancelToken::new()).await;
 
     let errors = errors.lock().unwrap().clone();
-    assert_eq!(errors.len(), 1, "the fault must be visible, not just logged: {errors:?}");
+    assert_eq!(
+        errors.len(),
+        1,
+        "the fault must be visible, not just logged: {errors:?}"
+    );
     assert_eq!(errors[0].extension, ExtensionId::from("boom"));
     assert!(errors[0].error.contains("demo:bus"));
 }
@@ -663,12 +786,24 @@ async fn exhausting_the_bus_round_bound_drops_explicitly_and_says_so() {
     host.bus().emit("demo:pingpong".into(), json!({}));
     host.deliver_bus_events(&CancelToken::new()).await;
 
-    assert_eq!(rounds.load(Ordering::Relaxed), 64, "the bound is MAX_ROUNDS");
+    assert_eq!(
+        rounds.load(Ordering::Relaxed),
+        64,
+        "the bound is MAX_ROUNDS"
+    );
     let errors = errors.lock().unwrap().clone();
-    assert_eq!(errors.len(), 1, "exactly one diagnostic names the bound: {errors:?}");
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly one diagnostic names the bound: {errors:?}"
+    );
     assert!(errors[0].error.contains("64"), "{:?}", errors[0]);
     assert!(errors[0].error.contains("dropped"), "{:?}", errors[0]);
-    assert_eq!(host.bus().pending_len(), 0, "the remainder is dropped EXPLICITLY, not left queued");
+    assert_eq!(
+        host.bus().pending_len(),
+        0,
+        "the remainder is dropped EXPLICITLY, not left queued"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +822,10 @@ fn a_bus_subscription_can_be_taken_down_individually_and_per_owner() {
     bus.subscribe("b".into(), "t1".into());
 
     assert!(bus.unsubscribe(&ExtensionId::from("a"), "t1"));
-    assert!(!bus.unsubscribe(&ExtensionId::from("a"), "t1"), "idempotent");
+    assert!(
+        !bus.unsubscribe(&ExtensionId::from("a"), "t1"),
+        "idempotent"
+    );
     assert_eq!(bus.subscribers_for("t1"), vec![ExtensionId::from("b")]);
 
     // The teardown pi's `invalidate()` performs (loader.ts:206-214 @v0.84.1).
@@ -707,7 +845,8 @@ fn an_invalidated_instance_loses_its_subscriptions_and_may_no_longer_publish() {
     use std::sync::Arc;
 
     let bus = Arc::new(crate::SharedBus::new());
-    let guest = GuestState::new("a".into(), Arc::new(ExtensionRegistry::new())).with_bus(bus.clone());
+    let guest =
+        GuestState::new("a".into(), Arc::new(ExtensionRegistry::new())).with_bus(bus.clone());
 
     // PRESENCE first — while active, both halves work.
     guest.bus_subscribe("t1".into());
@@ -725,12 +864,18 @@ fn an_invalidated_instance_loses_its_subscriptions_and_may_no_longer_publish() {
     );
     // ...and `assertActive` refuses both verbs afterwards.
     guest.bus_emit("t1".into(), serde_json::json!({"n": 2}));
-    assert_eq!(bus.pending_len(), 1, "a stale instance may not publish onto the fresh set's bus");
+    assert_eq!(
+        bus.pending_len(),
+        1,
+        "a stale instance may not publish onto the fresh set's bus"
+    );
     guest.bus_subscribe("t1".into());
     assert!(bus.subscribers_for("t1").is_empty(), "nor re-subscribe");
 
     // Idempotent, and the FIRST reason wins (upstream `if (state.staleMessage) return;`).
-    let first = guest.stale_reason().expect("a stale instance carries its reason");
+    let first = guest
+        .stale_reason()
+        .expect("a stale instance carries its reason");
     guest.invalidate(Some("a later, vaguer reason".into()));
     assert_eq!(guest.stale_reason().as_deref(), Some(first.as_str()));
 }
@@ -747,12 +892,21 @@ fn an_invalidated_instance_loses_its_subscriptions_and_may_no_longer_publish() {
 #[test]
 fn a_second_extension_registering_deploy_is_reachable_as_deploy_2() {
     let reg = ExtensionRegistry::new();
-    reg.register_command("first".into(), "deploy", CommandDescriptor::default()).unwrap();
-    reg.register_command("second".into(), "deploy", CommandDescriptor::default()).unwrap();
+    reg.register_command("first".into(), "deploy", CommandDescriptor::default())
+        .unwrap();
+    reg.register_command("second".into(), "deploy", CommandDescriptor::default())
+        .unwrap();
 
     let resolved = reg.resolved_commands().unwrap();
-    let names: Vec<&str> = resolved.iter().map(|r| r.invocation_name.as_str()).collect();
-    assert_eq!(names, vec!["deploy:1", "deploy:2"], "load-order suffixing, pi's rule");
+    let names: Vec<&str> = resolved
+        .iter()
+        .map(|r| r.invocation_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["deploy:1", "deploy:2"],
+        "load-order suffixing, pi's rule"
+    );
 
     // The lookup `ExtensionHost::live_for_command` now uses reaches BOTH owners.
     assert_eq!(
@@ -826,7 +980,12 @@ fn the_tool_descriptor_carries_constrained_sampling_in_pis_wire_shape() {
         render_shell: None,
         constrained_sampling: None,
     };
-    assert!(serde_json::to_value(&absent).unwrap().get("constrainedSampling").is_none());
+    assert!(
+        serde_json::to_value(&absent)
+            .unwrap()
+            .get("constrainedSampling")
+            .is_none()
+    );
 
     // pi's grammar config: `{"type":"grammar","variants":{"openai_lark":"…"}}`.
     let grammar = ToolDescriptor {
@@ -859,17 +1018,27 @@ fn the_tool_descriptor_carries_constrained_sampling_in_pis_wire_shape() {
     let wire = serde_json::to_value(&disabled).unwrap();
     assert_eq!(wire.get("constrainedSampling"), Some(&json!(false)));
     let back: ToolDescriptor = serde_json::from_value(wire).unwrap();
-    assert!(back.constrained_sampling.as_ref().unwrap().config().is_none());
+    assert!(
+        back.constrained_sampling
+            .as_ref()
+            .unwrap()
+            .config()
+            .is_none()
+    );
 
     // And the strict-JSON-schema arm keeps pi's snake_case tag + lowercase strictness.
     let strict = ToolDescriptor {
         constrained_sampling: Some(ConstrainedSampling::Config(
-            ConstrainedSamplingConfig::JsonSchema { strict: StrictSampling::Require },
+            ConstrainedSamplingConfig::JsonSchema {
+                strict: StrictSampling::Require,
+            },
         )),
         ..absent
     };
     assert_eq!(
-        serde_json::to_value(&strict).unwrap().get("constrainedSampling"),
+        serde_json::to_value(&strict)
+            .unwrap()
+            .get("constrainedSampling"),
         Some(&json!({"type": "json_schema", "strict": "require"}))
     );
 }
@@ -961,8 +1130,15 @@ impl NativeExtension for BashRedirect {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::UserBash { command, exclude_from_context, cwd } => {
-                self.seen.lock().unwrap().push(format!("{command}:{exclude_from_context}:{cwd}"));
+            HostEvent::UserBash {
+                command,
+                exclude_from_context,
+                cwd,
+            } => {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(format!("{command}:{exclude_from_context}:{cwd}"));
                 HookOutcome::Handled(crate::HandledValue(json!({
                     "operations": { "backend": "ssh", "remote": "build-box" },
                     "result": { "output": "Linux build-box\n", "exitCode": 0 },
@@ -997,14 +1173,21 @@ impl NativeExtension for BashRedirect {
 async fn user_bash_reduction_carries_the_operations_half_not_only_the_result_half() {
     let host = ExtensionHost::new(cfg());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    host.load_native(Arc::new(BashRedirect { id: "bash-redirect".into(), seen: seen.clone() }))
-        .await
-        .unwrap();
+    host.load_native(Arc::new(BashRedirect {
+        id: "bash-redirect".into(),
+        seen: seen.clone(),
+    }))
+    .await
+    .unwrap();
 
     let cancel = CancelToken::new();
     let reduced = host.emit_user_bash("uname -a", &cancel).await;
 
-    assert_eq!(seen.lock().unwrap().len(), 1, "the handler must have been reached");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the handler must have been reached"
+    );
 
     let v = match reduced {
         crate::UserBashReduction::Handled(v) => v,

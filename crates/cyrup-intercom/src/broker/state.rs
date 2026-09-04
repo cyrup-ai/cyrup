@@ -165,7 +165,11 @@ impl BrokerState {
     /// Separate from [`Self::new`] rather than folded into it because upstream's two facts come
     /// from the LISTEN TARGET, which only the real [`super::run`] has; every unit test drives a state whose
     /// endpoint is the default socket, and pi's own default is that same string arm.
-    pub(super) fn with_listen_endpoint(mut self, trusted_local: bool, endpoint_state_id: Option<String>) -> Self {
+    pub(super) fn with_listen_endpoint(
+        mut self,
+        trusted_local: bool,
+        endpoint_state_id: Option<String>,
+    ) -> Self {
         self.trusted_local = trusted_local;
         self.endpoint_state_id = endpoint_state_id;
         self
@@ -189,7 +193,9 @@ impl BrokerState {
         self.unregistered.push(conn_id);
         while self.unregistered.len() > MAX_UNREGISTERED_CONNECTIONS {
             // Oldest is at the front; never evict the just-added current if it is the only one.
-            let Some(&oldest) = self.unregistered.first() else { break };
+            let Some(&oldest) = self.unregistered.first() else {
+                break;
+            };
             if oldest == conn_id && self.unregistered.len() == 1 {
                 break;
             }
@@ -207,7 +213,9 @@ impl BrokerState {
     /// The registered sessions in join order — the Rust equivalent of iterating pi's
     /// `this.sessions` JS `Map` (`broker.ts:133`).
     pub(super) fn sessions_in_order(&self) -> impl Iterator<Item = (&String, &ConnectedSession)> {
-        self.session_order.iter().filter_map(|id| self.sessions.get_key_value(id))
+        self.session_order
+            .iter()
+            .filter_map(|id| self.sessions.get_key_value(id))
     }
 
     /// `this.sessions.set(id, …)` (`broker.ts:376`). JS `Map.set` on an **existing** key keeps
@@ -242,12 +250,14 @@ impl BrokerState {
     }
 
     pub(super) fn clear_ask_edges_for_session(&mut self, session_id: &str) {
-        self.ask_edges.retain(|_, edge| edge.from != session_id && edge.to != session_id);
+        self.ask_edges
+            .retain(|_, edge| edge.from != session_id && edge.to != session_id);
     }
 
     pub(super) fn prune_ask_edges(&mut self, now: u64) {
         let timeout = self.ask_timeout_ms;
-        self.ask_edges.retain(|_, edge| now.saturating_sub(edge.created_at) <= timeout);
+        self.ask_edges
+            .retain(|_, edge| now.saturating_sub(edge.created_at) <= timeout);
     }
 
     /// `clearMessageReceiptRoutesForSession` (`v0.10.1 broker/broker.ts:979-985`).
@@ -267,7 +277,9 @@ impl BrokerState {
     /// because pi's `Map` iterates in insertion order and neither `index.ts`'s `list` handler nor
     /// `ui/session-list.ts` re-sorts the reply.
     pub(super) fn session_infos(&self) -> Vec<SessionInfo> {
-        self.sessions_in_order().map(|(_, s)| s.info.clone()).collect()
+        self.sessions_in_order()
+            .map(|(_, s)| s.info.clone())
+            .collect()
     }
 
     /// Socket-close handler (`v0.10.1 broker/broker.ts:210-224`). Returns `true` if this owned
@@ -283,7 +295,12 @@ impl BrokerState {
     /// undeliverable-as-a-reply ("Reply target does not match a pending ask") the moment the peer
     /// reconnected. The edges instead expire on `pruneAskEdges`' `askTimeoutMs`, exactly as they do
     /// for a live-but-silent peer.
-    pub(super) fn on_connection_closed(&mut self, conn_id: u64, session_id: &Option<String>, now: u64) -> bool {
+    pub(super) fn on_connection_closed(
+        &mut self,
+        conn_id: u64,
+        session_id: &Option<String>,
+        now: u64,
+    ) -> bool {
         self.connections.remove(&conn_id);
         self.remove_unregistered(conn_id);
         if let Some(sid) = session_id
@@ -295,7 +312,12 @@ impl BrokerState {
             }
             self.remove_session(sid);
             self.clear_message_receipt_routes_for_session(sid);
-            self.broadcast(&BrokerMessage::SessionLeft { session_id: sid.clone() }, Some(sid));
+            self.broadcast(
+                &BrokerMessage::SessionLeft {
+                    session_id: sid.clone(),
+                },
+                Some(sid),
+            );
             // `this.recomputeNamespaceOwners()` (`v0.9.2 broker/broker.ts:337`) — this is what
             // re-elects a namespace whose owner just died.
             self.recompute_namespace_owners();
@@ -303,7 +325,6 @@ impl BrokerState {
         }
         false
     }
-
 }
 
 #[cfg(test)]
@@ -329,20 +350,33 @@ mod tests {
             register(&mut state, conn_id as u64, &mut sid, id);
         }
         let listed: Vec<String> = state.session_infos().into_iter().map(|s| s.id).collect();
-        assert_eq!(listed, joined, "`list` must report sessions in join order, like pi's Map");
+        assert_eq!(
+            listed, joined,
+            "`list` must report sessions in join order, like pi's Map"
+        );
 
         // An identity takeover is `this.sessions.set(id, …)` on an EXISTING key, which in JS keeps
         // that key's original position (`broker.ts:376`) — it must not jump to the back.
         let mut sid = None;
         register(&mut state, 900, &mut sid, "session-3");
         let after_takeover: Vec<String> = state.session_infos().into_iter().map(|s| s.id).collect();
-        assert_eq!(after_takeover, joined, "a re-register must keep the session's original position");
+        assert_eq!(
+            after_takeover, joined,
+            "a re-register must keep the session's original position"
+        );
 
         // `this.sessions.delete(id)` drops it from the order and leaves the rest intact.
         let mut sid = Some("session-7".to_string());
         state.handle_unregister(7, &make_tx(), &mut sid, 0);
-        let expected: Vec<String> = joined.iter().filter(|id| *id != "session-7").cloned().collect();
+        let expected: Vec<String> = joined
+            .iter()
+            .filter(|id| *id != "session-7")
+            .cloned()
+            .collect();
         let after_leave: Vec<String> = state.session_infos().into_iter().map(|s| s.id).collect();
-        assert_eq!(after_leave, expected, "a departure must not disturb the surviving join order");
+        assert_eq!(
+            after_leave, expected,
+            "a departure must not disturb the surviving join order"
+        );
     }
 }

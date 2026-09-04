@@ -118,7 +118,10 @@ async fn pending_never_reaches_a_settled_event_or_the_transcript() {
                 }
             }
         }
-        assert!(settled > 0, "{scripted_reason:?}: no settled assistant events recorded");
+        assert!(
+            settled > 0,
+            "{scripted_reason:?}: no settled assistant events recorded"
+        );
     }
 }
 
@@ -164,7 +167,10 @@ async fn a_turn_that_never_settled_is_an_error_not_a_completed_turn() {
             _ => None,
         })
         .collect();
-    assert_eq!(text, "hello there friend", "accumulated content must survive");
+    assert_eq!(
+        text, "hello there friend",
+        "accumulated content must survive"
+    );
 
     // And the loop must have STOPPED on it: Pi returns immediately from `streamAssistantResponse`
     // for an error/aborted turn (agent-loop.ts:342-355). A `Pending` that slipped through the

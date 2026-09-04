@@ -5,18 +5,23 @@
 //! subscription with a terminal `SessionReplaced`) and the **re-bind** side (`App::rebind_session`
 //! installs the new session's UI state). Mirrors Pi's interactive session-swap
 //! (`agent-session-runtime.ts` `newSession`/`fork` + the run-loop re-subscribe).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::{App, AppCommand, SelectorKind, UiTheme};
 use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{
     AgentSessionEvent, AgentSessionRuntime, SessionConfig, SessionFactory, SessionTarget,
 };
-use crate::{App, AppCommand, SelectorKind, UiTheme};
 use futures::StreamExt;
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
@@ -39,10 +44,15 @@ fn fixture() -> Fixture {
 
 async fn runtime(fx: &Fixture) -> Arc<AgentSessionRuntime> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let provider: Arc<dyn Provider> = faux;
     let factory = Arc::new(SessionFactory::new(provider, fx.config.clone()));
-    AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap()
+    AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap()
 }
 
 fn app() -> App<TestBackend> {
@@ -65,12 +75,21 @@ async fn new_session_command_swaps_and_rebinds_the_ui() {
     assert_eq!(rt.generation().await, 0);
 
     // Drive the command exactly as the run loop does (`AppAction::Command` arm).
-    app.execute_command(AppCommand::NewSession, &session0, Some(&rt)).await;
+    app.execute_command(AppCommand::NewSession, &session0, Some(&rt))
+        .await;
 
     // The runtime swapped the active session.
-    assert_eq!(rt.generation().await, 1, "/new bumps the replacement generation");
+    assert_eq!(
+        rt.generation().await,
+        1,
+        "/new bumps the replacement generation"
+    );
     let session1 = rt.session().await;
-    assert_ne!(session1.session_id().to_string(), id0, "a fresh session is installed");
+    assert_ne!(
+        session1.session_id().to_string(),
+        id0,
+        "a fresh session is installed"
+    );
 
     // The old subscription is terminated with a `SessionReplaced` (R-11-021) — the run loop drops it.
     let replaced = tokio::time::timeout(Duration::from_secs(2), async {
@@ -83,7 +102,10 @@ async fn new_session_command_swaps_and_rebinds_the_ui() {
     })
     .await
     .expect("old subscription should terminate promptly");
-    assert!(replaced, "the prior subscription must receive a terminal SessionReplaced");
+    assert!(
+        replaced,
+        "the prior subscription must receive a terminal SessionReplaced"
+    );
 
     // Re-subscribing the new session yields a live stream (the run loop's new `events`).
     let _new_sub = session1.subscribe();
@@ -96,7 +118,10 @@ async fn new_session_command_swaps_and_rebinds_the_ui() {
         scrollback.contains("\u{2713} New session started"),
         "rebind surfaces the swap receipt: {scrollback}"
     );
-    assert!(app.active_selector_kind().is_none(), "rebind clears any open selector");
+    assert!(
+        app.active_selector_kind().is_none(),
+        "rebind clears any open selector"
+    );
 }
 
 /// `/fork` drives `AgentSessionRuntime::fork`, switching the runtime to the new branched session
@@ -112,19 +137,29 @@ async fn fork_command_swaps_to_the_branched_session() {
     let _ = session0.prompt("remember this").await.unwrap();
     session0.wait_for_idle().await;
     let anchors = session0.user_messages_for_forking().await;
-    assert!(!anchors.is_empty(), "a user message anchor exists to fork from");
+    assert!(
+        !anchors.is_empty(),
+        "a user message anchor exists to fork from"
+    );
     let entry = anchors[0].entry_id.to_string();
     let anchor_text = anchors[0].text.clone();
     assert_eq!(rt.generation().await, 0);
 
     app.execute_command(
-        AppCommand::ConfirmSelection { kind: SelectorKind::UserMessage, value: entry },
+        AppCommand::ConfirmSelection {
+            kind: SelectorKind::UserMessage,
+            value: entry,
+        },
         &session0,
         Some(&rt),
     )
     .await;
 
-    assert_eq!(rt.generation().await, 1, "/fork bumps the replacement generation");
+    assert_eq!(
+        rt.generation().await,
+        1,
+        "/fork bumps the replacement generation"
+    );
     let session1 = rt.session().await;
     assert_ne!(
         session1.session_id().to_string(),
@@ -132,7 +167,11 @@ async fn fork_command_swaps_to_the_branched_session() {
         "fork installs a distinct branched session"
     );
     // `position:"before"` re-seeds the editor with the anchor text for re-editing.
-    assert_eq!(app.editor_mut().text(), anchor_text, "fork before re-seeds the editor");
+    assert_eq!(
+        app.editor_mut().text(),
+        anchor_text,
+        "fork before re-seeds the editor"
+    );
 
     // The run-loop re-bind resets the transcript for the new session.
     app.rebind_session();
@@ -154,7 +193,8 @@ async fn no_runtime_keeps_the_single_session_flow() {
     let session0 = rt.session().await;
 
     // `None` runtime → no swap, just a surfaced status line.
-    app.execute_command(AppCommand::NewSession, &session0, None).await;
+    app.execute_command(AppCommand::NewSession, &session0, None)
+        .await;
     app.draw().unwrap();
     assert!(app.scrollback_text().contains("starting new session"));
     assert_eq!(rt.generation().await, 0, "no runtime ⇒ no replacement");

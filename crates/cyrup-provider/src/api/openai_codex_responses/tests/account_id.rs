@@ -36,4 +36,3 @@ fn every_account_id_failure_collapses_to_one_message() {
     }));
     assert_eq!(extract_account_id(&ok).unwrap(), "acct_ok");
 }
-

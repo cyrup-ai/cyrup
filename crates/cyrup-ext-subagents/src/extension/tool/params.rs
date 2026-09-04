@@ -5,9 +5,9 @@ use cyrup_core::ToolError;
 
 use crate::discovery::types::AgentReadScope;
 use crate::exec::SingleResult;
+use crate::extension::tool::text::BLANK_ACTION_REFUSAL;
 use crate::fork_context::ContextRequest;
 use crate::registration::SubagentExtensionConfig;
-use crate::extension::tool::text::BLANK_ACTION_REFUSAL;
 
 /// The PUBLIC (model-facing) execution boundary — pi `normalizePublicSubagentExecution`
 /// (`extension/public-execution.ts:26-71` @v0.43.0) folded together with the `action` normalization
@@ -54,7 +54,9 @@ use crate::extension::tool::text::BLANK_ACTION_REFUSAL;
 /// # Errors
 ///
 /// [`BLANK_ACTION_REFUSAL`] when `action` is present and trims to empty.
-pub(crate) fn normalize_public_subagent_execution(action: Option<&str>) -> Result<Option<&str>, ToolError> {
+pub(crate) fn normalize_public_subagent_execution(
+    action: Option<&str>,
+) -> Result<Option<&str>, ToolError> {
     match action {
         None => Ok(None),
         Some(raw) => {
@@ -331,7 +333,10 @@ pub(crate) fn resolve_foreground_timeout(
     p: &SubagentToolParams,
     default_timeout_ms: Option<u64>,
 ) -> Result<Option<u64>, String> {
-    for (name, value) in [("timeoutMs", p.timeout_ms), ("maxRuntimeMs", p.max_runtime_ms)] {
+    for (name, value) in [
+        ("timeoutMs", p.timeout_ms),
+        ("maxRuntimeMs", p.max_runtime_ms),
+    ] {
         if value == Some(0) {
             return Err(format!("{name} must be a positive integer."));
         }
@@ -370,7 +375,10 @@ pub(crate) fn resolve_execution_agent_scope(raw: Option<&str>) -> AgentReadScope
 /// `details` JSON. (pi additionally appends an `Output artifact:` line from
 /// `result.artifactPaths?.outputPath`; this crate's [`SingleResult`] carries no such field — the
 /// saved-output reference is already folded into `final_output` — so that line has no analogue here.)
-pub(crate) fn format_failed_single_run_output(result: &SingleResult, display_output: &str) -> String {
+pub(crate) fn format_failed_single_run_output(
+    result: &SingleResult,
+    display_output: &str,
+) -> String {
     let error = result
         .error
         .as_deref()
@@ -401,8 +409,16 @@ impl SubagentToolParams {
     /// regardless of the async request).
     pub(crate) fn is_background(&self, cfg: &SubagentExtensionConfig, depth: u32) -> bool {
         let force_override = depth == 0 && cfg.force_top_level_async;
-        let async_param = if force_override { Some(true) } else { self.r#async };
-        let clarify = if force_override { Some(false) } else { self.clarify };
+        let async_param = if force_override {
+            Some(true)
+        } else {
+            self.r#async
+        };
+        let clarify = if force_override {
+            Some(false)
+        } else {
+            self.clarify
+        };
         let requested_async = async_param.unwrap_or(cfg.async_by_default);
         requested_async && clarify != Some(true)
     }
@@ -440,53 +456,147 @@ impl SubagentToolParams {
     /// workspace's `-D warnings` (`dead_code`) without any non-`#[cfg(test)]` `#[allow]`.
     pub(crate) fn provided_keys(&self) -> Vec<&'static str> {
         let mut keys = Vec::new();
-        if self.agent.is_some() { keys.push("agent"); }
-        if self.task.is_some() { keys.push("task"); }
-        if self.action.is_some() { keys.push("action"); }
-        if self.id.is_some() { keys.push("id"); }
-        if self.run_id.is_some() { keys.push("runId"); }
-        if self.dir.is_some() { keys.push("dir"); }
-        if self.index.is_some() { keys.push("index"); }
-        if self.view.is_some() { keys.push("view"); }
-        if self.lines.is_some() { keys.push("lines"); }
-        if self.message.is_some() { keys.push("message"); }
-        if self.chain_name.is_some() { keys.push("chainName"); }
-        if self.config.is_some() { keys.push("config"); }
-        if self.tasks.is_some() { keys.push("tasks"); }
-        if self.concurrency.is_some() { keys.push("concurrency"); }
-        if self.worktree.is_some() { keys.push("worktree"); }
-        if self.chain.is_some() { keys.push("chain"); }
-        if self.context.is_some() { keys.push("context"); }
-        if self.chain_dir.is_some() { keys.push("chainDir"); }
-        if self.r#async.is_some() { keys.push("async"); }
-        if self.timeout_ms.is_some() { keys.push("timeoutMs"); }
-        if self.max_runtime_ms.is_some() { keys.push("maxRuntimeMs"); }
-        if self.agent_scope.is_some() { keys.push("agentScope"); }
-        if self.cwd.is_some() { keys.push("cwd"); }
-        if self.artifacts.is_some() { keys.push("artifacts"); }
-        if self.include_progress.is_some() { keys.push("includeProgress"); }
-        if self.share.is_some() { keys.push("share"); }
-        if self.session_dir.is_some() { keys.push("sessionDir"); }
-        if self.clarify.is_some() { keys.push("clarify"); }
-        if self.control.is_some() { keys.push("control"); }
-        if self.output.is_some() { keys.push("output"); }
-        if self.output_mode.is_some() { keys.push("outputMode"); }
-        if self.skill.is_some() { keys.push("skill"); }
-        if self.model.is_some() { keys.push("model"); }
-        if self.output_schema.is_some() { keys.push("outputSchema"); }
-        if self.tool_budget.is_some() { keys.push("toolBudget"); }
-        if self.turn_budget.is_some() { keys.push("turnBudget"); }
-        if self.usage_budget.is_some() { keys.push("usageBudget"); }
-        if self.additional.is_some() { keys.push("additional"); }
-        if self.acceptance.is_some() { keys.push("acceptance"); }
-        if self.mission_id.is_some() { keys.push("missionId"); }
-        if self.mission.is_some() { keys.push("mission"); }
-        if self.mission_update.is_some() { keys.push("missionUpdate"); }
-        if self.mission_status.is_some() { keys.push("missionStatus"); }
-        if self.mission_scope.is_some() { keys.push("missionScope"); }
-        if self.run_mode.is_some() { keys.push("runMode"); }
-        if self.run_status.is_some() { keys.push("runStatus"); }
-        if self.summary.is_some() { keys.push("summary"); }
+        if self.agent.is_some() {
+            keys.push("agent");
+        }
+        if self.task.is_some() {
+            keys.push("task");
+        }
+        if self.action.is_some() {
+            keys.push("action");
+        }
+        if self.id.is_some() {
+            keys.push("id");
+        }
+        if self.run_id.is_some() {
+            keys.push("runId");
+        }
+        if self.dir.is_some() {
+            keys.push("dir");
+        }
+        if self.index.is_some() {
+            keys.push("index");
+        }
+        if self.view.is_some() {
+            keys.push("view");
+        }
+        if self.lines.is_some() {
+            keys.push("lines");
+        }
+        if self.message.is_some() {
+            keys.push("message");
+        }
+        if self.chain_name.is_some() {
+            keys.push("chainName");
+        }
+        if self.config.is_some() {
+            keys.push("config");
+        }
+        if self.tasks.is_some() {
+            keys.push("tasks");
+        }
+        if self.concurrency.is_some() {
+            keys.push("concurrency");
+        }
+        if self.worktree.is_some() {
+            keys.push("worktree");
+        }
+        if self.chain.is_some() {
+            keys.push("chain");
+        }
+        if self.context.is_some() {
+            keys.push("context");
+        }
+        if self.chain_dir.is_some() {
+            keys.push("chainDir");
+        }
+        if self.r#async.is_some() {
+            keys.push("async");
+        }
+        if self.timeout_ms.is_some() {
+            keys.push("timeoutMs");
+        }
+        if self.max_runtime_ms.is_some() {
+            keys.push("maxRuntimeMs");
+        }
+        if self.agent_scope.is_some() {
+            keys.push("agentScope");
+        }
+        if self.cwd.is_some() {
+            keys.push("cwd");
+        }
+        if self.artifacts.is_some() {
+            keys.push("artifacts");
+        }
+        if self.include_progress.is_some() {
+            keys.push("includeProgress");
+        }
+        if self.share.is_some() {
+            keys.push("share");
+        }
+        if self.session_dir.is_some() {
+            keys.push("sessionDir");
+        }
+        if self.clarify.is_some() {
+            keys.push("clarify");
+        }
+        if self.control.is_some() {
+            keys.push("control");
+        }
+        if self.output.is_some() {
+            keys.push("output");
+        }
+        if self.output_mode.is_some() {
+            keys.push("outputMode");
+        }
+        if self.skill.is_some() {
+            keys.push("skill");
+        }
+        if self.model.is_some() {
+            keys.push("model");
+        }
+        if self.output_schema.is_some() {
+            keys.push("outputSchema");
+        }
+        if self.tool_budget.is_some() {
+            keys.push("toolBudget");
+        }
+        if self.turn_budget.is_some() {
+            keys.push("turnBudget");
+        }
+        if self.usage_budget.is_some() {
+            keys.push("usageBudget");
+        }
+        if self.additional.is_some() {
+            keys.push("additional");
+        }
+        if self.acceptance.is_some() {
+            keys.push("acceptance");
+        }
+        if self.mission_id.is_some() {
+            keys.push("missionId");
+        }
+        if self.mission.is_some() {
+            keys.push("mission");
+        }
+        if self.mission_update.is_some() {
+            keys.push("missionUpdate");
+        }
+        if self.mission_status.is_some() {
+            keys.push("missionStatus");
+        }
+        if self.mission_scope.is_some() {
+            keys.push("missionScope");
+        }
+        if self.run_mode.is_some() {
+            keys.push("runMode");
+        }
+        if self.run_status.is_some() {
+            keys.push("runStatus");
+        }
+        if self.summary.is_some() {
+            keys.push("summary");
+        }
         keys
     }
 }
@@ -512,7 +622,10 @@ pub(crate) fn validate_execution_acceptance(params: &SubagentToolParams) -> Vec<
     }
 
     let mut errors = validate_acceptance_input(
-        params.acceptance.as_ref().unwrap_or(&serde_json::Value::Null),
+        params
+            .acceptance
+            .as_ref()
+            .unwrap_or(&serde_json::Value::Null),
         "acceptance",
     );
     for (index, task) in params.tasks.iter().flatten().enumerate() {
@@ -551,7 +664,12 @@ pub(crate) fn validate_execution_acceptance(params: &SubagentToolParams) -> Vec<
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::testsupport::scoped_tool;
@@ -569,12 +687,16 @@ mod tests {
     #[test]
     fn context_override_maps_each_value_exactly_and_treats_garbage_as_absent() {
         let parse = |value: serde_json::Value| -> Option<ContextRequest> {
-            let params: SubagentToolParams =
-                serde_json::from_value(serde_json::json!({ "agent": "w", "task": "t", "context": value }))
-                    .expect("params parse");
+            let params: SubagentToolParams = serde_json::from_value(
+                serde_json::json!({ "agent": "w", "task": "t", "context": value }),
+            )
+            .expect("params parse");
             params.context_override()
         };
-        assert_eq!(parse(serde_json::json!("fresh")), Some(ContextRequest::Fresh));
+        assert_eq!(
+            parse(serde_json::json!("fresh")),
+            Some(ContextRequest::Fresh)
+        );
         assert_eq!(parse(serde_json::json!("fork")), Some(ContextRequest::Fork));
         assert_eq!(
             parse(serde_json::json!("profile")),
@@ -656,7 +778,10 @@ mod tests {
             Ok(Some(BUILTIN)),
             "a foreground run with nothing set must be BOUNDED, not open-ended"
         );
-        assert_eq!(BUILTIN, 1_800_000, "pi `DEFAULT_FOREGROUND_TIMEOUT_MS` is 30 minutes");
+        assert_eq!(
+            BUILTIN, 1_800_000,
+            "pi `DEFAULT_FOREGROUND_TIMEOUT_MS` is 30 minutes"
+        );
     }
 
     /// pi `resolveConfigDefaultTimeoutMs` (`:2684`) returns `undefined` for ANY invalid value and
@@ -740,9 +865,11 @@ mod tests {
                 &params(serde_json::json!({"timeoutMs": 10, "maxRuntimeMs": 20})),
                 default
             ),
-            Err("timeoutMs and maxRuntimeMs are aliases; provide only one value or use the same \
+            Err(
+                "timeoutMs and maxRuntimeMs are aliases; provide only one value or use the same \
                  value for both."
-                .to_string())
+                    .to_string()
+            )
         );
     }
 
@@ -801,9 +928,9 @@ mod tests {
     #[test]
     fn async_by_default_config_key_deserializes_and_is_honored_by_is_background() {
         let cfg: SubagentExtensionConfig =
-            serde_json::from_value(serde_json::json!({ "asyncByDefault": true })).unwrap_or_else(|e| {
-                panic!("asyncByDefault must deserialize into SubagentExtensionConfig: {e}")
-            });
+            serde_json::from_value(serde_json::json!({ "asyncByDefault": true })).unwrap_or_else(
+                |e| panic!("asyncByDefault must deserialize into SubagentExtensionConfig: {e}"),
+            );
         assert!(cfg.async_by_default);
 
         let omitted: SubagentToolParams =
@@ -828,7 +955,10 @@ mod tests {
         .expect("single shape parses permissively (unknown keys ignored)");
         assert_eq!(single.agent.as_deref(), Some("worker"));
         assert!(single.is_background(&SubagentExtensionConfig::default(), 0));
-        assert!(matches!(single.context_override(), Some(ContextRequest::Fork)));
+        assert!(matches!(
+            single.context_override(),
+            Some(ContextRequest::Fork)
+        ));
         assert!(single.provided_keys().contains(&"model"));
         assert!(!single.provided_keys().contains(&"unknownFutureKey"));
 
@@ -877,8 +1007,10 @@ mod tests {
         let omitted: SubagentToolParams =
             serde_json::from_value(serde_json::json!({ "agent": "worker", "task": "do it" }))
                 .expect("single shape parses");
-        let async_by_default_cfg =
-            SubagentExtensionConfig { async_by_default: true, ..SubagentExtensionConfig::default() };
+        let async_by_default_cfg = SubagentExtensionConfig {
+            async_by_default: true,
+            ..SubagentExtensionConfig::default()
+        };
         assert!(
             omitted.is_background(&async_by_default_cfg, 0),
             "an omitted `async` must default to config.asyncByDefault"
@@ -997,8 +1129,14 @@ mod tests {
         assert_eq!(canonical.agent.as_deref(), Some("oracle"));
         let tasks = canonical.tasks.as_ref().expect("tasks kept");
         assert_eq!(tasks[0]["agent"], "worker");
-        assert_eq!(tasks[0]["task"], "a", "the rest of the task object must survive untouched");
-        assert_eq!(tasks[1]["agent"], "scout", "an already-canonical name is left alone");
+        assert_eq!(
+            tasks[0]["task"], "a",
+            "the rest of the task object must survive untouched"
+        );
+        assert_eq!(
+            tasks[1]["agent"], "scout",
+            "an already-canonical name is left alone"
+        );
 
         let chain = canonical.chain.as_ref().expect("chain kept");
         assert_eq!(chain[0]["agent"], "worker");
@@ -1043,5 +1181,4 @@ mod tests {
             "the ambiguity must name its position in the fan-out"
         );
     }
-
 }

@@ -464,15 +464,24 @@ pub struct ProjectTrustResult {
 impl ProjectTrustResult {
     /// Trust the project (Pi `{trusted:"yes"}`); `remember` persists the decision.
     pub fn trust(remember: bool) -> Self {
-        Self { trusted: ProjectTrustDecision::Yes, remember }
+        Self {
+            trusted: ProjectTrustDecision::Yes,
+            remember,
+        }
     }
     /// Distrust the project (Pi `{trusted:"no"}`).
     pub fn distrust(remember: bool) -> Self {
-        Self { trusted: ProjectTrustDecision::No, remember }
+        Self {
+            trusted: ProjectTrustDecision::No,
+            remember,
+        }
     }
     /// Abstain — defer to the next handler / host prompt (Pi `{trusted:"undecided"}`).
     pub fn undecided() -> Self {
-        Self { trusted: ProjectTrustDecision::Undecided, remember: false }
+        Self {
+            trusted: ProjectTrustDecision::Undecided,
+            remember: false,
+        }
     }
 }
 

@@ -256,10 +256,21 @@ impl<'de> serde::Deserialize<'de> for RpcResponse {
 
 impl RpcResponse {
     pub(super) fn ok(command: impl Into<String>, id: Option<Value>, data: Option<Value>) -> Self {
-        Self { id, kind: "response", command: command.into(), success: true, data, error: None }
+        Self {
+            id,
+            kind: "response",
+            command: command.into(),
+            success: true,
+            data,
+            error: None,
+        }
     }
 
-    pub(super) fn err(command: impl Into<String>, id: Option<Value>, error: impl Into<String>) -> Self {
+    pub(super) fn err(
+        command: impl Into<String>,
+        id: Option<Value>,
+        error: impl Into<String>,
+    ) -> Self {
         Self {
             id,
             kind: "response",

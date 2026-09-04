@@ -4,20 +4,25 @@
 //! `FauxProvider` and assert that auto-retry, post-run auto-compaction, the `agent_end.willRetry`
 //! payload, and `auto_retry_end{success}` ACTUALLY fire from the wired run path. The session is bound
 //! via `into_shared()` exactly as the runtime / SDK / print-mode bind it in production.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::{AgentSessionEvent, InputSource, SessionBuilder, SessionConfig, UserInput};
 use cyrup_core::{AssistantMessage, ExtensionId, StopReason};
 use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_assistant_message_with, faux_text, FauxMessageOptions, FauxProvider,
-    FauxResponseStep,
-};
 use cyrup_provider::Provider;
-use crate::{AgentSessionEvent, InputSource, SessionBuilder, SessionConfig, UserInput};
+use cyrup_provider::faux::{
+    FauxMessageOptions, FauxProvider, FauxResponseStep, faux_assistant_message,
+    faux_assistant_message_with, faux_text,
+};
 use futures::StreamExt;
 use tempfile::TempDir;
 
@@ -33,7 +38,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -45,8 +54,11 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 /// A near-instant retry backoff so the success path completes promptly.
 fn fast_retry_settings() -> cyrup_config::Settings {
     let mut cli = cyrup_config::Settings::new();
-    cli.set_field("retry", serde_json::json!({"enabled": true, "maxRetries": 3, "baseDelayMs": 1}))
-        .unwrap();
+    cli.set_field(
+        "retry",
+        serde_json::json!({"enabled": true, "maxRetries": 3, "baseDelayMs": 1}),
+    )
+    .unwrap();
     cli
 }
 
@@ -69,7 +81,10 @@ async fn assembled_run_auto_retries_a_transient_error_then_recovers() {
         faux_assistant_message_with(
             Vec::new(),
             StopReason::Error,
-            FauxMessageOptions { error_message: Some("overloaded".into()), ..Default::default() },
+            FauxMessageOptions {
+                error_message: Some("overloaded".into()),
+                ..Default::default()
+            },
         ),
         faux_assistant_message(vec![faux_text("recovered")], StopReason::Stop),
     ]);
@@ -91,17 +106,38 @@ async fn assembled_run_auto_retries_a_transient_error_then_recovers() {
     let ks = kinds(&events);
 
     // The continuation actually happened in the assembled run: BOTH scripted responses consumed.
-    assert_eq!(faux.call_count(), 2, "provider must be hit a second time (the auto-retry continuation)");
+    assert_eq!(
+        faux.call_count(),
+        2,
+        "provider must be hit a second time (the auto-retry continuation)"
+    );
 
     // auto_retry_start fired from the completed turn (NOT a hand call).
-    assert!(ks.contains(&"auto_retry_start"), "auto_retry_start must fire from the run: {ks:?}");
+    assert!(
+        ks.contains(&"auto_retry_start"),
+        "auto_retry_start must fire from the run: {ks:?}"
+    );
 
     // auto_retry_end{success:true} fired on the recovered message_end + the retry counter reset.
     let retry_end_success = events.iter().any(|e| {
-        matches!(e, AgentSessionEvent::AutoRetryEnd { success: true, attempt: 1, .. })
+        matches!(
+            e,
+            AgentSessionEvent::AutoRetryEnd {
+                success: true,
+                attempt: 1,
+                ..
+            }
+        )
     });
-    assert!(retry_end_success, "auto_retry_end{{success:true, attempt:1}} must fire: {ks:?}");
-    assert_eq!(session.retry_attempt(), 0, "retry counter resets on the successful continuation");
+    assert!(
+        retry_end_success,
+        "auto_retry_end{{success:true, attempt:1}} must fire: {ks:?}"
+    );
+    assert_eq!(
+        session.retry_attempt(),
+        0,
+        "retry counter resets on the successful continuation"
+    );
 
     // The FIRST agent_end carried willRetry:true; the LAST carried willRetry:false.
     let agent_ends: Vec<bool> = events
@@ -111,12 +147,25 @@ async fn assembled_run_auto_retries_a_transient_error_then_recovers() {
             _ => None,
         })
         .collect();
-    assert_eq!(agent_ends.len(), 2, "two agent_end events (error turn + recovered turn): {ks:?}");
-    assert!(agent_ends[0], "first agent_end.willRetry must be true (transient error pending retry)");
-    assert!(!agent_ends[1], "final agent_end.willRetry must be false (clean success)");
+    assert_eq!(
+        agent_ends.len(),
+        2,
+        "two agent_end events (error turn + recovered turn): {ks:?}"
+    );
+    assert!(
+        agent_ends[0],
+        "first agent_end.willRetry must be true (transient error pending retry)"
+    );
+    assert!(
+        !agent_ends[1],
+        "final agent_end.willRetry must be false (clean success)"
+    );
 
     // The session settled on the recovered answer.
-    assert_eq!(session.last_assistant_text().await.as_deref(), Some("recovered"));
+    assert_eq!(
+        session.last_assistant_text().await.as_deref(),
+        Some("recovered")
+    );
 }
 
 // ============================================================================ A.1 post-run compact ====
@@ -147,7 +196,10 @@ async fn assembled_run_triggers_post_run_overflow_compaction() {
     );
     faux.set_responses(vec![overflow]);
 
-    assert!(session.auto_compaction_enabled(), "auto-compaction on by default");
+    assert!(
+        session.auto_compaction_enabled(),
+        "auto-compaction on by default"
+    );
 
     let stream = session
         .prompt(UserInput::text("overflow me", InputSource::Sdk))
@@ -169,9 +221,15 @@ async fn assembled_run_triggers_post_run_overflow_compaction() {
             })
             .unwrap_or(false)
     });
-    assert!(overflow_start, "compaction_start{{reason:overflow}} must fire from the run: {ks:?}");
+    assert!(
+        overflow_start,
+        "compaction_start{{reason:overflow}} must fire from the run: {ks:?}"
+    );
     // A retryable-error path was NOT taken (overflow is excluded from retry).
-    assert!(!ks.contains(&"auto_retry_start"), "overflow must NOT be retried: {ks:?}");
+    assert!(
+        !ks.contains(&"auto_retry_start"),
+        "overflow must NOT be retried: {ks:?}"
+    );
 }
 
 /// SEAM-112 — after a successful OVERFLOW compaction the interrupted turn must actually be RETRIED.
@@ -236,16 +294,22 @@ async fn a_successful_overflow_compaction_retries_the_interrupted_turn() {
         faux_assistant_message(vec![faux_text("RETRIED ANSWER")], StopReason::Stop),
     ]);
 
-    let stream = session.prompt("tell me two").await.expect("prompt accepted");
+    let stream = session
+        .prompt("tell me two")
+        .await
+        .expect("prompt accepted");
     session.wait_for_idle().await;
     let events: Vec<AgentSessionEvent> = stream.collect().await;
     let ks = kinds(&events);
 
     // The compaction ran, succeeded, and carried pi's `willRetry` through to its end event.
     let end = events.iter().find_map(|e| match e {
-        AgentSessionEvent::CompactionEnd { reason, result, will_retry, .. } => {
-            Some((*reason, result.is_some(), *will_retry))
-        }
+        AgentSessionEvent::CompactionEnd {
+            reason,
+            result,
+            will_retry,
+            ..
+        } => Some((*reason, result.is_some(), *will_retry)),
         _ => None,
     });
     assert_eq!(
@@ -288,7 +352,10 @@ async fn unbound_session_does_not_run_the_post_run_loop() {
         faux_assistant_message_with(
             Vec::new(),
             StopReason::Error,
-            FauxMessageOptions { error_message: Some("overloaded".into()), ..Default::default() },
+            FauxMessageOptions {
+                error_message: Some("overloaded".into()),
+                ..Default::default()
+            },
         ),
         faux_assistant_message(vec![faux_text("unreached")], StopReason::Stop),
     ]);
@@ -299,12 +366,22 @@ async fn unbound_session_does_not_run_the_post_run_loop() {
         .await
         .expect("build"); // NOT bound — plain by-value session.
 
-    let stream = session.prompt(UserInput::text("go", InputSource::Sdk)).await.expect("prompt");
+    let stream = session
+        .prompt(UserInput::text("go", InputSource::Sdk))
+        .await
+        .expect("prompt");
     session.wait_for_idle().await;
     let events: Vec<AgentSessionEvent> = stream.collect().await;
 
-    assert_eq!(faux.call_count(), 1, "unbound session runs a single turn (no post-run retry)");
-    assert!(!kinds(&events).contains(&"auto_retry_start"), "no auto-retry on an unbound session");
+    assert_eq!(
+        faux.call_count(),
+        1,
+        "unbound session runs a single turn (no post-run retry)"
+    );
+    assert!(
+        !kinds(&events).contains(&"auto_retry_start"),
+        "no auto-retry on an unbound session"
+    );
 }
 
 // ============================================================================ R6 user_agents_dir ====
@@ -332,10 +409,13 @@ async fn builder_loads_user_tier_agents_skills() {
     let session = SessionBuilder::new(faux, cfg).build().await.expect("build");
 
     let catalog = session.slash_command_catalog();
-    let has_user_skill = catalog.iter().any(|c| {
-        c.get("name").and_then(serde_json::Value::as_str) == Some("skill:userskill")
-    });
-    assert!(has_user_skill, "user-tier ~/.agents/skills/userskill must be discovered: {catalog:?}");
+    let has_user_skill = catalog
+        .iter()
+        .any(|c| c.get("name").and_then(serde_json::Value::as_str) == Some("skill:userskill"));
+    assert!(
+        has_user_skill,
+        "user-tier ~/.agents/skills/userskill must be discovered: {catalog:?}"
+    );
 }
 
 // ============================================================================ A.6 session_info ====
@@ -353,7 +433,10 @@ async fn set_session_name_emits_session_info_changed() {
         .into_shared();
 
     let mut stream = session.subscribe();
-    session.set_session_name("my session").await.expect("set name");
+    session
+        .set_session_name("my session")
+        .await
+        .expect("set name");
 
     let mut found: Option<Option<String>> = None;
     while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
@@ -362,7 +445,11 @@ async fn set_session_name_emits_session_info_changed() {
             break;
         }
     }
-    assert_eq!(found, Some(Some("my session".to_string())), "session_info_changed{{name}} must fire");
+    assert_eq!(
+        found,
+        Some(Some("my session".to_string())),
+        "session_info_changed{{name}} must fire"
+    );
     assert_eq!(session.session_name().await.as_deref(), Some("my session"));
 }
 
@@ -380,7 +467,10 @@ impl NativeExtension for InfoChangedRecorder {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         if let HostEvent::SessionInfoChanged { name } = ev {
-            self.0.lock().unwrap_or_else(|e| e.into_inner()).push(name.clone());
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(name.clone());
         }
         HookOutcome::Noop
     }
@@ -407,7 +497,10 @@ async fn set_session_name_also_dispatches_the_session_info_changed_extension_eve
         .expect("build")
         .into_shared();
 
-    session.set_session_name("my session").await.expect("set name");
+    session
+        .set_session_name("my session")
+        .await
+        .expect("set name");
 
     assert_eq!(
         seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
@@ -419,7 +512,10 @@ async fn set_session_name_also_dispatches_the_session_info_changed_extension_eve
     // sees the SAME `None` the `AgentSessionEvent` subscribers do.
     session.set_session_name("   ").await.expect("clear name");
     assert_eq!(
-        seen.lock().unwrap_or_else(|e| e.into_inner()).last().cloned(),
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .cloned(),
         Some(None),
         "a blank rename dispatches `name: None`, not the previous name"
     );
@@ -442,7 +538,8 @@ async fn set_session_name_also_dispatches_the_session_info_changed_extension_eve
 async fn websocket_connect_timeout_setting_reaches_the_providers_stream_options() {
     let fx = fixture();
     let mut cli = cyrup_config::Settings::new();
-    cli.set_field("websocketConnectTimeoutMs", serde_json::json!(7_500)).unwrap();
+    cli.set_field("websocketConnectTimeoutMs", serde_json::json!(7_500))
+        .unwrap();
 
     let seen: Arc<std::sync::Mutex<Vec<Option<u64>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let faux = Arc::new(FauxProvider::new());
@@ -463,7 +560,10 @@ async fn websocket_connect_timeout_setting_reaches_the_providers_stream_options(
         .expect("build")
         .into_shared();
 
-    let _ = session.prompt(UserInput::text("go", InputSource::Sdk)).await.expect("prompt");
+    let _ = session
+        .prompt(UserInput::text("go", InputSource::Sdk))
+        .await
+        .expect("prompt");
     session.wait_for_idle().await;
 
     assert_eq!(
@@ -489,12 +589,19 @@ async fn system_md_and_append_system_md_are_discovered_and_read() {
     let fx = fixture();
     std::fs::create_dir_all(fx.cwd.join(".cyrup")).unwrap();
     std::fs::write(fx.cwd.join(".cyrup/SYSTEM.md"), "PROJECT-SYSTEM-BODY").unwrap();
-    std::fs::write(fx.cwd.join(".cyrup/APPEND_SYSTEM.md"), "PROJECT-APPEND-BODY").unwrap();
+    std::fs::write(
+        fx.cwd.join(".cyrup/APPEND_SYSTEM.md"),
+        "PROJECT-APPEND-BODY",
+    )
+    .unwrap();
     // A global pair too, to pin the PRECEDENCE: the trusted project file must win.
     std::fs::write(fx.agent_dir.join("SYSTEM.md"), "GLOBAL-SYSTEM-BODY").unwrap();
 
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.expect("build");
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .build()
+        .await
+        .expect("build");
 
     let prompt = session.system_prompt().to_string();
     assert!(
@@ -546,7 +653,11 @@ async fn a_cli_prompt_suppresses_discovery_rather_than_stacking() {
     let fx = fixture();
     std::fs::create_dir_all(fx.cwd.join(".cyrup")).unwrap();
     std::fs::write(fx.cwd.join(".cyrup/SYSTEM.md"), "PROJECT-SYSTEM-BODY").unwrap();
-    std::fs::write(fx.cwd.join(".cyrup/APPEND_SYSTEM.md"), "PROJECT-APPEND-BODY").unwrap();
+    std::fs::write(
+        fx.cwd.join(".cyrup/APPEND_SYSTEM.md"),
+        "PROJECT-APPEND-BODY",
+    )
+    .unwrap();
 
     let mut cfg = base_config(&fx);
     cfg.system_prompt = Some("CLI-SYSTEM-BODY".to_string());
@@ -557,8 +668,14 @@ async fn a_cli_prompt_suppresses_discovery_rather_than_stacking() {
     let prompt = session.system_prompt().to_string();
     assert!(prompt.contains("CLI-SYSTEM-BODY"), "{prompt}");
     assert!(prompt.contains("CLI-APPEND-BODY"), "{prompt}");
-    assert!(!prompt.contains("PROJECT-SYSTEM-BODY"), "discovery must be suppressed: {prompt}");
-    assert!(!prompt.contains("PROJECT-APPEND-BODY"), "discovery must be suppressed: {prompt}");
+    assert!(
+        !prompt.contains("PROJECT-SYSTEM-BODY"),
+        "discovery must be suppressed: {prompt}"
+    );
+    assert!(
+        !prompt.contains("PROJECT-APPEND-BODY"),
+        "discovery must be suppressed: {prompt}"
+    );
 }
 
 /// EXT-038 / TOOL-021 — an extension-contributed tool's `promptSnippet` and `promptGuidelines`

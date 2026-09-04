@@ -35,16 +35,19 @@ impl IntercomTool {
         // carrying a file/snippet sent the prose and silently lost the payload — and the
         // audit entry below recorded the same lie.
         let result = client
-            .send(&target.from.id, SendOptions {
-                text: message.clone(),
-                attachments: params.attachments.clone(),
-                reply_to: Some(target.message.id.clone()),
-                expects_reply: None,
-                message_id: None,
-                supersedes: None,
-                retry_of: None,
-                provenance: None,
-            })
+            .send(
+                &target.from.id,
+                SendOptions {
+                    text: message.clone(),
+                    attachments: params.attachments.clone(),
+                    reply_to: Some(target.message.id.clone()),
+                    expects_reply: None,
+                    message_id: None,
+                    supersedes: None,
+                    retry_of: None,
+                    provenance: None,
+                },
+            )
             .await
             .map_err(to_tool_err)?;
         // `index.ts:1692-1706`: the dismissal runs ONLY on a confirmed delivery (`:1718`); a

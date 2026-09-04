@@ -265,7 +265,8 @@ pub fn show_prompts(state: &McpState, has_ui: bool) -> String {
         .get_all_connections()
         .into_iter()
         .filter(|(_, connection)| {
-            connection.status() == ConnectionStatus::Connected && connection.prompt_discovery_failed()
+            connection.status() == ConnectionStatus::Connected
+                && connection.prompt_discovery_failed()
         })
         .map(|(name, _)| name)
         .collect();
@@ -293,8 +294,8 @@ pub fn show_prompts(state: &McpState, has_ui: bool) -> String {
 // The prologue, the split and the switch (`index.ts:501-617`)
 // =================================================================================================
 
-use cyrup_ext::native::HostCtx;
 use cyrup_ext::ExtError;
+use cyrup_ext::native::HostCtx;
 
 use crate::McpExtension;
 
@@ -365,7 +366,10 @@ impl McpExtension {
         // are not interchangeable: `/mcp logout my server` targets `"my server"` and
         // `/mcp reconnect a b` targets `"a"`.
         let target_server = parts.get(1).copied();
-        let rest = parts.get(1..).map(|rest| rest.join(" ")).unwrap_or_default();
+        let rest = parts
+            .get(1..)
+            .map(|rest| rest.join(" "))
+            .unwrap_or_default();
 
         match subcommand {
             "reconnect" => {
@@ -388,7 +392,10 @@ impl McpExtension {
                         "MCP setup is unavailable when config is supplied by createMcpAdapter().",
                         NotifyKind::Info,
                     );
-                } else if self.arm_setup(&cmd, crate::ui::SetupScreen::Setup, true).await {
+                } else if self
+                    .arm_setup(&cmd, crate::ui::SetupScreen::Setup, true)
+                    .await
+                {
                     if !cmd.alive() {
                         return Ok(None);
                     }
@@ -446,7 +453,9 @@ impl McpExtension {
     fn arm_set_disabled(&self, state: &McpState, cmd: &CommandCtx, sub: &str, name: &str) {
         if state.programmatic_config.is_some() {
             cmd.notify(
-                &format!("/mcp {sub} is unavailable when config is supplied by createMcpAdapter()."),
+                &format!(
+                    "/mcp {sub} is unavailable when config is supplied by createMcpAdapter()."
+                ),
                 NotifyKind::Info,
             );
             return;
@@ -593,8 +602,7 @@ impl McpExtension {
         let discovery = self
             .config_context()
             .mcp_discovery_summary(include_host_configs, &mut diagnostics);
-        let onboarding =
-            crate::onboarding::load_onboarding_state(&self.dirs().onboarding_state());
+        let onboarding = crate::onboarding::load_onboarding_state(&self.dirs().onboarding_state());
 
         // The callbacks own the flag `openMcpSetup` closes over, so the caller reads it back off
         // the same object after the panel resolves.
@@ -721,7 +729,9 @@ impl McpExtension {
         // GUARD 3 — nothing configured yet. `/mcp` on a fresh machine is a SETUP prompt, not an
         // empty table, and it opens on the Empty screen with import discovery OFF.
         if state.config.mcp_servers.is_empty() {
-            return self.arm_setup(cmd, crate::ui::SetupScreen::Empty, false).await;
+            return self
+                .arm_setup(cmd, crate::ui::SetupScreen::Empty, false)
+                .await;
         }
         let (Some(ui), Some(weak)) = (cmd.ui.as_ref(), self.self_handle()) else {
             // No fenced handle, or an extension not built through `into_arc` (the in-crate unit
@@ -739,8 +749,7 @@ impl McpExtension {
         let cache = crate::dirs::load_metadata_cache(&self.dirs().metadata_cache());
 
         let summary = config_context.mcp_standard_config_summary(&mut diagnostics);
-        let onboarding =
-            crate::onboarding::load_onboarding_state(&self.dirs().onboarding_state());
+        let onboarding = crate::onboarding::load_onboarding_state(&self.dirs().onboarding_state());
         let (notice_lines, fingerprint) =
             crate::panel_host::shared_config_notice(&summary, &onboarding);
 
@@ -851,7 +860,14 @@ impl McpExtension {
 /// same eight are `mcp_command_descriptor`'s static `completions`, which is the list the `/` menu
 /// shows before any argument is typed; this is the list shown *after* `/mcp `.
 const MCP_SUBCOMMANDS: [&str; 8] = [
-    "reconnect", "tools", "prompts", "setup", "logout", "disable", "enable", "status",
+    "reconnect",
+    "tools",
+    "prompts",
+    "setup",
+    "logout",
+    "disable",
+    "enable",
+    "status",
 ];
 
 /// `getArgumentCompletions` (`index.ts:470-497`) — both branches.
@@ -868,11 +884,7 @@ const MCP_SUBCOMMANDS: [&str; 8] = [
 /// typed into the prompt verbatim. Upstream's `{value, label}` pair has no counterpart on this
 /// path, so the label half is dropped rather than smuggled into the value.
 #[must_use]
-pub(crate) fn argument_completions(
-    ext: &McpExtension,
-    command: &str,
-    prefix: &str,
-) -> Vec<String> {
+pub(crate) fn argument_completions(ext: &McpExtension, command: &str, prefix: &str) -> Vec<String> {
     // `/mcp-auth` deliberately declares NO completer upstream — an asymmetry with `/mcp`, kept.
     if command != crate::registration::MCP_COMMAND {
         return Vec::new();
@@ -944,7 +956,9 @@ mod tests {
     fn config_with(servers: &[(&str, ServerEntry)]) -> McpConfig {
         let mut config = McpConfig::default();
         for (name, entry) in servers {
-            config.mcp_servers.insert((*name).to_string(), entry.clone());
+            config
+                .mcp_servers
+                .insert((*name).to_string(), entry.clone());
         }
         config
     }
@@ -972,7 +986,11 @@ mod tests {
     fn the_subcommand_branch_filters_by_prefix_not_fuzzily() {
         let ext = ext();
         let rows = argument_completions(&ext, crate::registration::MCP_COMMAND, "");
-        assert_eq!(rows.len(), 8, "all eight, and only eight — `token` is not one of them");
+        assert_eq!(
+            rows.len(),
+            8,
+            "all eight, and only eight — `token` is not one of them"
+        );
         assert!(!rows.iter().any(|row| row == "token"));
 
         let rows = argument_completions(&ext, crate::registration::MCP_COMMAND, "re");
@@ -1032,10 +1050,16 @@ mod tests {
 
         let out = show_status(&state, true);
         assert!(out.contains("srv: failed"), "got {out}");
-        assert!(!out.contains("cached"), "the failed rung must win; got {out}");
+        assert!(
+            !out.contains("cached"),
+            "the failed rung must win; got {out}"
+        );
         // The failed arm's suffix is empty — no tool count beside a failure.
         assert!(!out.contains("2 tools"), "got {out}");
-        assert!(out.contains("boom"), "the sanitized reason rides the row; got {out}");
+        assert!(
+            out.contains("boom"),
+            "the sanitized reason rides the row; got {out}"
+        );
     }
 
     /// With no failure recorded, the same metadata takes the `cached` rung and carries the count.
@@ -1054,7 +1078,10 @@ mod tests {
     /// A disabled server renders its own row via `continue` — **no tool suffix**, ever.
     #[test]
     fn a_disabled_server_has_no_tool_suffix() {
-        let disabled = ServerEntry { disabled: Some(true), ..Default::default() };
+        let disabled = ServerEntry {
+            disabled: Some(true),
+            ..Default::default()
+        };
         let state = state_with(config_with(&[("srv", disabled)]));
         state
             .tool_metadata
@@ -1066,7 +1093,10 @@ mod tests {
             out.contains("srv: disabled (run /mcp enable srv, then /reload)"),
             "got {out}"
         );
-        assert!(!out.contains("tools"), "a disabled row carries no count; got {out}");
+        assert!(
+            !out.contains("tools"),
+            "a disabled row carries no count; got {out}"
+        );
     }
 
     /// All three listings are UI-GATED, not headless: each returns `""` so `notify_multiline` skips
@@ -1089,7 +1119,10 @@ mod tests {
             .lock()
             .unwrap()
             .insert("srv".to_string(), vec![tool("only")]);
-        assert!(show_tools(&state, true).ends_with("Total: 1 tools"), "never singularised");
+        assert!(
+            show_tools(&state, true).ends_with("Total: 1 tools"),
+            "never singularised"
+        );
 
         state.prompt_metadata.lock().unwrap().insert(
             "srv".to_string(),
@@ -1114,7 +1147,10 @@ mod tests {
     /// server explicitly disabled in the config does not.
     #[test]
     fn an_unconfigured_server_still_lists_but_a_disabled_one_does_not() {
-        let disabled = ServerEntry { disabled: Some(true), ..Default::default() };
+        let disabled = ServerEntry {
+            disabled: Some(true),
+            ..Default::default()
+        };
         let state = state_with(config_with(&[("off", disabled)]));
         {
             let mut metadata = state.tool_metadata.lock().unwrap();
@@ -1122,8 +1158,14 @@ mod tests {
             metadata.insert("ghost".to_string(), vec![tool("orphan")]);
         }
         let out = show_tools(&state, true);
-        assert!(out.contains("orphan"), "an unconfigured server lists; got {out}");
-        assert!(!out.contains("hidden"), "a disabled server does not; got {out}");
+        assert!(
+            out.contains("orphan"),
+            "an unconfigured server lists; got {out}"
+        );
+        assert!(
+            !out.contains("hidden"),
+            "a disabled server does not; got {out}"
+        );
     }
 
     /// The empty-config message is two lines and replaces the rows entirely.
@@ -1165,6 +1207,9 @@ mod tests {
             !second.changed,
             "a repeat must report no change so the arm says `is already disabled`"
         );
-        assert_eq!(first.path, second.path, "both name the same project override file");
+        assert_eq!(
+            first.path, second.path,
+            "both name the same project override file"
+        );
     }
 }

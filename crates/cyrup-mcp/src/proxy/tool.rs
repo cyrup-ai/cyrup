@@ -5,20 +5,25 @@
 
 use std::sync::{Arc, OnceLock};
 
-use serde::{Deserialize};
-use serde_json::{json, Map as JsonMap, Value};
+use serde::Deserialize;
+use serde_json::{Map as JsonMap, Value, json};
 
-use cyrup_core::{CancelToken, Tool, ToolCallId, ToolError, ToolRenderKind, ToolResult, ToolUpdateSink};
-
-use crate::config::{
-    McpSettings, ToolResultRendering,
+use cyrup_core::{
+    CancelToken, Tool, ToolCallId, ToolError, ToolRenderKind, ToolResult, ToolUpdateSink,
 };
+
+use crate::config::{McpSettings, ToolResultRendering};
 use crate::errors::McpError;
 use crate::owner::McpRuntimeOwner;
 use crate::proxy::auth::{execute_auth_complete, execute_auth_start, execute_connect};
 use crate::proxy::call::execute_call;
-use crate::proxy::constants::{INIT_WAIT_TIMEOUT_MS, MCP_TOOL_GUIDELINE, MCP_TOOL_LABEL, MCP_TOOL_NAME, MCP_TOOL_PROMPT_SNIPPET};
-use crate::proxy::discovery::{execute_describe, execute_instructions, execute_list, execute_search, execute_status};
+use crate::proxy::constants::{
+    INIT_WAIT_TIMEOUT_MS, MCP_TOOL_GUIDELINE, MCP_TOOL_LABEL, MCP_TOOL_NAME,
+    MCP_TOOL_PROMPT_SNIPPET,
+};
+use crate::proxy::discovery::{
+    execute_describe, execute_instructions, execute_list, execute_search, execute_status,
+};
 use crate::proxy::env::ProxyCtx;
 use crate::proxy::error_vocab::McpErrorCode;
 use crate::proxy::results::{details_err, text_result};
@@ -175,7 +180,9 @@ fn parse_args(value: Option<&Value>) -> Result<Option<Value>, ToolError> {
         Value::Number(_) => "number",
         Value::Bool(_) => "boolean",
     };
-    Err(ToolError::new(format!("Invalid args: expected a JSON object, got {got_type}")))
+    Err(ToolError::new(format!(
+        "Invalid args: expected a JSON object, got {got_type}"
+    )))
 }
 
 /// The init gate's four states — upstream's `state` slot crossed with its `initPromise` slot.
@@ -213,7 +220,10 @@ impl ProxyInitGate {
     /// Build a gate over the generation's phase channel.
     #[must_use]
     pub fn new(phase: tokio::sync::watch::Receiver<InitPhase>) -> Self {
-        Self { phase, owner: arc_swap::ArcSwapOption::empty() }
+        Self {
+            phase,
+            owner: arc_swap::ArcSwapOption::empty(),
+        }
     }
 
     /// Publish the generation's owner — upstream's `currentOwner = owner` assignment.
@@ -399,7 +409,10 @@ impl Tool for McpTool {
                     Value::String(McpErrorCode::InitFailed.as_str().to_string()),
                 );
                 map.insert("message".to_string(), Value::String(message.clone()));
-                return Ok(text_result(format!("MCP initialization failed: {message}"), map));
+                return Ok(text_result(
+                    format!("MCP initialization failed: {message}"),
+                    map,
+                ));
             }
             InitWait::NotInitialized => {
                 let mut map = JsonMap::new();
@@ -414,7 +427,9 @@ impl Tool for McpTool {
         // 3 · The generation fence — a stale lifecycle generation aborts rather than writing into a
         // restarted session.
         if let Some(owner) = execute_owner.as_ref() {
-            owner.throw_if_inactive().map_err(|error| ToolError::new(error.to_string()))?;
+            owner
+                .throw_if_inactive()
+                .map_err(|error| ToolError::new(error.to_string()))?;
         }
 
         // 4 · Dispatch, first match wins. Nine arms after the cut, in unchanged relative order. An
@@ -423,24 +438,30 @@ impl Tool for McpTool {
         let to_tool_error = |error: McpError| ToolError::new(error.to_string());
         match params.action.as_deref() {
             Some("auth-start") => {
-                let Some(server) = params.server.as_deref().filter(|value| !value.is_empty()) else {
+                let Some(server) = params.server.as_deref().filter(|value| !value.is_empty())
+                else {
                     let map = details_err("auth-start", McpErrorCode::MissingServer);
                     return Ok(text_result(
                         "auth-start requires `server`. Example: mcp({ action: \"auth-start\", server: \"linear-server\" })",
                         map,
                     ));
                 };
-                return execute_auth_start(&ctx, server, &cancel).await.map_err(to_tool_error);
+                return execute_auth_start(&ctx, server, &cancel)
+                    .await
+                    .map_err(to_tool_error);
             }
             Some("auth-complete") => {
-                let Some(server) = params.server.as_deref().filter(|value| !value.is_empty()) else {
+                let Some(server) = params.server.as_deref().filter(|value| !value.is_empty())
+                else {
                     let map = details_err("auth-complete", McpErrorCode::MissingServer);
                     return Ok(text_result("auth-complete requires `server`.", map));
                 };
                 let input = parsed_args
                     .as_ref()
                     .and_then(|args| {
-                        args.get("redirectUrl").or_else(|| args.get("code")).or_else(|| args.get("input"))
+                        args.get("redirectUrl")
+                            .or_else(|| args.get("code"))
+                            .or_else(|| args.get("input"))
                     })
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty());
@@ -451,7 +472,9 @@ impl Tool for McpTool {
                         map,
                     ));
                 };
-                return execute_auth_complete(&ctx, server, input, &cancel).await.map_err(to_tool_error);
+                return execute_auth_complete(&ctx, server, input, &cancel)
+                    .await
+                    .map_err(to_tool_error);
             }
             _ => {}
         }
@@ -470,7 +493,9 @@ impl Tool for McpTool {
             .map_err(to_tool_error);
         }
         if let Some(server) = params.connect.as_deref().filter(|value| !value.is_empty()) {
-            let result = execute_connect(&ctx, server, &cancel).await.map_err(to_tool_error)?;
+            let result = execute_connect(&ctx, server, &cancel)
+                .await
+                .map_err(to_tool_error)?;
             // `syncToolSurface(ctx)` runs AFTER the mode returns and BEFORE the result is handed
             // back, so the next turn sees the refreshed surface.
             ctx.env.sync_tool_surface();
@@ -479,7 +504,11 @@ impl Tool for McpTool {
         if let Some(name) = params.describe.as_deref().filter(|value| !value.is_empty()) {
             return Ok(execute_describe(&ctx, name));
         }
-        if let Some(server) = params.instructions.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(server) = params
+            .instructions
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
             return Ok(execute_instructions(&ctx, server));
         }
         // `!== undefined`, so `search: ""` reaches the mode rather than falling through to status.
@@ -502,7 +531,12 @@ impl Tool for McpTool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::proxy::testsupport::{FakeEnv, config_with, ctx_with, stdio};
@@ -515,19 +549,34 @@ mod tests {
     fn tool_schema_declares_twelve_optional_properties_and_two_actions() {
         let schema = mcp_tool_schema();
         assert_eq!(schema["type"], json!("object"));
-        assert!(schema.get("required").is_none(), "every property is optional");
+        assert!(
+            schema.get("required").is_none(),
+            "every property is optional"
+        );
         let properties = schema["properties"].as_object().expect("properties");
         assert_eq!(properties.len(), 12);
         for name in [
-            "tool", "args", "connect", "describe", "instructions", "search", "regex",
-            "includeSchemas", "limit", "offset", "server", "action",
+            "tool",
+            "args",
+            "connect",
+            "describe",
+            "instructions",
+            "search",
+            "regex",
+            "includeSchemas",
+            "limit",
+            "offset",
+            "server",
+            "action",
         ] {
             assert!(properties.contains_key(name), "missing property {name}");
         }
         // `args` is a union, not a bare string.
         assert!(properties["args"]["anyOf"].is_array());
         // The cut-driven edit: exactly two legal actions are named.
-        let action = properties["action"]["description"].as_str().expect("description");
+        let action = properties["action"]["description"]
+            .as_str()
+            .expect("description");
         assert_eq!(action, "Action: 'auth-start' or 'auth-complete'");
         assert!(!action.contains("ui-messages"));
 
@@ -537,8 +586,18 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                "action", "args", "connect", "describe", "includeSchemas", "instructions", "limit",
-                "offset", "regex", "search", "server", "tool"
+                "action",
+                "args",
+                "connect",
+                "describe",
+                "includeSchemas",
+                "instructions",
+                "limit",
+                "offset",
+                "regex",
+                "search",
+                "server",
+                "tool"
             ]
         );
     }
@@ -549,17 +608,36 @@ mod tests {
     fn parse_args_accepts_objects_and_json_strings_and_throws_otherwise() {
         assert_eq!(parse_args(None).unwrap(), None);
         assert_eq!(parse_args(Some(&json!(""))).unwrap(), None);
-        assert_eq!(parse_args(Some(&json!({"a": 1}))).unwrap(), Some(json!({"a": 1})));
-        assert_eq!(parse_args(Some(&json!("{\"a\":1}"))).unwrap(), Some(json!({"a": 1})));
+        assert_eq!(
+            parse_args(Some(&json!({"a": 1}))).unwrap(),
+            Some(json!({"a": 1}))
+        );
+        assert_eq!(
+            parse_args(Some(&json!("{\"a\":1}"))).unwrap(),
+            Some(json!({"a": 1}))
+        );
 
         let array = parse_args(Some(&json!([]))).unwrap_err();
-        assert_eq!(array.message, "Invalid args: expected a JSON object, got array");
+        assert_eq!(
+            array.message,
+            "Invalid args: expected a JSON object, got array"
+        );
         let null_literal = parse_args(Some(&json!("null"))).unwrap_err();
-        assert_eq!(null_literal.message, "Invalid args: expected a JSON object, got null");
+        assert_eq!(
+            null_literal.message,
+            "Invalid args: expected a JSON object, got null"
+        );
         let number = parse_args(Some(&json!(7))).unwrap_err();
-        assert_eq!(number.message, "Invalid args: expected a JSON object, got number");
+        assert_eq!(
+            number.message,
+            "Invalid args: expected a JSON object, got number"
+        );
         let broken = parse_args(Some(&json!("{"))).unwrap_err();
-        assert!(broken.message.starts_with("Invalid args JSON: "), "{}", broken.message);
+        assert!(
+            broken.message.starts_with("Invalid args JSON: "),
+            "{}",
+            broken.message
+        );
     }
 
     #[test]
@@ -572,7 +650,10 @@ mod tests {
         params.include_schemas = Some(false);
         params.limit = Some(5.0);
         params.offset = Some(1.0);
-        assert!(!params.has_gateway_mode(), "the four tuning keys are not modes");
+        assert!(
+            !params.has_gateway_mode(),
+            "the four tuning keys are not modes"
+        );
         params.search = Some(String::new());
         assert!(params.has_gateway_mode(), "`search: \"\"` IS a mode");
     }
@@ -582,7 +663,10 @@ mod tests {
     #[test]
     fn render_shell_defaults_to_self_and_flips_on_boxed() {
         let compact = McpSettings::default();
-        assert_eq!(compact.tool_result_rendering(), ToolResultRendering::Compact);
+        assert_eq!(
+            compact.tool_result_rendering(),
+            ToolResultRendering::Compact
+        );
         let boxed = McpSettings {
             tool_result_rendering: Some(ToolResultRendering::Boxed),
             ..McpSettings::default()
@@ -619,7 +703,10 @@ mod tests {
             .expect("the not-initialized envelope is returned, not thrown");
         let details = result.details.expect("details");
         assert_eq!(details["error"], json!("not_initialized"));
-        assert!(details.get("mode").is_none(), "the init envelopes carry NO mode key");
+        assert!(
+            details.get("mode").is_none(),
+            "the init envelopes carry NO mode key"
+        );
         match result.content.first() {
             Some(Content::Text { text, .. }) => assert_eq!(text, "MCP not initialized"),
             other => panic!("expected text content, got {other:?}"),
@@ -632,7 +719,12 @@ mod tests {
         let gate = Arc::new(ProxyInitGate::new(rx));
         let tool = McpTool::new(String::new(), &McpSettings::default(), gate);
         let result = tool
-            .execute(ToolCallId::from("call-2"), json!({}), CancelToken::new(), Box::new(|_| {}))
+            .execute(
+                ToolCallId::from("call-2"),
+                json!({}),
+                CancelToken::new(),
+                Box::new(|_| {}),
+            )
             .await
             .expect("the timeout envelope is returned, not thrown");
         drop(keep);
@@ -656,7 +748,10 @@ mod tests {
             )
             .await
             .expect_err("a bad `args` is an Err(ToolError), never a details.error code");
-        assert_eq!(error.message, "Invalid args: expected a JSON object, got array");
+        assert_eq!(
+            error.message,
+            "Invalid args: expected a JSON object, got array"
+        );
     }
 
     /// `index.ts:886-906` (upstream `1bf3671` "fix: recover nested mcp proxy args", #364) — a model
@@ -693,9 +788,17 @@ mod tests {
             .await
             .expect("a rescued request dispatches like a top-level one");
         let details = rescued.details.expect("details");
-        assert_eq!(details["mode"], json!("search"), "`status` would mean the rescue never ran");
+        assert_eq!(
+            details["mode"],
+            json!("search"),
+            "`status` would mean the rescue never ran"
+        );
         assert_eq!(details["count"], json!(5));
-        assert_eq!(details["nextOffset"], json!(3), "`limit: 3` came from the nested object");
+        assert_eq!(
+            details["nextOffset"],
+            json!(3),
+            "`limit: 3` came from the nested object"
+        );
 
         // An OBJECT nesting reaches the later arms too.
         let described = tool
@@ -707,7 +810,10 @@ mod tests {
             )
             .await
             .expect("a rescued request dispatches like a top-level one");
-        assert_eq!(described.details.expect("details")["mode"], json!("describe"));
+        assert_eq!(
+            described.details.expect("details")["mode"],
+            json!("describe")
+        );
 
         // `parsedArgs = parseArgs(nestedParams.args)` — the INNER `args` is parsed a second time, so
         // a broken inner string throws instead of searching with the outer object still in hand.
@@ -720,7 +826,11 @@ mod tests {
             )
             .await
             .expect_err("the nested `args` is re-parsed after the rescue");
-        assert!(error.message.starts_with("Invalid args JSON: "), "{}", error.message);
+        assert!(
+            error.message.starts_with("Invalid args JSON: "),
+            "{}",
+            error.message
+        );
     }
 
     /// `index.ts:902` and `index.ts:905` — an `args` that is NOT a gateway request is a hard error, never a silent
@@ -755,10 +865,18 @@ mod tests {
 
         // No `args` at all is NOT the nested case — it is plain status, which the dead gate reports.
         let status = tool
-            .execute(ToolCallId::from("call-2"), json!({}), CancelToken::new(), Box::new(|_| {}))
+            .execute(
+                ToolCallId::from("call-2"),
+                json!({}),
+                CancelToken::new(),
+                Box::new(|_| {}),
+            )
             .await
             .expect("a bare call is status, not the nested error");
-        assert_eq!(status.details.expect("details")["error"], json!("not_initialized"));
+        assert_eq!(
+            status.details.expect("details")["error"],
+            json!("not_initialized")
+        );
     }
 
     /// `index.ts:880-882` — `parseArgs(null)` is NOT `parseArgs(undefined)`. `typeof null ===
@@ -775,7 +893,10 @@ mod tests {
 
         // Modeless AND with a gateway mode: `parseArgs` runs first either way, so both throw the
         // args sentence rather than the nested one or a status envelope.
-        for params in [json!({"args": null}), json!({"tool": "demo_run", "args": null})] {
+        for params in [
+            json!({"args": null}),
+            json!({"tool": "demo_run", "args": null}),
+        ] {
             let error = tool
                 .execute(
                     ToolCallId::from("call-null"),
@@ -793,10 +914,18 @@ mod tests {
 
         // The absent key still reaches status — the two are distinguished, not merged the other way.
         let status = tool
-            .execute(ToolCallId::from("call-absent"), json!({}), CancelToken::new(), Box::new(|_| {}))
+            .execute(
+                ToolCallId::from("call-absent"),
+                json!({}),
+                CancelToken::new(),
+                Box::new(|_| {}),
+            )
             .await
             .expect("an absent `args` is status");
-        assert_eq!(status.details.expect("details")["error"], json!("not_initialized"));
+        assert_eq!(
+            status.details.expect("details")["error"],
+            json!("not_initialized")
+        );
 
         // And the mapping is exactly "present or not" at the serde layer.
         let present: McpToolParams =
@@ -805,5 +934,4 @@ mod tests {
         let absent: McpToolParams = serde_json::from_value(json!({})).expect("args is optional");
         assert_eq!(absent.args, None);
     }
-
 }

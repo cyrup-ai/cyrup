@@ -82,7 +82,9 @@ impl Drop for ClearOnDrop {
 /// (`POST http://host:port/token HTTP/1.1`) to the proxy — which is what makes the recorded line
 /// proof that the request was PROXIED rather than sent direct, since a direct request would carry
 /// only the origin-form path (`POST /token HTTP/1.1`) and would go to the other socket entirely.
-fn spawn_recording_http_proxy(response_body: String) -> (String, std::sync::mpsc::Receiver<String>) {
+fn spawn_recording_http_proxy(
+    response_body: String,
+) -> (String, std::sync::mpsc::Receiver<String>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().expect("addr");
     let url = format!("http://{addr}");
@@ -131,7 +133,8 @@ async fn prov047_an_oauth_token_refresh_routes_through_the_configured_http_proxy
     let _serial = PROXY_SETTING_GUARD.lock().await;
 
     // `TokenResponse` (anthropic.rs:285-289 ← `anthropic.ts:221-226`).
-    let token_json = r#"{"access_token":"proxied-access","refresh_token":"proxied-refresh","expires_in":3600}"#;
+    let token_json =
+        r#"{"access_token":"proxied-access","refresh_token":"proxied-refresh","expires_in":3600}"#;
     let (proxy_url, seen) = spawn_recording_http_proxy(token_json.to_string());
 
     let dead = dead_loopback_url();
@@ -197,7 +200,8 @@ async fn prov047_with_no_proxy_configured_the_same_flow_connects_directly() {
 
     // Here the recording listener IS the token endpoint, so a direct connection reaches it and the
     // request line arrives in ORIGIN form — the shape a non-proxied request has on the wire.
-    let token_json = r#"{"access_token":"direct-access","refresh_token":"direct-refresh","expires_in":3600}"#;
+    let token_json =
+        r#"{"access_token":"direct-access","refresh_token":"direct-refresh","expires_in":3600}"#;
     let (endpoint, seen) = spawn_recording_http_proxy(token_json.to_string());
     let token_url = format!("{endpoint}/v1/oauth/token");
 
@@ -327,4 +331,3 @@ async fn the_http_proxy_setting_reaches_the_resolver_and_yields_to_everything_ab
 
     cyrup_provider::stream::sse::configure_http_proxy(None);
 }
-

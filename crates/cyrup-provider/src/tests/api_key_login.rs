@@ -34,9 +34,9 @@
 )]
 
 use crate::all_providers;
+use crate::auth::ApiKeyAuth;
 use crate::auth::oauth::{AuthPromptKind, OAuthError, ScriptedInteraction};
 use crate::auth::types::Credential;
-use crate::auth::ApiKeyAuth;
 use std::sync::Arc;
 
 fn api_key_strategy(id: &str) -> Arc<dyn ApiKeyAuth> {
@@ -156,7 +156,10 @@ async fn env_key_strategies_mint_a_credential_from_one_secret_prompt() {
     let interaction = answers(&["sk-live"]);
     let (key, env) = parts(&strategy.login(&interaction).await.expect("login"));
     assert_eq!(key.as_deref(), Some("sk-live"));
-    assert!(env.is_empty(), "a single-secret login stores no env overlay");
+    assert!(
+        env.is_empty(),
+        "a single-secret login stores no env overlay"
+    );
 
     let prompts = interaction.prompts();
     assert_eq!(prompts.len(), 1, "envApiKeyAuth asks exactly once");

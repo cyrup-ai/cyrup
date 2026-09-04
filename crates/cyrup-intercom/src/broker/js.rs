@@ -125,8 +125,8 @@ pub(super) const fn js_truthy_alias(alias: Option<bool>) -> bool {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-    use serde_json::json;
     use super::*;
+    use serde_json::json;
 
     /// `String(msg.namespace || "")`, the coercion pi applies to the raw `namespace` before it has
     /// been type-checked (`v0.9.2 broker/broker.ts:1371,1382`). Every case below is what node
@@ -148,7 +148,10 @@ mod tests {
         // `1.0` is the integer `1` in JS; serde would otherwise print "1.0".
         assert_eq!(js_string_or_empty(Some(&json!(1.0_f64))), "1");
         assert_eq!(js_string_or_empty(Some(&json!(true))), "true");
-        assert_eq!(js_string_or_empty(Some(&json!({"a": 1}))), "[object Object]");
+        assert_eq!(
+            js_string_or_empty(Some(&json!({"a": 1}))),
+            "[object Object]"
+        );
         // `Array.prototype.join(",")`: null elements render empty and nesting flattens.
         assert_eq!(js_string_or_empty(Some(&json!([1, 2]))), "1,2");
         assert_eq!(js_string_or_empty(Some(&json!([null]))), "");

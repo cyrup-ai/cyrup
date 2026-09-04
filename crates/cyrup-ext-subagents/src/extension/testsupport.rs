@@ -1,7 +1,12 @@
 //! Shared fixtures for this module tree's unit tests: capturing sinks, stub host services and
 //! the run/agent seeding helpers more than one submodule's tests need.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 // NOTE: the `CYRUP_HOME`-sandboxed tests that used to live in this module tree
 // (`child_env_gate_controls_what_is_registered`, `top_level_with_optin_attaches_full`,
@@ -13,7 +18,6 @@
 // identical env-mutation convention in this crate).
 
 use super::*;
-use cyrup_core::Tool;
 use crate::background::RunId;
 use crate::background::RunMode;
 use crate::background::RunPaths;
@@ -22,6 +26,7 @@ use crate::background::StepState;
 use crate::extension::executor::paths::default_async_root_in;
 use crate::extension::executor::paths::default_results_dir_in;
 use cyrup_core::CancelToken;
+use cyrup_core::Tool;
 use cyrup_core::ToolCallId;
 use cyrup_core::ToolError;
 use cyrup_core::ToolResult;
@@ -32,7 +37,10 @@ use std::sync::Arc;
 /// A [`SingleStepSpec`](crate::spawn::chain_graph::SingleStepSpec) with nothing set beyond the
 /// agent + task the lowered slash graphs in `executor::spawn_budget` and `host` need, so the
 /// spawn-budget assertions stay about the COUNT and not about step configuration.
-pub(crate) fn bare_single_step(agent: &str, task: &str) -> crate::spawn::chain_graph::SingleStepSpec {
+pub(crate) fn bare_single_step(
+    agent: &str,
+    task: &str,
+) -> crate::spawn::chain_graph::SingleStepSpec {
     crate::spawn::chain_graph::SingleStepSpec {
         skills: None,
         session_dir: None,
@@ -103,7 +111,12 @@ impl cyrup_ext::host::HostServices for FixedSessionHost {
 /// `reconcile`'s step 3 (`background/reconcile.rs`) falls through to `NoneNeeded` for
 /// `(Running, None)`, so before this change such a run stayed in `/subagents-fleet` and in
 /// `{action:"status"}` forever with no supported way to clear it.
-pub(crate) fn seed_orphaned_run(cwd: &Path, run_id: &str, session: Option<&str>, pid: Option<u32>) -> RunPaths {
+pub(crate) fn seed_orphaned_run(
+    cwd: &Path,
+    run_id: &str,
+    session: Option<&str>,
+    pid: Option<u32>,
+) -> RunPaths {
     let async_root = default_async_root_in(&crate::paths::Roots::from_env(), cwd);
     let results_dir = default_results_dir_in(&crate::paths::Roots::from_env(), cwd);
     let id = RunId::from_token(run_id.to_string());
@@ -115,8 +128,11 @@ pub(crate) fn seed_orphaned_run(cwd: &Path, run_id: &str, session: Option<&str>,
     let mut step = crate::background::StepStatus::pending("builder");
     step.status = StepState::Running;
     status.steps = vec![step];
-    std::fs::write(&paths.status, serde_json::to_string(&status).expect("serialize status"))
-        .expect("write status.json");
+    std::fs::write(
+        &paths.status,
+        serde_json::to_string(&status).expect("serialize status"),
+    )
+    .expect("write status.json");
     paths
 }
 
@@ -137,7 +153,11 @@ pub(crate) fn seed_running_run(cwd: &Path, run_id: &str, agents: &[&str]) -> Run
     std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
     let mut status = crate::background::RunStatus::queued(
         id,
-        if agents.len() > 1 { RunMode::Parallel } else { RunMode::Single },
+        if agents.len() > 1 {
+            RunMode::Parallel
+        } else {
+            RunMode::Single
+        },
         // A pid this process can definitely signal, so R-SA-079's reconciliation gate does not
         // rewrite `Running` to a dead-pid terminal state before the report is even rendered.
         Some(std::process::id()),
@@ -182,7 +202,11 @@ pub(crate) fn seed_running_run(cwd: &Path, run_id: &str, agents: &[&str]) -> Run
 pub(crate) fn scoped_missions(root: &Path) -> crate::missions::MissionStoreConfig {
     crate::missions::MissionStoreConfig {
         global_index_dir: Some(
-            root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+            root.join("agent")
+                .join("missions")
+                .join("index")
+                .to_string_lossy()
+                .into_owned(),
         ),
         ..Default::default()
     }
@@ -240,7 +264,11 @@ pub(crate) fn tool_text(result: &ToolResult) -> String {
 pub(crate) fn scoped_mission_config(root: &Path) -> crate::missions::MissionStoreConfig {
     crate::missions::MissionStoreConfig {
         global_index_dir: Some(
-            root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+            root.join("agent")
+                .join("missions")
+                .join("index")
+                .to_string_lossy()
+                .into_owned(),
         ),
         ..Default::default()
     }

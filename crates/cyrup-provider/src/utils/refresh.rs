@@ -335,7 +335,10 @@ mod tests {
         // Unblock the abandoned fetch, then let a second caller drive it to completion. It shares
         // the in-flight future, so it must NOT start a fetch of its own.
         let _ = tx.send(());
-        dedup.run(counting()).await.expect("shares the in-flight fetch");
+        dedup
+            .run(counting())
+            .await
+            .expect("shares the in-flight fetch");
         assert_eq!(
             count.load(Ordering::SeqCst),
             0,

@@ -456,7 +456,8 @@ impl McpError {
         if matches!(self, McpError::CredentialStore(_)) {
             return true;
         }
-        let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(self);
+        let mut source: Option<&(dyn std::error::Error + 'static)> =
+            std::error::Error::source(self);
         for _ in 0..32 {
             let Some(err) = source else { return false };
             if let Some(mcp) = err.downcast_ref::<McpError>()
@@ -611,9 +612,10 @@ mod tests {
         assert_eq!(duplicated.to_string(), "same");
 
         // Nesting: the inner aggregate's own head is dropped too, so only "inner" survives.
-        let nested = McpError::SetupFailed(CleanupErrors::from(vec![McpError::AbortCleanupFailed(
-            CleanupErrors::from(vec![McpError::other("inner")]),
-        )]));
+        let nested =
+            McpError::SetupFailed(CleanupErrors::from(vec![McpError::AbortCleanupFailed(
+                CleanupErrors::from(vec![McpError::other("inner")]),
+            )]));
         assert_eq!(nested.to_string(), "inner");
 
         // A child whose message is the empty string is not collected (`if (value.message)`), so the

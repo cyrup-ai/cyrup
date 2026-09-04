@@ -32,7 +32,7 @@ use cyrup_intercom::config::IntercomConfig;
 use cyrup_intercom::identity::short_session_id;
 use cyrup_intercom::session_state::SharedIntercomState;
 use cyrup_intercom::tools::intercom::IntercomTool;
-use cyrup_intercom::transport::client::{IntercomClient, InboundEvent, SendOptions};
+use cyrup_intercom::transport::client::{InboundEvent, IntercomClient, SendOptions};
 use cyrup_intercom::transport::protocol::{Message, MessageContent, SessionInfo, now_ms};
 
 use super::common::{Broker, registration};
@@ -66,7 +66,11 @@ fn ask_message(id: &str) -> Message {
         timestamp: now_ms().into(),
         reply_to: None,
         expects_reply: Some(true),
-        content: MessageContent { text: "hi".to_string(), attachments: None, ..Default::default() },
+        content: MessageContent {
+            text: "hi".to_string(),
+            attachments: None,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -96,11 +100,16 @@ async fn run(
     cancel: &CancelToken,
     params: serde_json::Value,
 ) -> Result<ToolResult, cyrup_core::ToolError> {
-    tool.execute(ToolCallId::from("call-1"), params, cancel.clone(), sink()).await
+    tool.execute(ToolCallId::from("call-1"), params, cancel.clone(), sink())
+        .await
 }
 
 fn fresh_state() -> Arc<SharedIntercomState> {
-    Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, PathBuf::from("/w")))
+    Arc::new(SharedIntercomState::new(
+        IntercomConfig::default(),
+        600_000,
+        PathBuf::from("/w"),
+    ))
 }
 
 // Regression proof for the dossier item "`reply` tool action is missing pi's self-target guard"
@@ -113,30 +122,46 @@ fn fresh_state() -> Arc<SharedIntercomState> {
 async fn reply_refuses_when_the_resolved_target_is_the_current_session() {
     let broker = Broker::start().await;
     let client = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("self"), Some("self-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("self"),
+            Some("self-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
     let state = fresh_state();
     state.set_client(Some(client.clone()));
 
     // A (misrouted) pending inbound ask whose sender id is THIS session's own id.
-    state
-        .tracker
-        .lock()
-        .unwrap()
-        .record_incoming_message(session("self-session", "/w"), ask_message("q1"), now_ms());
+    state.tracker.lock().unwrap().record_incoming_message(
+        session("self-session", "/w"),
+        ask_message("q1"),
+        now_ms(),
+    );
 
     let tool = IntercomTool::new(state.clone());
     let cancel = CancelToken::new();
-    let err = run(&tool, &cancel, serde_json::json!({ "action": "reply", "message": "hello back" }))
-        .await
-        .expect_err("must refuse a self-target reply");
-    assert!(err.message.contains("Cannot message the current session"), "got: {}", err.message);
+    let err = run(
+        &tool,
+        &cancel,
+        serde_json::json!({ "action": "reply", "message": "hello back" }),
+    )
+    .await
+    .expect_err("must refuse a self-target reply");
+    assert!(
+        err.message.contains("Cannot message the current session"),
+        "got: {}",
+        err.message
+    );
 
     // The ask must still be pending — the guard fires before `markReplied`/`dismissPendingAsk`.
     let pending = state.tracker.lock().unwrap().list_pending(now_ms());
-    assert_eq!(pending.len(), 1, "the self-targeted ask must remain pending, not sent or dismissed");
+    assert_eq!(
+        pending.len(),
+        1,
+        "the self-targeted ask must remain pending, not sent or dismissed"
+    );
 
     client.disconnect();
 }
@@ -150,19 +175,23 @@ async fn reply_refuses_when_the_resolved_target_is_the_current_session() {
 async fn send_does_not_mark_the_ask_replied_when_delivery_fails() {
     let broker = Broker::start().await;
     let client = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("self"), Some("self-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("self"),
+            Some("self-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
     let state = fresh_state();
     state.set_client(Some(client.clone()));
 
     // A real pending inbound ask this "send" call claims (via `replyTo`) to be answering.
-    state
-        .tracker
-        .lock()
-        .unwrap()
-        .record_incoming_message(session("original-asker", "/w"), ask_message("q1"), now_ms());
+    state.tracker.lock().unwrap().record_incoming_message(
+        session("original-asker", "/w"),
+        ask_message("q1"),
+        now_ms(),
+    );
 
     let tool = IntercomTool::new(state.clone());
     let cancel = CancelToken::new();
@@ -178,12 +207,20 @@ async fn send_does_not_mark_the_ask_replied_when_delivery_fails() {
     )
     .await
     .expect_err("delivery to an unknown session fails");
-    assert!(err.message.contains("Session not found"), "got: {}", err.message);
+    assert!(
+        err.message.contains("Session not found"),
+        "got: {}",
+        err.message
+    );
 
     // The original inbound ask must still be pending — a failed send must not have marked it
     // replied, so the agent can still retry answering it.
     let pending = state.tracker.lock().unwrap().list_pending(now_ms());
-    assert_eq!(pending.len(), 1, "a failed send must leave the original ask pending for a retry");
+    assert_eq!(
+        pending.len(),
+        1,
+        "a failed send must leave the original ask pending for a retry"
+    );
 
     client.disconnect();
 }
@@ -196,28 +233,47 @@ async fn send_does_not_mark_the_ask_replied_when_delivery_fails() {
 async fn list_splits_current_and_other_sessions_with_headed_sections() {
     let broker = Broker::start().await;
     let me = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("me"), Some("me-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("me"),
+            Some("me-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
     let other = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("other"), Some("other-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("other"),
+            Some("other-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
 
     let state = fresh_state();
     state.set_client(Some(me.clone()));
     let tool = IntercomTool::new(state.clone());
     let cancel = CancelToken::new();
-    let result = run(&tool, &cancel, serde_json::json!({ "action": "list" })).await.expect("list succeeds");
+    let result = run(&tool, &cancel, serde_json::json!({ "action": "list" }))
+        .await
+        .expect("list succeeds");
     let text = result_text(&result);
 
-    assert!(text.contains("**Current session:**"), "missing current-session header: {text}");
-    assert!(text.contains("**Other sessions:**"), "missing other-sessions header: {text}");
+    assert!(
+        text.contains("**Current session:**"),
+        "missing current-session header: {text}"
+    );
+    assert!(
+        text.contains("**Other sessions:**"),
+        "missing other-sessions header: {text}"
+    );
     let current_idx = text.find("**Current session:**").unwrap();
     let other_idx = text.find("**Other sessions:**").unwrap();
-    assert!(current_idx < other_idx, "current section must come first: {text}");
+    assert!(
+        current_idx < other_idx,
+        "current section must come first: {text}"
+    );
     // Self must be tagged `[self]` and NOT appear again under "Other sessions" (rows render the
     // `shortSessionId` — `identity::short_session_id` — not the raw id, so match on that).
     let current_section = &text[current_idx..other_idx];
@@ -235,12 +291,18 @@ async fn list_splits_current_and_other_sessions_with_headed_sections() {
         current_section.contains("[self, idle]"),
         "self row must be tagged `self` first and carry its lifecycle status: {text}"
     );
-    assert!(current_section.contains(&self_short_id), "self row missing own id: {text}");
+    assert!(
+        current_section.contains(&self_short_id),
+        "self row missing own id: {text}"
+    );
     assert!(
         !other_section.contains(&self_short_id) && !other_section.contains("[self"),
         "self leaked into other sessions: {text}"
     );
-    assert!(other_section.contains(&other_short_id), "the other session must be listed: {text}");
+    assert!(
+        other_section.contains(&other_short_id),
+        "the other session must be listed: {text}"
+    );
 
     me.disconnect();
     other.disconnect();
@@ -254,22 +316,40 @@ async fn list_splits_current_and_other_sessions_with_headed_sections() {
 async fn send_honors_a_declined_confirm_send_prompt() {
     let broker = Broker::start().await;
     let me = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("me"), Some("me-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("me"),
+            Some("me-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
     let target = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("target"), Some("target-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("target"),
+            Some("target-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
     let mut target_events = target.subscribe();
 
-    let config = IntercomConfig { confirm_send: true, ..IntercomConfig::default() };
-    let state = Arc::new(SharedIntercomState::new(config, 600_000, PathBuf::from("/w")));
+    let config = IntercomConfig {
+        confirm_send: true,
+        ..IntercomConfig::default()
+    };
+    let state = Arc::new(SharedIntercomState::new(
+        config,
+        600_000,
+        PathBuf::from("/w"),
+    ));
     state.set_client(Some(me.clone()));
     state.set_has_ui(true);
-    let services = Arc::new(RecordingServices::new(CannedResponses { confirm: false, ..Default::default() }));
+    let services = Arc::new(RecordingServices::new(CannedResponses {
+        confirm: false,
+        ..Default::default()
+    }));
     state.set_host_services(services.clone());
 
     let tool = IntercomTool::new(state.clone());
@@ -286,7 +366,10 @@ async fn send_honors_a_declined_confirm_send_prompt() {
     .await
     .expect("a declined confirm is not an error");
     assert_eq!(result_text(&result), "Message cancelled by user");
-    assert!(services.entries_persisted().is_empty(), "a cancelled send must not append an audit entry");
+    assert!(
+        services.entries_persisted().is_empty(),
+        "a cancelled send must not append an audit entry"
+    );
 
     // The target never actually received the MESSAGE.
     //
@@ -299,9 +382,7 @@ async fn send_honors_a_declined_confirm_send_prompt() {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
     let mut delivered: Vec<InboundEvent> = Vec::new();
     let mut saw_presence = false;
-    while let Ok(Ok(event)) =
-        tokio::time::timeout_at(deadline, target_events.recv()).await
-    {
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, target_events.recv()).await {
         match event {
             InboundEvent::PresenceUpdate(_) => saw_presence = true,
             other => delivered.push(other),
@@ -330,14 +411,22 @@ async fn send_honors_a_declined_confirm_send_prompt() {
 async fn successful_send_appends_an_intercom_sent_audit_entry() {
     let broker = Broker::start().await;
     let me = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("me"), Some("me-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("me"),
+            Some("me-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
     let target = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("target"), Some("target-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("target"),
+            Some("target-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
 
     let state = fresh_state();
@@ -357,11 +446,22 @@ async fn successful_send_appends_an_intercom_sent_audit_entry() {
     assert_eq!(result_text(&result), "Message sent to target-session");
 
     let entries = services.entries_persisted();
-    assert_eq!(entries.len(), 1, "exactly one intercom_sent entry: {entries:?}");
-    assert_eq!(entries[0].0, "intercom_sent");
-    assert_eq!(entries[0].1.get("to").and_then(|v| v.as_str()), Some("target-session"));
     assert_eq!(
-        entries[0].1.get("message").and_then(|m| m.get("text")).and_then(|v| v.as_str()),
+        entries.len(),
+        1,
+        "exactly one intercom_sent entry: {entries:?}"
+    );
+    assert_eq!(entries[0].0, "intercom_sent");
+    assert_eq!(
+        entries[0].1.get("to").and_then(|v| v.as_str()),
+        Some("target-session")
+    );
+    assert_eq!(
+        entries[0]
+            .1
+            .get("message")
+            .and_then(|m| m.get("text"))
+            .and_then(|v| v.as_str()),
         Some("hello target")
     );
 
@@ -382,16 +482,24 @@ async fn successful_send_appends_an_intercom_sent_audit_entry() {
 async fn send_reports_the_caller_supplied_target_not_the_resolved_session_id() {
     let broker = Broker::start().await;
     let me = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("me"), Some("me-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("me"),
+            Some("me-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
     // Registered under the NAME "reviewer" but the SESSION ID "peer-session": the two differ,
     // so the reported target proves which one the tool echoes.
     let peer = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("reviewer"), Some("peer-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("reviewer"),
+            Some("peer-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
 
     let state = fresh_state();
@@ -422,14 +530,22 @@ async fn send_reports_the_caller_supplied_target_not_the_resolved_session_id() {
 async fn ask_prefixes_the_reply_with_the_reply_from_header() {
     let broker = Broker::start().await;
     let me = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("me"), Some("me-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("me"),
+            Some("me-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
     let peer = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("reviewer"), Some("peer-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("reviewer"),
+            Some("peer-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
 
     let state = fresh_state();
@@ -446,14 +562,17 @@ async fn ask_prefixes_the_reply_with_the_reply_from_header() {
                 && message.expects_reply == Some(true)
             {
                 let _ = peer_writer
-                    .send(&from.id, SendOptions {
-                        text: "ship it".to_string(),
-                        attachments: None,
-                        reply_to: Some(message.id.clone()),
-                        expects_reply: None,
-                        message_id: None,
-                        ..Default::default()
-                    })
+                    .send(
+                        &from.id,
+                        SendOptions {
+                            text: "ship it".to_string(),
+                            attachments: None,
+                            reply_to: Some(message.id.clone()),
+                            expects_reply: None,
+                            message_id: None,
+                            ..Default::default()
+                        },
+                    )
                     .await;
                 return;
             }
@@ -464,7 +583,11 @@ async fn ask_prefixes_the_reply_with_the_reply_from_header() {
     let cancel = CancelToken::new();
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        run(&tool, &cancel, serde_json::json!({ "action": "ask", "to": "reviewer", "message": "ok to ship?" })),
+        run(
+            &tool,
+            &cancel,
+            serde_json::json!({ "action": "ask", "to": "reviewer", "message": "ok to ship?" }),
+        ),
     )
     .await
     .expect("the ask resolves within the timeout")
@@ -486,14 +609,22 @@ async fn ask_prefixes_the_reply_with_the_reply_from_header() {
 async fn reply_reports_the_sender_name_rather_than_the_raw_session_id() {
     let broker = Broker::start().await;
     let me = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("me"), Some("me-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("me"),
+            Some("me-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
     let peer = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("reviewer"), Some("peer-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("reviewer"),
+            Some("peer-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
 
     let state = fresh_state();
@@ -504,14 +635,17 @@ async fn reply_reports_the_sender_name_rather_than_the_raw_session_id() {
     // (`inbound.rs:332-336`); the sender's NAME ("reviewer") and SESSION ID ("peer-session")
     // differ, which is what makes the reported target diagnostic.
     let mut my_events = me.subscribe();
-    peer.send("me-session", SendOptions {
-        text: "ok to ship?".to_string(),
-        attachments: None,
-        reply_to: None,
-        expects_reply: Some(true),
-        message_id: Some("q1".to_string()),
-        ..Default::default()
-    })
+    peer.send(
+        "me-session",
+        SendOptions {
+            text: "ok to ship?".to_string(),
+            attachments: None,
+            reply_to: None,
+            expects_reply: Some(true),
+            message_id: Some("q1".to_string()),
+            ..Default::default()
+        },
+    )
     .await
     .expect("the ask is delivered");
     // DRAIN to the ask rather than assuming it is the next frame. The broker legitimately
@@ -530,13 +664,21 @@ async fn reply_reports_the_sender_name_rather_than_the_raw_session_id() {
     .await
     .expect("the inbound ask arrives");
     assert_eq!(from.name.as_deref(), Some("reviewer"));
-    state.tracker.lock().unwrap().record_incoming_message(from, message, now_ms());
+    state
+        .tracker
+        .lock()
+        .unwrap()
+        .record_incoming_message(from, message, now_ms());
 
     let tool = IntercomTool::new(state.clone());
     let cancel = CancelToken::new();
-    let result = run(&tool, &cancel, serde_json::json!({ "action": "reply", "message": "looks good" }))
-        .await
-        .expect("reply delivers");
+    let result = run(
+        &tool,
+        &cancel,
+        serde_json::json!({ "action": "reply", "message": "looks good" }),
+    )
+    .await
+    .expect("reply delivers");
     assert_eq!(
         result_text(&result),
         "Reply sent to reviewer",
@@ -554,21 +696,31 @@ async fn reply_reports_the_sender_name_rather_than_the_raw_session_id() {
 async fn status_renders_pi_four_line_intercom_status_block() {
     let broker = Broker::start().await;
     let me = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("me"), Some("me-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("me"),
+            Some("me-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
     let peer = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("reviewer"), Some("peer-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("reviewer"),
+            Some("peer-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
 
     let state = fresh_state();
     state.set_client(Some(me.clone()));
     let tool = IntercomTool::new(state.clone());
     let cancel = CancelToken::new();
-    let result = run(&tool, &cancel, serde_json::json!({ "action": "status" })).await.expect("status succeeds");
+    let result = run(&tool, &cancel, serde_json::json!({ "action": "status" }))
+        .await
+        .expect("status succeeds");
     assert_eq!(
         result_text(&result),
         "**Intercom Status:**\nConnected: Yes\nSession ID: me-session\nActive sessions: 2"
@@ -577,4 +729,3 @@ async fn status_renders_pi_four_line_intercom_status_block() {
     me.disconnect();
     peer.disconnect();
 }
-

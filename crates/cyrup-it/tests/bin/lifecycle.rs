@@ -15,13 +15,18 @@
 //! embedder got extensions that never saw either end of the session's life: audit loggers never
 //! initialised, intercom identities were never registered or deregistered, permission policy was
 //! never loaded.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::ExtensionId;
-use cyrup_ext::{EventKind, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension};
+use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
 use cyrup_provider::Provider;
 use cyrup_provider::faux::FauxProvider;
 use cyrup_sdk::{Cyrup, SessionConfig};
@@ -76,7 +81,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn config(fx: &Fixture) -> SessionConfig {
@@ -151,7 +160,10 @@ async fn close_announces_session_shutdown_to_extensions() {
 
     assert_eq!(
         rec.recorded(),
-        vec!["session_start:startup".to_string(), "session_shutdown:quit".to_string()],
+        vec![
+            "session_start:startup".to_string(),
+            "session_shutdown:quit".to_string()
+        ],
         "an embedder's extensions must see BOTH ends of the session's life, start then shutdown"
     );
 }
@@ -170,12 +182,16 @@ async fn a_full_embedder_drive_announces_each_end_exactly_once() {
 
     let seen = rec.recorded();
     assert_eq!(
-        seen.iter().filter(|e| e.starts_with("session_start")).count(),
+        seen.iter()
+            .filter(|e| e.starts_with("session_start"))
+            .count(),
         1,
         "exactly one session_start across the whole embedder drive: {seen:?}"
     );
     assert_eq!(
-        seen.iter().filter(|e| e.starts_with("session_shutdown")).count(),
+        seen.iter()
+            .filter(|e| e.starts_with("session_shutdown"))
+            .count(),
         1,
         "exactly one session_shutdown across the whole embedder drive: {seen:?}"
     );

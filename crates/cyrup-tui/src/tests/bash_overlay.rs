@@ -1,11 +1,16 @@
 //! `!`/`!!` bash-execution block + `/hotkeys` wiring, headless against a `TestBackend`
 //! (bash-execution; `handleHotkeysCommand`, interactive-mode.ts:6090-6205).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
 use crate::{App, AppAction, BashStatus, Entry, UiTheme};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 fn submit(app: &mut App<TestBackend>, line: &str) -> AppAction {
     app.editor_mut().set_text(line);
@@ -22,9 +27,15 @@ fn bang_command_opens_a_live_bash_block_and_requests_a_run() {
     let action = submit(&mut app, "!echo hi");
     assert_eq!(
         action,
-        AppAction::RunBash { command: "echo hi".to_string(), excluded: false }
+        AppAction::RunBash {
+            command: "echo hi".to_string(),
+            excluded: false
+        }
     );
-    assert!(app.state().transcript.has_bash(), "a live bash block is open");
+    assert!(
+        app.state().transcript.has_bash(),
+        "a live bash block is open"
+    );
     assert!(app.state().transcript.bash_running(), "it starts running");
     let b = app.state().transcript.bash().unwrap();
     assert_eq!(b.command(), "echo hi");
@@ -37,7 +48,10 @@ fn double_bang_marks_excluded_from_context() {
     let action = submit(&mut app, "!!secret-cmd");
     assert_eq!(
         action,
-        AppAction::RunBash { command: "secret-cmd".to_string(), excluded: true }
+        AppAction::RunBash {
+            command: "secret-cmd".to_string(),
+            excluded: true
+        }
     );
     assert!(app.state().transcript.bash().unwrap().excluded());
 }
@@ -51,10 +65,16 @@ fn bash_block_streams_output_and_renders_in_the_viewport() {
     app.transcript_mut().bash_complete_simple(Some(0), false);
     app.draw().unwrap();
     let screen = buf_text(&app);
-    assert!(screen.contains("$ echo hi"), "command header rendered:\n{screen}");
+    assert!(
+        screen.contains("$ echo hi"),
+        "command header rendered:\n{screen}"
+    );
     assert!(screen.contains("hello"), "stdout rendered:\n{screen}");
     assert!(screen.contains("world"), "stdout rendered:\n{screen}");
-    assert_eq!(app.state().transcript.bash().unwrap().status(), BashStatus::Complete);
+    assert_eq!(
+        app.state().transcript.bash().unwrap().status(),
+        BashStatus::Complete
+    );
 }
 
 #[test]
@@ -67,9 +87,15 @@ fn ctrl_o_toggles_bash_expansion() {
     app.transcript_mut().bash_complete_simple(Some(0), false);
     assert!(!app.state().transcript.bash().unwrap().expanded());
     app.handle_input(&ctrl(KeyCode::Char('o')));
-    assert!(app.state().transcript.bash().unwrap().expanded(), "Ctrl+O expands the bash block");
+    assert!(
+        app.state().transcript.bash().unwrap().expanded(),
+        "Ctrl+O expands the bash block"
+    );
     app.handle_input(&ctrl(KeyCode::Char('o')));
-    assert!(!app.state().transcript.bash().unwrap().expanded(), "Ctrl+O collapses again");
+    assert!(
+        !app.state().transcript.bash().unwrap().expanded(),
+        "Ctrl+O collapses again"
+    );
 }
 
 #[test]
@@ -80,10 +106,17 @@ fn interrupt_cancels_a_running_bash_block() {
     // Esc → Interrupt cancels + commits the block to scrollback.
     let action = app.handle_input(&key(KeyCode::Esc));
     assert_eq!(action, AppAction::Interrupt);
-    assert!(!app.state().transcript.has_bash(), "the live block was committed away");
+    assert!(
+        !app.state().transcript.has_bash(),
+        "the live block was committed away"
+    );
     // The committed block shows the cancelled status once flushed.
     app.draw().unwrap();
-    assert!(app.scrollback_text().contains("(cancelled)"), "{}", app.scrollback_text());
+    assert!(
+        app.scrollback_text().contains("(cancelled)"),
+        "{}",
+        app.scrollback_text()
+    );
 }
 
 /// S36 — `/hotkeys` appends a bordered block to the TRANSCRIPT and opens no overlay
@@ -93,17 +126,28 @@ fn interrupt_cancels_a_running_bash_block() {
 fn hotkeys_renders_into_the_transcript_and_opens_no_overlay() {
     let mut app = new_app();
     submit(&mut app, "/hotkeys");
-    assert!(!app.overlay_open(), "/hotkeys must not open a floating overlay");
     assert!(
-        app.state().transcript.pending().iter().any(
-            |e| matches!(e, Entry::Block { title, .. } if title == "Keyboard Shortcuts")
-        ),
+        !app.overlay_open(),
+        "/hotkeys must not open a floating overlay"
+    );
+    assert!(
+        app.state()
+            .transcript
+            .pending()
+            .iter()
+            .any(|e| matches!(e, Entry::Block { title, .. } if title == "Keyboard Shortcuts")),
         "no `Keyboard Shortcuts` block was appended to the transcript"
     );
     app.draw().unwrap();
     let screen = app.scrollback_text();
-    assert!(screen.contains("Keyboard Shortcuts"), "block title:\n{screen}");
-    assert!(screen.contains("Send message"), "block lists the submit binding:\n{screen}");
+    assert!(
+        screen.contains("Keyboard Shortcuts"),
+        "block title:\n{screen}"
+    );
+    assert!(
+        screen.contains("Send message"),
+        "block lists the submit binding:\n{screen}"
+    );
     // A transcript block, not a modal. The discriminator is the envelope, not the presence of box
     // glyphs — the GFM tables in the body legitimately draw their own `┌┬┐`. `DynamicBorder` is a
     // bare full-width `─` rule flush at column 0; a floating overlay was a centered, INSET box.
@@ -143,18 +187,39 @@ fn hotkeys_key_cells_are_capitalized_and_list_every_bound_key() {
         })
         .expect("hotkeys block");
     // The three GFM tables, verbatim from interactive-mode.ts:6134-6182.
-    assert!(body.starts_with("**Navigation**\n| Key | Action |\n|-----|--------|\n"), "{body}");
+    assert!(
+        body.starts_with("**Navigation**\n| Key | Action |\n|-----|--------|\n"),
+        "{body}"
+    );
     assert!(body.contains("\n**Editing**\n| Key | Action |\n"), "{body}");
     assert!(body.contains("\n**Other**\n| Key | Action |\n"), "{body}");
     // Capitalized, and BOTH newLine keys present.
-    assert!(body.contains("| `Shift+Enter/Ctrl+J` | New line |"), "newLine cell:\n{body}");
-    assert!(body.contains("| `Enter` | Send message |"), "submit cell:\n{body}");
+    assert!(
+        body.contains("| `Shift+Enter/Ctrl+J` | New line |"),
+        "newLine cell:\n{body}"
+    );
+    assert!(
+        body.contains("| `Enter` | Send message |"),
+        "submit cell:\n{body}"
+    );
     // Rows cyrup previously omitted outright.
-    assert!(body.contains("| Exit (when editor is empty) |"), "exit row:\n{body}");
-    assert!(body.contains("| Paste the most-recently-deleted text |"), "yank row:\n{body}");
-    assert!(body.contains("| `!!` | Run bash command (excluded from context) |"), "{body}");
+    assert!(
+        body.contains("| Exit (when editor is empty) |"),
+        "exit row:\n{body}"
+    );
+    assert!(
+        body.contains("| Paste the most-recently-deleted text |"),
+        "yank row:\n{body}"
+    );
+    assert!(
+        body.contains("| `!!` | Run bash command (excluded from context) |"),
+        "{body}"
+    );
     // No em-dash placeholder: upstream renders an unbound id as an EMPTY cell, never a glyph.
-    assert!(!body.contains('—'), "no fabricated key placeholder:\n{body}");
+    assert!(
+        !body.contains('—'),
+        "no fabricated key placeholder:\n{body}"
+    );
 }
 
 #[test]
@@ -164,7 +229,10 @@ fn page_up_scrolls_the_active_region_and_page_down_returns_to_tail() {
     let mut app = App::new(TestBackend::new(40, 8), UiTheme::dark()).unwrap();
     // Paragraph breaks (blank line between) keep each `rowN` on its own rendered line (a single
     // newline is a markdown soft break → collapsed), so the active region is genuinely tall.
-    let body: String = (1..=40).map(|i| format!("row{i}")).collect::<Vec<_>>().join("\n\n");
+    let body: String = (1..=40)
+        .map(|i| format!("row{i}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
     app.transcript_mut().push_assistant_delta(&body);
     app.draw().unwrap();
     let tail = buf_text(&app);
@@ -173,12 +241,19 @@ fn page_up_scrolls_the_active_region_and_page_down_returns_to_tail() {
     app.handle_input(&key(KeyCode::PageUp));
     app.handle_input(&key(KeyCode::PageUp));
     app.draw().unwrap();
-    assert!(app.state().transcript.scroll_offset() > 0, "paged up off the tail");
+    assert!(
+        app.state().transcript.scroll_offset() > 0,
+        "paged up off the tail"
+    );
 
     app.handle_input(&key(KeyCode::PageDown));
     app.handle_input(&key(KeyCode::PageDown));
     app.draw().unwrap();
-    assert_eq!(app.state().transcript.scroll_offset(), 0, "PageDown returns to the tail");
+    assert_eq!(
+        app.state().transcript.scroll_offset(),
+        0,
+        "PageDown returns to the tail"
+    );
     assert!(buf_text(&app).contains("row40"), "tail visible again");
 }
 
@@ -187,7 +262,10 @@ fn ctrl_g_requests_the_external_editor() {
     // `app.editor.external` (Ctrl+G) surfaces to the run loop, which launches $VISUAL/$EDITOR.
     let mut app = new_app();
     app.editor_mut().set_text("draft text");
-    assert_eq!(app.handle_input(&ctrl(KeyCode::Char('g'))), AppAction::OpenExternalEditor);
+    assert_eq!(
+        app.handle_input(&ctrl(KeyCode::Char('g'))),
+        AppAction::OpenExternalEditor
+    );
 }
 
 /// The counterpart of the block above: because `/hotkeys` is scrollback and not a modal, arrow keys
@@ -204,11 +282,17 @@ fn ctrl_g_requests_the_external_editor() {
 fn hotkeys_does_not_capture_navigation_keys() {
     let mut app = new_app();
     submit(&mut app, "/hotkeys");
-    assert!(app.state().editor.is_empty(), "submitting cleared the editor");
+    assert!(
+        app.state().editor.is_empty(),
+        "submitting cleared the editor"
+    );
 
     // Consumed as an ordinary redraw-worthy edit, not by an overlay.
     assert_eq!(app.handle_input(&key(KeyCode::Down)), AppAction::Redraw);
-    assert!(!app.overlay_open(), "no overlay may capture navigation after /hotkeys");
+    assert!(
+        !app.overlay_open(),
+        "no overlay may capture navigation after /hotkeys"
+    );
 
     // …and it genuinely reached the editor: Up now walks the submission history back to `/hotkeys`.
     // An overlay (or a swallowed key) leaves the buffer empty.
@@ -230,11 +314,16 @@ fn hotkeys_does_not_capture_navigation_keys() {
     // aborts nothing, so asserting an abort there would pin behaviour upstream does not have.
     app.editor_mut().set_text("");
     app.state_mut().status.set_streaming(true);
-    assert_eq!(app.handle_input(&key(KeyCode::Esc)), AppAction::InterruptRestoreQueued);
+    assert_eq!(
+        app.handle_input(&key(KeyCode::Esc)),
+        AppAction::InterruptRestoreQueued
+    );
     assert!(
-        app.state().transcript.pending().iter().any(
-            |e| matches!(e, Entry::Block { title, .. } if title == "Keyboard Shortcuts")
-        ),
+        app.state()
+            .transcript
+            .pending()
+            .iter()
+            .any(|e| matches!(e, Entry::Block { title, .. } if title == "Keyboard Shortcuts")),
         "Esc must not remove the block"
     );
 }
@@ -268,9 +357,18 @@ fn hotkeys_global_key_cells_resolve_from_the_live_keymap() {
     let mut app = new_app();
     submit(&mut app, "/hotkeys");
     let stock = hotkeys_body(&app);
-    assert!(stock.contains("| `Ctrl+O` | Toggle tool output expansion |"), "{stock}");
-    assert!(stock.contains("| `Ctrl+G` | Edit message in external editor |"), "{stock}");
-    assert!(stock.contains("| `Ctrl+D` | Exit (when editor is empty) |"), "{stock}");
+    assert!(
+        stock.contains("| `Ctrl+O` | Toggle tool output expansion |"),
+        "{stock}"
+    );
+    assert!(
+        stock.contains("| `Ctrl+G` | Edit message in external editor |"),
+        "{stock}"
+    );
+    assert!(
+        stock.contains("| `Ctrl+D` | Exit (when editor is empty) |"),
+        "{stock}"
+    );
 
     // Rebind two of them and re-issue the command. A literal cell cannot follow.
     let mut rebound = new_app();
@@ -296,13 +394,22 @@ fn hotkeys_global_key_cells_resolve_from_the_live_keymap() {
     // `process.platform === "darwin"`, so the expected cell is host-dependent — the same reason
     // `tests/chrome.rs:36-43` branches. Spelled out rather than sourced from
     // `crate::format_key_text`, which would assert the renderer against itself.
-    let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
+    let alt = if cfg!(target_os = "macos") {
+        "Option"
+    } else {
+        "Alt"
+    };
     assert!(
-        body.contains(&format!("| `Ctrl+X/{alt}+E` | Edit message in external editor |")),
+        body.contains(&format!(
+            "| `Ctrl+X/{alt}+E` | Edit message in external editor |"
+        )),
         "a two-key global binding must list both:\n{body}"
     );
     // MIRROR — an untouched global row is unchanged, so the rebind moved one cell and not the table.
-    assert!(body.contains("| `Ctrl+D` | Exit (when editor is empty) |"), "{body}");
+    assert!(
+        body.contains("| `Ctrl+D` | Exit (when editor is empty) |"),
+        "{body}"
+    );
 }
 
 /// S36 — the **Extensions** table (`interactive-mode.ts:6186-6197`).
@@ -342,7 +449,10 @@ fn hotkeys_lists_extension_registered_shortcuts() {
     let mut bare = new_app();
     submit(&mut bare, "/hotkeys");
     let none = hotkeys_body(&bare);
-    assert!(!none.contains("**Extensions**"), "an empty registry must emit no section:\n{none}");
+    assert!(
+        !none.contains("**Extensions**"),
+        "an empty registry must emit no section:\n{none}"
+    );
 
     let mut app = new_app();
     app.set_extension_shortcuts([
@@ -358,12 +468,22 @@ fn hotkeys_lists_extension_registered_shortcuts() {
     // `formatKeyText(key, { capitalize: true })` — every chord part title-cased, and `alt`→`option`
     // on darwin only (`formatKeyPart`, `keybinding-hints.ts:12-15` @v0.83.0).
     assert!(body.contains("| `Ctrl+J` | Jump to definition |"), "{body}");
-    let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
-    assert!(body.contains(&format!("| `{alt}+Shift+K` | Kill the ring |")), "{body}");
+    let alt = if cfg!(target_os = "macos") {
+        "Option"
+    } else {
+        "Alt"
+    };
+    assert!(
+        body.contains(&format!("| `{alt}+Shift+K` | Kill the ring |")),
+        "{body}"
+    );
     // The section is LAST — it is appended after the `**Other**` table (`:6188`).
     let other = body.find("**Other**").expect("Other section");
     let ext = body.find("**Extensions**").expect("Extensions section");
-    assert!(ext > other, "the Extensions table must trail the built-in ones:\n{body}");
+    assert!(
+        ext > other,
+        "the Extensions table must trail the built-in ones:\n{body}"
+    );
     // And it is a real read of the routing registry, not a parallel list: the same ids still
     // dispatch.
     assert_eq!(

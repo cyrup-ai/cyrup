@@ -5,9 +5,14 @@
 //! `rgb_to_256` (Pi `hexTo256`/`fgAnsi`, `theme.ts:222-283`). Here we render the WHOLE app — footer,
 //! editor, and an open `/model` selector — through a `TestBackend` and assert **no cell carries a
 //! truecolor `Color::Rgb`** while indexed colors ARE used.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use crate::{rgb_to_256, App, ColorMode, ModelEntry, UiTheme};
+use crate::{App, ColorMode, ModelEntry, UiTheme, rgb_to_256};
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
@@ -38,14 +43,19 @@ fn assembled_256color_render_emits_indexed_never_truecolor() {
     let theme = UiTheme::dark().with_color_mode(ColorMode::Ansi256);
     assert_eq!(theme.color_mode, ColorMode::Ansi256);
     let mut app = App::new(TestBackend::new(100, 30), theme).unwrap();
-    assert_eq!(app.color_mode(), ColorMode::Ansi256, "app did not adopt the theme color mode");
+    assert_eq!(
+        app.color_mode(),
+        ColorMode::Ansi256,
+        "app did not adopt the theme color mode"
+    );
 
     // A colored, assembled surface: seeded footer + a committed exchange + an OPEN model selector
     // (accent/muted/success roles all in play).
     app.status_mut().set_model("anthropic/claude-opus-4-6");
     app.status_mut().set_reasoning(true);
     app.status_mut().set_thinking_level("high");
-    app.transcript_mut().push_assistant_delta("indexing the workspace");
+    app.transcript_mut()
+        .push_assistant_delta("indexing the workspace");
     app.open_model_selector(model(), None);
     app.draw().unwrap();
 
@@ -66,7 +76,10 @@ fn assembled_256color_render_emits_indexed_never_truecolor() {
             indexed += 1;
         }
     }
-    assert!(indexed > 0, "no indexed colors were used — the 256-color projection did nothing");
+    assert!(
+        indexed > 0,
+        "no indexed colors were used — the 256-color projection did nothing"
+    );
 }
 
 #[test]
@@ -85,7 +98,10 @@ fn assembled_truecolor_render_keeps_rgb_for_contrast() {
         .content()
         .iter()
         .any(|c| matches!(c.fg, Color::Rgb(_, _, _)) || matches!(c.bg, Color::Rgb(_, _, _)));
-    assert!(has_rgb, "truecolor mode should keep RGB roles (the 256-color test proves the contrast)");
+    assert!(
+        has_rgb,
+        "truecolor mode should keep RGB roles (the 256-color test proves the contrast)"
+    );
 }
 
 #[test]
@@ -97,8 +113,15 @@ fn rgb_to_256_matches_pi_reference_points() {
     assert_eq!(rgb_to_256(0x00, 0x00, 0x00), 16, "black → cube black 16");
     // A mid-gray `#808080` sits exactly on the grayscale ramp (value 128 = index 244) and is closer to
     // the ramp than to any cube cell → grayscale (Pi's spread<10 && grayDist<cubeDist branch).
-    assert_eq!(rgb_to_256(0x80, 0x80, 0x80), 244, "#808080 → grayscale ramp index 244");
+    assert_eq!(
+        rgb_to_256(0x80, 0x80, 0x80),
+        244,
+        "#808080 → grayscale ramp index 244"
+    );
     // A saturated teal `#8abeb7` keeps its hue → the cube (16..=231), not grayscale.
     let teal = rgb_to_256(0x8a, 0xbe, 0xb7);
-    assert!((16..=231).contains(&teal), "saturated teal → cube, got {teal}");
+    assert!(
+        (16..=231).contains(&teal),
+        "saturated teal → cube, got {teal}"
+    );
 }

@@ -10,8 +10,8 @@
 //! was deleted after a workspace-wide grep found it had never had a single caller (EXT-M08).
 
 use crate::error::ExtError;
-use crate::host::{build_engine, EpochDriver};
 use crate::host::epoch::DEFAULT_TICK;
+use crate::host::{EpochDriver, build_engine};
 use cyrup_core::RunCancel;
 use wasmtime::Engine;
 
@@ -29,7 +29,11 @@ impl WasmRuntime {
         let engine = build_engine()?;
         let cancel = RunCancel::new();
         let epoch = EpochDriver::spawn(engine.clone(), DEFAULT_TICK, cancel.clone());
-        Ok(Self { engine, cancel, _epoch: epoch })
+        Ok(Self {
+            engine,
+            cancel,
+            _epoch: epoch,
+        })
     }
 
     pub fn engine(&self) -> &Engine {

@@ -1,12 +1,12 @@
 //! The turn driver (Pi `runLoop`): steering/follow-up injection, the assistant turn, the tool
 //! batch, and the two post-turn hooks whose overrides are folded back into the run baseline.
 
-use std::sync::Arc;
 use super::{RunCtx, RunFailure};
 use crate::agent::message::tool_calls;
 use crate::event::{AgentEvent, AgentMessage};
 use crate::hooks::{AgentContextView, PostTurn};
 use cyrup_core::StopReason;
+use std::sync::Arc;
 
 impl RunCtx {
     pub(super) async fn run_loop(&mut self, mut turn_started: bool) -> Result<(), RunFailure> {
@@ -29,8 +29,10 @@ impl RunCtx {
                     self.emit(AgentEvent::TurnStart).await?;
                 }
                 for m in std::mem::take(&mut pending) {
-                    self.emit(AgentEvent::MessageStart { message: m.clone() }).await?;
-                    self.emit(AgentEvent::MessageEnd { message: m.clone() }).await?;
+                    self.emit(AgentEvent::MessageStart { message: m.clone() })
+                        .await?;
+                    self.emit(AgentEvent::MessageEnd { message: m.clone() })
+                        .await?;
                     // Pi pushes each injected steering/follow-up message onto the loop's working copy
                     // (`currentContext.messages.push`, agent-loop.ts:186).
                     let m = Arc::new(m);
@@ -56,7 +58,10 @@ impl RunCtx {
                         tool_results: Vec::new(),
                     })
                     .await?;
-                    self.emit(AgentEvent::AgentEnd { messages: self.new_messages.clone() }).await?;
+                    self.emit(AgentEvent::AgentEnd {
+                        messages: self.new_messages.clone(),
+                    })
+                    .await?;
                     return Ok(());
                 }
 
@@ -178,11 +183,16 @@ impl RunCtx {
                             tools: &self.tools,
                         },
                     };
-                    self.hooks.should_stop_after_turn(ctx, self.cancel.child()).await
+                    self.hooks
+                        .should_stop_after_turn(ctx, self.cancel.child())
+                        .await
                 };
                 match stop {
                     Ok(true) => {
-                        self.emit(AgentEvent::AgentEnd { messages: self.new_messages.clone() }).await?;
+                        self.emit(AgentEvent::AgentEnd {
+                            messages: self.new_messages.clone(),
+                        })
+                        .await?;
                         return Ok(());
                     }
                     Ok(false) => {}
@@ -202,7 +212,10 @@ impl RunCtx {
             }
             break;
         }
-        self.emit(AgentEvent::AgentEnd { messages: self.new_messages.clone() }).await?;
+        self.emit(AgentEvent::AgentEnd {
+            messages: self.new_messages.clone(),
+        })
+        .await?;
         Ok(())
     }
 }

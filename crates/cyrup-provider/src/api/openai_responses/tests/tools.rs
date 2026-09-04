@@ -546,15 +546,17 @@ fn a_disabled_model_emits_a_byte_identical_body_to_the_pre_drift_shape() {
     let body = build_params(&model(), &ctx, &StreamOptions::default(), None);
     assert_eq!(
         body["tools"],
-        Value::Array(convert_responses_tools(
-            &ctx.tools,
-            ConvertResponsesToolsOptions {
-                defer_loading: false,
-                supports_strict_mode: get_responses_compat(&model()).supports_strict_mode,
-                default_strict: Some(false),
-            },
+        Value::Array(
+            convert_responses_tools(
+                &ctx.tools,
+                ConvertResponsesToolsOptions {
+                    defer_loading: false,
+                    supports_strict_mode: get_responses_compat(&model()).supports_strict_mode,
+                    default_strict: Some(false),
+                },
+            )
+            .unwrap()
         )
-        .unwrap())
     );
     assert!(
         !serde_json::to_string(&body)

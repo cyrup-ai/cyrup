@@ -21,15 +21,15 @@
 //! (R-SA-049/050/051/066/069); [`chain_graph`] and [`worktree`] are siblings built on top of
 //! those same primitives.
 
+pub mod chain_graph;
 pub mod depth;
+pub mod dynamic_fanout;
+pub mod intercom_target;
+pub mod nested_events;
+pub mod nested_path;
 pub mod parallel;
 pub mod signal;
 pub mod worktree;
-pub mod nested_path;
-pub mod nested_events;
-pub mod chain_graph;
-pub mod intercom_target;
-pub mod dynamic_fanout;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -915,7 +915,9 @@ impl CapturedStderr {
         // failed run's error, so an unbounded buffer here would let a chatty child grow the
         // parent's heap by exactly as much as it wrote — the same hole the stdout cap closes, on
         // the stream far likelier to be spammed.
-        let tail = Arc::new(AsyncMutex::new(BoundedByteTail::new(MAX_CHILD_STDERR_BYTES)));
+        let tail = Arc::new(AsyncMutex::new(BoundedByteTail::new(
+            MAX_CHILD_STDERR_BYTES,
+        )));
         let pump_tail = Arc::clone(&tail);
         let pump = tokio::spawn(async move {
             let mut reader = stderr;
@@ -924,7 +926,7 @@ impl CapturedStderr {
             let mut buf = vec![0u8; STDERR_PUMP_CHUNK_BYTES];
             loop {
                 let read = match reader.read(&mut buf).await {
-                    Ok(0) => break,                       // EOF: the child closed its write end
+                    Ok(0) => break, // EOF: the child closed its write end
                     Ok(read) => read,
                     Err(_) => break, // a broken stderr pipe is diagnostic-only; never fails the run
                 };
@@ -1075,7 +1077,10 @@ mod tests {
     fn resolve_spawn_command_carries_base_args_from_the_companion_var() {
         let vars = StdHashMap::from([
             (SUBAGENT_BINARY_ENV_VAR, "/opt/wrapper/shim"),
-            (SUBAGENT_BINARY_ARGS_ENV_VAR, r#"["--launch","a b","x,y","say \"hi\""]"#),
+            (
+                SUBAGENT_BINARY_ARGS_ENV_VAR,
+                r#"["--launch","a b","x,y","say \"hi\""]"#,
+            ),
         ]);
         let resolved = resolve_spawn_command_from(lookup_from(vars), || {
             Ok(PathBuf::from("/should/not/be/used"))
@@ -1295,7 +1300,9 @@ mod tests {
             ..
         } = ev
         else {
-            panic!("a real `tool_execution_start` line must parse to the tool-start variant, got {ev:?}");
+            panic!(
+                "a real `tool_execution_start` line must parse to the tool-start variant, got {ev:?}"
+            );
         };
         assert_eq!(
             tool_call_id.as_str(),

@@ -128,7 +128,10 @@ impl Ctx {
         descriptor: crate::descriptor::ToolDescriptor,
         exec: impl crate::api::ToolExec,
     ) {
-        let tool = crate::api::RegisteredTool { descriptor, exec: Box::new(exec) };
+        let tool = crate::api::RegisteredTool {
+            descriptor,
+            exec: Box::new(exec),
+        };
         #[cfg(target_arch = "wasm32")]
         crate::guest::register_tool_late(tool);
         #[cfg(not(target_arch = "wasm32"))]

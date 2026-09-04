@@ -32,7 +32,7 @@
 use std::path::Path;
 
 use crate::session::trash_args;
-use crate::{delete_session_file_at, DeleteMethod};
+use crate::{DeleteMethod, delete_session_file_at};
 use tempfile::TempDir;
 
 /// pi's `trashArgs` (`session-selector.ts:649`). RED before the fix by construction — there was no
@@ -59,7 +59,10 @@ fn trash_argv_carries_pis_dash_dash_guard() {
 /// "deleted session" whether or not the file went.
 #[test]
 fn status_messages_are_pis_own() {
-    assert_eq!(DeleteMethod::Trash.status_message(), "Session moved to trash");
+    assert_eq!(
+        DeleteMethod::Trash.status_message(),
+        "Session moved to trash"
+    );
     assert_eq!(DeleteMethod::Unlink.status_message(), "Session deleted");
 }
 

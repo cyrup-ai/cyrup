@@ -116,7 +116,9 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
 #[must_use]
 pub fn normalize_rel_path(value: &str) -> String {
     let slashed = value.replace(std::path::MAIN_SEPARATOR, "/");
-    slashed.strip_prefix("./").map_or(slashed.clone(), str::to_string)
+    slashed
+        .strip_prefix("./")
+        .map_or(slashed.clone(), str::to_string)
 }
 
 /// `ignoredRelPath` (`change-signature.ts:49-54`): the exact-path set, the prefix list, or ANY path
@@ -125,8 +127,12 @@ pub fn normalize_rel_path(value: &str) -> String {
 pub fn ignored_rel_path(rel_path: &str) -> bool {
     let normalized = normalize_rel_path(rel_path);
     IGNORED_CHANGE_PATHS.contains(&normalized.as_str())
-        || IGNORED_CHANGE_PREFIXES.iter().any(|prefix| normalized.starts_with(prefix))
-        || normalized.split('/').any(|segment| IGNORED_CHANGE_SEGMENTS.contains(&segment))
+        || IGNORED_CHANGE_PREFIXES
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix))
+        || normalized
+            .split('/')
+            .any(|segment| IGNORED_CHANGE_SEGMENTS.contains(&segment))
 }
 
 /// `HashBudget` (`change-signature.ts:56-61`).
@@ -161,11 +167,13 @@ fn entry(path: &str, state: &str) -> Map<String, Value> {
 /// `createHash("sha256").…digest("hex")` (`change-signature.ts:70-72`). `sha2` 0.11's digest output
 /// does not implement `LowerHex`, so the hex encoding is explicit rather than a `{:x}` format.
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().fold(String::with_capacity(64), |mut out, byte| {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 /// `largeFileHash` (`change-signature.ts:73-75`): the metadata marker a file too big (or too far
@@ -267,7 +275,10 @@ fn hash_file_entry(
 /// and a hash of its own porcelain status rather than walked, so a submodule's whole object store is
 /// never hashed.
 fn git_worktree_entry(normalized: &str, full_path: &Path) -> Value {
-    let status = git(full_path, &["status", "--porcelain=v1", "-z", "--untracked-files=no"]);
+    let status = git(
+        full_path,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=no"],
+    );
     let mut map = entry(normalized, "git-worktree");
     map.insert(
         "head".to_string(),
@@ -297,7 +308,10 @@ fn hash_path(
     let normalized = normalize_rel_path(rel_path);
     if !budget.use_entry() {
         let mut map = entry(&normalized, "skipped");
-        map.insert("reason".to_string(), Value::String("entry-limit".to_string()));
+        map.insert(
+            "reason".to_string(),
+            Value::String("entry-limit".to_string()),
+        );
         return Ok(Value::Object(map));
     }
     let full_path = root.join(&normalized);
@@ -337,7 +351,9 @@ fn hash_path(
             .collect();
         names.sort();
         let remaining = budget.max_entries.saturating_sub(budget.entries);
-        let take = usize::try_from(remaining).unwrap_or(usize::MAX).min(names.len());
+        let take = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(names.len());
         let skipped = names.len() - take;
         let mut child_entries: Vec<Value> = Vec::with_capacity(take + usize::from(skipped > 0));
         for child in names.iter().take(take) {
@@ -345,7 +361,10 @@ fn hash_path(
         }
         if skipped > 0 {
             let mut map = entry(&normalized, "skipped-children");
-            map.insert("reason".to_string(), Value::String("entry-limit".to_string()));
+            map.insert(
+                "reason".to_string(),
+                Value::String("entry-limit".to_string()),
+            );
             map.insert("count".to_string(), Value::from(skipped));
             child_entries.push(Value::Object(map));
         }
@@ -376,7 +395,9 @@ fn parse_porcelain_z(raw: &str) -> Vec<PorcelainEntry> {
     let mut entries = Vec::new();
     let mut index = 0;
     while index < tokens.len() {
-        let Some(token) = tokens.get(index) else { break };
+        let Some(token) = tokens.get(index) else {
+            break;
+        };
         if token.len() < 4 {
             index += 1;
             continue;
@@ -440,8 +461,11 @@ fn build_repo_change_signature_with(
         .filter(|entry| !entry.paths.is_empty())
         .collect();
     entries.sort_by(|a, b| {
-        format!("{} {}", a.status, a.paths.join("\0"))
-            .cmp(&format!("{} {}", b.status, b.paths.join("\0")))
+        format!("{} {}", a.status, a.paths.join("\0")).cmp(&format!(
+            "{} {}",
+            b.status,
+            b.paths.join("\0")
+        ))
     });
     let changed_paths: Vec<String> = entries
         .iter()
@@ -486,7 +510,10 @@ pub fn compute_watchdog_repo_change_signature(cwd: &Path) -> Option<WatchdogRepo
         return None;
     }
     let root = Path::new(root);
-    let status_output = git(root, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+    let status_output = git(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
     match build_repo_change_signature(root, &status_output) {
         Ok(signature) => Some(signature),
         Err(err) => {
@@ -540,7 +567,10 @@ pub fn event_indicates_repo_edit(event: &Value) -> bool {
             || input.get("event").and_then(Value::as_str) == Some(name)
     };
     if is_type("turn_end") {
-        if input.get("message").is_some_and(message_indicates_repo_edit) {
+        if input
+            .get("message")
+            .is_some_and(message_indicates_repo_edit)
+        {
             return true;
         }
         return input
@@ -561,7 +591,9 @@ pub fn event_indicates_repo_edit(event: &Value) -> bool {
     if !is_type("tool_result_end") {
         return false;
     }
-    input.get("message").is_some_and(message_indicates_repo_edit)
+    input
+        .get("message")
+        .is_some_and(message_indicates_repo_edit)
 }
 
 // -------------------------------------------------------------------------------------------
@@ -584,7 +616,12 @@ impl super::runtime::WatchdogRepoChangeSource for GitRepoChangeSource {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -624,13 +661,27 @@ mod tests {
     /// the arm that uses it in production is the one this suite does not run.
     #[test]
     fn the_non_unix_mode_is_nodes_own_win32_synthesis() {
-        assert_eq!(synthetic_win32_mode(false), 0o666, "writable: Node reports 0o100666");
-        assert_eq!(synthetic_win32_mode(true), 0o444, "read-only: Node reports 0o100444, not 0");
+        assert_eq!(
+            synthetic_win32_mode(false),
+            0o666,
+            "writable: Node reports 0o100666"
+        );
+        assert_eq!(
+            synthetic_win32_mode(true),
+            0o444,
+            "read-only: Node reports 0o100444, not 0"
+        );
         // Both are real permission bits; neither is the empty mode the arithmetic form produced.
         assert_ne!(synthetic_win32_mode(true), 0);
         // And both survive `hashFileEntry`'s own `& 0o777` mask unchanged.
-        assert_eq!(synthetic_win32_mode(true) & 0o777, synthetic_win32_mode(true));
-        assert_eq!(synthetic_win32_mode(false) & 0o777, synthetic_win32_mode(false));
+        assert_eq!(
+            synthetic_win32_mode(true) & 0o777,
+            synthetic_win32_mode(true)
+        );
+        assert_eq!(
+            synthetic_win32_mode(false) & 0o777,
+            synthetic_win32_mode(false)
+        );
     }
 
     #[test]
@@ -692,7 +743,10 @@ mod tests {
         // Rewrite byte-identically: git reports it, the content hash does not.
         std::fs::write(&file, "one").unwrap();
         let second = compute_watchdog_repo_change_signature(tmp.path()).unwrap();
-        assert_eq!(first.key, second.key, "identical content must not move the key");
+        assert_eq!(
+            first.key, second.key,
+            "identical content must not move the key"
+        );
         std::fs::write(&file, "two").unwrap();
         let third = compute_watchdog_repo_change_signature(tmp.path()).unwrap();
         assert_ne!(first.key, third.key, "changed content must move the key");
@@ -707,7 +761,11 @@ mod tests {
         let signature = compute_watchdog_repo_change_signature(tmp.path()).unwrap();
         assert_eq!(
             signature.changed_paths,
-            vec!["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()]
+            vec![
+                "a.txt".to_string(),
+                "b.txt".to_string(),
+                "c.txt".to_string()
+            ]
         );
     }
 
@@ -727,20 +785,24 @@ mod tests {
         for i in 0..5 {
             std::fs::write(tmp.path().join(format!("f{i}.txt")), "x").unwrap();
         }
-        let status = (0..5)
-            .map(|i| format!("?? f{i}.txt\0"))
-            .collect::<String>();
+        let status = (0..5).map(|i| format!("?? f{i}.txt\0")).collect::<String>();
         let budget = |max_entries: u64| HashBudget {
             entries: 0,
             bytes: 0,
             max_entries,
             max_bytes: DEFAULT_MAX_HASH_TOTAL_BYTES,
         };
-        let full =
-            build_repo_change_signature_with(tmp.path(), &status, budget(2_000)).unwrap();
+        let full = build_repo_change_signature_with(tmp.path(), &status, budget(2_000)).unwrap();
         let truncated = build_repo_change_signature_with(tmp.path(), &status, budget(2)).unwrap();
-        assert_eq!(truncated.changed_paths.len(), 5, "the path list is not budgeted");
-        assert_ne!(full.key, truncated.key, "the truncation is part of the hashed payload");
+        assert_eq!(
+            truncated.changed_paths.len(),
+            5,
+            "the path list is not budgeted"
+        );
+        assert_ne!(
+            full.key, truncated.key,
+            "the truncation is part of the hashed payload"
+        );
     }
 
     #[test]
@@ -809,7 +871,9 @@ mod tests {
             "message": { "role": "toolResult", "toolName": "write", "content": "ok" },
         });
         assert!(event_indicates_repo_edit(&event));
-        assert!(!event_indicates_repo_edit(&json!({ "event": "tool_result_end" })));
+        assert!(!event_indicates_repo_edit(
+            &json!({ "event": "tool_result_end" })
+        ));
         assert!(!event_indicates_repo_edit(&json!("not an object")));
     }
 }

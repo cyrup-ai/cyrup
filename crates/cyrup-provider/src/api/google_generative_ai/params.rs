@@ -1,17 +1,17 @@
 //! Request encoding — the `:streamGenerateContent` request body (Pi `buildParams` + the
 //! `streamSimple` thinking lowering, google-generative-ai.ts:283-400).
 
+use super::convert::convert_messages;
+use super::thinking::{thinking_config, thinking_config_override};
+use super::tools::{
+    convert_tools, resolve_google_function_calling_mode, supports_google_strict_tool_sampling,
+};
 use crate::api::compat::sanitize_surrogates;
 use crate::context::Context;
 use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use serde_json::{Map, Value, json};
-use super::convert::convert_messages;
-use super::thinking::{thinking_config, thinking_config_override};
-use super::tools::{
-    convert_tools, resolve_google_function_calling_mode, supports_google_strict_tool_sampling,
-};
 
 /// Test-only convenience wrapper for [`build_params`].
 #[cfg(test)]

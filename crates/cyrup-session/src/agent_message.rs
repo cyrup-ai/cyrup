@@ -199,7 +199,10 @@ impl AgentMessage {
             }
             AgentMessage::Custom(c) => out.push(custom_to_message(&c.content, c.timestamp)),
             AgentMessage::BranchSummary(b) => {
-                out.push(crate::context::branch_summary_message(&b.summary, b.timestamp));
+                out.push(crate::context::branch_summary_message(
+                    &b.summary,
+                    b.timestamp,
+                ));
             }
             AgentMessage::CompactionSummary(c) => {
                 out.push(crate::context::compaction_summary_message(
@@ -261,7 +264,10 @@ pub fn custom_to_message(content: &Value, timestamp: i64) -> Message {
         Value::Null => Vec::new(),
         other => vec![Content::text(other.to_string())],
     };
-    Message::User { content: blocks, timestamp }
+    Message::User {
+        content: blocks,
+        timestamp,
+    }
 }
 
 impl Serialize for AgentMessage {
@@ -336,13 +342,12 @@ impl<'de> Deserialize<'de> for AgentMessage {
         let v = Value::deserialize(d)?;
         match v.get("role").and_then(Value::as_str) {
             Some("bashExecution") => {
-                let b = serde_json::from_value::<BashExecutionMessage>(v)
-                    .map_err(D::Error::custom)?;
+                let b =
+                    serde_json::from_value::<BashExecutionMessage>(v).map_err(D::Error::custom)?;
                 Ok(AgentMessage::BashExecution(b))
             }
             Some("custom") => {
-                let c =
-                    serde_json::from_value::<CustomRoleMessage>(v).map_err(D::Error::custom)?;
+                let c = serde_json::from_value::<CustomRoleMessage>(v).map_err(D::Error::custom)?;
                 Ok(AgentMessage::Custom(c))
             }
             Some("branchSummary") => {
@@ -364,7 +369,12 @@ impl<'de> Deserialize<'de> for AgentMessage {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic, clippy::collapsible_if)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::collapsible_if
+)]
 mod tests {
     use super::*;
 
@@ -415,7 +425,10 @@ mod tests {
         });
         let mut out = Vec::new();
         m.push_llm(&mut out);
-        assert!(out.is_empty(), "!! bash messages are excluded from LLM context");
+        assert!(
+            out.is_empty(),
+            "!! bash messages are excluded from LLM context"
+        );
     }
 
     #[test]
@@ -459,7 +472,13 @@ mod tests {
         assert_eq!(back["customType"], "ext.note");
         let mut out = Vec::new();
         m.push_llm(&mut out);
-        assert_eq!(out, vec![Message::User { content: vec![Content::text("hello")], timestamp: 3 }]);
+        assert_eq!(
+            out,
+            vec![Message::User {
+                content: vec![Content::text("hello")],
+                timestamp: 3
+            }]
+        );
     }
 
     #[test]
@@ -469,6 +488,12 @@ mod tests {
         assert!(matches!(m, AgentMessage::Core(Message::User { .. })));
         let mut out = Vec::new();
         m.push_llm(&mut out);
-        assert_eq!(out, vec![Message::User { content: vec![Content::text("hi")], timestamp: 1 }]);
+        assert_eq!(
+            out,
+            vec![Message::User {
+                content: vec![Content::text("hi")],
+                timestamp: 1
+            }]
+        );
     }
 }

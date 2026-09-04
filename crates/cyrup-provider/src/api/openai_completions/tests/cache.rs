@@ -79,7 +79,10 @@ fn cache_breakpoint_lands_on_a_trailing_tool_result() {
         "the trailing tool result must carry the breakpoint"
     );
     assert!(
-        messages[2].get("content").and_then(Value::as_array).is_none(),
+        messages[2]
+            .get("content")
+            .and_then(Value::as_array)
+            .is_none(),
         "the assistant message must be left as a plain string — untouched"
     );
 

@@ -86,7 +86,10 @@ pub struct EscalationGraces {
 
 impl Default for EscalationGraces {
     fn default() -> Self {
-        Self { sigint: SIGINT_GRACE, sigterm: SIGTERM_GRACE }
+        Self {
+            sigint: SIGINT_GRACE,
+            sigterm: SIGTERM_GRACE,
+        }
     }
 }
 
@@ -195,10 +198,7 @@ pub fn signal_name_of(status: &std::process::ExitStatus) -> Option<&'static str>
 /// from", exactly mirroring `cyrup_ext::caps::proc::ProcCaps::kill`'s and
 /// `cyrup_tools::ops::local::terminate_pid`'s existing try-and-ignore convention for the same
 /// class of benign race.
-pub async fn terminate(
-    child: Child,
-    cancel: &CancelToken,
-) -> std::io::Result<TerminationOutcome> {
+pub async fn terminate(child: Child, cancel: &CancelToken) -> std::io::Result<TerminationOutcome> {
     terminate_with_graces(child, cancel, EscalationGraces::default()).await
 }
 
@@ -461,7 +461,12 @@ pub(crate) fn send_sigkill(child: &mut Child) {
 /// platform that runs it.
 #[cfg(any(not(unix), test))]
 fn win32_tree_kill_argv(pid: u32) -> [String; 4] {
-    ["/F".to_string(), "/T".to_string(), "/PID".to_string(), pid.to_string()]
+    [
+        "/F".to_string(),
+        "/T".to_string(),
+        "/PID".to_string(),
+        pid.to_string(),
+    ]
 }
 
 /// Send `signal` to the child via `nix::sys::signal::kill`, swallowing the result.
@@ -603,7 +608,9 @@ fn catch_sigint_for_the_rest_of_the_process() {
     let thread = std::thread::Builder::new()
         .name("sigint-disposition-repair".to_string())
         .spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
             else {
                 return;
             };
@@ -672,7 +679,11 @@ mod tests {
             .args(["-c", "exit 0"])
             .status()
             .expect("sh runs");
-        assert_eq!(signal_name_of(&clean), None, "a normal exit names no signal");
+        assert_eq!(
+            signal_name_of(&clean),
+            None,
+            "a normal exit names no signal"
+        );
 
         // Signalled exit, constructed from the same representation `wait()` produces.
         let killed = std::process::ExitStatus::from_raw(9);
@@ -752,11 +763,23 @@ mod tests {
         // grace may be paid out. This half of the assertion runs everywhere.
         send_sigkill(&mut child);
         let _ = child.wait().await.expect("the sleeper is reaped");
-        assert!(child.id().is_none(), "a reaped child has no pid left to signal");
-        assert!(!send_sigint(&child), "nothing can be sent to a reaped child");
-        assert!(!send_sigterm(&child), "nothing can be sent to a reaped child");
+        assert!(
+            child.id().is_none(),
+            "a reaped child has no pid left to signal"
+        );
+        assert!(
+            !send_sigint(&child),
+            "nothing can be sent to a reaped child"
+        );
+        assert!(
+            !send_sigterm(&child),
+            "nothing can be sent to a reaped child"
+        );
         assert_eq!(grace_if_sent(send_sigint(&child), GENEROUS), Duration::ZERO);
-        assert_eq!(grace_if_sent(send_sigterm(&child), GENEROUS), Duration::ZERO);
+        assert_eq!(
+            grace_if_sent(send_sigterm(&child), GENEROUS),
+            Duration::ZERO
+        );
     }
 
     /// Stage 3 must kill the SUBTREE on every platform, not just on Unix.
@@ -776,7 +799,12 @@ mod tests {
         let argv = win32_tree_kill_argv(4242);
         assert_eq!(
             argv,
-            ["/F".to_string(), "/T".to_string(), "/PID".to_string(), "4242".to_string()],
+            [
+                "/F".to_string(),
+                "/T".to_string(),
+                "/PID".to_string(),
+                "4242".to_string()
+            ],
             "stage 3's non-Unix argv is pi `killProcessTree`'s literal, `/T` (tree) included"
         );
         assert!(
@@ -822,7 +850,10 @@ mod tests {
         let pid = child.id().expect("live child has a pid");
 
         let cancel = CancelToken::new();
-        let graces = EscalationGraces { sigint: GENEROUS, ..EscalationGraces::default() };
+        let graces = EscalationGraces {
+            sigint: GENEROUS,
+            ..EscalationGraces::default()
+        };
         let started = tokio::time::Instant::now();
         let outcome = terminate_with_graces(child, &cancel, graces)
             .await
@@ -880,8 +911,10 @@ mod tests {
         // Both graces must genuinely elapse here (the child ignores both signals), so they are
         // injected SHORT — a lower bound is load-robust in a way an upper bound is not, and the
         // production constants would cost this test 4.5s of pure sleeping for no extra proof.
-        let graces =
-            EscalationGraces { sigint: Duration::from_millis(200), sigterm: Duration::from_millis(300) };
+        let graces = EscalationGraces {
+            sigint: Duration::from_millis(200),
+            sigterm: Duration::from_millis(300),
+        };
         let started = tokio::time::Instant::now();
         let outcome = terminate_with_graces(child, &cancel, graces)
             .await
@@ -935,7 +968,10 @@ mod tests {
         // Stage 1's grace is SHORT here because this test needs it to genuinely elapse (the child
         // ignores SIGINT), and stage 2's is GENEROUS because the claim under test is that SIGTERM
         // is what ended it — which must not double as a bet on reaping beating a 3500ms clock.
-        let graces = EscalationGraces { sigint: Duration::from_millis(200), sigterm: GENEROUS };
+        let graces = EscalationGraces {
+            sigint: Duration::from_millis(200),
+            sigterm: GENEROUS,
+        };
         let started = tokio::time::Instant::now();
         let outcome = terminate_with_graces(child, &cancel, graces)
             .await
@@ -995,7 +1031,10 @@ mod tests {
         // without a tight wall-clock bound: paying out even one of these legs would take 30s, so
         // returning in far less proves the cancellation skipped them — an assertion that holds no
         // matter how badly loaded the machine is, unlike a `< 1000ms` bound on a real process kill.
-        let graces = EscalationGraces { sigint: GENEROUS, sigterm: GENEROUS };
+        let graces = EscalationGraces {
+            sigint: GENEROUS,
+            sigterm: GENEROUS,
+        };
         let started = tokio::time::Instant::now();
         let outcome = terminate_with_graces(child, &cancel, graces)
             .await

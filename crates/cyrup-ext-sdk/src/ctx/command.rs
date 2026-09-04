@@ -201,8 +201,13 @@ impl CommandCtx {
     ///
     /// Both `message` and `opts` are author-supplied; either encoding failing is returned as `Err`
     /// rather than sending a `null` message or dropping the options.
-    pub fn send_message(&self, message: impl Serialize, opts: impl Serialize) -> Result<(), String> {
-        let m = serde_json::to_string(&message).map_err(|e| format!("send_message message: {e}"))?;
+    pub fn send_message(
+        &self,
+        message: impl Serialize,
+        opts: impl Serialize,
+    ) -> Result<(), String> {
+        let m =
+            serde_json::to_string(&message).map_err(|e| format!("send_message message: {e}"))?;
         let o = serde_json::to_string(&opts).map_err(|e| format!("send_message opts: {e}"))?;
         control(Control::SendMessage(&m, &o))
     }

@@ -24,13 +24,18 @@
 //!    inside the full-width state-tinted `Box`, so one `read` painted hundreds of rows of solid
 //!    tool background over the conversation. On a 256-colour terminal that background is
 //!    `Indexed(22)` — a vivid `#005f00` — which is the "hideous solid green" in the report.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use crate::{App, ColorMode, UiTheme};
 use cyrup_agent::AgentMessage;
 use cyrup_core::{AssistantMessage, Content, ProviderId, StopReason};
 use cyrup_provider::StreamEvent;
 use cyrup_session_svc::AgentSessionEvent;
-use crate::{App, ColorMode, UiTheme};
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
@@ -118,7 +123,11 @@ fn drive_turn(app: &mut App<TestBackend>) {
     assistant_step(
         app,
         "I'll check the file.",
-        Some(("call_1", "read", serde_json::json!({ "file_path": "/src/main.rs" }))),
+        Some((
+            "call_1",
+            "read",
+            serde_json::json!({ "file_path": "/src/main.rs" }),
+        )),
     );
     app.draw().unwrap();
     run_tool(
@@ -130,7 +139,10 @@ fn drive_turn(app: &mut App<TestBackend>) {
     );
     app.draw().unwrap();
     assistant_step(app, "Done - it is a stub.", None);
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: vec![],
+        will_retry: false,
+    });
     app.draw().unwrap();
 }
 
@@ -139,7 +151,11 @@ fn row_of(app: &App<TestBackend>, needle: &str) -> usize {
     app.scrollback_lines()
         .iter()
         .position(|l| {
-            l.spans.iter().map(|s| s.content.as_ref()).collect::<String>().contains(needle)
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .contains(needle)
         })
         .unwrap_or_else(|| {
             panic!(
@@ -150,7 +166,10 @@ fn row_of(app: &App<TestBackend>, needle: &str) -> usize {
                     .map(|(i, l)| format!(
                         "[{i}] bg={:?} {}",
                         l.style.bg,
-                        l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
                     ))
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -172,7 +191,10 @@ fn a_turn_interleaves_user_text_tool_text_in_that_order() {
     let tool = row_of(&app, "/src/main.rs");
     let second_text = row_of(&app, "Done - it is a stub.");
 
-    assert!(user < first_text, "user echo must precede the answer (user={user}, text={first_text})");
+    assert!(
+        user < first_text,
+        "user echo must precede the answer (user={user}, text={first_text})"
+    );
     assert!(
         first_text < tool,
         "the tool block must follow the text that requested it (text={first_text}, tool={tool})"
@@ -223,8 +245,15 @@ fn painted_cells_tint_the_tool_block_only_and_never_the_prose() {
             Some(DARK_TOOL_SUCCESS_BG),
             "tool box row {row} is not painted toolSuccessBg"
         );
-        let painted: usize = lines[row].spans.iter().map(|s| s.content.chars().count()).sum();
-        assert!(painted >= 99, "tool box row {row} only painted {painted} of 100 columns");
+        let painted: usize = lines[row]
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert!(
+            painted >= 99,
+            "tool box row {row} only painted {painted} of 100 columns"
+        );
         for span in &lines[row].spans {
             assert!(
                 span.style.bg.is_none() || span.style.bg == Some(DARK_TOOL_SUCCESS_BG),
@@ -240,7 +269,10 @@ fn painted_cells_tint_the_tool_block_only_and_never_the_prose() {
             "assistant prose row {row} ({needle:?}) was painted a background"
         );
         for span in &lines[row].spans {
-            assert_eq!(span.style.bg, None, "assistant prose span carries a background: {span:?}");
+            assert_eq!(
+                span.style.bg, None,
+                "assistant prose span carries a background: {span:?}"
+            );
         }
     }
     // The tint is a background only — the header keeps its own foreground, so nothing is buried.
@@ -263,13 +295,25 @@ fn a_committed_read_stays_collapsed_instead_of_painting_the_whole_file() {
         "reading",
         Some(("c1", "read", serde_json::json!({ "file_path": "/big.rs" }))),
     );
-    run_tool(&mut app, "c1", "read", serde_json::json!({ "file_path": "/big.rs" }), &body);
+    run_tool(
+        &mut app,
+        "c1",
+        "read",
+        serde_json::json!({ "file_path": "/big.rs" }),
+        &body,
+    );
     assistant_step(&mut app, "done reading", None);
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: vec![],
+        will_retry: false,
+    });
     app.draw().unwrap();
 
-    let tinted =
-        app.scrollback_lines().iter().filter(|l| l.style.bg == Some(DARK_TOOL_SUCCESS_BG)).count();
+    let tinted = app
+        .scrollback_lines()
+        .iter()
+        .filter(|l| l.style.bg == Some(DARK_TOOL_SUCCESS_BG))
+        .count();
     assert_eq!(
         tinted,
         3,
@@ -293,8 +337,17 @@ fn a_committed_read_stays_collapsed_instead_of_painting_the_whole_file() {
         "reading",
         Some(("c1", "read", serde_json::json!({ "file_path": "/big.rs" }))),
     );
-    run_tool(&mut app, "c1", "read", serde_json::json!({ "file_path": "/big.rs" }), &body);
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
+    run_tool(
+        &mut app,
+        "c1",
+        "read",
+        serde_json::json!({ "file_path": "/big.rs" }),
+        &body,
+    );
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: vec![],
+        will_retry: false,
+    });
     app.draw().unwrap();
     assert!(
         app.scrollback_text().contains("let x60"),
@@ -365,8 +418,17 @@ fn ansi256_tool_tints_quantise_exactly_as_pi_does() {
         "checking",
         Some(("c1", "read", serde_json::json!({ "file_path": "/m.rs" }))),
     );
-    run_tool(&mut app, "c1", "read", serde_json::json!({ "file_path": "/m.rs" }), "fn main() {}");
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
+    run_tool(
+        &mut app,
+        "c1",
+        "read",
+        serde_json::json!({ "file_path": "/m.rs" }),
+        "fn main() {}",
+    );
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: vec![],
+        will_retry: false,
+    });
     app.draw().unwrap();
 
     let tinted: Vec<Color> = app
@@ -377,10 +439,18 @@ fn ansi256_tool_tints_quantise_exactly_as_pi_does() {
         .collect();
     assert!(!tinted.is_empty(), "no tinted rows at all under Ansi256");
     for bg in &tinted {
-        assert_eq!(*bg, Color::Indexed(22), "toolSuccessBg must quantise to Pi's cube index 22");
+        assert_eq!(
+            *bg,
+            Color::Indexed(22),
+            "toolSuccessBg must quantise to Pi's cube index 22"
+        );
     }
     // And the block is still three rows, not the file.
-    assert_eq!(tinted.len(), 3, "the Ansi256 block grew past Pi's 3-row Box(1,1)");
+    assert_eq!(
+        tinted.len(),
+        3,
+        "the Ansi256 block grew past Pi's 3-row Box(1,1)"
+    );
 }
 
 /// Idempotence of the finalize. `message_end` is guarded on the open-message bit — Pi's
@@ -409,9 +479,17 @@ fn a_forwarded_terminal_then_message_end_commits_the_text_once() {
     app.ingest_event(&AgentSessionEvent::MessageEnd {
         message: AgentMessage::Assistant(std::sync::Arc::new(final_msg)),
     });
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: vec![],
+        will_retry: false,
+    });
     app.draw().unwrap();
 
     let hits = app.scrollback_text().matches("only once").count();
-    assert_eq!(hits, 1, "the message committed {hits} times:\n{}", app.scrollback_text());
+    assert_eq!(
+        hits,
+        1,
+        "the message committed {hits} times:\n{}",
+        app.scrollback_text()
+    );
 }

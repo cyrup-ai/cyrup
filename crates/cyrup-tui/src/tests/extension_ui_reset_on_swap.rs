@@ -6,10 +6,15 @@
 //! widget, status rows and shortcut bindings in place, so surfaces owned by the OUTGOING session's
 //! extensions kept rendering under the new session, attached to a host that no longer exists.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
-use cyrup_session_svc::UiEffect;
 use crate::{App, UiTheme};
+use cyrup_session_svc::UiEffect;
 use ratatui::backend::TestBackend;
 
 fn app() -> App<TestBackend> {
@@ -22,21 +27,44 @@ async fn a_session_swap_clears_extension_owned_surfaces() {
     let mut app = app();
 
     // Drive the REAL effect path an extension uses, not the fields directly.
-    app.apply_ui_effect(UiEffect::SetHeader { content: "ext header".to_string() });
-    app.apply_ui_effect(UiEffect::SetFooter { content: "ext footer".to_string() });
+    app.apply_ui_effect(UiEffect::SetHeader {
+        content: "ext header".to_string(),
+    });
+    app.apply_ui_effect(UiEffect::SetFooter {
+        content: "ext footer".to_string(),
+    });
     app.apply_ui_effect(UiEffect::SetWidget {
         widget: serde_json::json!({"key": "k", "lines": ["widget"], "placement": "aboveEditor"}),
     });
-    app.apply_ui_effect(UiEffect::SetStatus { key: "ext".to_string(), text: Some("busy".to_string()) });
+    app.apply_ui_effect(UiEffect::SetStatus {
+        key: "ext".to_string(),
+        text: Some("busy".to_string()),
+    });
     app.set_extension_shortcuts(["ctrl+g".to_string()]);
 
     // Non-vacuity: every surface must actually be OCCUPIED before the swap, or the assertions below
     // pass on a payload the app silently dropped.
-    assert_eq!(app.state().extension_widgets.len(), 1, "the widget mounted before the swap");
-    assert!(app.state().extension_header.is_some(), "the header mounted before the swap");
-    assert!(app.state().extension_footer.is_some(), "the footer mounted before the swap");
-    assert!(!app.state().status.extension_statuses.is_empty(), "a status row exists pre-swap");
-    assert!(!app.state().extension_shortcuts.is_empty(), "a shortcut exists pre-swap");
+    assert_eq!(
+        app.state().extension_widgets.len(),
+        1,
+        "the widget mounted before the swap"
+    );
+    assert!(
+        app.state().extension_header.is_some(),
+        "the header mounted before the swap"
+    );
+    assert!(
+        app.state().extension_footer.is_some(),
+        "the footer mounted before the swap"
+    );
+    assert!(
+        !app.state().status.extension_statuses.is_empty(),
+        "a status row exists pre-swap"
+    );
+    assert!(
+        !app.state().extension_shortcuts.is_empty(),
+        "a shortcut exists pre-swap"
+    );
 
     app.rebind_session();
 
@@ -61,7 +89,11 @@ async fn a_session_swap_still_resets_the_session_owned_surfaces() {
         steering: vec!["from the old session".to_string()],
         follow_up: vec!["and this".to_string()],
     });
-    assert_eq!(app.state().pending_messages.len(), 2, "fixture: the region is populated");
+    assert_eq!(
+        app.state().pending_messages.len(),
+        2,
+        "fixture: the region is populated"
+    );
 
     app.rebind_session();
 

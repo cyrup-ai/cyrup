@@ -110,7 +110,9 @@ pub fn parse_iso8601_utc_ms(value: &str) -> Option<i64> {
     }
     // Fractional seconds are truncated, not rounded — `Date.parse` keeps millisecond precision but
     // the manifest is second-granular, so a whole-second floor is exact for every real input.
-    let (clock, frac) = time.split_once('.').map_or((time, None), |(c, f)| (c, Some(f)));
+    let (clock, frac) = time
+        .split_once('.')
+        .map_or((time, None), |(c, f)| (c, Some(f)));
     let (hour, min, sec) = split_clock(clock)?;
     let millis = match frac {
         None => 0,

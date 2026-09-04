@@ -79,7 +79,9 @@ pub(super) fn latex_prepass(source: &str) -> (String, Vec<Vec<String>>) {
             at_block_start = true;
             continue;
         }
-        if matches!(c, '$' | '\\') && let Some(token) = latex::tokenize_inline(rest) {
+        if matches!(c, '$' | '\\')
+            && let Some(token) = latex::tokenize_inline(rest)
+        {
             let rendered = latex::render_token(&token, false);
             push_math_placeholder(&mut out, &mut math, &rendered);
             i += token.raw_len;
@@ -232,7 +234,10 @@ pub fn trim_partial_closing_fence(text: &str) -> String {
         && last.chars().all(|c| c == fc)
         && last.chars().count() < open_len
     {
-        return text.get(..last_start.saturating_sub(1)).unwrap_or("").to_string();
+        return text
+            .get(..last_start.saturating_sub(1))
+            .unwrap_or("")
+            .to_string();
     }
     text.to_string()
 }
@@ -295,16 +300,40 @@ mod fence_closure {
     /// The predicate itself, over the cases that decide a fence's memo-eligibility.
     #[test]
     fn a_fence_is_closed_only_when_it_carries_its_own_delimiter() {
-        assert!(fence_is_closed("```rust\nfn a() {}\n```"), "a plainly closed fence");
+        assert!(
+            fence_is_closed("```rust\nfn a() {}\n```"),
+            "a plainly closed fence"
+        );
         assert!(fence_is_closed("```rust\n```"), "empty, but closed");
-        assert!(fence_is_closed("```rust\nfn a() {}\n```\n"), "a trailing newline is not content");
-        assert!(fence_is_closed("````\n```\n````"), "a 4-char opener; the interior ``` is body");
-        assert!(fence_is_closed("~~~\n```\n~~~"), "a ~ fence is not closed by a ` run");
+        assert!(
+            fence_is_closed("```rust\nfn a() {}\n```\n"),
+            "a trailing newline is not content"
+        );
+        assert!(
+            fence_is_closed("````\n```\n````"),
+            "a 4-char opener; the interior ``` is body"
+        );
+        assert!(
+            fence_is_closed("~~~\n```\n~~~"),
+            "a ~ fence is not closed by a ` run"
+        );
 
-        assert!(!fence_is_closed("```rust\nfn a() {"), "the growing tail of a stream");
-        assert!(!fence_is_closed("```rust"), "the opener alone does not close itself");
-        assert!(!fence_is_closed("````\nfn a() {}\n```"), "a closer must be at least as long");
-        assert!(!fence_is_closed("    indented code"), "an indented block has no delimiter");
+        assert!(
+            !fence_is_closed("```rust\nfn a() {"),
+            "the growing tail of a stream"
+        );
+        assert!(
+            !fence_is_closed("```rust"),
+            "the opener alone does not close itself"
+        );
+        assert!(
+            !fence_is_closed("````\nfn a() {}\n```"),
+            "a closer must be at least as long"
+        );
+        assert!(
+            !fence_is_closed("    indented code"),
+            "an indented block has no delimiter"
+        );
     }
 
     /// The property the predicate is USELESS without, and whose failure would be silent.

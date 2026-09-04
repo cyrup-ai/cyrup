@@ -48,7 +48,10 @@ pub enum InputReduction {
     /// A handler fully serviced the input (Pi `{action:"handled"}`) — do not submit it.
     Handled,
     /// A handler blocked the submission (first block wins).
-    Blocked { reason: Option<String>, by: ExtensionId },
+    Blocked {
+        reason: Option<String>,
+        by: ExtensionId,
+    },
 }
 
 /// The reduced result of [`ExtensionHost::emit_user_bash`] (Pi `UserBashEventResult`, `extensions/types.ts:1078-1083` @v0.83.0; EXT-036 corrected `:1043`, a member of the `ExtensionEvent` union):
@@ -60,7 +63,10 @@ pub enum UserBashReduction {
     /// A handler fully serviced it (Pi `{operations}`/`{result}`) — carried as the open-shaped value.
     Handled(Value),
     /// A handler blocked the command (first block wins).
-    Blocked { reason: Option<String>, by: ExtensionId },
+    Blocked {
+        reason: Option<String>,
+        by: ExtensionId,
+    },
 }
 
 /// The reduced result of [`ExtensionHost::emit_session_before_compact`] (Pi
@@ -71,7 +77,10 @@ pub enum CompactionReduction {
     /// No handler intervened — run the default (model) compaction.
     Proceed,
     /// A handler vetoed the compaction (Pi `{cancel:true}`); first block wins.
-    Blocked { reason: Option<String>, by: ExtensionId },
+    Blocked {
+        reason: Option<String>,
+        by: ExtensionId,
+    },
     /// A handler supplied a compaction override (Pi `SessionBeforeCompactResult.compaction`) — the
     /// producer threads its summary/details into the appended compaction entry (`fromExtension`).
     Override(Value),
@@ -84,7 +93,10 @@ pub enum TreeReduction {
     /// No handler intervened — run the default branch summarization / navigation.
     Proceed,
     /// A handler vetoed the navigation (Pi `{cancel:true}`); first block wins.
-    Blocked { reason: Option<String>, by: ExtensionId },
+    Blocked {
+        reason: Option<String>,
+        by: ExtensionId,
+    },
     /// A handler supplied a summary/customInstructions/label override (Pi `SessionBeforeTreeResult`).
     Override(Value),
 }
@@ -146,13 +158,15 @@ impl crate::native::LateRegistrar for HostLateRegistrar {
     }
 
     fn register_command(&self, name: String, desc: CommandDescriptor) -> Result<(), ExtError> {
-        self.registry.register_command(self.owner.clone(), name, desc)?;
+        self.registry
+            .register_command(self.owner.clone(), name, desc)?;
         (self.on_commands_changed)();
         Ok(())
     }
 
     fn register_tool_renderer(&self, tool_name: String) -> Result<(), ExtError> {
-        self.registry.register_tool_renderer(self.owner.clone(), tool_name)
+        self.registry
+            .register_tool_renderer(self.owner.clone(), tool_name)
     }
 
     fn owner(&self) -> ExtensionId {
@@ -294,7 +308,8 @@ impl ExtensionHost {
         // EXT-034: the dispatcher holds the drain WEAKLY. `fanout` already holds the dispatcher
         // strongly (it needs `report_external`), so a strong edge back would be a reference cycle
         // that leaks the whole host.
-        dispatcher.set_bus_drain(Arc::downgrade(&fanout) as std::sync::Weak<dyn crate::bus::BusDrain>);
+        dispatcher
+            .set_bus_drain(Arc::downgrade(&fanout) as std::sync::Weak<dyn crate::bus::BusDrain>);
         Self {
             dispatcher,
             registry,
@@ -464,15 +479,18 @@ impl ExtensionHost {
         // guest path writes, so `render_tool_call`/`render_message_call` route by name/type without
         // caring which runtime supplies the renderer.
         for tool_name in tool_renderers {
-            self.registry.register_tool_renderer(id.clone(), tool_name)?;
+            self.registry
+                .register_tool_renderer(id.clone(), tool_name)?;
         }
         for custom_type in message_renderers {
-            self.registry.register_message_renderer(id.clone(), custom_type)?;
+            self.registry
+                .register_message_renderer(id.clone(), custom_type)?;
         }
         // X15: the custom-ENTRY renderer table (Pi `extension.entryRenderers`, loader.ts:314-318) —
         // separate from the message table above, exactly as upstream keeps them.
         for custom_type in entry_renderers {
-            self.registry.register_entry_renderer(id.clone(), custom_type)?;
+            self.registry
+                .register_entry_renderer(id.clone(), custom_type)?;
         }
 
         // EXT-035: the six registration surfaces `interface registration` offered a WASM guest and
@@ -486,10 +504,12 @@ impl ExtensionHost {
             self.registry.register_flag(id.clone(), name, spec)?;
         }
         for (provider_id, config) in providers {
-            self.registry.register_provider(id.clone(), provider_id, config)?;
+            self.registry
+                .register_provider(id.clone(), provider_id, config)?;
         }
         for command in autocomplete {
-            self.registry.add_command_autocomplete(id.clone(), command)?;
+            self.registry
+                .add_command_autocomplete(id.clone(), command)?;
         }
         for _ in 0..autocomplete_providers {
             self.registry.add_autocomplete_provider(id.clone())?;
@@ -517,7 +537,11 @@ impl ExtensionHost {
         if let Ok(mut g) = self.native.write() {
             g.insert(id.clone(), ext.clone());
         }
-        let ctx = HostCtx::event(self.config.mode, self.config.has_ui, self.config.cwd.clone());
+        let ctx = HostCtx::event(
+            self.config.mode,
+            self.config.has_ui,
+            self.config.cwd.clone(),
+        );
         let handle = NativeHandle::new(ext, subs, ctx).with_ctx_source(self.ctx_source());
         self.dispatcher.add(Arc::new(handle))?;
         Ok(())
@@ -554,7 +578,11 @@ impl ExtensionHost {
             // The command is owned by a non-native (wasm) extension: not our route.
             None => return Ok(None),
         };
-        let ctx = HostCtx::command(self.config.mode, self.config.has_ui, self.config.cwd.clone());
+        let ctx = HostCtx::command(
+            self.config.mode,
+            self.config.has_ui,
+            self.config.cwd.clone(),
+        );
         // Live rich fields for the command ctx too (EXT-005) — a command handler reading
         // `ctx.is_idle()`/`ctx.is_project_trusted()` used to get `HostCtxRich::default()`.
         let ctx = match self.ctx_source() {
@@ -791,11 +819,11 @@ impl ExtensionHost {
             // whole verdict is per-directory (`options.trustStore.set(options.cwd, trusted)`,
             // core/project-trust.ts:63-65), so a handler without it cannot key an allowlist.
             .dispatch_first_handled(
-                &HostEvent::ProjectTrust { cwd: self.config.cwd.to_string_lossy().into_owned() },
-                cancel,
-                |HandledValue(v)| {
-                    crate::aggregate::parse_trust_decision(v).is_some()
+                &HostEvent::ProjectTrust {
+                    cwd: self.config.cwd.to_string_lossy().into_owned(),
                 },
+                cancel,
+                |HandledValue(v)| crate::aggregate::parse_trust_decision(v).is_some(),
             )
             .await?;
         crate::fold_project_trust(std::slice::from_ref(&hit))
@@ -844,7 +872,12 @@ impl ExtensionHost {
         };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
             Reduced::Pass(ev) => {
-                let HostEvent::BeforeAgentStart { system_prompt: sp, injected, .. } = *ev else {
+                let HostEvent::BeforeAgentStart {
+                    system_prompt: sp,
+                    injected,
+                    ..
+                } = *ev
+                else {
                     return None;
                 };
                 let changed = sp != system_prompt;
@@ -874,7 +907,12 @@ impl ExtensionHost {
     ) -> InputReduction {
         let orig_text = text.to_string();
         let orig_images = images.clone();
-        let ev = HostEvent::Input { text: orig_text.clone(), images, source, streaming_behavior };
+        let ev = HostEvent::Input {
+            text: orig_text.clone(),
+            images,
+            source,
+            streaming_behavior,
+        };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
             Reduced::Blocked { reason, by, .. } => InputReduction::Blocked { reason, by },
             Reduced::Handled(_) => InputReduction::Handled,
@@ -944,17 +982,14 @@ impl ExtensionHost {
     /// FIRST handler that returns a result wins (Pi short-circuits): a block stops the command, a
     /// `handled` result (operations/result) supplies the execution. Returns the reduced
     /// [`UserBashReduction`].
-    pub async fn emit_user_bash(
-        &self,
-        command: &str,
-        cancel: &CancelToken,
-    ) -> UserBashReduction {
+    pub async fn emit_user_bash(&self, command: &str, cancel: &CancelToken) -> UserBashReduction {
         // `exclude_from_context` (the `!!` prefix) is decided by the submission parser at the caller
         // (cross-crate), so it defaults to `false` here; `cwd` is the process working directory (Pi
         // `UserBashEvent.cwd`, types.ts:789). The richer caller-supplied values flow once the
         // submission pipeline threads them into this entry point.
-        let cwd =
-            std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let ev = HostEvent::UserBash {
             command: command.to_string(),
             exclude_from_context: false,
@@ -993,9 +1028,10 @@ impl ExtensionHost {
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
             Reduced::Blocked { reason, by, .. } => CompactionReduction::Blocked { reason, by },
             Reduced::Pass(ev) => match *ev {
-                HostEvent::SessionBeforeCompact { override_result: Some(v), .. } => {
-                    CompactionReduction::Override(v)
-                }
+                HostEvent::SessionBeforeCompact {
+                    override_result: Some(v),
+                    ..
+                } => CompactionReduction::Override(v),
                 _ => CompactionReduction::Proceed,
             },
             // `session_before_compact` has no `handled` channel (Pi returns only cancel/compaction).
@@ -1011,13 +1047,17 @@ impl ExtensionHost {
         preparation: Value,
         cancel: &CancelToken,
     ) -> TreeReduction {
-        let ev = HostEvent::SessionBeforeTree { preparation, override_result: None };
+        let ev = HostEvent::SessionBeforeTree {
+            preparation,
+            override_result: None,
+        };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
             Reduced::Blocked { reason, by, .. } => TreeReduction::Blocked { reason, by },
             Reduced::Pass(ev) => match *ev {
-                HostEvent::SessionBeforeTree { override_result: Some(v), .. } => {
-                    TreeReduction::Override(v)
-                }
+                HostEvent::SessionBeforeTree {
+                    override_result: Some(v),
+                    ..
+                } => TreeReduction::Override(v),
                 _ => TreeReduction::Proceed,
             },
             Reduced::Handled(_) => TreeReduction::Proceed,
@@ -1034,7 +1074,9 @@ impl ExtensionHost {
     /// `LiveExtension::render_call` existed, but nothing could get from a tool NAME to the guest
     /// that renders it, so both were dead outside a unit test.
     pub async fn render_tool_call(&self, tool_name: &str, call: &Value) -> Option<Value> {
-        self.render_tool_call_outcome(tool_name, call).await.into_option()
+        self.render_tool_call_outcome(tool_name, call)
+            .await
+            .into_option()
     }
 
     /// Register a tool that supplies its own `render_call`/`render_result` — the SDK half of
@@ -1053,7 +1095,10 @@ impl ExtensionHost {
 
     /// The registered native tool for `tool_name`, if any.
     fn native_tool_renderer(&self, tool_name: &str) -> Option<Arc<dyn Tool>> {
-        self.native_tool_renderers.read().ok().and_then(|g| g.get(tool_name).cloned())
+        self.native_tool_renderers
+            .read()
+            .ok()
+            .and_then(|g| g.get(tool_name).cloned())
     }
 
     /// [`Self::render_tool_call`] keeping the FAULT distinct from "no renderer" — see
@@ -1072,13 +1117,16 @@ impl ExtensionHost {
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
-        self.render_via(&owner, tool_name, call, RenderKind::Call).await
+        self.render_via(&owner, tool_name, call, RenderKind::Call)
+            .await
     }
 
     /// Render a TOOL RESULT through the tool's registered renderer (Pi `renderResult`,
     /// extensions/types.ts:492-497). See [`Self::render_tool_call`].
     pub async fn render_tool_result(&self, tool_name: &str, result: &Value) -> Option<Value> {
-        self.render_tool_result_outcome(tool_name, result).await.into_option()
+        self.render_tool_result_outcome(tool_name, result)
+            .await
+            .into_option()
     }
 
     /// [`Self::render_tool_result`] keeping the FAULT distinct from "no renderer" — see
@@ -1096,7 +1144,8 @@ impl ExtensionHost {
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
-        self.render_via(&owner, tool_name, result, RenderKind::Result).await
+        self.render_via(&owner, tool_name, result, RenderKind::Result)
+            .await
     }
 
     /// Render a CUSTOM MESSAGE through the extension that registered a renderer for `custom_type`
@@ -1110,7 +1159,9 @@ impl ExtensionHost {
     /// both surfaces route through them; the two are kept apart by their REGISTRY tables
     /// (`tool_renderer_owner` vs `message_renderer_owner`), not by the wire shape.
     pub async fn render_message_call(&self, custom_type: &str, message: &Value) -> Option<Value> {
-        self.render_message_call_outcome(custom_type, message).await.into_option()
+        self.render_message_call_outcome(custom_type, message)
+            .await
+            .into_option()
     }
 
     /// [`Self::render_message_call`] keeping the FAULT distinct from "no renderer" — see
@@ -1125,15 +1176,23 @@ impl ExtensionHost {
         custom_type: &str,
         message: &Value,
     ) -> RenderOutcome {
-        let Some(owner) = self.registry.message_renderer_owner(custom_type).ok().flatten() else {
+        let Some(owner) = self
+            .registry
+            .message_renderer_owner(custom_type)
+            .ok()
+            .flatten()
+        else {
             return RenderOutcome::None;
         };
-        self.render_via(&owner, custom_type, message, RenderKind::Call).await
+        self.render_via(&owner, custom_type, message, RenderKind::Call)
+            .await
     }
 
     /// The result-side companion of [`Self::render_message_call`].
     pub async fn render_message_result(&self, custom_type: &str, message: &Value) -> Option<Value> {
-        self.render_message_result_outcome(custom_type, message).await.into_option()
+        self.render_message_result_outcome(custom_type, message)
+            .await
+            .into_option()
     }
 
     /// [`Self::render_message_result`] keeping the FAULT distinct from "no renderer" — see
@@ -1143,10 +1202,16 @@ impl ExtensionHost {
         custom_type: &str,
         message: &Value,
     ) -> RenderOutcome {
-        let Some(owner) = self.registry.message_renderer_owner(custom_type).ok().flatten() else {
+        let Some(owner) = self
+            .registry
+            .message_renderer_owner(custom_type)
+            .ok()
+            .flatten()
+        else {
             return RenderOutcome::None;
         };
-        self.render_via(&owner, custom_type, message, RenderKind::Result).await
+        self.render_via(&owner, custom_type, message, RenderKind::Result)
+            .await
     }
 
     /// Render a custom ENTRY through the extension that registered an ENTRY renderer for
@@ -1175,10 +1240,16 @@ impl ExtensionHost {
     /// guest component for no behavioural gain. A NATIVE owner has no such constraint and gets its
     /// own [`crate::NativeExtension::render_entry`] hook.
     pub async fn render_entry(&self, custom_type: &str, entry: &Value) -> RenderOutcome {
-        let Some(owner) = self.registry.entry_renderer_owner(custom_type).ok().flatten() else {
+        let Some(owner) = self
+            .registry
+            .entry_renderer_owner(custom_type)
+            .ok()
+            .flatten()
+        else {
             return RenderOutcome::None;
         };
-        self.render_via(&owner, custom_type, entry, RenderKind::Entry).await
+        self.render_via(&owner, custom_type, entry, RenderKind::Entry)
+            .await
     }
 
     /// Fold every registered markdown transformer over `markdown`, in extension LOAD ORDER
@@ -1202,7 +1273,10 @@ impl ExtensionHost {
         is_streaming: bool,
         available_width: u32,
     ) -> String {
-        let owners = self.registry.markdown_transformer_owners().unwrap_or_default();
+        let owners = self
+            .registry
+            .markdown_transformer_owners()
+            .unwrap_or_default();
         if owners.is_empty() {
             return markdown.to_string();
         }
@@ -1243,7 +1317,10 @@ impl ExtensionHost {
     /// is load-bearing rather than merely tidy: the alternative (fail closed) would let one broken
     /// extension swallow the user's keyboard with no way to type the command that unloads it.
     pub async fn terminal_input(&self, data: &str) -> TerminalInputDecision {
-        let owners = self.registry.terminal_input_subscribers().unwrap_or_default();
+        let owners = self
+            .registry
+            .terminal_input_subscribers()
+            .unwrap_or_default();
         if owners.is_empty() {
             return TerminalInputDecision::Deliver(data.to_string());
         }
@@ -1462,23 +1539,39 @@ impl ExtensionHost {
     /// `builtInToolDefinition !== undefined || toolDefinition !== undefined`
     /// (`tool-execution.ts:104-106`), true for every tool that has a definition at all.
     pub fn has_tool_renderer(&self, tool_name: &str) -> bool {
-        if self.native_tool_renderers.read().is_ok_and(|g| g.contains_key(tool_name)) {
+        if self
+            .native_tool_renderers
+            .read()
+            .is_ok_and(|g| g.contains_key(tool_name))
+        {
             return true;
         }
-        self.registry.tool_renderer_owner(tool_name).ok().flatten().is_some()
+        self.registry
+            .tool_renderer_owner(tool_name)
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// Whether ANY extension registered a custom-message renderer for `custom_type` (Pi
     /// `getMessageRenderer(...) !== undefined`, runner.ts:579-587).
     pub fn has_message_renderer(&self, custom_type: &str) -> bool {
-        self.registry.message_renderer_owner(custom_type).ok().flatten().is_some()
+        self.registry
+            .message_renderer_owner(custom_type)
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// Whether ANY extension registered a custom-ENTRY renderer for `custom_type` (Pi
     /// `getEntryRenderer(...) !== undefined`, runner.ts:593-600 — the `if (!renderer) return;`
     /// early-out of `addCustomEntryToChat`, interactive-mode.ts:3432-3435).
     pub fn has_entry_renderer(&self, custom_type: &str) -> bool {
-        self.registry.entry_renderer_owner(custom_type).ok().flatten().is_some()
+        self.registry
+            .entry_renderer_owner(custom_type)
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// Whether ANY extension registered a markdown transformer — the sync pre-check twin of the
@@ -1662,7 +1755,8 @@ impl ExtensionHost {
         bytes: &[u8],
         services: Arc<dyn crate::host::HostServices>,
     ) -> Result<Arc<crate::host::LiveExtension>, ExtError> {
-        self.load_wasm_with_caps(id, bytes, services, &Capabilities::host_granted()).await
+        self.load_wasm_with_caps(id, bytes, services, &Capabilities::host_granted())
+            .await
     }
 
     /// [`Self::load_wasm`] under an explicit capability grant — the seam EXT-054 was missing.
@@ -1702,7 +1796,11 @@ impl ExtensionHost {
                 // not session state: copy them in from the SAME [`HostConfig`] the native path
                 // hands to `HostCtx::event`/`::command` above, so a WASM guest's `ctx.mode()` and a
                 // built-in's `ctx.mode` cannot disagree about the mode the host is running in.
-                .with_host_mode(self.config.mode, self.config.has_ui, self.config.cwd.clone())
+                .with_host_mode(
+                    self.config.mode,
+                    self.config.has_ui,
+                    self.config.cwd.clone(),
+                )
                 // EXT-052: the `before_provider_request`/`after_provider_response` reductions a
                 // guest provider's `streamSimple` MUST invoke (pi extensions/types.ts:1452-1457
                 // @v0.84.1). Installed before `init` so a provider registered during `init` is
@@ -1786,7 +1884,10 @@ impl ExtensionHost {
         let (discovered, manifest_diags) = self.discover_with_diagnostics(roots);
         result.errors.extend(manifest_diags);
         for disc in discovered {
-            match self.load_discovered(&disc, project_trusted, services.clone()).await {
+            match self
+                .load_discovered(&disc, project_trusted, services.clone())
+                .await
+            {
                 Ok(id) => result.loaded.push(id),
                 Err(e) => result.errors.push(LoadError {
                     path: disc.dir.clone(),
@@ -1804,11 +1905,13 @@ impl ExtensionHost {
         // collision is FATAL upstream — hence `fatal: true` (only the project-trust skip is not).
         // Native built-ins are loaded before this call by the session builder, so their names are in
         // scope here too, matching Pi's sweep over the whole loaded set (inline extensions included).
-        result.errors.extend(self.extension_conflicts().into_iter().map(|c| LoadError {
-            path: PathBuf::from(c.path.as_str()),
-            fatal: true,
-            error: c.message,
-        }));
+        result
+            .errors
+            .extend(self.extension_conflicts().into_iter().map(|c| LoadError {
+                path: PathBuf::from(c.path.as_str()),
+                fatal: true,
+                error: c.message,
+            }));
         result
     }
 
@@ -1860,7 +1963,8 @@ impl ExtensionHost {
             id.clone(),
             crate::ExtensionProvenance::local(disc.dir.to_string_lossy().into_owned()),
         )?;
-        self.load_wasm_with_caps(id.clone(), &bytes, services, &disc.manifest.capabilities).await?;
+        self.load_wasm_with_caps(id.clone(), &bytes, services, &disc.manifest.capabilities)
+            .await?;
         Ok(id)
     }
 
@@ -2017,7 +2121,9 @@ impl ExtensionHost {
         &self,
         resolved_keybindings: &[(String, Vec<String>)],
     ) -> Vec<(String, ExtensionId)> {
-        self.registry.resolve_shortcuts(resolved_keybindings).unwrap_or_default()
+        self.registry
+            .resolve_shortcuts(resolved_keybindings)
+            .unwrap_or_default()
     }
 
     /// Warnings from the last [`Self::resolve_shortcuts`] (pi `getShortcutDiagnostics()`,
@@ -2048,8 +2154,11 @@ impl ExtensionHost {
         // two maps are disjoint by construction (an id loads through exactly one path).
         let native = self.native.read().ok().and_then(|g| g.get(&owner).cloned());
         let out = if let Some(ext) = native {
-            let ctx =
-                HostCtx::command(self.config.mode, self.config.has_ui, self.config.cwd.clone());
+            let ctx = HostCtx::command(
+                self.config.mode,
+                self.config.has_ui,
+                self.config.cwd.clone(),
+            );
             // Live rich fields, exactly as the native COMMAND route does (EXT-005) — a shortcut
             // handler reading `ctx.is_idle()`/`ctx.is_project_trusted()` must not get
             // `HostCtxRich::default()`.
@@ -2061,14 +2170,21 @@ impl ExtensionHost {
         } else {
             #[cfg(feature = "wasm-host")]
             {
-                let ext = self.live.read().ok().and_then(|g| g.get(&owner).cloned()).ok_or_else(
-                    || ExtError::Component(format!("shortcut `{key}` has no live owner")),
-                )?;
+                let ext = self
+                    .live
+                    .read()
+                    .ok()
+                    .and_then(|g| g.get(&owner).cloned())
+                    .ok_or_else(|| {
+                        ExtError::Component(format!("shortcut `{key}` has no live owner"))
+                    })?;
                 ext.execute_shortcut(key, cancel).await
             }
             #[cfg(not(feature = "wasm-host"))]
             {
-                Err(ExtError::Component(format!("shortcut `{key}` has no live owner")))
+                Err(ExtError::Component(format!(
+                    "shortcut `{key}` has no live owner"
+                )))
             }
         };
         // Fan out any inter-extension bus events the shortcut handler emitted (gap-08 §5.3).
@@ -2097,7 +2213,8 @@ impl ExtensionHost {
     /// guests there is nothing to invalidate, so the native-only arm is a genuine no-op.
     #[cfg(feature = "wasm-host")]
     pub fn invalidate_live(&self, reason: Option<String>) {
-        self.live_invalidations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.live_invalidations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(g) = self.live.read() {
             for ext in g.values() {
                 ext.guest().invalidate(reason.clone());
@@ -2113,7 +2230,8 @@ impl ExtensionHost {
     /// Counting on one arm only would make the seam's own test pass or fail on a feature flag.
     #[cfg(not(feature = "wasm-host"))]
     pub fn invalidate_live(&self, _reason: Option<String>) {
-        self.live_invalidations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.live_invalidations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// How many times [`Self::invalidate_live`] has run on this host.
@@ -2128,7 +2246,8 @@ impl ExtensionHost {
     /// Monotonic and saturating in practice (it is a `u64` bumped once per teardown); the ordering
     /// is `Relaxed` because nothing is published through it.
     pub fn live_invalidations(&self) -> u64 {
-        self.live_invalidations.load(std::sync::atomic::Ordering::Relaxed)
+        self.live_invalidations
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Hot reload (`/reload`, R-08-005): emit `session_shutdown{reload}` to the live set, cache-bust
@@ -2181,14 +2300,19 @@ impl ExtensionHost {
             g.clear();
         }
         // 3) re-discover + re-load.
-        let result = self.discover_and_load(roots, project_trusted, services).await;
+        let result = self
+            .discover_and_load(roots, project_trusted, services)
+            .await;
         // 4) signal start to the fresh set (reason = "reload").
         self.dispatcher
             .dispatch_notify(
                 // EXT-015: pi documents `previousSessionFile` as "Present for \"new\",
                 // \"resume\", and \"fork\"" (extensions/types.ts:568 @v0.83.0) — a reload keeps
                 // the SAME session file, so it is absent.
-                &HostEvent::SessionStart { reason: "reload".into(), previous_session_file: None },
+                &HostEvent::SessionStart {
+                    reason: "reload".into(),
+                    previous_session_file: None,
+                },
                 cancel,
             )
             .await;
@@ -2228,7 +2352,10 @@ impl ExtensionHost {
     }
 
     fn reserve_id(&self, id: &ExtensionId) -> Result<(), ExtError> {
-        let mut g = self.loaded.write().map_err(|_| ExtError::Io("host lock poisoned".into()))?;
+        let mut g = self
+            .loaded
+            .write()
+            .map_err(|_| ExtError::Io("host lock poisoned".into()))?;
         if g.iter().any(|e| e == id) {
             return Err(ExtError::DuplicateId(id.to_string()));
         }
@@ -2414,7 +2541,9 @@ impl crate::bus::BusDrain for BusFanout {
         // dispatch reached from a delivered handler) must not start a second fan-out over the same
         // queue — the outer one already owns it and will pick up whatever the inner seam enqueued
         // on its next round. RAII, because a dropped future must not leave the latch stuck.
-        let Some(_latch) = crate::bus::DrainLatch::acquire(&self.draining) else { return };
+        let Some(_latch) = crate::bus::DrainLatch::acquire(&self.draining) else {
+            return;
+        };
         // Bound on delivery rounds: each round drains the whole queue, then re-checks for events a
         // just-delivered handler emitted. A cycle (A→B→A→…) stops after the bound rather than
         // hanging.
@@ -2468,7 +2597,11 @@ impl BusFanout {
             return ext.bus_deliver(topic, payload, cancel).await;
         }
         if let Some(ext) = self.native.read().ok().and_then(|g| g.get(id).cloned()) {
-            let ctx = HostCtx::event(self.config.mode, self.config.has_ui, self.config.cwd.clone());
+            let ctx = HostCtx::event(
+                self.config.mode,
+                self.config.has_ui,
+                self.config.cwd.clone(),
+            );
             return ext.on_bus_event(topic, payload, &ctx).await;
         }
         self.bus.unsubscribe(id, topic);

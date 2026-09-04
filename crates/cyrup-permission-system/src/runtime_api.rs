@@ -130,7 +130,9 @@ mod tests {
 
     impl FakeApi {
         fn arc(yolo: bool) -> Arc<dyn PermissionSystemRuntimeApi> {
-            Arc::new(Self { yolo: AtomicBool::new(yolo) })
+            Arc::new(Self {
+                yolo: AtomicBool::new(yolo),
+            })
         }
     }
 
@@ -144,7 +146,12 @@ mod tests {
             _options: &YoloModeControlOptions,
         ) -> YoloModeControlResult {
             let changed = self.yolo.swap(enabled, Ordering::SeqCst) != enabled;
-            YoloModeControlResult { yolo_mode: enabled, changed, persisted: false, error: None }
+            YoloModeControlResult {
+                yolo_mode: enabled,
+                changed,
+                persisted: false,
+                error: None,
+            }
         }
         fn toggle_yolo_mode(&self, options: &YoloModeControlOptions) -> YoloModeControlResult {
             self.set_yolo_mode(!self.get_yolo_mode(), options)

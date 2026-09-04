@@ -2,25 +2,32 @@
 //! the runtime `diagnostics` getter, the `newSession`/`switchSession` option bags
 //! (`parentSession`/`cwdOverride`), the runtime `reload` op, the in-`prompt` `streamingBehavior`
 //! routing (expand-then-queue), and the `input` extension event short-circuit.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use cyrup_core::{
-    TerminateHint,Content, ExtensionId, StopReason, Tool, ToolError, ToolResult, ToolUpdateSink};
-use cyrup_ext::{
-    EventKind, ExtError, HandledValue, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension,
-};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxConfig, FauxModelDefinition, FauxProvider,
-};
-use cyrup_provider::Provider;
 use crate::{
     AgentSessionRuntime, NewSessionOptions, PromptAccepted, PromptOptions, SessionBuilder,
     SessionConfig, SessionFactory, SessionTarget, StreamingBehavior, SwitchSessionOptions,
+};
+use cyrup_core::{
+    Content, ExtensionId, StopReason, TerminateHint, Tool, ToolError, ToolResult, ToolUpdateSink,
+};
+use cyrup_ext::{
+    EventKind, ExtError, HandledValue, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
+};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{
+    FauxConfig, FauxModelDefinition, FauxProvider, faux_assistant_message, faux_text,
+    faux_tool_call,
 };
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -37,7 +44,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -61,9 +72,15 @@ async fn model_restore_fallback_is_carried_beside_diagnostics_not_inside_them() 
 
     // Session 1 persists a `model_change` for `faux/faux-1` (a driven turn flushes the file).
     let faux1 = Arc::new(FauxProvider::new());
-    faux1.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux1.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let p1: Arc<dyn Provider> = faux1.clone();
-    let s1 = SessionBuilder::new(p1.clone(), base_config(&fx)).build().await.unwrap();
+    let s1 = SessionBuilder::new(p1.clone(), base_config(&fx))
+        .build()
+        .await
+        .unwrap();
     let session_file = s1.session_file().await.expect("session 1 persisted");
     let _ = s1.prompt("hi").await.unwrap();
     s1.wait_for_idle().await;
@@ -71,12 +88,20 @@ async fn model_restore_fallback_is_carried_beside_diagnostics_not_inside_them() 
 
     // A clean runtime (fresh New session) has no diagnostics.
     let clean_factory = Arc::new(SessionFactory::new(p1, base_config(&fx)));
-    let clean = AgentSessionRuntime::create(clean_factory, SessionTarget::New).await.unwrap();
-    assert!(clean.diagnostics().await.is_empty(), "a clean build has no diagnostics");
+    let clean = AgentSessionRuntime::create(clean_factory, SessionTarget::New)
+        .await
+        .unwrap();
+    assert!(
+        clean.diagnostics().await.is_empty(),
+        "a clean build has no diagnostics"
+    );
 
     // Resume session 1 with a provider whose catalog LACKS `faux-1` → model restore fails →
     // a `modelFallbackMessage` is produced and surfaced as a runtime diagnostic.
-    let other = FauxConfig { models: vec![FauxModelDefinition::new("other-1")], ..FauxConfig::default() };
+    let other = FauxConfig {
+        models: vec![FauxModelDefinition::new("other-1")],
+        ..FauxConfig::default()
+    };
     let p2: Arc<dyn Provider> = Arc::new(FauxProvider::with_config(other));
     let factory2 = Arc::new(SessionFactory::new(p2, base_config(&fx)));
     let runtime = AgentSessionRuntime::create(factory2, SessionTarget::Resume(session_file))
@@ -88,7 +113,10 @@ async fn model_restore_fallback_is_carried_beside_diagnostics_not_inside_them() 
         .model_fallback_message()
         .await
         .expect("an unrestorable saved model produces a modelFallbackMessage");
-    assert!(fallback.contains("faux-1"), "message names the unrestorable model: {fallback}");
+    assert!(
+        fallback.contains("faux-1"),
+        "message names the unrestorable model: {fallback}"
+    );
     // …and it is NOT duplicated into the diagnostics array that `reportDiagnostics` prints.
     let diags = runtime.diagnostics().await;
     assert!(
@@ -105,19 +133,34 @@ async fn new_session_with_records_parent_session() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
     let factory = Arc::new(SessionFactory::new(faux, base_config(&fx)));
-    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap();
 
-    let parent_file = runtime.session().await.session_file().await.expect("persisted").display().to_string();
+    let parent_file = runtime
+        .session()
+        .await
+        .session_file()
+        .await
+        .expect("persisted")
+        .display()
+        .to_string();
 
     let result = runtime
-        .new_session_with(NewSessionOptions { parent_session: Some(parent_file.clone()) })
+        .new_session_with(NewSessionOptions {
+            parent_session: Some(parent_file.clone()),
+        })
         .await
         .unwrap();
     assert!(!result.cancelled);
 
     // The new session's JSONL header carries `parentSession`.
     let session = runtime.session().await;
-    let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl text");
+    let jsonl = session
+        .export_to_jsonl(None)
+        .await
+        .unwrap()
+        .expect("jsonl text");
     let header_line = jsonl.lines().next().expect("header line");
     let header: serde_json::Value = serde_json::from_str(header_line).unwrap();
     assert_eq!(
@@ -137,10 +180,15 @@ async fn switch_session_with_cwd_override_rebinds_services_cwd() {
     std::fs::create_dir_all(&cwd2).unwrap();
 
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let provider: Arc<dyn Provider> = faux.clone();
     let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
-    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap();
     let session_file = {
         // Drive a turn so the session file flushes to disk before we re-open it.
         let s = runtime.session().await;
@@ -153,14 +201,20 @@ async fn switch_session_with_cwd_override_rebinds_services_cwd() {
     let result = runtime
         .switch_session_with(
             session_file,
-            SwitchSessionOptions { cwd_override: Some(cwd2.clone()) },
+            SwitchSessionOptions {
+                cwd_override: Some(cwd2.clone()),
+            },
         )
         .await
         .unwrap();
     assert!(!result.cancelled);
 
     let session = runtime.session().await;
-    assert_eq!(session.services().cwd, cwd2, "cwd_override rebinds the services cwd");
+    assert_eq!(
+        session.services().cwd,
+        cwd2,
+        "cwd_override rebinds the services cwd"
+    );
 }
 
 /// gap #26: a missing override cwd is rejected at the pre-flight before any teardown.
@@ -169,17 +223,36 @@ async fn switch_session_with_missing_override_cwd_is_rejected() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
     let factory = Arc::new(SessionFactory::new(faux, base_config(&fx)));
-    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
-    let session_file = runtime.session().await.session_file().await.expect("persisted");
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap();
+    let session_file = runtime
+        .session()
+        .await
+        .session_file()
+        .await
+        .expect("persisted");
     let gen_before = runtime.generation().await;
 
     let missing = fx._tmp.path().join("does-not-exist");
     let err = runtime
-        .switch_session_with(session_file, SwitchSessionOptions { cwd_override: Some(missing) })
+        .switch_session_with(
+            session_file,
+            SwitchSessionOptions {
+                cwd_override: Some(missing),
+            },
+        )
         .await
         .unwrap_err();
-    assert!(matches!(err, crate::SessionServiceError::MissingSessionCwd(_)));
-    assert_eq!(runtime.generation().await, gen_before, "a rejected switch leaves the session intact");
+    assert!(matches!(
+        err,
+        crate::SessionServiceError::MissingSessionCwd(_)
+    ));
+    assert_eq!(
+        runtime.generation().await,
+        gen_before,
+        "a rejected switch leaves the session intact"
+    );
 }
 
 // ================================================================================== #18b reload ====
@@ -190,17 +263,26 @@ async fn switch_session_with_missing_override_cwd_is_rejected() {
 async fn reload_rebuilds_session_preserving_transcript_and_runs_hook() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("hi there")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("hi there")],
+        StopReason::Stop,
+    )]);
     let provider: Arc<dyn Provider> = faux.clone();
     let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
-    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap();
 
     // Drive one turn so the persisted session has a transcript.
     {
         let s = runtime.session().await;
         let _ = s.prompt("remember me").await.unwrap();
         s.wait_for_idle().await;
-        assert_eq!(s.messages().await.len(), 2, "user + assistant persisted before reload");
+        assert_eq!(
+            s.messages().await.len(),
+            2,
+            "user + assistant persisted before reload"
+        );
     }
     assert_eq!(runtime.generation().await, 0);
 
@@ -212,12 +294,23 @@ async fn reload_rebuilds_session_preserving_transcript_and_runs_hook() {
         .await
         .unwrap();
 
-    assert!(fired.load(Ordering::SeqCst), "before_start hook must run on reload");
-    assert_eq!(runtime.generation().await, 1, "reload bumps the replacement generation");
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "before_start hook must run on reload"
+    );
+    assert_eq!(
+        runtime.generation().await,
+        1,
+        "reload bumps the replacement generation"
+    );
 
     // The rebuilt session re-opened the SAME persisted file, preserving the transcript.
     let reloaded = runtime.session().await;
-    assert_eq!(reloaded.messages().await.len(), 2, "reload preserves the persisted transcript");
+    assert_eq!(
+        reloaded.messages().await.len(),
+        2,
+        "reload preserves the persisted transcript"
+    );
 }
 
 // ============================================================ #13 in-prompt streamingBehavior ====
@@ -247,7 +340,12 @@ impl Tool for BlockTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.gate.notified().await;
-        Ok(ToolResult { content: vec![Content::text("released")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("released")],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -286,7 +384,10 @@ async fn prompt_with_streaming_behavior_expands_and_queues() {
 
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![
-        faux_assistant_message(vec![faux_tool_call("block", serde_json::json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("block", serde_json::json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("after tool")], StopReason::Stop),
         faux_assistant_message(vec![faux_text("after steer")], StopReason::Stop),
     ]);
@@ -307,11 +408,19 @@ async fn prompt_with_streaming_behavior_expands_and_queues() {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(streaming, "the parking tool must hold the agent in a streaming state");
+    assert!(
+        streaming,
+        "the parking tool must hold the agent in a streaming state"
+    );
 
     // Submit a `/greet` template while streaming with `steer`: it must be EXPANDED then queued.
     let accepted = session
-        .prompt_with("/greet", PromptOptions { streaming_behavior: Some(StreamingBehavior::Steer) })
+        .prompt_with(
+            "/greet",
+            PromptOptions {
+                streaming_behavior: Some(StreamingBehavior::Steer),
+            },
+        )
         .await
         .unwrap();
     assert_eq!(accepted, PromptAccepted::Queued(StreamingBehavior::Steer));
@@ -324,8 +433,14 @@ async fn prompt_with_streaming_behavior_expands_and_queues() {
     );
 
     // Without a behavior while streaming, the submission is rejected (Pi throws).
-    let err = session.prompt_with("late", PromptOptions::default()).await.unwrap_err();
-    assert!(matches!(err, crate::SessionServiceError::StreamingNeedsBehavior));
+    let err = session
+        .prompt_with("late", PromptOptions::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::SessionServiceError::StreamingNeedsBehavior
+    ));
 
     // Release the tool and let the run settle so the test does not leak a task.
     gate.notify_one();
@@ -367,8 +482,15 @@ async fn input_event_handled_short_circuits_prompt() {
         .await
         .unwrap();
 
-    let accepted = session.prompt_with("anything", PromptOptions::default()).await.unwrap();
-    assert_eq!(accepted, PromptAccepted::Handled, "the input handler serviced the submission");
+    let accepted = session
+        .prompt_with("anything", PromptOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted,
+        PromptAccepted::Handled,
+        "the input handler serviced the submission"
+    );
     assert!(!session.is_streaming().await, "no run was started");
     assert!(session.messages().await.is_empty(), "nothing was persisted");
 }

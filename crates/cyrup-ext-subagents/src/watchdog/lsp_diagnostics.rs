@@ -124,7 +124,9 @@ pub struct LspCommand {
 /// `normalizeRelPath` (`lsp-diagnostics.ts:61-63`).
 fn normalize_rel_path(value: &str) -> String {
     let slashed = value.replace(std::path::MAIN_SEPARATOR, "/");
-    slashed.strip_prefix("./").map_or(slashed.clone(), str::to_string)
+    slashed
+        .strip_prefix("./")
+        .map_or(slashed.clone(), str::to_string)
 }
 
 /// `isPathInsideRoot` (`lsp-diagnostics.ts:64-67`): the relative path from the root must be empty
@@ -202,8 +204,16 @@ fn path_executable_names(name: &str) -> Vec<String> {
         .map(str::to_string)
         .collect();
     let mut names = vec![name.to_string()];
-    names.extend(extensions.iter().map(|ext| format!("{name}{}", ext.to_lowercase())));
-    names.extend(extensions.iter().map(|ext| format!("{name}{}", ext.to_uppercase())));
+    names.extend(
+        extensions
+            .iter()
+            .map(|ext| format!("{name}{}", ext.to_lowercase())),
+    );
+    names.extend(
+        extensions
+            .iter()
+            .map(|ext| format!("{name}{}", ext.to_uppercase())),
+    );
     names
 }
 
@@ -370,7 +380,9 @@ impl WatchdogLspDiagnosticsLedger {
     pub fn reduce(&mut self, result: &WatchdogLspResult) -> WatchdogLspResult {
         if matches!(
             result.status,
-            WatchdogLspStatus::Disabled | WatchdogLspStatus::Unavailable | WatchdogLspStatus::Failed
+            WatchdogLspStatus::Disabled
+                | WatchdogLspStatus::Unavailable
+                | WatchdogLspStatus::Failed
         ) {
             return result.clone();
         }
@@ -450,7 +462,11 @@ pub fn format_watchdog_lsp_diagnostics_block(result: &WatchdogLspResult) -> Stri
         return String::new();
     }
     let mut lines = vec!["LSP diagnostics:".to_string()];
-    lines.extend(actionable.iter().map(|d| format!("- {}", format_diagnostic(d))));
+    lines.extend(
+        actionable
+            .iter()
+            .map(|d| format!("- {}", format_diagnostic(d))),
+    );
     lines.join("\n")
 }
 
@@ -461,7 +477,9 @@ pub fn format_watchdog_lsp_diagnostics_block(result: &WatchdogLspResult) -> Stri
 /// evidence is the first FIVE formatted diagnostics — not all of them — so one catastrophic file
 /// cannot flood the transcript.
 #[must_use]
-pub fn watchdog_warning_from_lsp_diagnostics(result: &WatchdogLspResult) -> Option<WatchdogWarning> {
+pub fn watchdog_warning_from_lsp_diagnostics(
+    result: &WatchdogLspResult,
+) -> Option<WatchdogWarning> {
     let actionable = actionable(result);
     if actionable.is_empty() {
         return None;
@@ -475,12 +493,19 @@ pub fn watchdog_warning_from_lsp_diagnostics(result: &WatchdogLspResult) -> Opti
     } else {
         WatchdogSeverity::Blocker
     };
-    let primary = errors.first().map_or_else(
-        || actionable.first().copied(),
-        |first| Some(**first),
-    )?;
-    let count = if errors.is_empty() { actionable.len() } else { errors.len() };
-    let kind = if errors.is_empty() { "warning" } else { "error" };
+    let primary = errors
+        .first()
+        .map_or_else(|| actionable.first().copied(), |first| Some(**first))?;
+    let count = if errors.is_empty() {
+        actionable.len()
+    } else {
+        errors.len()
+    };
+    let kind = if errors.is_empty() {
+        "warning"
+    } else {
+        "error"
+    };
     let evidence = actionable
         .iter()
         .take(5)
@@ -543,8 +568,14 @@ struct JsonRpcLspClient {
 impl JsonRpcLspClient {
     /// Take ownership of a spawned child and start draining both of its output streams.
     fn new(mut child: Child) -> Result<Self, String> {
-        let stdin = child.stdin.take().ok_or("language server stdin unavailable")?;
-        let stdout = child.stdout.take().ok_or("language server stdout unavailable")?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or("language server stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("language server stdout unavailable")?;
         let stderr = child.stderr.take();
         let state = Arc::new(Mutex::new(ClientState::default()));
         let stderr_tail = Arc::new(Mutex::new(String::new()));
@@ -587,7 +618,10 @@ impl JsonRpcLspClient {
     /// `send` (`lsp-diagnostics.ts:334-339`): the `Content-Length` frame.
     async fn send(&mut self, payload: &Value) -> Result<(), String> {
         let body = serde_json::to_string(payload).map_err(|e| e.to_string())?;
-        let stdin = self.stdin.as_mut().ok_or("language server already exited")?;
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or("language server already exited")?;
         stdin
             .write_all(format!("Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
             .await
@@ -652,7 +686,9 @@ impl JsonRpcLspClient {
     /// How many of `targets` have published (the `targets.every(...)` predicate at `:432,437`).
     async fn all_published(&self, targets: &[TargetFile]) -> bool {
         let state = self.state.lock().await;
-        targets.iter().all(|target| state.diagnostics.contains_key(&target.uri))
+        targets
+            .iter()
+            .all(|target| state.diagnostics.contains_key(&target.uri))
     }
 
     /// `stderrTail` (`lsp-diagnostics.ts:330-332`).
@@ -668,7 +704,10 @@ impl JsonRpcLspClient {
     /// `shutdown` (`lsp-diagnostics.ts:317-328`) plus the reap the Node version gets for free.
     async fn shutdown(&mut self) {
         if !self.state.lock().await.exited {
-            match self.request("shutdown", Value::Null, SHUTDOWN_TIMEOUT_MS, None).await {
+            match self
+                .request("shutdown", Value::Null, SHUTDOWN_TIMEOUT_MS, None)
+                .await
+            {
                 Ok(_) => self.notify("exit", Value::Null).await,
                 Err(_) => self.kill().await,
             }
@@ -708,7 +747,8 @@ async fn read_frames(stdout: tokio::process::ChildStdout, state: Arc<Mutex<Clien
         // (`lsp-diagnostics.ts:344-348`): drain every COMPLETE frame the buffer now holds, then go
         // back for more bytes. The loop condition is the header search itself.
         while let Some(header_end) = find_subsequence(&buffer, b"\r\n\r\n") {
-            let header = String::from_utf8_lossy(buffer.get(..header_end).unwrap_or(&[])).to_string();
+            let header =
+                String::from_utf8_lossy(buffer.get(..header_end).unwrap_or(&[])).to_string();
             let Some(length) = content_length(&header) else {
                 // A header block with no `Content-Length` is discarded, exactly as upstream does,
                 // rather than desynchronizing the stream.
@@ -720,8 +760,8 @@ async fn read_frames(stdout: tokio::process::ChildStdout, state: Arc<Mutex<Clien
             if buffer.len() < body_end {
                 break;
             }
-            let body =
-                String::from_utf8_lossy(buffer.get(body_start..body_end).unwrap_or(&[])).to_string();
+            let body = String::from_utf8_lossy(buffer.get(body_start..body_end).unwrap_or(&[]))
+                .to_string();
             buffer.drain(..body_end);
             match serde_json::from_str::<Value>(&body) {
                 Ok(message) => handle_message(&message, &state).await,
@@ -730,8 +770,7 @@ async fn read_frames(stdout: tokio::process::ChildStdout, state: Arc<Mutex<Clien
                     let mut state = state.lock().await;
                     state.exited = true;
                     for (_, sender) in state.pending.drain() {
-                        let _ = sender
-                            .send(Err(format!("Invalid LSP JSON-RPC response: {err}")));
+                        let _ = sender.send(Err(format!("Invalid LSP JSON-RPC response: {err}")));
                     }
                     return;
                 }
@@ -758,7 +797,9 @@ fn content_length(header: &str) -> Option<usize> {
 
 /// `Buffer.indexOf` over a byte needle.
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// `handleMessage` (`lsp-diagnostics.ts:368-379`).
@@ -766,7 +807,9 @@ async fn handle_message(message: &Value, state: &Arc<Mutex<ClientState>>) {
     if message.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics") {
         let params = message.get("params");
         let uri = params.and_then(|p| p.get("uri")).and_then(Value::as_str);
-        let diagnostics = params.and_then(|p| p.get("diagnostics")).and_then(Value::as_array);
+        let diagnostics = params
+            .and_then(|p| p.get("diagnostics"))
+            .and_then(Value::as_array);
         if let (Some(uri), Some(diagnostics)) = (uri, diagnostics) {
             state
                 .lock()
@@ -805,7 +848,10 @@ fn convert_diagnostics(target: &TargetFile, diagnostics: &[Value]) -> Vec<Watchd
         })
         .map(|d| {
             let start = d.get("range").and_then(|r| r.get("start"));
-            let line = start.and_then(|s| s.get("line")).and_then(Value::as_i64).unwrap_or(0);
+            let line = start
+                .and_then(|s| s.get("line"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
             let column = start
                 .and_then(|s| s.get("character"))
                 .and_then(Value::as_i64)
@@ -1022,20 +1068,20 @@ pub async fn collect_watchdog_lsp_diagnostics(request: &WatchdogLspRequest) -> W
     } else {
         request.root.clone()
     };
-    let selection = match collect_target_files(&root, &request.changed_paths, request.config.max_files)
-    {
-        Ok(selection) => selection,
-        Err(err) => {
-            return WatchdogLspResult {
-                status: WatchdogLspStatus::Failed,
-                provider: None,
-                checked_paths: Vec::new(),
-                skipped_paths: request.changed_paths.clone(),
-                diagnostics: Vec::new(),
-                message: Some(err.to_string()),
-            };
-        }
-    };
+    let selection =
+        match collect_target_files(&root, &request.changed_paths, request.config.max_files) {
+            Ok(selection) => selection,
+            Err(err) => {
+                return WatchdogLspResult {
+                    status: WatchdogLspStatus::Failed,
+                    provider: None,
+                    checked_paths: Vec::new(),
+                    skipped_paths: request.changed_paths.clone(),
+                    diagnostics: Vec::new(),
+                    message: Some(err.to_string()),
+                };
+            }
+        };
     if selection.targets.is_empty() {
         return WatchdogLspResult {
             status: WatchdogLspStatus::Skipped,
@@ -1128,7 +1174,12 @@ impl WatchdogLspDiagnostics for TypeScriptLspDiagnostics {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -1166,12 +1217,27 @@ mod tests {
 
     #[test]
     fn severity_mapping_defaults_everything_unknown_to_hint() {
-        assert_eq!(severity_from_lsp(Some(1)), WatchdogLspDiagnosticSeverity::Error);
-        assert_eq!(severity_from_lsp(Some(2)), WatchdogLspDiagnosticSeverity::Warning);
-        assert_eq!(severity_from_lsp(Some(3)), WatchdogLspDiagnosticSeverity::Info);
-        assert_eq!(severity_from_lsp(Some(4)), WatchdogLspDiagnosticSeverity::Hint);
+        assert_eq!(
+            severity_from_lsp(Some(1)),
+            WatchdogLspDiagnosticSeverity::Error
+        );
+        assert_eq!(
+            severity_from_lsp(Some(2)),
+            WatchdogLspDiagnosticSeverity::Warning
+        );
+        assert_eq!(
+            severity_from_lsp(Some(3)),
+            WatchdogLspDiagnosticSeverity::Info
+        );
+        assert_eq!(
+            severity_from_lsp(Some(4)),
+            WatchdogLspDiagnosticSeverity::Hint
+        );
         assert_eq!(severity_from_lsp(None), WatchdogLspDiagnosticSeverity::Hint);
-        assert_eq!(severity_from_lsp(Some(99)), WatchdogLspDiagnosticSeverity::Hint);
+        assert_eq!(
+            severity_from_lsp(Some(99)),
+            WatchdogLspDiagnosticSeverity::Hint
+        );
     }
 
     #[test]
@@ -1199,7 +1265,11 @@ mod tests {
             .collect();
         let selection = collect_target_files(root, &changed, 2).unwrap();
         assert_eq!(
-            selection.targets.iter().map(|t| t.rel_path.as_str()).collect::<Vec<_>>(),
+            selection
+                .targets
+                .iter()
+                .map(|t| t.rel_path.as_str())
+                .collect::<Vec<_>>(),
             vec!["a.ts", "b.tsx"]
         );
         // `c.rs` (wrong language), `missing.ts` (absent) and `d.js` (over the cap) are all skipped.
@@ -1214,15 +1284,17 @@ mod tests {
         let root = tmp.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(tmp.path().join("outside.ts"), "x").unwrap();
-        let selection =
-            collect_target_files(&root, &["../outside.ts".to_string()], 10).unwrap();
+        let selection = collect_target_files(&root, &["../outside.ts".to_string()], 10).unwrap();
         assert!(selection.targets.is_empty());
         assert_eq!(selection.skipped_paths, vec!["../outside.ts"]);
     }
 
     #[test]
     fn file_uris_percent_encode_spaces_and_non_ascii() {
-        assert_eq!(path_to_file_uri(Path::new("/a/b c.ts")), "file:///a/b%20c.ts");
+        assert_eq!(
+            path_to_file_uri(Path::new("/a/b c.ts")),
+            "file:///a/b%20c.ts"
+        );
         assert!(path_to_file_uri(Path::new("/a/é.ts")).starts_with("file:///a/%C3%A9"));
     }
 
@@ -1232,7 +1304,11 @@ mod tests {
         let first = result(
             WatchdogLspStatus::Ok,
             &["a.ts"],
-            vec![diagnostic("a.ts", WatchdogLspDiagnosticSeverity::Error, "boom")],
+            vec![diagnostic(
+                "a.ts",
+                WatchdogLspDiagnosticSeverity::Error,
+                "boom",
+            )],
         );
         assert_eq!(ledger.reduce(&first).diagnostics.len(), 1);
         assert_eq!(ledger.reduce(&first).diagnostics.len(), 0, "already seen");
@@ -1268,7 +1344,11 @@ mod tests {
         let dirty = result(
             WatchdogLspStatus::Ok,
             &["a.ts"],
-            vec![diagnostic("a.ts", WatchdogLspDiagnosticSeverity::Error, "boom")],
+            vec![diagnostic(
+                "a.ts",
+                WatchdogLspDiagnosticSeverity::Error,
+                "boom",
+            )],
         );
         assert_eq!(ledger.reduce(&dirty).diagnostics.len(), 1);
         // A TIMEOUT that reports nothing must NOT forget the remembered diagnostic.
@@ -1291,7 +1371,11 @@ mod tests {
         let seeded = result(
             WatchdogLspStatus::Ok,
             &["a.ts"],
-            vec![diagnostic("a.ts", WatchdogLspDiagnosticSeverity::Error, "boom")],
+            vec![diagnostic(
+                "a.ts",
+                WatchdogLspDiagnosticSeverity::Error,
+                "boom",
+            )],
         );
         assert_eq!(ledger.reduce(&seeded).diagnostics.len(), 1);
         for status in [
@@ -1302,7 +1386,11 @@ mod tests {
             let passthrough = result(
                 status,
                 &["a.ts"],
-                vec![diagnostic("a.ts", WatchdogLspDiagnosticSeverity::Error, "boom")],
+                vec![diagnostic(
+                    "a.ts",
+                    WatchdogLspDiagnosticSeverity::Error,
+                    "boom",
+                )],
             );
             assert_eq!(
                 ledger.reduce(&passthrough).diagnostics.len(),
@@ -1385,7 +1473,11 @@ mod tests {
         let one = result(
             WatchdogLspStatus::Ok,
             &["a.ts"],
-            vec![diagnostic("a.ts", WatchdogLspDiagnosticSeverity::Error, "boom")],
+            vec![diagnostic(
+                "a.ts",
+                WatchdogLspDiagnosticSeverity::Error,
+                "boom",
+            )],
         );
         assert_eq!(
             format_watchdog_lsp_diagnostics_block(&one),
@@ -1501,9 +1593,15 @@ mod tests {
         ];
         let converted = convert_diagnostics(&target, &raw);
         assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].line, 5, "LSP lines are 0-based, display is 1-based");
+        assert_eq!(
+            converted[0].line, 5,
+            "LSP lines are 0-based, display is 1-based"
+        );
         assert_eq!(converted[0].column, 3);
         assert_eq!(converted[0].code.as_deref(), Some("2322"));
-        assert_eq!(converted[0].source, PROVIDER_NAME, "an absent source defaults");
+        assert_eq!(
+            converted[0].source, PROVIDER_NAME,
+            "an absent source defaults"
+        );
     }
 }

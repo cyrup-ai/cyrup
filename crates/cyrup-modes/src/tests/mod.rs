@@ -4,7 +4,12 @@
 // The workspace DENIES these four (see `/Cargo.toml` `[workspace.lints.clippy]`); test code is
 // exactly where panicking on a broken invariant is the correct reaction, so the whole tree opts
 // out once here — lint levels propagate down the module tree to every descendant file.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 mod support;
 

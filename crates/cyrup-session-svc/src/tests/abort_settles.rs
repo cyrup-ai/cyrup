@@ -24,18 +24,26 @@
 //!  3. **That exact ORDER.** Awaiting idle before cancelling the retry would block for the whole
 //!     remaining backoff — up to `baseDelayMs * 2^attempt`. These tests use a 600 s backoff, so an
 //!     implementation that inverted the two would hang rather than fail.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cyrup_provider::Provider;
-use cyrup_provider::faux::{
-    FauxMessageOptions, FauxProvider, faux_assistant_message, faux_assistant_message_with, faux_text,
+use crate::{
+    AgentSession, AgentSessionEvent, InputSource, SessionBuilder, SessionConfig, UserInput,
 };
 use cyrup_core::StopReason;
-use crate::{AgentSession, AgentSessionEvent, InputSource, SessionBuilder, SessionConfig, UserInput};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{
+    FauxMessageOptions, FauxProvider, faux_assistant_message, faux_assistant_message_with,
+    faux_text,
+};
 use futures::StreamExt;
 use tempfile::TempDir;
 
@@ -51,7 +59,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -80,7 +92,10 @@ async fn session_stuck_in_retry_backoff(fx: &Fixture) -> (Arc<AgentSession>, Arc
         faux_assistant_message_with(
             Vec::new(),
             StopReason::Error,
-            FauxMessageOptions { error_message: Some("overloaded".into()), ..Default::default() },
+            FauxMessageOptions {
+                error_message: Some("overloaded".into()),
+                ..Default::default()
+            },
         ),
         faux_assistant_message(vec![faux_text("retried anyway")], StopReason::Stop),
     ]);
@@ -132,7 +147,10 @@ async fn abort_cancels_the_retry_backoff() {
         .await
         .expect("abort() must cancel the retry backoff so the run settles (Pi abortRetry() first)");
 
-    assert!(!session.is_retrying(), "no retry may still be in flight after abort()");
+    assert!(
+        !session.is_retrying(),
+        "no retry may still be in flight after abort()"
+    );
     assert_eq!(
         faux.call_count(),
         1,
@@ -147,7 +165,10 @@ async fn abort_cancels_the_retry_backoff() {
     assert!(
         cancelled,
         "auto_retry_end{{success:false, final_error:\"Retry cancelled\"}} must be emitted: {:?}",
-        events.iter().map(AgentSessionEvent::kind).collect::<Vec<_>>()
+        events
+            .iter()
+            .map(AgentSessionEvent::kind)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -166,7 +187,10 @@ async fn abort_and_settle_returns_only_once_the_run_is_idle() {
         .await
         .expect("prompt accepted");
     await_retry_backoff(&session).await;
-    assert!(!session.is_idle(), "precondition: the run is live (in retry backoff)");
+    assert!(
+        !session.is_idle(),
+        "precondition: the run is live (in retry backoff)"
+    );
 
     tokio::time::timeout(Duration::from_secs(5), session.abort_and_settle())
         .await

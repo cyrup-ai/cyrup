@@ -23,16 +23,16 @@
 //! `:58`, fed from `session.getAvailableThinkingLevels()` at `interactive-mode.ts:4792`), not from a
 //! hardcoded table, so a non-reasoning model offers `off` alone.
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::fuzzy;
 use crate::keymap::{EditorKeymap, SelectAction, SelectKeymap};
 use crate::select_list::{ColumnLayout, SelectItem, SelectList};
-use crate::selector::{border_rule_line, input_line_spans, Selector, SelectorOutcome};
+use crate::selector::{Selector, SelectorOutcome, border_rule_line, input_line_spans};
 use crate::text_input::{Input, InputOutcome};
 use crate::theme::UiTheme;
 
@@ -135,9 +135,15 @@ impl ThinkingSelector {
         let indices: Vec<usize> = if query.is_empty() {
             (0..self.all.len()).collect()
         } else {
-            let haystacks: Vec<String> =
-                self.all.iter().map(|(label, desc)| format!("{label} {desc}")).collect();
-            fuzzy::filter(&haystacks, &query, String::as_str).into_iter().map(|m| m.index).collect()
+            let haystacks: Vec<String> = self
+                .all
+                .iter()
+                .map(|(label, desc)| format!("{label} {desc}"))
+                .collect();
+            fuzzy::filter(&haystacks, &query, String::as_str)
+                .into_iter()
+                .map(|m| m.index)
+                .collect()
         };
         let mut values = Vec::with_capacity(indices.len());
         let mut items = Vec::with_capacity(indices.len());
@@ -185,7 +191,10 @@ impl ThinkingSelector {
         let mut lines = Vec::with_capacity(self.values.len().saturating_add(10));
         lines.push(border_rule_line(width, theme)); // :77
         lines.push(Line::from("")); // :78
-        lines.push(Line::from(Span::styled("Thinking Level", theme.base_style()))); // :79
+        lines.push(Line::from(Span::styled(
+            "Thinking Level",
+            theme.base_style(),
+        ))); // :79
         lines.push(Line::from("")); // :80
         lines.push(Line::from(Span::styled(
             format!("{} cycles thinking levels in-session", self.cycle_key),
@@ -232,7 +241,9 @@ impl ThinkingSelector {
 
 impl Selector for ThinkingSelector {
     fn desired_height(&self, width: u16) -> u16 {
-        self.lines(width, UiTheme::default_ref()).len().clamp(0, usize::from(u16::MAX)) as u16
+        self.lines(width, UiTheme::default_ref())
+            .len()
+            .clamp(0, usize::from(u16::MAX)) as u16
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {

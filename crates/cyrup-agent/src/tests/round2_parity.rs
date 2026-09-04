@@ -13,13 +13,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue, AfterOutcome, AfterOverride,
-    AfterToolCall, Agent, AgentContext, AgentEvent, AgentEventSink, AgentLoopConfig, AgentMessage,
-    Hooks, HookError, PostTurn, StreamFn, TurnUpdate,
+    AfterOutcome, AfterOverride, AfterToolCall, Agent, AgentContext, AgentEvent, AgentEventSink,
+    AgentLoopConfig, AgentMessage, HookError, Hooks, PostTurn, StreamFn, TurnUpdate, agent_loop,
+    agent_loop_continue, run_agent_loop, run_agent_loop_continue,
 };
 use cyrup_core::{
-    TerminateHint,
     CancelToken, Content, EventStream, ModelRef, ModelThinkingLevel, RunCancel, StopReason,
+    TerminateHint,
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
 use cyrup_provider::{Context, StreamEvent, StreamOptions};
@@ -40,7 +40,12 @@ struct ReasoningRecorder {
 }
 
 impl StreamFn for ReasoningRecorder {
-    fn stream(&self, model: &ModelRef, ctx: &Context, opts: &StreamOptions) -> EventStream<StreamEvent> {
+    fn stream(
+        &self,
+        model: &ModelRef,
+        ctx: &Context,
+        opts: &StreamOptions,
+    ) -> EventStream<StreamEvent> {
         self.reasoning.lock().unwrap().push(opts.reasoning);
         self.inner.stream(model, ctx, opts)
     }
@@ -51,7 +56,10 @@ fn reasoning_recording(
 ) -> (Arc<dyn StreamFn>, Arc<Mutex<Vec<ModelThinkingLevel>>>) {
     let inner = faux_stream_fn(responses).1;
     let reasoning = Arc::new(Mutex::new(Vec::new()));
-    let sf: Arc<dyn StreamFn> = Arc::new(ReasoningRecorder { inner, reasoning: reasoning.clone() });
+    let sf: Arc<dyn StreamFn> = Arc::new(ReasoningRecorder {
+        inner,
+        reasoning: reasoning.clone(),
+    });
     (sf, reasoning)
 }
 
@@ -73,7 +81,12 @@ impl RecSink {
         self.events.lock().unwrap().iter().map(ev_kind).collect()
     }
     fn turn_starts(&self) -> usize {
-        self.events.lock().unwrap().iter().filter(|e| matches!(e, AgentEvent::TurnStart)).count()
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnStart))
+            .count()
     }
 }
 
@@ -90,7 +103,11 @@ struct StickyThinkingHook {
 
 #[async_trait::async_trait]
 impl Hooks for StickyThinkingHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<Option<TurnUpdate>, HookError> {
         if self.overridden.fetch_add(1, Ordering::SeqCst) == 0 {
             Ok(Some(TurnUpdate {
                 thinking_level: Some(ModelThinkingLevel::High),
@@ -113,7 +130,9 @@ async fn gap4_prepare_next_turn_override_is_sticky_across_later_turns() {
     let agent = Agent::builder(model_ref(), sf)
         .thinking_level(ModelThinkingLevel::Low)
         .tools(vec![EchoTool::named("echo")])
-        .hooks(Arc::new(StickyThinkingHook { overridden: AtomicUsize::new(0) }))
+        .hooks(Arc::new(StickyThinkingHook {
+            overridden: AtomicUsize::new(0),
+        }))
         .build();
 
     agent.prompt("go").await.unwrap().finished().await;
@@ -124,7 +143,11 @@ async fn gap4_prepare_next_turn_override_is_sticky_across_later_turns() {
     assert_eq!(r[0], ModelThinkingLevel::Low, "turn 1 uses the run default");
     assert_eq!(r[1], ModelThinkingLevel::High, "turn 2 uses the override");
     // The crux: the override was returned ONCE, but Pi makes it sticky, so turn 3 is STILL High.
-    assert_eq!(r[2], ModelThinkingLevel::High, "turn 3 keeps the sticky override (not reverted)");
+    assert_eq!(
+        r[2],
+        ModelThinkingLevel::High,
+        "turn 3 keeps the sticky override (not reverted)"
+    );
 }
 
 // ============================================================================
@@ -139,14 +162,17 @@ struct TerminateAndCount {
 
 #[async_trait::async_trait]
 impl Hooks for TerminateAndCount {
-    async fn after_tool_call(
-        &self,
-        _ctx: AfterToolCall<'_>,
-        _cancel: CancelToken,
-    ) -> AfterOutcome {
-        AfterOutcome::Override(AfterOverride { terminate: Some(TerminateHint::Terminate), ..Default::default() })
+    async fn after_tool_call(&self, _ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
+        AfterOutcome::Override(AfterOverride {
+            terminate: Some(TerminateHint::Terminate),
+            ..Default::default()
+        })
     }
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<Option<TurnUpdate>, HookError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
         Ok(None)
     }
@@ -156,11 +182,14 @@ impl Hooks for TerminateAndCount {
 async fn gap5_terminate_still_runs_post_turn_hooks_and_drains_follow_up() {
     // Turn 1 calls a tool (which terminates); turn 2 (only reached if the loop did NOT short-circuit
     // on terminate) is a plain stop after the queued follow-up is injected.
-    let hook = Arc::new(TerminateAndCount { prepare_calls: AtomicUsize::new(0) });
+    let hook = Arc::new(TerminateAndCount {
+        prepare_calls: AtomicUsize::new(0),
+    });
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("echo", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("after follow-up")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![EchoTool::named("echo")])
         .hooks(hook.clone())
@@ -181,12 +210,18 @@ async fn gap5_terminate_still_runs_post_turn_hooks_and_drains_follow_up() {
     );
     // (b) The queued follow-up still drove a second turn — terminate did NOT drop it.
     let asst_count = new.iter().filter(|m| m.is_assistant()).count();
-    assert_eq!(asst_count, 2, "follow-up produced a second assistant turn despite terminate");
+    assert_eq!(
+        asst_count, 2,
+        "follow-up produced a second assistant turn despite terminate"
+    );
     let follow_visible = new.iter().any(|m| matches!(
         m,
         AgentMessage::User { content, .. } if matches!(content.first(), Some(Content::Text { text, .. }) if text == "keep going")
     ));
-    assert!(follow_visible, "the follow-up message was injected, not dropped");
+    assert!(
+        follow_visible,
+        "the follow-up message was injected, not dropped"
+    );
 }
 
 // ============================================================================
@@ -197,15 +232,25 @@ struct ExplodingHook;
 
 #[async_trait::async_trait]
 impl Hooks for ExplodingHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<Option<TurnUpdate>, HookError> {
         panic!("kaboom: hook detonated");
     }
 }
 
 #[tokio::test]
 async fn gap6_run_failure_surfaces_real_panic_message_and_error_stop_reason() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]).1;
-    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(ExplodingHook)).build();
+    let sf = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("a1")],
+        StopReason::Stop,
+    )])
+    .1;
+    let agent = Agent::builder(model_ref(), sf)
+        .hooks(Arc::new(ExplodingHook))
+        .build();
 
     let new = agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -219,7 +264,11 @@ async fn gap6_run_failure_surfaces_real_panic_message_and_error_stop_reason() {
         })
         .expect("a synthetic failure assistant message");
     // Not aborted (no cancellation) => error.
-    assert_eq!(failure.stop_reason, StopReason::Error, "uncancelled failure => error");
+    assert_eq!(
+        failure.stop_reason,
+        StopReason::Error,
+        "uncancelled failure => error"
+    );
     // The real panic message is recovered (downcast), not a generic "run task failed".
     assert_eq!(
         failure.error_message.as_deref(),
@@ -243,7 +292,11 @@ struct FailingPrepareHook;
 
 #[async_trait::async_trait]
 impl Hooks for FailingPrepareHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<Option<TurnUpdate>, HookError> {
         Err(HookError::new("prepare exploded"))
     }
 }
@@ -253,16 +306,26 @@ struct FailingStopHook;
 
 #[async_trait::async_trait]
 impl Hooks for FailingStopHook {
-    async fn should_stop_after_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<bool, HookError> {
+    async fn should_stop_after_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<bool, HookError> {
         Err(HookError::new("stop check exploded"))
     }
 }
 
 #[tokio::test]
 async fn agent007_failing_prepare_next_turn_emits_pis_full_failure_quartet() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]).1;
+    let sf = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("a1")],
+        StopReason::Stop,
+    )])
+    .1;
     let rec = Arc::new(EventRecorder::default());
-    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(FailingPrepareHook)).build();
+    let agent = Agent::builder(model_ref(), sf)
+        .hooks(Arc::new(FailingPrepareHook))
+        .build();
     agent.subscribe(rec.clone());
 
     let new = agent.prompt("go").await.unwrap().finished().await;
@@ -270,7 +333,13 @@ async fn agent007_failing_prepare_next_turn_emits_pis_full_failure_quartet() {
 
     // The tail is Pi's `handleRunFailure` quartet, NOT a bare `agent_end` (agent.ts:508-511).
     let names = rec.names();
-    let tail: Vec<&str> = names.iter().rev().take(4).rev().map(String::as_str).collect();
+    let tail: Vec<&str> = names
+        .iter()
+        .rev()
+        .take(4)
+        .rev()
+        .map(String::as_str)
+        .collect();
     assert_eq!(
         tail,
         vec!["message_start", "message_end", "turn_end", "agent_end"],
@@ -283,7 +352,11 @@ async fn agent007_failing_prepare_next_turn_emits_pis_full_failure_quartet() {
     let failure = last_assistant(&events);
     assert_eq!(failure.stop_reason, StopReason::Error);
     assert_eq!(failure.error_message.as_deref(), Some("prepare exploded"));
-    assert_eq!(failure.content.len(), 1, "one EMPTY text block, not empty content");
+    assert_eq!(
+        failure.content.len(),
+        1,
+        "one EMPTY text block, not empty content"
+    );
     assert!(matches!(&failure.content[0], Content::Text { text, .. } if text.is_empty()));
 
     // `turn_end` carries the failure message and NO tool results (agent.ts:510).
@@ -291,13 +364,17 @@ async fn agent007_failing_prepare_next_turn_emits_pis_full_failure_quartet() {
         .iter()
         .rev()
         .find_map(|e| match e {
-            AgentEvent::TurnEnd { message, tool_results } => {
-                Some((message.clone(), tool_results.clone()))
-            }
+            AgentEvent::TurnEnd {
+                message,
+                tool_results,
+            } => Some((message.clone(), tool_results.clone())),
             _ => None,
         })
         .expect("a turn_end");
-    assert!(te.1.is_empty(), "the failure turn_end carries no tool results");
+    assert!(
+        te.1.is_empty(),
+        "the failure turn_end carries no tool results"
+    );
     assert!(matches!(&te.0, AgentMessage::Assistant(a) if a.stop_reason == StopReason::Error));
 
     // `agent_end` carries EXACTLY `[failureMessage]` (agent.ts:511) — not the run's accumulator.
@@ -309,29 +386,50 @@ async fn agent007_failing_prepare_next_turn_emits_pis_full_failure_quartet() {
             _ => None,
         })
         .expect("an agent_end");
-    assert_eq!(end.len(), 1, "agent_end carries only the failure message, got {end:?}");
-    assert!(matches!(end[0].as_ref(), AgentMessage::Assistant(a) if a.error_message.as_deref() == Some("prepare exploded")));
+    assert_eq!(
+        end.len(),
+        1,
+        "agent_end carries only the failure message, got {end:?}"
+    );
+    assert!(
+        matches!(end[0].as_ref(), AgentMessage::Assistant(a) if a.error_message.as_deref() == Some("prepare exploded"))
+    );
 
     // The run's returned messages match `agent_end`, exactly as the catch_unwind twin settles.
     assert_eq!(new.len(), 1);
     assert!(matches!(&new[0], AgentMessage::Assistant(a) if a.stop_reason == StopReason::Error));
 
     // The failure is visible on the agent's observable state, as it is for the panic path.
-    assert_eq!(agent.snapshot().await.error_message.as_deref(), Some("prepare exploded"));
+    assert_eq!(
+        agent.snapshot().await.error_message.as_deref(),
+        Some("prepare exploded")
+    );
 }
 
 #[tokio::test]
 async fn agent007_failing_should_stop_after_turn_emits_pis_full_failure_quartet() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]).1;
+    let sf = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("a1")],
+        StopReason::Stop,
+    )])
+    .1;
     let rec = Arc::new(EventRecorder::default());
-    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(FailingStopHook)).build();
+    let agent = Agent::builder(model_ref(), sf)
+        .hooks(Arc::new(FailingStopHook))
+        .build();
     agent.subscribe(rec.clone());
 
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
 
     let names = rec.names();
-    let tail: Vec<&str> = names.iter().rev().take(4).rev().map(String::as_str).collect();
+    let tail: Vec<&str> = names
+        .iter()
+        .rev()
+        .take(4)
+        .rev()
+        .map(String::as_str)
+        .collect();
     assert_eq!(
         tail,
         vec!["message_start", "message_end", "turn_end", "agent_end"],
@@ -340,7 +438,10 @@ async fn agent007_failing_should_stop_after_turn_emits_pis_full_failure_quartet(
 
     let failure = last_assistant(&rec.snapshot());
     assert_eq!(failure.stop_reason, StopReason::Error);
-    assert_eq!(failure.error_message.as_deref(), Some("stop check exploded"));
+    assert_eq!(
+        failure.error_message.as_deref(),
+        Some("stop check exploded")
+    );
 }
 
 // ============================================================================
@@ -349,10 +450,18 @@ async fn agent007_failing_should_stop_after_turn_emits_pis_full_failure_quartet(
 
 #[tokio::test]
 async fn gap3_run_agent_loop_pushes_ordered_events_and_returns_new_messages() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("hello")], StopReason::Stop)]).1;
+    let sf = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hello")],
+        StopReason::Stop,
+    )])
+    .1;
     let sink = Arc::new(RecSink::default());
     let cancel = RunCancel::new();
-    let ctx = AgentContext { system_prompt: "sys".into(), messages: Vec::new(), tools: Vec::new() };
+    let ctx = AgentContext {
+        system_prompt: "sys".into(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+    };
     let config = AgentLoopConfig::new(model_ref());
 
     let new = run_agent_loop(
@@ -378,12 +487,19 @@ async fn gap3_run_agent_loop_pushes_ordered_events_and_returns_new_messages() {
     // message_start/end for the prompt user message precede the assistant message_start.
     let first_user = n.iter().position(|s| s == "message_start").unwrap();
     let turn_start = n.iter().position(|s| s == "turn_start").unwrap();
-    assert!(turn_start < first_user, "turn_start precedes the prompt message_start");
+    assert!(
+        turn_start < first_user,
+        "turn_start precedes the prompt message_start"
+    );
 }
 
 #[tokio::test]
 async fn gap3_agent_loop_pull_stream_finalizes_to_new_messages() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("yo")], StopReason::Stop)]).1;
+    let sf = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("yo")],
+        StopReason::Stop,
+    )])
+    .1;
     let cancel = RunCancel::new();
     let ctx = AgentContext::default();
     let config = AgentLoopConfig::new(model_ref());
@@ -401,13 +517,21 @@ async fn gap3_agent_loop_pull_stream_finalizes_to_new_messages() {
         }
     }
     assert!(saw_agent_start, "stream yields agent_start");
-    assert_eq!(final_messages.len(), 2, "agent_end carries prompt + assistant");
+    assert_eq!(
+        final_messages.len(),
+        2,
+        "agent_end carries prompt + assistant"
+    );
     assert!(final_messages[1].is_assistant());
 }
 
 #[tokio::test]
 async fn gap3_run_agent_loop_continue_rejects_empty_and_trailing_assistant() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]).1;
+    let sf = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )])
+    .1;
     let sink = Arc::new(RecSink::default()) as Arc<dyn AgentEventSink>;
 
     // Empty transcript => NoMessages.
@@ -421,7 +545,10 @@ async fn gap3_run_agent_loop_continue_rejects_empty_and_trailing_assistant() {
     .await;
     // AGENT-034 — the LOW-LEVEL surface's string, distinct from `Agent::continue_run`'s
     // (`agent-loop.ts:128` in `runAgentLoopContinue`, identical at both tags).
-    assert!(matches!(empty, Err(crate::AgentError::NoMessages(crate::ContinueSurface::Loop))));
+    assert!(matches!(
+        empty,
+        Err(crate::AgentError::NoMessages(crate::ContinueSurface::Loop))
+    ));
     assert_eq!(
         empty.err().map(|e| e.to_string()).unwrap_or_default(),
         "Cannot continue: no messages in context"
@@ -444,7 +571,10 @@ async fn gap3_run_agent_loop_continue_rejects_empty_and_trailing_assistant() {
         sf,
     )
     .await;
-    assert!(matches!(trailing, Err(crate::AgentError::ContinueFromAssistant)));
+    assert!(matches!(
+        trailing,
+        Err(crate::AgentError::ContinueFromAssistant)
+    ));
     assert_eq!(
         trailing.err().map(|e| e.to_string()).unwrap_or_default(),
         "Cannot continue from message role: assistant"
@@ -453,7 +583,11 @@ async fn gap3_run_agent_loop_continue_rejects_empty_and_trailing_assistant() {
 
 #[tokio::test]
 async fn gap3_run_agent_loop_continue_resumes_from_user_tail() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("resumed")], StopReason::Stop)]).1;
+    let sf = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("resumed")],
+        StopReason::Stop,
+    )])
+    .1;
     let sink = Arc::new(RecSink::default());
     // Transcript ends with a user message => a valid continuation point.
     let ctx = AgentContext {
@@ -473,14 +607,22 @@ async fn gap3_run_agent_loop_continue_resumes_from_user_tail() {
     .expect("continue resumes from a user tail");
 
     // Continuation does NOT re-add pre-existing context; only the new assistant message is returned.
-    assert_eq!(new.len(), 1, "continuation returns only the new assistant message");
+    assert_eq!(
+        new.len(),
+        1,
+        "continuation returns only the new assistant message"
+    );
     assert!(new[0].is_assistant());
     assert_eq!(sink.names().last().map(String::as_str), Some("agent_end"));
 }
 
 #[tokio::test]
 async fn gap3_agent_loop_continue_pull_stream_validates_up_front() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]).1;
+    let sf = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )])
+    .1;
     // A trailing assistant message must be rejected synchronously, before spawning.
     let ctx = AgentContext {
         system_prompt: String::new(),

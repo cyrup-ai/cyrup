@@ -109,8 +109,10 @@ pub(super) fn collapsed_summary_lines(
         Span::styled(expand_key.to_string(), theme.dim_style()),
         Span::styled(" to expand)".to_string(), text),
     ]);
-    let mut children =
-        vec![Line::styled(format!("[{label}]"), theme.custom_message_label_style())];
+    let mut children = vec![Line::styled(
+        format!("[{label}]"),
+        theme.custom_message_label_style(),
+    )];
     children.push(Line::default());
     // `new Text(…, 0, 0)` — paddingX 0 inside the `Box`, so the row wraps at the box's own content
     // width with no extra margin.
@@ -139,8 +141,10 @@ pub(super) fn labeled_message_lines(
     let block = theme.custom_message_bg_style();
     // `Box(1, 1)` renders its children at `contentWidth = width - 2` (`box.ts:79`).
     let content_width = width.saturating_sub(2).max(1);
-    let mut children =
-        vec![Line::styled(format!("[{label}]"), theme.custom_message_label_style())];
+    let mut children = vec![Line::styled(
+        format!("[{label}]"),
+        theme.custom_message_label_style(),
+    )];
     if spacer_after_label {
         children.push(Line::default());
     }

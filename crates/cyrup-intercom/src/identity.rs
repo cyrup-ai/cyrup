@@ -107,7 +107,9 @@ pub const ENV_TMUX_PANE: &str = "TMUX_PANE";
 /// whitespace-only pane id on the wire.
 #[must_use]
 pub fn current_tmux_pane_from(env: impl Fn(&str) -> Option<String>) -> Option<String> {
-    env(ENV_TMUX_PANE).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    env(ENV_TMUX_PANE)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// [`current_tmux_pane_from`] over the process environment.
@@ -195,7 +197,10 @@ pub fn liveness_interval_ms() -> u64 {
 #[must_use]
 pub fn liveness_interval_ms_from(env: &dyn Fn(&str) -> Option<String>) -> u64 {
     const DEFAULT_LIVENESS_INTERVAL_MS: u64 = 30_000;
-    match env(ENV_INTERCOM_LIVENESS_INTERVAL_MS).as_deref().and_then(js_parse_int_base10) {
+    match env(ENV_INTERCOM_LIVENESS_INTERVAL_MS)
+        .as_deref()
+        .and_then(js_parse_int_base10)
+    {
         Some(v) if v.is_finite() && v > 0.0 => v as u64,
         _ => DEFAULT_LIVENESS_INTERVAL_MS,
     }
@@ -221,7 +226,10 @@ pub fn liveness_timeout_ms() -> u64 {
 #[must_use]
 pub fn liveness_timeout_ms_from(env: &dyn Fn(&str) -> Option<String>) -> u64 {
     const DEFAULT_LIVENESS_TIMEOUT_MS: u64 = 5_000;
-    match env(ENV_INTERCOM_LIVENESS_TIMEOUT_MS).as_deref().and_then(js_parse_int_base10) {
+    match env(ENV_INTERCOM_LIVENESS_TIMEOUT_MS)
+        .as_deref()
+        .and_then(js_parse_int_base10)
+    {
         Some(v) if v.is_finite() && v > 0.0 => (v as u64).min(liveness_interval_ms_from(env)),
         _ => DEFAULT_LIVENESS_TIMEOUT_MS,
     }
@@ -262,7 +270,11 @@ pub fn read_child_orchestrator_metadata() -> Option<ChildOrchestratorMetadata> {
 pub fn read_child_orchestrator_metadata_from(
     env: impl Fn(&str) -> Option<String>,
 ) -> Option<ChildOrchestratorMetadata> {
-    let trimmed = |k: &str| env(k).map(|v| v.trim().to_string()).filter(|s| !s.is_empty());
+    let trimmed = |k: &str| {
+        env(k)
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
 
     let orchestrator_target = trimmed(ENV_ORCH_TARGET)?;
     let orchestrator_session_id =
@@ -337,10 +349,16 @@ where
 {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for name in names {
-        let Some(name) = name.filter(|n| !n.is_empty()) else { continue };
+        let Some(name) = name.filter(|n| !n.is_empty()) else {
+            continue;
+        };
         *counts.entry(name.to_lowercase()).or_insert(0) += 1;
     }
-    counts.into_iter().filter(|(_, count)| *count > 1).map(|(name, _)| name).collect()
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// `formatSessionLabel` (`v0.10.1 index.ts:440-446`): how a peer is NAMED back to the human in the
@@ -494,8 +512,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |k| map.get(k).cloned()
     }
 
@@ -541,8 +561,14 @@ mod tests {
     #[test]
     fn presence_name_uses_alias_for_unnamed() {
         assert_eq!(presence_name(Some("  Alice "), "id"), "Alice");
-        assert_eq!(presence_name(None, "session-deadbeefcafef00d"), "subagent-chat-deadbeefcafef00d");
-        assert_eq!(presence_name(Some("   "), "abcdefghij"), "subagent-chat-abcdefghij");
+        assert_eq!(
+            presence_name(None, "session-deadbeefcafef00d"),
+            "subagent-chat-deadbeefcafef00d"
+        );
+        assert_eq!(
+            presence_name(Some("   "), "abcdefghij"),
+            "subagent-chat-abcdefghij"
+        );
     }
 
     /// The whole point of v0.10.0's 8→18 widening (`126875e`, CHANGELOG 0.10.0: "Extend
@@ -564,9 +590,17 @@ mod tests {
         let a = "0192f3c1-9a10-7a3c-8000-aaaaaaaaaaaa";
         let b = "0192f3c1-9a10-7f21-8000-bbbbbbbbbbbb";
         // Same mint millisecond: identical through the timestamp AND the version nibble.
-        assert_eq!(&a[..15], &b[..15], "the fixture must be two same-millisecond UUIDv7 mints");
+        assert_eq!(
+            &a[..15],
+            &b[..15],
+            "the fixture must be two same-millisecond UUIDv7 mints"
+        );
         // …so the pre-fix 8-char alias could not tell them apart.
-        assert_eq!(&a[..8], &b[..8], "slice(0, 8) lands inside the shared timestamp");
+        assert_eq!(
+            &a[..8],
+            &b[..8],
+            "slice(0, 8) lands inside the shared timestamp"
+        );
 
         assert_ne!(presence_name(None, a), presence_name(None, b));
         assert_eq!(presence_name(None, a), "subagent-chat-0192f3c1-9a10-7a3c");
@@ -578,7 +612,13 @@ mod tests {
     /// in the picker, the compose header and the sent-confirmation would grow one.
     #[test]
     fn a_session_label_carries_its_id_suffix_only_when_the_name_is_ambiguous() {
-        let roster = [Some("reviewer"), Some("Reviewer"), Some("builder"), None, Some("")];
+        let roster = [
+            Some("reviewer"),
+            Some("Reviewer"),
+            Some("builder"),
+            None,
+            Some(""),
+        ];
         let duplicates = duplicate_session_names(roster);
         // Case-insensitive: `reviewer` and `Reviewer` collide.
         assert!(duplicates.contains("reviewer"));
@@ -589,7 +629,10 @@ mod tests {
         assert_eq!(duplicates.len(), 1);
 
         let id = "0192f3c1-9a10-7000-8000-aaaaaaaaaaaa";
-        assert_eq!(format_session_label(Some("builder"), id, &duplicates), "builder");
+        assert_eq!(
+            format_session_label(Some("builder"), id, &duplicates),
+            "builder"
+        );
         assert_eq!(
             format_session_label(Some("Reviewer"), id, &duplicates),
             "Reviewer (0192f3c1)",
@@ -632,11 +675,18 @@ mod tests {
         // Distinct from character 0, so `longestSharedPrefix == 0` → minimumLength 8; the next `-`
         // is at index 8, so the prefix is the first 8 chars (the `-` is excluded).
         let map = session_id_prefixes(["aaaaaaaa-1111-2222", "bbbbbbbb-1111-2222"]);
-        assert_eq!(map.get("aaaaaaaa-1111-2222").map(String::as_str), Some("aaaaaaaa"));
+        assert_eq!(
+            map.get("aaaaaaaa-1111-2222").map(String::as_str),
+            Some("aaaaaaaa")
+        );
 
         // A lone session has no `other`, so it also floors at 8.
         let solo = session_id_prefixes(["0192f3c1-9a10-7000-8000-aaaaaaaaaaaa"]);
-        assert_eq!(solo.get("0192f3c1-9a10-7000-8000-aaaaaaaaaaaa").map(String::as_str), Some("0192f3c1"));
+        assert_eq!(
+            solo.get("0192f3c1-9a10-7000-8000-aaaaaaaaaaaa")
+                .map(String::as_str),
+            Some("0192f3c1")
+        );
 
         // An id SHORTER than the 8-char floor with no `-` yields the whole id, not a panic.
         let short = session_id_prefixes(["ab", "cd"]);
@@ -648,9 +698,14 @@ mod tests {
     #[test]
     fn native_supervisor_channel_probe_treats_blank_as_absent() {
         assert!(!native_supervisor_channel_available_from(|_| None));
-        assert!(!native_supervisor_channel_available_from(|_| Some(String::new())));
-        assert!(!native_supervisor_channel_available_from(|_| Some("   ".to_string())));
-        assert!(native_supervisor_channel_available_from(|k| (k == ENV_SUPERVISOR_CHANNEL_DIR)
+        assert!(!native_supervisor_channel_available_from(|_| Some(
+            String::new()
+        )));
+        assert!(!native_supervisor_channel_available_from(|_| Some(
+            "   ".to_string()
+        )));
+        assert!(native_supervisor_channel_available_from(|k| (k
+            == ENV_SUPERVISOR_CHANNEL_DIR)
             .then(|| "/tmp/chan".to_string())));
     }
 

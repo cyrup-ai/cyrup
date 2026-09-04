@@ -524,20 +524,20 @@ impl TurnBudgetTracker {
             ));
         }
         match state.outcome {
-            TurnBudgetOutcome::TerminationDeferred => Some(TurnBudgetTerminalNote::Note(
-                turn_budget_deferred_note(
+            TurnBudgetOutcome::TerminationDeferred => {
+                Some(TurnBudgetTerminalNote::Note(turn_budget_deferred_note(
                     &budget,
                     state
                         .termination_deferred_at_turn
                         .unwrap_or(state.turn_count),
-                ),
-            )),
-            TurnBudgetOutcome::WrapUpRequested if self.wrap_up_requested => Some(
-                TurnBudgetTerminalNote::Note(turn_budget_soft_note(
+                )))
+            }
+            TurnBudgetOutcome::WrapUpRequested if self.wrap_up_requested => {
+                Some(TurnBudgetTerminalNote::Note(turn_budget_soft_note(
                     &budget,
                     state.wrap_up_requested_at_turn.unwrap_or(state.turn_count),
-                )),
-            ),
+                )))
+            }
             _ => None,
         }
     }
@@ -598,7 +598,10 @@ mod tests {
         );
         // `graceTurns: 0` is legal and is NOT the default — the ?? only fires on null/undefined.
         assert_eq!(
-            resolve_turn_budget_config(Some(&json!({"maxTurns": 3, "graceTurns": 0})), "turnBudget"),
+            resolve_turn_budget_config(
+                Some(&json!({"maxTurns": 3, "graceTurns": 0})),
+                "turnBudget"
+            ),
             Ok(Some(ResolvedTurnBudget {
                 max_turns: 3,
                 grace_turns: 0,
@@ -628,7 +631,10 @@ mod tests {
             );
         }
         assert_eq!(
-            resolve_turn_budget_config(Some(&json!({"maxTurns": 2, "graceTurns": -1})), "turnBudget"),
+            resolve_turn_budget_config(
+                Some(&json!({"maxTurns": 2, "graceTurns": -1})),
+                "turnBudget"
+            ),
             Err("turnBudget.graceTurns must be an integer >= 0.".to_string())
         );
         // A float with no fractional part is an integer to `Number.isInteger`, so it must pass.
@@ -664,7 +670,10 @@ mod tests {
             }),
         );
         assert!(many.starts_with("## Turn budget\n"), "{many}");
-        assert!(many.contains("a soft budget of 4 assistant turns."), "{many}");
+        assert!(
+            many.contains("a soft budget of 4 assistant turns."),
+            "{many}"
+        );
         assert!(
             many.contains("After that, 2 additional assistant turns may be allowed"),
             "{many}"
@@ -787,7 +796,10 @@ mod tests {
         let mut tracker = TurnBudgetTracker::new(Some(budget), false);
         // Turn 1 is already at the hard limit (1 + 0) with tool work in flight → defer.
         let effect = tracker.observe_assistant_turn(1, false, true, false);
-        assert!(matches!(effect, TurnBudgetEffect::SoftNote(_)), "{effect:?}");
+        assert!(
+            matches!(effect, TurnBudgetEffect::SoftNote(_)),
+            "{effect:?}"
+        );
         assert_eq!(
             tracker.state().map(|s| s.outcome),
             Some(TurnBudgetOutcome::TerminationDeferred)

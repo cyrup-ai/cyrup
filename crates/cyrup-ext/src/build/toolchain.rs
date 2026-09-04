@@ -29,7 +29,10 @@ impl ToolchainStatus {
     /// componentization tooling (`wasm-tools`/`cargo-component`) is for validation/inspection and
     /// must NOT gate the build (gap-08 #6: "not environment-blocked").
     pub fn can_build(&self) -> bool {
-        matches!(self, ToolchainStatus::Ready | ToolchainStatus::NoComponentTooling)
+        matches!(
+            self,
+            ToolchainStatus::Ready | ToolchainStatus::NoComponentTooling
+        )
     }
 
     /// An actionable, user-facing message for a missing-toolchain condition (R-ARCH-EXT-015).
@@ -39,9 +42,7 @@ impl ToolchainStatus {
             ToolchainStatus::NoCargo => {
                 Some("cargo not found: install the Rust toolchain (https://rustup.rs)".into())
             }
-            ToolchainStatus::NoWasmTarget => {
-                Some("run: rustup target add wasm32-wasip2".into())
-            }
+            ToolchainStatus::NoWasmTarget => Some("run: rustup target add wasm32-wasip2".into()),
             ToolchainStatus::NoComponentTooling => Some(
                 "componentization tooling missing: install with `cargo install cargo-component` \
                  and `cargo install wasm-tools`"
@@ -83,7 +84,11 @@ pub fn detect_toolchain() -> Toolchain {
         ToolchainStatus::Ready
     };
 
-    Toolchain { status, rustc_version, target }
+    Toolchain {
+        status,
+        rustc_version,
+        target,
+    }
 }
 
 fn wasm_target_installed() -> bool {
@@ -126,7 +131,9 @@ pub fn require_buildable(tc: &Toolchain) -> Result<(), ExtError> {
         Ok(())
     } else {
         Err(ExtError::Toolchain(
-            tc.status.actionable().unwrap_or_else(|| "toolchain cannot build".into()),
+            tc.status
+                .actionable()
+                .unwrap_or_else(|| "toolchain cannot build".into()),
         ))
     }
 }

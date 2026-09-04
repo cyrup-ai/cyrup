@@ -52,14 +52,14 @@ use std::path::PathBuf;
 use crate::discovery::types::AgentOverrideConfig;
 
 pub mod authority;
+pub mod cost;
 pub mod doctor;
 pub mod guide;
 pub mod profiles;
+pub mod prompt_workflows;
+pub mod resources;
 pub mod slash_commands;
 pub mod tool_description;
-pub mod cost;
-pub mod resources;
-pub mod prompt_workflows;
 
 // -------------------------------------------------------------------------------------------
 // SubagentExtensionConfig (func-SA §4.7; arch-SA §3.8) — tier 3 of R-SA-133
@@ -558,12 +558,12 @@ impl SubagentExtensionConfig {
             // `cleanupDays !== undefined` is TRUE for an explicit JSON `null`, which then fails
             // `typeof === "number"`.
             return Err(
-                "config.artifactConfig.cleanupDays must be a non-negative integer".to_string()
+                "config.artifactConfig.cleanupDays must be a non-negative integer".to_string(),
             );
         }
         if days.as_u64().is_none() {
             return Err(
-                "config.artifactConfig.cleanupDays must be a non-negative integer".to_string()
+                "config.artifactConfig.cleanupDays must be a non-negative integer".to_string(),
             );
         }
         Ok(())
@@ -834,9 +834,7 @@ impl SubagentsSettingsView {
     /// underlying `subagents.*` settings value, never two independently-parsed copies that could
     /// disagree.
     #[must_use]
-    pub fn from_subagent_settings(
-        settings: &crate::discovery::types::SubagentSettings,
-    ) -> Self {
+    pub fn from_subagent_settings(settings: &crate::discovery::types::SubagentSettings) -> Self {
         Self {
             default_model: settings.default_model.clone(),
             agent_overrides: settings
@@ -1403,7 +1401,7 @@ mod tests {
             default_extensions: None,
             disable_builtins: Some(true),
             disable_thinking: Some(true),
-                    max_thinking: None,
+            max_thinking: None,
         };
         let view = SubagentsSettingsView::from_subagent_settings(&settings);
         assert!(view.disable_builtins);
@@ -1524,13 +1522,8 @@ mod tests {
         let ext_cfg = extension_config_fixture();
         let frontmatter = frontmatter_fixture();
 
-        let resolved = resolve_effective_config(
-            &inline,
-            &settings,
-            Some("reviewer"),
-            &ext_cfg,
-            &frontmatter,
-        );
+        let resolved =
+            resolve_effective_config(&inline, &settings, Some("reviewer"), &ext_cfg, &frontmatter);
 
         assert_eq!(resolved.model.value.as_deref(), Some("inline-model"));
         assert_eq!(resolved.model.tier, ConfigTier::InlineCallOverride);
@@ -1546,13 +1539,8 @@ mod tests {
         let ext_cfg = extension_config_fixture();
         let frontmatter = frontmatter_fixture();
 
-        let resolved = resolve_effective_config(
-            &inline,
-            &settings,
-            Some("reviewer"),
-            &ext_cfg,
-            &frontmatter,
-        );
+        let resolved =
+            resolve_effective_config(&inline, &settings, Some("reviewer"), &ext_cfg, &frontmatter);
 
         assert_eq!(
             resolved.model.value.as_deref(),
@@ -1563,7 +1551,10 @@ mod tests {
         // The settings tier no longer supplies a per-agent max depth; it resolves from config.json
         // (`extension_config_fixture` sets `max_subagent_depth: 7`), NOT the settings tier.
         assert_eq!(resolved.max_subagent_depth.value, 7);
-        assert_eq!(resolved.max_subagent_depth.tier, ConfigTier::ExtensionConfig);
+        assert_eq!(
+            resolved.max_subagent_depth.tier,
+            ConfigTier::ExtensionConfig
+        );
     }
 
     /// Tier 2 falls back to the FLAT `subagents.defaultModel` (not the per-agent override) when

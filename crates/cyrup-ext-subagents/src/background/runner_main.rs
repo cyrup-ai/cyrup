@@ -562,7 +562,11 @@ pub async fn run_with(
     run_paths: &RunPaths,
     overrides: RunnerOverrides,
 ) -> Result<(), SubagentError> {
-    let RunnerOverrides { spawn_command, roots, child_env } = overrides;
+    let RunnerOverrides {
+        spawn_command,
+        roots,
+        child_env,
+    } = overrides;
     // Resolved ONCE here, then carried: the cascade's own read is mid-run, and re-deriving it there
     // is what used to force a caller to move `CYRUP_SUBAGENTS_TEMP_ROOT` on the whole process.
     let roots = roots.unwrap_or_else(crate::paths::Roots::from_env);
@@ -769,7 +773,8 @@ async fn ensure_run_directories(run_paths: &RunPaths) {
 /// `None` means the status could not be published and the terminal `Failed` record has already
 /// been written by [`finish_run`] — the caller returns without running a single step.
 async fn publish_initial_status(config: &RunnerConfig, run_paths: &RunPaths) -> Option<RunStatus> {
-    let mut status = RunStatus::queued(config.run_id.clone(), config.mode, Some(std::process::id()));
+    let mut status =
+        RunStatus::queued(config.run_id.clone(), config.mode, Some(std::process::id()));
     // pi `...(config.sessionId ? { sessionId: config.sessionId } : {})` (`subagent-runner.ts:2088`):
     // stamp the ORCHESTRATOR session onto the run's own `status.json`, so a later reader can scope
     // the async root to one session (`async-status.ts:432`).
@@ -786,11 +791,7 @@ async fn publish_initial_status(config: &RunnerConfig, run_paths: &RunPaths) -> 
         .filter(|id| !id.is_empty())
         .or_else(crate::background::parent_anchor::resolve_parent_session_anchor);
     status.chain_step_count = Some(config.steps.len());
-    status.steps = config
-        .steps
-        .iter()
-        .map(pending_step_status_for)
-        .collect();
+    status.steps = config.steps.iter().map(pending_step_status_for).collect();
     // Queued -> Running is always legal (RunState::can_transition_to).
     if status.advance_state(RunState::Running).is_err() {
         // Unreachable in practice (a freshly `queued` status can always advance to Running), but
@@ -982,7 +983,11 @@ async fn settle_loop_outcome(
             )
             .await;
             (
-                if all_ok { RunState::Complete } else { RunState::Failed },
+                if all_ok {
+                    RunState::Complete
+                } else {
+                    RunState::Failed
+                },
                 results,
                 None,
             )
@@ -1251,7 +1256,9 @@ pub(crate) struct TelemetryMsg {
 /// Lock the shared status, recovering the guard on a poisoned mutex rather than propagating the
 /// panic (the map's contents stay structurally valid), matching `background/tracker.rs`.
 fn lock_status(shared: &SharedStatus) -> std::sync::MutexGuard<'_, RunStatus> {
-    shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Atomically write the current shared status to `status.json` (R-SA-076): clone under the lock,
@@ -1402,10 +1409,9 @@ async fn run_inner(
             return Ok(LoopOutcome::Completed { results });
         }
 
-        let step = steps
-            .get(cursor)
-            .cloned()
-            .ok_or_else(|| SubagentError::Spawn(std::io::Error::other("step cursor out of range")))?;
+        let step = steps.get(cursor).cloned().ok_or_else(|| {
+            SubagentError::Spawn(std::io::Error::other("step cursor out of range"))
+        })?;
 
         // Publish the current flat index BEFORE dispatch so the live-telemetry sink tags this
         // step's child NDJSON lines with the right index (pi `statusPayload.currentStep = flatIndex`).
@@ -1434,8 +1440,16 @@ async fn run_inner(
         .await;
 
         if let RunnerStep::ImportAsyncRoot(spec) = &step {
-            run_import_async_root(&mut io, &steps, cursor, &step, spec, &mut registry, &mut results)
-                .await?;
+            run_import_async_root(
+                &mut io,
+                &steps,
+                cursor,
+                &step,
+                spec,
+                &mut registry,
+                &mut results,
+            )
+            .await?;
             cursor += 1;
             continue;
         }
@@ -1616,7 +1630,8 @@ fn build_chain_context(
     // and `tool-description.ts:25,:73` @v0.34.0 both say it applies to "foreground and
     // async/background runs"; `async-execution.ts:1302-1305` arms the deadline).
     let deadline_at = config.deadline_at_ms.map(|deadline_ms| {
-        let remaining_ms = deadline_ms.saturating_sub(u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0));
+        let remaining_ms =
+            deadline_ms.saturating_sub(u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0));
         std::time::Instant::now() + std::time::Duration::from_millis(remaining_ms)
     });
     let ctx = ChainRunContext {
@@ -1724,9 +1739,10 @@ async fn check_timeout_flag(
     let timed_out = &io.flags.timed_out;
     if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
         if let Some(request) = control::consume_timeout_request(run_paths).await? {
-            let message = request.reason.clone().unwrap_or_else(|| {
-                timeout_message(config.timeout_ms, &request.source)
-            });
+            let message = request
+                .reason
+                .clone()
+                .unwrap_or_else(|| timeout_message(config.timeout_ms, &request.source));
             {
                 let mut guard = lock_status(status);
                 let s = &mut *guard;
@@ -1869,8 +1885,7 @@ async fn run_import_async_root(
     let status = io.status;
     let events = &mut *io.events;
     let target_run_id = RunId::from_token(spec.run_id.clone());
-    let target_paths =
-        RunPaths::for_run(&spec.async_root, &spec.results_dir, &target_run_id);
+    let target_paths = RunPaths::for_run(&spec.async_root, &spec.results_dir, &target_run_id);
     let imported = control::wait_for_imported_async_root(
         &target_paths,
         &spec.run_id,
@@ -1942,7 +1957,6 @@ async fn run_import_async_root(
     write_shared_status(run_paths, status)
         .await
         .map_err(SubagentError::Spawn)?;
-
 
     Ok(())
 }
@@ -2228,8 +2242,7 @@ async fn cascade_to_descendants(
     let Some(route) = config.nested_route.as_ref() else {
         return;
     };
-    let report =
-        cascade::cascade_to_nested_async_descendants(roots, route, verb).await;
+    let report = cascade::cascade_to_nested_async_descendants(roots, route, verb).await;
     for failure in report.failures {
         let mut payload = serde_json::json!({
             "runId": config.run_id.as_str(),
@@ -2269,7 +2282,8 @@ fn mark_remaining_paused(status: &mut RunStatus, from_index: usize, total: usize
 fn mark_step_running(status: &mut RunStatus, index: usize) {
     if let Some(step) = status.steps.get_mut(index) {
         step.status = StepState::Running;
-        step.started_at.get_or_insert(crate::time::now_epoch_millis());
+        step.started_at
+            .get_or_insert(crate::time::now_epoch_millis());
     }
 }
 
@@ -2284,7 +2298,11 @@ fn record_step_outcome(
 ) {
     let now = crate::time::now_epoch_millis();
     if let Some(entry) = status.steps.get_mut(index) {
-        entry.status = if result.success { StepState::Complete } else { StepState::Failed };
+        entry.status = if result.success {
+            StepState::Complete
+        } else {
+            StepState::Failed
+        };
         entry.ended_at = Some(now);
         entry.error = result.error.clone();
     }
@@ -2301,7 +2319,11 @@ fn record_step_outcome(
                 s.ended_at = Some(now);
                 match child {
                     Some(outcome) => {
-                        s.status = if outcome.success { StepState::Complete } else { StepState::Failed };
+                        s.status = if outcome.success {
+                            StepState::Complete
+                        } else {
+                            StepState::Failed
+                        };
                         s.error = outcome.error.clone();
                     }
                     None => {
@@ -2316,7 +2338,10 @@ fn record_step_outcome(
             group_step_index: index,
             children,
         };
-        status.parallel_groups.get_or_insert_with(Vec::new).push(entry);
+        status
+            .parallel_groups
+            .get_or_insert_with(Vec::new)
+            .push(entry);
     }
 }
 
@@ -2744,13 +2769,17 @@ impl ExecSingleStepExecutor {
     /// steerCapabilityPath(asyncDir, fi)`, `runs/shared/pi-args.ts:766-768,764-765` @v0.43.0).
     #[must_use]
     pub(crate) fn steer_ack_dir_for(&self, index: usize) -> Option<PathBuf> {
-        self.run_dir.as_deref().map(|run_dir| control::steer_acks_dir(run_dir, index))
+        self.run_dir
+            .as_deref()
+            .map(|run_dir| control::steer_acks_dir(run_dir, index))
     }
 
     /// SUBA-049 — this child's capability file, same derivation as [`Self::steer_ack_dir_for`].
     #[must_use]
     pub(crate) fn steer_capability_path_for(&self, index: usize) -> Option<PathBuf> {
-        self.run_dir.as_deref().map(|run_dir| control::steer_capability_path(run_dir, index))
+        self.run_dir
+            .as_deref()
+            .map(|run_dir| control::steer_capability_path(run_dir, index))
     }
 
     /// T0.1 / C13: dispatch the REAL named persona. Every step's agent was resolved to a full
@@ -2777,7 +2806,10 @@ impl ExecSingleStepExecutor {
         step: &SingleStepSpec,
     ) -> Result<StepAgentSetup, Box<StepResult>> {
         let Some(persona) = self.resolved_agents.get(&step.agent) else {
-            return Err(Box::new(StepResult::failure(format!("Unknown agent: {}", step.agent))));
+            return Err(Box::new(StepResult::failure(format!(
+                "Unknown agent: {}",
+                step.agent
+            ))));
         };
 
         // Reconstitute the execution-ready config from the persona, stamping THIS process's own
@@ -2868,7 +2900,12 @@ impl ExecSingleStepExecutor {
             None => None,
         };
 
-        Ok(StepAgentSetup { agent, available_models, model_override, acceptance })
+        Ok(StepAgentSetup {
+            agent,
+            available_models,
+            model_override,
+            acceptance,
+        })
     }
 
     /// Lower this step's spec and the chain-run context into the [`RunOptions`] `exec::run_sync`
@@ -2918,7 +2955,10 @@ impl ExecSingleStepExecutor {
             let flat = Arc::clone(&self.current_flat_index);
             crate::exec::LiveEventSink::new(move |raw: &str| {
                 let flat_index = flat.load(std::sync::atomic::Ordering::SeqCst);
-                let _ = sender.send(TelemetryMsg { flat_index, raw: raw.to_string() });
+                let _ = sender.send(TelemetryMsg {
+                    flat_index,
+                    raw: raw.to_string(),
+                });
             })
         });
 
@@ -3059,7 +3099,10 @@ impl ExecSingleStepExecutor {
             // of its own), matching the `status.steps` position the steer path indexes by.
             orchestrator_intercom_target: self.orchestrator_intercom_target.clone(),
             run_id: self.run_id.clone(),
-            child_index: Some(self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst)),
+            child_index: Some(
+                self.current_flat_index
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
             // G90 (pi `steerInboxDir: stepSteerInboxDir(asyncDir, fi)`,
             // `subagent-runner.ts:2313,2600,2797` @v0.34.0): THIS step's own per-child steer inbox,
             // handed to the spawned child so its live steering watcher has a path to attach to. The
@@ -3067,15 +3110,19 @@ impl ExecSingleStepExecutor {
             // runner's own `deliver_steer_request` routes an accepted request to
             // (`control::enqueue_step_steer`), so the two halves of the hop address the same
             // directory by construction. `None` for a foreground executor (no async run dir).
-            steer_inbox_dir: self
-                .steer_inbox_for(self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst)),
+            steer_inbox_dir: self.steer_inbox_for(
+                self.current_flat_index
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
             // SUBA-049: the return path, keyed off the SAME flat index as the inbox above — see
             // `steer_ack_dir_for`'s doc for why the derivation is shared rather than re-written.
             steer_ack_dir: self.steer_ack_dir_for(
-                self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst),
+                self.current_flat_index
+                    .load(std::sync::atomic::Ordering::SeqCst),
             ),
             steer_capability_path: self.steer_capability_path_for(
-                self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst),
+                self.current_flat_index
+                    .load(std::sync::atomic::Ordering::SeqCst),
             ),
             // SUBA-N05: the run's resolved live-control config, threaded from
             // [`RunnerConfig::control`] (background) or [`ExecSingleStepExecutor::with_control`]
@@ -3130,20 +3177,29 @@ impl ExecSingleStepExecutor {
         step: &SingleStepSpec,
         resolved_task: &str,
     ) -> Option<(crate::artifacts::ArtifactPaths, String)> {
-        self.artifacts_dir.as_ref().filter(|_| self.artifact_config.enabled).map(|dir| {
-            let index = self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst);
-            let run_token = self.run_id.as_ref().map_or("run", RunId::as_str).to_string();
-            let paths =
-                crate::artifacts::artifact_paths(dir, &run_token, &step.agent, Some(index));
-            let _ = crate::artifacts::ensure_artifacts_dir(dir);
-            if self.artifact_config.include_input {
-                let _ = crate::artifacts::write_artifact(
-                    &paths.input_path,
-                    &format!("# Task for {}\n\n{resolved_task}", step.agent),
-                );
-            }
-            (paths, run_token)
-        })
+        self.artifacts_dir
+            .as_ref()
+            .filter(|_| self.artifact_config.enabled)
+            .map(|dir| {
+                let index = self
+                    .current_flat_index
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let run_token = self
+                    .run_id
+                    .as_ref()
+                    .map_or("run", RunId::as_str)
+                    .to_string();
+                let paths =
+                    crate::artifacts::artifact_paths(dir, &run_token, &step.agent, Some(index));
+                let _ = crate::artifacts::ensure_artifacts_dir(dir);
+                if self.artifact_config.include_input {
+                    let _ = crate::artifacts::write_artifact(
+                        &paths.input_path,
+                        &format!("# Task for {}\n\n{resolved_task}", step.agent),
+                    );
+                }
+                (paths, run_token)
+            })
     }
 
     /// SUBA-N03 / T6: the after-run half (pi `subagent-runner.ts:1117-1134` — `_output.md`,
@@ -3186,11 +3242,15 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         resolved_task: &str,
         ctx: &ChainRunContext,
     ) -> Result<StepResult, SubagentError> {
-        let StepAgentSetup { agent, available_models, model_override, acceptance } =
-            match self.build_step_agent_config(step) {
-                Ok(setup) => setup,
-                Err(rejection) => return Ok(*rejection),
-            };
+        let StepAgentSetup {
+            agent,
+            available_models,
+            model_override,
+            acceptance,
+        } = match self.build_step_agent_config(step) {
+            Ok(setup) => setup,
+            Err(rejection) => return Ok(*rejection),
+        };
 
         let opts =
             self.build_step_run_options(step, ctx, available_models, model_override, acceptance);
@@ -3201,7 +3261,11 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
 
         self.write_step_result_artifacts(artifact_paths.as_ref(), &result);
 
-        Ok(build_step_result(&agent.name, result, artifact_paths.as_ref()))
+        Ok(build_step_result(
+            &agent.name,
+            result,
+            artifact_paths.as_ref(),
+        ))
     }
 }
 
@@ -3218,7 +3282,10 @@ fn build_step_result(
         StepResult::success(result.final_output, result.structured_output)
     } else {
         StepResult::failure(result.error.unwrap_or_else(|| {
-            format!("subagent step '{}' exited with code {}", agent_name, result.exit_code)
+            format!(
+                "subagent step '{}' exited with code {}",
+                agent_name, result.exit_code
+            )
         }))
     };
     step_result.interrupted = result.interrupted;
@@ -3281,7 +3348,8 @@ fn build_step_result(
 /// before this function was ever added).
 #[cfg(unix)]
 fn install_ignored_sigusr2_handler() -> Option<SigUsr2Guard> {
-    let mut stream = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()).ok()?;
+    let mut stream =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()).ok()?;
     let handle = tokio::spawn(async move {
         loop {
             // `recv()` returning `None` means the underlying signal stream has been torn down
@@ -3484,7 +3552,10 @@ async fn route_steer_requests(
         // `.await`-ing filesystem work and a `std::sync::Mutex` guard must never cross an await.
         let (run_state, step_states): (RunState, Vec<StepState>) = {
             let status = lock_status(shared);
-            (status.state, status.steps.iter().map(|s| s.status).collect())
+            (
+                status.state,
+                status.steps.iter().map(|s| s.status).collect(),
+            )
         };
         if run_state != RunState::Running {
             pending.push(request);
@@ -3550,8 +3621,13 @@ async fn route_steer_requests(
                 }
             }
             let total = u64::try_from(accepted.len()).unwrap_or(0);
-            status.telemetry.steer_count =
-                Some(status.telemetry.steer_count.unwrap_or(0).saturating_add(total));
+            status.telemetry.steer_count = Some(
+                status
+                    .telemetry
+                    .steer_count
+                    .unwrap_or(0)
+                    .saturating_add(total),
+            );
             status.telemetry.last_steer_at = Some(now);
             status.last_update = now;
             status_dirty = true;
@@ -3732,8 +3808,7 @@ async fn finish_run(
     // produced zero step results — e.g. a `Chain` run whose `steps` list was itself empty — is
     // treated as a success, matching this crate's general "no work attempted, no work failed"
     // convention rather than requiring a nonsensical "at least one result" precondition).
-    let success =
-        terminal_state == RunState::Complete && results.iter().all(|r| r.exit_code == 0);
+    let success = terminal_state == RunState::Complete && results.iter().all(|r| r.exit_code == 0);
 
     // R-SA-077: status.json THEN ResultFile, in that exact order. Both writes are best-effort at
     // the OUTER level (a failure writing `status.json` here still attempts the `ResultFile` write,
@@ -3827,8 +3902,15 @@ mod tests {
     fn steer_fixture(dir: &Path, agents: &[&str], running: &[usize]) -> (RunPaths, SharedStatus) {
         let paths = RunPaths::for_run(dir, dir, &RunId::from_token("steerroute01".to_string()));
         std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
-        let mut status =
-            RunStatus::queued(paths.run_dir.file_name().map(|n| RunId::from_token(n.to_string_lossy().into_owned())).expect("run id"), RunMode::Parallel, Some(std::process::id()));
+        let mut status = RunStatus::queued(
+            paths
+                .run_dir
+                .file_name()
+                .map(|n| RunId::from_token(n.to_string_lossy().into_owned()))
+                .expect("run id"),
+            RunMode::Parallel,
+            Some(std::process::id()),
+        );
         status.state = RunState::Running;
         status.steps = agents
             .iter()
@@ -3856,9 +3938,14 @@ mod tests {
     async fn the_inbox_the_runner_writes_is_the_inbox_the_child_is_handed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (paths, shared) = steer_fixture(dir.path(), &["a", "b"], &[1]);
-        control::request_async_steer(&paths.run_dir, "look at step two", None, Some("steer-action"))
-            .await
-            .expect("parent write");
+        control::request_async_steer(
+            &paths.run_dir,
+            "look at step two",
+            None,
+            Some("steer-action"),
+        )
+        .await
+        .expect("parent write");
 
         let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
         let mut pending = Vec::new();
@@ -3934,9 +4021,14 @@ mod tests {
     async fn steer_routing_fans_an_untargeted_request_to_every_running_child() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (paths, shared) = steer_fixture(dir.path(), &["a", "b", "c"], &[0, 2]);
-        control::request_async_steer(&paths.run_dir, "tighten the scope", None, Some("steer-action"))
-            .await
-            .expect("parent write");
+        control::request_async_steer(
+            &paths.run_dir,
+            "tighten the scope",
+            None,
+            Some("steer-action"),
+        )
+        .await
+        .expect("parent write");
 
         let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
         let mut pending = Vec::new();
@@ -3949,10 +4041,18 @@ mod tests {
                 .unwrap_or_else(|e| panic!("child {index} inbox must exist: {e}"))
                 .filter_map(Result::ok)
                 .collect();
-            assert_eq!(files.len(), 1, "child {index} must receive exactly one steer");
+            assert_eq!(
+                files.len(),
+                1,
+                "child {index} must receive exactly one steer"
+            );
             let raw = std::fs::read_to_string(files[0].path()).expect("read");
             let request: control::SteerRequest = serde_json::from_str(&raw).expect("parse");
-            assert_eq!(request.target_index, Some(index), "the copy must be PINNED to its child");
+            assert_eq!(
+                request.target_index,
+                Some(index),
+                "the copy must be PINNED to its child"
+            );
             assert_eq!(request.message, "tighten the scope");
         }
         assert!(
@@ -3962,7 +4062,9 @@ mod tests {
 
         // The run-level queue was drained exactly once (delete-before-deliver).
         assert!(
-            control::consume_steer_requests(&paths.run_dir).await.is_empty(),
+            control::consume_steer_requests(&paths.run_dir)
+                .await
+                .is_empty(),
             "the run queue must be empty after routing"
         );
         assert!(pending.is_empty(), "nothing was held");
@@ -3990,7 +4092,10 @@ mod tests {
         assert_eq!(event["acceptedIndexes"], serde_json::json!([0, 2]));
         assert_eq!(event["source"], serde_json::json!("steer-action"));
         assert_eq!(event["message"], serde_json::json!("tighten the scope"));
-        assert!(event.get("rejected").is_none(), "nothing was rejected: {event}");
+        assert!(
+            event.get("rejected").is_none(),
+            "nothing was rejected: {event}"
+        );
     }
 
     #[tokio::test]
@@ -4004,7 +4109,11 @@ mod tests {
         let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
         let mut pending = Vec::new();
         route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
-        assert_eq!(pending.len(), 1, "a pending target must be HELD, never dropped");
+        assert_eq!(
+            pending.len(),
+            1,
+            "a pending target must be HELD, never dropped"
+        );
         assert!(
             !control::step_steer_inbox_dir(&paths.run_dir, 1).exists(),
             "nothing may be delivered while the child is pending"
@@ -4035,7 +4144,10 @@ mod tests {
         let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
         let mut pending = Vec::new();
         route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
-        assert!(pending.is_empty(), "a terminal child is a rejection, not a hold");
+        assert!(
+            pending.is_empty(),
+            "a terminal child is a rejection, not a hold"
+        );
         assert_eq!(lock_status(&shared).telemetry.steer_count, None);
 
         drop(events);
@@ -4047,7 +4159,10 @@ mod tests {
         let event: serde_json::Value = serde_json::from_str(line).expect("parse event");
         assert_eq!(event["acceptedIndexes"], serde_json::json!([]));
         assert_eq!(event["rejected"][0]["index"], serde_json::json!(1));
-        assert_eq!(event["rejected"][0]["reason"], serde_json::json!("child is complete"));
+        assert_eq!(
+            event["rejected"][0]["reason"],
+            serde_json::json!("child is complete")
+        );
     }
 
     #[tokio::test]
@@ -4172,7 +4287,10 @@ mod tests {
             .await
             .expect("run_single itself returns Ok, carrying the step-level failure in StepResult");
 
-        assert!(!result.success, "an unresolved agent must be a step failure: {result:?}");
+        assert!(
+            !result.success,
+            "an unresolved agent must be a step failure: {result:?}"
+        );
         assert!(
             result
                 .error
@@ -4235,16 +4353,22 @@ mod tests {
             control: None,
             include_progress: None,
         };
-        write_atomic_json(&cfg_path, &config).await.expect("write config");
+        write_atomic_json(&cfg_path, &config)
+            .await
+            .expect("write config");
 
-        let outcome = read_and_delete_config(&cfg_path).await.expect("read succeeds");
+        let outcome = read_and_delete_config(&cfg_path)
+            .await
+            .expect("read succeeds");
         match outcome {
             ConfigConsumeOutcome::Consumed(read_back) => assert_eq!(*read_back, config),
             ConfigConsumeOutcome::AlreadyConsumed => panic!("expected Consumed"),
         }
 
         assert!(
-            !tokio::fs::try_exists(&cfg_path).await.expect("check exists"),
+            !tokio::fs::try_exists(&cfg_path)
+                .await
+                .expect("check exists"),
             "the config file must be deleted immediately after being read (R-SA-073)"
         );
     }
@@ -4291,14 +4415,20 @@ mod tests {
             control: None,
             include_progress: None,
         };
-        write_atomic_json(&cfg_path, &config).await.expect("write config");
+        write_atomic_json(&cfg_path, &config)
+            .await
+            .expect("write config");
 
-        let first = read_and_delete_config(&cfg_path).await.expect("first read succeeds");
+        let first = read_and_delete_config(&cfg_path)
+            .await
+            .expect("first read succeeds");
         assert!(matches!(first, ConfigConsumeOutcome::Consumed(_)));
 
         // The load-bearing idempotency proof this task calls for: a SECOND consume against the
         // now-deleted path must not panic, must not error, and must report AlreadyConsumed.
-        let second = read_and_delete_config(&cfg_path).await.expect("second read does not error");
+        let second = read_and_delete_config(&cfg_path)
+            .await
+            .expect("second read does not error");
         assert!(
             matches!(second, ConfigConsumeOutcome::AlreadyConsumed),
             "a double-consume of the handoff config must degrade to AlreadyConsumed, never panic \
@@ -4310,7 +4440,9 @@ mod tests {
     async fn read_and_delete_config_malformed_json_surfaces_as_error_not_already_consumed() {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
-        tokio::fs::write(&cfg_path, b"not valid json").await.expect("write garbage");
+        tokio::fs::write(&cfg_path, b"not valid json")
+            .await
+            .expect("write garbage");
 
         let result = read_and_delete_config(&cfg_path).await;
         assert!(
@@ -4364,12 +4496,14 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn control_inbox_dir_creation_failure_still_reaches_a_terminal_failed_state_via_finish_run(
-    ) {
+    async fn control_inbox_dir_creation_failure_still_reaches_a_terminal_failed_state_via_finish_run()
+     {
         let dir = tempfile::tempdir().expect("real tempdir");
         let run_id = RunId::from_token("run-badcontrol");
         let run_paths = run_paths_in(dir.path(), &run_id);
-        tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+        tokio::fs::create_dir_all(&run_paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
         tokio::fs::create_dir_all(dir.path().join("results"))
             .await
             .expect("mkdir results_dir");
@@ -4420,7 +4554,9 @@ mod tests {
             include_progress: None,
         };
         let cfg_path = run_paths.run_dir.join("runner-config.json");
-        write_atomic_json(&cfg_path, &config).await.expect("write config");
+        write_atomic_json(&cfg_path, &config)
+            .await
+            .expect("write config");
 
         let outcome = run(&cfg_path, &run_paths).await;
         assert!(
@@ -4455,13 +4591,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let run_id = RunId::from_token("run-double-invoke");
         let run_paths = run_paths_in(dir.path(), &run_id);
-        tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+        tokio::fs::create_dir_all(&run_paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
         tokio::fs::create_dir_all(dir.path().join("results"))
             .await
             .expect("mkdir results_dir");
 
         let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(111));
-        status.advance_state(RunState::Running).expect("Queued -> Running");
+        status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
 
         // First call: a genuine successful completion.
         finish_run(
@@ -4508,7 +4648,10 @@ mod tests {
         let first_result: ResultFile =
             serde_json::from_slice(&first_result_bytes).expect("valid JSON");
         assert_eq!(first_result.state, RunState::Complete);
-        assert!(first_result.success, "first call recorded a genuine success");
+        assert!(
+            first_result.success,
+            "first call recorded a genuine success"
+        );
 
         let first_status_bytes = tokio::fs::read(&run_paths.status)
             .await
@@ -4557,7 +4700,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let run_id = RunId::from_token("run-first-call");
         let run_paths = run_paths_in(dir.path(), &run_id);
-        tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+        tokio::fs::create_dir_all(&run_paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
         tokio::fs::create_dir_all(dir.path().join("results"))
             .await
             .expect("mkdir results_dir");
@@ -4576,11 +4721,15 @@ mod tests {
         .await;
 
         assert!(
-            tokio::fs::try_exists(&run_paths.result).await.expect("check exists"),
+            tokio::fs::try_exists(&run_paths.result)
+                .await
+                .expect("check exists"),
             "the double-invocation guard must not block a genuine FIRST terminal write"
         );
         let result: ResultFile = serde_json::from_slice(
-            &tokio::fs::read(&run_paths.result).await.expect("read result"),
+            &tokio::fs::read(&run_paths.result)
+                .await
+                .expect("read result"),
         )
         .expect("valid JSON");
         assert_eq!(result.state, RunState::Failed);
@@ -4598,7 +4747,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let run_id = RunId::from_token("run-cwd-stamp");
         let run_paths = run_paths_in(dir.path(), &run_id);
-        tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+        tokio::fs::create_dir_all(&run_paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
         tokio::fs::create_dir_all(dir.path().join("results"))
             .await
             .expect("mkdir results_dir");
@@ -4619,7 +4770,9 @@ mod tests {
         .await;
 
         let written_status: RunStatus = serde_json::from_slice(
-            &tokio::fs::read(&run_paths.status).await.expect("read status"),
+            &tokio::fs::read(&run_paths.status)
+                .await
+                .expect("read status"),
         )
         .expect("valid JSON");
         assert_eq!(
@@ -4685,7 +4838,9 @@ mod tests {
             let dir = tempfile::tempdir().expect("real tempdir");
             let run_id = RunId::from_token(format!("synth-{terminal_state:?}").to_lowercase());
             let run_paths = run_paths_in(dir.path(), &run_id);
-            tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+            tokio::fs::create_dir_all(&run_paths.run_dir)
+                .await
+                .expect("mkdir run_dir");
             tokio::fs::create_dir_all(dir.path().join("results"))
                 .await
                 .expect("mkdir results_dir");
@@ -4706,7 +4861,9 @@ mod tests {
             .await;
 
             let result: ResultFile = serde_json::from_slice(
-                &tokio::fs::read(&run_paths.result).await.expect("read result"),
+                &tokio::fs::read(&run_paths.result)
+                    .await
+                    .expect("read result"),
             )
             .expect("valid JSON");
             assert_eq!(result.state, terminal_state);
@@ -4716,7 +4873,10 @@ mod tests {
                 "a terminal run with an error and no step results must still explain itself"
             );
             let child = &result.results[0];
-            assert_eq!(child.agent, "scout", "the placeholder inherits the first step's agent");
+            assert_eq!(
+                child.agent, "scout",
+                "the placeholder inherits the first step's agent"
+            );
             assert_eq!(child.exit_code, 1);
             assert_eq!(
                 child.error.as_deref(),
@@ -4728,7 +4888,11 @@ mod tests {
             // placeholder carries no output, exactly as before.
             assert_eq!(
                 child.final_output.as_deref(),
-                if expect_stopped { Some(control::STOP_MESSAGE) } else { None },
+                if expect_stopped {
+                    Some(control::STOP_MESSAGE)
+                } else {
+                    None
+                },
                 "{terminal_state:?}: {child:?}"
             );
             assert_eq!(
@@ -4798,12 +4962,18 @@ mod tests {
             // Strictly BEFORE the cursor: already settled, must not be touched.
             group(0, &[StepState::Complete]),
             // At the cursor: one mid-flight, one never started, one already finished.
-            group(1, &[StepState::Running, StepState::Pending, StepState::Complete]),
+            group(
+                1,
+                &[StepState::Running, StepState::Pending, StepState::Complete],
+            ),
         ]);
 
         mark_remaining_stopped(&mut status, 1, 2, control::STOP_MESSAGE);
 
-        let groups = status.parallel_groups.as_ref().expect("groups survive the sweep");
+        let groups = status
+            .parallel_groups
+            .as_ref()
+            .expect("groups survive the sweep");
         assert_eq!(
             groups[0].children[0].status,
             StepState::Complete,
@@ -4836,13 +5006,26 @@ mod tests {
             swept[2].error.is_none(),
             "the finished child is not restamped with a stop message it never earned"
         );
-        assert!(swept[0].ended_at.is_some(), "a swept child gets an end timestamp");
-        assert!(swept[1].ended_at.is_some(), "a swept child gets an end timestamp");
+        assert!(
+            swept[0].ended_at.is_some(),
+            "a swept child gets an end timestamp"
+        );
+        assert!(
+            swept[1].ended_at.is_some(),
+            "a swept child gets an end timestamp"
+        );
 
         // The flat step list is swept by the same call, from the same cursor.
-        assert_eq!(status.steps[0].status, StepState::Pending, "before the cursor");
+        assert_eq!(
+            status.steps[0].status,
+            StepState::Pending,
+            "before the cursor"
+        );
         assert_eq!(status.steps[1].status, StepState::Stopped);
-        assert_eq!(status.steps[1].error.as_deref(), Some(control::STOP_MESSAGE));
+        assert_eq!(
+            status.steps[1].error.as_deref(),
+            Some(control::STOP_MESSAGE)
+        );
     }
 
     /// G77 widening 3, half one — `promote_interrupted_results_to_stopped` must NOT touch a child
@@ -4884,7 +5067,11 @@ mod tests {
             progress: None,
         };
         let mut results = vec![
-            settled("finished-first", false, Some("I completed before the stop.")),
+            settled(
+                "finished-first",
+                false,
+                Some("I completed before the stop."),
+            ),
             settled("torn-down", true, None),
             settled("torn-down-with-output", true, Some("partial work")),
         ];
@@ -4939,12 +5126,20 @@ mod tests {
         let target_results = dir.path().join("target-results");
         let target_id = RunId::from_token("target-root");
         let target_paths = RunPaths::for_run(&target_async, &target_results, &target_id);
-        tokio::fs::create_dir_all(&target_paths.run_dir).await.expect("mkdir target run_dir");
-        tokio::fs::create_dir_all(&target_results).await.expect("mkdir target results_dir");
+        tokio::fs::create_dir_all(&target_paths.run_dir)
+            .await
+            .expect("mkdir target run_dir");
+        tokio::fs::create_dir_all(&target_results)
+            .await
+            .expect("mkdir target results_dir");
 
         let mut target_status = RunStatus::queued(target_id.clone(), RunMode::Single, Some(4321));
-        target_status.advance_state(RunState::Running).expect("Queued -> Running");
-        target_status.advance_state(RunState::Complete).expect("Running -> Complete");
+        target_status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
+        target_status
+            .advance_state(RunState::Complete)
+            .expect("Running -> Complete");
         write_atomic_json(&target_paths.status, &target_status)
             .await
             .expect("write target status");
@@ -4993,7 +5188,9 @@ mod tests {
         // THIS chain: a single ImportAsyncRoot step attaching the target as its first step.
         let run_id = RunId::from_token("attaching-chain");
         let run_paths = run_paths_in(dir.path(), &run_id);
-        tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+        tokio::fs::create_dir_all(&run_paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
         tokio::fs::create_dir_all(dir.path().join("results"))
             .await
             .expect("mkdir results_dir");
@@ -5043,19 +5240,34 @@ mod tests {
             include_progress: None,
         };
         let cfg_path = run_paths.run_dir.join("runner-config.json");
-        write_atomic_json(&cfg_path, &config).await.expect("write config");
+        write_atomic_json(&cfg_path, &config)
+            .await
+            .expect("write config");
 
         let outcome = run(&cfg_path, &run_paths).await;
-        assert!(outcome.is_ok(), "run() never returns Err to its caller: {outcome:?}");
+        assert!(
+            outcome.is_ok(),
+            "run() never returns Err to its caller: {outcome:?}"
+        );
 
         let result_file: ResultFile = serde_json::from_slice(
-            &tokio::fs::read(&run_paths.result).await.expect("terminal ResultFile must exist"),
+            &tokio::fs::read(&run_paths.result)
+                .await
+                .expect("terminal ResultFile must exist"),
         )
         .expect("valid JSON");
 
-        assert_eq!(result_file.state, RunState::Complete, "attached root imported as success");
+        assert_eq!(
+            result_file.state,
+            RunState::Complete,
+            "attached root imported as success"
+        );
         assert!(result_file.success);
-        assert_eq!(result_file.results.len(), 1, "the attached root IS the chain's first step");
+        assert_eq!(
+            result_file.results.len(),
+            1,
+            "the attached root IS the chain's first step"
+        );
         let first = &result_file.results[0];
         assert_eq!(
             first.agent, "researcher",

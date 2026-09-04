@@ -8,7 +8,7 @@ use cyrup_core::EntryId;
 use serde_json::Value;
 
 use crate::entry::{Entry, KnownEntry};
-use crate::header::{SessionHeader, CURRENT_VERSION};
+use crate::header::{CURRENT_VERSION, SessionHeader};
 
 /// Migrate header + entries to the current version in place. Returns `true` if anything changed.
 pub fn to_current(header: &mut SessionHeader, entries: &mut [Entry]) -> bool {
@@ -108,8 +108,10 @@ fn v1_to_v2(entries: &mut [Entry]) {
             }
             Entry::Unknown(v) => {
                 if let Some(obj) = v.as_object_mut() {
-                    let needs_id =
-                        obj.get("id").and_then(Value::as_str).is_none_or(str::is_empty);
+                    let needs_id = obj
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty);
                     if needs_id {
                         let id = mint_unique(&used);
                         used.insert(id.clone());
@@ -126,7 +128,8 @@ fn v1_to_v2(entries: &mut [Entry]) {
                     convert_first_kept_index(obj, &assigned);
                     // Re-type now that the entry is well-formed (e.g. a v1 `message` or the
                     // just-converted `compaction`).
-                    if let Ok(known) = serde_json::from_value::<KnownEntry>(Value::Object(obj.clone()))
+                    if let Ok(known) =
+                        serde_json::from_value::<KnownEntry>(Value::Object(obj.clone()))
                     {
                         *e = Entry::Known(known);
                     }

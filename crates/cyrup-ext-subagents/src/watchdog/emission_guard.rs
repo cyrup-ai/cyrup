@@ -278,7 +278,10 @@ impl WatchdogEmissionGuard {
             watchdog_warning_underlying_identity(&warning.summary, &warning.evidence);
         let identity =
             watchdog_warning_identity(warning.severity, &warning.summary, &warning.evidence);
-        let prior_severity = self.accepted_by_underlying_identity.get(&underlying_identity).copied();
+        let prior_severity = self
+            .accepted_by_underlying_identity
+            .get(&underlying_identity)
+            .copied();
         let escalation = prior_severity == Some(WatchdogSeverity::Concern)
             && warning.severity == WatchdogSeverity::Blocker;
 
@@ -345,7 +348,12 @@ impl WatchdogEmissionGuard {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
 
@@ -355,12 +363,18 @@ mod tests {
 
     #[test]
     fn normalization_strips_apostrophes_before_collapsing_punctuation() {
-        assert_eq!(normalize_watchdog_emission_text("Don't  STOP!"), "dont stop");
+        assert_eq!(
+            normalize_watchdog_emission_text("Don't  STOP!"),
+            "dont stop"
+        );
         assert_eq!(normalize_watchdog_emission_text("don\u{2019}t"), "dont");
         assert_eq!(normalize_watchdog_emission_text("N/A"), "n a");
         assert_eq!(normalize_watchdog_emission_text("   ---   "), "");
         // NFKC folds the compatibility ligature and the fullwidth digit.
-        assert_eq!(normalize_watchdog_emission_text("\u{FB01}le \u{FF11}"), "file 1");
+        assert_eq!(
+            normalize_watchdog_emission_text("\u{FB01}le \u{FF11}"),
+            "file 1"
+        );
     }
 
     #[test]
@@ -381,7 +395,11 @@ mod tests {
             }
         );
         // ... and it consumed neither the update slot nor the count: a real warning still lands.
-        assert!(guard.evaluate(&warn(WatchdogSeverity::Concern, "real finding")).accepted());
+        assert!(
+            guard
+                .evaluate(&warn(WatchdogSeverity::Concern, "real finding"))
+                .accepted()
+        );
     }
 
     #[test]
@@ -390,13 +408,22 @@ mod tests {
             max_warnings: Some(1),
             dedupe_history_limit: None,
         });
-        assert!(guard.evaluate(&warn(WatchdogSeverity::Concern, "first")).accepted());
+        assert!(
+            guard
+                .evaluate(&warn(WatchdogSeverity::Concern, "first"))
+                .accepted()
+        );
         // A SECOND, DISTINCT warning inside the same update: upstream reports `update-budget`,
         // not `max-warnings`, because step 3 precedes step 5.
         match guard.evaluate(&warn(WatchdogSeverity::Concern, "second")) {
-            WatchdogEmissionDecision::Rejected { reason, identity, .. } => {
+            WatchdogEmissionDecision::Rejected {
+                reason, identity, ..
+            } => {
                 assert_eq!(reason, WatchdogEmissionSuppressionReason::UpdateBudget);
-                assert!(identity.is_some(), "non-content-free rejections carry identities");
+                assert!(
+                    identity.is_some(),
+                    "non-content-free rejections carry identities"
+                );
             }
             other => panic!("expected update-budget rejection, got {other:?}"),
         }
@@ -413,7 +440,11 @@ mod tests {
     #[test]
     fn escalation_within_one_update_is_the_sole_budget_exception() {
         let mut guard = WatchdogEmissionGuard::default();
-        assert!(guard.evaluate(&warn(WatchdogSeverity::Concern, "same finding")).accepted());
+        assert!(
+            guard
+                .evaluate(&warn(WatchdogSeverity::Concern, "same finding"))
+                .accepted()
+        );
         let decision = guard.evaluate(&warn(WatchdogSeverity::Blocker, "same finding"));
         assert_eq!(
             decision,
@@ -446,8 +477,16 @@ mod tests {
             max_warnings: Some(1),
             dedupe_history_limit: None,
         });
-        assert!(guard.evaluate(&warn(WatchdogSeverity::Concern, "one")).accepted());
-        assert!(guard.evaluate(&warn(WatchdogSeverity::Blocker, "one")).accepted());
+        assert!(
+            guard
+                .evaluate(&warn(WatchdogSeverity::Concern, "one"))
+                .accepted()
+        );
+        assert!(
+            guard
+                .evaluate(&warn(WatchdogSeverity::Blocker, "one"))
+                .accepted()
+        );
         guard.start_model_update();
         // The ceiling is still 1/1 — the escalation re-wrote the entry rather than adding one.
         match guard.evaluate(&warn(WatchdogSeverity::Concern, "two")) {
@@ -466,7 +505,12 @@ mod tests {
         });
         for name in ["a", "b", "c"] {
             guard.start_model_update();
-            assert!(guard.evaluate(&warn(WatchdogSeverity::Concern, name)).accepted(), "{name}");
+            assert!(
+                guard
+                    .evaluate(&warn(WatchdogSeverity::Concern, name))
+                    .accepted(),
+                "{name}"
+            );
         }
         // "a" was evicted from the dedup map (limit 2), so it is no longer a `duplicate` — but the
         // ceiling has been consumed three times, so it now rejects as `max-warnings`.
@@ -494,9 +538,17 @@ mod tests {
             max_warnings: Some(1),
             dedupe_history_limit: None,
         });
-        assert!(guard.evaluate(&warn(WatchdogSeverity::Concern, "one")).accepted());
+        assert!(
+            guard
+                .evaluate(&warn(WatchdogSeverity::Concern, "one"))
+                .accepted()
+        );
         guard.reset();
-        assert!(guard.evaluate(&warn(WatchdogSeverity::Concern, "one")).accepted());
+        assert!(
+            guard
+                .evaluate(&warn(WatchdogSeverity::Concern, "one"))
+                .accepted()
+        );
     }
 
     #[test]

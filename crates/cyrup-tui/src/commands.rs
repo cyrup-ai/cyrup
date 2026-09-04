@@ -147,23 +147,52 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
         "<provider/model>",
         ArgumentCompleter::Models,
     ),
-    cmd("scoped-models", "Enable/disable models for Ctrl+P cycling", None),
-    cmd("export", "Export session (HTML default, or specify path: .html/.jsonl)", None),
-    cmd("import", "Import and resume a session from a JSONL file", None),
+    cmd(
+        "scoped-models",
+        "Enable/disable models for Ctrl+P cycling",
+        None,
+    ),
+    cmd(
+        "export",
+        "Export session (HTML default, or specify path: .html/.jsonl)",
+        None,
+    ),
+    cmd(
+        "import",
+        "Import and resume a session from a JSONL file",
+        None,
+    ),
     cmd("share", "Share session as a secret GitHub gist", None),
     cmd("copy", "Copy last agent message to clipboard", None),
     cmd("name", "Set session display name", None),
     cmd("session", "Show session info and stats", None),
     cmd("changelog", "Show changelog entries", None),
     cmd("hotkeys", "Show all keyboard shortcuts", None),
-    cmd("fork", "Create a new fork from a previous user message", None),
-    cmd("clone", "Duplicate the current session at the current position", None),
+    cmd(
+        "fork",
+        "Create a new fork from a previous user message",
+        None,
+    ),
+    cmd(
+        "clone",
+        "Duplicate the current session at the current position",
+        None,
+    ),
     cmd("tree", "Navigate session tree (switch branches)", None),
     // GAP 5 — pi registers this immediately after `tree` (`slash-commands.ts:23`), with exactly
     // this description and hint. The list order is user-visible autocomplete order, so the slot
     // matters as much as the entry.
-    arg_cmd("thinking", "Set thinking level", "<level>", ArgumentCompleter::ThinkingLevels),
-    cmd("trust", "Save project trust decision for future sessions", None),
+    arg_cmd(
+        "thinking",
+        "Set thinking level",
+        "<level>",
+        ArgumentCompleter::ThinkingLevels,
+    ),
+    cmd(
+        "trust",
+        "Save project trust decision for future sessions",
+        None,
+    ),
     // TUI-025 — pi carries `argumentHint: "<provider>"` here (`slash-commands.ts:35` @v0.83.0); cyrup had no
     // hint at all, which is also what left `/login` without an argument completer.
     arg_cmd(
@@ -207,8 +236,9 @@ pub const HIDDEN_COMMANDS: &[&str] = &["debug", "arminsayshi", "dementedelves"];
 /// other nineteen, `/settings` (`:2666`) through `/quit` (`:2789`), are strict equality. So
 /// upstream `/quit now` is **not** the quit command: it falls past the whole chain and is sent to
 /// the model as a prompt. Matching that requires this list; a uniform matcher cannot express it.
-const ARGUMENT_DISPATCH_NAMES: &[&str] =
-    &["model", "thinking", "export", "import", "name", "login", "compact"];
+const ARGUMENT_DISPATCH_NAMES: &[&str] = &[
+    "model", "thinking", "export", "import", "name", "login", "compact",
+];
 
 const fn cmd(
     name: &'static str,
@@ -283,7 +313,10 @@ impl CommandRegistry {
             })
             .collect();
         dispatch_names.extend_from_slice(HIDDEN_COMMANDS);
-        CommandRegistry { commands: BUILTIN_SLASH_COMMANDS.to_vec(), dispatch_names }
+        CommandRegistry {
+            commands: BUILTIN_SLASH_COMMANDS.to_vec(),
+            dispatch_names,
+        }
     }
 
     /// The registry this crate's doc has always described: the builtin table PLUS the dynamic
@@ -304,10 +337,15 @@ impl CommandRegistry {
         let mut registry = Self::new();
         // Builtins win a name collision: pi resolves duplicate registrations by suffixing the
         // LATER one (`runner.ts:598-641` `invocationName`), never by shadowing an existing name.
-        let existing: std::collections::HashSet<String> =
-            registry.commands.iter().map(|c| c.name.to_string()).collect();
-        let mut merged: Vec<SlashCommand> =
-            dynamic.into_iter().filter(|c| !existing.contains(c.name.as_ref())).collect();
+        let existing: std::collections::HashSet<String> = registry
+            .commands
+            .iter()
+            .map(|c| c.name.to_string())
+            .collect();
+        let mut merged: Vec<SlashCommand> = dynamic
+            .into_iter()
+            .filter(|c| !existing.contains(c.name.as_ref()))
+            .collect();
         // TUI-075 — pi's display order is builtins → PROMPT TEMPLATES → extension commands → skills
         // (`interactive-mode.ts:625` @v0.83.0, `[...slashCommands, ...templateCommands,
         // ...extensionCommands, ...skillCommandList]`). The catalog this list comes from emits
@@ -360,7 +398,10 @@ impl CommandRegistry {
         }
         if let Some(slash) = trimmed.strip_prefix('/') {
             if let Some((name, arg)) = self.match_command(slash) {
-                return Dispatch::Command { name: name.to_string(), arg };
+                return Dispatch::Command {
+                    name: name.to_string(),
+                    arg,
+                };
             }
             // Unknown `/foo` (or `/modelX`) is NOT an error — it is a literal prompt (§2.3 rule).
             return Dispatch::Prompt(trimmed.to_string());
@@ -372,7 +413,10 @@ impl CommandRegistry {
             };
             let command = body.trim();
             if !command.is_empty() {
-                return Dispatch::Bash { command: command.to_string(), excluded };
+                return Dispatch::Bash {
+                    command: command.to_string(),
+                    excluded,
+                };
             }
             // `!` with an empty body is normal text (§2.4 / edge-case 4).
         }
@@ -395,10 +439,11 @@ impl CommandRegistry {
             }
             // `"name "`-prefixed: an argument follows. `strip_prefix(name)` then a leading space.
             if let Some(rest) = slash.strip_prefix(name)
-                && let Some(arg) = rest.strip_prefix(' ') {
-                    let arg = arg.trim();
-                    return Some((name, (!arg.is_empty()).then(|| arg.to_string())));
-                }
+                && let Some(arg) = rest.strip_prefix(' ')
+            {
+                let arg = arg.trim();
+                return Some((name, (!arg.is_empty()).then(|| arg.to_string())));
+            }
         }
         None
     }
@@ -429,7 +474,11 @@ pub(crate) fn autocomplete_source_tag(source_info: Option<&serde_json::Value>) -
         Some("project") => "p",
         _ => "t",
     };
-    let source = info.get("source").and_then(serde_json::Value::as_str).unwrap_or("").trim();
+    let source = info
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
     if source.starts_with("npm:") {
         return Some(format!("{scope_prefix}:{source}"));
     }
@@ -478,7 +527,9 @@ pub(crate) fn path_command_argument(arg: &str) -> Option<String> {
 /// there is no tag at all (`if (!sourceTag) return description`, `:524-526`; TUI-085).
 #[must_use]
 fn prefix_autocomplete_description(description: &str, tag: Option<&str>) -> String {
-    let Some(tag) = tag else { return description.to_string() };
+    let Some(tag) = tag else {
+        return description.to_string();
+    };
     if description.is_empty() {
         format!("[{tag}]")
     } else {
@@ -533,7 +584,10 @@ pub fn dynamic_commands_from_catalog_gated(
             if name.is_empty() {
                 return None;
             }
-            let source = row.get("source").and_then(serde_json::Value::as_str).unwrap_or("");
+            let source = row
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             let kind = match source {
                 "extension" => CommandSource::Extension,
                 "prompt" => CommandSource::Prompt,

@@ -200,7 +200,9 @@ pub(super) fn convert_messages(
                             if supports_thinking_signature(model) {
                                 // pi `:830-843`: a replayed reasoning block without a signature is
                                 // rejected by Bedrock, so it degrades to plain text.
-                                match thinking_signature.as_deref().filter(|s| !s.trim().is_empty())
+                                match thinking_signature
+                                    .as_deref()
+                                    .filter(|s| !s.trim().is_empty())
                                 {
                                     Some(sig) => blocks.push(json!({
                                         "reasoningContent": {

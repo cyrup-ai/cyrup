@@ -6,15 +6,14 @@
 use cyrup_core::{Content, EntryId, Message, ModelRef};
 
 use crate::agent_message::{
-    custom_to_message, AgentMessage, BranchSummaryMessage, CompactionSummaryMessage,
-    CustomRoleMessage, MessageRole,
+    AgentMessage, BranchSummaryMessage, CompactionSummaryMessage, CustomRoleMessage, MessageRole,
+    custom_to_message,
 };
 use crate::entry::{Entry, KnownEntry};
 
 /// Compaction-summary wrapper (Pi `COMPACTION_SUMMARY_PREFIX`/`SUFFIX`, `messages.ts:11-17`). The
 /// model conditions on this exact text, so it is byte-1:1 with Pi.
-pub const COMPACTION_SUMMARY_PREFIX: &str =
-    "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+pub const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 
 /// Branch-summary wrapper (Pi `BRANCH_SUMMARY_PREFIX`/`SUFFIX`, `messages.ts:19-24`).
@@ -35,7 +34,11 @@ pub struct SessionContext {
 
 impl SessionContext {
     pub fn empty() -> Self {
-        Self { messages: Vec::new(), thinking_level: "off".to_string(), model: None }
+        Self {
+            messages: Vec::new(),
+            thinking_level: "off".to_string(),
+            model: None,
+        }
     }
 }
 
@@ -65,9 +68,17 @@ pub fn push_as_message(out: &mut Vec<Message>, e: &Entry) {
                 out.push(custom_to_message(content, parse_entry_ts(&base.timestamp)));
             }
             KnownEntry::BranchSummary { summary, base, .. } if !summary.is_empty() => {
-                out.push(branch_summary_message(summary, parse_entry_ts(&base.timestamp)));
+                out.push(branch_summary_message(
+                    summary,
+                    parse_entry_ts(&base.timestamp),
+                ));
             }
-            KnownEntry::Compaction { summary, tokens_before, base, .. } => {
+            KnownEntry::Compaction {
+                summary,
+                tokens_before,
+                base,
+                ..
+            } => {
                 out.push(compaction_summary_message(
                     summary,
                     *tokens_before,
@@ -126,7 +137,10 @@ pub fn is_deferred_assistant(message: &AgentMessage) -> bool {
 /// (`messages.ts:111-120`), which sets `timestamp: new Date(entry.timestamp).getTime()`.
 pub fn compaction_summary_message(summary: &str, _tokens_before: u64, timestamp: i64) -> Message {
     let text = format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}");
-    Message::User { content: vec![Content::text(text)], timestamp }
+    Message::User {
+        content: vec![Content::text(text)],
+        timestamp,
+    }
 }
 
 /// A `BranchSummary` rendered as the wrapped user-form note (Pi `messages.ts:170-175`).
@@ -134,13 +148,17 @@ pub fn compaction_summary_message(summary: &str, _tokens_before: u64, timestamp:
 /// `createBranchSummaryMessage` (`messages.ts:100-107`).
 pub fn branch_summary_message(summary: &str, timestamp: i64) -> Message {
     let text = format!("{BRANCH_SUMMARY_PREFIX}{summary}{BRANCH_SUMMARY_SUFFIX}");
-    Message::User { content: vec![Content::text(text)], timestamp }
+    Message::User {
+        content: vec![Content::text(text)],
+        timestamp,
+    }
 }
 
 /// The compaction entry that governs a path, if any (the latest one — Pi takes the last on the
 /// path, `session-manager.ts:377-379`).
 fn latest_compaction(path: &[&Entry]) -> Option<usize> {
-    path.iter().rposition(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })))
+    path.iter()
+        .rposition(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })))
 }
 
 /// Build the active-path LLM messages exactly as Pi `buildSessionContext` does (the message-list
@@ -151,13 +169,16 @@ fn latest_compaction(path: &[&Entry]) -> Option<usize> {
 pub fn build_context_messages(path: &[&Entry]) -> Vec<Message> {
     let mut messages = Vec::new();
     match latest_compaction(path).and_then(|i| path.get(i).copied().map(|e| (i, e))) {
-        Some((cpos, Entry::Known(KnownEntry::Compaction {
-            summary,
-            first_kept_entry_id,
-            tokens_before,
-            base,
-            ..
-        }))) => {
+        Some((
+            cpos,
+            Entry::Known(KnownEntry::Compaction {
+                summary,
+                first_kept_entry_id,
+                tokens_before,
+                base,
+                ..
+            }),
+        )) => {
             messages.push(compaction_summary_message(
                 summary,
                 *tokens_before,
@@ -217,7 +238,13 @@ fn push_as_raw(out: &mut Vec<AgentMessage>, e: &Entry) {
         match k {
             KnownEntry::Message { message, .. } if is_deferred_assistant(message) => {}
             KnownEntry::Message { message, .. } => out.push(message.clone()),
-            KnownEntry::CustomMessage { content, custom_type, display, details, base } => {
+            KnownEntry::CustomMessage {
+                content,
+                custom_type,
+                display,
+                details,
+                base,
+            } => {
                 out.push(AgentMessage::Custom(CustomRoleMessage {
                     custom_type: custom_type.clone(),
                     content: content.clone(),
@@ -226,14 +253,24 @@ fn push_as_raw(out: &mut Vec<AgentMessage>, e: &Entry) {
                     timestamp: parse_entry_ts(&base.timestamp),
                 }));
             }
-            KnownEntry::BranchSummary { summary, from_id, base, .. } if !summary.is_empty() => {
+            KnownEntry::BranchSummary {
+                summary,
+                from_id,
+                base,
+                ..
+            } if !summary.is_empty() => {
                 out.push(AgentMessage::BranchSummary(BranchSummaryMessage {
                     summary: summary.clone(),
                     from_id: from_id.clone(),
                     timestamp: parse_entry_ts(&base.timestamp),
                 }));
             }
-            KnownEntry::Compaction { summary, tokens_before, base, .. } => {
+            KnownEntry::Compaction {
+                summary,
+                tokens_before,
+                base,
+                ..
+            } => {
                 out.push(AgentMessage::CompactionSummary(CompactionSummaryMessage {
                     summary: summary.clone(),
                     tokens_before: *tokens_before,
@@ -290,7 +327,10 @@ pub fn context_message_role(e: &Entry) -> Option<MessageRole> {
 /// `estimateContextTokens(buildSessionContext(pathEntries).messages)` (`compaction.ts:678`) rather
 /// than estimating over the LLM-rendered text.
 pub fn build_context_agent_messages(path: &[&Entry]) -> Vec<AgentMessage> {
-    build_context_agent_messages_tagged(path).into_iter().map(|(_, m)| m).collect()
+    build_context_agent_messages_tagged(path)
+        .into_iter()
+        .map(|(_, m)| m)
+        .collect()
 }
 
 /// [`build_context_agent_messages`], with each projected message paired with the [`EntryId`] of the
@@ -310,13 +350,16 @@ pub fn build_context_agent_messages(path: &[&Entry]) -> Vec<AgentMessage> {
 pub fn build_context_agent_messages_tagged(path: &[&Entry]) -> Vec<(EntryId, AgentMessage)> {
     let mut messages = Vec::new();
     match latest_compaction(path).and_then(|i| path.get(i).copied().map(|e| (i, e))) {
-        Some((cpos, centry @ Entry::Known(KnownEntry::Compaction {
-            summary,
-            first_kept_entry_id,
-            tokens_before,
-            base,
-            ..
-        }))) => {
+        Some((
+            cpos,
+            centry @ Entry::Known(KnownEntry::Compaction {
+                summary,
+                first_kept_entry_id,
+                tokens_before,
+                base,
+                ..
+            }),
+        )) => {
             messages.push((
                 centry.id(),
                 AgentMessage::CompactionSummary(CompactionSummaryMessage {

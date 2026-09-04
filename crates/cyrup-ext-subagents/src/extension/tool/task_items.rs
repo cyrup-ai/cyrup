@@ -8,10 +8,10 @@ use cyrup_core::{ModelId, ToolError};
 
 use crate::background::RunId;
 use crate::discovery::types::ChainStepConfig;
-use crate::registration::SubagentExtensionConfig;
-use crate::spawn::chain_graph::{GroupStepResult, ParallelGroupSpec, RunnerStep, SingleStepSpec};
 use crate::extension::executor::paths::{expand_tilde, resolve_against_process_cwd};
 use crate::extension::tool::params::SubagentToolParams;
+use crate::registration::SubagentExtensionConfig;
+use crate::spawn::chain_graph::{GroupStepResult, ParallelGroupSpec, RunnerStep, SingleStepSpec};
 
 // SUBA-041 / SUBA-N04 — the SINGLE-mode `acceptance` param's lowering (pi `AcceptanceOverride`,
 // `schemas.ts:80-93`, applied at `subagent-executor.ts:1418`).
@@ -94,20 +94,48 @@ impl ToolTaskItem {
     /// Returns the per-item keys actually supplied, for diagnostics.
     pub(crate) fn provided_keys(&self) -> Vec<&'static str> {
         let mut keys = vec!["agent"];
-        if self.task.is_some() { keys.push("task"); }
-        if self.cwd.is_some() { keys.push("cwd"); }
-        if self.count.is_some() { keys.push("count"); }
-        if self.output.is_some() { keys.push("output"); }
-        if self.output_mode.is_some() { keys.push("outputMode"); }
-        if self.reads.is_some() { keys.push("reads"); }
-        if self.progress.is_some() { keys.push("progress"); }
-        if self.model.is_some() { keys.push("model"); }
-        if self.skill.is_some() { keys.push("skill"); }
-        if self.acceptance.is_some() { keys.push("acceptance"); }
-        if self.as_output.is_some() { keys.push("as"); }
-        if self.output_schema.is_some() { keys.push("outputSchema"); }
-        if self.phase.is_some() { keys.push("phase"); }
-        if self.label.is_some() { keys.push("label"); }
+        if self.task.is_some() {
+            keys.push("task");
+        }
+        if self.cwd.is_some() {
+            keys.push("cwd");
+        }
+        if self.count.is_some() {
+            keys.push("count");
+        }
+        if self.output.is_some() {
+            keys.push("output");
+        }
+        if self.output_mode.is_some() {
+            keys.push("outputMode");
+        }
+        if self.reads.is_some() {
+            keys.push("reads");
+        }
+        if self.progress.is_some() {
+            keys.push("progress");
+        }
+        if self.model.is_some() {
+            keys.push("model");
+        }
+        if self.skill.is_some() {
+            keys.push("skill");
+        }
+        if self.acceptance.is_some() {
+            keys.push("acceptance");
+        }
+        if self.as_output.is_some() {
+            keys.push("as");
+        }
+        if self.output_schema.is_some() {
+            keys.push("outputSchema");
+        }
+        if self.phase.is_some() {
+            keys.push("phase");
+        }
+        if self.label.is_some() {
+            keys.push("label");
+        }
         keys
     }
 }
@@ -140,7 +168,9 @@ pub(crate) fn parse_tool_task_items(
 /// pi `expandTopLevelTaskCounts` (`subagent-executor.ts:1986-2000`): repeat each task `count` times
 /// (default 1), erroring on `count < 1` with pi's exact message. `count` is stripped from each
 /// expanded clone (it is a width hint, never carried onto the concrete task).
-pub(crate) fn expand_top_level_task_counts(items: Vec<ToolTaskItem>) -> Result<Vec<ToolTaskItem>, String> {
+pub(crate) fn expand_top_level_task_counts(
+    items: Vec<ToolTaskItem>,
+) -> Result<Vec<ToolTaskItem>, String> {
     let mut out = Vec::with_capacity(items.len());
     for (i, item) in items.into_iter().enumerate() {
         let count = item.count.unwrap_or(1);
@@ -336,7 +366,9 @@ pub(crate) fn resolve_single_run_session_root(
         })
 }
 
-pub(crate) fn parse_tool_output_mode(raw: Option<&str>) -> Option<crate::discovery::types::OutputMode> {
+pub(crate) fn parse_tool_output_mode(
+    raw: Option<&str>,
+) -> Option<crate::discovery::types::OutputMode> {
     match raw {
         Some("inline") => Some(crate::discovery::types::OutputMode::Inline),
         Some("file-only") => Some(crate::discovery::types::OutputMode::FileOnly),
@@ -544,9 +576,8 @@ pub(crate) fn parse_tool_chain_items(
                 )));
             }
             None => {
-                let item: ToolTaskItem = serde_json::from_value(value.clone()).map_err(|e| {
-                    ToolError::new(format!("invalid chain step at index {i}: {e}"))
-                })?;
+                let item: ToolTaskItem = serde_json::from_value(value.clone())
+                    .map_err(|e| ToolError::new(format!("invalid chain step at index {i}: {e}")))?;
                 let _ = item.provided_keys();
                 graph.push(RunnerStep::SingleStep(tool_task_to_spec(&item)));
             }
@@ -780,16 +811,20 @@ fn chain_step_requested_spawns(step: &serde_json::Value, cfg: &SubagentExtension
 ///   so billing it would charge a spawn that provably cannot happen.
 ///
 /// Saturating throughout, exactly like [`count_requested_subagent_spawns`].
-pub(crate) fn count_graph_requested_spawns(graph: &[RunnerStep], cfg: &SubagentExtensionConfig) -> u32 {
+pub(crate) fn count_graph_requested_spawns(
+    graph: &[RunnerStep],
+    cfg: &SubagentExtensionConfig,
+) -> u32 {
     graph.iter().fold(0u32, |total, step| {
         let step_charge = match step {
             RunnerStep::SingleStep(_) => 1,
             RunnerStep::ParallelGroup(group) => {
                 u32::try_from(group.steps.len()).unwrap_or(u32::MAX)
             }
-            RunnerStep::DynamicGroup(group) => {
-                group.max_items.or_else(|| cfg.dynamic_fanout_max_items()).unwrap_or(0)
-            }
+            RunnerStep::DynamicGroup(group) => group
+                .max_items
+                .or_else(|| cfg.dynamic_fanout_max_items())
+                .unwrap_or(0),
             RunnerStep::ImportAsyncRoot(_) => 0,
         };
         total.saturating_add(step_charge)
@@ -798,7 +833,12 @@ pub(crate) fn count_graph_requested_spawns(graph: &[RunnerStep], cfg: &SubagentE
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::exec::acceptance::lower_acceptance_input as parse_single_acceptance;
@@ -903,7 +943,10 @@ mod tests {
             Some("report.md".to_string())
         );
         // An empty string is "no output".
-        assert_eq!(normalize_single_output_override(Some(&serde_json::json!("")), None), None);
+        assert_eq!(
+            normalize_single_output_override(Some(&serde_json::json!("")), None),
+            None
+        );
     }
 
     /// pi `resolveSingleOutputPath` (`single-output.ts:64-77`) as `runSinglePath` calls it: a
@@ -931,7 +974,10 @@ mod tests {
     fn normalize_skill_input_ports_pis_union() {
         assert_eq!(normalize_skill_input(None), None);
         assert_eq!(normalize_skill_input(Some(&serde_json::json!(true))), None);
-        assert_eq!(normalize_skill_input(Some(&serde_json::json!(false))), Some(Vec::new()));
+        assert_eq!(
+            normalize_skill_input(Some(&serde_json::json!(false))),
+            Some(Vec::new())
+        );
         assert_eq!(
             normalize_skill_input(Some(&serde_json::json!(["a", " b ", "", "a"]))),
             Some(vec!["a".to_string(), "b".to_string()])
@@ -955,13 +1001,19 @@ mod tests {
         use crate::exec::acceptance::AcceptanceStatus;
 
         // "auto" is pi's "omitted means auto-inferred" — defer to the heuristic default.
-        assert_eq!(parse_single_acceptance(&serde_json::json!("auto")), Ok(None));
+        assert_eq!(
+            parse_single_acceptance(&serde_json::json!("auto")),
+            Ok(None)
+        );
 
         let checked = parse_single_acceptance(&serde_json::json!("checked"))
             .expect("valid level")
             .expect("an explicit level yields a contract");
         assert_eq!(checked.required_level, AcceptanceStatus::Checked);
-        assert!(checked.explicit, "an explicit param arms R-SA-033's exit-code correction");
+        assert!(
+            checked.explicit,
+            "an explicit param arms R-SA-033's exit-code correction"
+        );
 
         // `false` is pi's `level: "none"` shorthand: explicit, but nothing to gate.
         let disabled = parse_single_acceptance(&serde_json::json!(false))
@@ -986,9 +1038,11 @@ mod tests {
             parse_single_acceptance(&serde_json::json!("nope")),
             Err("acceptance has invalid level 'nope'.".to_string())
         );
-        assert!(parse_single_acceptance(&serde_json::json!({ "bogus": 1 }))
-            .expect_err("an unsupported key is rejected")
-            .contains("acceptance.bogus is not supported."));
+        assert!(
+            parse_single_acceptance(&serde_json::json!({ "bogus": 1 }))
+                .expect_err("an unsupported key is rejected")
+                .contains("acceptance.bogus is not supported.")
+        );
     }
 
     /// SUBA-N04: a `tasks[]`/`chain[]` item's `acceptance` reaches its [`SingleStepSpec`] WHOLE.
@@ -1046,7 +1100,9 @@ mod tests {
     fn a_tasks_item_carries_its_skill_override_onto_its_step_spec() {
         let spec_for = |skill: serde_json::Value| {
             let mut obj = serde_json::json!({ "agent": "builder", "task": "fix it" });
-            obj.as_object_mut().expect("object").insert("skill".to_string(), skill);
+            obj.as_object_mut()
+                .expect("object")
+                .insert("skill".to_string(), skill);
             let item: ToolTaskItem =
                 serde_json::from_value(obj).expect("a well-formed tasks[] item");
             tool_task_to_spec(&item).skills
@@ -1094,7 +1150,12 @@ mod tests {
 
         let explicit = PathBuf::from("/somewhere/the/caller/picked");
         assert_eq!(
-            resolve_chain_dir(Some(explicit.clone()), cwd, &run, ArtifactDirPreference::Project),
+            resolve_chain_dir(
+                Some(explicit.clone()),
+                cwd,
+                &run,
+                ArtifactDirPreference::Project
+            ),
             explicit,
             "an explicit chainDir must be used EXACTLY as given — pi does not rewrite it either"
         );
@@ -1103,7 +1164,12 @@ mod tests {
         // this dir (`chain-execution.ts:283`); it never normalizes the dir itself.
         let relative = PathBuf::from("artifacts/chain");
         assert_eq!(
-            resolve_chain_dir(Some(relative.clone()), cwd, &run, ArtifactDirPreference::Temp),
+            resolve_chain_dir(
+                Some(relative.clone()),
+                cwd,
+                &run,
+                ArtifactDirPreference::Temp
+            ),
             relative
         );
 
@@ -1130,5 +1196,4 @@ mod tests {
             );
         }
     }
-
 }

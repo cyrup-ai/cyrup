@@ -2,19 +2,29 @@
 //! Native built-ins (no wasm) answer `project_trust`/`resources_discover` via `handled(json)`; the
 //! facade folds them into typed decisions. Also covers the first-wins tool getter and the rich
 //! `HostCtx` fields.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use cyrup_core::{
-    TerminateHint,CancelToken, ExtensionId, Tool, ToolCallId, ToolError, ToolResult};
 use crate::{
     EventKind, ExtMode, ExtensionHost, HandledValue, HookOutcome, HostConfig, HostCtx, HostCtxRich,
     InitApi, NativeExtension, ProjectTrustDecision,
 };
-use serde_json::{json, Value};
+use cyrup_core::{
+    CancelToken, ExtensionId, TerminateHint, Tool, ToolCallId, ToolError, ToolResult,
+};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: std::path::PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: std::path::PathBuf::from("."),
+    }
 }
 
 /// A native extension that answers `project_trust` and/or `resources_discover` with a fixed payload.
@@ -87,7 +97,11 @@ async fn project_trust_first_decision_wins() {
     let decision = host.aggregate_project_trust(&CancelToken::new()).await;
     assert_eq!(
         decision,
-        Some(ProjectTrustDecision { trusted: true, remember: true, by: "decider".into() }),
+        Some(ProjectTrustDecision {
+            trusted: true,
+            remember: true,
+            by: "decider".into()
+        }),
         "the first extension that DECIDES (yes/no) wins; undecided falls through"
     );
 }
@@ -110,7 +124,10 @@ async fn project_trust_no_decision_is_none() {
     }))
     .await
     .unwrap();
-    assert_eq!(host.aggregate_project_trust(&CancelToken::new()).await, None);
+    assert_eq!(
+        host.aggregate_project_trust(&CancelToken::new()).await,
+        None
+    );
 }
 
 #[tokio::test]
@@ -128,7 +145,9 @@ async fn resources_discover_concatenates_with_per_path_attribution() {
         id: "b".into(),
         trust: None,
         // Pi CONCATENATES (no dedup): the duplicated theme `/t/x` appears again, attributed to b.
-        resources: Some(json!({ "skillPaths": ["/s/b"], "promptPaths": ["/p/b"], "themePaths": ["/t/x"] })),
+        resources: Some(
+            json!({ "skillPaths": ["/s/b"], "promptPaths": ["/p/b"], "themePaths": ["/t/x"] }),
+        ),
     }))
     .await
     .unwrap();
@@ -137,20 +156,35 @@ async fn resources_discover_concatenates_with_per_path_attribution() {
     assert_eq!(
         agg.skill_paths,
         vec![
-            AttributedPath { path: "/s/a".into(), extension: ExtensionId::from("a") },
-            AttributedPath { path: "/s/b".into(), extension: ExtensionId::from("b") },
+            AttributedPath {
+                path: "/s/a".into(),
+                extension: ExtensionId::from("a")
+            },
+            AttributedPath {
+                path: "/s/b".into(),
+                extension: ExtensionId::from("b")
+            },
         ]
     );
     assert_eq!(
         agg.prompt_paths,
-        vec![AttributedPath { path: "/p/b".into(), extension: ExtensionId::from("b") }]
+        vec![AttributedPath {
+            path: "/p/b".into(),
+            extension: ExtensionId::from("b")
+        }]
     );
     // Both `/t/x` contributions are kept (Pi concatenates, no dedup), each attributed.
     assert_eq!(
         agg.theme_paths,
         vec![
-            AttributedPath { path: "/t/x".into(), extension: ExtensionId::from("a") },
-            AttributedPath { path: "/t/x".into(), extension: ExtensionId::from("b") },
+            AttributedPath {
+                path: "/t/x".into(),
+                extension: ExtensionId::from("a")
+            },
+            AttributedPath {
+                path: "/t/x".into(),
+                extension: ExtensionId::from("b")
+            },
         ],
         "Pi concatenates resource paths (no de-dup) with per-path attribution"
     );
@@ -178,7 +212,12 @@ impl Tool for NamedTool {
         _cancel: CancelToken,
         _on_update: cyrup_core::ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        Ok(ToolResult {
+            content: vec![],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -189,14 +228,38 @@ fn all_registered_tool_names_is_first_registration_wins() {
     let schema = json!({ "type": "object" });
     // ext A registers `alpha` then `beta`; ext B overrides `alpha` (last-wins for execution) and
     // adds `gamma`. The GETTER order must stay first-registration-wins: alpha, beta, gamma.
-    reg.register_tool("a".into(), Arc::new(NamedTool { name: "alpha".into(), schema: schema.clone() }))
-        .unwrap();
-    reg.register_tool("a".into(), Arc::new(NamedTool { name: "beta".into(), schema: schema.clone() }))
-        .unwrap();
-    reg.register_tool("b".into(), Arc::new(NamedTool { name: "alpha".into(), schema: schema.clone() }))
-        .unwrap();
-    reg.register_tool("b".into(), Arc::new(NamedTool { name: "gamma".into(), schema: schema.clone() }))
-        .unwrap();
+    reg.register_tool(
+        "a".into(),
+        Arc::new(NamedTool {
+            name: "alpha".into(),
+            schema: schema.clone(),
+        }),
+    )
+    .unwrap();
+    reg.register_tool(
+        "a".into(),
+        Arc::new(NamedTool {
+            name: "beta".into(),
+            schema: schema.clone(),
+        }),
+    )
+    .unwrap();
+    reg.register_tool(
+        "b".into(),
+        Arc::new(NamedTool {
+            name: "alpha".into(),
+            schema: schema.clone(),
+        }),
+    )
+    .unwrap();
+    reg.register_tool(
+        "b".into(),
+        Arc::new(NamedTool {
+            name: "gamma".into(),
+            schema: schema.clone(),
+        }),
+    )
+    .unwrap();
 
     let names = reg.all_registered_tool_names().unwrap();
     assert_eq!(
@@ -219,7 +282,13 @@ fn all_registered_tool_names_is_first_registration_wins() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["description", "name", "parameters", "promptGuidelines", "sourceInfo"],
+        [
+            "description",
+            "name",
+            "parameters",
+            "promptGuidelines",
+            "sourceInfo"
+        ],
         "ToolInfo must be pi's five keys exactly — no cyrup tier discriminator: {info:?}"
     );
 
@@ -233,7 +302,9 @@ fn all_registered_tool_names_is_first_registration_wins() {
         "promptGuidelines is one of the four `Pick`ed ToolDefinition fields: {:?}",
         info[0]
     );
-    let src = info[0].get("sourceInfo").expect("pi's ToolInfo carries sourceInfo");
+    let src = info[0]
+        .get("sourceInfo")
+        .expect("pi's ToolInfo carries sourceInfo");
     // pi's `SourceInfo` shape (`core/source-info.ts:6-12`).
     for key in ["path", "source", "scope", "origin"] {
         assert!(src.get(key).is_some(), "sourceInfo.{key} missing: {src:?}");
@@ -255,17 +326,32 @@ fn command_invocation_names_are_disambiguated_in_load_order() {
     reg.register_command("a".into(), "status", d()).unwrap();
 
     let resolved = reg.resolved_commands().unwrap();
-    let names: Vec<(&str, &str)> =
-        resolved.iter().map(|r| (r.invocation_name.as_str(), r.name.as_str())).collect();
+    let names: Vec<(&str, &str)> = resolved
+        .iter()
+        .map(|r| (r.invocation_name.as_str(), r.name.as_str()))
+        .collect();
     // Duplicated `deploy` gets `deploy:1`/`deploy:2` in load order; unique `status` stays bare.
     assert_eq!(
         names,
-        vec![("deploy:1", "deploy"), ("deploy:2", "deploy"), ("status", "status")]
+        vec![
+            ("deploy:1", "deploy"),
+            ("deploy:2", "deploy"),
+            ("status", "status")
+        ]
     );
     // Each invocation name routes back to its registering extension.
-    assert_eq!(reg.resolved_command_owner("deploy:1").unwrap(), Some(ExtensionId::from("a")));
-    assert_eq!(reg.resolved_command_owner("deploy:2").unwrap(), Some(ExtensionId::from("b")));
-    assert_eq!(reg.resolved_command_owner("status").unwrap(), Some(ExtensionId::from("a")));
+    assert_eq!(
+        reg.resolved_command_owner("deploy:1").unwrap(),
+        Some(ExtensionId::from("a"))
+    );
+    assert_eq!(
+        reg.resolved_command_owner("deploy:2").unwrap(),
+        Some(ExtensionId::from("b"))
+    );
+    assert_eq!(
+        reg.resolved_command_owner("status").unwrap(),
+        Some(ExtensionId::from("a"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -275,28 +361,39 @@ fn command_invocation_names_are_disambiguated_in_load_order() {
 fn registered_shortcut_resolves_owner_and_lists_keys() {
     use crate::ExtensionRegistry;
     let reg = ExtensionRegistry::new();
-    reg.register_shortcut(ExtensionId::from("a"), "ctrl+j", None).unwrap();
-    reg.register_shortcut(ExtensionId::from("b"), "alt+k", None).unwrap();
+    reg.register_shortcut(ExtensionId::from("a"), "ctrl+j", None)
+        .unwrap();
+    reg.register_shortcut(ExtensionId::from("b"), "alt+k", None)
+        .unwrap();
 
     let mut keys = reg.shortcut_keys().unwrap();
     keys.sort();
     assert_eq!(keys, vec!["alt+k".to_string(), "ctrl+j".to_string()]);
     // The key-id routes back to the registering extension (the seam `run_shortcut` uses).
-    assert_eq!(reg.shortcut_owner("ctrl+j").unwrap(), Some(ExtensionId::from("a")));
-    assert_eq!(reg.shortcut_owner("alt+k").unwrap(), Some(ExtensionId::from("b")));
+    assert_eq!(
+        reg.shortcut_owner("ctrl+j").unwrap(),
+        Some(ExtensionId::from("a"))
+    );
+    assert_eq!(
+        reg.shortcut_owner("alt+k").unwrap(),
+        Some(ExtensionId::from("b"))
+    );
     assert_eq!(reg.shortcut_owner("ctrl+z").unwrap(), None);
 }
 
 #[tokio::test]
 async fn host_run_shortcut_reports_unregistered_key() {
-    use cyrup_core::CancelToken;
     use crate::{ExtensionHost, HostConfig};
+    use cyrup_core::CancelToken;
     // A native-only host: `shortcut_keys` is empty and firing an unregistered key is a typed error,
     // not a panic (the live-guest dispatch path is exercised under the `wasm-host` E2E, ledger 09).
     let host = ExtensionHost::new(HostConfig::default());
     assert!(host.shortcut_keys().is_empty());
     let err = host.run_shortcut("ctrl+j", &CancelToken::new()).await;
-    assert!(err.is_err(), "an unregistered / owner-less shortcut is a typed error");
+    assert!(
+        err.is_err(),
+        "an unregistered / owner-less shortcut is a typed error"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +414,10 @@ fn host_ctx_rich_fields() {
     assert_eq!(ctx.model(), Some("claude-x"));
     assert!(ctx.is_idle());
     assert!(ctx.is_project_trusted());
-    assert_eq!(ctx.context_usage().and_then(|u| u.get("tokens")), Some(&json!(1234)));
+    assert_eq!(
+        ctx.context_usage().and_then(|u| u.get("tokens")),
+        Some(&json!(1234))
+    );
     assert_eq!(ctx.system_prompt(), Some("you are a helpful agent"));
     // A default-constructed ctx carries empty rich fields.
     let plain = HostCtx::event(ExtMode::Tui, true, std::path::PathBuf::from("."));

@@ -12,14 +12,14 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use cyrup_core::StopReason;
 use crate::{run_json, run_rpc};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
+use cyrup_core::StopReason;
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text, faux_tool_call};
 use cyrup_session_svc::{AgentSessionRuntime, InputSource, SessionFactory, UserInput};
 use serde_json::Value;
 
-use super::support::{base_config, create_runtime, fixture, kind, parse_lines, Fixture};
+use super::support::{Fixture, base_config, create_runtime, fixture, kind, parse_lines};
 
 /// The plain runtime: no provider resolver and no native extension, because nothing here drives a
 /// model command or an extension — just the two one-shot adapters over a scripted provider.

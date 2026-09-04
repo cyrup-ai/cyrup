@@ -46,8 +46,10 @@ pub(crate) fn stop_reason_notice(message: &cyrup_core::AssistantMessage) -> Opti
     if message.stop_reason == StopReason::Length {
         return Some(LENGTH_STOP_NOTICE.to_string());
     }
-    let has_tool_calls =
-        message.content.iter().any(|c| matches!(c, cyrup_core::Content::ToolCall(_)));
+    let has_tool_calls = message
+        .content
+        .iter()
+        .any(|c| matches!(c, cyrup_core::Content::ToolCall(_)));
     if has_tool_calls {
         return None;
     }
@@ -110,9 +112,10 @@ pub(crate) fn read_clipboard_image_to_temp() -> Option<std::path::PathBuf> {
     // `arboard::ImageData::bytes` is an RGBA8 raster; `from_raw` returns `None` if the buffer length
     // does not match `width * height * 4`, guarding a malformed clipboard payload without panicking.
     let raster = image::RgbaImage::from_raw(width, height, img.bytes.into_owned())?;
-    let path =
-        std::env::temp_dir().join(format!("cyrup-clipboard-{}.png", uuid::Uuid::now_v7()));
-    raster.save_with_format(&path, image::ImageFormat::Png).ok()?;
+    let path = std::env::temp_dir().join(format!("cyrup-clipboard-{}.png", uuid::Uuid::now_v7()));
+    raster
+        .save_with_format(&path, image::ImageFormat::Png)
+        .ok()?;
     Some(path)
 }
 
@@ -145,9 +148,12 @@ pub(crate) fn edit_preview(
         .and_then(serde_json::Value::as_str)?;
 
     let str_field = |v: &serde_json::Value, k: &str| {
-        v.get(k).and_then(serde_json::Value::as_str).map(str::to_string)
+        v.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
     };
-    let edits: Vec<(String, String)> = match obj.get("edits").and_then(serde_json::Value::as_array) {
+    let edits: Vec<(String, String)> = match obj.get("edits").and_then(serde_json::Value::as_array)
+    {
         // `args.edits.every(edit => typeof edit?.oldText === "string" && ...)` — one malformed
         // entry rejects the whole preview (edit.ts:180-186).
         Some(list) if !list.is_empty() => list
@@ -222,7 +228,9 @@ pub(crate) fn user_message_text_from_event(ev: &AgentSessionEvent) -> Option<Str
 /// the same projection. `AgentMessage::Assistant` is an internally-tagged newtype variant, so the
 /// serialized object is the assistant message's own fields plus `role` — which deserializes
 /// straight back into `AssistantMessage`.
-pub(crate) fn assistant_message_from_event(ev: &AgentSessionEvent) -> Option<cyrup_core::AssistantMessage> {
+pub(crate) fn assistant_message_from_event(
+    ev: &AgentSessionEvent,
+) -> Option<cyrup_core::AssistantMessage> {
     let value = serde_json::to_value(ev).ok()?;
     let message = value.get("message")?;
     if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
@@ -237,9 +245,15 @@ pub(crate) fn custom_message_from_event(ev: &AgentSessionEvent) -> Option<(Strin
     if message.get("role").and_then(serde_json::Value::as_str) != Some("custom") {
         return None;
     }
-    let kind =
-        message.get("kind").and_then(serde_json::Value::as_str).unwrap_or("custom").to_string();
-    let body = message.get("payload").map(custom_message_text).unwrap_or_default();
+    let kind = message
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("custom")
+        .to_string();
+    let body = message
+        .get("payload")
+        .map(custom_message_text)
+        .unwrap_or_default();
     Some((kind, body))
 }
 
@@ -282,8 +296,11 @@ pub(crate) fn truncate_summary(s: &str) -> String {
 /// the `/model <text>` exact-match/pre-filter path so both see the identical catalog.
 pub(crate) fn model_entries(session: &AgentSession) -> Vec<ModelEntry> {
     let current = session.model();
-    let scoped: std::collections::HashSet<String> =
-        session.scoped_models().into_iter().map(|sm| sm.model.id.to_string()).collect();
+    let scoped: std::collections::HashSet<String> = session
+        .scoped_models()
+        .into_iter()
+        .map(|sm| sm.model.id.to_string())
+        .collect();
     session
         .available_model_catalog()
         .iter()
@@ -300,6 +317,5 @@ pub(crate) fn model_entries(session: &AgentSession) -> Vec<ModelEntry> {
         })
         .collect()
 }
-
 
 pub(crate) const LENGTH_STOP_NOTICE: &str = "Response was truncated before completion.";

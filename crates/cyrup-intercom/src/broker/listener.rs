@@ -119,7 +119,10 @@ impl BrokerListener {
         let pending = tokio::net::windows::named_pipe::ServerOptions::new()
             .first_pipe_instance(true)
             .create(path)?;
-        Ok(Self::Pipe { path: path.to_path_buf(), pending })
+        Ok(Self::Pipe {
+            path: path.to_path_buf(),
+            pending,
+        })
     }
 
     /// Await the next client (`net.Server`'s internal accept loop feeding
@@ -210,7 +213,12 @@ pub fn unlink_stale_endpoint(target: &BrokerConnectTarget) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
     use super::*;
     use crate::transport::target::{BrokerTcpEndpoint, INTERCOM_TCP_HOST};
 
@@ -233,10 +241,14 @@ mod tests {
             std::thread::current().id()
         )));
 
-        let mut listener = BrokerListener::bind(&target).await.expect("binds the listen target");
+        let mut listener = BrokerListener::bind(&target)
+            .await
+            .expect("binds the listen target");
         let connect_target = target.clone();
         let client = tokio::spawn(async move {
-            let mut stream = BrokerStream::connect(&connect_target).await.expect("connects");
+            let mut stream = BrokerStream::connect(&connect_target)
+                .await
+                .expect("connects");
             stream.write_all(b"ping").await.expect("write");
             let mut buf = [0u8; 4];
             stream.read_exact(&mut buf).await.expect("read");
@@ -293,8 +305,15 @@ mod tests {
         .await
         .expect("the loopback TCP endpoint binds");
 
-        let addr = listener.local_addr().expect("local_addr").expect("the TCP arm has an address");
-        assert_ne!(addr.port(), 0, "the published port is the one the kernel chose, never the 0 bound");
+        let addr = listener
+            .local_addr()
+            .expect("local_addr")
+            .expect("the TCP arm has an address");
+        assert_ne!(
+            addr.port(),
+            0,
+            "the published port is the one the kernel chose, never the 0 bound"
+        );
 
         // A TCP peer carries no uid, so it is never `trustedLocal` (`broker.ts:365`), and it is the
         // one endpoint that demands the `stateId` credential (`:284`).
@@ -355,7 +374,11 @@ mod tests {
         std::fs::write(&path, b"stale").unwrap();
 
         unlink_stale_endpoint(&BrokerConnectTarget::Socket(path.clone()));
-        assert_eq!(path.exists(), cfg!(windows), "unlink is the non-Windows arm only");
+        assert_eq!(
+            path.exists(),
+            cfg!(windows),
+            "unlink is the non-Windows arm only"
+        );
 
         // A TCP listen target has no path; the call must never touch the filesystem for it.
         unlink_stale_endpoint(&BrokerConnectTarget::Tcp(BrokerTcpEndpoint {

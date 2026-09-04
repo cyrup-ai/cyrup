@@ -19,13 +19,18 @@
 // always true here. Re-spelled in cyrup-it it would name THIS crate's `wasm-host`, which
 // `--features it` does not enable, and every test below would SILENTLY not compile in.
 // See the `[[test]]` note in crates/cyrup-it/Cargo.toml.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::sync::Arc;
 
 use cyrup_core::{ExtensionId, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 
@@ -39,7 +44,10 @@ use crate::support::bins;
 
 fn faux_with_ok() -> Arc<FauxProvider> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     faux
 }
 
@@ -79,7 +87,14 @@ async fn wasm_guest_exec_runs_a_real_command_through_the_assembled_session() {
 
     // The guest's `init` registered `/execdemo`.
     assert!(
-        session.services().ext_host.registry().command_names().unwrap().iter().any(|n| n == "execdemo"),
+        session
+            .services()
+            .ext_host
+            .registry()
+            .command_names()
+            .unwrap()
+            .iter()
+            .any(|n| n == "execdemo"),
         "the guest-registered `/execdemo` command is in the host command registry"
     );
 
@@ -92,7 +107,10 @@ async fn wasm_guest_exec_runs_a_real_command_through_the_assembled_session() {
     // The GUEST saw the REAL captured stdout across the wasm boundary: `echo hi` printed "hi", which the
     // command handler surfaced via `ctx.ui().notify("exec stdout: hi")`.
     assert!(
-        ext.guest().notifications().iter().any(|n| n == "exec stdout: hi"),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n == "exec stdout: hi"),
         "the guest exec returned the real `echo hi` stdout: {:?}",
         ext.guest().notifications()
     );

@@ -77,7 +77,10 @@ fn rg_pattern_error(err: &grep_regex::Error) -> String {
 /// See `build_matcher` for why a raw NUL is refused ahead of the builder at all.
 fn rg_nul_literal_error() -> String {
     let seed = "pattern contains \"\\0\" but it is impossible to match".to_string();
-    format!("rg: {}", suggest_other_engine(suggest_text(suggest_multiline(seed))))
+    format!(
+        "rg: {}",
+        suggest_other_engine(suggest_text(suggest_multiline(seed)))
+    )
 }
 
 /// ripgrep `hiargs.rs:1437-1448`, verbatim.
@@ -272,7 +275,10 @@ impl GrepTool {
         // ALREADY cancelled (tokio-util 0.7.18 `sync/cancellation_token.rs:280-293`), so this
         // doubles as the entry guard.
         let paths: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
-        let Some(opened) = cancel.run_until_cancelled(self.fs.read_streams(&paths)).await else {
+        let Some(opened) = cancel
+            .run_until_cancelled(self.fs.read_streams(&paths))
+            .await
+        else {
             return Err(error::aborted());
         };
 
@@ -308,67 +314,66 @@ impl GrepTool {
         let invert = rg.invert_match;
         let max_count = rg.max_count;
         let encoding = encoding.cloned();
-        let searched: Result<Vec<FileMatches>, Aborted> =
-            tokio::task::spawn_blocking(move || {
-                let mut searcher: Searcher = SearcherBuilder::new()
-                    .line_number(true)
-                    .binary_detection(binary)
-                    .invert_match(invert)
-                    // `-m/--max-count` is ripgrep's PER-FILE cap, a different axis from pi's
-                    // GLOBAL `limit`: rg stops reading each haystack after N matches and moves on
-                    // to the next file, whereas `limit` ends the whole search. So it belongs on
-                    // the searcher and not folded into the sink's budget — both caps apply
-                    // independently, and reusing one searcher across the batch does not change
-                    // that: `max_matches` is re-applied per `search_reader` call.
-                    .max_matches(max_count)
-                    // `None` is grep-searcher's "sniff the BOM, else assume UTF-8" default, so an
-                    // absent `-E` leaves the existing behaviour exactly as it was.
-                    .encoding(encoding)
-                    .build();
-                let mut per_file: Vec<FileMatches> = Vec::with_capacity(opened.len());
-                for reader in opened {
-                    // The abort edge batching adds. Within a file `CancelReader` and `MatchSink`
-                    // still observe the token; without this check a cancelled search would keep
-                    // grinding through the REST of the batch before anything noticed.
-                    if cancel_task.is_cancelled() {
-                        return Err(Aborted);
-                    }
-                    // A file that could not be opened contributes nothing and does not stop the
-                    // batch: rg emits no match events for a file it cannot read. Its slot is kept
-                    // so `per_file` stays index-aligned with `files`.
-                    let Ok(reader) = reader else {
-                        per_file.push(Vec::new());
-                        continue;
-                    };
-                    let mut matches: FileMatches = Vec::new();
-                    let mut local = 0usize;
-                    let outcome = {
-                        let sink = MatchSink {
-                            matches: &mut matches,
-                            count: &mut local,
-                            limit,
-                            cancel: cancel_task.clone(),
-                        };
-                        searcher.search_reader(
-                            &matcher_owned,
-                            CancelReader::new(reader, cancel_task.clone()),
-                            sink,
-                        )
-                    };
-                    // A cancel marker is an abort for the whole batch; EVERY other `io::Error`
-                    // keeps the previous per-file semantics — whatever was collected before the
-                    // failure stands and the walk moves on.
-                    if let Err(e) = &outcome
-                        && Cancelled::is(e)
-                    {
-                        return Err(Aborted);
-                    }
-                    per_file.push(matches);
+        let searched: Result<Vec<FileMatches>, Aborted> = tokio::task::spawn_blocking(move || {
+            let mut searcher: Searcher = SearcherBuilder::new()
+                .line_number(true)
+                .binary_detection(binary)
+                .invert_match(invert)
+                // `-m/--max-count` is ripgrep's PER-FILE cap, a different axis from pi's
+                // GLOBAL `limit`: rg stops reading each haystack after N matches and moves on
+                // to the next file, whereas `limit` ends the whole search. So it belongs on
+                // the searcher and not folded into the sink's budget — both caps apply
+                // independently, and reusing one searcher across the batch does not change
+                // that: `max_matches` is re-applied per `search_reader` call.
+                .max_matches(max_count)
+                // `None` is grep-searcher's "sniff the BOM, else assume UTF-8" default, so an
+                // absent `-E` leaves the existing behaviour exactly as it was.
+                .encoding(encoding)
+                .build();
+            let mut per_file: Vec<FileMatches> = Vec::with_capacity(opened.len());
+            for reader in opened {
+                // The abort edge batching adds. Within a file `CancelReader` and `MatchSink`
+                // still observe the token; without this check a cancelled search would keep
+                // grinding through the REST of the batch before anything noticed.
+                if cancel_task.is_cancelled() {
+                    return Err(Aborted);
                 }
-                Ok(per_file)
-            })
-            .await
-            .map_err(|e| error::invalid(format!("grep: {e}")))?;
+                // A file that could not be opened contributes nothing and does not stop the
+                // batch: rg emits no match events for a file it cannot read. Its slot is kept
+                // so `per_file` stays index-aligned with `files`.
+                let Ok(reader) = reader else {
+                    per_file.push(Vec::new());
+                    continue;
+                };
+                let mut matches: FileMatches = Vec::new();
+                let mut local = 0usize;
+                let outcome = {
+                    let sink = MatchSink {
+                        matches: &mut matches,
+                        count: &mut local,
+                        limit,
+                        cancel: cancel_task.clone(),
+                    };
+                    searcher.search_reader(
+                        &matcher_owned,
+                        CancelReader::new(reader, cancel_task.clone()),
+                        sink,
+                    )
+                };
+                // A cancel marker is an abort for the whole batch; EVERY other `io::Error`
+                // keeps the previous per-file semantics — whatever was collected before the
+                // failure stands and the walk moves on.
+                if let Err(e) = &outcome
+                    && Cancelled::is(e)
+                {
+                    return Err(Aborted);
+                }
+                per_file.push(matches);
+            }
+            Ok(per_file)
+        })
+        .await
+        .map_err(|e| error::invalid(format!("grep: {e}")))?;
 
         let Ok(per_file) = searched else {
             return Err(error::aborted());
@@ -419,7 +424,10 @@ impl GrepTool {
             } else {
                 None
             };
-            out.push((path, render_blocks(&rel, &matches, src_lines.as_ref(), context)));
+            out.push((
+                path,
+                render_blocks(&rel, &matches, src_lines.as_ref(), context),
+            ));
         }
         Ok(out)
     }
@@ -821,7 +829,9 @@ impl Tool for GrepTool {
                 // Same relativisation as the file filter below: the glob is anchored at the
                 // OVERRIDE ROOT — ripgrep's own cwd — not at the search root, because pi spawns
                 // `rg` with no `cwd` option and passes `searchPath` positionally (grep.ts:224).
-                let rel = dir.strip_prefix(&cwd).map_or_else(|_| to_posix(dir), to_posix);
+                let rel = dir
+                    .strip_prefix(&cwd)
+                    .map_or_else(|_| to_posix(dir), to_posix);
                 glob.as_ref().is_some_and(|g| g.prunes_dir(&rel))
                     || cfg_override
                         .as_ref()
@@ -870,13 +880,7 @@ impl Tool for GrepTool {
                 )
                 .await?;
             for (_, blocks) in searched {
-                take_into(
-                    &mut out,
-                    &mut count,
-                    &mut any_line_truncated,
-                    limit,
-                    blocks,
-                );
+                take_into(&mut out, &mut count, &mut any_line_truncated, limit, blocks);
             }
         } else {
             // Pi runs plain `rg --hidden` with NO `--no-require-git` flag (grep.ts:215-219): search
@@ -957,7 +961,9 @@ impl Tool for GrepTool {
             // and search at the same width so neither starves the other.
             // ripgrep's own default and `WalkParallel`'s (ignore `walk.rs:1434-1440`): keep walk
             // and search at the same width so neither starves the other.
-            let concurrency = std::thread::available_parallelism().map_or(1, |n| n.get()).min(12);
+            let concurrency = std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(12);
             // Candidates waiting to be dispatched as one batch. Batching is what removes the
             // per-file `spawn_blocking` round-trips — see [`Self::search_batch`].
             let mut pending: Vec<(PathBuf, String)> = Vec::new();
@@ -1001,8 +1007,7 @@ impl Tool for GrepTool {
 
             loop {
                 // Dispatch when a batch is full, or when the walk has ended and a tail remains.
-                let batch_ready =
-                    pending.len() >= batch_size || (walk_done && !pending.is_empty());
+                let batch_ready = pending.len() >= batch_size || (walk_done && !pending.is_empty());
                 if batch_ready && found < limit && inflight.len() < concurrency {
                     let batch = std::mem::take(&mut pending);
                     dispatched += batch.len();
@@ -1219,13 +1224,7 @@ impl Tool for GrepTool {
                 Some(PathSort::Ascending) | None => collected.sort_by(|(a, _), (b, _)| a.cmp(b)),
             }
             for (_, blocks) in collected {
-                take_into(
-                    &mut out,
-                    &mut count,
-                    &mut any_line_truncated,
-                    limit,
-                    blocks,
-                );
+                take_into(&mut out, &mut count, &mut any_line_truncated, limit, blocks);
             }
 
             // pi: `if (!killedDueToLimit && code !== 0 && code !== 1) { reject(stderr.trim()); }`
@@ -1316,14 +1315,14 @@ impl Tool for GrepTool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use super::{build_matcher, CaseMode, GrepInput, GrepTool};
+    use super::{CaseMode, GrepInput, GrepTool, build_matcher};
     // `line_terminator()` lives on the `Matcher` trait, not on `RegexMatcher` itself.
-    use grep_matcher::Matcher;
     use crate::config::GrepOpts;
     use crate::ops::local::LocalFs;
-    use crate::tools::rgconfig::RgFlags;
     use crate::ops::{Access, DirEntry, FsOps, Meta, WalkItem, WalkOpts};
+    use crate::tools::rgconfig::RgFlags;
     use cyrup_core::{CancelToken, Content, EventStream, Tool, ToolCallId, ToolError, ToolUpdate};
+    use grep_matcher::Matcher;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2126,7 +2125,11 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     /// Run `grep` against `cwd` with `config` (if any) as the user's ripgrep config file.
-    async fn grep_with_config(cwd: &Path, config: Option<&Path>, args: serde_json::Value) -> String {
+    async fn grep_with_config(
+        cwd: &Path,
+        config: Option<&Path>,
+        args: serde_json::Value,
+    ) -> String {
         let opts = GrepOpts {
             rg_config_path: config.map(std::path::Path::to_path_buf),
             ..GrepOpts::default()
@@ -2167,14 +2170,23 @@ mod tests {
         let dir = tree_with_config("--smart-case\n");
         let rc = dir.path().join("rc");
 
-        let without = grep_with_config(dir.path(), None, serde_json::json!({"pattern": "needle"})).await;
-        assert!(without.contains("a.txt"), "baseline should match the lowercase file: {without}");
+        let without =
+            grep_with_config(dir.path(), None, serde_json::json!({"pattern": "needle"})).await;
+        assert!(
+            without.contains("a.txt"),
+            "baseline should match the lowercase file: {without}"
+        );
         assert!(
             !without.contains("b.txt"),
             "without the config the search is case-SENSITIVE: {without}"
         );
 
-        let with = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        let with = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
         assert!(
             with.contains("a.txt") && with.contains("b.txt"),
             "--smart-case must fold the uppercase file in: {with}"
@@ -2195,7 +2207,12 @@ mod tests {
         );
         let dir = tree_with_config("-q\n");
         let rc = dir.path().join("rc");
-        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        let out = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
         assert!(
             out.contains("a.txt"),
             "-q must not silence the result set: {out}"
@@ -2242,7 +2259,10 @@ mod tests {
         // `--no-pre` is a SWITCH (`Pre::update` asserts there is no affirmative switch for
         // `--pre`, defs.rs:5431-5435), so it must not call `take()`. If it ever did, it would
         // swallow the following line and this would read `None`.
-        assert_eq!(RgFlags::parse("--no-pre\n-i\n").case, Some(CaseMode::Insensitive));
+        assert_eq!(
+            RgFlags::parse("--no-pre\n-i\n").case,
+            Some(CaseMode::Insensitive)
+        );
         assert_eq!(
             RgFlags::parse("--auto-hybrid-regex\n--no-auto-hybrid-regex\n"),
             RgFlags::default()
@@ -2313,8 +2333,16 @@ mod tests {
         let rc = dir.path().join("rc");
 
         // Config alone: case-insensitive, so both files match.
-        let cfg_only = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
-        assert!(cfg_only.contains("b.txt"), "config -i should fold in NEEDLE: {cfg_only}");
+        let cfg_only = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
+        assert!(
+            cfg_only.contains("b.txt"),
+            "config -i should fold in NEEDLE: {cfg_only}"
+        );
 
         // The caller says otherwise, and the caller wins.
         let overridden = grep_with_config(
@@ -2339,7 +2367,12 @@ mod tests {
     async fn unknown_flag_is_ignored_not_fatal() {
         let dir = tree_with_config("--this-flag-does-not-exist\n--smart-case\n");
         let rc = dir.path().join("rc");
-        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        let out = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
         assert!(
             out.contains("a.txt") && out.contains("b.txt"),
             "the unknown flag must be skipped and --smart-case must still apply: {out}"
@@ -2357,13 +2390,29 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
         let absent = dir.path().join("no-such-file");
 
-        let out = grep_with_config(dir.path(), Some(&absent), serde_json::json!({"pattern": "needle"})).await;
-        assert!(out.contains("a.txt"), "a missing config must not fail the search: {out}");
+        let out = grep_with_config(
+            dir.path(),
+            Some(&absent),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
+        assert!(
+            out.contains("a.txt"),
+            "a missing config must not fail the search: {out}"
+        );
 
         // A directory stands in for the unreadable case: `read_to_string` fails on it on every
         // platform, with no need to depend on running as a non-root user.
-        let out = grep_with_config(dir.path(), Some(dir.path()), serde_json::json!({"pattern": "needle"})).await;
-        assert!(out.contains("a.txt"), "an unreadable config must not fail the search: {out}");
+        let out = grep_with_config(
+            dir.path(),
+            Some(dir.path()),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
+        assert!(
+            out.contains("a.txt"),
+            "an unreadable config must not fail the search: {out}"
+        );
     }
 
     /// Comments, blank lines and a value on its own line — ripgrep's config FORMAT, not a shell
@@ -2381,20 +2430,25 @@ mod tests {
         .unwrap();
         let rc = dir.path().join("rc");
 
-        let without = grep_with_config(dir.path(), None, serde_json::json!({"pattern": "needle"})).await;
+        let without =
+            grep_with_config(dir.path(), None, serde_json::json!({"pattern": "needle"})).await;
         assert!(
             without.contains("keep.txt") && without.contains("skip.txt"),
             "baseline should reach both files: {without}"
         );
 
-        let with = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        let with = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
         assert!(with.contains("keep.txt"), "{with}");
         assert!(
             !with.contains("skip.txt"),
             "the config's !vendor/** must prune the directory: {with}"
         );
     }
-
 
     // ---------------------------------------------------------------------------------------
     // QA rework guards. Each of the three below was a flag §6.1 lists as HONOUR that did not
@@ -2441,7 +2495,12 @@ mod tests {
 
         let dir = tree_with_config("--max-filesize\n18446744073709551615K\n");
         let rc = dir.path().join("rc");
-        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        let out = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
         assert!(
             out.contains("a.txt"),
             "the search must still run with the bad value dropped: {out}"
@@ -2463,7 +2522,8 @@ mod tests {
         let dir = tree_with_config("--crlf\n");
         let rc = dir.path().join("rc");
 
-        let msg = grep_err_with_config(dir.path(), &rc, serde_json::json!({"pattern": "a\\rb"})).await;
+        let msg =
+            grep_err_with_config(dir.path(), &rc, serde_json::json!({"pattern": "a\\rb"})).await;
         assert!(
             msg.starts_with(r#"rg: the literal "\r" is not allowed in a regex"#),
             "under --crlf, \\r is a line terminator and must be refused exactly as \\n is: {msg}"
@@ -2492,8 +2552,14 @@ mod tests {
         let asc = grep_with_config(dir.path(), Some(&dir.path().join("asc")), args.clone()).await;
         let desc = grep_with_config(dir.path(), Some(&dir.path().join("desc")), args).await;
 
-        assert!(asc.contains("a.txt") && !asc.contains("z.txt"), "--sort=path: {asc}");
-        assert!(desc.contains("z.txt") && !desc.contains("a.txt"), "--sortr=path: {desc}");
+        assert!(
+            asc.contains("a.txt") && !asc.contains("z.txt"),
+            "--sort=path: {asc}"
+        );
+        assert!(
+            desc.contains("z.txt") && !desc.contains("a.txt"),
+            "--sortr=path: {desc}"
+        );
     }
 
     /// `-i`, `-s` and `-S` are one group, and the LAST one written wins.
@@ -2504,7 +2570,12 @@ mod tests {
     async fn last_case_flag_in_config_wins() {
         let dir = tree_with_config("-S\n-s\n");
         let rc = dir.path().join("rc");
-        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        let out = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
         assert!(
             out.contains("a.txt") && !out.contains("b.txt"),
             "-s came last, so the search is case-sensitive: {out}"
@@ -2514,7 +2585,12 @@ mod tests {
         // merely the presence of `-s`.
         let dir = tree_with_config("-s\n-S\n");
         let rc = dir.path().join("rc");
-        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        let out = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
         assert!(
             out.contains("a.txt") && out.contains("b.txt"),
             "-S came last, so smart-case folds NEEDLE in: {out}"
@@ -2535,14 +2611,18 @@ mod tests {
         std::fs::write(dir.path().join("rc"), "--ignore-file\nmyignore\n").unwrap();
         let rc = dir.path().join("rc");
 
-        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        let out = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
         assert!(out.contains("keep.txt"), "{out}");
         assert!(
             !out.contains("skip.txt"),
             "the relative ignore file must be found and applied: {out}"
         );
     }
-
 
     /// An `--ignore-file` whose filename really does begin with `@` must be opened, not rewritten.
     ///
@@ -2563,7 +2643,12 @@ mod tests {
         std::fs::write(dir.path().join("rc"), "--ignore-file\n@vendorignore\n").unwrap();
         let rc = dir.path().join("rc");
 
-        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        let out = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
         assert!(
             out.contains("keep.txt"),
             "the @-named ignore file excludes skip.txt, so keep.txt must survive: {out}"
@@ -2593,14 +2678,21 @@ mod tests {
         .unwrap();
         let rc = dir.path().join("rc");
 
-        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
-        assert!(out.contains("top.rs"), "the valid -t rust must still select: {out}");
+        let out = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
+        assert!(
+            out.contains("top.rs"),
+            "the valid -t rust must still select: {out}"
+        );
         assert!(
             !out.contains("top.txt"),
             "type filtering must survive the malformed --type-add: {out}"
         );
     }
-
 
     /// `--no-ignore` must clear EVERY ignore source, including the strongest one.
     ///
@@ -2630,12 +2722,21 @@ mod tests {
 
         // Baseline: each of the three files is hidden by a different ignore source, so a search
         // with no config finds none of them. This is what makes the assertion below meaningful.
-        let without = grep_with_config(dir.path(), None, serde_json::json!({"pattern": "needle"})).await;
+        let without =
+            grep_with_config(dir.path(), None, serde_json::json!({"pattern": "needle"})).await;
         for f in ["a.txt", "b.txt", "c.txt"] {
-            assert!(!without.contains(f), "{f} should be ignored by default: {without}");
+            assert!(
+                !without.contains(f),
+                "{f} should be ignored by default: {without}"
+            );
         }
 
-        let with = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        let with = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
         for f in ["a.txt", "b.txt", "c.txt"] {
             assert!(with.contains(f), "--no-ignore must surface {f}: {with}");
         }
@@ -2663,10 +2764,17 @@ mod tests {
         std::fs::write(dir.path().join("rc"), "--no-ignore-vcs\n").unwrap();
         let rc = dir.path().join("rc");
 
-        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
-        assert!(out.contains("a.txt"), "the gitignore'd file must surface: {out}");
+        let out = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle"}),
+        )
+        .await;
+        assert!(
+            out.contains("a.txt"),
+            "the gitignore'd file must surface: {out}"
+        );
         assert!(!out.contains("b.txt"), ".ignore must still apply: {out}");
         assert!(!out.contains("c.txt"), ".rgignore must still apply: {out}");
     }
-
 }

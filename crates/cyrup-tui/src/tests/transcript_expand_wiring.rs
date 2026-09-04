@@ -11,10 +11,15 @@
 //! * X13 — `component.setComplete(message.exitCode, message.cancelled, message.truncated ? … ,
 //!   message.fullOutputPath)` (`modes/interactive/interactive-mode.ts:3460-3465`) on the
 //!   `bashExecution` replay arm.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use cyrup_session_svc::agent_message::{AgentMessage, BashExecutionMessage};
 use crate::{App, UiTheme};
+use cyrup_session_svc::agent_message::{AgentMessage, BashExecutionMessage};
 use ratatui::backend::TestBackend;
 
 fn new_app() -> App<TestBackend> {
@@ -25,7 +30,8 @@ fn new_app() -> App<TestBackend> {
 #[test]
 fn rebinding_the_expand_key_changes_the_transcript_hints() {
     let mut app = new_app();
-    app.transcript_mut().push_branch_summary("we merged the spike");
+    app.transcript_mut()
+        .push_branch_summary("we merged the spike");
     app.draw().unwrap();
     assert!(
         app.scrollback_text().contains("(ctrl+o to expand)"),
@@ -37,10 +43,15 @@ fn rebinding_the_expand_key_changes_the_transcript_hints() {
     rebound
         .load_keybindings_json(r#"{ "app.tools.expand": "ctrl+e" }"#)
         .expect("a valid keybindings document loads");
-    rebound.transcript_mut().push_branch_summary("we merged the spike");
+    rebound
+        .transcript_mut()
+        .push_branch_summary("we merged the spike");
     rebound.draw().unwrap();
     let out = rebound.scrollback_text();
-    assert!(out.contains("(ctrl+e to expand)"), "the REBOUND label reaches the hint:\n{out}");
+    assert!(
+        out.contains("(ctrl+e to expand)"),
+        "the REBOUND label reaches the hint:\n{out}"
+    );
     assert!(!out.contains("ctrl+o"), "and the literal is gone:\n{out}");
 }
 
@@ -57,7 +68,8 @@ fn the_session_cwd_reaches_the_compact_read_classification() {
         Some(std::path::Path::new("/w/project")),
         "`set_title_cwd` is the funnel Pi's `ToolRenderContext.cwd` rides"
     );
-    app.transcript_mut().push_tool_start("read", serde_json::json!({ "path": "AGENTS.md" }));
+    app.transcript_mut()
+        .push_tool_start("read", serde_json::json!({ "path": "AGENTS.md" }));
     app.draw().unwrap();
     let buf = app.terminal().backend().buffer();
     let area = buf.area;
@@ -70,7 +82,10 @@ fn the_session_cwd_reaches_the_compact_read_classification() {
         }
         out.push('\n');
     }
-    assert!(out.contains("read resource AGENTS.md"), "compact resource header:\n{out}");
+    assert!(
+        out.contains("read resource AGENTS.md"),
+        "compact resource header:\n{out}"
+    );
     assert!(out.contains("to expand"), "with its expand hint:\n{out}");
 }
 
@@ -108,7 +123,11 @@ fn a_replayed_bash_execution_replays_its_truncation_warning() {
         exclude_from_context: Some(false),
     })]);
     clean.draw().unwrap();
-    assert!(!clean.scrollback_text().contains("truncated"), "{}", clean.scrollback_text());
+    assert!(
+        !clean.scrollback_text().contains("truncated"),
+        "{}",
+        clean.scrollback_text()
+    );
 }
 
 /// **X7(b) — the PRODUCTION runtime-cwd adoption goes through the funnel.**

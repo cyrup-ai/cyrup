@@ -40,7 +40,9 @@ impl IntercomTool {
         // `v0.12.0 index.ts:2322-2326` — verbatim, and BEFORE the confirm, so a flag typo never
         // costs a dialog.
         if open_pane && cwd.is_none() {
-            return Err(ToolError::new("openProjectPaneIfMissing requires a target cwd."));
+            return Err(ToolError::new(
+                "openProjectPaneIfMissing requires a target cwd.",
+            ));
         }
 
         // `const confirmSend = !replyTo && config.confirmSend && ctx.hasUI` (`:2328`), hoisted
@@ -83,13 +85,17 @@ impl IntercomTool {
         // hang.
         let delivery = match cwd.as_deref() {
             Some(cwd) => {
-                resolve_cwd_delivery_target(&self.state, client, CwdDeliveryOptions {
-                    to: to.as_deref(),
-                    cwd,
-                    open_project_pane_if_missing: open_pane,
-                    focus: params.focus.unwrap_or(true),
-                    cancel,
-                })
+                resolve_cwd_delivery_target(
+                    &self.state,
+                    client,
+                    CwdDeliveryOptions {
+                        to: to.as_deref(),
+                        cwd,
+                        open_project_pane_if_missing: open_pane,
+                        focus: params.focus.unwrap_or(true),
+                        cancel,
+                    },
+                )
                 .await?
             }
             None => {
@@ -106,14 +112,21 @@ impl IntercomTool {
                 }
             }
         };
-        let DeliveryTarget { id: target, label, project_pane } = delivery;
+        let DeliveryTarget {
+            id: target,
+            label,
+            project_pane,
+        } = delivery;
         // `const targetDisplay = target.projectPane ? target.label : to ?? target.label;`
         // (`v0.12.0 index.ts:2346`). Pane-less, that is `to ?? target.label`: an explicit `to` is
         // echoed back verbatim, and a cwd-addressed send reports the peer's resolved name. With a
         // pane, the LAUNCHED session's own name wins over the caller's `to`, because `to` may have
         // been a bare filter that never named this session.
-        let target_display =
-            if project_pane.is_some() { label } else { to.clone().unwrap_or(label) };
+        let target_display = if project_pane.is_some() {
+            label
+        } else {
+            to.clone().unwrap_or(label)
+        };
         // `v0.10.1 index.ts:2005-2010` — the SAME string as the `ask` and `reply` self-guards
         // (`:2122`, `:2205`). pi has exactly one self-target message across all three arms.
         if client.session_id().as_deref() == Some(target.as_str()) {
@@ -163,19 +176,22 @@ impl IntercomTool {
             }
         }
         let result = client
-            .send(&target, SendOptions {
-                text: message.clone(),
-                attachments: params.attachments.clone(),
-                reply_to: effective_reply_to.clone(),
-                expects_reply: None,
-                message_id: None,
-                // `supersedes` / `retryOf` are threaded through `send` and `ask` only
-                // (`v0.10.1 index.ts:2029-2030`, `:2144-2145`); the `reply` arm (now `reply.rs`)
-                // deliberately does NOT carry them (`:2217-2221`).
-                supersedes: params.supersedes.clone(),
-                retry_of: params.retry_of.clone(),
-                provenance: None,
-            })
+            .send(
+                &target,
+                SendOptions {
+                    text: message.clone(),
+                    attachments: params.attachments.clone(),
+                    reply_to: effective_reply_to.clone(),
+                    expects_reply: None,
+                    message_id: None,
+                    // `supersedes` / `retryOf` are threaded through `send` and `ask` only
+                    // (`v0.10.1 index.ts:2029-2030`, `:2144-2145`); the `reply` arm (now `reply.rs`)
+                    // deliberately does NOT carry them (`:2217-2221`).
+                    supersedes: params.supersedes.clone(),
+                    retry_of: params.retry_of.clone(),
+                    provenance: None,
+                },
+            )
             .await
             .map_err(to_tool_err)?;
         if !result.delivered {
@@ -239,7 +255,10 @@ impl IntercomTool {
         {
             map.insert("openedProjectPane".to_string(), serde_json::json!(true));
             map.insert("paneId".to_string(), serde_json::json!(pane.pane_id));
-            map.insert("projectRoot".to_string(), serde_json::json!(pane.project_root));
+            map.insert(
+                "projectRoot".to_string(),
+                serde_json::json!(pane.project_root),
+            );
         }
         Ok(detailed_result(
             // The pane branch OUTRANKS the inferred-reply branch upstream (`:2392-2396`): a

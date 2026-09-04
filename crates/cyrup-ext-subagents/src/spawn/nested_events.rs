@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use crate::error::SubagentError;
 use crate::spawn::nested_path::{
-    is_safe_nested_path_id_str, parse_nested_path_env, sanitize_nested_path, NestedPathEntry,
+    NestedPathEntry, is_safe_nested_path_id_str, parse_nested_path_env, sanitize_nested_path,
 };
 
 // =================================================================================================
@@ -389,7 +389,9 @@ fn string_value(value: Option<&Value>, max: usize) -> Option<String> {
 }
 
 fn is_safe_nested_id(value: Option<&Value>) -> bool {
-    value.and_then(Value::as_str).is_some_and(is_safe_nested_path_id_str)
+    value
+        .and_then(Value::as_str)
+        .is_some_and(is_safe_nested_path_id_str)
 }
 
 fn sanitize_state(value: Option<&Value>, fallback: &str) -> String {
@@ -408,8 +410,8 @@ fn sanitize_step_status(value: Option<&Value>) -> String {
     match value.and_then(Value::as_str) {
         // G77: same allowlist widening for a nested STEP status (`nested-events.ts:281-283`).
         Some(
-            s @ ("pending" | "running" | "complete" | "completed" | "failed" | "paused"
-            | "stopped"),
+            s
+            @ ("pending" | "running" | "complete" | "completed" | "failed" | "paused" | "stopped"),
         ) => s.to_string(),
         _ => "pending".to_string(),
     }
@@ -450,20 +452,49 @@ fn sanitize_step_map(input: &Value, depth: i64) -> Option<Value> {
     let agent = string_value(obj.get("agent"), 128)?;
     let mut map = serde_json::Map::new();
     map.insert("agent".to_string(), Value::String(agent));
-    map.insert("status".to_string(), Value::String(sanitize_step_status(obj.get("status"))));
-    set_if_some(&mut map, "sessionFile", string_value(obj.get("sessionFile"), 2048).map(Value::String));
-    if let Some(s @ ("active_long_running" | "needs_attention")) = obj.get("activityState").and_then(Value::as_str) {
+    map.insert(
+        "status".to_string(),
+        Value::String(sanitize_step_status(obj.get("status"))),
+    );
+    set_if_some(
+        &mut map,
+        "sessionFile",
+        string_value(obj.get("sessionFile"), 2048).map(Value::String),
+    );
+    if let Some(s @ ("active_long_running" | "needs_attention")) =
+        obj.get("activityState").and_then(Value::as_str)
+    {
         map.insert("activityState".to_string(), Value::String(s.to_string()));
     }
-    set_if_some(&mut map, "lastActivityAt", number_value(obj.get("lastActivityAt")));
-    set_if_some(&mut map, "currentTool", string_value(obj.get("currentTool"), 128).map(Value::String));
-    set_if_some(&mut map, "currentToolStartedAt", number_value(obj.get("currentToolStartedAt")));
-    set_if_some(&mut map, "currentPath", string_value(obj.get("currentPath"), 2048).map(Value::String));
+    set_if_some(
+        &mut map,
+        "lastActivityAt",
+        number_value(obj.get("lastActivityAt")),
+    );
+    set_if_some(
+        &mut map,
+        "currentTool",
+        string_value(obj.get("currentTool"), 128).map(Value::String),
+    );
+    set_if_some(
+        &mut map,
+        "currentToolStartedAt",
+        number_value(obj.get("currentToolStartedAt")),
+    );
+    set_if_some(
+        &mut map,
+        "currentPath",
+        string_value(obj.get("currentPath"), 2048).map(Value::String),
+    );
     set_if_some(&mut map, "turnCount", number_value(obj.get("turnCount")));
     set_if_some(&mut map, "toolCount", number_value(obj.get("toolCount")));
     set_if_some(&mut map, "startedAt", number_value(obj.get("startedAt")));
     set_if_some(&mut map, "endedAt", number_value(obj.get("endedAt")));
-    set_if_some(&mut map, "error", string_value(obj.get("error"), 1024).map(Value::String));
+    set_if_some(
+        &mut map,
+        "error",
+        string_value(obj.get("error"), 1024).map(Value::String),
+    );
     if depth < MAX_DEPTH
         && let Some(Value::Array(children)) = obj.get("children")
     {
@@ -498,31 +529,81 @@ fn sanitize_summary_map(input: &Value, depth: i64) -> Option<Value> {
     let mut map = serde_json::Map::new();
     map.insert("id".to_string(), Value::String(id));
     map.insert("parentRunId".to_string(), Value::String(parent_run_id));
-    set_if_some(&mut map, "parentStepIndex", number_value(obj.get("parentStepIndex")));
-    set_if_some(&mut map, "parentAgent", string_value(obj.get("parentAgent"), 128).map(Value::String));
+    set_if_some(
+        &mut map,
+        "parentStepIndex",
+        number_value(obj.get("parentStepIndex")),
+    );
+    set_if_some(
+        &mut map,
+        "parentAgent",
+        string_value(obj.get("parentAgent"), 128).map(Value::String),
+    );
     map.insert("depth".to_string(), Value::from(clamped_depth));
-    map.insert("path".to_string(), serde_json::to_value(&path).unwrap_or(Value::Array(Vec::new())));
-    map.insert("state".to_string(), Value::String(sanitize_state(obj.get("state"), "running")));
+    map.insert(
+        "path".to_string(),
+        serde_json::to_value(&path).unwrap_or(Value::Array(Vec::new())),
+    );
+    map.insert(
+        "state".to_string(),
+        Value::String(sanitize_state(obj.get("state"), "running")),
+    );
 
-    set_if_some(&mut map, "asyncDir", string_value(obj.get("asyncDir"), 2048).map(Value::String));
+    set_if_some(
+        &mut map,
+        "asyncDir",
+        string_value(obj.get("asyncDir"), 2048).map(Value::String),
+    );
     // pid must be a positive integer.
     if let Some(pid) = obj.get("pid").and_then(Value::as_i64).filter(|p| *p > 0) {
         map.insert("pid".to_string(), Value::from(pid));
     }
-    set_if_some(&mut map, "sessionId", string_value(obj.get("sessionId"), 256).map(Value::String));
-    set_if_some(&mut map, "sessionFile", string_value(obj.get("sessionFile"), 2048).map(Value::String));
-    set_if_some(&mut map, "intercomTarget", string_value(obj.get("intercomTarget"), 256).map(Value::String));
-    set_if_some(&mut map, "ownerIntercomTarget", string_value(obj.get("ownerIntercomTarget"), 256).map(Value::String));
-    set_if_some(&mut map, "leafIntercomTarget", string_value(obj.get("leafIntercomTarget"), 256).map(Value::String));
+    set_if_some(
+        &mut map,
+        "sessionId",
+        string_value(obj.get("sessionId"), 256).map(Value::String),
+    );
+    set_if_some(
+        &mut map,
+        "sessionFile",
+        string_value(obj.get("sessionFile"), 2048).map(Value::String),
+    );
+    set_if_some(
+        &mut map,
+        "intercomTarget",
+        string_value(obj.get("intercomTarget"), 256).map(Value::String),
+    );
+    set_if_some(
+        &mut map,
+        "ownerIntercomTarget",
+        string_value(obj.get("ownerIntercomTarget"), 256).map(Value::String),
+    );
+    set_if_some(
+        &mut map,
+        "leafIntercomTarget",
+        string_value(obj.get("leafIntercomTarget"), 256).map(Value::String),
+    );
     if let Some(s @ ("live" | "gone" | "unknown")) = obj.get("ownerState").and_then(Value::as_str) {
         map.insert("ownerState".to_string(), Value::String(s.to_string()));
     }
-    set_if_some(&mut map, "controlInbox", string_value(obj.get("controlInbox"), 2048).map(Value::String));
-    set_if_some(&mut map, "capabilityToken", string_value(obj.get("capabilityToken"), 128).map(Value::String));
+    set_if_some(
+        &mut map,
+        "controlInbox",
+        string_value(obj.get("controlInbox"), 2048).map(Value::String),
+    );
+    set_if_some(
+        &mut map,
+        "capabilityToken",
+        string_value(obj.get("capabilityToken"), 128).map(Value::String),
+    );
     if let Some(s @ ("single" | "parallel" | "chain")) = obj.get("mode").and_then(Value::as_str) {
         map.insert("mode".to_string(), Value::String(s.to_string()));
     }
-    set_if_some(&mut map, "agent", string_value(obj.get("agent"), 128).map(Value::String));
+    set_if_some(
+        &mut map,
+        "agent",
+        string_value(obj.get("agent"), 128).map(Value::String),
+    );
     if let Some(Value::Array(agents)) = obj.get("agents") {
         let names: Vec<Value> = agents
             .iter()
@@ -531,23 +612,57 @@ fn sanitize_summary_map(input: &Value, depth: i64) -> Option<Value> {
             .collect();
         map.insert("agents".to_string(), Value::Array(names));
     }
-    set_if_some(&mut map, "currentStep", number_value(obj.get("currentStep")));
-    set_if_some(&mut map, "chainStepCount", number_value(obj.get("chainStepCount")));
-    if let Some(s @ ("active_long_running" | "needs_attention")) = obj.get("activityState").and_then(Value::as_str) {
+    set_if_some(
+        &mut map,
+        "currentStep",
+        number_value(obj.get("currentStep")),
+    );
+    set_if_some(
+        &mut map,
+        "chainStepCount",
+        number_value(obj.get("chainStepCount")),
+    );
+    if let Some(s @ ("active_long_running" | "needs_attention")) =
+        obj.get("activityState").and_then(Value::as_str)
+    {
         map.insert("activityState".to_string(), Value::String(s.to_string()));
     }
-    set_if_some(&mut map, "lastActivityAt", number_value(obj.get("lastActivityAt")));
-    set_if_some(&mut map, "currentTool", string_value(obj.get("currentTool"), 128).map(Value::String));
-    set_if_some(&mut map, "currentToolStartedAt", number_value(obj.get("currentToolStartedAt")));
-    set_if_some(&mut map, "currentPath", string_value(obj.get("currentPath"), 2048).map(Value::String));
+    set_if_some(
+        &mut map,
+        "lastActivityAt",
+        number_value(obj.get("lastActivityAt")),
+    );
+    set_if_some(
+        &mut map,
+        "currentTool",
+        string_value(obj.get("currentTool"), 128).map(Value::String),
+    );
+    set_if_some(
+        &mut map,
+        "currentToolStartedAt",
+        number_value(obj.get("currentToolStartedAt")),
+    );
+    set_if_some(
+        &mut map,
+        "currentPath",
+        string_value(obj.get("currentPath"), 2048).map(Value::String),
+    );
     set_if_some(&mut map, "turnCount", number_value(obj.get("turnCount")));
     set_if_some(&mut map, "toolCount", number_value(obj.get("toolCount")));
-    set_if_some(&mut map, "totalTokens", sanitize_token_usage(obj.get("totalTokens")));
+    set_if_some(
+        &mut map,
+        "totalTokens",
+        sanitize_token_usage(obj.get("totalTokens")),
+    );
     set_if_some(&mut map, "totalCost", sanitize_cost(obj.get("totalCost")));
     set_if_some(&mut map, "startedAt", number_value(obj.get("startedAt")));
     set_if_some(&mut map, "endedAt", number_value(obj.get("endedAt")));
     set_if_some(&mut map, "lastUpdate", number_value(obj.get("lastUpdate")));
-    set_if_some(&mut map, "error", string_value(obj.get("error"), 1024).map(Value::String));
+    set_if_some(
+        &mut map,
+        "error",
+        string_value(obj.get("error"), 1024).map(Value::String),
+    );
 
     if let Some(Value::Array(steps)) = obj.get("steps") {
         let sanitized: Vec<Value> = steps
@@ -703,13 +818,21 @@ pub fn create_nested_route_in(
     })
 }
 
-fn read_route_metadata(route: &NestedRoute) -> Result<(Option<String>, Option<String>), SubagentError> {
+fn read_route_metadata(
+    route: &NestedRoute,
+) -> Result<(Option<String>, Option<String>), SubagentError> {
     let route_file = common_route_root(&route.event_sink).join(ROUTE_FILE);
     let content = std::fs::read_to_string(&route_file).map_err(SubagentError::Spawn)?;
     let parsed: Value = serde_json::from_str(&content)
         .map_err(|err| SubagentError::MalformedSettings(format!("route.json: {err}")))?;
-    let root = parsed.get("rootRunId").and_then(Value::as_str).map(str::to_string);
-    let token = parsed.get("capabilityToken").and_then(Value::as_str).map(str::to_string);
+    let root = parsed
+        .get("rootRunId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let token = parsed
+        .get("capabilityToken")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Ok((root, token))
 }
 
@@ -804,10 +927,22 @@ pub fn resolve_nested_parent_address_from_env(
 #[must_use]
 pub fn nested_route_env(route: &NestedRoute) -> HashMap<String, String> {
     HashMap::from([
-        (PARENT_EVENT_SINK_ENV.to_string(), route.event_sink.to_string_lossy().into_owned()),
-        (PARENT_CONTROL_INBOX_ENV.to_string(), route.control_inbox.to_string_lossy().into_owned()),
-        (PARENT_ROOT_RUN_ID_ENV.to_string(), route.root_run_id.clone()),
-        (PARENT_CAPABILITY_TOKEN_ENV.to_string(), route.capability_token.clone()),
+        (
+            PARENT_EVENT_SINK_ENV.to_string(),
+            route.event_sink.to_string_lossy().into_owned(),
+        ),
+        (
+            PARENT_CONTROL_INBOX_ENV.to_string(),
+            route.control_inbox.to_string_lossy().into_owned(),
+        ),
+        (
+            PARENT_ROOT_RUN_ID_ENV.to_string(),
+            route.root_run_id.clone(),
+        ),
+        (
+            PARENT_CAPABILITY_TOKEN_ENV.to_string(),
+            route.capability_token.clone(),
+        ),
     ])
 }
 
@@ -834,7 +969,10 @@ pub fn nested_route_env(route: &NestedRoute) -> HashMap<String, String> {
 /// grandchild that was never granted the route.
 #[must_use]
 pub fn child_role_env(authorized: bool) -> [(&'static str, &'static str); 2] {
-    [(CHILD_ENV, "1"), (FANOUT_CHILD_ENV, if authorized { "1" } else { "0" })]
+    [
+        (CHILD_ENV, "1"),
+        (FANOUT_CHILD_ENV, if authorized { "1" } else { "0" }),
+    ]
 }
 
 /// The `fanout-child` authorization env overlay (pi-args `augmentChildEnv`, the nested-route
@@ -866,7 +1004,9 @@ pub fn nested_child_auth_env(
     let (parent_run_id, child_index, depth, path) = match (authorized, address) {
         (true, Some(addr)) => (
             addr.parent_run_id.clone(),
-            addr.parent_step_index.map(|i| i.to_string()).unwrap_or_default(),
+            addr.parent_step_index
+                .map(|i| i.to_string())
+                .unwrap_or_default(),
             addr.depth.to_string(),
             encode_path(&addr.path),
         ),
@@ -906,7 +1046,8 @@ fn parse_record(content: &str, route: &NestedRoute) -> Option<NestedEventRecord>
         return None;
     }
     if obj.get("rootRunId").and_then(Value::as_str) != Some(route.root_run_id.as_str())
-        || obj.get("capabilityToken").and_then(Value::as_str) != Some(route.capability_token.as_str())
+        || obj.get("capabilityToken").and_then(Value::as_str)
+            != Some(route.capability_token.as_str())
     {
         return None;
     }
@@ -922,7 +1063,11 @@ fn parse_record(content: &str, route: &NestedRoute) -> Option<NestedEventRecord>
     let mut routed_child = child;
     routed_child.control_inbox = Some(route.control_inbox.to_string_lossy().into_owned());
     routed_child.capability_token = Some(route.capability_token.clone());
-    routed_child.owner_state = Some(routed_child.owner_state.unwrap_or_else(|| "unknown".to_string()));
+    routed_child.owner_state = Some(
+        routed_child
+            .owner_state
+            .unwrap_or_else(|| "unknown".to_string()),
+    );
 
     Some(NestedEventRecord {
         event_type: type_str.to_string(),
@@ -998,7 +1143,10 @@ fn write_route_record<T: serde::Serialize>(
 ///
 /// Returns [`SubagentError`] if the route is invalid, the record fails sanitization, or the file
 /// cannot be written.
-pub fn write_nested_event(route: &NestedRoute, event: &NestedEventInput) -> Result<(), SubagentError> {
+pub fn write_nested_event(
+    route: &NestedRoute,
+    event: &NestedEventInput,
+) -> Result<(), SubagentError> {
     write_nested_event_in(&nested_events_dir(), route, event)
 }
 
@@ -1065,14 +1213,16 @@ fn overlay(existing: &NestedRunSummary, incoming: &NestedRunSummary) -> NestedRu
     serde_json::from_value(Value::Object(base)).unwrap_or_else(|_| incoming.clone())
 }
 
-fn merge_summary(existing: Option<NestedRunSummary>, event: &NestedEventRecord) -> NestedRunSummary {
-    let incoming_state = if event.event_type == "subagent.nested.completed"
-        && event.child.state == "running"
-    {
-        "complete".to_string()
-    } else {
-        event.child.state.clone()
-    };
+fn merge_summary(
+    existing: Option<NestedRunSummary>,
+    event: &NestedEventRecord,
+) -> NestedRunSummary {
+    let incoming_state =
+        if event.event_type == "subagent.nested.completed" && event.child.state == "running" {
+            "complete".to_string()
+        } else {
+            event.child.state.clone()
+        };
     let mut incoming = event.child.clone();
     incoming.state = incoming_state;
     incoming.last_update = Some(event.child.last_update.unwrap_or(event.ts));
@@ -1088,7 +1238,8 @@ fn merge_summary(existing: Option<NestedRunSummary>, event: &NestedEventRecord) 
     if terminal(&existing.state) && !terminal(&incoming.state) {
         return existing;
     }
-    if terminal(&existing.state) && terminal(&incoming.state) && incoming_update == existing_update {
+    if terminal(&existing.state) && terminal(&incoming.state) && incoming_update == existing_update
+    {
         return existing;
     }
     let mut merged = overlay(&existing, &incoming);
@@ -1108,11 +1259,10 @@ fn walk_attach(
             if item.id == event.parent_run_id {
                 let existing = item.children.take().unwrap_or_default();
                 let child_pos = existing.iter().position(|c| c.id == event.child.id);
-                let next_child = merge_summary(
-                    child_pos.and_then(|p| existing.get(p).cloned()),
-                    event,
-                );
-                let mut next_children: Vec<NestedRunSummary> = Vec::with_capacity(existing.len() + 1);
+                let next_child =
+                    merge_summary(child_pos.and_then(|p| existing.get(p).cloned()), event);
+                let mut next_children: Vec<NestedRunSummary> =
+                    Vec::with_capacity(existing.len() + 1);
                 let mut replaced = false;
                 for (idx, child) in existing.into_iter().enumerate() {
                     if Some(idx) == child_pos {
@@ -1141,7 +1291,10 @@ fn walk_attach(
         .collect()
 }
 
-fn attach_child(children: Vec<NestedRunSummary>, event: &NestedEventRecord) -> Vec<NestedRunSummary> {
+fn attach_child(
+    children: Vec<NestedRunSummary>,
+    event: &NestedEventRecord,
+) -> Vec<NestedRunSummary> {
     let mut updated = false;
     let next = walk_attach(children, event, &mut updated);
     if updated {
@@ -1154,7 +1307,13 @@ fn attach_child(children: Vec<NestedRunSummary>, event: &NestedEventRecord) -> V
         Some(pos) => next
             .into_iter()
             .enumerate()
-            .map(|(idx, child)| if idx == pos { next_child.clone() } else { child })
+            .map(|(idx, child)| {
+                if idx == pos {
+                    next_child.clone()
+                } else {
+                    child
+                }
+            })
             .collect(),
         None => {
             let mut out = next;
@@ -1325,12 +1484,16 @@ fn route_from_root_dir(route_root: &Path) -> Option<NestedRoute> {
 
 /// [`route_from_root_dir`] validated against an explicitly supplied nested-events root.
 fn route_from_root_dir_in(events_root: &Path, route_root: &Path) -> Option<NestedRoute> {
-    let metadata: Value = serde_json::from_str(
-        &std::fs::read_to_string(route_root.join(ROUTE_FILE)).ok()?,
-    )
-    .ok()?;
-    let root_run_id = metadata.get("rootRunId").and_then(Value::as_str)?.to_string();
-    let capability_token = metadata.get("capabilityToken").and_then(Value::as_str)?.to_string();
+    let metadata: Value =
+        serde_json::from_str(&std::fs::read_to_string(route_root.join(ROUTE_FILE)).ok()?).ok()?;
+    let root_run_id = metadata
+        .get("rootRunId")
+        .and_then(Value::as_str)?
+        .to_string();
+    let capability_token = metadata
+        .get("capabilityToken")
+        .and_then(Value::as_str)?
+        .to_string();
     let route = NestedRoute {
         root_run_id,
         event_sink: route_root.join("events"),
@@ -1346,7 +1509,9 @@ fn route_from_root_dir_in(events_root: &Path, route_root: &Path) -> Option<Neste
 /// # Errors
 ///
 /// Returns [`SubagentError`] if `root_run_id` is unsafe or the events dir cannot be listed.
-pub fn find_nested_route_for_root_id(root_run_id: &str) -> Result<Option<NestedRoute>, SubagentError> {
+pub fn find_nested_route_for_root_id(
+    root_run_id: &str,
+) -> Result<Option<NestedRoute>, SubagentError> {
     assert_safe_id("rootRunId", root_run_id)?;
     let dir = nested_events_dir();
     let entries = match std::fs::read_dir(&dir) {
@@ -1473,12 +1638,19 @@ fn parse_control_request(content: &str, route: &NestedRoute) -> Option<NestedCon
         return None;
     }
     if obj.get("rootRunId").and_then(Value::as_str) != Some(route.root_run_id.as_str())
-        || obj.get("capabilityToken").and_then(Value::as_str) != Some(route.capability_token.as_str())
+        || obj.get("capabilityToken").and_then(Value::as_str)
+            != Some(route.capability_token.as_str())
     {
         return None;
     }
-    let request_id = obj.get("requestId").and_then(Value::as_str).filter(|s| is_safe_nested_path_id_str(s))?;
-    let target_run_id = obj.get("targetRunId").and_then(Value::as_str).filter(|s| is_safe_nested_path_id_str(s))?;
+    let request_id = obj
+        .get("requestId")
+        .and_then(Value::as_str)
+        .filter(|s| is_safe_nested_path_id_str(s))?;
+    let target_run_id = obj
+        .get("targetRunId")
+        .and_then(Value::as_str)
+        .filter(|s| is_safe_nested_path_id_str(s))?;
     let action = obj.get("action").and_then(Value::as_str)?;
     if action != "interrupt" && action != "resume" {
         return None;
@@ -1506,12 +1678,19 @@ fn parse_control_result(content: &str, route: &NestedRoute) -> Option<NestedCont
         return None;
     }
     if obj.get("rootRunId").and_then(Value::as_str) != Some(route.root_run_id.as_str())
-        || obj.get("capabilityToken").and_then(Value::as_str) != Some(route.capability_token.as_str())
+        || obj.get("capabilityToken").and_then(Value::as_str)
+            != Some(route.capability_token.as_str())
     {
         return None;
     }
-    let request_id = obj.get("requestId").and_then(Value::as_str).filter(|s| is_safe_nested_path_id_str(s))?;
-    let target_run_id = obj.get("targetRunId").and_then(Value::as_str).filter(|s| is_safe_nested_path_id_str(s))?;
+    let request_id = obj
+        .get("requestId")
+        .and_then(Value::as_str)
+        .filter(|s| is_safe_nested_path_id_str(s))?;
+    let target_run_id = obj
+        .get("targetRunId")
+        .and_then(Value::as_str)
+        .filter(|s| is_safe_nested_path_id_str(s))?;
     let ts = finite_number(obj.get("ts"))? as i64;
     let ok = obj.get("ok").and_then(Value::as_bool)?;
     let message = string_value(obj.get("message"), 16_000).unwrap_or_else(|| {
@@ -1599,11 +1778,15 @@ pub fn read_nested_control_requests(
         if !contained_path(&route.control_inbox, &file_path) {
             continue;
         }
-        let Ok(meta) = std::fs::metadata(&file_path) else { continue };
+        let Ok(meta) = std::fs::metadata(&file_path) else {
+            continue;
+        };
         if !meta.is_file() || meta.len() > MAX_EVENT_BYTES {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&file_path) else { continue };
+        let Ok(content) = std::fs::read_to_string(&file_path) else {
+            continue;
+        };
         if let Some(request) = parse_control_request(&content, route) {
             requests.push((request, file_path));
         }
@@ -1679,13 +1862,20 @@ pub fn read_nested_control_results(
         if !contained_path(&route.event_sink, &event_path) {
             continue;
         }
-        let Ok(meta) = std::fs::metadata(&event_path) else { continue };
+        let Ok(meta) = std::fs::metadata(&event_path) else {
+            continue;
+        };
         if !meta.is_file() || meta.len() > MAX_EVENT_BYTES {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&event_path) else { continue };
+        let Ok(content) = std::fs::read_to_string(&event_path) else {
+            continue;
+        };
         let lines: Vec<&str> = if content.contains('\n') {
-            content.split('\n').filter(|l| !l.trim().is_empty()).collect()
+            content
+                .split('\n')
+                .filter(|l| !l.trim().is_empty())
+                .collect()
         } else {
             vec![content.as_str()]
         };
@@ -1711,7 +1901,10 @@ pub fn read_nested_control_results(
 pub fn nested_results_path(root_run_id: &str, id: &str) -> Result<PathBuf, SubagentError> {
     assert_safe_id("rootRunId", root_run_id)?;
     assert_safe_id("id", id)?;
-    Ok(results_dir().join("nested").join(root_run_id).join(format!("{id}.json")))
+    Ok(results_dir()
+        .join("nested")
+        .join(root_run_id)
+        .join(format!("{id}.json")))
 }
 
 /// The results-DIRECTORY a nested run's terminal result file (via [`nested_results_path`]) lives
@@ -1744,7 +1937,8 @@ pub fn nested_async_root(root_run_id: &str) -> Result<PathBuf, SubagentError> {
 /// pi `isTopLevelAsyncDir`: contained in the async root but not under the nested-runs root.
 #[must_use]
 pub fn is_top_level_async_dir(async_dir_path: &Path) -> bool {
-    let resolved = std::path::absolute(async_dir_path).unwrap_or_else(|_| async_dir_path.to_path_buf());
+    let resolved =
+        std::path::absolute(async_dir_path).unwrap_or_else(|_| async_dir_path.to_path_buf());
     contained_path(&async_dir(), &resolved) && !contained_path(&nested_runs_dir(), &resolved)
 }
 
@@ -1779,14 +1973,25 @@ pub fn resolve_nested_async_dir_in(
 #[must_use]
 pub fn nested_artifact_env(root_run_id: &str, parent_run_id: &str) -> HashMap<String, String> {
     HashMap::from([
-        ("CYRUP_SUBAGENT_NESTED_ROOT_RUN_ID".to_string(), root_run_id.to_string()),
-        ("CYRUP_SUBAGENT_NESTED_PARENT_RUN_ID".to_string(), parent_run_id.to_string()),
+        (
+            "CYRUP_SUBAGENT_NESTED_ROOT_RUN_ID".to_string(),
+            root_run_id.to_string(),
+        ),
+        (
+            "CYRUP_SUBAGENT_NESTED_PARENT_RUN_ID".to_string(),
+            parent_run_id.to_string(),
+        ),
     ])
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use super::*;
     use std::process::Command as StdCommand;
@@ -1810,7 +2015,11 @@ mod tests {
             parent_step_index: Some(1),
             parent_agent: None,
             depth: 1,
-            path: vec![NestedPathEntry { run_id: parent.to_string(), step_index: Some(1), agent: None }],
+            path: vec![NestedPathEntry {
+                run_id: parent.to_string(),
+                step_index: Some(1),
+                agent: None,
+            }],
             async_dir: None,
             pid: None,
             session_id: None,
@@ -1842,7 +2051,12 @@ mod tests {
             error: None,
             steps: Some(vec![NestedStepSummary {
                 agent: "leaf".to_string(),
-                status: if state == "running" { "running" } else { "complete" }.to_string(),
+                status: if state == "running" {
+                    "running"
+                } else {
+                    "complete"
+                }
+                .to_string(),
                 session_file: None,
                 activity_state: None,
                 last_activity_at: None,
@@ -1889,20 +2103,33 @@ printf '{"type":"subagent.nested.started","ts":100,"rootRunId":"%s","parentRunId
             .envs(env.iter())
             .status()
             .expect("child sh spawns");
-        assert!(status.success(), "the nested descendant subprocess must succeed");
+        assert!(
+            status.success(),
+            "the nested descendant subprocess must succeed"
+        );
 
         // The grandparent projects the sink and sees the descendant it never spawned directly.
         let registry = project_nested_events(&route).expect("project");
-        assert_eq!(registry.children.len(), 1, "grandparent must see exactly one nested run");
+        assert_eq!(
+            registry.children.len(),
+            1,
+            "grandparent must see exactly one nested run"
+        );
         assert_eq!(registry.children[0].id, "nested-a");
         assert_eq!(registry.children[0].state, "running");
-        assert_eq!(registry.children[0].steps.as_ref().unwrap()[0].agent, "leaf");
+        assert_eq!(
+            registry.children[0].steps.as_ref().unwrap()[0].agent,
+            "leaf"
+        );
         // The route stamped the child with its control coordinates (so the grandparent can steer it).
         assert_eq!(
             registry.children[0].control_inbox.as_deref(),
             Some(route.control_inbox.to_string_lossy().as_ref())
         );
-        assert_eq!(registry.children[0].capability_token.as_deref(), Some(route.capability_token.as_str()));
+        assert_eq!(
+            registry.children[0].capability_token.as_deref(),
+            Some(route.capability_token.as_str())
+        );
 
         cleanup(&route);
     }
@@ -1957,18 +2184,30 @@ printf '{"type":"subagent.nested.started","ts":100,"rootRunId":"%s","parentRunId
             "parentRunId": root, "parentStepIndex": 1, "capabilityToken": route.capability_token,
             "child": child_summary("nested-terminal", "running", 100, &root),
         });
-        std::fs::write(route.event_sink.join("0000000000400-stale.json"), format!("{stale}\n")).unwrap();
+        std::fs::write(
+            route.event_sink.join("0000000000400-stale.json"),
+            format!("{stale}\n"),
+        )
+        .unwrap();
         // A wrong-token record must be dropped entirely.
         let wrong = serde_json::json!({
             "type": "subagent.nested.started", "ts": 500, "rootRunId": root,
             "parentRunId": root, "parentStepIndex": 1, "capabilityToken": "wrong",
             "child": child_summary("wrong-token", "running", 500, &root),
         });
-        std::fs::write(route.event_sink.join("0000000000500-wrong.json"), format!("{wrong}\n")).unwrap();
+        std::fs::write(
+            route.event_sink.join("0000000000500-wrong.json"),
+            format!("{wrong}\n"),
+        )
+        .unwrap();
 
         let registry = project_nested_events(&route).expect("project");
         assert_eq!(
-            registry.children.iter().find(|c| c.id == "nested-terminal").map(|c| c.state.as_str()),
+            registry
+                .children
+                .iter()
+                .find(|c| c.id == "nested-terminal")
+                .map(|c| c.state.as_str()),
             Some("complete")
         );
         assert!(!registry.children.iter().any(|c| c.id == "wrong-token"));
@@ -1987,7 +2226,10 @@ printf '{"type":"subagent.nested.started","ts":100,"rootRunId":"%s","parentRunId
         assert_eq!(resolved, route);
 
         let mut bad = base;
-        bad.insert(PARENT_CAPABILITY_TOKEN_ENV.to_string(), "wrong-token".to_string());
+        bad.insert(
+            PARENT_CAPABILITY_TOKEN_ENV.to_string(),
+            "wrong-token".to_string(),
+        );
         assert!(resolve_nested_route_from_env(|k| bad.get(k).cloned()).is_err());
         cleanup(&route);
     }
@@ -2006,7 +2248,8 @@ printf '{"type":"subagent.nested.started","ts":100,"rootRunId":"%s","parentRunId
             (PARENT_DEPTH_ENV.to_string(), "3".to_string()),
             (PARENT_PATH_ENV.to_string(), path),
         ]);
-        let address = resolve_nested_parent_address_from_env(|k| env.get(k).cloned()).expect("address");
+        let address =
+            resolve_nested_parent_address_from_env(|k| env.get(k).cloned()).expect("address");
         assert_eq!(address.parent_run_id, "nested-parent");
         assert_eq!(address.parent_step_index, Some(2));
         assert_eq!(address.depth, 3);
@@ -2032,18 +2275,28 @@ printf '{"type":"subagent.nested.started","ts":100,"rootRunId":"%s","parentRunId
             parent_run_id: root.clone(),
             parent_step_index: Some(1),
             depth: 1,
-            path: vec![NestedPathEntry { run_id: root.clone(), step_index: Some(1), agent: None }],
+            path: vec![NestedPathEntry {
+                run_id: root.clone(),
+                step_index: Some(1),
+                agent: None,
+            }],
         };
 
         let authed = nested_child_auth_env(true, Some(&route), Some(&address));
         assert_eq!(authed.get(FANOUT_CHILD_ENV), Some(&"1".to_string()));
         assert_eq!(authed.get(PARENT_ROOT_RUN_ID_ENV), Some(&root));
-        assert_eq!(authed.get(PARENT_CAPABILITY_TOKEN_ENV), Some(&route.capability_token));
+        assert_eq!(
+            authed.get(PARENT_CAPABILITY_TOKEN_ENV),
+            Some(&route.capability_token)
+        );
 
         let denied = nested_child_auth_env(false, Some(&route), Some(&address));
         assert_eq!(denied.get(FANOUT_CHILD_ENV), Some(&"0".to_string()));
         assert_eq!(denied.get(PARENT_ROOT_RUN_ID_ENV), Some(&String::new()));
-        assert_eq!(denied.get(PARENT_CAPABILITY_TOKEN_ENV), Some(&String::new()));
+        assert_eq!(
+            denied.get(PARENT_CAPABILITY_TOKEN_ENV),
+            Some(&String::new())
+        );
         cleanup(&route);
     }
 

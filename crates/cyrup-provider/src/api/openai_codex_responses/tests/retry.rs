@@ -110,4 +110,3 @@ fn exponential_ladder_has_no_jitter() {
     assert_eq!(backoff_delay_ms(2), 4_000);
     assert_eq!(backoff_delay_ms(3), 8_000);
 }
-

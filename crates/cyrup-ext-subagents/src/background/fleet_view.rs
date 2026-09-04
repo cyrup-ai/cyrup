@@ -51,7 +51,9 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use super::run_status::{ActiveRun, progress_label, run_mode_label, run_state_label, step_state_label};
+use super::run_status::{
+    ActiveRun, progress_label, run_mode_label, run_state_label, step_state_label,
+};
 use super::{ActivityState, RunPaths, RunStatus, StepStatus};
 use crate::formatters::{format_model_thinking, format_tokens};
 
@@ -89,10 +91,20 @@ struct TextTail {
 
 impl TextTail {
     fn empty(path: &Path) -> Self {
-        Self { path: path.to_path_buf(), lines: Vec::new(), truncated: false, error: None }
+        Self {
+            path: path.to_path_buf(),
+            lines: Vec::new(),
+            truncated: false,
+            error: None,
+        }
     }
     fn failed(path: &Path, error: String) -> Self {
-        Self { path: path.to_path_buf(), lines: Vec::new(), truncated: false, error: Some(error) }
+        Self {
+            path: path.to_path_buf(),
+            lines: Vec::new(),
+            truncated: false,
+            error: Some(error),
+        }
     }
 }
 
@@ -124,7 +136,10 @@ fn read_text_tail(path: &Path, max_lines: usize) -> TextTail {
         return TextTail::failed(path, e.to_string());
     }
     let content = String::from_utf8_lossy(&buf).into_owned();
-    let mut lines: Vec<String> = content.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
+    let mut lines: Vec<String> = content
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .collect();
     if start > 0 && !lines.is_empty() {
         lines.remove(0);
     }
@@ -133,7 +148,12 @@ fn read_text_tail(path: &Path, max_lines: usize) -> TextTail {
     }
     let truncated = start > 0 || lines.len() > max_lines;
     let kept = lines.split_off(lines.len().saturating_sub(max_lines));
-    TextTail { path: path.to_path_buf(), lines: kept, truncated, error: None }
+    TextTail {
+        path: path.to_path_buf(),
+        lines: kept,
+        truncated,
+        error: None,
+    }
 }
 
 /// pi `readContainedTextTail` (`fleet-view.ts:121-148`): refuse outright when there is no trusted
@@ -149,14 +169,23 @@ fn read_contained_text_tail(
     if trusted_roots.is_empty() {
         return TextTail::failed(
             path,
-            format!("Refusing to read {label} transcript path without a trusted root: {}", path.display()),
+            format!(
+                "Refusing to read {label} transcript path without a trusted root: {}",
+                path.display()
+            ),
         );
     }
     let resolved = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    if !trusted_roots.iter().any(|root| path_within(root, &resolved)) {
+    if !trusted_roots
+        .iter()
+        .any(|root| path_within(root, &resolved))
+    {
         return TextTail::failed(
             path,
-            format!("Refusing to read {label} transcript path outside trusted roots: {}", path.display()),
+            format!(
+                "Refusing to read {label} transcript path outside trusted roots: {}",
+                path.display()
+            ),
         );
     }
     let lstat = match std::fs::symlink_metadata(&resolved) {
@@ -167,13 +196,19 @@ fn read_contained_text_tail(
     if lstat.file_type().is_symlink() {
         return TextTail::failed(
             path,
-            format!("Refusing to read symlink {label} transcript path: {}", path.display()),
+            format!(
+                "Refusing to read symlink {label} transcript path: {}",
+                path.display()
+            ),
         );
     }
     if !lstat.is_file() {
         return TextTail::failed(
             path,
-            format!("Refusing to read non-file {label} transcript path: {}", path.display()),
+            format!(
+                "Refusing to read non-file {label} transcript path: {}",
+                path.display()
+            ),
         );
     }
     let real_path = match std::fs::canonicalize(&resolved) {
@@ -187,7 +222,10 @@ fn read_contained_text_tail(
     if !real_roots.iter().any(|root| path_within(root, &real_path)) {
         return TextTail::failed(
             path,
-            format!("Refusing to read {label} transcript path outside trusted roots: {}", path.display()),
+            format!(
+                "Refusing to read {label} transcript path outside trusted roots: {}",
+                path.display()
+            ),
         );
     }
     read_text_tail(&real_path, max_lines)
@@ -263,7 +301,9 @@ fn format_activity_facts(input: &ActivityFacts<'_>, now: i64) -> Option<String> 
     match (input.current_tool, input.current_tool_started_at) {
         (Some(tool), Some(started)) => facts.push(format!(
             "tool {tool} {}",
-            crate::background::wait::format_duration(u64::try_from((now - started).max(0)).unwrap_or(0))
+            crate::background::wait::format_duration(
+                u64::try_from((now - started).max(0)).unwrap_or(0)
+            )
         )),
         (Some(tool), None) => facts.push(format!("tool {tool}")),
         _ => {}
@@ -346,13 +386,19 @@ fn format_foreground_fleet_lines(controls: &[ForegroundFleetEntry], now: i64) ->
     let mut lines = vec!["Foreground runs:".to_string()];
     for control in controls {
         let activity = format_activity_facts(
-            &ActivityFacts { activity_state: control.activity_state, ..ActivityFacts::default() },
+            &ActivityFacts {
+                activity_state: control.activity_state,
+                ..ActivityFacts::default()
+            },
             now,
         );
         // pi `foregroundModeName`: a single-mode run shows its current agent in the mode slot.
         // cyrup's foreground registry does not record the run mode, so the current agent (when
         // known) is the whole label, exactly as pi's `mode === "single"` branch renders it.
-        let mode = control.current_agent.clone().unwrap_or_else(|| "single".to_string());
+        let mode = control
+            .current_agent
+            .clone()
+            .unwrap_or_else(|| "single".to_string());
         let current = control
             .current_agent
             .as_ref()
@@ -362,7 +408,10 @@ fn format_foreground_fleet_lines(controls: &[ForegroundFleetEntry], now: i64) ->
             })
             .unwrap_or_default();
         let activity_suffix = activity.map(|a| format!(" | {a}")).unwrap_or_default();
-        lines.push(format!("- {} | running | {mode}{current}{activity_suffix}", control.run_id));
+        lines.push(format!(
+            "- {} | running | {mode}{current}{activity_suffix}",
+            control.run_id
+        ));
         lines.push(format!(
             "  status: subagent({{ action: \"status\", id: \"{}\" }})",
             control.run_id
@@ -394,7 +443,12 @@ fn format_async_fleet_lines(runs: &[ActiveRun], now: i64) -> Vec<String> {
         let pending = status
             .pending_appends
             .filter(|count| *count > 0)
-            .map(|count| format!(" | {count} pending append{}", if count == 1 { "" } else { "s" }))
+            .map(|count| {
+                format!(
+                    " | {count} pending append{}",
+                    if count == 1 { "" } else { "s" }
+                )
+            })
             .unwrap_or_default();
         lines.push(format!(
             "- {} | {}{activity} | {} | {}{pending} | {}",
@@ -404,7 +458,10 @@ fn format_async_fleet_lines(runs: &[ActiveRun], now: i64) -> Vec<String> {
             progress_label(status),
             crate::exec::tool_call_summary::shorten_path(&cwd.to_string_lossy())
         ));
-        lines.push(format!("  status: subagent({{ action: \"status\", id: \"{}\" }})", status.run_id));
+        lines.push(format!(
+            "  status: subagent({{ action: \"status\", id: \"{}\" }})",
+            status.run_id
+        ));
         lines.push(format!(
             "  transcript: subagent({{ action: \"status\", id: \"{}\", view: \"transcript\" }})",
             status.run_id
@@ -415,7 +472,10 @@ fn format_async_fleet_lines(runs: &[ActiveRun], now: i64) -> Vec<String> {
                 step.model.as_ref().map(super::ModelId::as_str),
                 step.telemetry.thinking.as_deref(),
             );
-            let mut parts = vec![format!("{index}. {}", step.agent), step_state_label(step.status).to_string()];
+            let mut parts = vec![
+                format!("{index}. {}", step.agent),
+                step_state_label(step.status).to_string(),
+            ];
             if let Some(a) = step_activity {
                 parts.push(a);
             }
@@ -568,7 +628,11 @@ fn select_transcript_step(
 fn step_state_line(status: &RunStatus, index: Option<usize>, now: i64) -> Option<String> {
     let index = index?;
     let step = status.steps.get(index)?;
-    let label = if status.mode == super::RunMode::Parallel { "Agent" } else { "Step" };
+    let label = if status.mode == super::RunMode::Parallel {
+        "Agent"
+    } else {
+        "Step"
+    };
     let mut parts = vec![
         format!("{label}: {index} ({})", step.agent),
         step_state_label(step.status).to_string(),
@@ -602,7 +666,10 @@ fn append_known_artifacts(lines: &mut Vec<String>, artifacts: &[(&str, String)])
 
 /// pi `appendTranscriptBody` (`fleet-view.ts:413-420`).
 fn append_transcript_body(lines: &mut Vec<String>, source: &str, body: &[String], truncated: bool) {
-    lines.push(format!("{source}{}:", if truncated { " (tail truncated)" } else { "" }));
+    lines.push(format!(
+        "{source}{}:",
+        if truncated { " (tail truncated)" } else { "" }
+    ));
     if body.is_empty() {
         lines.push("  (no transcript lines available yet)".to_string());
         return;
@@ -628,7 +695,10 @@ fn read_session_transcript_tail(
     );
     let mut warnings = Vec::new();
     if let Some(error) = tail.error.as_ref() {
-        warnings.push(format!("Session read failed for {}: {error}", session_file.display()));
+        warnings.push(format!(
+            "Session read failed for {}: {error}",
+            session_file.display()
+        ));
     }
     let mut lines: Vec<String> = Vec::new();
     let mut malformed = 0usize;
@@ -657,7 +727,10 @@ fn read_session_transcript_tail(
 
 /// pi `sessionMessageLine` (`fleet-view.ts:176-185`) + `contentText` (`:157-174`).
 fn session_message_line(record: &serde_json::Value) -> Option<String> {
-    let message = record.get("message").filter(|m| m.is_object()).unwrap_or(record);
+    let message = record
+        .get("message")
+        .filter(|m| m.is_object())
+        .unwrap_or(record);
     let role = message.get("role")?.as_str()?;
     let text = content_text(message.get("content")).trim().to_string();
     if text.is_empty() {
@@ -669,19 +742,28 @@ fn session_message_line(record: &serde_json::Value) -> Option<String> {
 /// pi `contentText` (`fleet-view.ts:157-174`) — flatten a message's content into plain text,
 /// summarising tool calls/results rather than dropping them.
 fn content_text(content: Option<&serde_json::Value>) -> String {
-    let Some(content) = content else { return String::new() };
+    let Some(content) = content else {
+        return String::new();
+    };
     if let Some(s) = content.as_str() {
         return s.to_string();
     }
-    let Some(parts) = content.as_array() else { return String::new() };
+    let Some(parts) = content.as_array() else {
+        return String::new();
+    };
     parts
         .iter()
         .map(|part| {
-            let Some(entry) = part.as_object() else { return String::new() };
+            let Some(entry) = part.as_object() else {
+                return String::new();
+            };
             if let Some(text) = entry.get("text").and_then(serde_json::Value::as_str) {
                 return text.to_string();
             }
-            let kind = entry.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+            let kind = entry
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             if kind == "toolCall" || kind == "tool_call" {
                 let name = entry
                     .get("name")
@@ -793,9 +875,17 @@ pub fn format_async_run_transcript(
     let mut source = "Transcript tail".to_string();
     let mut truncated = false;
     for output_path in &output_paths {
-        let tail = read_contained_text_tail(output_path, line_limit, &[async_dir.to_path_buf()], "output");
+        let tail = read_contained_text_tail(
+            output_path,
+            line_limit,
+            &[async_dir.to_path_buf()],
+            "output",
+        );
         if let Some(error) = tail.error.as_ref() {
-            warnings.push(format!("Output read failed for {}: {error}", tail.path.display()));
+            warnings.push(format!(
+                "Output read failed for {}: {error}",
+                tail.path.display()
+            ));
         }
         if tail.lines.is_empty() {
             continue;
@@ -839,13 +929,22 @@ pub fn format_async_run_transcript(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::background::{RunId, RunMode, RunState, StepState};
 
     fn status_with(steps: Vec<StepStatus>) -> RunStatus {
-        let mut status = RunStatus::queued(RunId::from_token("run1234".to_string()), RunMode::Chain, Some(1));
+        let mut status = RunStatus::queued(
+            RunId::from_token("run1234".to_string()),
+            RunMode::Chain,
+            Some(1),
+        );
         status.state = RunState::Running;
         status.steps = steps;
         status
@@ -872,18 +971,26 @@ mod tests {
             format_activity_label(None, Some(ActivityState::ActiveLongRunning), now).as_deref(),
             Some("active but long-running")
         );
-        assert_eq!(format_activity_label(Some(now), None, now).as_deref(), Some("active now"));
+        assert_eq!(
+            format_activity_label(Some(now), None, now).as_deref(),
+            Some("active now")
+        );
         assert_eq!(
             format_activity_label(Some(now - 5_000), None, now).as_deref(),
             Some("active 5s ago")
         );
         assert_eq!(
-            format_activity_label(Some(now - 5_000), Some(ActivityState::NeedsAttention), now).as_deref(),
+            format_activity_label(Some(now - 5_000), Some(ActivityState::NeedsAttention), now)
+                .as_deref(),
             Some("no activity for 5s")
         );
         assert_eq!(
-            format_activity_label(Some(now - 120_000), Some(ActivityState::ActiveLongRunning), now)
-                .as_deref(),
+            format_activity_label(
+                Some(now - 120_000),
+                Some(ActivityState::ActiveLongRunning),
+                now
+            )
+            .as_deref(),
             Some("active but long-running · last activity 2m ago")
         );
     }
@@ -896,7 +1003,10 @@ mod tests {
              completion notifications or subagent({ action: \"status\", id: \"...\" })."
         );
         let err = format_fleet(&[], &[], true, 0).unwrap_err();
-        assert!(err.starts_with("Child-safe subagent fleet view is unavailable"), "{err}");
+        assert!(
+            err.starts_with("Child-safe subagent fleet view is unavailable"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -919,7 +1029,10 @@ mod tests {
             text.contains("- fg0001 | running | reviewer | reviewer #2 | needs attention"),
             "{text}"
         );
-        assert!(text.contains("  status: subagent({ action: \"status\", id: \"fg0001\" })"), "{text}");
+        assert!(
+            text.contains("  status: subagent({ action: \"status\", id: \"fg0001\" })"),
+            "{text}"
+        );
         assert!(
             text.contains("  Tail child transcript: subagent({ action: \"status\", id: \"<run-id>\", index: 0, view: \"transcript\" })"),
             "{text}"
@@ -942,7 +1055,8 @@ mod tests {
         status.current_step = Some(0);
         let paths = RunPaths::for_run(dir.path(), dir.path(), &status.run_id);
         std::fs::create_dir_all(&paths.run_dir).expect("mkdir");
-        std::fs::write(paths.step_output_log(0), "line one\nline two\nline three\n").expect("write");
+        std::fs::write(paths.step_output_log(0), "line one\nline two\nline three\n")
+            .expect("write");
 
         let text = format_async_run_transcript(&status, &paths, None, Some(2), &[]).unwrap();
         assert!(text.contains("Run: run1234"), "{text}");
@@ -950,7 +1064,10 @@ mod tests {
         assert!(text.contains("Artifacts:"), "{text}");
         assert!(text.contains("  line two"), "{text}");
         assert!(text.contains("  line three"), "{text}");
-        assert!(!text.contains("  line one"), "the 2-line limit must drop the oldest line: {text}");
+        assert!(
+            !text.contains("  line one"),
+            "the 2-line limit must drop the oldest line: {text}"
+        );
     }
 
     #[test]
@@ -970,7 +1087,10 @@ mod tests {
         let bare = status_with(vec![StepStatus::pending("alpha")]);
         let bare_paths = RunPaths::for_run(dir.path(), dir.path(), &bare.run_id);
         let text = format_async_run_transcript(&bare, &bare_paths, None, None, &[]).unwrap();
-        assert!(text.contains("(no transcript lines available yet)"), "{text}");
+        assert!(
+            text.contains("(no transcript lines available yet)"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -979,26 +1099,37 @@ mod tests {
         let outside = dir.path().join("secrets.jsonl");
         std::fs::write(&outside, "{\"role\":\"user\",\"content\":\"leak me\"}\n").expect("write");
         let (lines, warnings) = read_session_transcript_tail(&outside, 10, &[]);
-        assert!(lines.is_empty(), "no trusted root must mean no read: {lines:?}");
         assert!(
-            warnings.iter().any(|w| w.contains("without a trusted root")),
+            lines.is_empty(),
+            "no trusted root must mean no read: {lines:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("without a trusted root")),
             "{warnings:?}"
         );
 
-        let (lines, warnings) = read_session_transcript_tail(&outside, 10, &[dir.path().to_path_buf()]);
+        let (lines, warnings) =
+            read_session_transcript_tail(&outside, 10, &[dir.path().to_path_buf()]);
         assert_eq!(lines, vec!["user: leak me".to_string()], "{warnings:?}");
     }
 
     #[test]
     fn a_multi_step_run_with_no_index_emits_pis_child_hint() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut status = status_with(vec![StepStatus::pending("alpha"), StepStatus::pending("beta")]);
+        let mut status = status_with(vec![
+            StepStatus::pending("alpha"),
+            StepStatus::pending("beta"),
+        ]);
         status.current_step = None;
         status.state = RunState::Paused;
         let paths = RunPaths::for_run(dir.path(), dir.path(), &status.run_id);
         let text = format_async_run_transcript(&status, &paths, None, None, &[]).unwrap();
         assert!(
-            text.contains("Tip: pass index to inspect a specific child transcript (0=alpha, 1=beta)."),
+            text.contains(
+                "Tip: pass index to inspect a specific child transcript (0=alpha, 1=beta)."
+            ),
             "{text}"
         );
     }

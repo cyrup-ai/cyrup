@@ -42,19 +42,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-
 use cyrup_core::ModelId;
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
 use cyrup_ext_subagents::background::control::{InterruptRequest, StopRequest, TimeoutRequest};
 use cyrup_ext_subagents::background::runner_main::{RunnerConfig, RunnerOverrides, run_with};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::{ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus};
 use cyrup_ext_subagents::discovery::types::SystemPromptMode;
 use cyrup_ext_subagents::exec::ResolvedAgentPersona;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 use cyrup_ext_subagents::spawn::nested_events::{
-    NestedEventInput, NestedRoute, NestedRunSummary, create_nested_route_in,
-    write_nested_event_in,
+    NestedEventInput, NestedRoute, NestedRunSummary, create_nested_route_in, write_nested_event_in,
 };
 
 fn persona(name: &str) -> ResolvedAgentPersona {
@@ -113,10 +111,7 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
 /// create its run directory. Returns the descendant's async dir — the directory whose `control/`
 /// inbox the cascade must reach.
 fn register_live_descendant(roots: &Roots, route: &NestedRoute, child_id: &str) -> PathBuf {
-    let async_dir = roots
-        .nested_runs()
-        .join(&route.root_run_id)
-        .join(child_id);
+    let async_dir = roots.nested_runs().join(&route.root_run_id).join(child_id);
     std::fs::create_dir_all(&async_dir).expect("create the descendant's run dir");
 
     let mut child = NestedRunSummary {
@@ -188,8 +183,8 @@ struct Harness {
 /// Build a one-step background run that owns a nested route with one live descendant, and write its
 /// one-shot config to disk. Nothing is started yet — the caller plants a control request first.
 async fn build_run(dir: &Path, roots: &Roots, run_token: &str, child_id: &str) -> Harness {
-    let route = create_nested_route_in(&roots.nested_events(), run_token)
-        .expect("mint a nested route");
+    let route =
+        create_nested_route_in(&roots.nested_events(), run_token).expect("mint a nested route");
     let descendant_dir = register_live_descendant(roots, &route, child_id);
 
     let async_root = dir.join("async");
@@ -214,7 +209,10 @@ async fn build_run(dir: &Path, roots: &Roots, run_token: &str, child_id: &str) -
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id,
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "do the thing",
+        ))],
         cwd: dir.to_path_buf(),
         session_file: None,
         session_id: None,
@@ -284,7 +282,10 @@ async fn interrupting_a_background_run_cascades_to_its_live_async_descendants() 
     run_with(
         &harness.config_path,
         &harness.run_paths,
-        RunnerOverrides { roots: Some(roots.clone()), ..Default::default() },
+        RunnerOverrides {
+            roots: Some(roots.clone()),
+            ..Default::default()
+        },
     )
     .await
     .expect("run() never returns Err");
@@ -295,7 +296,10 @@ async fn interrupting_a_background_run_cascades_to_its_live_async_descendants() 
     assert_eq!(result.state, RunState::Paused);
 
     // The half this test exists for: the DESCENDANT's own control inbox.
-    let descendant_inbox = harness.descendant_dir.join("control").join("interrupt.json");
+    let descendant_inbox = harness
+        .descendant_dir
+        .join("control")
+        .join("interrupt.json");
     assert!(
         descendant_inbox.exists(),
         "the live async descendant at {} received no interrupt — it would keep running forever \
@@ -326,7 +330,12 @@ async fn a_delivered_timeout_request_fails_the_run_and_cascades_to_descendants()
     let harness = build_run(dir.path(), &roots, "cascadetmo1", "childtmo1").await;
 
     // What an ancestor whose own deadline expired drops into this run's inbox.
-    let inbox_dir = harness.run_paths.control_inbox.parent().unwrap().to_path_buf();
+    let inbox_dir = harness
+        .run_paths
+        .control_inbox
+        .parent()
+        .unwrap()
+        .to_path_buf();
     std::fs::create_dir_all(&inbox_dir).unwrap();
     let timeout_path = inbox_dir.join("timeout.json");
     write_atomic_json(
@@ -339,7 +348,10 @@ async fn a_delivered_timeout_request_fails_the_run_and_cascades_to_descendants()
     run_with(
         &harness.config_path,
         &harness.run_paths,
-        RunnerOverrides { roots: Some(roots.clone()), ..Default::default() },
+        RunnerOverrides {
+            roots: Some(roots.clone()),
+            ..Default::default()
+        },
     )
     .await
     .expect("run() never returns Err");
@@ -438,9 +450,8 @@ async fn a_delivered_stop_request_stops_the_run_and_cascades_to_descendants() {
     let harness = build_run(dir.path(), &roots, "cascadestp1", "childstp1").await;
 
     // Planted through the REAL parent-side primitive, so this covers the writer too.
-    let stop_path = cyrup_ext_subagents::background::control::stop_request_path(
-        &harness.run_paths.run_dir,
-    );
+    let stop_path =
+        cyrup_ext_subagents::background::control::stop_request_path(&harness.run_paths.run_dir);
     cyrup_ext_subagents::background::control::deliver_stop_request(
         &harness.run_paths.run_dir,
         "stop-action",
@@ -452,7 +463,10 @@ async fn a_delivered_stop_request_stops_the_run_and_cascades_to_descendants() {
     run_with(
         &harness.config_path,
         &harness.run_paths,
-        RunnerOverrides { roots: Some(roots.clone()), ..Default::default() },
+        RunnerOverrides {
+            roots: Some(roots.clone()),
+            ..Default::default()
+        },
     )
     .await
     .expect("run() never returns Err");
@@ -507,7 +521,11 @@ async fn a_delivered_stop_request_stops_the_run_and_cascades_to_descendants() {
     assert_eq!(delivered.source, "ancestor-stop");
     for downgrade in ["interrupt.json", "timeout.json"] {
         assert!(
-            !harness.descendant_dir.join("control").join(downgrade).exists(),
+            !harness
+                .descendant_dir
+                .join("control")
+                .join(downgrade)
+                .exists(),
             "a stop must not be downgraded into {downgrade} on the way down"
         );
     }

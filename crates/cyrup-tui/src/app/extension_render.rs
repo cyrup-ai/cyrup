@@ -67,20 +67,25 @@ pub async fn extension_render(
             if !ext_host.has_message_renderer(&kind) {
                 return Rendered::None;
             }
-            let Some(message) =
-                serde_json::to_value(ev).ok().and_then(|v| v.get("message").cloned())
+            let Some(message) = serde_json::to_value(ev)
+                .ok()
+                .and_then(|v| v.get("message").cloned())
             else {
                 return Rendered::None;
             };
             Which::Message(kind, message)
         }
-        AgentSessionEvent::ToolExecutionStart { tool_name, args, .. } => {
+        AgentSessionEvent::ToolExecutionStart {
+            tool_name, args, ..
+        } => {
             if !ext_host.has_tool_renderer(tool_name) {
                 return Rendered::None;
             }
             Which::ToolCall(tool_name.clone(), args.clone())
         }
-        AgentSessionEvent::ToolExecutionEnd { tool_name, result, .. } => {
+        AgentSessionEvent::ToolExecutionEnd {
+            tool_name, result, ..
+        } => {
             if !ext_host.has_tool_renderer(tool_name) {
                 return Rendered::None;
             }
@@ -123,7 +128,11 @@ pub async fn extension_render_entry(
     if !ext_host.has_entry_renderer(custom_type) {
         return crate::transcript::Rendered::None;
     }
-    run_renderer(ext_host, Which::Entry(custom_type.to_string(), entry.clone())).await
+    run_renderer(
+        ext_host,
+        Which::Entry(custom_type.to_string(), entry.clone()),
+    )
+    .await
 }
 
 /// The `customType` of a serialized session entry — the key an entry renderer is registered under
@@ -176,7 +185,9 @@ pub(crate) async fn run_renderer(
         match which {
             Which::Message(key, payload) => host.render_message_call_outcome(&key, &payload).await,
             Which::ToolCall(key, payload) => host.render_tool_call_outcome(&key, &payload).await,
-            Which::ToolResult(key, payload) => host.render_tool_result_outcome(&key, &payload).await,
+            Which::ToolResult(key, payload) => {
+                host.render_tool_result_outcome(&key, &payload).await
+            }
             Which::Entry(key, payload) => host.render_entry(&key, &payload).await,
         }
     });
@@ -261,7 +272,12 @@ pub(crate) fn flatten_widget(v: &serde_json::Value, depth: usize) -> Option<Stri
         Value::String(s) => Some(s.clone()),
         Value::Array(items) => flatten_children(items, depth, "\n"),
         Value::Object(o) => {
-            let text = || o.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+            let text = || {
+                o.get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
             let children = |sep: &str| match o.get("children") {
                 Some(Value::Array(items)) => flatten_children(items, depth, sep),
                 // A container with no children is an empty row, not an error (Pi's `Container`
@@ -289,7 +305,11 @@ pub(crate) fn flatten_widget(v: &serde_json::Value, depth: usize) -> Option<Stri
 /// Flatten every child, joining with `sep`. One unrecognized child fails the WHOLE tree so the
 /// caller's JSON fallback shows the guest's actual return rather than a half-rendered tree with a
 /// silently missing row.
-pub(crate) fn flatten_children(items: &[serde_json::Value], depth: usize, sep: &str) -> Option<String> {
+pub(crate) fn flatten_children(
+    items: &[serde_json::Value],
+    depth: usize,
+    sep: &str,
+) -> Option<String> {
     let mut out: Vec<String> = Vec::with_capacity(items.len());
     for item in items {
         out.push(flatten_widget(item, depth.saturating_add(1))?);
@@ -320,7 +340,12 @@ pub async fn extension_render_message(
     }
     // Same collapse as [`extension_render`]: `custom-message.ts:82-84` swallows the throw.
     // A LIVE component passes through so the replay can re-render it per frame.
-    match run_renderer(ext_host, Which::Message(custom_type.to_string(), payload.clone())).await {
+    match run_renderer(
+        ext_host,
+        Which::Message(custom_type.to_string(), payload.clone()),
+    )
+    .await
+    {
         Rendered::Failed(_) => Rendered::None,
         other => other,
     }

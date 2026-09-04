@@ -30,16 +30,16 @@ mod tools;
 #[cfg(test)]
 mod tests;
 
-pub use options::{MistralOptions, MistralPromptMode, MistralReasoningEffort};
 pub(crate) use driver::decode_stream;
+pub use options::{MistralOptions, MistralPromptMode, MistralReasoningEffort};
 
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::AuthResult;
 use crate::context::Context;
 use crate::error::ProviderError;
 use crate::model::Model;
-use crate::stream::sse::SseRequest;
 use crate::stream::StreamOptions;
+use crate::stream::sse::SseRequest;
 use crate::utils::provider_plumbing::connect_sse;
 use cyrup_core::{ApiId, CancelToken};
 use endpoint::{build_headers, resolve_url};

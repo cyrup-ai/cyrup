@@ -2,21 +2,21 @@
 //! the decoder state and the SSE frame loop.
 
 use super::blocks::{RBlock, project_block};
-use crate::api::content_cache::ContentCache;
 use super::errors::emit_error;
 use super::events::{ProcessResult, process_event};
 use super::slots::SlotKind;
 use crate::api::EventSink;
+use crate::api::content_cache::ContentCache;
 use crate::error::ProviderError;
 use crate::model::Model;
-use crate::stream::sse::SseFrame;
 use crate::stream::StreamEvent;
+use crate::stream::sse::SseFrame;
 use crate::utils::provider_plumbing::now_millis;
-use std::sync::Arc;
 use cyrup_core::{ApiId, AssistantMessage, StopReason, Usage};
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub(super) struct RDecoder {
     pub(super) blocks: Vec<RBlock>,

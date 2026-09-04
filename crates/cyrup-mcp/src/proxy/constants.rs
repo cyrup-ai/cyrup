@@ -3,10 +3,6 @@
 //!
 //! See [`crate::proxy`] for the module overview.
 
-
-
-
-
 // ==================================================================================================
 // 0 · Constants
 // ==================================================================================================
@@ -103,11 +99,15 @@ pub const MCP_TOOL_PROMPT_SNIPPET: &str =
 /// `guideline_keep_rule(...).unwrap_or(true)`, so a bullet matching no rule is *always kept*. A
 /// mismatched string therefore does not delete guidance — it silently disables the gating and leaves
 /// "use mcp …" in the system prompt after the `mcp` tool has been taken away (MCP-192).
-pub const MCP_TOOL_GUIDELINE: &str =
-    "Use mcp for MCP discovery first: search by capability, describe one exact tool name, then call it.";
+pub const MCP_TOOL_GUIDELINE: &str = "Use mcp for MCP discovery first: search by capability, describe one exact tool name, then call it.";
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -129,5 +129,4 @@ mod tests {
         );
         assert_eq!(MCP_TOOL_NAME, "mcp");
     }
-
 }

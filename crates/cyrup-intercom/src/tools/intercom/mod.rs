@@ -150,19 +150,33 @@ pub(super) async fn resolve_cwd_delivery_target(
     client: &crate::transport::client::IntercomClient,
     options: CwdDeliveryOptions<'_>,
 ) -> Result<DeliveryTarget, ToolError> {
-    let CwdDeliveryOptions { to, cwd, open_project_pane_if_missing, focus, cancel } = options;
+    let CwdDeliveryOptions {
+        to,
+        cwd,
+        open_project_pane_if_missing,
+        focus,
+        cancel,
+    } = options;
     let sessions = client.list_sessions().await.map_err(to_tool_err)?;
     // `if (!currentSessionId) throw new Error("Current session is not registered with intercom.")`
     let Some(current_session_id) = client.session_id() else {
-        return Err(ToolError::new("Current session is not registered with intercom."));
+        return Err(ToolError::new(
+            "Current session is not registered with intercom.",
+        ));
     };
     let Some(current_session) = sessions.iter().find(|s| s.id == current_session_id) else {
-        return Err(ToolError::new("Current session is missing from intercom session list."));
+        return Err(ToolError::new(
+            "Current session is missing from intercom session list.",
+        ));
     };
     let target_cwd = resolve_target_cwd(&current_session.cwd, cwd);
-    let existing =
-        crate::project_target::resolve_target_in_cwd(&sessions, &current_session_id, &target_cwd, to)
-            .map_err(ToolError::new)?;
+    let existing = crate::project_target::resolve_target_in_cwd(
+        &sessions,
+        &current_session_id,
+        &target_cwd,
+        to,
+    )
+    .map_err(ToolError::new)?;
     match existing {
         crate::project_target::ProjectTargetResolution::Found { session, .. } => {
             // `options.to || existing.session.name || existing.session.id` — JS `||`, so a blank
@@ -173,7 +187,11 @@ pub(super) async fn resolve_cwd_delivery_target(
                 .map(str::to_string)
                 .or_else(|| session.name.clone().filter(|n| !n.is_empty()))
                 .unwrap_or_else(|| session.id.clone());
-            Ok(DeliveryTarget { id: session.id.clone(), label, project_pane: None })
+            Ok(DeliveryTarget {
+                id: session.id.clone(),
+                label,
+                project_pane: None,
+            })
         }
         crate::project_target::ProjectTargetResolution::Missing { reason, .. } => {
             let launcher = state.project_pane_launcher();
@@ -233,9 +251,16 @@ pub(super) async fn resolve_cwd_delivery_target(
             // `{ id: session.id, label: session.name || session.id, projectPane }` (`:1542`) —
             // JS `||`, so a blank name falls through to the id. NOTE the label deliberately does
             // NOT consider `to` here, unlike the `found` arm.
-            let label =
-                session.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| session.id.clone());
-            Ok(DeliveryTarget { id: session.id, label, project_pane: Some(launch) })
+            let label = session
+                .name
+                .clone()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| session.id.clone());
+            Ok(DeliveryTarget {
+                id: session.id,
+                label,
+                project_pane: Some(launch),
+            })
         }
     }
 }
@@ -244,7 +269,10 @@ impl IntercomTool {
     /// Build the tool over the shared session state.
     #[must_use]
     pub fn new(state: Arc<SharedIntercomState>) -> Self {
-        Self { state, parameters: parameters_schema() }
+        Self {
+            state,
+            parameters: parameters_schema(),
+        }
     }
 
     /// The action switch (`v0.10.1 index.ts:1854-2271`).
@@ -252,13 +280,20 @@ impl IntercomTool {
     /// Every arm is one `action_*` handler in the module named for it; the shared prelude below is
     /// all this function computes for them. `cancel` is threaded to `ask` alone — it is the only
     /// blocking action and so the only arm with a wait to abort (`v0.10.1 index.ts:2144-2153`).
-    async fn dispatch(&self, params: IntercomParams, cancel: &CancelToken) -> Result<ToolResult, ToolError> {
+    async fn dispatch(
+        &self,
+        params: IntercomParams,
+        cancel: &CancelToken,
+    ) -> Result<ToolResult, ToolError> {
         // pi routes every tool call through `ensureConnected("tool")` (`index.ts:1477`), not a bare
         // `client` read: a tool call is worth (re)spawning the broker and reconnecting for, so a
         // single earlier connection failure does not make this tool permanently useless.
-        let client = crate::connect::ensure_connected(&self.state, crate::connect::ConnectReason::Tool)
-            .await
-            .map_err(|e| ToolError::new(format!("intercom is not connected to the broker: {e}")))?;
+        let client =
+            crate::connect::ensure_connected(&self.state, crate::connect::ConnectReason::Tool)
+                .await
+                .map_err(|e| {
+                    ToolError::new(format!("intercom is not connected to the broker: {e}"))
+                })?;
         // `v0.10.1 index.ts:1853`: `syncPresenceIdentity(ctx.sessionManager.getSessionId())`
         // immediately after `ensureConnected("tool")` and before the action `match`. One of pi's
         // three name-sync points; without it a session renamed by `/name`, a branch switch or a
@@ -276,7 +311,9 @@ impl IntercomTool {
             "reply" => self.action_reply(&params, &client).await,
             "pending" => self.action_pending(&params, &client).await,
             "status" => self.action_status(&params, &client).await,
-            other => Err(ToolError::new(format!("unknown intercom action \"{other}\""))),
+            other => Err(ToolError::new(format!(
+                "unknown intercom action \"{other}\""
+            ))),
         }
     }
 }
@@ -295,7 +332,11 @@ pub(super) fn to_tool_err(e: crate::error::IntercomError) -> ToolError {
 /// `session.name || session.id` (`index.ts:1720,1726`). JS `||` is falsy-based, so an empty name
 /// falls through to the id — hence the `filter(|n| !n.is_empty())`.
 pub(super) fn display_name(session: &SessionInfo) -> &str {
-    session.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&session.id)
+    session
+        .name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .unwrap_or(&session.id)
 }
 
 /// `formatSessionListRow` (`v0.10.1 index.ts:448-453`, 6 lines):
@@ -347,7 +388,11 @@ pub(super) fn format_session_list_row(
     if let Some(status) = &session.status {
         tags.push(status.clone());
     }
-    let suffix = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
+    let suffix = if tags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", tags.join(", "))
+    };
     // `const pane = session.tmuxPane ? ` · tmux ${session.tmuxPane}` : ""` (`v0.12.0 index.ts:551`).
     // Same empty-string-means-omitted contract [`format_context_usage`] already uses: a session
     // outside tmux renders byte-for-byte the pre-v0.11.0 row — no column, no placeholder, no
@@ -488,7 +533,12 @@ impl Tool for IntercomTool {
 /// nothing else. Neither spawns a binary, so neither is a seam test.
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use crate::identity::short_session_id;
     use crate::transport::protocol::{Message, MessageContent, now_ms};
@@ -512,7 +562,11 @@ mod tests {
             std::path::PathBuf::from("/w"),
         )));
 
-        assert_eq!(tool.label(), Some("Intercom"), "`v0.10.1 index.ts:1781` `label: \"Intercom\"`");
+        assert_eq!(
+            tool.label(),
+            Some("Intercom"),
+            "`v0.10.1 index.ts:1781` `label: \"Intercom\"`"
+        );
         assert_eq!(
             tool.prompt_snippet(),
             Some(
@@ -550,7 +604,9 @@ mod tests {
         // existing action to add `cancel` is red too.
         assert_eq!(
             actions,
-            vec!["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"],
+            vec![
+                "list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"
+            ],
             "`v0.10.1 index.ts:1810-1812` — pi's enum, in pi's order, with `cancel` last"
         );
         for (key, needle) in [
@@ -589,7 +645,10 @@ mod tests {
             .iter()
             .map(|c| {
                 let who = c.from.name.clone().unwrap_or_else(|| c.from.id.clone());
-                format!("- {} · {} · 0s ago · {}", who, c.message.id, c.message.content.text)
+                format!(
+                    "- {} · {} · 0s ago · {}",
+                    who, c.message.id, c.message.content.text
+                )
             })
             .collect();
         let rendered = format!("**Pending asks:**\n{}", rows.join("\n"));
@@ -616,7 +675,10 @@ mod tests {
             .take(80)
             .collect();
         assert_eq!(preview.chars().count(), 80, "sliced to 80 chars");
-        assert!(preview.starts_with("word spaced out "), "whitespace collapsed: {preview:?}");
+        assert!(
+            preview.starts_with("word spaced out "),
+            "whitespace collapsed: {preview:?}"
+        );
         assert!(!preview.contains('\n') && !preview.contains('\t'));
     }
 
@@ -638,7 +700,10 @@ mod tests {
         let row_b = format_session_list_row(&b, "/w", false, prefixes.get(&b.id).expect("b"));
         assert!(row_a.contains("(0192f3c1-9a10-7000-8000-a)"), "{row_a}");
         assert!(row_b.contains("(0192f3c1-9a10-7000-8000-b)"), "{row_b}");
-        assert_ne!(row_a, row_b, "two peers must not print the same addressable id");
+        assert_ne!(
+            row_a, row_b,
+            "two peers must not print the same addressable id"
+        );
         // The fixed 8-char slice — which upstream deliberately KEPT for the picker label
         // (`formatSessionLabel`, `v0.10.1 index.ts:440-446`) — would have collided.
         assert_eq!(short_session_id(&a.id), short_session_id(&b.id));
@@ -672,7 +737,10 @@ mod tests {
     #[test]
     fn cwd_delivery_label_falls_through_blank_to_and_blank_name() {
         let label = |to: Option<&str>, name: Option<&str>| {
-            let peer = SessionInfo { name: name.map(str::to_string), ..session("peer-1", "/w/proj") };
+            let peer = SessionInfo {
+                name: name.map(str::to_string),
+                ..session("peer-1", "/w/proj")
+            };
             to.map(str::trim)
                 .filter(|t| !t.is_empty())
                 .map(str::to_string)
@@ -698,7 +766,10 @@ mod tests {
     async fn fake_broker(
         self_id: &str,
         sessions: Vec<SessionInfo>,
-    ) -> (Arc<crate::transport::client::IntercomClient>, tempfile::TempDir) {
+    ) -> (
+        Arc<crate::transport::client::IntercomClient>,
+        tempfile::TempDir,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         use crate::transport::framing::{FrameReader, encode_json};
@@ -802,9 +873,18 @@ mod tests {
     #[tokio::test]
     async fn list_cwd_filters_the_roster_to_one_directory_and_points_back_when_it_is_empty() {
         let roster = vec![
-            SessionInfo { name: Some("me".to_string()), ..session("self-1", "/w/proj") },
-            SessionInfo { name: Some("peer-here".to_string()), ..session("s-here", "/w/proj") },
-            SessionInfo { name: Some("peer-there".to_string()), ..session("s-there", "/w/other") },
+            SessionInfo {
+                name: Some("me".to_string()),
+                ..session("self-1", "/w/proj")
+            },
+            SessionInfo {
+                name: Some("peer-here".to_string()),
+                ..session("s-here", "/w/proj")
+            },
+            SessionInfo {
+                name: Some("peer-there".to_string()),
+                ..session("s-there", "/w/other")
+            },
         ];
         let (client, _dir) = fake_broker("self-1", roster).await;
         let tool = tool();
@@ -812,13 +892,25 @@ mod tests {
         // No `cwd`: `"."`, i.e. the current session's own broker-reported cwd.
         let here = result_text(
             &tool
-                .action_list_cwd(&action(serde_json::json!({ "action": "list-cwd" })), &client)
+                .action_list_cwd(
+                    &action(serde_json::json!({ "action": "list-cwd" })),
+                    &client,
+                )
                 .await
                 .expect("list-cwd answers"),
         );
-        assert!(here.contains("**Other sessions (cwd: /w/proj):**"), "{here}");
-        assert!(here.contains("peer-here"), "the peer in this cwd is listed: {here}");
-        assert!(!here.contains("peer-there"), "the peer in another cwd is filtered out: {here}");
+        assert!(
+            here.contains("**Other sessions (cwd: /w/proj):**"),
+            "{here}"
+        );
+        assert!(
+            here.contains("peer-here"),
+            "the peer in this cwd is listed: {here}"
+        );
+        assert!(
+            !here.contains("peer-there"),
+            "the peer in another cwd is filtered out: {here}"
+        );
         assert!(here.starts_with("**Current session:**\n• me ("), "{here}");
 
         // An explicit absolute `cwd` overrides the default.
@@ -831,7 +923,10 @@ mod tests {
                 .await
                 .expect("list-cwd answers"),
         );
-        assert!(there.contains("**Other sessions (cwd: /w/other):**"), "{there}");
+        assert!(
+            there.contains("**Other sessions (cwd: /w/other):**"),
+            "{there}"
+        );
         assert!(there.contains("peer-there"), "{there}");
         assert!(!there.contains("• peer-here"), "{there}");
 
@@ -865,7 +960,12 @@ mod tests {
         let tool = tool();
         let params = action(serde_json::json!({ "action": "pending" }));
 
-        let empty = result_text(&tool.action_pending(&params, &client).await.expect("pending answers"));
+        let empty = result_text(
+            &tool
+                .action_pending(&params, &client)
+                .await
+                .expect("pending answers"),
+        );
         assert_eq!(empty, "No unresolved inbound asks.", "the empty branch");
 
         {
@@ -876,11 +976,26 @@ mod tests {
             tracker.record_incoming_message(session("s1", "/w/proj"), ask_message("m-second"), now);
         }
 
-        let rows = result_text(&tool.action_pending(&params, &client).await.expect("pending answers"));
-        assert!(rows.starts_with("**Pending asks:**\n"), "pi's header: {rows}");
-        assert_eq!(rows.lines().count(), 3, "header plus one row per ask: {rows}");
+        let rows = result_text(
+            &tool
+                .action_pending(&params, &client)
+                .await
+                .expect("pending answers"),
+        );
+        assert!(
+            rows.starts_with("**Pending asks:**\n"),
+            "pi's header: {rows}"
+        );
+        assert_eq!(
+            rows.lines().count(),
+            3,
+            "header plus one row per ask: {rows}"
+        );
         for id in ["m-first", "m-second"] {
-            assert!(rows.contains(&format!("- s1 · {id} · 0s ago · hi")), "{rows}");
+            assert!(
+                rows.contains(&format!("- s1 · {id} · 0s ago · hi")),
+                "{rows}"
+            );
         }
     }
 
@@ -911,7 +1026,11 @@ mod tests {
             timestamp: now_ms().into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: "hi".to_string(), attachments: None, ..Default::default() },
+            content: MessageContent {
+                text: "hi".to_string(),
+                attachments: None,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }

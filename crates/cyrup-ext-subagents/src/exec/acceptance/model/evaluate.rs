@@ -7,10 +7,17 @@ use serde_json::Value;
 
 use super::checks::{check_criteria_satisfied, run_structural_checks};
 use super::prompt::acceptance_requires_child_report;
-use super::report::parse::{parse_acceptance_report_sources, ACCEPTANCE_REPORT_NOT_FOUND, ParsedAcceptanceReport};
+use super::report::parse::{
+    ACCEPTANCE_REPORT_NOT_FOUND, ParsedAcceptanceReport, parse_acceptance_report_sources,
+};
 use super::report::validate::validate_acceptance_report;
-use super::types::{level_rank, AcceptanceEvidenceStatus, AcceptanceLedger, AcceptanceLedgerStatus, AcceptanceLevel, AcceptanceReport, AcceptanceReviewResult, AcceptanceRuntimeCheck, ResolvedAcceptanceConfig, ReviewFinding, ReviewFindingSeverity, ReviewResultStatus, ReviewSetting, RuntimeCheckStatus, SerializableGate, VerifyRunStatus};
-use super::verify::memo::{run_memoized_verify_command, VerifyMemoContext};
+use super::types::{
+    AcceptanceEvidenceStatus, AcceptanceLedger, AcceptanceLedgerStatus, AcceptanceLevel,
+    AcceptanceReport, AcceptanceReviewResult, AcceptanceRuntimeCheck, ResolvedAcceptanceConfig,
+    ReviewFinding, ReviewFindingSeverity, ReviewResultStatus, ReviewSetting, RuntimeCheckStatus,
+    SerializableGate, VerifyRunStatus, level_rank,
+};
+use super::verify::memo::{VerifyMemoContext, run_memoized_verify_command};
 
 // --------------------------------------------------------------------------------------------
 // evaluateAcceptance / acceptanceFailureMessage (acceptance.ts:769-856)
@@ -60,7 +67,11 @@ pub async fn evaluate_acceptance(input: EvaluateAcceptanceInput<'_>) -> Acceptan
         evidence_status: initial_status,
         explicit: acceptance.explicit,
         inferred_reason: acceptance.inferred_reason.clone(),
-        criteria: acceptance.criteria.iter().map(SerializableGate::from_gate).collect(),
+        criteria: acceptance
+            .criteria
+            .iter()
+            .map(SerializableGate::from_gate)
+            .collect(),
         child_report: Option::None,
         child_report_parse_error: Option::None,
         runtime_checks: Vec::new(),
@@ -196,7 +207,10 @@ pub async fn evaluate_acceptance(input: EvaluateAcceptanceInput<'_>) -> Acceptan
         }
         ledger.verify_runs = runs;
         if ledger.verify_runs.iter().any(|run| {
-            matches!(run.status, VerifyRunStatus::Failed | VerifyRunStatus::TimedOut)
+            matches!(
+                run.status,
+                VerifyRunStatus::Failed | VerifyRunStatus::TimedOut
+            )
         }) {
             ledger.status = AcceptanceLedgerStatus::Rejected;
             ledger.evidence_status = AcceptanceEvidenceStatus::Rejected;
@@ -285,11 +299,12 @@ pub fn acceptance_failure_message(ledger: &AcceptanceLedger) -> Option<String> {
     {
         return Some(format!("Acceptance rejected: {}", check.message));
     }
-    if let Some(run) = ledger
-        .verify_runs
-        .iter()
-        .find(|r| matches!(r.status, VerifyRunStatus::Failed | VerifyRunStatus::TimedOut))
-    {
+    if let Some(run) = ledger.verify_runs.iter().find(|r| {
+        matches!(
+            r.status,
+            VerifyRunStatus::Failed | VerifyRunStatus::TimedOut
+        )
+    }) {
         let status = match run.status {
             VerifyRunStatus::Failed => "failed",
             VerifyRunStatus::TimedOut => "timed-out",
@@ -301,9 +316,7 @@ pub fn acceptance_failure_message(ledger: &AcceptanceLedger) -> Option<String> {
     // review status no longer exists, and its successor (`review-required`) is not a REJECTED
     // ledger, so it never reaches this function at all.
     match ledger.review_result.as_ref().map(|r| r.status) {
-        Some(ReviewResultStatus::Blockers) => {
-            Some("Acceptance review found blockers.".to_string())
-        }
+        Some(ReviewResultStatus::Blockers) => Some("Acceptance review found blockers.".to_string()),
         _ => Some("Acceptance rejected.".to_string()),
     }
 }
@@ -327,7 +340,6 @@ mod tests {
     use crate::exec::acceptance::model::types::AcceptanceReviewGate;
     use crate::exec::acceptance::model::types::CriterionInput;
     use serde_json::json;
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn report_optional_does_not_reject_a_merely_absent_report() {
@@ -361,7 +373,6 @@ mod tests {
         assert!(acceptance_failure_message(&ledger).is_none());
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_same_absent_report_still_rejects_when_the_caller_is_not_report_optional() {
         // The control for the test above: only `report_optional` changes.
@@ -383,7 +394,6 @@ mod tests {
         assert_eq!(ledger.runtime_checks.len(), 1);
         assert_eq!(ledger.runtime_checks[0].id, "attestation");
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn report_optional_still_records_a_check_when_the_report_was_present_but_broken() {
@@ -413,7 +423,6 @@ mod tests {
         assert_eq!(ledger.status, AcceptanceLedgerStatus::Rejected);
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn checked_mode_rejects_missing_required_evidence() {
         let dir = temp_dir();
@@ -442,7 +451,11 @@ mod tests {
         })
         .await;
         assert_eq!(ledger.status, AcceptanceLedgerStatus::Rejected);
-        assert!(acceptance_failure_message(&ledger).unwrap().contains("tests-added evidence missing"));
+        assert!(
+            acceptance_failure_message(&ledger)
+                .unwrap()
+                .contains("tests-added evidence missing")
+        );
     }
 
     /// SUBA-076, the other side of the same coin at LEDGER level: a child that honestly reports an
@@ -481,12 +494,12 @@ mod tests {
             ledger.runtime_checks.iter().any(|check| {
                 check.id == "evidence:tests-added"
                     && check.status == RuntimeCheckStatus::NotApplicable
-                    && check.message == "tests-added evidence explicitly reported as not applicable."
+                    && check.message
+                        == "tests-added evidence explicitly reported as not applicable."
             }),
             "the check must be RECORDED as not-applicable, not quietly dropped: {ledger:?}"
         );
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn checked_mode_rejects_not_satisfied_required_criteria() {
@@ -521,11 +534,12 @@ mod tests {
         })
         .await;
         assert_eq!(ledger.status, AcceptanceLedgerStatus::Rejected);
-        assert!(acceptance_failure_message(&ledger)
-            .unwrap()
-            .contains("Required criterion 'regression' was reported as not-satisfied"));
+        assert!(
+            acceptance_failure_message(&ledger)
+                .unwrap()
+                .contains("Required criterion 'regression' was reported as not-satisfied")
+        );
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     /// G78 — a dynamic-fanout run whose inference recommends review. v0.34.0 escalated the
@@ -576,7 +590,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     /// G78 — no reviewer result can ever be invented from the child's own evidence. With the
     /// gate explicitly switched OFF (`review: false`, which is falsy at `acceptance.ts:1318`)
@@ -612,7 +625,6 @@ mod tests {
         assert!(acceptance_failure_message(&ledger).is_none());
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn zero_child_aggregate_reports_do_not_fabricate_required_evidence() {
         let dir = temp_dir();
@@ -639,13 +651,19 @@ mod tests {
         assert_eq!(ledger.status, AcceptanceLedgerStatus::Rejected);
         let msg = acceptance_failure_message(&ledger).unwrap();
         assert!(
-            ["criterion", "changed-files", "tests-added", "commands-run", "validation-output", "no-staged-files"]
-                .iter()
-                .any(|needle| msg.contains(needle)),
+            [
+                "criterion",
+                "changed-files",
+                "tests-added",
+                "commands-run",
+                "validation-output",
+                "no-staged-files"
+            ]
+            .iter()
+            .any(|needle| msg.contains(needle)),
             "unexpected message: {msg}"
         );
     }
-
 
     /// G78 — `acceptance.ts:1325`: `else if (acceptance.review.required !== false)`. The gate
     /// parks the ledger at `review-required` unless `required` is EXPLICITLY `false`, so a gate
@@ -711,7 +729,6 @@ mod tests {
         // `review-required` is not a rejection.
         assert!(acceptance_failure_message(&ledger).is_none());
     }
-
 
     /// G78 — `resolveEffectiveAcceptance`'s review resolution, `acceptance.ts:389`:
     /// `explicit.review !== undefined ? explicit.review : inferred.review`. An authored
@@ -794,7 +811,6 @@ mod tests {
         assert_eq!(ledger.review_result, None);
     }
 
-
     /// G79 — `validateStringArrayField`'s v0.43.0 tightening (`acceptance.ts:827` added
     /// `|| !item.trim()`): a BLANK entry is no longer admissible evidence.
     ///
@@ -864,5 +880,4 @@ mod tests {
             "{ledger:?}"
         );
     }
-
 }

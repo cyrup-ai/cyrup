@@ -30,10 +30,10 @@ use std::time::{Duration, Instant};
 
 use cyrup_core::{AssistantMessage, Content, Message, StopReason, Usage};
 use cyrup_ext::host::HostServices;
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::{ResultFile, RunId, RunMode, RunState};
 use cyrup_ext_subagents::extension::SubagentExecutor;
 use cyrup_ext_subagents::fork_context::ContextMode;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_session::{NewSessionOpts, SessionLayout, SessionManager};
 
 /// The sandbox root for one test, handed to the executor as `SubagentExtensionConfig::roots`.
@@ -63,7 +63,10 @@ fn assistant(s: &str) -> Message {
 }
 
 fn user(s: &str) -> Message {
-    Message::User { content: vec![Content::text(s)], timestamp: 0 }
+    Message::User {
+        content: vec![Content::text(s)],
+        timestamp: 0,
+    }
 }
 
 /// A `HostServices` backend that returns a fixed `session_file()` — the seam blocker #4 consumes.
@@ -79,10 +82,17 @@ impl HostServices for SessionFileServices {
 
 /// Create one persisted parent session under `layout` (a user + assistant message → a real leaf +
 /// on-disk JSONL), returning its persisted file path + its session id.
-fn create_persisted_session(cwd: &std::path::Path, layout: &SessionLayout, marker: &str) -> (PathBuf, String) {
-    let mut mgr = SessionManager::create(cwd, layout, NewSessionOpts::default()).expect("create session");
-    mgr.append_message(user(&format!("hello {marker}"))).expect("append user");
-    mgr.append_message(assistant(&format!("hi from {marker}"))).expect("append assistant");
+fn create_persisted_session(
+    cwd: &std::path::Path,
+    layout: &SessionLayout,
+    marker: &str,
+) -> (PathBuf, String) {
+    let mut mgr =
+        SessionManager::create(cwd, layout, NewSessionOpts::default()).expect("create session");
+    mgr.append_message(user(&format!("hello {marker}")))
+        .expect("append user");
+    mgr.append_message(assistant(&format!("hi from {marker}")))
+        .expect("append assistant");
     let file = mgr.session_file().expect("session persisted").to_path_buf();
     let id = mgr.session_id().to_string();
     (file, id)
@@ -94,7 +104,6 @@ fn create_persisted_session(cwd: &std::path::Path, layout: &SessionLayout, marke
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_branches_from_the_real_session_file_handle_not_the_mtime_heuristic() {
-
     let home = tempfile::tempdir().expect("home tempdir");
     let cwd_dir = tempfile::tempdir().expect("cwd tempdir");
     let cwd = cwd_dir.path();
@@ -113,7 +122,9 @@ async fn fork_branches_from_the_real_session_file_handle_not_the_mtime_heuristic
 
     // Bind a HostServices whose session_file() is the OLDER session A, then resolve a fork.
     let executor = SubagentExecutor::with_config(sandboxed(home.path()));
-    executor.set_host_services(Arc::new(SessionFileServices { session_file: file_a.clone() }));
+    executor.set_host_services(Arc::new(SessionFileServices {
+        session_file: file_a.clone(),
+    }));
 
     let fork = executor
         // SUBA-075: `force_thinking_off` — this fixture resolves no model ladder, which is the
@@ -122,11 +133,17 @@ async fn fork_branches_from_the_real_session_file_handle_not_the_mtime_heuristic
         .await
         .expect("fork resolves against the real session_file handle");
 
-    let branch_path = fork.session_file_path.expect("a fork produces a concrete branch file");
+    let branch_path = fork
+        .session_file_path
+        .expect("a fork produces a concrete branch file");
     let reopened = SessionManager::open(&branch_path).expect("reopen the branched session");
     // `create_branched_session` records the parent's provenance on the branch header (the parent's
     // own session file, whose name embeds the parent session id) — pi lineage (R-SA-143).
-    let parent = reopened.header().parent_session.clone().expect("branch records its parent");
+    let parent = reopened
+        .header()
+        .parent_session
+        .clone()
+        .expect("branch records its parent");
 
     assert!(
         parent.contains(&id_a),
@@ -159,10 +176,12 @@ impl HostServices for RecordingInjectServices {
         _details: Option<&serde_json::Value>,
         trigger_turn: bool,
     ) -> Result<(), String> {
-        self.calls
-            .lock()
-            .expect("inject lock")
-            .push((content.to_string(), custom_type.map(str::to_string), display, trigger_turn));
+        self.calls.lock().expect("inject lock").push((
+            content.to_string(),
+            custom_type.map(str::to_string),
+            display,
+            trigger_turn,
+        ));
         Ok(())
     }
 }
@@ -183,7 +202,6 @@ fn completed_result(run_id: &str) -> ResultFile {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_completion_injects_a_turn_triggering_message_on_the_real_host_services() {
-
     let home = tempfile::tempdir().expect("home tempdir");
     let cwd_dir = tempfile::tempdir().expect("cwd tempdir");
     let cwd = cwd_dir.path();
@@ -194,11 +212,16 @@ async fn background_completion_injects_a_turn_triggering_message_on_the_real_hos
     let results_dir =
         cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd)
             .results_dir;
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
-    let result_path = results_dir.join("run-notify-e.json");
-    cyrup_ext_subagents::background::atomic::write_atomic_json(&result_path, &completed_result("runproofe000000e"))
+    tokio::fs::create_dir_all(&results_dir)
         .await
-        .expect("write result");
+        .expect("mkdir results_dir");
+    let result_path = results_dir.join("run-notify-e.json");
+    cyrup_ext_subagents::background::atomic::write_atomic_json(
+        &result_path,
+        &completed_result("runproofe000000e"),
+    )
+    .await
+    .expect("write result");
 
     // Bind the recording HostServices (P-1) into the executor, exactly as the builder's
     // `load_native_with_services` does in production, then install the REAL completion watcher —
@@ -216,16 +239,29 @@ async fn background_completion_injects_a_turn_triggering_message_on_the_real_hos
             break;
         }
         if Instant::now() >= deadline {
-            panic!("inject_message never fired: the completion did not reach the live host services");
+            panic!(
+                "inject_message never fired: the completion did not reach the live host services"
+            );
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
     let calls = services.calls.lock().expect("lock");
-    assert_eq!(calls.len(), 1, "exactly one live injection for one completion, got: {calls:?}");
+    assert_eq!(
+        calls.len(),
+        1,
+        "exactly one live injection for one completion, got: {calls:?}"
+    );
     let (content, custom_type, display, trigger_turn) = &calls[0];
-    assert!(trigger_turn, "R-SA-101: the completion MUST re-enter the parent turn loop (trigger_turn=true)");
-    assert_eq!(custom_type.as_deref(), Some("subagent-notify"), "pi's fixed customType");
+    assert!(
+        trigger_turn,
+        "R-SA-101: the completion MUST re-enter the parent turn loop (trigger_turn=true)"
+    );
+    assert_eq!(
+        custom_type.as_deref(),
+        Some("subagent-notify"),
+        "pi's fixed customType"
+    );
     assert!(display, "pi's fixed display=true");
     assert!(
         content.contains("Background task completed") && content.contains("researcher"),

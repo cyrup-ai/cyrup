@@ -34,8 +34,12 @@ const SKIP: [&str; 2] = ["comment", "heredoc_end"];
 ///
 /// `echo hi > $(rm x)` parses with `file_redirect` as a SIBLING of the `command`, so a walker that
 /// abandons redirects never sees the substitution — the bypass pi #741 fixed.
-const EXECUTION_HOSTS: [&str; 4] =
-    ["file_redirect", "heredoc_redirect", "herestring_redirect", "heredoc_body"];
+const EXECUTION_HOSTS: [&str; 4] = [
+    "file_redirect",
+    "heredoc_redirect",
+    "herestring_redirect",
+    "heredoc_body",
+];
 
 /// The two node types whose interior commands really execute (pi `NESTED_EXECUTION_CONTEXTS`,
 /// `nested-execution.ts:17-23`). `subshell` is deliberately absent — it is a command unit in its
@@ -99,7 +103,10 @@ pub fn collect_commands(root: Node<'_>, src: &str) -> Option<Vec<BashCommand>> {
                 }
 
                 if node.kind() == "command" {
-                    out.push(BashCommand { text: unit_text(node, src)?.to_string(), context });
+                    out.push(BashCommand {
+                        text: unit_text(node, src)?.to_string(),
+                        context,
+                    });
                     // The command's own text already contains any substitution; descend anyway to
                     // ALSO emit the inner commands as units of their own.
                     stack.push(Work::FindNested(node));
@@ -112,7 +119,10 @@ pub fn collect_commands(root: Node<'_>, src: &str) -> Option<Vec<BashCommand>> {
                 }
 
                 if node.kind() == "subshell" {
-                    out.push(BashCommand { text: node_text(node, src)?.to_string(), context });
+                    out.push(BashCommand {
+                        text: node_text(node, src)?.to_string(),
+                        context,
+                    });
                     push_children(&mut stack, node, Some(BashCommandContext::Subshell));
                     continue;
                 }
@@ -124,12 +134,17 @@ pub fn collect_commands(root: Node<'_>, src: &str) -> Option<Vec<BashCommand>> {
 
                 // Any other named statement (compound_statement, if/while/for/case, function
                 // definition): emit whole, do not descend.
-                out.push(BashCommand { text: node_text(node, src)?.to_string(), context });
+                out.push(BashCommand {
+                    text: node_text(node, src)?.to_string(),
+                    context,
+                });
             }
 
             Work::FindNested(node) => {
                 for index in (0..node.child_count()).rev() {
-                    let Some(child) = node.child(index) else { continue };
+                    let Some(child) = node.child(index) else {
+                        continue;
+                    };
                     match nested_context(child.kind()) {
                         // Do not descend past the context: enumerate its interior as commands.
                         Some(context) => push_children(&mut stack, child, Some(context)),
@@ -166,7 +181,9 @@ fn node_text<'a>(node: Node<'_>, src: &'a str) -> Option<&'a str> {
 /// preserve spacing. A pure assignment with no `command_name` runs nothing and is returned whole.
 fn unit_text<'a>(node: Node<'_>, src: &'a str) -> Option<&'a str> {
     for index in 0..node.child_count() {
-        let Some(child) = node.child(index) else { continue };
+        let Some(child) = node.child(index) else {
+            continue;
+        };
         if child.is_named() && child.kind() != "variable_assignment" {
             return src.get(child.start_byte()..node.end_byte());
         }
@@ -213,7 +230,10 @@ mod tests {
         );
         assert_eq!(
             units("( rm b )"),
-            vec![("( rm b )".to_string(), None), ("rm b".to_string(), Some(Subshell))]
+            vec![
+                ("( rm b )".to_string(), None),
+                ("rm b".to_string(), Some(Subshell))
+            ]
         );
         // A current-shell command carries no context.
         assert_eq!(units("echo hi"), vec![("echo hi".to_string(), None)]);
@@ -242,12 +262,25 @@ mod tests {
         // plus the innermost `rm x`.
         let nested = format!("{}rm x{}", "$(".repeat(DEPTH), ")".repeat(DEPTH));
         let u = units(&nested);
-        assert_eq!(u.len(), DEPTH + 1, "one unit per nesting level plus the innermost command");
-        assert_eq!(u[u.len() - 1], ("rm x".to_string(), Some(BashCommandContext::CommandSubstitution)));
+        assert_eq!(
+            u.len(),
+            DEPTH + 1,
+            "one unit per nesting level plus the innermost command"
+        );
+        assert_eq!(
+            u[u.len() - 1],
+            (
+                "rm x".to_string(),
+                Some(BashCommandContext::CommandSubstitution)
+            )
+        );
 
         // A DEPTH-element `&&` chain — `list` nodes nest left-recursively, so this is also ~DEPTH
         // levels deep even though it reads as flat.
-        let chain = (0..DEPTH).map(|i| format!("echo {i}")).collect::<Vec<_>>().join(" && ");
+        let chain = (0..DEPTH)
+            .map(|i| format!("echo {i}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
         let u = units(&chain);
         assert_eq!(u.len(), DEPTH, "every command in the chain is its own unit");
         assert_eq!(u[0].0, "echo 0");

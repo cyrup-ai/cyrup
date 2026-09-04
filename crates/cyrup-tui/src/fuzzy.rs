@@ -36,7 +36,9 @@ fn match_query(query: &[char], text: &[char]) -> Option<f64> {
     let mut consecutive_matches: i64 = 0;
 
     for (i, &tc) in text.iter().enumerate() {
-        let Some(&qc) = query.get(query_index) else { break };
+        let Some(&qc) = query.get(query_index) else {
+            break;
+        };
         if tc != qc {
             continue;
         }
@@ -102,14 +104,18 @@ fn swapped_query(query: &[char]) -> Option<Vec<char>> {
     // `^[a-z]+[0-9]+$`: letters then digits → digits then letters.
     if lead_alpha > 0
         && lead_alpha < query.len()
-        && query.get(lead_alpha..).is_some_and(|rest| rest.iter().all(is_digit))
+        && query
+            .get(lead_alpha..)
+            .is_some_and(|rest| rest.iter().all(is_digit))
     {
         return build(lead_alpha);
     }
     // `^[0-9]+[a-z]+$`: digits then letters → letters then digits.
     if lead_digit > 0
         && lead_digit < query.len()
-        && query.get(lead_digit..).is_some_and(|rest| rest.iter().all(is_alpha))
+        && query
+            .get(lead_digit..)
+            .is_some_and(|rest| rest.iter().all(is_alpha))
     {
         return build(lead_digit);
     }
@@ -141,7 +147,10 @@ pub fn score(candidate: &str, query: &str) -> Option<f64> {
 /// An empty/whitespace query keeps every item in original order. The sort is stable, so equal totals
 /// preserve input order — matching Pi's stable `Array.sort`.
 pub fn filter<T>(items: &[T], query: &str, key: impl Fn(&T) -> &str) -> Vec<Match> {
-    let tokens: Vec<&str> = query.split(|c: char| c.is_whitespace() || c == '/').filter(|t| !t.is_empty()).collect();
+    let tokens: Vec<&str> = query
+        .split(|c: char| c.is_whitespace() || c == '/')
+        .filter(|t| !t.is_empty())
+        .collect();
     if tokens.is_empty() {
         return items
             .iter()
@@ -165,7 +174,10 @@ pub fn filter<T>(items: &[T], query: &str, key: impl Fn(&T) -> &str) -> Vec<Matc
             }
         }
         if all_match {
-            matches.push(Match { index, score: total });
+            matches.push(Match {
+                index,
+                score: total,
+            });
         }
     }
     // Stable ascending sort (lower score first); equal scores keep input order.

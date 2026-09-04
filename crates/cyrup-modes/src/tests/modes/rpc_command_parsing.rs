@@ -14,7 +14,11 @@ fn session_command_parses_streaming_behavior() {
     )
     .expect("parse prompt");
     match cmd {
-        SessionCommand::Prompt { message, images, streaming_behavior } => {
+        SessionCommand::Prompt {
+            message,
+            images,
+            streaming_behavior,
+        } => {
             assert_eq!(message, "hi");
             assert!(images.is_empty());
             assert!(streaming_behavior.is_some());
@@ -33,7 +37,9 @@ fn session_command_parses_new_command_shapes() {
     )
     .expect("parse set_model")
     {
-        SessionCommand::SetModel { provider, model_id, .. } => {
+        SessionCommand::SetModel {
+            provider, model_id, ..
+        } => {
             assert_eq!(provider, "anthropic");
             assert_eq!(model_id, "claude");
         }
@@ -51,8 +57,10 @@ fn session_command_parses_new_command_shapes() {
         r#"{"type":"bash","command":"ls","excludeFromContext":true}"#,
     )
     .expect("parse bash");
-    serde_json::from_str::<SessionCommand>(r#"{"type":"set_steering_mode","mode":"one-at-a-time"}"#)
-        .expect("parse set_steering_mode");
+    serde_json::from_str::<SessionCommand>(
+        r#"{"type":"set_steering_mode","mode":"one-at-a-time"}"#,
+    )
+    .expect("parse set_steering_mode");
     serde_json::from_str::<SessionCommand>(r#"{"type":"new_session","parentSession":"p.jsonl"}"#)
         .expect("parse new_session");
 }

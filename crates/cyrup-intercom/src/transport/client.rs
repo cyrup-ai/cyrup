@@ -15,9 +15,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -186,7 +186,11 @@ fn teardown(inner: &Arc<ClientInner>, reason: String) {
     inner.connected.store(false, Ordering::SeqCst);
     *guard(&inner.session_id) = None;
     for (_, tx) in guard(&inner.pending_sends).drain() {
-        let _ = tx.send(SendResult { id: String::new(), delivered: false, reason: Some(reason.clone()) });
+        let _ = tx.send(SendResult {
+            id: String::new(),
+            delivered: false,
+            reason: Some(reason.clone()),
+        });
     }
     for (_, tx) in guard(&inner.pending_lists).drain() {
         let _ = tx.send(Err(reason.clone()));
@@ -309,14 +313,19 @@ async fn liveness_task(inner: Arc<ClientInner>, config: LivenessConfig) {
 /// The body of [`IntercomClient::list_sessions`], parameterized on the correlation deadline so the
 /// liveness probe can pass `getLivenessTimeoutMs()` (`listSessions({ timeoutMs })`,
 /// `v0.10.1 broker/client.ts:581-604`) and so the probe does not need an [`IntercomClient`] handle.
-async fn list_sessions_inner(inner: &Arc<ClientInner>, timeout: Duration) -> Result<Vec<SessionInfo>> {
+async fn list_sessions_inner(
+    inner: &Arc<ClientInner>,
+    timeout: Duration,
+) -> Result<Vec<SessionInfo>> {
     if !inner_is_connected(inner) {
         return Err(IntercomError::Client("not connected".to_string()));
     }
     let request_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel();
     guard(&inner.pending_lists).insert(request_id.clone(), tx);
-    let frame = encode_json(&ClientMessage::List { request_id: request_id.clone() })?;
+    let frame = encode_json(&ClientMessage::List {
+        request_id: request_id.clone(),
+    })?;
     if !inner.send_frame(frame) {
         guard(&inner.pending_lists).remove(&request_id);
         return Err(IntercomError::Client("client disconnected".to_string()));
@@ -380,8 +389,13 @@ impl IntercomClient {
         registration: SessionRegistration,
         session_id: Option<String>,
     ) -> Result<Self> {
-        Self::connect_target_with_liveness(target, registration, session_id, LivenessConfig::from_env())
-            .await
+        Self::connect_target_with_liveness(
+            target,
+            registration,
+            session_id,
+            LivenessConfig::from_env(),
+        )
+        .await
     }
 
     /// [`Self::connect_target`] with an explicit liveness schedule instead of the env-resolved one
@@ -430,7 +444,9 @@ impl IntercomClient {
             state_id,
         };
         if !inner.send_frame(encode_json(&register)?) {
-            return Err(IntercomError::Client("writer closed before register".to_string()));
+            return Err(IntercomError::Client(
+                "writer closed before register".to_string(),
+            ));
         }
 
         match tokio::time::timeout(CONNECT_TIMEOUT, reg_rx).await {
@@ -444,7 +460,9 @@ impl IntercomClient {
                 Ok(Self { inner })
             }
             Ok(Ok(Err(msg))) => Err(IntercomError::Client(msg)),
-            Ok(Err(_)) => Err(IntercomError::Client("connection closed before registration".to_string())),
+            Ok(Err(_)) => Err(IntercomError::Client(
+                "connection closed before registration".to_string(),
+            )),
             Err(_) => {
                 // Destroy the socket + background tasks on timeout (client.ts:184-191) rather than
                 // leaving them running past the reported error.
@@ -497,12 +515,19 @@ impl IntercomClient {
             supersedes: options.supersedes,
             retry_of: options.retry_of,
             provenance: options.provenance,
-            content: MessageContent { text: options.text, attachments: options.attachments, ..Default::default() },
+            content: MessageContent {
+                text: options.text,
+                attachments: options.attachments,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let (tx, rx) = oneshot::channel();
         guard(&self.inner.pending_sends).insert(message_id.clone(), tx);
-        let frame = encode_json(&ClientMessage::Send { to: to.to_string(), message })?;
+        let frame = encode_json(&ClientMessage::Send {
+            to: to.to_string(),
+            message,
+        })?;
         if !self.inner.send_frame(frame) {
             guard(&self.inner.pending_sends).remove(&message_id);
             return Err(IntercomError::Client("client disconnected".to_string()));
@@ -557,7 +582,9 @@ impl IntercomClient {
         let message_id = message_id.to_string();
         let (tx, rx) = oneshot::channel();
         guard(&self.inner.pending_sends).insert(message_id.clone(), tx);
-        let frame = encode_json(&ClientMessage::CancelMessage { message_id: message_id.clone() })?;
+        let frame = encode_json(&ClientMessage::CancelMessage {
+            message_id: message_id.clone(),
+        })?;
         if !self.inner.send_frame(frame) {
             guard(&self.inner.pending_sends).remove(&message_id);
             return Err(IntercomError::Client("client disconnected".to_string()));
@@ -602,14 +629,21 @@ impl IntercomClient {
         if self.inner.disconnecting.load(Ordering::SeqCst) || !self.is_connected() {
             return;
         }
-        if let Ok(frame) = encode_json(&ClientMessage::CancelAsk { message_id: message_id.to_string() }) {
+        if let Ok(frame) = encode_json(&ClientMessage::CancelAsk {
+            message_id: message_id.to_string(),
+        }) {
             let _ = self.inner.send_frame(frame);
         }
     }
 
     /// Best-effort presence update (`updatePresence`, `client.ts:568-579`). Same guards as
     /// [`Self::cancel_ask`] (`client.ts:569-576`).
-    pub fn update_presence(&self, name: Option<String>, status: Option<String>, model: Option<String>) {
+    pub fn update_presence(
+        &self,
+        name: Option<String>,
+        status: Option<String>,
+        model: Option<String>,
+    ) {
         if self.inner.disconnecting.load(Ordering::SeqCst) || !self.is_connected() {
             return;
         }
@@ -640,7 +674,15 @@ impl IntercomClient {
         context_tokens: Option<Option<serde_json::Number>>,
         context_window: Option<Option<serde_json::Number>>,
     ) {
-        self.update_presence_full(name, None, status, model, context_pct, context_tokens, context_window);
+        self.update_presence_full(
+            name,
+            None,
+            status,
+            model,
+            context_pct,
+            context_tokens,
+            context_window,
+        );
     }
 
     /// [`Self::update_presence_with_context`] carrying `runtimeFallbackAlias`
@@ -694,7 +736,11 @@ impl IntercomClient {
 
         let reason = "client disconnected".to_string();
         for (_, tx) in guard(&self.inner.pending_sends).drain() {
-            let _ = tx.send(SendResult { id: String::new(), delivered: false, reason: Some(reason.clone()) });
+            let _ = tx.send(SendResult {
+                id: String::new(),
+                delivered: false,
+                reason: Some(reason.clone()),
+            });
         }
         for (_, tx) in guard(&self.inner.pending_lists).drain() {
             let _ = tx.send(Err(reason.clone()));
@@ -833,18 +879,27 @@ async fn read_task(
             let kind = broker_message_kind(&msg);
             // Any message other than `registered`/`error` arriving before registration is fatal
             // (`client.ts:302-304`) — no frame type is meaningful without a session id yet.
-            if !registered && !matches!(msg, BrokerMessage::Registered { .. } | BrokerMessage::Error { .. }) {
+            if !registered
+                && !matches!(
+                    msg,
+                    BrokerMessage::Registered { .. } | BrokerMessage::Error { .. }
+                )
+            {
                 close_reason = format!("received {kind} before registered");
                 break 'outer;
             }
             match msg {
-                BrokerMessage::Registered { session_id, features: _ } => {
+                BrokerMessage::Registered {
+                    session_id,
+                    features: _,
+                } => {
                     if registered {
                         // A second `registered` frame is fatal post-connect (`client.ts:312-314`);
                         // connectionEstablished is already true, so this surfaces as a distinct
                         // `error` event before the eventual `disconnected`.
                         close_reason =
-                            "intercom protocol error: received duplicate registered message".to_string();
+                            "intercom protocol error: received duplicate registered message"
+                                .to_string();
                         let _ = inner.events.send(InboundEvent::Error(close_reason.clone()));
                         break 'outer;
                     }
@@ -855,17 +910,27 @@ async fn read_task(
                         let _ = tx.send(Ok(session_id));
                     }
                 }
-                BrokerMessage::Sessions { request_id, sessions } => {
+                BrokerMessage::Sessions {
+                    request_id,
+                    sessions,
+                } => {
                     if let Some(tx) = guard(&inner.pending_lists).remove(&request_id) {
                         let _ = tx.send(Ok(sessions));
                     }
                 }
                 BrokerMessage::Message { from, message } => {
-                    let _ = inner.events.send(InboundEvent::Message { from, message: Box::new(message) });
+                    let _ = inner.events.send(InboundEvent::Message {
+                        from,
+                        message: Box::new(message),
+                    });
                 }
                 BrokerMessage::Delivered { message_id } => {
                     if let Some(tx) = guard(&inner.pending_sends).remove(&message_id) {
-                        let _ = tx.send(SendResult { id: message_id, delivered: true, reason: None });
+                        let _ = tx.send(SendResult {
+                            id: message_id,
+                            delivered: true,
+                            reason: None,
+                        });
                     }
                 }
                 BrokerMessage::DeliveryFailed { message_id, reason } => {
@@ -899,10 +964,14 @@ async fn read_task(
                 // (`v0.10.1 broker/broker.ts:688-696`), and before these variants existed it was an
                 // `unknown variant` serde error, i.e. `close_reason` + `break 'outer`.
                 BrokerMessage::MessageReceipt { from, receipt } => {
-                    let _ = inner.events.send(InboundEvent::MessageReceipt { from, receipt });
+                    let _ = inner
+                        .events
+                        .send(InboundEvent::MessageReceipt { from, receipt });
                 }
                 BrokerMessage::MessageControl { from, control } => {
-                    let _ = inner.events.send(InboundEvent::MessageControl { from, control });
+                    let _ = inner
+                        .events
+                        .send(InboundEvent::MessageControl { from, control });
                 }
                 // Extension-bus frames (`v0.9.2 types.ts:115-136`). Still unreachable in practice,
                 // but for a narrower reason since ICOM-016: BOTH brokers now route these only to a
@@ -950,7 +1019,12 @@ async fn read_task(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
     use crate::transport::protocol::now_ms;
     use crate::transport::target::{BrokerTcpEndpoint, INTERCOM_TCP_HOST};
@@ -1010,9 +1084,11 @@ mod tests {
             assert_ne!(n, 0, "the client closed before registering");
             if let Some(payload) = reader.push(&buf[..n]).expect("frames").into_iter().next() {
                 let frame: serde_json::Value = serde_json::from_slice(&payload).expect("json");
-                let registered =
-                    encode_json(&BrokerMessage::Registered { session_id: "s1".to_string(), features: None })
-                        .expect("encodes");
+                let registered = encode_json(&BrokerMessage::Registered {
+                    session_id: "s1".to_string(),
+                    features: None,
+                })
+                .expect("encodes");
                 stream.write_all(&registered).await.expect("write");
                 return frame;
             }
@@ -1024,7 +1100,9 @@ mod tests {
     /// which the broker requires (`broker.ts:263-266`). Registration then completes normally.
     #[tokio::test]
     async fn connect_target_registers_over_tcp_with_the_endpoint_state_id() {
-        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0)).await.expect("bind");
+        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0))
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let broker = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -1045,7 +1123,10 @@ mod tests {
         let frame = broker.await.expect("broker task");
         assert_eq!(frame["type"], "register");
         assert_eq!(frame["sessionId"], "sess-1");
-        assert_eq!(frame["stateId"], "state-1", "client.ts:284 spreads the TCP endpoint stateId");
+        assert_eq!(
+            frame["stateId"], "state-1",
+            "client.ts:284 spreads the TCP endpoint stateId"
+        );
     }
 
     // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
@@ -1072,7 +1153,10 @@ mod tests {
 
         let frame = broker.await.expect("broker task");
         assert_eq!(frame["type"], "register");
-        assert!(frame.get("stateId").is_none(), "socket registers carry no credential: {frame}");
+        assert!(
+            frame.get("stateId").is_none(),
+            "socket registers carry no credential: {frame}"
+        );
     }
 
     // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
@@ -1150,7 +1234,10 @@ mod tests {
         // `Disconnected while waiting for reply: …` text name the real cause rather than a generic
         // close. `IntercomError::Client`'s Display prefix is `error.rs:28`.
         assert_eq!(reason, "intercom client error: list sessions timeout");
-        assert!(!client.is_connected(), "the ladder's `is_connected` gate must now be false");
+        assert!(
+            !client.is_connected(),
+            "the ladder's `is_connected` gate must now be false"
+        );
         broker.abort();
     }
 
@@ -1164,7 +1251,10 @@ mod tests {
         inner.connected.store(true, Ordering::SeqCst);
         start_liveness_heartbeat(
             &inner,
-            LivenessConfig { interval: Duration::from_secs(30), timeout: Duration::from_secs(5) },
+            LivenessConfig {
+                interval: Duration::from_secs(30),
+                timeout: Duration::from_secs(5),
+            },
         );
         assert!(guard(&inner.liveness_abort).is_some(), "heartbeat armed");
 
@@ -1188,7 +1278,8 @@ mod tests {
 
         let (send_tx, mut send_rx) = oneshot::channel::<SendResult>();
         guard(&inner.pending_sends).insert("m1".to_string(), send_tx);
-        let (list_tx, mut list_rx) = oneshot::channel::<std::result::Result<Vec<SessionInfo>, String>>();
+        let (list_tx, mut list_rx) =
+            oneshot::channel::<std::result::Result<Vec<SessionInfo>, String>>();
         guard(&inner.pending_lists).insert("r1".to_string(), list_tx);
 
         let client = IntercomClient { inner };
@@ -1196,10 +1287,14 @@ mod tests {
 
         // No `.await` yield occurred between `disconnect()` returning and these `try_recv()`s —
         // proving the fail-pending happened synchronously inside `disconnect()` itself.
-        let sent = send_rx.try_recv().expect("pending send was already failed synchronously");
+        let sent = send_rx
+            .try_recv()
+            .expect("pending send was already failed synchronously");
         assert!(!sent.delivered);
         assert_eq!(sent.reason.as_deref(), Some("client disconnected"));
-        let listed = list_rx.try_recv().expect("pending list was already failed synchronously");
+        let listed = list_rx
+            .try_recv()
+            .expect("pending list was already failed synchronously");
         assert_eq!(listed.unwrap_err(), "client disconnected");
         assert!(!client.is_connected());
     }
@@ -1221,11 +1316,16 @@ mod tests {
 
         // Only the two frames `disconnect()` itself queued may appear; cancel_ask/update_presence
         // must not have queued anything after them.
-        let first = wrx.try_recv().expect("disconnect queued the unregister frame");
+        let first = wrx
+            .try_recv()
+            .expect("disconnect queued the unregister frame");
         assert!(matches!(first, WriterCmd::Frame(_)));
         let second = wrx.try_recv().expect("disconnect queued the close command");
         assert!(matches!(second, WriterCmd::Close));
-        assert!(wrx.try_recv().is_err(), "cancel_ask/update_presence must not queue any frame");
+        assert!(
+            wrx.try_recv().is_err(),
+            "cancel_ask/update_presence must not queue any frame"
+        );
     }
 
     // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
@@ -1245,8 +1345,11 @@ mod tests {
         tokio::spawn(read_task(read_half, inner, reg_tx));
 
         // A `sessions` frame is well-formed but illegal before `registered`.
-        let frame = encode_json(&BrokerMessage::Sessions { request_id: "r1".to_string(), sessions: vec![] })
-            .expect("encodes");
+        let frame = encode_json(&BrokerMessage::Sessions {
+            request_id: "r1".to_string(),
+            sessions: vec![],
+        })
+        .expect("encodes");
         b.write_all(&frame).await.expect("write");
 
         let result = tokio::time::timeout(Duration::from_secs(2), reg_rx)
@@ -1254,7 +1357,10 @@ mod tests {
             .expect("reg_rx resolves promptly, not after the 10s connect timeout")
             .expect("oneshot not dropped");
         let err = result.expect_err("must reject the connect");
-        assert!(err.contains("sessions"), "error names the offending message type: {err}");
+        assert!(
+            err.contains("sessions"),
+            "error names the offending message type: {err}"
+        );
         assert!(err.contains("before registered"), "error text: {err}");
     }
 
@@ -1273,7 +1379,11 @@ mod tests {
         let mut events = inner.events.subscribe();
         tokio::spawn(read_task(read_half, inner, reg_tx));
 
-        let registered = encode_json(&BrokerMessage::Registered { session_id: "s1".to_string(), features: None }).expect("encodes");
+        let registered = encode_json(&BrokerMessage::Registered {
+            session_id: "s1".to_string(),
+            features: None,
+        })
+        .expect("encodes");
         b.write_all(&registered).await.expect("write");
         let first = tokio::time::timeout(Duration::from_secs(2), reg_rx)
             .await
@@ -1316,7 +1426,11 @@ mod tests {
         let mut events = inner.events.subscribe();
         tokio::spawn(read_task(read_half, inner, reg_tx));
 
-        let registered = encode_json(&BrokerMessage::Registered { session_id: "s1".to_string(), features: None }).expect("encodes");
+        let registered = encode_json(&BrokerMessage::Registered {
+            session_id: "s1".to_string(),
+            features: None,
+        })
+        .expect("encodes");
         b.write_all(&registered).await.expect("write");
         tokio::time::timeout(Duration::from_secs(2), reg_rx)
             .await
@@ -1337,7 +1451,10 @@ mod tests {
             .await
             .expect("a disconnected event follows")
             .expect("channel open");
-        assert!(matches!(second_evt, InboundEvent::Disconnected(_)), "{second_evt:?}");
+        assert!(
+            matches!(second_evt, InboundEvent::Disconnected(_)),
+            "{second_evt:?}"
+        );
     }
 
     // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
@@ -1360,7 +1477,11 @@ mod tests {
         let mut events = inner.events.subscribe();
         tokio::spawn(read_task(read_half, inner, reg_tx));
 
-        let registered = encode_json(&BrokerMessage::Registered { session_id: "s1".to_string(), features: None }).expect("encodes");
+        let registered = encode_json(&BrokerMessage::Registered {
+            session_id: "s1".to_string(),
+            features: None,
+        })
+        .expect("encodes");
         b.write_all(&registered).await.expect("write");
         tokio::time::timeout(Duration::from_secs(2), reg_rx)
             .await
@@ -1393,7 +1514,11 @@ mod tests {
             timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: "hi".to_string(), attachments: None, ..Default::default() },
+            content: MessageContent {
+                text: "hi".to_string(),
+                attachments: None,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut chunk = encode_json(&BrokerMessage::Message { from, message }).expect("encodes");
@@ -1413,12 +1538,18 @@ mod tests {
             .await
             .expect("an error event follows")
             .expect("channel open");
-        assert!(matches!(second_evt, InboundEvent::Error(_)), "{second_evt:?}");
+        assert!(
+            matches!(second_evt, InboundEvent::Error(_)),
+            "{second_evt:?}"
+        );
         let third_evt = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await
             .expect("a disconnected event follows")
             .expect("channel open");
-        assert!(matches!(third_evt, InboundEvent::Disconnected(_)), "{third_evt:?}");
+        assert!(
+            matches!(third_evt, InboundEvent::Disconnected(_)),
+            "{third_evt:?}"
+        );
     }
 
     // Only the `#[cfg(unix)]` socket tests below build the fixture sessions it makes.
@@ -1461,9 +1592,11 @@ mod tests {
         let (reg_tx, reg_rx) = oneshot::channel();
         let events = inner.events.subscribe();
         tokio::spawn(read_task(read_half, inner, reg_tx));
-        let registered =
-            encode_json(&BrokerMessage::Registered { session_id: "s1".to_string(), features: None })
-                .expect("encodes");
+        let registered = encode_json(&BrokerMessage::Registered {
+            session_id: "s1".to_string(),
+            features: None,
+        })
+        .expect("encodes");
         b.write_all(&registered).await.expect("write");
         tokio::time::timeout(Duration::from_secs(2), reg_rx)
             .await
@@ -1512,7 +1645,9 @@ mod tests {
                 "type": "extension_owner", "namespace": "ns", "ownerId": "s2", "ownerEpoch": "e1",
             }),
         ] {
-            b.write_all(&encode_json(&frame).expect("encodes")).await.expect("write");
+            b.write_all(&encode_json(&frame).expect("encodes"))
+                .await
+                .expect("write");
         }
 
         // The connection must still be reading: a normal `message` after all of the above surfaces.
@@ -1521,7 +1656,10 @@ mod tests {
             message: Message {
                 id: "m2".to_string(),
                 timestamp: 0u64.into(),
-                content: MessageContent { text: "still alive".to_string(), ..Default::default() },
+                content: MessageContent {
+                    text: "still alive".to_string(),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         })
@@ -1560,7 +1698,9 @@ mod tests {
         // The `extension_owner` written between the control and the follow-up produces no event of
         // its own, so the very next event is the message — that ordering is the assertion.
         match next().await {
-            InboundEvent::Message { message, .. } => assert_eq!(message.content.text, "still alive"),
+            InboundEvent::Message { message, .. } => {
+                assert_eq!(message.content.text, "still alive")
+            }
             other => panic!("expected the follow-up message, got {other:?}"),
         }
     }
@@ -1589,7 +1729,9 @@ mod tests {
             }),
         ] {
             let (mut b, mut events, _keepalive) = registered_read_task().await;
-            b.write_all(&encode_json(&bad).expect("encodes")).await.expect("write");
+            b.write_all(&encode_json(&bad).expect("encodes"))
+                .await
+                .expect("write");
 
             let mut saw_error = false;
             let mut saw_disconnected = false;
@@ -1605,8 +1747,14 @@ mod tests {
                     Err(_) => break,
                 }
             }
-            assert!(saw_error, "a protocol error event must precede teardown for {bad}");
-            assert!(saw_disconnected, "the connection must still be torn down for {bad}");
+            assert!(
+                saw_error,
+                "a protocol error event must precede teardown for {bad}"
+            );
+            assert!(
+                saw_disconnected,
+                "the connection must still be torn down for {bad}"
+            );
         }
     }
 
@@ -1705,12 +1853,18 @@ mod tests {
         });
 
         let result = IntercomClient::connect(&socket_path, registration(), None).await;
-        assert!(result.is_err(), "the broker never registers, so connect() must time out");
+        assert!(
+            result.is_err(),
+            "the broker never registers, so connect() must time out"
+        );
 
         let saw_eof = tokio::time::timeout(Duration::from_secs(15), broker)
             .await
             .expect("broker task completes")
             .expect("broker task did not panic");
-        assert!(saw_eof, "the client's socket/tasks must be torn down on a connect timeout");
+        assert!(
+            saw_eof,
+            "the client's socket/tasks must be torn down on a connect timeout"
+        );
     }
 }

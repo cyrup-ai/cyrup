@@ -36,18 +36,17 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::store::{
-    create_mission, is_absolute_url, list_global_missions, list_missions,
-    mission_record_path, mission_status_list, read_mission, resolve_mission_store_location,
-    update_mission, validate_mission_id_str,
+    create_mission, is_absolute_url, list_global_missions, list_missions, mission_record_path,
+    mission_status_list, read_mission, resolve_mission_store_location, update_mission,
+    validate_mission_id_str,
 };
 use super::workflow_state::mission_state_path;
 use super::{
     MissionArtifact, MissionArtifactKind, MissionCreateInput, MissionDecisionInput,
-    MissionDecisionResolution, MissionDecisionStatus, MissionError, MissionGoal,
-    MissionGoalStatus, MissionGoalUpdate,
-    MissionReceiptInput, MissionReceiptKind, MissionReceiptStatus, MissionRecord, MissionResult,
-    MissionRunLink, MissionRunMode, MissionStatus, MissionStoreConfig, MissionStoreLocation,
-    MissionTokenBudget, MissionUpdateInput,
+    MissionDecisionResolution, MissionDecisionStatus, MissionError, MissionGoal, MissionGoalStatus,
+    MissionGoalUpdate, MissionReceiptInput, MissionReceiptKind, MissionReceiptStatus,
+    MissionRecord, MissionResult, MissionRunLink, MissionRunMode, MissionStatus,
+    MissionStoreConfig, MissionStoreLocation, MissionTokenBudget, MissionUpdateInput,
 };
 
 /// pi `MISSION_ACTIONS` (`actions.ts:32-40` @v0.64.0) — the exact seven-action vocabulary, in
@@ -207,7 +206,9 @@ pub struct MissionActionOutcome {
 fn require_mission_id(params: &MissionActionParams) -> MissionResult<String> {
     match params.mission_id.as_deref() {
         Some(id) => validate_mission_id_str(id, "missionId"),
-        None => Err(MissionError::invalid("missionId must be a non-empty string")),
+        None => Err(MissionError::invalid(
+            "missionId must be a non-empty string",
+        )),
     }
 }
 
@@ -263,12 +264,16 @@ pub fn validate_mission_launch(value: &Value) -> MissionResult<MissionLaunchInpu
         None => false,
         Some(Value::Bool(true)) => true,
         Some(_) => {
-            return Err(MissionError::invalid("mission.goal must be true when supplied"));
+            return Err(MissionError::invalid(
+                "mission.goal must be true when supplied",
+            ));
         }
     };
     let budget = match input.get("budget") {
         None => None,
-        Some(v) => Some(MissionTokenBudget { tokens: positive_tokens(v, "mission.budget")? }),
+        Some(v) => Some(MissionTokenBudget {
+            tokens: positive_tokens(v, "mission.budget")?,
+        }),
     };
     if goal && budget.is_none() {
         return Err(MissionError::invalid(
@@ -296,9 +301,9 @@ fn positive_tokens(value: &Value, label: &str) -> MissionResult<u64> {
         .and_then(|o| o.get("tokens"))
         .and_then(Value::as_i64)
         .filter(|n| *n >= 1 && n.abs() <= 9_007_199_254_740_991);
-    tokens.map(i64::unsigned_abs).ok_or_else(|| {
-        MissionError::invalid(format!("{label}.tokens must be a positive integer"))
-    })
+    tokens
+        .map(i64::unsigned_abs)
+        .ok_or_else(|| MissionError::invalid(format!("{label}.tokens must be a positive integer")))
 }
 
 /// The `labels` array check both `mission.labels` (`actions.ts:122-124`) and
@@ -315,10 +320,17 @@ fn validate_label_array(value: &Value, label: &str, trim: bool) -> MissionResult
     })?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let s = item.as_str().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
-            MissionError::invalid(format!("{label} must contain only non-empty strings"))
-        })?;
-        out.push(if trim { s.trim().to_string() } else { s.to_string() });
+        let s = item
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                MissionError::invalid(format!("{label} must contain only non-empty strings"))
+            })?;
+        out.push(if trim {
+            s.trim().to_string()
+        } else {
+            s.to_string()
+        });
     }
     Ok(out)
 }
@@ -326,7 +338,9 @@ fn validate_label_array(value: &Value, label: &str, trim: bool) -> MissionResult
 /// pi `validateArtifact` (`actions.ts:134-146`).
 fn validate_artifact(value: &Value, index: usize) -> MissionResult<MissionArtifact> {
     let input = value.as_object().ok_or_else(|| {
-        MissionError::invalid(format!("missionUpdate.artifacts[{index}] must be an object"))
+        MissionError::invalid(format!(
+            "missionUpdate.artifacts[{index}] must be an object"
+        ))
     })?;
     let kind = input
         .get("kind")
@@ -366,7 +380,10 @@ fn validate_receipt(value: &Value, index: usize) -> MissionResult<MissionReceipt
         MissionError::invalid(format!("missionUpdate.receipts[{index}] must be an object"))
     })?;
     for key in input.keys() {
-        if !matches!(key.as_str(), "kind" | "status" | "title" | "url" | "description") {
+        if !matches!(
+            key.as_str(),
+            "kind" | "status" | "title" | "url" | "description"
+        ) {
             return Err(MissionError::invalid(format!(
                 "missionUpdate.receipts[{index}].{key} is unknown"
             )));
@@ -445,12 +462,16 @@ fn validate_mission_update(value: Option<&Value>) -> MissionResult<MissionUpdate
                 | "receipts"
                 | "decisions"
         ) {
-            return Err(MissionError::invalid(format!("missionUpdate.{key} is unknown")));
+            return Err(MissionError::invalid(format!(
+                "missionUpdate.{key} is unknown"
+            )));
         }
     }
     let mut update = MissionUpdateInput::default();
     for field in ["title", "objective", "summary"] {
-        let Some(candidate) = input.get(field) else { continue };
+        let Some(candidate) = input.get(field) else {
+            continue;
+        };
         let trimmed = candidate
             .as_str()
             .filter(|s| !s.trim().is_empty())
@@ -490,8 +511,9 @@ fn validate_mission_update(value: Option<&Value>) -> MissionResult<MissionUpdate
         });
     }
     if let Some(budget) = input.get("budget") {
-        update.budget =
-            Some(MissionTokenBudget { tokens: positive_tokens(budget, "missionUpdate.budget")? });
+        update.budget = Some(MissionTokenBudget {
+            tokens: positive_tokens(budget, "missionUpdate.budget")?,
+        });
     }
     if let Some(status) = input.get("status") {
         update.status = Some(validate_status(status.as_str(), "missionUpdate.status")?);
@@ -541,7 +563,9 @@ fn validate_mission_update(value: Option<&Value>) -> MissionResult<MissionUpdate
 /// guarded on TRUTHINESS-after-trim rather than validated, so an empty string is silently dropped.
 fn validate_decision(value: &Value, index: usize) -> MissionResult<MissionDecisionInput> {
     let decision = value.as_object().ok_or_else(|| {
-        MissionError::invalid(format!("missionUpdate.decisions[{index}] must be an object"))
+        MissionError::invalid(format!(
+            "missionUpdate.decisions[{index}] must be an object"
+        ))
     })?;
     let title = decision
         .get("title")
@@ -552,27 +576,28 @@ fn validate_decision(value: &Value, index: usize) -> MissionResult<MissionDecisi
                 "missionUpdate.decisions[{index}].title must be a non-empty string"
             ))
         })?;
-    let options = match decision.get("options") {
-        None => None,
-        Some(v) => {
-            let items = v.as_array().ok_or_else(|| {
+    let options =
+        match decision.get("options") {
+            None => None,
+            Some(v) => {
+                let items = v.as_array().ok_or_else(|| {
                 MissionError::invalid(format!(
                     "missionUpdate.decisions[{index}].options must contain only non-empty strings"
                 ))
             })?;
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                let s = item.as_str().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    let s = item.as_str().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
                     MissionError::invalid(format!(
                         "missionUpdate.decisions[{index}].options must contain only non-empty \
                          strings"
                     ))
                 })?;
-                out.push(s.to_string());
+                    out.push(s.to_string());
+                }
+                Some(out)
             }
-            Some(out)
-        }
-    };
+        };
     Ok(MissionDecisionInput {
         title: title.trim().to_string(),
         prompt: decision
@@ -604,7 +629,9 @@ fn refresh_linked_run_status(
     let mut warnings = Vec::new();
     let mut updates: Vec<MissionRunLink> = Vec::new();
     for run in &record.runs {
-        let Some(async_dir) = run.async_dir.as_deref() else { continue };
+        let Some(async_dir) = run.async_dir.as_deref() else {
+            continue;
+        };
         let status_path = Path::new(async_dir).join("status.json");
         if !status_path.exists() {
             continue;
@@ -613,14 +640,18 @@ fn refresh_linked_run_status(
         let raw = match std::fs::read_to_string(&status_path) {
             Ok(raw) => raw,
             Err(err) => {
-                warnings.push(format!("Failed to read linked run status '{display}': {err}"));
+                warnings.push(format!(
+                    "Failed to read linked run status '{display}': {err}"
+                ));
                 continue;
             }
         };
         let status: Value = match serde_json::from_str(&raw) {
             Ok(value) => value,
             Err(err) => {
-                warnings.push(format!("Failed to read linked run status '{display}': {err}"));
+                warnings.push(format!(
+                    "Failed to read linked run status '{display}': {err}"
+                ));
                 continue;
             }
         };
@@ -628,7 +659,10 @@ fn refresh_linked_run_status(
             warnings.push(format!("Linked run status '{display}' must be an object"));
             continue;
         }
-        let state = status.get("state").and_then(Value::as_str).filter(|s| !s.trim().is_empty());
+        let state = status
+            .get("state")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty());
         let Some(state) = state else {
             warnings.push(format!("Linked run status '{display}' is missing state"));
             continue;
@@ -656,9 +690,7 @@ fn refresh_linked_run_status(
         .map(|run| {
             updates
                 .iter()
-                .find(|update| {
-                    update.run_id == run.run_id && update.child_index == run.child_index
-                })
+                .find(|update| update.run_id == run.run_id && update.child_index == run.child_index)
                 .cloned()
                 .unwrap_or_else(|| run.clone())
         })
@@ -693,7 +725,9 @@ fn refresh_linked_run_status(
     {
         MissionStatus::Cancelled
     } else if !states.is_empty()
-        && states.iter().all(|s| matches!(*s, Some("complete" | "completed")))
+        && states
+            .iter()
+            .all(|s| matches!(*s, Some("complete" | "completed")))
     {
         MissionStatus::Completed
     } else {
@@ -702,7 +736,11 @@ fn refresh_linked_run_status(
     let refreshed = update_mission(
         location,
         &record.id,
-        &MissionUpdateInput { status: Some(status), add_runs: updates, ..Default::default() },
+        &MissionUpdateInput {
+            status: Some(status),
+            add_runs: updates,
+            ..Default::default()
+        },
         crate::time::now_epoch_millis(),
         None,
     )?;
@@ -736,9 +774,19 @@ pub fn format_mission(record: &MissionRecord) -> String {
     if !record.runs.is_empty() {
         lines.push("Runs:".to_string());
         for run in &record.runs {
-            let status = run.status.as_ref().map_or_else(String::new, |s| format!(", {s}"));
-            let dir = run.async_dir.as_ref().map_or_else(String::new, |d| format!(" — {d}"));
-            lines.push(format!("  {} ({}{status}){dir}", run.run_id, run.mode.as_str()));
+            let status = run
+                .status
+                .as_ref()
+                .map_or_else(String::new, |s| format!(", {s}"));
+            let dir = run
+                .async_dir
+                .as_ref()
+                .map_or_else(String::new, |d| format!(" — {d}"));
+            lines.push(format!(
+                "  {} ({}{status}){dir}",
+                run.run_id,
+                run.mode.as_str()
+            ));
         }
     }
     if !record.decisions.is_empty() {
@@ -806,11 +854,8 @@ pub fn handle_mission_action(
     params: &MissionActionParams,
     ctx: &MissionActionContext,
 ) -> MissionResult<MissionActionOutcome> {
-    let location = resolve_mission_store_location(
-        &ctx.cwd,
-        ctx.config.as_ref(),
-        ctx.agent_dir.as_deref(),
-    );
+    let location =
+        resolve_mission_store_location(&ctx.cwd, ctx.config.as_ref(), ctx.agent_dir.as_deref());
     match action {
         MissionAction::Create => {
             let mission = validate_mission_launch(
@@ -940,7 +985,10 @@ pub fn handle_mission_action(
             let (record, warnings) = refresh_linked_run_status(&location, current)?;
             let mut lines = vec![
                 format_mission(&record),
-                format!("State: {}", mission_state_path(&location, &record.id)?.display()),
+                format!(
+                    "State: {}",
+                    mission_state_path(&location, &record.id)?.display()
+                ),
             ];
             if !warnings.is_empty() {
                 lines.push(String::new());
@@ -954,7 +1002,10 @@ pub fn handle_mission_action(
                     serde_json::json!({ "warnings": warnings }),
                 );
             }
-            Ok(MissionActionOutcome { text: lines.join("\n"), details })
+            Ok(MissionActionOutcome {
+                text: lines.join("\n"),
+                details,
+            })
         }
         MissionAction::Update => {
             let record = update_mission(
@@ -1025,17 +1076,21 @@ pub fn handle_mission_action(
                 .as_deref()
                 .or(params.id.as_deref())
                 .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| {
-                    MissionError::invalid("mission.attach-run requires runId or id")
-                })?;
+                .ok_or_else(|| MissionError::invalid("mission.attach-run requires runId or id"))?;
             let raw_mode = params.run_mode.as_deref().unwrap_or("external");
             let mode = MissionRunMode::from_wire(raw_mode)
                 .ok_or_else(|| MissionError::invalid("runMode is invalid"))?;
             if params.dir.as_deref().is_some_and(|d| d.trim().is_empty()) {
                 return Err(MissionError::invalid("dir must be a non-empty string"));
             }
-            if params.run_status.as_deref().is_some_and(|s| s.trim().is_empty()) {
-                return Err(MissionError::invalid("runStatus must be a non-empty string"));
+            if params
+                .run_status
+                .as_deref()
+                .is_some_and(|s| s.trim().is_empty())
+            {
+                return Err(MissionError::invalid(
+                    "runStatus must be a non-empty string",
+                ));
             }
             let record = update_mission(
                 &location,
@@ -1049,7 +1104,9 @@ pub fn handle_mission_action(
                         child_index: None,
                         agent: params.agent.clone(),
                         status: params.run_status.clone(),
-                        started_at: Some(super::format_iso8601_millis(crate::time::now_epoch_millis())),
+                        started_at: Some(super::format_iso8601_millis(
+                            crate::time::now_epoch_millis(),
+                        )),
                         completed_at: None,
                         usage: None,
                     }],
@@ -1076,7 +1133,11 @@ pub fn handle_mission_action(
                     ));
                 }
             };
-            if params.summary.as_deref().is_some_and(|s| s.trim().is_empty()) {
+            if params
+                .summary
+                .as_deref()
+                .is_some_and(|s| s.trim().is_empty())
+            {
                 return Err(MissionError::invalid("summary must be a non-empty string"));
             }
             let record = update_mission(
@@ -1092,7 +1153,11 @@ pub fn handle_mission_action(
             )?;
             let path = mission_record_path(&location, &record.id)?;
             Ok(MissionActionOutcome {
-                text: format!("Closed mission {} as {}.", record.id, record.status.as_str()),
+                text: format!(
+                    "Closed mission {} as {}.",
+                    record.id,
+                    record.status.as_str()
+                ),
                 details: mission_details(&record, &path),
             })
         }
@@ -1159,7 +1224,10 @@ mod tests {
         for name in MISSION_ACTIONS {
             let action = MissionAction::from_wire(name).unwrap();
             assert_eq!(action.as_str(), name);
-            assert_eq!(action.is_mutating(), MUTATING_MISSION_ACTIONS.contains(&name));
+            assert_eq!(
+                action.is_mutating(),
+                MUTATING_MISSION_ACTIONS.contains(&name)
+            );
         }
         assert!(MissionAction::from_wire("mission.nope").is_none());
         assert!(MissionAction::from_wire("list").is_none());
@@ -1373,7 +1441,10 @@ mod tests {
         let trimmed =
             validate_mission_launch(&serde_json::json!({"title": "t", "labels": ["  a  ", "b"]}))
                 .unwrap();
-        assert_eq!(trimmed.labels.as_deref(), Some(["a".to_string(), "b".to_string()].as_slice()));
+        assert_eq!(
+            trimmed.labels.as_deref(),
+            Some(["a".to_string(), "b".to_string()].as_slice())
+        );
     }
 
     #[test]
@@ -1389,7 +1460,13 @@ mod tests {
         .unwrap();
         assert!(listed.text.contains(&id), "{}", listed.text);
         assert!(listed.text.contains("planned  One  "), "{}", listed.text);
-        assert_eq!(listed.details["missions"]["records"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            listed.details["missions"]["records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         let global = handle_mission_action(
             MissionAction::List,
@@ -1401,10 +1478,22 @@ mod tests {
         )
         .unwrap();
         assert!(global.text.contains(&id), "{}", global.text);
-        assert_eq!(global.details["missions"]["globalEntries"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            global.details["missions"]["globalEntries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         // The flattened pointer keeps its entry fields at the TOP level.
-        assert_eq!(global.details["missions"]["globalEntries"][0]["missionId"], id.as_str());
-        assert_eq!(global.details["missions"]["globalEntries"][0]["stale"], false);
+        assert_eq!(
+            global.details["missions"]["globalEntries"][0]["missionId"],
+            id.as_str()
+        );
+        assert_eq!(
+            global.details["missions"]["globalEntries"][0]["stale"],
+            false
+        );
 
         let err = handle_mission_action(
             MissionAction::List,
@@ -1415,7 +1504,10 @@ mod tests {
             &ctx(tmp.path()),
         )
         .unwrap_err();
-        assert_eq!(err.to_string(), "missionScope must be \"project\" or \"global\"");
+        assert_eq!(
+            err.to_string(),
+            "missionScope must be \"project\" or \"global\""
+        );
     }
 
     #[test]
@@ -1446,12 +1538,27 @@ mod tests {
         let id = mission_id_of(&create(tmp.path(), "Showable"));
         let shown = handle_mission_action(
             MissionAction::Show,
-            &MissionActionParams { mission_id: Some(id.clone()), ..Default::default() },
+            &MissionActionParams {
+                mission_id: Some(id.clone()),
+                ..Default::default()
+            },
             &ctx(tmp.path()),
         )
         .unwrap();
-        assert!(shown.text.starts_with(&format!("Mission: {id}\nTitle: Showable\nStatus: planned")));
-        assert!(shown.text.contains(&format!("State: {}", tmp.path().join(".cyrup-subagents").join("missions").join(&id).join("state.json").display())));
+        assert!(
+            shown
+                .text
+                .starts_with(&format!("Mission: {id}\nTitle: Showable\nStatus: planned"))
+        );
+        assert!(shown.text.contains(&format!(
+                "State: {}",
+                tmp.path()
+                    .join(".cyrup-subagents")
+                    .join("missions")
+                    .join(&id)
+                    .join("state.json")
+                    .display()
+            )));
     }
 
     #[test]
@@ -1476,12 +1583,19 @@ mod tests {
 
         let shown = handle_mission_action(
             MissionAction::Show,
-            &MissionActionParams { mission_id: Some(id.clone()), ..Default::default() },
+            &MissionActionParams {
+                mission_id: Some(id.clone()),
+                ..Default::default()
+            },
             &ctx(tmp.path()),
         )
         .unwrap();
         assert!(shown.text.contains("Status: completed"), "{}", shown.text);
-        assert!(shown.text.contains("run-1 (external, complete)"), "{}", shown.text);
+        assert!(
+            shown.text.contains("run-1 (external, complete)"),
+            "{}",
+            shown.text
+        );
         assert_eq!(shown.details["mission"]["runs"][0]["status"], "complete");
         assert!(shown.details["mission"]["runs"][0]["completedAt"].is_string());
     }
@@ -1523,7 +1637,10 @@ mod tests {
 
         let shown = handle_mission_action(
             MissionAction::Show,
-            &MissionActionParams { mission_id: Some(id), ..Default::default() },
+            &MissionActionParams {
+                mission_id: Some(id),
+                ..Default::default()
+            },
             &ctx(tmp.path()),
         )
         .unwrap();
@@ -1552,12 +1669,17 @@ mod tests {
         .unwrap();
         let shown = handle_mission_action(
             MissionAction::Show,
-            &MissionActionParams { mission_id: Some(id), ..Default::default() },
+            &MissionActionParams {
+                mission_id: Some(id),
+                ..Default::default()
+            },
             &ctx(tmp.path()),
         )
         .unwrap();
         assert!(
-            shown.text.contains("Warning: Failed to read linked run status '"),
+            shown
+                .text
+                .contains("Warning: Failed to read linked run status '"),
             "{}",
             shown.text
         );
@@ -1568,9 +1690,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let id = mission_id_of(&create(tmp.path(), "Updatable"));
         let bad: Vec<(Value, &str)> = vec![
-            (serde_json::json!({}), "missionUpdate must include at least one supported field"),
-            (serde_json::json!({"nope": 1}), "missionUpdate.nope is unknown"),
-            (serde_json::json!({"title": " "}), "missionUpdate.title must be a non-empty string"),
+            (
+                serde_json::json!({}),
+                "missionUpdate must include at least one supported field",
+            ),
+            (
+                serde_json::json!({"nope": 1}),
+                "missionUpdate.nope is unknown",
+            ),
+            (
+                serde_json::json!({"title": " "}),
+                "missionUpdate.title must be a non-empty string",
+            ),
             (
                 serde_json::json!({"goal": {"paused": "yes"}}),
                 "missionUpdate.goal must be boolean or { paused: boolean }",
@@ -1633,17 +1764,34 @@ mod tests {
         )
         .unwrap();
         assert!(updated.text.starts_with("Updated mission "));
-        assert!(updated.text.contains("Goal mode: paused"), "{}", updated.text);
-        assert!(updated.text.contains("Budget: 0/5000 tokens"), "{}", updated.text);
-        assert!(updated.text.contains("Labels: a, b"), "{}", updated.text);
-        assert!(updated.text.contains("  patch: /tmp/x.diff"), "{}", updated.text);
         assert!(
-            updated.text.contains("  pull_request (ready): PR — https://example.com/pr/9"),
+            updated.text.contains("Goal mode: paused"),
+            "{}",
+            updated.text
+        );
+        assert!(
+            updated.text.contains("Budget: 0/5000 tokens"),
+            "{}",
+            updated.text
+        );
+        assert!(updated.text.contains("Labels: a, b"), "{}", updated.text);
+        assert!(
+            updated.text.contains("  patch: /tmp/x.diff"),
+            "{}",
+            updated.text
+        );
+        assert!(
+            updated
+                .text
+                .contains("  pull_request (ready): PR — https://example.com/pr/9"),
             "{}",
             updated.text
         );
         assert!(updated.text.contains(": open — Ship?"), "{}", updated.text);
-        assert_eq!(updated.details["mission"]["receipts"][0]["url"], "https://example.com/pr/9");
+        assert_eq!(
+            updated.details["mission"]["receipts"][0]["url"],
+            "https://example.com/pr/9"
+        );
     }
 
     #[test]
@@ -1652,7 +1800,10 @@ mod tests {
         let id = mission_id_of(&create(tmp.path(), "Attachable"));
         let err = handle_mission_action(
             MissionAction::AttachRun,
-            &MissionActionParams { mission_id: Some(id.clone()), ..Default::default() },
+            &MissionActionParams {
+                mission_id: Some(id.clone()),
+                ..Default::default()
+            },
             &ctx(tmp.path()),
         )
         .unwrap_err();
@@ -1727,7 +1878,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = handle_mission_action(
             MissionAction::Show,
-            &MissionActionParams { mission_id: Some("nope".to_string()), ..Default::default() },
+            &MissionActionParams {
+                mission_id: Some("nope".to_string()),
+                ..Default::default()
+            },
             &ctx(tmp.path()),
         )
         .unwrap_err();

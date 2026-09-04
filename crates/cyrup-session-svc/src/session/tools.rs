@@ -33,7 +33,11 @@ impl AgentSession {
     /// `setActiveToolsByName` tail, agent-session.ts:850-854). Shared by the host/CLI
     /// [`Self::set_active_tools_by_name`] path and the guest-driven drain in
     /// [`Self::apply_pending_control`] so both reach the live agent identically.
-    pub(super) async fn push_active_tools(&self, tools: Vec<Arc<dyn cyrup_core::Tool>>, prompt: String) {
+    pub(super) async fn push_active_tools(
+        &self,
+        tools: Vec<Arc<dyn cyrup_core::Tool>>,
+        prompt: String,
+    ) {
         self.agent.set_tools(tools).await;
         // The rebuilt prompt is the new BASE, not just this turn's value (Pi
         // `this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames)`, agent-session.ts:939).
@@ -166,7 +170,10 @@ impl AgentSession {
     /// `tool_call`/`tool_result` hooks around it — the permission gate and every observer extension
     /// were blind to it — and it never derived `addedToolNames`.
     pub fn register_custom_tools(&self, tools: Vec<Arc<dyn cyrup_core::Tool>>) {
-        let wrapped = tools.into_iter().map(|t| self.services.ext_host.wrap_tool(t)).collect();
+        let wrapped = tools
+            .into_iter()
+            .map(|t| self.services.ext_host.wrap_tool(t))
+            .collect();
         Self::lock(&self.dynamic_tools).register_custom(wrapped);
     }
 }

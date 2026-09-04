@@ -8,7 +8,6 @@ use crate::discovery::discover_agents;
 use crate::extension::executor::SubagentExecutor;
 
 impl SubagentExecutor {
-
     // ---------------------------------------------------------------------------------------
     // Nested-control inbox listener (T6, pi `fanout-child.ts:53-128`): serviced ONLY by a
     // `RegistrationMode::ChildSafe` process that inherited a nested route from its own parent's
@@ -42,8 +41,10 @@ impl SubagentExecutor {
         route: crate::spawn::nested_events::NestedRoute,
     ) {
         let mut seen: HashSet<String> = HashSet::new();
-        let mut pending_results: HashMap<String, crate::spawn::nested_events::NestedControlResultInput> =
-            HashMap::new();
+        let mut pending_results: HashMap<
+            String,
+            crate::spawn::nested_events::NestedControlResultInput,
+        > = HashMap::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
         loop {
             ticker.tick().await;
@@ -60,7 +61,10 @@ impl SubagentExecutor {
         &self,
         route: &crate::spawn::nested_events::NestedRoute,
         seen: &mut HashSet<String>,
-        pending_results: &mut HashMap<String, crate::spawn::nested_events::NestedControlResultInput>,
+        pending_results: &mut HashMap<
+            String,
+            crate::spawn::nested_events::NestedControlResultInput,
+        >,
     ) {
         let requests = match crate::spawn::nested_events::read_nested_control_requests(route) {
             Ok(requests) => requests,

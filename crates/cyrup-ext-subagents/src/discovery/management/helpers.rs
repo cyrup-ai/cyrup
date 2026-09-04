@@ -10,9 +10,9 @@
 
 use std::path::PathBuf;
 
+use super::super::AgentDiscoveryConfig;
 use super::super::package_name::{collapse_repeated_char, is_valid_package_identifier};
 use super::super::types::{AgentSource, OverrideScope};
-use super::super::AgentDiscoveryConfig;
 use crate::fork_context::ContextMode;
 
 /// Normalize + validate a caller-supplied package identifier exactly per R-SA-006's grammar:

@@ -17,7 +17,6 @@ pub(crate) struct ParentModelMemory {
     last: Option<ModelId>,
 }
 impl SubagentExecutor {
-
     /// The captured parent-session anchor (`CYRUP_SUBAGENT_PARENT_SESSION`, R-SA-P1), if the root
     /// `SessionStart` handler has resolved it from [`cyrup_ext::host::HostServices::session_id`].
     #[must_use]
@@ -108,7 +107,9 @@ impl SubagentExecutor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let name = name_guard.as_deref().filter(|s| !s.trim().is_empty());
-        Some(crate::spawn::intercom_target::orchestrator_presence_target(name, &id))
+        Some(crate::spawn::intercom_target::orchestrator_presence_target(
+            name, &id,
+        ))
     }
 
     /// The live PARENT session's current model as a `provider/id` [`ModelId`] — pi's `ctx.model`
@@ -122,7 +123,9 @@ impl SubagentExecutor {
     /// own `model`/`fallback_models` exactly as before (see [`crate::exec::fallback::resolve_model_inheritance`]).
     #[must_use]
     pub fn inherited_session_model(&self) -> Option<ModelId> {
-        self.host_services().and_then(|s| s.current_model()).map(ModelId::from)
+        self.host_services()
+            .and_then(|s| s.current_model())
+            .map(ModelId::from)
     }
 
     /// pi `normalizeParentModel` (`runs/shared/model-fallback.ts:33-39` @v0.43.0): a live `ctx.model`
@@ -216,7 +219,12 @@ impl SubagentExecutor {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::background::RunId;
@@ -239,8 +247,7 @@ mod tests {
             *self
                 .model
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                model.map(str::to_string);
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = model.map(str::to_string);
         }
     }
 
@@ -277,7 +284,10 @@ mod tests {
         host.set_model(Some("anthropic/opus"));
         executor.set_host_services(host.clone());
         executor.capture_parent_session_anchor();
-        assert_eq!(executor.root_parent_session().as_deref(), Some("session-one"));
+        assert_eq!(
+            executor.root_parent_session().as_deref(),
+            Some("session-one")
+        );
 
         // A live read that resolves is returned AND remembered.
         assert_eq!(
@@ -421,5 +431,4 @@ mod tests {
             serde_json::from_value(json).expect("config round-trips");
         assert_eq!(round_tripped.model_scope, Some(scope));
     }
-
 }

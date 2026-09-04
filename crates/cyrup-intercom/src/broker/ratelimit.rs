@@ -20,7 +20,10 @@ impl TokenBucket {
     /// A full bucket as of `now_ms` (a fresh connection starts at capacity, `broker.ts:212-214`).
     #[must_use]
     pub fn new(now_ms: u64) -> Self {
-        Self { tokens: RATE_LIMIT_CAPACITY, last_refill_at_ms: now_ms }
+        Self {
+            tokens: RATE_LIMIT_CAPACITY,
+            last_refill_at_ms: now_ms,
+        }
     }
 
     /// Refill by elapsed time, then attempt to spend one token. Returns `true` if a token was
@@ -49,9 +52,15 @@ mod tests {
     fn spends_up_to_capacity_then_denies() {
         let mut b = TokenBucket::new(0);
         for _ in 0..240 {
-            assert!(b.consume(0), "each of the first 240 tokens is available at t=0");
+            assert!(
+                b.consume(0),
+                "each of the first 240 tokens is available at t=0"
+            );
         }
-        assert!(!b.consume(0), "the 241st consume at the same instant is denied");
+        assert!(
+            !b.consume(0),
+            "the 241st consume at the same instant is denied"
+        );
     }
 
     #[test]
@@ -62,7 +71,10 @@ mod tests {
         }
         assert!(!b.consume(0));
         // 120 tokens/sec → 1000ms yields the full 240-cap back (capped).
-        assert!(b.consume(1000), "after 1s the bucket has refilled and a token is available");
+        assert!(
+            b.consume(1000),
+            "after 1s the bucket has refilled and a token is available"
+        );
     }
 
     #[test]
@@ -76,6 +88,9 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(spent, 240, "an idle bucket refills to at most the 240 capacity, not unbounded");
+        assert_eq!(
+            spent, 240,
+            "an idle bucket refills to at most the 240 capacity, not unbounded"
+        );
     }
 }

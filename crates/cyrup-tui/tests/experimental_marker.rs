@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 //! C15 of `docs/audits/2026-08-09-tui-presentation-fidelity.md` §3C — the footer's `• xp` experimental marker.
 //!
 //! ```ts
@@ -38,7 +43,7 @@
 // wrapper, in a binary that holds one test, is the cheapest way to close that gap.
 #![allow(clippy::disallowed_methods)]
 
-use cyrup_tui::{experimental_features_enabled, experimental_features_enabled_from, App, UiTheme};
+use cyrup_tui::{App, UiTheme, experimental_features_enabled, experimental_features_enabled_from};
 use ratatui::backend::TestBackend;
 
 /// Set (or clear) an env var. Sound here because this binary runs exactly one test, single-threaded
@@ -61,7 +66,10 @@ fn footer_text(app: &App<TestBackend>) -> String {
     let buf = app.terminal().backend().buffer();
     (0..buf.area.height)
         .map(|y| -> String {
-            (0..buf.area.width).filter_map(|x| buf.cell((x, y))).map(|c| c.symbol()).collect()
+            (0..buf.area.width)
+                .filter_map(|x| buf.cell((x, y)))
+                .map(|c| c.symbol())
+                .collect()
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -91,10 +99,16 @@ fn xp_marker_appears_when_experimental_features_are_enabled() {
         }
     };
     assert!(experimental_features_enabled_from(env(Some("1"), None)));
-    assert!(experimental_features_enabled_from(env(None, Some("1"))), "PI_* survives as fallback");
+    assert!(
+        experimental_features_enabled_from(env(None, Some("1"))),
+        "PI_* survives as fallback"
+    );
     assert!(!experimental_features_enabled_from(env(None, None)));
     assert!(!experimental_features_enabled_from(env(Some("0"), None)));
-    assert!(!experimental_features_enabled_from(env(Some("true"), None)), "only the literal `1`");
+    assert!(
+        !experimental_features_enabled_from(env(Some("true"), None)),
+        "only the literal `1`"
+    );
 
     // --- the wiring: launching with the flag set must reach the footer ------------------------
     set_env("PI_EXPERIMENTAL", None);
@@ -109,8 +123,14 @@ fn xp_marker_appears_when_experimental_features_are_enabled() {
     );
     app.draw().unwrap();
     let text = footer_text(&app);
-    assert!(text.contains("• xp"), "the `• xp` marker must be on the footer's line 2:\n{text}");
-    assert!(stats_row(&app).contains("• xp"), "…on the stats row specifically:\n{text}");
+    assert!(
+        text.contains("• xp"),
+        "the `• xp` marker must be on the footer's line 2:\n{text}"
+    );
+    assert!(
+        stats_row(&app).contains("• xp"),
+        "…on the stats row specifically:\n{text}"
+    );
 
     // --- MIRROR: with the flag off the marker stays off ---------------------------------------
     set_env("CYRUP_EXPERIMENTAL", None);
@@ -122,10 +142,19 @@ fn xp_marker_appears_when_experimental_features_are_enabled() {
     // screen: the startup block's closing `onboarding` line — "Cyrup can e**xp**lain its own
     // features…" (`interactive-mode.ts:947-950`) — contains the substring `xp`, so a whole-buffer
     // search cannot distinguish the marker from ordinary prose. The row under test is unchanged.
-    assert!(!stats_row(&off).contains("xp"), "no marker without the flag:\n{off_text}");
-    assert!(!off_text.contains("• xp"), "…and the marker glyph pair appears nowhere:\n{off_text}");
+    assert!(
+        !stats_row(&off).contains("xp"),
+        "no marker without the flag:\n{off_text}"
+    );
+    assert!(
+        !off_text.contains("• xp"),
+        "…and the marker glyph pair appears nowhere:\n{off_text}"
+    );
     // …and the rest of the footer is untouched — the context segment still renders (C1).
-    assert!(off_text.contains("0.0%/0"), "the other segments are unaffected:\n{off_text}");
+    assert!(
+        off_text.contains("0.0%/0"),
+        "the other segments are unaffected:\n{off_text}"
+    );
 
     set_env("CYRUP_EXPERIMENTAL", restore_cyrup.as_deref());
     set_env("PI_EXPERIMENTAL", restore_pi.as_deref());

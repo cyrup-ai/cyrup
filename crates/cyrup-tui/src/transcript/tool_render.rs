@@ -59,9 +59,7 @@ pub(crate) fn tool_lines(
                 Some(kind) => render_builtin_result(kind, run, expanded, theme, images, &mut block),
                 // `createResultFallback()` (`:141-155`, selected at `:298-304`). Upstream reaches
                 // it only inside `if (this.result)` (`:295`); the fallback makes the same check.
-                None => {
-                    render_result_fallback(run, expanded, theme, images.expand_key, &mut block)
-                }
+                None => render_result_fallback(run, expanded, theme, images.expand_key, &mut block),
             },
         }
     }

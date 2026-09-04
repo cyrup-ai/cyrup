@@ -42,8 +42,7 @@ use std::collections::BTreeMap;
 use crate::exec::split_known_thinking_suffix;
 
 /// `THINKING_LEVELS` (`shared/model-info.ts:1`).
-pub const THINKING_LEVELS: [&str; 7] =
-    ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+pub const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// `STRONG_WATCHDOG_THINKING` (`model-selection.ts:12`).
 pub const STRONG_WATCHDOG_THINKING: &str = "high";
@@ -120,7 +119,9 @@ impl<'a> WatchdogModelContext<'a> {
 
     /// `typeof ctx.model?.provider === "string" ? ctx.model.provider : undefined` (`:80`).
     fn preferred_provider(&self) -> Option<&str> {
-        self.current_model.as_ref().map(|model| model.provider.as_str())
+        self.current_model
+            .as_ref()
+            .map(|model| model.provider.as_str())
     }
 }
 
@@ -260,7 +261,9 @@ pub fn fuzzy_resolve_model(
     let mut query_provider: Option<String> = None;
     let mut query_id_raw = base_model.to_string();
     if let Some(slash) = base_model.find('/') {
-        query_provider = Some(normalize_model_segment(base_model.get(..slash).unwrap_or("")));
+        query_provider = Some(normalize_model_segment(
+            base_model.get(..slash).unwrap_or(""),
+        ));
         query_id_raw = base_model.get(slash + 1..).unwrap_or("").to_string();
     } else {
         for separator in [':', '.'] {
@@ -319,7 +322,10 @@ pub fn fuzzy_resolve_model(
 /// distinct from [`crate::exec::split_known_thinking_suffix`].
 fn split_thinking_suffix(model: &str) -> (&str, &str) {
     match model.rfind(':') {
-        Some(idx) => (model.get(..idx).unwrap_or(model), model.get(idx..).unwrap_or("")),
+        Some(idx) => (
+            model.get(..idx).unwrap_or(model),
+            model.get(idx..).unwrap_or(""),
+        ),
         None => (model, ""),
     }
 }
@@ -335,10 +341,14 @@ fn resolve_base_model_candidate(
             return Some(exact.full_id.clone());
         }
     } else {
-        let exact_matches: Vec<&WatchdogModelInfo> =
-            available.iter().filter(|entry| entry.id == base_model).collect();
+        let exact_matches: Vec<&WatchdogModelInfo> = available
+            .iter()
+            .filter(|entry| entry.id == base_model)
+            .collect();
         if let Some(preferred) = preferred_provider
-            && let Some(entry) = exact_matches.iter().find(|entry| entry.provider == preferred)
+            && let Some(entry) = exact_matches
+                .iter()
+                .find(|entry| entry.provider == preferred)
         {
             return Some(entry.full_id.clone());
         }
@@ -530,9 +540,9 @@ pub fn parse_watchdog_thinking_input(
     match value {
         None | Some("") => Ok(None),
         Some("false") => Ok(Some(WatchdogThinkingInput::Off)),
-        Some(level) => Ok(Some(WatchdogThinkingInput::Level(assert_supported_thinking(
-            level, source,
-        )?))),
+        Some(level) => Ok(Some(WatchdogThinkingInput::Level(
+            assert_supported_thinking(level, source)?,
+        ))),
     }
 }
 
@@ -724,7 +734,12 @@ pub fn recommend_strong_watchdog_model(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
 
@@ -789,7 +804,10 @@ mod tests {
     fn date_stamps_are_stripped_in_both_spellings_and_only_when_plausible() {
         assert_eq!(strip_trailing_date_stamp("gpt-5-5-20251001"), "gpt-5-5");
         assert_eq!(strip_trailing_date_stamp("gpt-5-5-2025-10-01"), "gpt-5-5");
-        assert_eq!(strip_trailing_date_stamp("gpt-5-5-2025-99-01"), "gpt-5-5-2025-99-01");
+        assert_eq!(
+            strip_trailing_date_stamp("gpt-5-5-2025-99-01"),
+            "gpt-5-5-2025-99-01"
+        );
         assert_eq!(strip_trailing_date_stamp("gpt-5-5"), "gpt-5-5");
     }
 
@@ -845,7 +863,8 @@ mod tests {
     fn resolve_input_returns_the_canonical_id_and_the_suffix_level() {
         let registry = both_families();
         let ctx = WatchdogModelContext::new(&registry);
-        let resolved = resolve_watchdog_model_input(&ctx, "anthropic/claude-opus-4.8:high").unwrap();
+        let resolved =
+            resolve_watchdog_model_input(&ctx, "anthropic/claude-opus-4.8:high").unwrap();
         assert_eq!(resolved.model, "anthropic/claude-opus-4-8");
         assert_eq!(resolved.thinking.as_deref(), Some("high"));
         let bare = resolve_watchdog_model_input(&ctx, "anthropic/claude-opus-4-8").unwrap();
@@ -873,14 +892,20 @@ mod tests {
         let registry = both_families();
         let on_gpt = WatchdogModelContext::new(&registry)
             .with_current_model(Some(reasoning("openai-codex", "gpt-5-5")));
-        assert_eq!(strong_family_order(&on_gpt), vec![StrongWatchdogFamily::Opus48]);
+        assert_eq!(
+            strong_family_order(&on_gpt),
+            vec![StrongWatchdogFamily::Opus48]
+        );
         assert_eq!(
             recommend_strong_watchdog_model(&on_gpt).unwrap().model,
             "anthropic/claude-opus-4-8"
         );
         let on_opus = WatchdogModelContext::new(&registry)
             .with_current_model(Some(reasoning("anthropic", "claude-opus-4-8")));
-        assert_eq!(strong_family_order(&on_opus), vec![StrongWatchdogFamily::Gpt55]);
+        assert_eq!(
+            strong_family_order(&on_opus),
+            vec![StrongWatchdogFamily::Gpt55]
+        );
         assert_eq!(
             recommend_strong_watchdog_model(&on_opus).unwrap().model,
             "openai-codex/gpt-5-5"
@@ -934,7 +959,10 @@ mod tests {
     #[test]
     fn family_membership_tolerates_a_date_stamp_but_not_a_different_model() {
         assert_eq!(
-            family_for_model(Some(&WatchdogModelInfo::new("anthropic", "claude-opus-4-8-20251001"))),
+            family_for_model(Some(&WatchdogModelInfo::new(
+                "anthropic",
+                "claude-opus-4-8-20251001"
+            ))),
             Some(StrongWatchdogFamily::Opus48)
         );
         assert_eq!(
@@ -942,7 +970,10 @@ mod tests {
             Some(StrongWatchdogFamily::Gpt55)
         );
         assert_eq!(
-            family_for_model(Some(&WatchdogModelInfo::new("anthropic", "claude-opus-4-7"))),
+            family_for_model(Some(&WatchdogModelInfo::new(
+                "anthropic",
+                "claude-opus-4-7"
+            ))),
             None
         );
         assert_eq!(
@@ -961,7 +992,10 @@ mod tests {
         );
         let mut non_reasoning = WatchdogModelInfo::new("p", "m");
         non_reasoning.reasoning = Some(false);
-        assert_eq!(get_supported_thinking_levels(Some(&non_reasoning)), vec!["off"]);
+        assert_eq!(
+            get_supported_thinking_levels(Some(&non_reasoning)),
+            vec!["off"]
+        );
         let mut mapped = WatchdogModelInfo::new("p", "m");
         mapped.thinking_level_map = Some(BTreeMap::from([
             ("low".to_string(), None),

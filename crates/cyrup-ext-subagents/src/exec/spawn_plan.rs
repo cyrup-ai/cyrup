@@ -8,22 +8,15 @@ use std::path::PathBuf;
 
 use cyrup_core::ModelId;
 
-use crate::discovery::types::{
-    SystemPromptMode, ToolRef,
-};
+use crate::discovery::types::{SystemPromptMode, ToolRef};
+use crate::error::SubagentError;
+use crate::exec::acceptance::{AcceptanceContract, inject_acceptance_contract};
+use crate::exec::agent_config::{AgentConfig, RunOptions};
 use crate::exec::completion_guard_projection;
 use crate::exec::mcp_direct_tools;
-use crate::error::SubagentError;
-use crate::exec::acceptance::{
-    AcceptanceContract, inject_acceptance_contract,
-};
-use crate::exec::output::{
-    inject_output_path_system_prompt, inject_single_output_instruction,
-};
+use crate::exec::output::{inject_output_path_system_prompt, inject_single_output_instruction};
 use crate::spawn::depth::DepthEnvelope;
 use crate::spawn::{ChildSpawnSpec, SpawnCommand};
-use crate::exec::agent_config::{AgentConfig, RunOptions};
-
 
 // ================================================================================================
 // SubagentSpawner: the seam production spawning goes through (mirrors AttemptRunner's own
@@ -177,7 +170,10 @@ pub fn split_known_thinking_suffix(model: &str) -> (&str, &str) {
     if !THINKING_LEVELS.contains(&suffix) {
         return (model, "");
     }
-    (model.get(..idx).unwrap_or(model), model.get(idx..).unwrap_or(""))
+    (
+        model.get(..idx).unwrap_or(model),
+        model.get(idx..).unwrap_or(""),
+    )
 }
 
 /// Append `item` to `vec` only if not already present — the order-preserving de-duplication pi
@@ -346,7 +342,10 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         let sources = capability_ceiling
             .as_ref()
             .filter(|ceiling| !ceiling.sources.is_empty())
-            .map_or_else(|| "unknown source".to_string(), |ceiling| ceiling.sources.join(", "));
+            .map_or_else(
+                || "unknown source".to_string(),
+                |ceiling| ceiling.sources.join(", "),
+            );
         return Err(SubagentError::CapabilityCeilingViolation(format!(
             "Capability ceiling from {sources} excludes required tool 'read' for lazy skill \
              loading."
@@ -461,8 +460,7 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
 
     let (task_arg, temp_file) = ChildSpawnSpec::resolve_task_arg(task_text, temp_dir)?;
 
-    let mut env_overlay =
-        env_identity_and_depth(
+    let mut env_overlay = env_identity_and_depth(
         agent,
         opts,
         depth,
@@ -509,7 +507,10 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         // `if let Ok` rather than `expect`: a `Vec<String>` always serializes, but the workspace
         // forbids `unwrap`/`expect`.
         if let Ok(encoded) = serde_json::to_string(&command.base_args) {
-            env_overlay.insert(crate::spawn::SUBAGENT_BINARY_ARGS_ENV_VAR.to_string(), encoded);
+            env_overlay.insert(
+                crate::spawn::SUBAGENT_BINARY_ARGS_ENV_VAR.to_string(),
+                encoded,
+            );
         }
     }
 
@@ -740,9 +741,11 @@ fn resolve_child_tools(
     // `excludeTools` and a ceiling whose `allowedTools` omits `subagent` each veto it. And because
     // the first disjunct reads the EXCLUSION-filtered list, `excludeTools: [subagent]` now revokes
     // the grant an explicit `tools: [subagent]` would otherwise confer.
-    let subagent_within_ceiling = ceiling_allowed_tools
-        .as_ref()
-        .is_none_or(|allowed| allowed.iter().any(|tool| tool == crate::extension::TOOL_NAME));
+    let subagent_within_ceiling = ceiling_allowed_tools.as_ref().is_none_or(|allowed| {
+        allowed
+            .iter()
+            .any(|tool| tool == crate::extension::TOOL_NAME)
+    });
     let fanout_authorized = effective_builtin_tools
         .iter()
         .any(|tool| tool == crate::extension::TOOL_NAME)
@@ -922,12 +925,11 @@ fn compose_persona(
     // that this argv pair is the only channel for. `build_agent_memory_injection` returns "" for an
     // agent with no scope (the common case), an unresolvable/unsafe path, or a read-only agent with
     // nothing recorded yet — so the overwhelming majority of spawns are byte-identical to before.
-    let memory_injection =
-        crate::discovery::agent_memory::build_agent_memory_injection(
-            agent.memory.as_ref(),
-            agent.tools.as_ref(),
-            &opts.cwd,
-        );
+    let memory_injection = crate::discovery::agent_memory::build_agent_memory_injection(
+        agent.memory.as_ref(),
+        agent.tools.as_ref(),
+        &opts.cwd,
+    );
     let persona_body_trimmed = agent.system_prompt_body.trim();
     let persona_with_memory: String = if memory_injection.is_empty() {
         persona_body_trimmed.to_string()
@@ -1104,7 +1106,12 @@ fn env_identity_and_depth(
     // pi `runs/shared/pi-args.ts:199-200`: the child observes the agent's inherit flags as env (`1`/`0`).
     env_overlay.insert(
         INHERIT_PROJECT_CONTEXT_ENV.to_string(),
-        if agent.inherit_project_context { "1" } else { "0" }.to_string(),
+        if agent.inherit_project_context {
+            "1"
+        } else {
+            "0"
+        }
+        .to_string(),
     );
     env_overlay.insert(
         INHERIT_SKILLS_ENV.to_string(),
@@ -1186,7 +1193,11 @@ fn env_orchestration(
         .parent_session_id
         .clone()
         .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var(PARENT_SESSION_ENV_VAR).ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var(PARENT_SESSION_ENV_VAR)
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
     {
         env_overlay.insert(PARENT_SESSION_ENV_VAR.to_string(), anchor);
     }
@@ -1238,7 +1249,9 @@ fn env_orchestration(
     // `3ac0ef5` (`runs/shared/pi-args.ts:221-231`), which needs the launching session's own id as its request
     // routing key.
     if let (Some(orch_target), Some(run_id)) = (
-        opts.orchestrator_intercom_target.as_deref().filter(|s| !s.is_empty()),
+        opts.orchestrator_intercom_target
+            .as_deref()
+            .filter(|s| !s.is_empty()),
         opts.run_id.as_ref(),
     ) && !agent.name.trim().is_empty()
     {
@@ -1247,9 +1260,18 @@ fn env_orchestration(
             crate::spawn::intercom_target::ENV_ORCHESTRATOR_TARGET.to_string(),
             orch_target.to_string(),
         );
-        env_overlay.insert(crate::spawn::nested_events::RUN_ID_ENV.to_string(), run_id.as_str().to_string());
-        env_overlay.insert(crate::spawn::intercom_target::ENV_CHILD_AGENT.to_string(), agent.name.clone());
-        env_overlay.insert(crate::spawn::nested_events::CHILD_INDEX_ENV.to_string(), child_index.to_string());
+        env_overlay.insert(
+            crate::spawn::nested_events::RUN_ID_ENV.to_string(),
+            run_id.as_str().to_string(),
+        );
+        env_overlay.insert(
+            crate::spawn::intercom_target::ENV_CHILD_AGENT.to_string(),
+            agent.name.clone(),
+        );
+        env_overlay.insert(
+            crate::spawn::nested_events::CHILD_INDEX_ENV.to_string(),
+            child_index.to_string(),
+        );
         env_overlay.insert(
             crate::spawn::intercom_target::ENV_INTERCOM_SESSION_NAME.to_string(),
             crate::spawn::intercom_target::resolve_subagent_intercom_target(
@@ -1340,14 +1362,16 @@ fn env_orchestration(
     // this crate has no per-call override for the audit path today, so it always takes that
     // default, using the SAME `temp_dir` this function already receives for the
     // persona-body/task spill files.
-    if let Some(encoded) = crate::exec::permissions::encode_permission_rules(
-        opts.permission_rules.as_ref(),
-    )
-    .map_err(SubagentError::Management)?
+    if let Some(encoded) =
+        crate::exec::permissions::encode_permission_rules(opts.permission_rules.as_ref())
+            .map_err(SubagentError::Management)?
     {
         env_overlay.insert(
             crate::watchdog::permission_arbiter::PERMISSION_AUDIT_PATH_ENV.to_string(),
-            temp_dir.join("permission-audit.jsonl").display().to_string(),
+            temp_dir
+                .join("permission-audit.jsonl")
+                .display()
+                .to_string(),
         );
         env_overlay.insert(
             crate::watchdog::permission_arbiter::PERMISSION_POLICY_ENV.to_string(),
@@ -1586,9 +1610,10 @@ mod tests {
     use crate::discovery::types::OutputMode;
     use crate::exec::ResolvedAgentPersona;
     use crate::exec::acceptance::AcceptanceStatus;
-    use crate::exec::testsupport::{sample_agent_config, base_opts, delivered_system_prompt, read_system_prompt_arg};
+    use crate::exec::testsupport::{
+        base_opts, delivered_system_prompt, read_system_prompt_arg, sample_agent_config,
+    };
     use crate::fork_context::{ContextMode, ForkContext};
-
 
     /// SUBA-021 — the CAPABILITY CEILING is consulted by `build_attempt_spawn_plan`, on both of its
     /// halves: the agent gate REFUSES a delegation outside the ceiling before any child is planned,
@@ -1617,7 +1642,10 @@ mod tests {
                 &ModelId::from("m1"),
                 "task",
                 opts,
-                DepthEnvelope { current_depth: 0, max_depth: 5 },
+                DepthEnvelope {
+                    current_depth: 0,
+                    max_depth: 5,
+                },
                 dir.path(),
                 None,
             )
@@ -1626,10 +1654,12 @@ mod tests {
         // No ceiling registered: the plan builds and writes no ceiling var (the overlay only adds,
         // so an unbounded run cannot inherit a stale bound).
         let unbounded = plan(&agent, &opts).expect("no ceiling, no refusal");
-        assert!(!unbounded
-            .spec
-            .env_overlay
-            .contains_key(cc::CAPABILITY_CEILING_ENV));
+        assert!(
+            !unbounded
+                .spec
+                .env_overlay
+                .contains_key(cc::CAPABILITY_CEILING_ENV)
+        );
 
         let _handle = cc::register_capability_ceiling(
             session,
@@ -1689,7 +1719,10 @@ mod tests {
         let session = "spawn-plan-ceiling-allowed-tools-session";
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.parent_session_id = Some(session.to_string());
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
 
         let _handle = cc::register_capability_ceiling(
             session,
@@ -1705,11 +1738,21 @@ mod tests {
             ToolRef::Builtin("write".to_string()),
             ToolRef::Builtin("bash".to_string()),
         ]);
-        let plan =
-            build_attempt_spawn_plan(&wide, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &wide,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
-        let idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
+        let idx = argv
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools present");
         assert_eq!(
             argv.get(idx + 1).map(String::as_str),
             Some("read"),
@@ -1719,12 +1762,21 @@ mod tests {
         // Arm 2 — the agent declared NO `tools:` at all; the ceiling's set must still apply rather
         // than falling through to the ambient (unflagged) tool surface.
         let bare = sample_agent_config("m1", &[]);
-        let plan =
-            build_attempt_spawn_plan(&bare, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &bare,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
         let idx = argv.iter().position(|a| a == "--tools").unwrap_or_else(|| {
-            panic!("a ceiling must pin the surface even with no agent-level `tools:`; argv {argv:?}")
+            panic!(
+                "a ceiling must pin the surface even with no agent-level `tools:`; argv {argv:?}"
+            )
         });
         assert_eq!(argv.get(idx + 1).map(String::as_str), Some("read"));
     }
@@ -1739,14 +1791,17 @@ mod tests {
     /// the widening the ceiling exists to prevent.
     #[test]
     fn a_capability_ceilings_deny_extensions_axis_strips_all_extension_paths_and_forces_no_extensions()
-    {
+     {
         use crate::exec::capability_ceiling as cc;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let session = "spawn-plan-ceiling-deny-extensions-session";
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.parent_session_id = Some(session.to_string());
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
 
         let _handle = cc::register_capability_ceiling(
             session,
@@ -1758,11 +1813,21 @@ mod tests {
         // The agent itself declares NO `extensions:` at all — the pre-fix code never pushed
         // `--no-extensions` on this arm.
         let bare = sample_agent_config("m1", &[]);
-        let plan =
-            build_attempt_spawn_plan(&bare, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &bare,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
-        assert!(argv.contains(&"--no-extensions".to_string()), "argv {argv:?}");
+        assert!(
+            argv.contains(&"--no-extensions".to_string()),
+            "argv {argv:?}"
+        );
         assert!(!argv.iter().any(|a| a == "--extension"), "argv {argv:?}");
 
         // The agent DOES declare `extensions:`, a tool-extension path, and a child-only
@@ -1783,7 +1848,10 @@ mod tests {
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
-        assert!(argv.contains(&"--no-extensions".to_string()), "argv {argv:?}");
+        assert!(
+            argv.contains(&"--no-extensions".to_string()),
+            "argv {argv:?}"
+        );
         assert!(
             !argv.iter().any(|a| a == "--extension"),
             "denyExtensions must strip agent.extensions, subagent_only_extensions AND \
@@ -1802,7 +1870,10 @@ mod tests {
         let session = "spawn-plan-ceiling-require-read-session";
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.parent_session_id = Some(session.to_string());
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
 
         let _handle = cc::register_capability_ceiling(
             session,
@@ -1824,7 +1895,10 @@ mod tests {
         ) else {
             panic!("a ceiling excluding `read` must refuse a launch that requires it");
         };
-        assert!(matches!(err, SubagentError::CapabilityCeilingViolation(_)), "{err:?}");
+        assert!(
+            matches!(err, SubagentError::CapabilityCeilingViolation(_)),
+            "{err:?}"
+        );
         assert_eq!(
             err.to_string(),
             "Capability ceiling from org-policy excludes required tool 'read' for lazy skill \
@@ -1851,7 +1925,10 @@ mod tests {
         let session = "spawn-plan-ceiling-deny-extensions-mcp-env-session";
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.parent_session_id = Some(session.to_string());
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
 
         let _handle = cc::register_capability_ceiling(
             session,
@@ -1865,9 +1942,16 @@ mod tests {
             ToolRef::Builtin("read".to_string()),
             ToolRef::Mcp("chrome-devtools".to_string()),
         ]);
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
 
         assert_eq!(
             plan.spec.env_overlay.get(MCP_DIRECT_TOOLS_ENV),
@@ -1889,22 +1973,35 @@ mod tests {
             binary: dir.path().join("wrapper-shim"),
             base_args: vec!["--launch".to_string(), "a b".to_string()],
         });
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
         let agent = sample_agent_config("m1", &[]);
 
         let plan = build_attempt_spawn_plan(
-            &agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
         )
         .expect("plan builds");
 
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::SUBAGENT_BINARY_ENV_VAR),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::SUBAGENT_BINARY_ENV_VAR),
             Some(&dir.path().join("wrapper-shim").display().to_string()),
             "the binary half must travel; overlay was {:?}",
             plan.spec.env_overlay
         );
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::SUBAGENT_BINARY_ARGS_ENV_VAR),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::SUBAGENT_BINARY_ARGS_ENV_VAR),
             Some(&r#"["--launch","a b"]"#.to_string()),
             "the args half must travel as JSON so an entry containing a space survives; overlay \
              was {:?}",
@@ -1925,16 +2022,27 @@ mod tests {
             binary: dir.path().join("bare-binary"),
             base_args: Vec::new(),
         });
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
         let agent = sample_agent_config("m1", &[]);
 
         let plan = build_attempt_spawn_plan(
-            &agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
         )
         .expect("plan builds");
 
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::SUBAGENT_BINARY_ARGS_ENV_VAR),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::SUBAGENT_BINARY_ARGS_ENV_VAR),
             Some(&"[]".to_string()),
             "an injected command must be authoritative over BOTH halves: writing `[]` is what \
              stops a stale inherited args value from attaching to the injected binary; overlay \
@@ -1949,16 +2057,28 @@ mod tests {
     fn no_injected_spawn_command_seeds_neither_env_var() {
         let dir = tempfile::tempdir().expect("tempdir");
         let opts = base_opts(dir.path(), &["m1"]);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
         let agent = sample_agent_config("m1", &[]);
 
         let plan = build_attempt_spawn_plan(
-            &agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
         )
         .expect("plan builds");
 
         assert!(
-            !plan.spec.env_overlay.contains_key(crate::spawn::SUBAGENT_BINARY_ENV_VAR)
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(crate::spawn::SUBAGENT_BINARY_ENV_VAR)
                 && !plan
                     .spec
                     .env_overlay
@@ -1989,7 +2109,10 @@ mod tests {
         let session = "spawn-plan-ceiling-allowed-tools-mcp-env-session";
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.parent_session_id = Some(session.to_string());
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
 
         let _handle = cc::register_capability_ceiling(
             session,
@@ -2003,9 +2126,16 @@ mod tests {
             ToolRef::Builtin("read".to_string()),
             ToolRef::Mcp("chrome-devtools".to_string()),
         ]);
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
 
         assert_eq!(
             plan.spec.env_overlay.get(MCP_DIRECT_TOOLS_ENV),
@@ -2015,7 +2145,6 @@ mod tests {
             plan.spec.env_overlay
         );
     }
-
 
     // ---- build_task_text / build_attempt_spawn_plan ----
 
@@ -2038,11 +2167,13 @@ mod tests {
         let text = build_task_text(&agent, "review it", &opts, &contract, "");
         assert_eq!(
             text,
-            format!("[Read from: {}]\n\nreview it", dir.path().join("plan.md").display()),
+            format!(
+                "[Read from: {}]\n\nreview it",
+                dir.path().join("plan.md").display()
+            ),
             "the read line is FIRST, closed by a blank line — pi's `readsInstruction + task`"
         );
     }
-
 
     /// pi's `resolveExistingReadPaths` filter (`shared/settings.ts:356-367`, upstream `bc1b689`):
     /// a declared read that does not exist is DROPPED, and an all-missing list emits no line at all
@@ -2055,12 +2186,14 @@ mod tests {
         let contract = AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]);
 
         let mut opts = base_opts(dir.path(), &["m1"]);
-        opts.reads =
-            Some(vec![PathBuf::from("present.md"), PathBuf::from("gone.md")]);
+        opts.reads = Some(vec![PathBuf::from("present.md"), PathBuf::from("gone.md")]);
         let text = build_task_text(&agent, "go", &opts, &contract, "");
         assert_eq!(
             text,
-            format!("[Read from: {}]\n\ngo", dir.path().join("present.md").display())
+            format!(
+                "[Read from: {}]\n\ngo",
+                dir.path().join("present.md").display()
+            )
         );
 
         let mut none_present = base_opts(dir.path(), &["m1"]);
@@ -2076,7 +2209,6 @@ mod tests {
         assert_eq!(build_task_text(&agent, "go", &bare, &contract, ""), "go");
     }
 
-
     /// An ABSOLUTE declared read is used verbatim (pi `resolveChainPath`'s `isAbsolute` arm), which
     /// is what lets a persona point at a file outside the child's cwd.
     #[test]
@@ -2090,11 +2222,16 @@ mod tests {
         let mut opts = base_opts(repo.path(), &["m1"]);
         opts.reads = Some(vec![target.clone()]);
         assert_eq!(
-            build_task_text(&agent, "go", &opts, &AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]), ""),
+            build_task_text(
+                &agent,
+                "go",
+                &opts,
+                &AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]),
+                ""
+            ),
             format!("[Read from: {}]\n\ngo", target.display())
         );
     }
-
 
     #[test]
     fn build_task_text_injects_acceptance_contract_and_output_path_instruction() {
@@ -2111,7 +2248,6 @@ mod tests {
         assert!(text.contains("Acceptance Contract"));
         assert!(text.contains("out.md"));
     }
-
 
     /// G82 — `build_task_text` must use the TASK-side injector
     /// (`injectSingleOutputInstruction`, `single-output.ts:99-102`), whose header is
@@ -2144,7 +2280,6 @@ mod tests {
             "the injected output instruction must be stripped before intent classification: {text:?}"
         );
     }
-
 
     /// G82 REGRESSION — upstream keys the output instruction on the PATH alone
     /// (`subagent-executor.ts:3674`, `chain-execution.ts:363,1320` @v0.43.0,
@@ -2198,7 +2333,6 @@ mod tests {
         }
     }
 
-
     /// G82 — the capability branch of `formatOutputPathInstruction` (`single-output.ts:84-91`)
     /// must be reachable from the LIVE composition path, not merely from the injector's own unit
     /// test: an agent whose whole resolved allowlist is read-only is told to return the artifact
@@ -2247,7 +2381,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn build_task_text_appends_skill_injection_even_when_the_agent_does_not_inherit_skills() {
         // T5 (C4): the `<available_skills>` pointer block is composed into the child prompt from the
@@ -2279,11 +2412,18 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &text, &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            &text,
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         assert!(plan.spec.build_argv().contains(&"--no-skills".to_string()));
     }
-
 
     // ---- Child watchdog activation (pi `execution.ts:298-302`, `subagent-runner.ts:1309-1312`) ----
 
@@ -2317,13 +2457,13 @@ mod tests {
         );
     }
 
-
     /// With `subagents.watchdog.{enabled,children.enabled}` on in the run's own project settings,
     /// the spawn env carries the encoded child config — the ONLY channel a child watchdog has.
     #[test]
     fn a_spawn_carries_the_encoded_child_watchdog_config_when_children_are_enabled() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let settings_path = crate::watchdog::settings::get_watchdog_project_settings_path(dir.path());
+        let settings_path =
+            crate::watchdog::settings::get_watchdog_project_settings_path(dir.path());
         std::fs::create_dir_all(settings_path.parent().expect("settings parent")).expect("mkdir");
         std::fs::write(
             &settings_path,
@@ -2374,7 +2514,6 @@ mod tests {
         assert_eq!(decoded.agent.as_deref(), Some(agent.name.as_str()));
     }
 
-
     /// SUBA-030 — the persona spill exists on disk, carries the composed body, and is mode `0600`;
     /// the body appears NOWHERE in argv. This is the item's own Verify recipe, minus the live
     /// `/proc/<pid>/cmdline` half, which needs a real spawn.
@@ -2411,7 +2550,10 @@ mod tests {
             .position(|a| a == "--system-prompt")
             .expect("replace mode ships the persona on --system-prompt");
         let path = std::path::PathBuf::from(&argv[idx + 1]);
-        assert!(path.is_absolute(), "the spill path must be absolute: {path:?}");
+        assert!(
+            path.is_absolute(),
+            "the spill path must be absolute: {path:?}"
+        );
         assert_eq!(
             path.parent(),
             Some(dir.path()),
@@ -2430,7 +2572,9 @@ mod tests {
 
         // The whole point: nothing on argv contains the body.
         assert!(
-            !argv.iter().any(|a| a.contains("You are the REVIEWER persona.")),
+            !argv
+                .iter()
+                .any(|a| a.contains("You are the REVIEWER persona.")),
             "SUBA-030: the persona must not be readable from the child's cmdline; argv was {argv:?}"
         );
 
@@ -2442,7 +2586,10 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777;
-            assert_eq!(mode, 0o600, "pi writes the prompt file with {{ mode: 0o600 }}");
+            assert_eq!(
+                mode, 0o600,
+                "pi writes the prompt file with {{ mode: 0o600 }}"
+            );
         }
 
         // Cleanup contract: the spill is registered, so `cleanup_temp_files` removes it on every
@@ -2456,21 +2603,23 @@ mod tests {
         assert!(!path.exists(), "cleanup must remove the persona spill");
     }
 
-
     /// pi `(input.promptFileStem ?? "prompt").replace(/[^\w.-]/g, "_")`
     /// (`runs/shared/pi-args.ts:572` @v0.43.0).
     #[test]
     fn prompt_file_stem_sanitization_matches_pis_character_class() {
         use crate::spawn::sanitize_prompt_file_stem as s;
         assert_eq!(s("reviewer"), "reviewer");
-        assert_eq!(s("my.agent-2_x"), "my.agent-2_x", "`.`, `-` and `_` are kept");
+        assert_eq!(
+            s("my.agent-2_x"),
+            "my.agent-2_x",
+            "`.`, `-` and `_` are kept"
+        );
         assert_eq!(s("a/b c:d"), "a_b_c_d", "separators and spaces become `_`");
         // JS `\w` is ASCII-only; `char::is_alphanumeric` would wrongly keep these.
         assert_eq!(s("résumé"), "r_sum_");
         assert_eq!(s(""), "prompt", "pi's `?? \"prompt\"` default");
         assert_eq!(s("   "), "prompt");
     }
-
 
     #[test]
     fn build_attempt_spawn_plan_delivers_the_persona_body_as_system_prompt_in_replace_mode() {
@@ -2493,9 +2642,16 @@ mod tests {
             max_depth: 5,
         };
 
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "do the thing", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
 
         let delivered = delivered_system_prompt(&argv)
@@ -2507,7 +2663,6 @@ mod tests {
         // `replace` must never also append — the two flags are mutually exclusive per mode.
         assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
     }
-
 
     /// pi `execution.ts:1433-1443` composes FOUR things onto `systemPrompt`, in this order:
     /// skills, the agent-memory block, the project-local refinement overlay, the output-path
@@ -2618,9 +2773,11 @@ mod tests {
             !without.contains("pi-subagents-refinement"),
             "no overlay file means no overlay block: {without}"
         );
-        assert!(without.contains("Runtime output path override:"), "{without}");
+        assert!(
+            without.contains("Runtime output path override:"),
+            "{without}"
+        );
     }
-
 
     // ---- G103: an EXPLICITLY empty `tools:` means "no tools" (pi `runs/shared/pi-args.ts:389-393,549-555`) ----
 
@@ -2687,7 +2844,6 @@ mod tests {
         );
     }
 
-
     /// MIRROR: an agent that OMITS `tools:` entirely is asking to INHERIT the ambient tool set, not
     /// to be stripped of it. Neither flag may appear — the case the fix must not capture.
     #[test]
@@ -2728,7 +2884,6 @@ mod tests {
             "an agent that pinned no allowlist must get neither flag; argv was {argv:?}"
         );
     }
-
 
     /// MIRROR: a NON-empty allowlist is unaffected — `--tools <list>` exactly as before, and the
     /// `REQUIRED_CHILD_TOOLS` env still pinned.
@@ -2772,7 +2927,6 @@ mod tests {
             plan.spec.env_overlay
         );
     }
-
 
     /// SUBA-045 — the diagnostic handshake is armed under pi's own gate (`if
     /// (toolPlan.requiredChildTools.length > 0)`, `pi-args.ts:611`) and nowhere else.
@@ -2852,7 +3006,6 @@ mod tests {
             plan.spec.env_overlay
         );
     }
-
 
     // ---- SUBA-014: `requireReadTool` head-injection (pi `runs/shared/pi-args.ts:361-371`) ----
 
@@ -2937,15 +3090,11 @@ mod tests {
                         argv.contains(&"--no-tools".to_string()),
                         "an empty allowlist must stay --no-tools even with require_read_tool; argv {argv:?}"
                     );
-                    assert!(
-                        !argv.iter().any(|a| a == "--tools"),
-                        "argv {argv:?}"
-                    );
+                    assert!(!argv.iter().any(|a| a == "--tools"), "argv {argv:?}");
                 }
             }
         }
     }
-
 
     /// MIRROR: an agent that pinned NO allowlist at all (`tools:` absent) is on pi's
     /// `input.tools === undefined` arm, where the injection does not exist — the child inherits the
@@ -2978,7 +3127,6 @@ mod tests {
             "argv {argv:?}"
         );
     }
-
 
     // ---- `memory:` scopes reach the child persona (pi `execution.ts:1058-1061`) ----
 
@@ -3058,7 +3206,6 @@ mod tests {
         );
     }
 
-
     /// An agent with NO `memory:` block must produce a byte-identical spawn plan to before — the
     /// overwhelming majority of agents.
     #[test]
@@ -3089,7 +3236,6 @@ mod tests {
         );
         assert!(!argv.iter().any(|a| a.contains("Persistent agent memory")));
     }
-
 
     // ---- `toolBudget:` reaches the child (pi `tool-budget.ts:70-72`) ----
 
@@ -3144,7 +3290,6 @@ mod tests {
         );
     }
 
-
     /// An agent with no `toolBudget:` must set no budget var at all — a child must never inherit a
     /// stale budget from the parent process's own environment.
     #[test]
@@ -3189,9 +3334,20 @@ mod tests {
         let agent = sample_agent_config("m1", &[]);
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.permission_rules = Some(rules.clone());
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
 
         let encoded = plan
             .spec
@@ -3210,7 +3366,10 @@ mod tests {
             .expect("an audit path must accompany a present policy");
         assert_eq!(
             audit_path,
-            &dir.path().join("permission-audit.jsonl").display().to_string(),
+            &dir.path()
+                .join("permission-audit.jsonl")
+                .display()
+                .to_string(),
             "the default audit path is under this attempt's own temp_dir"
         );
     }
@@ -3225,13 +3384,33 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = sample_agent_config("m1", &[]);
         let opts = base_opts(dir.path(), &["m1"]);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
-        assert!(!plan.spec.env_overlay.contains_key(pa::PERMISSION_POLICY_ENV));
-        assert!(!plan.spec.env_overlay.contains_key(pa::PERMISSION_AUDIT_PATH_ENV));
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(pa::PERMISSION_POLICY_ENV)
+        );
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(pa::PERMISSION_AUDIT_PATH_ENV)
+        );
     }
-
 
     /// G90, the SPAWN hop: a child handed a steer inbox must receive the path in its environment,
     /// and the directory must already exist when it starts.
@@ -3291,7 +3470,6 @@ mod tests {
                 .contains_key(crate::prompt_runtime::STEER_INBOX_ENV)
         );
     }
-
 
     /// G95 + G89 across the DETACHED-RUNNER seam, which the two tests above do not touch.
     ///
@@ -3375,7 +3553,6 @@ mod tests {
         );
     }
 
-
     /// SUBA-074 across the SAME detached-runner seam the test above guards.
     ///
     /// `runner` is a third `#[serde(default)] Option` field on that hand-off, so it carries the
@@ -3401,21 +3578,36 @@ mod tests {
             std::path::Path::new("reviewer.md"),
         )
         .expect("an external-cli profile declaring no Pi-only field must load");
-        assert!(def.runner.is_some(), "HOP 0: the frontmatter parse must yield a runner");
+        assert!(
+            def.runner.is_some(),
+            "HOP 0: the frontmatter parse must yield a runner"
+        );
 
         // The hand-off, verbatim: resolve → serialize into the runner config → deserialize in the
         // detached runner process → rebuild the spawn input.
         let persona = ResolvedAgentPersona::from_agent_definition(&def);
-        assert_eq!(persona.runner, def.runner, "HOP A: from_agent_definition dropped the runner");
+        assert_eq!(
+            persona.runner, def.runner,
+            "HOP A: from_agent_definition dropped the runner"
+        );
 
         let encoded = serde_json::to_string(&persona).expect("persona serializes");
         let decoded: ResolvedAgentPersona =
             serde_json::from_str(&encoded).expect("runner config deserializes");
-        assert_eq!(decoded.runner, def.runner, "HOP B: the JSON round-trip dropped the runner");
+        assert_eq!(
+            decoded.runner, def.runner,
+            "HOP B: the JSON round-trip dropped the runner"
+        );
 
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
         let agent = decoded.to_agent_config(depth);
-        assert_eq!(agent.runner, def.runner, "HOP C: to_agent_config dropped the runner");
+        assert_eq!(
+            agent.runner, def.runner,
+            "HOP C: to_agent_config dropped the runner"
+        );
 
         // The observable end product: the rebuilt config refuses, so a background/chain/parallel
         // step declines the profile exactly as the foreground path does.
@@ -3428,7 +3620,6 @@ mod tests {
         assert!(reason.contains("adapter 'claude-code'"), "{reason}");
         assert!(reason.contains("full-capability native child"), "{reason}");
     }
-
 
     /// SUBA-S01 (pi `runs/shared/pi-args.ts:246-250`): a declared `outputSchema` must reach the child as BOTH
     /// structured-output env vars, pointing at the runtime's real schema and capture paths.
@@ -3493,7 +3684,6 @@ mod tests {
         assert_eq!(written, schema);
     }
 
-
     /// The other half of the gate: no declared schema means NO structured-output env at all, so an
     /// ordinary child registers no `structured_output` tool (pi gates on both vars being present,
     /// `subagent-prompt-runtime.ts:281`).
@@ -3507,9 +3697,16 @@ mod tests {
             max_depth: 5,
         };
 
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
 
         assert!(
             !plan
@@ -3523,7 +3720,6 @@ mod tests {
             "a step with no outputSchema must carry no structured-output env"
         );
     }
-
 
     #[test]
     fn build_attempt_spawn_plan_delivers_the_persona_body_as_append_in_append_mode() {
@@ -3540,9 +3736,16 @@ mod tests {
         };
 
         let task_text = build_task_text(&agent, "do the thing", &opts, &contract, "");
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &task_text, &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            &task_text,
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
 
         let delivered = delivered_system_prompt(&argv).unwrap_or_default();
@@ -3559,7 +3762,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn build_attempt_spawn_plan_omits_the_system_prompt_flag_for_an_empty_persona_body() {
         // A persona with no prose must not blank the child's own assembled system prompt.
@@ -3573,13 +3775,20 @@ mod tests {
             max_depth: 5,
         };
 
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
         assert!(!argv.iter().any(|a| a.starts_with("--system-prompt")));
         assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
     }
-
 
     // ---- G82 / R-SA-024: the SYSTEM-PROMPT half of the output-path override
     //      (pi `injectOutputPathSystemPrompt`, `execution.ts:1443`) ----
@@ -3603,9 +3812,16 @@ mod tests {
             max_depth: 5,
         };
 
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
         let delivered = delivered_system_prompt(&argv).unwrap_or_default();
         assert!(
@@ -3642,7 +3858,6 @@ mod tests {
         );
     }
 
-
     /// No configured output path means no override — the persona ships alone, byte-identical to
     /// what it was before this injection existed (`injectOutputPathSystemPrompt` returns its input
     /// unchanged for an undefined path, `single-output.ts:105`).
@@ -3658,9 +3873,16 @@ mod tests {
             max_depth: 5,
         };
 
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
         assert_eq!(
             delivered_system_prompt(&argv).as_deref(),
@@ -3668,7 +3890,6 @@ mod tests {
             "argv was {argv:?}"
         );
     }
-
 
     /// Same rule as the task side: upstream keys the injection on the PATH alone. `outputMode` is
     /// read only by `validateFileOnlyOutputMode` and by delivery-side `finalizeSingleOutput`.
@@ -3706,7 +3927,6 @@ mod tests {
             );
         }
     }
-
 
     /// The capability branch (`formatOutputPathInstruction`, `single-output.ts:84-91`) must be
     /// live on this surface too, not only on the task side: a read-only agent is told the runtime
@@ -3774,7 +3994,6 @@ mod tests {
         );
     }
 
-
     /// An empty persona plus a configured output path composes a NON-empty body, so the flag ships
     /// — pi emits its system-prompt flag for any non-null string (`runs/shared/pi-args.ts:570-585`), and the
     /// composed value is exactly the override. The empty-body omission delta survives only for the
@@ -3793,9 +4012,16 @@ mod tests {
             max_depth: 5,
         };
 
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
         let delivered = delivered_system_prompt(&argv).unwrap_or_default();
         assert!(
@@ -3803,7 +4029,6 @@ mod tests {
             "the override alone must still ship; argv was {argv:?}"
         );
     }
-
 
     /// Both halves reach the SAME run, as upstream's foreground single run does: the task side
     /// from `subagent-executor.ts:3674` (cyrup: [`build_task_text`]) and the system-prompt side
@@ -3823,12 +4048,22 @@ mod tests {
         };
 
         let task = build_task_text(&agent, "do the thing", &opts, &contract, "");
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &task, &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            &task,
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let delivered = delivered_system_prompt(&plan.spec.build_argv()).unwrap_or_default();
 
-        assert!(task.contains("\n\n---\n**Output:**\n"), "task side missing: {task:?}");
+        assert!(
+            task.contains("\n\n---\n**Output:**\n"),
+            "task side missing: {task:?}"
+        );
         assert!(
             delivered.contains("Runtime output path override:"),
             "system-prompt side missing: {delivered:?}"
@@ -3845,7 +4080,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn build_attempt_spawn_plan_includes_tools_flag_only_when_agent_declares_tools() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3859,16 +4093,27 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
-        let tools_idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
+        let tools_idx = argv
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools present");
         assert_eq!(argv[tools_idx + 1], "read,edit");
     }
 
-
     #[test]
-    fn build_attempt_spawn_plan_writes_the_child_intercom_bridge_env_when_orchestrator_target_is_set() {
+    fn build_attempt_spawn_plan_writes_the_child_intercom_bridge_env_when_orchestrator_target_is_set()
+     {
         // The production activation path: when the orchestrator's presence target + this run's id are
         // present in `RunOptions`, the spawn overlay MUST write all six child-bridge identity vars so
         // the spawned child's `IntercomExtension` reads `read_child_orchestrator_metadata() == Some`
@@ -3879,25 +4124,49 @@ mod tests {
         opts.orchestrator_intercom_target = Some("subagent-chat-abcd1234".to_string());
         opts.run_id = Some(crate::background::RunId::from_token("run-XYZ"));
         opts.child_index = Some(2);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let env = &plan.spec.env_overlay;
         assert_eq!(
-            env.get(crate::spawn::intercom_target::ENV_ORCHESTRATOR_TARGET).map(String::as_str),
+            env.get(crate::spawn::intercom_target::ENV_ORCHESTRATOR_TARGET)
+                .map(String::as_str),
             Some("subagent-chat-abcd1234")
         );
-        assert_eq!(env.get(crate::spawn::nested_events::RUN_ID_ENV).map(String::as_str), Some("run-XYZ"));
-        assert_eq!(env.get(crate::spawn::intercom_target::ENV_CHILD_AGENT).map(String::as_str), Some("worker"));
-        assert_eq!(env.get(crate::spawn::nested_events::CHILD_INDEX_ENV).map(String::as_str), Some("2"));
+        assert_eq!(
+            env.get(crate::spawn::nested_events::RUN_ID_ENV)
+                .map(String::as_str),
+            Some("run-XYZ")
+        );
+        assert_eq!(
+            env.get(crate::spawn::intercom_target::ENV_CHILD_AGENT)
+                .map(String::as_str),
+            Some("worker")
+        );
+        assert_eq!(
+            env.get(crate::spawn::nested_events::CHILD_INDEX_ENV)
+                .map(String::as_str),
+            Some("2")
+        );
         // The child's own label = resolve_subagent_intercom_target(run_id, agent, index) — the SAME
         // string the parent's `control_resume` recomputes to steer it (index+1 suffix).
         assert_eq!(
-            env.get(crate::spawn::intercom_target::ENV_INTERCOM_SESSION_NAME).map(String::as_str),
+            env.get(crate::spawn::intercom_target::ENV_INTERCOM_SESSION_NAME)
+                .map(String::as_str),
             Some("subagent-worker-run-xyz-3")
         );
     }
-
 
     /// G106 (pi `runs/shared/pi-args.ts:221-231`, `3ac0ef5` "Make supervisor coordination native"): the single
     /// spawn-plan chokepoint must hand a child BOTH native-supervisor-channel vars and CREATE the
@@ -3915,13 +4184,25 @@ mod tests {
         opts.run_id = Some(crate::background::RunId::from_token("run-NSC"));
         opts.child_index = Some(2);
         opts.parent_session_id = Some("session-parent-1".to_string());
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let env = &plan.spec.env_overlay;
 
         assert_eq!(
-            env.get(crate::spawn::intercom_target::ENV_ORCHESTRATOR_SESSION_ID).map(String::as_str),
+            env.get(crate::spawn::intercom_target::ENV_ORCHESTRATOR_SESSION_ID)
+                .map(String::as_str),
             Some("session-parent-1"),
             "the native channel keys every request on the launching session's own id"
         );
@@ -3950,7 +4231,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&channel_dir);
     }
 
-
     /// The negative half: no parent session id means no routing key, so NEITHER var is written — a
     /// half-set overlay would leave the child holding a channel it cannot address.
     #[test]
@@ -3962,31 +4242,54 @@ mod tests {
         opts.run_id = Some(crate::background::RunId::from_token("run-NSC2"));
         opts.child_index = Some(0);
         opts.parent_session_id = None;
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let env = &plan.spec.env_overlay;
         assert!(!env.contains_key(crate::spawn::intercom_target::ENV_SUPERVISOR_CHANNEL_DIR));
-        assert!(crate::native_supervisor::read_child_metadata_from(&|k| env.get(k).cloned()).is_none());
+        assert!(
+            crate::native_supervisor::read_child_metadata_from(&|k| env.get(k).cloned()).is_none()
+        );
     }
 
-
     #[test]
-    fn build_attempt_spawn_plan_omits_the_child_intercom_bridge_env_without_an_orchestrator_target() {
+    fn build_attempt_spawn_plan_omits_the_child_intercom_bridge_env_without_an_orchestrator_target()
+    {
         // A headless / no-intercom run (no orchestrator target) must leave the child un-bridged — the
         // clean no-intercom path, so a plain run spawns no broker-participant child.
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = sample_agent_config("m1", &[]);
         let opts = base_opts(dir.path(), &["m1"]); // orchestrator_intercom_target / run_id both None
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let env = &plan.spec.env_overlay;
         assert!(!env.contains_key(crate::spawn::intercom_target::ENV_ORCHESTRATOR_TARGET));
         assert!(!env.contains_key(crate::spawn::intercom_target::ENV_INTERCOM_SESSION_NAME));
         assert!(!env.contains_key(crate::spawn::intercom_target::ENV_CHILD_AGENT));
     }
-
 
     /// TOOL-031 / PARITY-GAPS PB-5 — the agent-identity markers must survive the re-exec.
     ///
@@ -4006,9 +4309,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = sample_agent_config("m1", &[]);
         let opts = base_opts(dir.path(), &["m1"]);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let env = &plan.spec.env_overlay;
         assert_eq!(
             env.get("PI_CODING_AGENT").map(String::as_str),
@@ -4021,7 +4335,6 @@ mod tests {
             "`AI_AGENT` (pi `cli.ts:14`) names WHICH agent is running; the key is pi's verbatim"
         );
     }
-
 
     /// CFG-069 — the third and last of the three sites that write `AI_AGENT` into a child.
     ///
@@ -4042,14 +4355,20 @@ mod tests {
         let src = include_str!("spawn_plan.rs");
 
         assert!(
-            src.contains(r#"env_overlay.insert("PI_CODING_AGENT".to_string(), "true".to_string());"#),
+            src.contains(
+                r#"env_overlay.insert("PI_CODING_AGENT".to_string(), "true".to_string());"#
+            ),
             "the at-tag marker `PI_CODING_AGENT` (cli.ts:13 @v0.83.0) must still be written"
         );
 
         let insert = r#"env_overlay.insert("AI_AGENT".to_string(), "cyrup".to_string());"#;
-        let at = src.find(insert).expect("`AI_AGENT` is written into the spawn overlay");
+        let at = src
+            .find(insert)
+            .expect("`AI_AGENT` is written into the spawn overlay");
         let annotation = &src[..at];
-        let annotation = &annotation[annotation.rfind("[CYRUP-DELTA").expect("a delta annotation")..];
+        let annotation = &annotation[annotation
+            .rfind("[CYRUP-DELTA")
+            .expect("a delta annotation")..];
 
         assert!(
             annotation.contains("@v0.84.1"),
@@ -4065,7 +4384,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn build_attempt_spawn_plan_omits_tools_flag_when_agent_declares_no_allowlist() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4075,11 +4393,18 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         assert!(!plan.spec.build_argv().contains(&"--tools".to_string()));
     }
-
 
     #[test]
     fn build_attempt_spawn_plan_includes_session_flag_when_fork_context_resolved() {
@@ -4095,17 +4420,27 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
-        let idx = argv.iter().position(|a| a == "--session").expect("--session present");
+        let idx = argv
+            .iter()
+            .position(|a| a == "--session")
+            .expect("--session present");
         assert!(argv[idx + 1].contains("parent-branch.jsonl"));
         // pi's `sessionFile` branch (`runs/shared/pi-args.ts:101-103`) emits ONLY `--session`: never the
         // `--no-session`/`--session-dir` pair from the else arm.
         assert!(!argv.contains(&"--no-session".to_string()));
         assert!(!argv.contains(&"--session-dir".to_string()));
     }
-
 
     /// SUBA-041 prerequisite (pi `buildPiArgs`, `runs/shared/pi-args.ts:517-528`): with NO fork-context session
     /// file, no `session_dir` and no `share`, pi's `sessionEnabled` is false and the child is spawned
@@ -4116,14 +4451,27 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = sample_agent_config("m1", &[]);
         let opts = base_opts(dir.path(), &["m1"]);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
         assert!(argv.contains(&"--no-session".to_string()), "argv: {argv:?}");
-        assert!(!argv.contains(&"--session-dir".to_string()), "argv: {argv:?}");
+        assert!(
+            !argv.contains(&"--session-dir".to_string()),
+            "argv: {argv:?}"
+        );
     }
-
 
     /// SUBA-041 prerequisite: an explicit `session_dir` both ENABLES sessions (no `--no-session`)
     /// and reaches the child as `--session-dir <dir>`, with the directory created up front — pi's
@@ -4135,9 +4483,20 @@ mod tests {
         let mut opts = base_opts(dir.path(), &["m1"]);
         let session_dir = dir.path().join("sessions").join("run-0");
         opts.session_dir = Some(session_dir.clone());
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
         let idx = argv
             .iter()
@@ -4148,9 +4507,11 @@ mod tests {
             !argv.contains(&"--no-session".to_string()),
             "an explicit session dir enables sessions: {argv:?}"
         );
-        assert!(session_dir.is_dir(), "the session dir must be created up front");
+        assert!(
+            session_dir.is_dir(),
+            "the session dir must be created up front"
+        );
     }
-
 
     /// SUBA-041 prerequisite: `share: true` alone is pi's other `sessionEnabled` term
     /// (`execution.ts:1412`) — it suppresses `--no-session` without naming a directory.
@@ -4160,14 +4521,30 @@ mod tests {
         let agent = sample_agent_config("m1", &[]);
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.share = Some(true);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
-        assert!(!argv.contains(&"--no-session".to_string()), "argv: {argv:?}");
-        assert!(!argv.contains(&"--session-dir".to_string()), "argv: {argv:?}");
+        assert!(
+            !argv.contains(&"--no-session".to_string()),
+            "argv: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&"--session-dir".to_string()),
+            "argv: {argv:?}"
+        );
     }
-
 
     /// SUBA-041 prerequisite: `share: false` is NOT an enabling value — pi's term is
     /// `options.share === true` (`execution.ts:1027`), so an explicit `false` still yields
@@ -4178,12 +4555,22 @@ mod tests {
         let agent = sample_agent_config("m1", &[]);
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.share = Some(false);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         assert!(plan.spec.build_argv().contains(&"--no-session".to_string()));
     }
-
 
     #[test]
     fn build_attempt_spawn_plan_propagates_depth_envelope_into_env_overlay() {
@@ -4194,18 +4581,29 @@ mod tests {
             current_depth: 2,
             max_depth: 4,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::depth::DEPTH_ENV_VAR),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::depth::DEPTH_ENV_VAR),
             Some(&"2".to_string())
         );
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::depth::MAX_DEPTH_ENV_VAR),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::depth::MAX_DEPTH_ENV_VAR),
             Some(&"4".to_string())
         );
     }
-
 
     // ---- PERM-001: the child-ROLE env pair (pi `augmentChildEnv`, `runs/shared/pi-args.ts:329-330`) ----
 
@@ -4229,11 +4627,21 @@ mod tests {
             max_depth: 5,
         };
 
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
 
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::nested_events::CHILD_ENV),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::nested_events::CHILD_ENV),
             Some(&"1".to_string()),
             "every spawned child must carry the child-role flag; overlay was {:?}",
             plan.spec.env_overlay
@@ -4241,13 +4649,14 @@ mod tests {
         // Explicit `"0"`, never absent: the overlay is applied OVER the inherited env, so omitting it
         // would let a fanout-authorized parent's own `1` leak into an unauthorized grandchild.
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
             Some(&"0".to_string()),
             "an unauthorized child must be pinned to fanout=0, not left to inherit; overlay was {:?}",
             plan.spec.env_overlay
         );
     }
-
 
     /// The consequence of the flag, at the seam that reads it: a child spawned by the production
     /// planner registers NO subagent surface at all (pi `extension/index.ts:177`), instead of the
@@ -4262,8 +4671,16 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
 
         let is_one = |name: &str| plan.spec.env_overlay.get(name).map(String::as_str) == Some("1");
         let mode = crate::extension::resolve_registration_mode(
@@ -4276,7 +4693,6 @@ mod tests {
             plan.spec.env_overlay
         );
     }
-
 
     /// The other half of pi's `fanoutAuthorized = declaredBuiltinTools.includes("subagent")`
     /// (`runs/shared/pi-args.ts:194`, written to the env at `:330`): a persona that declares the
@@ -4297,11 +4713,21 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
 
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
             Some(&"1".to_string()),
             "a persona that declares `subagent` must be spawned fanout-authorized; overlay was {:?}",
             plan.spec.env_overlay
@@ -4321,11 +4747,12 @@ mod tests {
         );
         // It is still a CHILD: its asks forward to the parent's spool rather than resolving locally.
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::nested_events::CHILD_ENV),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::nested_events::CHILD_ENV),
             Some(&"1".to_string())
         );
     }
-
 
     /// A persona that declares tools but NOT `subagent` stays unauthorized — the grant is per-agent,
     /// not "anyone who declares any tools" (pi's `.includes("subagent")` is an exact membership
@@ -4343,10 +4770,20 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
             Some(&"0".to_string()),
             "only a declared `subagent` tool grants fanout; overlay was {:?}",
             plan.spec.env_overlay
@@ -4364,14 +4801,17 @@ mod tests {
     /// `--no-extensions`/the launch-time throw, never against `FANOUT_CHILD_ENV`).
     #[test]
     fn a_capability_ceiling_excluding_subagent_revokes_fanout_authorization_even_when_the_agent_declares_it()
-    {
+     {
         use crate::exec::capability_ceiling as cc;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let session = "spawn-plan-ceiling-fanout-revoke-session";
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.parent_session_id = Some(session.to_string());
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
 
         let _handle = cc::register_capability_ceiling(
             session,
@@ -4385,19 +4825,31 @@ mod tests {
             ToolRef::Builtin(crate::extension::TOOL_NAME.to_string()),
             ToolRef::Builtin("read".to_string()),
         ]);
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
 
         // The ceiling still correctly narrows --tools to just `read` (the (a)-(d) fix, unaffected).
         let argv = plan.spec.build_argv();
-        let idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
+        let idx = argv
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools present");
         assert_eq!(argv.get(idx + 1).map(String::as_str), Some("read"));
 
         // But fanout authorization must ALSO be revoked, even though the agent's own `tools:`
         // declares `subagent` — the ceiling excludes it from `allowedTools`.
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
             Some(&"0".to_string()),
             "a ceiling excluding `subagent` from allowedTools must revoke fanout authorization \
              even when the agent's own tools: declares it; overlay was {:?}",
@@ -4419,7 +4871,10 @@ mod tests {
         let session = "spawn-plan-ceiling-fanout-grant-session";
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.parent_session_id = Some(session.to_string());
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
 
         let _handle = cc::register_capability_ceiling(
             session,
@@ -4430,18 +4885,32 @@ mod tests {
 
         // No `tools:` declared at all.
         let agent = sample_agent_config("m1", &[]);
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
 
         let argv = plan.spec.build_argv();
         let idx = argv.iter().position(|a| a == "--tools").unwrap_or_else(|| {
-            panic!("a ceiling must pin the surface even with no agent-level `tools:`; argv {argv:?}")
+            panic!(
+                "a ceiling must pin the surface even with no agent-level `tools:`; argv {argv:?}"
+            )
         });
-        assert_eq!(argv.get(idx + 1).map(String::as_str), Some(crate::extension::TOOL_NAME));
+        assert_eq!(
+            argv.get(idx + 1).map(String::as_str),
+            Some(crate::extension::TOOL_NAME)
+        );
 
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
             Some(&"1".to_string()),
             "a ceiling granting `subagent` via allowedTools must authorize fanout even when the \
              agent declares no tools: of its own; overlay was {:?}",
@@ -4449,28 +4918,27 @@ mod tests {
         );
     }
 
-
     // ---- T4: thinking suffix (pi `applyThinkingSuffix`), inherit flags, extension threading,
     // and the direct-MCP tools split (`mcp:` refs no longer leak into `--tools` literally) ----
 
     #[test]
     fn apply_thinking_suffix_appends_level_to_a_provider_qualified_model() {
         assert_eq!(
-            apply_thinking_suffix(Some("openai-codex/gpt-5.4-mini"), Some("high"), false).as_deref(),
+            apply_thinking_suffix(Some("openai-codex/gpt-5.4-mini"), Some("high"), false)
+                .as_deref(),
             Some("openai-codex/gpt-5.4-mini:high")
         );
     }
-
 
     #[test]
     fn apply_thinking_suffix_passes_explicit_off_through() {
         // pi: "passes explicit thinking off through to the model arg".
         assert_eq!(
-            apply_thinking_suffix(Some("anthropic/claude-haiku-4-5"), Some("off"), false).as_deref(),
+            apply_thinking_suffix(Some("anthropic/claude-haiku-4-5"), Some("off"), false)
+                .as_deref(),
             Some("anthropic/claude-haiku-4-5:off")
         );
     }
-
 
     #[test]
     fn apply_thinking_suffix_leaves_a_non_thinking_provider_suffix_untouched() {
@@ -4478,11 +4946,11 @@ mod tests {
         // `:7b`-style suffix is not a THINKING_LEVEL, so with no thinking requested the id is
         // returned verbatim (no double-suffix, no accidental `:high`).
         assert_eq!(
-            apply_thinking_suffix(Some("openai-compatible/qwen2.5-coder:7b"), None, false).as_deref(),
+            apply_thinking_suffix(Some("openai-compatible/qwen2.5-coder:7b"), None, false)
+                .as_deref(),
             Some("openai-compatible/qwen2.5-coder:7b")
         );
     }
-
 
     #[test]
     fn apply_thinking_suffix_does_not_double_suffix_an_existing_thinking_level() {
@@ -4492,7 +4960,6 @@ mod tests {
         );
     }
 
-
     /// PROV-002: `max` must be a RECOGNIZED suffix. With the 6-entry list, a model id already
     /// ending `:max` was not recognized and got double-suffixed to `model:max:high`, producing an
     /// unresolvable id for the child process. Upstream pi-subagents fixed this in 747de75
@@ -4500,7 +4967,8 @@ mod tests {
     #[test]
     fn apply_thinking_suffix_recognizes_max_as_an_existing_level() {
         assert_eq!(
-            apply_thinking_suffix(Some("anthropic/claude-opus-4-6:max"), Some("high"), false).as_deref(),
+            apply_thinking_suffix(Some("anthropic/claude-opus-4-6:max"), Some("high"), false)
+                .as_deref(),
             Some("anthropic/claude-opus-4-6:max"),
             "an existing `:max` must not be double-suffixed"
         );
@@ -4510,7 +4978,6 @@ mod tests {
             Some("anthropic/claude-opus-4-6:max")
         );
     }
-
 
     /// SUBA-075 / pi `applyThinkingSuffix(model, thinking, replaceExisting)`
     /// (`runs/shared/pi-args.ts:238-252` @v0.57.0). The third argument exists for exactly one
@@ -4524,7 +4991,10 @@ mod tests {
     fn the_thinking_ceiling_crosses_the_spawn_boundary_only_when_one_is_set() {
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = sample_agent_config("m1", &[]);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
 
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.thinking_ceiling = Some("low".to_string());
@@ -4616,13 +5086,19 @@ mod tests {
             &ModelId::from("m1"),
             "task",
             &opts,
-            DepthEnvelope { current_depth: 0, max_depth: 5 },
+            DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
             dir.path(),
             None,
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
-        let model_idx = argv.iter().position(|a| a == "--model").expect("--model present");
+        let model_idx = argv
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model present");
         assert_eq!(
             argv.get(model_idx + 1).map(String::as_str),
             Some("m1:high"),
@@ -4639,13 +5115,19 @@ mod tests {
             &ModelId::from("m1"),
             "task",
             &opts,
-            DepthEnvelope { current_depth: 0, max_depth: 5 },
+            DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
             dir.path(),
             None,
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
-        let model_idx = argv.iter().position(|a| a == "--model").expect("--model present");
+        let model_idx = argv
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model present");
         assert_eq!(
             argv.get(model_idx + 1).map(String::as_str),
             Some("m1:off"),
@@ -4657,7 +5139,6 @@ mod tests {
     fn apply_thinking_suffix_returns_none_without_a_model() {
         assert_eq!(apply_thinking_suffix(None, Some("high"), false), None);
     }
-
 
     #[test]
     fn build_attempt_spawn_plan_suffixes_the_child_model_with_the_agent_thinking_level() {
@@ -4680,10 +5161,12 @@ mod tests {
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
-        let idx = argv.iter().position(|a| a == "--model").expect("--model present");
+        let idx = argv
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model present");
         assert_eq!(argv[idx + 1], "openai-codex/gpt-5.4-mini:high");
     }
-
 
     #[test]
     fn an_inheriting_persona_spawns_the_child_with_the_parent_session_model() {
@@ -4699,8 +5182,12 @@ mod tests {
         let inherited = ModelId::from("together/zai-org/GLM-5.2");
         // available_models is built the way run_foreground_impl / run_single build it (persona
         // fallbacks + own model), then resolve_model_inheritance folds in the inherited parent model.
-        let mut available_models: Vec<ModelId> =
-            agent.fallback_models.iter().cloned().chain(agent.model.clone()).collect();
+        let mut available_models: Vec<ModelId> = agent
+            .fallback_models
+            .iter()
+            .cloned()
+            .chain(agent.model.clone())
+            .collect();
         let ov = crate::exec::fallback::resolve_model_inheritance(
             None, // no per-call override
             agent.model.as_ref(),
@@ -4731,16 +5218,27 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &candidates[0], "task", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &candidates[0],
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
-        let idx = argv.iter().position(|a| a == "--model").expect("--model present");
+        let idx = argv
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model present");
         assert_eq!(
-            argv[idx + 1], "together/zai-org/GLM-5.2",
+            argv[idx + 1],
+            "together/zai-org/GLM-5.2",
             "the child must spawn with the inherited parent session model as --model"
         );
     }
-
 
     #[test]
     fn build_attempt_spawn_plan_emits_no_skills_only_when_the_agent_does_not_inherit_skills() {
@@ -4753,9 +5251,16 @@ mod tests {
 
         let mut inheriting = sample_agent_config("m1", &[]);
         inheriting.inherit_skills = true;
-        let plan =
-            build_attempt_spawn_plan(&inheriting, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &inheriting,
+            &ModelId::from("m1"),
+            "t",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         assert!(
             !plan.spec.build_argv().contains(&"--no-skills".to_string()),
             "an agent that inherits skills must NOT be spawned with --no-skills"
@@ -4787,7 +5292,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn build_attempt_spawn_plan_threads_inherit_project_context_and_none_mcp_sentinel() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4798,10 +5302,20 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "t",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         assert_eq!(
-            plan.spec.env_overlay.get("CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT"),
+            plan.spec
+                .env_overlay
+                .get("CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT"),
             Some(&"1".to_string())
         );
         // No direct MCP tools declared -> pi's `__none__` sentinel, never an unset/empty value.
@@ -4818,20 +5332,29 @@ mod tests {
         );
     }
 
-
     #[test]
     fn build_attempt_spawn_plan_omits_agent_name_env_for_unnamed_persona() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = sample_agent_config("m1", &[]);
         agent.name = String::new();
         let opts = base_opts(dir.path(), &["m1"]);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "t",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         // An empty persona name writes NO var (child resolves `None` — pi's top-level `""`).
         assert_eq!(plan.spec.env_overlay.get(AGENT_NAME_ENV_VAR), None);
     }
-
 
     /// SUBA-008 — the budget notice must reach the CHILD, and it must reach it through the system
     /// prompt: there is no `CYRUP_SUBAGENT_TURN_BUDGET` env var to carry it (unlike the tool
@@ -4846,12 +5369,23 @@ mod tests {
         let mut agent = sample_agent_config("m1", &[]);
         agent.system_prompt_body = "You are a careful worker.".to_string();
         let mut opts = base_opts(dir.path(), &["m1"]);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
 
         // Presence before absence: with NO budget the block must not appear at all, so the
         // assertion below cannot be satisfied by some unrelated boilerplate.
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "t",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let unbudgeted = read_system_prompt_arg(&plan);
         assert_eq!(unbudgeted.trim(), "You are a careful worker.");
         assert!(!unbudgeted.contains("## Turn budget"), "{unbudgeted}");
@@ -4860,19 +5394,34 @@ mod tests {
             max_turns: 4,
             grace_turns: 2,
         });
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "t",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let budgeted = read_system_prompt_arg(&plan);
         // The persona survives and the block is APPENDED after it (pi's outermost append,
         // `execution.ts:326`), never substituted for it.
-        assert!(budgeted.starts_with("You are a careful worker.\n\n## Turn budget\n"), "{budgeted}");
-        assert!(budgeted.contains("a soft budget of 4 assistant turns."), "{budgeted}");
         assert!(
-            budgeted.contains("After that, 2 additional assistant turns may be allowed only for a final wrap-up."),
+            budgeted.starts_with("You are a careful worker.\n\n## Turn budget\n"),
+            "{budgeted}"
+        );
+        assert!(
+            budgeted.contains("a soft budget of 4 assistant turns."),
+            "{budgeted}"
+        );
+        assert!(
+            budgeted.contains(
+                "After that, 2 additional assistant turns may be allowed only for a final wrap-up."
+            ),
             "{budgeted}"
         );
     }
-
 
     #[test]
     fn build_attempt_spawn_plan_threads_extensions_and_subagent_only_paths() {
@@ -4890,8 +5439,16 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "t",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
 
         // `Some(extensions)` turns discovery off.
@@ -4901,15 +5458,26 @@ mod tests {
             .enumerate()
             .filter_map(|(i, a)| (i > 0 && argv[i - 1] == "--extension").then_some(a))
             .collect();
-        assert!(ext_args.iter().any(|a| a.as_str() == "./custom-tool.ts"), "tool-extension path threaded");
-        assert!(ext_args.iter().any(|a| a.as_str() == "./allowed-ext.ts"), "allowlisted extension threaded");
-        assert!(ext_args.iter().any(|a| a.as_str() == "./child-tool.ts"), "child-only extension threaded");
+        assert!(
+            ext_args.iter().any(|a| a.as_str() == "./custom-tool.ts"),
+            "tool-extension path threaded"
+        );
+        assert!(
+            ext_args.iter().any(|a| a.as_str() == "./allowed-ext.ts"),
+            "allowlisted extension threaded"
+        );
+        assert!(
+            ext_args.iter().any(|a| a.as_str() == "./child-tool.ts"),
+            "child-only extension threaded"
+        );
 
         // The extension path is NOT in --tools; only the builtin is.
-        let tools_idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
+        let tools_idx = argv
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools present");
         assert_eq!(argv[tools_idx + 1], "read");
     }
-
 
     #[test]
     fn build_attempt_spawn_plan_splits_mcp_refs_out_of_tools_and_sets_the_env() {
@@ -4928,10 +5496,21 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
-            .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "t",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
-        let tools_idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
+        let tools_idx = argv
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools present");
         let tools_val = &argv[tools_idx + 1];
         assert!(
             tools_val.split(',').next() == Some("read"),
@@ -4947,7 +5526,6 @@ mod tests {
             Some(&"chrome-devtools".to_string())
         );
     }
-
 
     // ---- T0.3 (C15, SAFETY): the CHILD env overlay increments depth by exactly one and applies
     // the agent's tightening-only max, exactly as `SpawnedChildAttemptRunner::run_attempt`
@@ -4972,22 +5550,32 @@ mod tests {
         // Exactly what run_attempt now does before building the spawn plan.
         let child_depth =
             crate::spawn::depth::next_envelope(&agent.depth, agent.max_subagent_depth);
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, child_depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            child_depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
 
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::depth::DEPTH_ENV_VAR),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::depth::DEPTH_ENV_VAR),
             Some(&"2".to_string()),
             "the child MUST inherit parent_depth + 1, never the parent's own depth verbatim"
         );
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::depth::MAX_DEPTH_ENV_VAR),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::depth::MAX_DEPTH_ENV_VAR),
             Some(&"5".to_string()),
             "with no agent-level tightening, the inherited ceiling passes through unchanged"
         );
     }
-
 
     #[test]
     fn child_spawn_env_applies_the_agents_tightening_only_max_depth() {
@@ -5004,21 +5592,31 @@ mod tests {
 
         let child_depth =
             crate::spawn::depth::next_envelope(&agent.depth, agent.max_subagent_depth);
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, child_depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            child_depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
 
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::depth::DEPTH_ENV_VAR),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::depth::DEPTH_ENV_VAR),
             Some(&"1".to_string())
         );
         assert_eq!(
-            plan.spec.env_overlay.get(crate::spawn::depth::MAX_DEPTH_ENV_VAR),
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::depth::MAX_DEPTH_ENV_VAR),
             Some(&"2".to_string()),
             "the agent's own tighter declared max must win over the looser inherited ceiling"
         );
     }
-
 
     /// SUBA-092 / pi `runs/shared/pi-args.ts:502-504,776-777` @v0.64.0 — an agent that declared
     /// NO `tools:` keeps its ambient tool set minus `excludeTools`, delivered to the child as
@@ -5028,26 +5626,46 @@ mod tests {
     fn exclude_tools_on_an_agent_with_no_allowlist_reaches_the_child_as_exclude_tools() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = sample_agent_config("m1", &[]);
-        agent.exclude_tools =
-            vec![" bash ".to_string(), "bash".to_string(), String::new(), "write".to_string()];
+        agent.exclude_tools = vec![
+            " bash ".to_string(),
+            "bash".to_string(),
+            String::new(),
+            "write".to_string(),
+        ];
         let opts = base_opts(dir.path(), &["m1"]);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
         assert!(
             !argv.iter().any(|a| a == "--tools" || a == "--no-tools"),
             "no allowlist was pinned; argv {argv:?}"
         );
-        let idx = argv.iter().position(|a| a == "--exclude-tools").expect("--exclude-tools present");
+        let idx = argv
+            .iter()
+            .position(|a| a == "--exclude-tools")
+            .expect("--exclude-tools present");
         assert_eq!(
             argv.get(idx + 1).map(String::as_str),
             Some("bash,write"),
             "trimmed + deduplicated; argv {argv:?}"
         );
         assert!(
-            !plan.spec.env_overlay.contains_key(crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS),
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS),
             "an exclusion is not an allowlist, so no required-tools contract is written"
         );
     }
@@ -5065,13 +5683,30 @@ mod tests {
         ]);
         agent.exclude_tools = vec!["bash".to_string()];
         let opts = base_opts(dir.path(), &["m1"]);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
-        let idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
-        assert_eq!(argv.get(idx + 1).map(String::as_str), Some("edit"), "argv {argv:?}");
+        let idx = argv
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools present");
+        assert_eq!(
+            argv.get(idx + 1).map(String::as_str),
+            Some("edit"),
+            "argv {argv:?}"
+        );
         assert!(
             !argv.iter().any(|a| a == "--exclude-tools"),
             "the allowlist arm never emits the denylist flag; argv {argv:?}"
@@ -5087,9 +5722,16 @@ mod tests {
 
         // Excluding everything the agent declared yields `--no-tools`, exactly as `tools: []` does.
         agent.exclude_tools = vec!["bash".to_string(), "edit".to_string()];
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
         assert!(argv.iter().any(|a| a == "--no-tools"), "argv {argv:?}");
     }
@@ -5101,13 +5743,25 @@ mod tests {
     fn allow_nested_subagents_grants_fanout_without_an_explicit_tools_allowlist() {
         let dir = tempfile::tempdir().expect("tempdir");
         let opts = base_opts(dir.path(), &["m1"]);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
         let fanout = |agent: &AgentConfig| {
             let plan = build_attempt_spawn_plan(
-                agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+                agent,
+                &ModelId::from("m1"),
+                "task",
+                &opts,
+                depth,
+                dir.path(),
+                None,
             )
             .expect("plan builds");
-            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV).cloned()
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::nested_events::FANOUT_CHILD_ENV)
+                .cloned()
         };
 
         let mut agent = sample_agent_config("m1", &[]);
@@ -5115,14 +5769,28 @@ mod tests {
         agent.allow_nested_subagents = Some(false);
         assert_eq!(fanout(&agent), Some("0".to_string()), "false: no grant");
         agent.allow_nested_subagents = Some(true);
-        assert_eq!(fanout(&agent), Some("1".to_string()), "true: independent grant, no tools: needed");
+        assert_eq!(
+            fanout(&agent),
+            Some("1".to_string()),
+            "true: independent grant, no tools: needed"
+        );
 
         // The grant does not pin an allowlist: the child still keeps its ambient tool set.
-        let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
-                .expect("plan builds");
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
         let argv = plan.spec.build_argv();
-        assert!(!argv.iter().any(|a| a == "--tools" || a == "--no-tools"), "argv {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--tools" || a == "--no-tools"),
+            "argv {argv:?}"
+        );
 
         // Still a real (restricted) fanout child at the seam that reads the flag.
         let is_one = |name: &str| plan.spec.env_overlay.get(name).map(String::as_str) == Some("1");
@@ -5140,13 +5808,25 @@ mod tests {
     fn excluding_the_subagent_tool_revokes_fanout_from_both_the_allowlist_and_the_nested_grant() {
         let dir = tempfile::tempdir().expect("tempdir");
         let opts = base_opts(dir.path(), &["m1"]);
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
         let fanout = |agent: &AgentConfig| {
             let plan = build_attempt_spawn_plan(
-                agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+                agent,
+                &ModelId::from("m1"),
+                "task",
+                &opts,
+                depth,
+                dir.path(),
+                None,
             )
             .expect("plan builds");
-            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV).cloned()
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::nested_events::FANOUT_CHILD_ENV)
+                .cloned()
         };
 
         let mut declared = sample_agent_config("m1", &[]);
@@ -5154,7 +5834,11 @@ mod tests {
             ToolRef::Builtin("read".to_string()),
             ToolRef::Builtin(crate::extension::TOOL_NAME.to_string()),
         ]);
-        assert_eq!(fanout(&declared), Some("1".to_string()), "sanity: declared subagent grants");
+        assert_eq!(
+            fanout(&declared),
+            Some("1".to_string()),
+            "sanity: declared subagent grants"
+        );
         declared.exclude_tools = vec![crate::extension::TOOL_NAME.to_string()];
         assert_eq!(
             fanout(&declared),
@@ -5180,7 +5864,10 @@ mod tests {
         use crate::exec::capability_ceiling as cc;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
         let mut agent = sample_agent_config("m1", &[]);
         agent.allow_nested_subagents = Some(true);
 
@@ -5194,10 +5881,19 @@ mod tests {
             )
             .expect("registers");
             let plan = build_attempt_spawn_plan(
-                &agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+                &agent,
+                &ModelId::from("m1"),
+                "task",
+                &opts,
+                depth,
+                dir.path(),
+                None,
             )
             .expect("plan builds");
-            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV).cloned()
+            plan.spec
+                .env_overlay
+                .get(crate::spawn::nested_events::FANOUT_CHILD_ENV)
+                .cloned()
         };
 
         assert_eq!(
@@ -5206,7 +5902,10 @@ mod tests {
             "a ceiling omitting `subagent` vetoes the nested grant"
         );
         assert_eq!(
-            fanout_under("spawn-plan-suba092-ceiling-allow", &["read", crate::extension::TOOL_NAME]),
+            fanout_under(
+                "spawn-plan-suba092-ceiling-allow",
+                &["read", crate::extension::TOOL_NAME]
+            ),
             Some("1".to_string()),
             "a ceiling that includes `subagent` leaves the grant standing"
         );

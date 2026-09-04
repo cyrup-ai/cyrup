@@ -2,11 +2,11 @@
 //! [`HookOutcome`]; the dispatcher folds outcomes left-to-right in load order. For `[mutate]`,
 //! later handlers observe the folded value (chaining, R-08-011).
 
-use std::sync::Arc;
 use crate::event::HostEvent;
 use cyrup_agent::AgentMessage;
 use cyrup_core::{Content, Message, TerminateHint};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// What a single handler contributes (arch-08 §3.3).
 #[derive(Clone, Debug)]
@@ -68,12 +68,18 @@ pub enum EventPatch {
     /// `message_end`: replace the message.
     Message(Box<Message>),
     /// `before_agent_start`: system-prompt replacement + optional injection.
-    SystemPromptAndInject { system: Option<String>, inject: Option<Box<Message>> },
+    SystemPromptAndInject {
+        system: Option<String>,
+        inject: Option<Box<Message>>,
+    },
     /// `input` (Pi `action:"transform"`, runner.ts:1116-1119): rewrite the submission text and
     /// (optionally) its images. `images: None` keeps the current images (Pi `result.images ??
     /// currentImages`); `Some(_)` replaces them. Folds across handlers — a later handler observes
     /// the rewritten text/images (R-08-011).
-    Input { text: String, images: Option<Vec<Content>> },
+    Input {
+        text: String,
+        images: Option<Vec<Content>>,
+    },
     /// `before_provider_request` (Pi runner.ts:946-978): a handler's return value REPLACES the
     /// outbound payload wholesale (`currentPayload = handlerResult`); later handlers observe the
     /// replacement. Open-shaped: the provider request body crosses as `serde_json::Value`.
@@ -102,8 +108,21 @@ impl HostEvent {
         match (self, patch) {
             (HostEvent::ToolCall { input, .. }, EventPatch::ToolInput(v)) => *input = v,
             (
-                HostEvent::ToolResult { content, details, is_error, usage, terminate, .. },
-                EventPatch::ToolResult { content: c, details: d, is_error: e, usage: u, terminate: t },
+                HostEvent::ToolResult {
+                    content,
+                    details,
+                    is_error,
+                    usage,
+                    terminate,
+                    ..
+                },
+                EventPatch::ToolResult {
+                    content: c,
+                    details: d,
+                    is_error: e,
+                    usage: u,
+                    terminate: t,
+                },
             ) => {
                 if let Some(c) = c {
                     *content = c;
@@ -135,7 +154,11 @@ impl HostEvent {
             // `before_agent_start` (Pi runner.ts:980): replace the system prompt AND/OR accumulate
             // an injected message across the handler chain.
             (
-                HostEvent::BeforeAgentStart { system_prompt, injected, .. },
+                HostEvent::BeforeAgentStart {
+                    system_prompt,
+                    injected,
+                    ..
+                },
                 EventPatch::SystemPromptAndInject { system, inject },
             ) => {
                 if let Some(s) = system {
@@ -175,13 +198,18 @@ impl HostEvent {
             // `session_before_compact` (Pi `SessionBeforeCompactResult.compaction`): capture the
             // extension-supplied compaction override on the event so the producer folds it back.
             (
-                HostEvent::SessionBeforeCompact { override_result, .. },
+                HostEvent::SessionBeforeCompact {
+                    override_result, ..
+                },
                 EventPatch::CompactionOverride(v),
             ) => *override_result = Some(v),
             // `session_before_tree` (Pi `SessionBeforeTreeResult`): capture the summary/label override.
-            (HostEvent::SessionBeforeTree { override_result, .. }, EventPatch::TreeOverride(v)) => {
-                *override_result = Some(v)
-            }
+            (
+                HostEvent::SessionBeforeTree {
+                    override_result, ..
+                },
+                EventPatch::TreeOverride(v),
+            ) => *override_result = Some(v),
             // Shape mismatch: ignore (degrade gracefully).
             _ => {}
         }
@@ -205,7 +233,11 @@ pub enum Reduced {
     Pass(Box<HostEvent>),
     /// First `Block` wins; carries the reason, the blocking extension id, and (on `tool_call`
     /// only) pi's `ToolCallEventResult.terminate` hint — see [`HookOutcome::Block::terminate`].
-    Blocked { reason: Option<String>, terminate: TerminateHint, by: cyrup_core::ExtensionId },
+    Blocked {
+        reason: Option<String>,
+        terminate: TerminateHint,
+        by: cyrup_core::ExtensionId,
+    },
     /// An extension fully serviced the action.
     Handled(HandledValue),
 }

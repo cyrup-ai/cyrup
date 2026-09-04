@@ -77,8 +77,13 @@ pub struct ContextFileLoader {
 /// Because the loop returns on the FIRST hit, listing the override first is what makes it *win*
 /// over a sibling `AGENTS.md` in the same directory — it is a per-directory override, not an
 /// additional file (Pi never loads two candidates from one dir).
-const CANDIDATES: [&str; 5] =
-    ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+const CANDIDATES: [&str; 5] = [
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+];
 
 impl ContextFileLoader {
     pub fn new(
@@ -87,7 +92,12 @@ impl ContextFileLoader {
         project_trusted: bool,
         disabled: bool,
     ) -> Self {
-        Self { cwd, global_agent_dir, project_trusted, disabled }
+        Self {
+            cwd,
+            global_agent_dir,
+            project_trusted,
+            disabled,
+        }
     }
 
     /// Construct resolving project trust from a [`TrustQuery`] seam.
@@ -115,9 +125,10 @@ impl ContextFileLoader {
         // (a) GLOBAL — pre-trust (R-06-009).
         if let Some(cf) =
             first_context_file(&self.global_agent_dir, ContextScope::Global, &mut diags)
-            && seen.insert(cf.path.clone()) {
-                files.push(cf);
-            }
+            && seen.insert(cf.path.clone())
+        {
+            files.push(cf);
+        }
 
         // (b) PROJECT (ancestors + cwd) — trust-gated (R-06-009).
         if self.project_trusted {
@@ -150,9 +161,10 @@ impl ContextFileLoader {
                     && !shadowed.as_ref().is_some_and(|s| {
                         crate::git_paths::canonicalize_path(&cf.path) == *s
                     })
-                    && seen.insert(cf.path.clone()) {
-                        ancestors.insert(0, cf);
-                    }
+                    && seen.insert(cf.path.clone())
+                {
+                    ancestors.insert(0, cf);
+                }
                 match dir.parent() {
                     Some(p) if p != dir => dir = p.to_path_buf(),
                     _ => break,
@@ -160,7 +172,9 @@ impl ContextFileLoader {
             }
             files.extend(ancestors); // global first, then parents top→down, then cwd
         } else {
-            diags.push(ContextDiagnostic::SkippedUntrusted { dir: self.cwd.clone() });
+            diags.push(ContextDiagnostic::SkippedUntrusted {
+                dir: self.cwd.clone(),
+            });
         }
 
         (files, diags)
@@ -214,11 +228,18 @@ fn first_context_file(
         let p = dir.join(name);
         match std::fs::read_to_string(&p) {
             Ok(content) => {
-                return Some(ContextFile { path: p, content: content.into(), scope });
+                return Some(ContextFile {
+                    path: p,
+                    content: content.into(),
+                    scope,
+                });
             }
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) => {
-                diags.push(ContextDiagnostic::Unreadable { path: p, reason: e.to_string() });
+                diags.push(ContextDiagnostic::Unreadable {
+                    path: p,
+                    reason: e.to_string(),
+                });
                 continue;
             }
         }

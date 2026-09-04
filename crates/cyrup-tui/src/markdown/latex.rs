@@ -399,52 +399,13 @@ static ACCENTS: &[(&str, &str)] = &[
 ];
 /// `NAMED_OPERATORS` (`latex.ts`), sorted for binary search.
 static NAMED_OPERATORS: &[&str] = &[
-    "Pr",
-    "arccos",
-    "arcsin",
-    "arctan",
-    "arg",
-    "cos",
-    "cosh",
-    "cot",
-    "coth",
-    "csc",
-    "deg",
-    "det",
-    "dim",
-    "exp",
-    "gcd",
-    "hom",
-    "inf",
-    "ker",
-    "lg",
-    "lim",
-    "liminf",
-    "limsup",
-    "ln",
-    "log",
-    "max",
-    "min",
-    "sec",
-    "sin",
-    "sinh",
-    "sup",
-    "tan",
-    "tanh",
+    "Pr", "arccos", "arcsin", "arctan", "arg", "cos", "cosh", "cot", "coth", "csc", "deg", "det",
+    "dim", "exp", "gcd", "hom", "inf", "ker", "lg", "lim", "liminf", "limsup", "ln", "log", "max",
+    "min", "sec", "sin", "sinh", "sup", "tan", "tanh",
 ];
 /// `LIMIT_OPERATORS` (`latex.ts`), sorted for binary search.
 static LIMIT_OPERATORS: &[&str] = &[
-    "argmax",
-    "argmin",
-    "inf",
-    "injlim",
-    "lim",
-    "liminf",
-    "limsup",
-    "max",
-    "min",
-    "projlim",
-    "sup",
+    "argmax", "argmin", "inf", "injlim", "lim", "liminf", "limsup", "max", "min", "projlim", "sup",
 ];
 /// `DISPLAY_LIMIT_SYMBOLS` (`latex.ts`), sorted for binary search.
 static DISPLAY_LIMIT_SYMBOLS: &[&str] = &[
@@ -565,12 +526,7 @@ static SPACING_COMMANDS: &[&str] = &[
     "thinspace",
 ];
 /// `NEGATIVE_SPACING_COMMANDS` (`latex.ts`), sorted for binary search.
-static NEGATIVE_SPACING_COMMANDS: &[&str] = &[
-    "!",
-    "negmedspace",
-    "negthickspace",
-    "negthinspace",
-];
+static NEGATIVE_SPACING_COMMANDS: &[&str] = &["!", "negmedspace", "negthickspace", "negthinspace"];
 /// `IGNORED_COMMANDS` (`latex.ts`), sorted for binary search.
 static IGNORED_COMMANDS: &[&str] = &[
     "displaystyle",
@@ -582,17 +538,7 @@ static IGNORED_COMMANDS: &[&str] = &[
 ];
 /// `SIZE_COMMANDS` (`latex.ts`), sorted for binary search.
 static SIZE_COMMANDS: &[&str] = &[
-    "Big",
-    "Bigg",
-    "Biggl",
-    "Biggr",
-    "Bigl",
-    "Bigr",
-    "big",
-    "bigg",
-    "biggl",
-    "biggr",
-    "bigl",
+    "Big", "Bigg", "Biggl", "Biggr", "Bigl", "Bigr", "big", "bigg", "biggl", "biggr", "bigl",
     "bigr",
 ];
 /// `PLAIN_WRAPPERS` (`latex.ts`), sorted for binary search.
@@ -648,7 +594,11 @@ fn visible_width(s: &str) -> usize {
 
 /// `chars[from..to]` without a slice index — the no-panic policy denies `indexing_slicing`.
 fn slice(chars: &[char], from: usize, to: usize) -> String {
-    chars.iter().skip(from).take(to.saturating_sub(from)).collect()
+    chars
+        .iter()
+        .skip(from)
+        .take(to.saturating_sub(from))
+        .collect()
 }
 
 fn slice_from(chars: &[char], from: usize) -> String {
@@ -661,7 +611,12 @@ fn find_sub(hay: &[char], needle: &[char], from: usize) -> Option<usize> {
         return Some(from.min(hay.len()));
     }
     let last = hay.len().checked_sub(needle.len())?;
-    (from..=last).find(|&i| needle.iter().enumerate().all(|(k, c)| hay.get(i + k) == Some(c)))
+    (from..=last).find(|&i| {
+        needle
+            .iter()
+            .enumerate()
+            .all(|(k, c)| hay.get(i + k) == Some(c))
+    })
 }
 
 // ── scalar formatters (`latex.ts:587-625`) ───────────────────────────────────────────────────────
@@ -701,7 +656,9 @@ fn collapse_around_ops(s: &str) -> String {
 
 /// `/^[\p{L}\p{N}.]+$/u` (`latex.ts:617`, `:624`).
 fn is_letters_digits_dot(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_alphabetic() || c.is_numeric() || c == '.')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphabetic() || c.is_numeric() || c == '.')
 }
 
 /// `/^[\p{N}.]+$/u` (`latex.ts:618`).
@@ -721,7 +678,11 @@ fn format_script(value: &str, sub: bool) -> String {
     let prefix = if sub { '_' } else { '^' };
     let single = value.chars().count() == 1;
     let alpha_sub = sub && !value.is_empty() && value.chars().all(|c| c.is_ascii_alphabetic());
-    if single || alpha_sub { format!("{prefix}{value}") } else { format!("{prefix}({value})") }
+    if single || alpha_sub {
+        format!("{prefix}{value}")
+    } else {
+        format!("{prefix}({value})")
+    }
 }
 
 /// `formatFraction` (`latex.ts:614-620`) — the INLINE fraction `a/b`, parenthesised where ambiguous.
@@ -730,8 +691,16 @@ fn format_fraction(numerator: &str, denominator: &str) -> String {
     let denominator = denominator.trim();
     let simple_num = is_letters_digits_dot(numerator);
     let simple_den = is_digits_dot(denominator) || denominator.chars().count() == 1;
-    let n = if simple_num { numerator.to_string() } else { format!("({numerator})") };
-    let d = if simple_den { denominator.to_string() } else { format!("({denominator})") };
+    let n = if simple_num {
+        numerator.to_string()
+    } else {
+        format!("({numerator})")
+    };
+    let d = if simple_den {
+        denominator.to_string()
+    } else {
+        format!("({denominator})")
+    };
     format!("{n}/{d}")
 }
 
@@ -786,7 +755,10 @@ fn normalize_output(value: &str) -> String {
     }
     // Per line: `/[ \t]+/g` → " ", then trim; then drop blank lines that are neither interior
     // (`:640`).
-    let lines: Vec<String> = b.split('\n').map(|l| collapse_blanks(l).trim().to_string()).collect();
+    let lines: Vec<String> = b
+        .split('\n')
+        .map(|l| collapse_blanks(l).trim().to_string())
+        .collect();
     let n = lines.len();
     let kept: Vec<String> = lines
         .into_iter()
@@ -818,9 +790,19 @@ fn collapse_blanks(s: &str) -> String {
 // ── two-dimensional layout (`latex.ts:645-795`) ──────────────────────────────────────────────────
 
 enum LayoutNode {
-    Fraction { numerator: String, denominator: String },
-    Operator { operator: String, lower: Option<String>, upper: Option<String> },
-    Matrix { lines: Vec<String>, baseline: usize },
+    Fraction {
+        numerator: String,
+        denominator: String,
+    },
+    Operator {
+        operator: String,
+        lower: Option<String>,
+        upper: Option<String>,
+    },
+    Matrix {
+        lines: Vec<String>,
+        baseline: usize,
+    },
 }
 
 struct Layout {
@@ -839,7 +821,11 @@ fn pad_layout_line(line: &str, width: usize, centered: bool) -> String {
 /// `joinLayouts` (`latex.ts:684-707`) — sit boxes side by side on a shared baseline.
 fn join_layouts(layouts: &[Layout]) -> Layout {
     if layouts.is_empty() {
-        return Layout { lines: vec![String::new()], width: 0, baseline: 0 };
+        return Layout {
+            lines: vec![String::new()],
+            width: 0,
+            baseline: 0,
+        };
     }
     let baseline = layouts.iter().map(|l| l.baseline).max().unwrap_or(0);
     let below = layouts
@@ -862,7 +848,11 @@ fn join_layouts(layouts: &[Layout]) -> Layout {
         lines.push(line.trim_end().to_string());
     }
     let width = layouts.iter().map(|l| l.width).sum();
-    Layout { lines, width, baseline }
+    Layout {
+        lines,
+        width,
+        baseline,
+    }
 }
 
 /// Scan one source line for `\u{f0000}(\d+)\u{f0001}` (`LAYOUT_MARKER_PATTERN`, `latex.ts:674`).
@@ -903,7 +893,9 @@ fn render_layout(source: &str, nodes: &[LayoutNode]) -> Layout {
         let mut position = 0usize;
         let mut previous: Option<&LayoutNode> = None;
         for (index, len, node_index) in layout_markers(&ch) {
-            let Some(node) = nodes.get(node_index) else { continue };
+            let Some(node) = nodes.get(node_index) else {
+                continue;
+            };
             if index > position {
                 let sliced = slice(&ch, position, index);
                 let trimmed = if previous.is_some() {
@@ -916,7 +908,11 @@ fn render_layout(source: &str, nodes: &[LayoutNode]) -> Layout {
                 let keep_trailing = matches!(node, LayoutNode::Matrix { .. })
                     && sliced.ends_with(char::is_whitespace);
                 let text = if trimmed.is_empty() {
-                    if keep_leading || keep_trailing { " ".to_string() } else { String::new() }
+                    if keep_leading || keep_trailing {
+                        " ".to_string()
+                    } else {
+                        String::new()
+                    }
                 } else {
                     format!(
                         "{}{trimmed}{}",
@@ -925,21 +921,39 @@ fn render_layout(source: &str, nodes: &[LayoutNode]) -> Layout {
                     )
                 };
                 let width = visible_width(&text);
-                layouts.push(Layout { lines: vec![text], width, baseline: 0 });
+                layouts.push(Layout {
+                    lines: vec![text],
+                    width,
+                    baseline: 0,
+                });
             }
             match node {
-                LayoutNode::Fraction { numerator, denominator } => {
+                LayoutNode::Fraction {
+                    numerator,
+                    denominator,
+                } => {
                     let num = render_layout(numerator, nodes);
                     let den = render_layout(denominator, nodes);
                     let content_width = num.width.max(den.width).max(1);
                     let width = content_width + 2;
-                    let mut lines: Vec<String> =
-                        num.lines.iter().map(|l| pad_layout_line(l, width, true)).collect();
+                    let mut lines: Vec<String> = num
+                        .lines
+                        .iter()
+                        .map(|l| pad_layout_line(l, width, true))
+                        .collect();
                     lines.push(format!(" {} ", "─".repeat(content_width)));
                     lines.extend(den.lines.iter().map(|l| pad_layout_line(l, width, true)));
-                    layouts.push(Layout { lines, width, baseline: num.lines.len() });
+                    layouts.push(Layout {
+                        lines,
+                        width,
+                        baseline: num.lines.len(),
+                    });
                 }
-                LayoutNode::Operator { operator, lower, upper } => {
+                LayoutNode::Operator {
+                    operator,
+                    lower,
+                    upper,
+                } => {
                     let content_width = visible_width(operator)
                         .max(lower.as_deref().map(visible_width).unwrap_or(0))
                         .max(upper.as_deref().map(visible_width).unwrap_or(0));
@@ -947,17 +961,30 @@ fn render_layout(source: &str, nodes: &[LayoutNode]) -> Layout {
                     if let Some(u) = upper {
                         lines.push(format!("{} ", pad_layout_line(u, content_width, true)));
                     }
-                    lines.push(format!("{} ", pad_layout_line(operator, content_width, true)));
+                    lines.push(format!(
+                        "{} ",
+                        pad_layout_line(operator, content_width, true)
+                    ));
                     if let Some(l) = lower {
                         lines.push(format!("{} ", pad_layout_line(l, content_width, true)));
                     }
                     let baseline = usize::from(upper.is_some());
-                    layouts.push(Layout { lines, width: content_width + 1, baseline });
+                    layouts.push(Layout {
+                        lines,
+                        width: content_width + 1,
+                        baseline,
+                    });
                 }
-                LayoutNode::Matrix { lines: mlines, baseline } => {
+                LayoutNode::Matrix {
+                    lines: mlines,
+                    baseline,
+                } => {
                     let width = mlines.iter().map(|l| visible_width(l)).max().unwrap_or(0);
                     layouts.push(Layout {
-                        lines: mlines.iter().map(|l| pad_layout_line(l, width, false)).collect(),
+                        lines: mlines
+                            .iter()
+                            .map(|l| pad_layout_line(l, width, false))
+                            .collect(),
                         width,
                         baseline: *baseline,
                     });
@@ -968,8 +995,11 @@ fn render_layout(source: &str, nodes: &[LayoutNode]) -> Layout {
         }
         if position < ch.len() {
             let sliced = slice_from(&ch, position);
-            let trimmed =
-                if previous.is_some() { sliced.trim_start().to_string() } else { sliced.clone() };
+            let trimmed = if previous.is_some() {
+                sliced.trim_start().to_string()
+            } else {
+                sliced.clone()
+            };
             let text = if matches!(previous, Some(LayoutNode::Matrix { .. }))
                 && sliced.starts_with(char::is_whitespace)
             {
@@ -978,7 +1008,11 @@ fn render_layout(source: &str, nodes: &[LayoutNode]) -> Layout {
                 trimmed
             };
             let width = visible_width(&text);
-            layouts.push(Layout { lines: vec![text], width, baseline: 0 });
+            layouts.push(Layout {
+                lines: vec![text],
+                width,
+                baseline: 0,
+            });
         }
         let line_layout = join_layouts(&layouts);
         if rendered_lines.is_empty() {
@@ -986,8 +1020,16 @@ fn render_layout(source: &str, nodes: &[LayoutNode]) -> Layout {
         }
         rendered_lines.extend(line_layout.lines);
     }
-    let width = rendered_lines.iter().map(|l| visible_width(l)).max().unwrap_or(0);
-    Layout { lines: rendered_lines, width, baseline: first_baseline }
+    let width = rendered_lines
+        .iter()
+        .map(|l| visible_width(l))
+        .max()
+        .unwrap_or(0);
+    Layout {
+        lines: rendered_lines,
+        width,
+        baseline: first_baseline,
+    }
 }
 
 // ── the parser (`latex.ts:797-1344`) ─────────────────────────────────────────────────────────────
@@ -1327,7 +1369,10 @@ impl<'a> Parser<'a> {
     ) -> String {
         let mut use_display_limits = display_limits;
         let mut modifier_position = self.position;
-        while self.at(modifier_position).is_some_and(|c| c == ' ' || c == '\t') {
+        while self
+            .at(modifier_position)
+            .is_some_and(|c| c == ' ' || c == '\t')
+        {
             modifier_position += 1;
         }
         // `/^\\(limits|nolimits)(?![A-Za-z])/`
@@ -1352,7 +1397,10 @@ impl<'a> Parser<'a> {
         let mut upper: Option<String> = None;
         loop {
             let mut script_position = self.position;
-            while self.at(script_position).is_some_and(|c| c == ' ' || c == '\t') {
+            while self
+                .at(script_position)
+                .is_some_and(|c| c == ' ' || c == '\t')
+            {
                 script_position += 1;
             }
             let kind = self.at(script_position);
@@ -1395,7 +1443,11 @@ impl<'a> Parser<'a> {
         if let Some(u) = &upper {
             rendered.push_str(&format_script(u, false));
         }
-        if spaced { format!(" {rendered} ") } else { rendered }
+        if spaced {
+            format!(" {rendered} ")
+        } else {
+            rendered
+        }
     }
 
     /// `parseRequiredArgument` (`latex.ts:1135-1141`) — `stackFractions` is AND-ed, never restored
@@ -1494,7 +1546,10 @@ impl<'a> Parser<'a> {
         let body = slice(&self.src, self.position, end);
         self.position = end + end_marker.len();
 
-        if matches!(environment.as_str(), "equation" | "equation*" | "displaymath") {
+        if matches!(
+            environment.as_str(),
+            "equation" | "equation*" | "displaymath"
+        ) {
             return self.render_nested(&body, true).trim().to_string();
         }
 
@@ -1513,8 +1568,11 @@ impl<'a> Parser<'a> {
                 | "split"
         ) {
             let aligned_at = matches!(environment.as_str(), "alignedat" | "alignat" | "alignat*");
-            let aligned_body =
-                if aligned_at { strip_leading_brace_group(&body) } else { body.clone() };
+            let aligned_body = if aligned_at {
+                strip_leading_brace_group(&body)
+            } else {
+                body.clone()
+            };
             let rows: Vec<String> = split_environment_rows(&aligned_body)
                 .into_iter()
                 .map(|row| {
@@ -1564,7 +1622,11 @@ impl<'a> Parser<'a> {
                     let tail = if condition.is_empty() {
                         String::new()
                     } else {
-                        let prefix = if starts_with_condition_word(condition) { " " } else { " if " };
+                        let prefix = if starts_with_condition_word(condition) {
+                            " "
+                        } else {
+                            " if "
+                        };
                         format!("{prefix}{condition}")
                     };
                     format!("{delimiter} {value}{tail}")
@@ -1584,8 +1646,11 @@ impl<'a> Parser<'a> {
                 | "vmatrix"
                 | "Vmatrix"
         ) {
-            let matrix_body =
-                if environment == "array" { strip_leading_brace_group(&body) } else { body };
+            let matrix_body = if environment == "array" {
+                strip_leading_brace_group(&body)
+            } else {
+                body
+            };
             return self.render_matrix(&environment, &matrix_body);
         }
 
@@ -1704,7 +1769,11 @@ fn trailing_layout_marker(result: &str) -> Option<usize> {
         match ch.get(i) {
             Some(c) if c.is_ascii_digit() => digits.insert(0, *c),
             Some(c) if *c == LAYOUT_MARKER_START => {
-                return if digits.is_empty() { None } else { digits.parse().ok() };
+                return if digits.is_empty() {
+                    None
+                } else {
+                    digits.parse().ok()
+                };
             }
             _ => return None,
         }
@@ -1782,7 +1851,9 @@ fn starts_with_condition_word(condition: &str) -> bool {
     let lower = condition.to_ascii_lowercase();
     ["if", "when", "for", "otherwise"].iter().any(|w| {
         lower.strip_prefix(w).is_some_and(|rest| {
-            rest.chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            rest.chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
         })
     })
 }
@@ -1874,7 +1945,9 @@ fn looks_like_pending_dollar_math(source: &[char]) -> bool {
 /// see the quoted conditions below).
 pub(crate) fn tokenize_inline(source: &[char]) -> Option<LatexToken> {
     let starts = |p: &str| -> bool {
-        p.chars().enumerate().all(|(i, c)| source.get(i) == Some(&c))
+        p.chars()
+            .enumerate()
+            .all(|(i, c)| source.get(i) == Some(&c))
     };
     let (opening, closing): (&str, &str) = if starts("$$") {
         ("$$", "$$")
@@ -1896,7 +1969,12 @@ pub(crate) fn tokenize_inline(source: &[char]) -> Option<LatexToken> {
     if let Some(ci) = closing_index
         && opening == "$"
     {
-        let inner: Vec<char> = source.iter().copied().skip(open_len).take(ci - open_len).collect();
+        let inner: Vec<char> = source
+            .iter()
+            .copied()
+            .skip(open_len)
+            .take(ci - open_len)
+            .collect();
         let after: &[char] = source.get(ci + close.len()..).unwrap_or(&[]);
         // `/\s$/.test(inner) || /^\d/.test(after) ||
         //  (/^[A-Z_][A-Z0-9_]*(?:[^A-Za-z0-9_\s])?$/.test(inner) &&
@@ -1905,7 +1983,9 @@ pub(crate) fn tokenize_inline(source: &[char]) -> Option<LatexToken> {
         let inner_ends_ws = inner.last().is_some_and(|c| c.is_whitespace());
         let after_digit = after.first().is_some_and(char::is_ascii_digit);
         let shouty = is_shouty_ident(&inner)
-            && after.first().is_some_and(|c| c.is_ascii_alphabetic() || *c == '_');
+            && after
+                .first()
+                .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_');
         if inner_ends_ws || after_digit || shouty || inner.contains(&'`') {
             return None;
         }
@@ -1924,8 +2004,12 @@ pub(crate) fn tokenize_inline(source: &[char]) -> Option<LatexToken> {
         return None;
     };
 
-    let text: String =
-        source.iter().copied().skip(open_len).take(closing_index - open_len).collect();
+    let text: String = source
+        .iter()
+        .copied()
+        .skip(open_len)
+        .take(closing_index - open_len)
+        .collect();
     if text.is_empty() || text.contains('\n') {
         return None;
     }
@@ -1997,7 +2081,11 @@ fn block_open(source: &[char], open: &str) -> Option<(usize, usize)> {
     while i < 3 && source.get(i) == Some(&' ') {
         i += 1;
     }
-    if !open.chars().enumerate().all(|(k, c)| source.get(i + k) == Some(&c)) {
+    if !open
+        .chars()
+        .enumerate()
+        .all(|(k, c)| source.get(i + k) == Some(&c))
+    {
         return None;
     }
     let open_end = i + open.chars().count();
@@ -2016,7 +2104,12 @@ fn block_delimited(source: &[char], open: &str, close: &str) -> Option<LatexToke
     let (body_start, _) = block_open(source, open)?;
     let close_chars: Vec<char> = close.chars().collect();
     let close_at = find_sub(source, &close_chars, body_start)?;
-    let body: String = source.iter().copied().skip(body_start).take(close_at - body_start).collect();
+    let body: String = source
+        .iter()
+        .copied()
+        .skip(body_start)
+        .take(close_at - body_start)
+        .collect();
     // `dollarMatch?.[1]` / `bracketMatch?.[1]` are truthiness-tested (`:104`, `:108`), so an EMPTY
     // body falls through to the pending arms.
     if body.is_empty() {
@@ -2046,7 +2139,11 @@ fn block_delimited(source: &[char], open: &str, close: &str) -> Option<LatexToke
 /// (`markdown.ts:505-512`). Inline: the same without `display` and without the trim
 /// (`markdown.ts:645-652`).
 pub(crate) fn render_token(token: &LatexToken, display: bool) -> String {
-    let fallback = if display { token.raw.trim().to_string() } else { token.raw.clone() };
+    let fallback = if display {
+        token.raw.trim().to_string()
+    } else {
+        token.raw.clone()
+    };
     if token.pending {
         return fallback;
     }
@@ -2054,7 +2151,12 @@ pub(crate) fn render_token(token: &LatexToken, display: bool) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::render_latex;
 
@@ -2062,7 +2164,10 @@ mod tests {
     /// mechanically. These call `renderLatex(source)` with no options, i.e. inline mode.
     const INLINE_CASES: &[(&str, &str)] = &[
         ("\\mathbb{C}^3 \\to \\mathbb{C}^3", "ℂ³ → ℂ³"),
-        ("\\{3x+2y,\\; 27x^2-4z-1,\\; x(x-1)(x+1)\\} \\quad\\Rightarrow\\quad x \\in \\{0, \\pm 1\\},", "{3x+2y, 27x²-4z-1, x(x-1)(x+1)} ⇒ x ∈ {0, ± 1},"),
+        (
+            "\\{3x+2y,\\; 27x^2-4z-1,\\; x(x-1)(x+1)\\} \\quad\\Rightarrow\\quad x \\in \\{0, \\pm 1\\},",
+            "{3x+2y, 27x²-4z-1, x(x-1)(x+1)} ⇒ x ∈ {0, ± 1},",
+        ),
         ("F_1 = -\\frac{1}{4x^2}.", "F₁ = -1/(4x²)."),
         ("-2", "-2"),
         ("(0,0,-1/4)", "(0,0,-1/4)"),
@@ -2070,12 +2175,18 @@ mod tests {
         ("(1,1,1)", "(1,1,1)"),
         ("(2,1,0)", "(2,1,0)"),
         ("(-1/4, 0, 0)", "(-1/4, 0, 0)"),
-        ("\\{(0,0,-1/4), (1,-3/2,13/2), (-1,3/2,13/2)\\}", "{(0,0,-1/4), (1,-3/2,13/2), (-1,3/2,13/2)}"),
+        (
+            "\\{(0,0,-1/4), (1,-3/2,13/2), (-1,3/2,13/2)\\}",
+            "{(0,0,-1/4), (1,-3/2,13/2), (-1,3/2,13/2)}",
+        ),
         ("(2,1,1)", "(2,1,1)"),
         ("(7/3,-2/5,11/7)", "(7/3,-2/5,11/7)"),
         ("\\{y - p(x),\\; q(x)\\}", "{y - p(x), q(x)}"),
         ("\\deg q = 3", "deg q = 3"),
-        ("[\\mathbb{C}(x,y,z):\\mathbb{C}(F_1,F_2,F_3)] = 3", "[ℂ(x,y,z):ℂ(F₁,F₂,F₃)] = 3"),
+        (
+            "[\\mathbb{C}(x,y,z):\\mathbb{C}(F_1,F_2,F_3)] = 3",
+            "[ℂ(x,y,z):ℂ(F₁,F₂,F₃)] = 3",
+        ),
         ("u = 1+xy", "u = 1+xy"),
         ("G = u^2 z + y^2(4+3xy)", "G = u² z + y²(4+3xy)"),
         ("F_1 = uG", "F₁ = uG"),
@@ -2085,10 +2196,16 @@ mod tests {
         ("xy = -3/2", "xy = -3/2"),
         ("x^2 z = 13/2", "x² z = 13/2"),
         ("\\mathbb{C}^*", "ℂ^*"),
-        ("s \\mapsto (s,\\, -\\tfrac{3}{2s},\\, \\tfrac{13}{2s^2})", "s ↦ (s, -3/(2s), 13/(2s²))"),
+        (
+            "s \\mapsto (s,\\, -\\tfrac{3}{2s},\\, \\tfrac{13}{2s^2})",
+            "s ↦ (s, -3/(2s), 13/(2s²))",
+        ),
         ("X", "X"),
         ("p_\\pm", "p_±"),
-        ("F(-x,-y,z) = (F_1, -F_2, -F_3)", "F(-x,-y,z) = (F₁, -F₂, -F₃)"),
+        (
+            "F(-x,-y,z) = (F_1, -F_2, -F_3)",
+            "F(-x,-y,z) = (F₁, -F₂, -F₃)",
+        ),
         ("p_0", "p₀"),
         ("s \\to \\infty", "s → ∞"),
         ("(0,0,0)", "(0,0,0)"),
@@ -2098,21 +2215,57 @@ mod tests {
         ("1", "1"),
         ("\\mathrm{diag}(-1/2,1,1)", "diag(-1/2,1,1)"),
         ("4+3xy", "4+3xy"),
-        ("E \\approx \\frac{0.1\\ \\text{lux}}{100\\ \\text{lm/W}} = 0.001\\ \\text{W/m}^2", "E ≈ (0.1 lux)/(100 lm/W) = 0.001 W/m²"),
-        ("\\boxed{1\\ \\text{milliwatt per square metre}}", "[1 milliwatt per square metre]"),
-        ("5\\ \\text{km}^2 = 5{,}000{,}000\\ \\text{m}^2", "5 km² = 5,000,000 m²"),
-        ("P_{\\text{light}} = 0.001 \\times 5{,}000{,}000\n= \\boxed{5{,}000\\ \\text{W}}", "P_light = 0.001 × 5,000,000 = [5,000 W]"),
-        ("P_{\\text{electric}} = 5\\ \\text{kW} \\times 0.2\n= \\boxed{1\\ \\text{kW}}", "P_electric = 5 kW × 0.2 = [1 kW]"),
-        ("\\pi(2.5\\ \\text{km})^2 = 19.6\\ \\text{km}^2", "π(2.5 km)² = 19.6 km²"),
-        ("0.001\\ \\text{W/m}^2 \\times 19.6 \\times 10^6\\ \\text{m}^2\n\\approx \\boxed{20\\ \\text{kW optical}}", "0.001 W/m² × 19.6 × 10⁶ m² ≈ [20 kW optical]"),
-        ("1\\ \\text{kW} \\times \\frac{1}{3600}\\ \\text{hour}\n= \\boxed{0.28\\ \\text{Wh}}", "1 kW × 1/3600 hour = [0.28 Wh]"),
-        ("\\det\\!\\left(\\frac{\\partial(F_1,F_2,F_3)}{\\partial(x,y,z)}\\right)=-2.", "det((∂(F₁,F₂,F₃))/(∂(x,y,z))) = -2."),
-        ("\\begin{aligned}\nF(0,0,-\\tfrac14)&=(-\\tfrac14,0,0),\\\\\nF(1,-\\tfrac32,\\tfrac{13}2)&=(-\\tfrac14,0,0),\\\\\nF(-1,\\tfrac32,\\tfrac{13}2)&=(-\\tfrac14,0,0).\n\\end{aligned}", "F(0,0,-1/4) = (-1/4,0,0),\nF(1,-3/2,13/2) = (-1/4,0,0),\nF(-1,3/2,13/2) = (-1/4,0,0)."),
+        (
+            "E \\approx \\frac{0.1\\ \\text{lux}}{100\\ \\text{lm/W}} = 0.001\\ \\text{W/m}^2",
+            "E ≈ (0.1 lux)/(100 lm/W) = 0.001 W/m²",
+        ),
+        (
+            "\\boxed{1\\ \\text{milliwatt per square metre}}",
+            "[1 milliwatt per square metre]",
+        ),
+        (
+            "5\\ \\text{km}^2 = 5{,}000{,}000\\ \\text{m}^2",
+            "5 km² = 5,000,000 m²",
+        ),
+        (
+            "P_{\\text{light}} = 0.001 \\times 5{,}000{,}000\n= \\boxed{5{,}000\\ \\text{W}}",
+            "P_light = 0.001 × 5,000,000 = [5,000 W]",
+        ),
+        (
+            "P_{\\text{electric}} = 5\\ \\text{kW} \\times 0.2\n= \\boxed{1\\ \\text{kW}}",
+            "P_electric = 5 kW × 0.2 = [1 kW]",
+        ),
+        (
+            "\\pi(2.5\\ \\text{km})^2 = 19.6\\ \\text{km}^2",
+            "π(2.5 km)² = 19.6 km²",
+        ),
+        (
+            "0.001\\ \\text{W/m}^2 \\times 19.6 \\times 10^6\\ \\text{m}^2\n\\approx \\boxed{20\\ \\text{kW optical}}",
+            "0.001 W/m² × 19.6 × 10⁶ m² ≈ [20 kW optical]",
+        ),
+        (
+            "1\\ \\text{kW} \\times \\frac{1}{3600}\\ \\text{hour}\n= \\boxed{0.28\\ \\text{Wh}}",
+            "1 kW × 1/3600 hour = [0.28 Wh]",
+        ),
+        (
+            "\\det\\!\\left(\\frac{\\partial(F_1,F_2,F_3)}{\\partial(x,y,z)}\\right)=-2.",
+            "det((∂(F₁,F₂,F₃))/(∂(x,y,z))) = -2.",
+        ),
+        (
+            "\\begin{aligned}\nF(0,0,-\\tfrac14)&=(-\\tfrac14,0,0),\\\\\nF(1,-\\tfrac32,\\tfrac{13}2)&=(-\\tfrac14,0,0),\\\\\nF(-1,\\tfrac32,\\tfrac{13}2)&=(-\\tfrac14,0,0).\n\\end{aligned}",
+            "F(0,0,-1/4) = (-1/4,0,0),\nF(1,-3/2,13/2) = (-1/4,0,0),\nF(-1,3/2,13/2) = (-1/4,0,0).",
+        ),
         ("F=(F_1,F_2,F_3)", "F = (F₁,F₂,F₃)"),
         ("F", "F"),
         ("3", "3"),
-        ("J = \\begin{pmatrix}\n\\frac{\\partial f_1}{\\partial x} & \\frac{\\partial f_1}{\\partial y} & \\frac{\\partial f_1}{\\partial z} \\\\\n\\frac{\\partial f_2}{\\partial x} & \\frac{\\partial f_2}{\\partial y} & \\frac{\\partial f_2}{\\partial z} \\\\\n\\frac{\\partial f_3}{\\partial x} & \\frac{\\partial f_3}{\\partial y} & \\frac{\\partial f_3}{\\partial z}\n\\end{pmatrix}", "J = ⎛ (∂ f₁)/(∂ x) │ (∂ f₁)/(∂ y) │ (∂ f₁)/(∂ z) ⎞\n    ⎜ (∂ f₂)/(∂ x) │ (∂ f₂)/(∂ y) │ (∂ f₂)/(∂ z) ⎟\n    ⎝ (∂ f₃)/(∂ x) │ (∂ f₃)/(∂ y) │ (∂ f₃)/(∂ z) ⎠"),
-        ("\\begin{aligned}\nf_1 &= (1+xy)^3 z + y^2(1+xy)(4+3xy) \\\\\nf_2 &= y + 3x(1+xy)^2 z + 3xy^2(4+3xy) \\\\\nf_3 &= 2x - 3x^2y - x^3z\n\\end{aligned}", "f₁ = (1+xy)³ z + y²(1+xy)(4+3xy)\nf₂ = y + 3x(1+xy)² z + 3xy²(4+3xy)\nf₃ = 2x - 3x²y - x³z"),
+        (
+            "J = \\begin{pmatrix}\n\\frac{\\partial f_1}{\\partial x} & \\frac{\\partial f_1}{\\partial y} & \\frac{\\partial f_1}{\\partial z} \\\\\n\\frac{\\partial f_2}{\\partial x} & \\frac{\\partial f_2}{\\partial y} & \\frac{\\partial f_2}{\\partial z} \\\\\n\\frac{\\partial f_3}{\\partial x} & \\frac{\\partial f_3}{\\partial y} & \\frac{\\partial f_3}{\\partial z}\n\\end{pmatrix}",
+            "J = ⎛ (∂ f₁)/(∂ x) │ (∂ f₁)/(∂ y) │ (∂ f₁)/(∂ z) ⎞\n    ⎜ (∂ f₂)/(∂ x) │ (∂ f₂)/(∂ y) │ (∂ f₂)/(∂ z) ⎟\n    ⎝ (∂ f₃)/(∂ x) │ (∂ f₃)/(∂ y) │ (∂ f₃)/(∂ z) ⎠",
+        ),
+        (
+            "\\begin{aligned}\nf_1 &= (1+xy)^3 z + y^2(1+xy)(4+3xy) \\\\\nf_2 &= y + 3x(1+xy)^2 z + 3xy^2(4+3xy) \\\\\nf_3 &= 2x - 3x^2y - x^3z\n\\end{aligned}",
+            "f₁ = (1+xy)³ z + y²(1+xy)(4+3xy)\nf₂ = y + 3x(1+xy)² z + 3xy²(4+3xy)\nf₃ = 2x - 3x²y - x³z",
+        ),
         ("x, y, z", "x, y, z"),
         ("(x, y, z)", "(x, y, z)"),
         ("(0,\\; 0,\\; -\\tfrac14)", "(0, 0, -1/4)"),
@@ -2121,9 +2274,15 @@ mod tests {
         ("(-1,\\; \\tfrac32,\\; \\tfrac{13}{2})", "(-1, 3/2, 13/2)"),
         ("(-\\frac14, 0, 0)", "(-1/4, 0, 0)"),
         ("F: \\mathbb{C}^3 \\to \\mathbb{C}^3", "F: ℂ³ → ℂ³"),
-        ("F(0,0,-\\tfrac14) = F(1,-\\tfrac32,\\tfrac{13}{2}) = F(-1,\\tfrac32,\\tfrac{13}{2}) = (-\\tfrac14, 0, 0)", "F(0,0,-1/4) = F(1,-3/2,13/2) = F(-1,3/2,13/2) = (-1/4, 0, 0)"),
+        (
+            "F(0,0,-\\tfrac14) = F(1,-\\tfrac32,\\tfrac{13}{2}) = F(-1,\\tfrac32,\\tfrac{13}{2}) = (-\\tfrac14, 0, 0)",
+            "F(0,0,-1/4) = F(1,-3/2,13/2) = F(-1,3/2,13/2) = (-1/4, 0, 0)",
+        ),
         ("\\mathbb{C}^3", "ℂ³"),
-        ("\\begin{aligned}\nf_1 &= \\frac{f_1^{\\text{ut}}(u,t)}{x^2}, \\quad\nf_2 = \\frac{f_2^{\\text{ut}}(u,t)}{x}, \\quad\nf_3 = x\\,(2 - 3u - t)\n\\end{aligned}", "f₁ = (f₁ᵘᵗ(u,t))/(x²), f₂ = (f₂ᵘᵗ(u,t))/x, f₃ = x (2 - 3u - t)"),
+        (
+            "\\begin{aligned}\nf_1 &= \\frac{f_1^{\\text{ut}}(u,t)}{x^2}, \\quad\nf_2 = \\frac{f_2^{\\text{ut}}(u,t)}{x}, \\quad\nf_3 = x\\,(2 - 3u - t)\n\\end{aligned}",
+            "f₁ = (f₁ᵘᵗ(u,t))/(x²), f₂ = (f₂ᵘᵗ(u,t))/x, f₃ = x (2 - 3u - t)",
+        ),
         ("\\det J_F", "det J_F"),
         ("(-\\tfrac14, 0, 0)", "(-1/4, 0, 0)"),
         ("u = xy", "u = xy"),
@@ -2137,22 +2296,70 @@ mod tests {
         ("n \\geq 2", "n ≥ 2"),
         ("\\mathbb{P}^3", "ℙ³"),
         ("e^{i\\pi}+1=0", "e^(iπ)+1 = 0"),
-        ("\\boxed{\n\\mathcal{Z}(\\beta)\n=\n\\int_{\\mathcal M}\n\\exp\\!\\left(\n-\\beta\\left[\n\\frac12 g^{ij}(x)\\,\\partial_i\\phi\\,\\partial_j\\phi\n+V(\\phi)\n\\right]\\right)\n\\mathcal D\\phi\n}", "[Z(β) = ∫_M exp( -β[ 1/2 gⁱʲ(x) ∂ᵢϕ ∂ⱼϕ +V(ϕ) ]) Dϕ]"),
-        ("\\begin{aligned}\n\\nabla_\\mu T^{\\mu\\nu}\n&=\n\\frac{1}{\\sqrt{-g}}\n\\partial_\\mu\\!\\left(\\sqrt{-g}\\,T^{\\mu\\nu}\\right)\n+\\Gamma^\\nu_{\\mu\\lambda}T^{\\mu\\lambda}\n=0, \\\\[4pt]\nR_{\\mu\\nu}-\\frac12 Rg_{\\mu\\nu}+\\Lambda g_{\\mu\\nu}\n&=\n\\frac{8\\pi G}{c^4}T_{\\mu\\nu}.\n\\end{aligned}", "∇_μ T^(μν) = 1/(√(-g)) ∂_μ(√(-g) T^(μν)) +Γ^ν_(μλ)T^(μλ) = 0,\nR_(μν)-1/2 Rg_(μν)+Λ g_(μν) = (8π G)/(c⁴)T_(μν)."),
-        ("f(z)\n=\n\\frac{1}{2\\pi i}\n\\oint_{\\gamma}\n\\frac{f(\\zeta)}{\\zeta-z}\\,d\\zeta,\n\\qquad\n\\det\\!\\begin{pmatrix}\n\\lambda-a & -b & 0\\\\\n-c & \\lambda-d & -e\\\\\n0 & -f & \\lambda-g\n\\end{pmatrix}\n=0.", "f(z) = 1/(2π i) ∮_γ (f(ζ))/(ζ-z) dζ, det⎛ λ-a │ -b  │ 0   ⎞ = 0.\n                                        ⎜ -c  │ λ-d │ -e  ⎟\n                                        ⎝ 0   │ -f  │ λ-g ⎠"),
-        ("\\Psi(x,t)=\n\\sum_{n=1}^{\\infty}\n\\underbrace{\nc_n\n\\sqrt{\\frac{2}{L}}\n\\sin\\!\\left(\\frac{n\\pi x}{L}\\right)\n}_{\\text{spatial eigenmode}}\n\\exp\\!\\left(-\\frac{i\\hbar n^2\\pi^2}{2mL^2}t\\right),\n\\qquad\n|\\Psi(x,t)|^2\n=\n\\begin{cases}\n\\Psi^\\ast\\Psi, & 0<x<L,\\\\\n0, & \\text{otherwise}.\n\\end{cases}", "Ψ(x,t) = ∑ₙ₌₁^∞ cₙ √(2/L) sin((nπ x)/L)_(spatial eigenmode) exp(-(iℏ n²π²)/(2mL²)t), |Ψ(x,t)|² = ⎧ Ψ^∗Ψ if 0 < x < L,\n⎩ 0 otherwise."),
-        ("x=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}", "x = (-b±√(b²-4ac))/(2a)"),
-        ("\\int_0^\\infty e^{-x^2}\\,dx=\\frac{\\sqrt{\\pi}}{2}", "∫₀^∞ e^(-x²) dx = (√π)/2"),
-        ("e^{i\\theta}=\\cos\\theta+i\\sin\\theta", "e^(iθ) = cos θ+i sin θ"),
-        ("\\sum_{n=1}^{\\infty}\\frac{1}{n^2}=\\frac{\\pi^2}{6}", "∑ₙ₌₁^∞1/(n²) = π²/6"),
-        ("\\lim_{x\\to 0}\\frac{\\sin x}{x}=1", "lim[x→0] (sin x)/x = 1"),
-        ("\\lim_{n\\to\\infty}\n\\left(1+\\frac{1}{n}\\right)^n=e", "lim[n→∞] (1+1/n)ⁿ = e"),
-        ("\\int_0^1 \\frac{x^2}{1+x^3}\\,dx\n=\\frac{1}{3}\\ln 2", "∫₀¹ x²/(1+x³) dx = 1/3 ln 2"),
-        ("\\sum_{k=1}^{n}\\frac{k}{k+1}\n=n+1-H_{n+1}", "∑ₖ₌₁ⁿk/(k+1) = n+1-Hₙ₊₁"),
-        ("\\frac{\n  \\displaystyle \\frac{x^2+1}{x-1}\n  -\n  \\displaystyle \\frac{2x}{x+1}\n}{\n  \\displaystyle \\frac{x}{x^2-1}\n}", "((x²+1)/(x-1) - 2x/(x+1))/(x/(x²-1))"),
-        ("\\lim_{x\\to 0}\n\\frac{\n  \\displaystyle \\frac{\\sin x}{x}-1\n}{\n  \\displaystyle \\frac{e^x-1}{x}-1\n}\n=0", "lim[x→0] ((sin x)/x-1)/((eˣ-1)/x-1) = 0"),
-        ("\\frac{\n  1+\\displaystyle\\frac{1}{1+\\frac{1}{x}}\n}{\n  1-\\displaystyle\\frac{1}{1-\\frac{1}{x}}\n}", "(1+1/(1+1/x))/(1-1/(1-1/x))"),
-        ("\\sum_{n=1}^{\\infty}\n\\frac{\n  \\displaystyle \\frac{1}{n}-\\frac{1}{n+1}\n}{\n  \\displaystyle 1+\\frac{1}{n^2}\n}", "∑ₙ₌₁^∞ (1/n-1/(n+1))/(1+1/(n²))"),
+        (
+            "\\boxed{\n\\mathcal{Z}(\\beta)\n=\n\\int_{\\mathcal M}\n\\exp\\!\\left(\n-\\beta\\left[\n\\frac12 g^{ij}(x)\\,\\partial_i\\phi\\,\\partial_j\\phi\n+V(\\phi)\n\\right]\\right)\n\\mathcal D\\phi\n}",
+            "[Z(β) = ∫_M exp( -β[ 1/2 gⁱʲ(x) ∂ᵢϕ ∂ⱼϕ +V(ϕ) ]) Dϕ]",
+        ),
+        (
+            "\\begin{aligned}\n\\nabla_\\mu T^{\\mu\\nu}\n&=\n\\frac{1}{\\sqrt{-g}}\n\\partial_\\mu\\!\\left(\\sqrt{-g}\\,T^{\\mu\\nu}\\right)\n+\\Gamma^\\nu_{\\mu\\lambda}T^{\\mu\\lambda}\n=0, \\\\[4pt]\nR_{\\mu\\nu}-\\frac12 Rg_{\\mu\\nu}+\\Lambda g_{\\mu\\nu}\n&=\n\\frac{8\\pi G}{c^4}T_{\\mu\\nu}.\n\\end{aligned}",
+            "∇_μ T^(μν) = 1/(√(-g)) ∂_μ(√(-g) T^(μν)) +Γ^ν_(μλ)T^(μλ) = 0,\nR_(μν)-1/2 Rg_(μν)+Λ g_(μν) = (8π G)/(c⁴)T_(μν).",
+        ),
+        (
+            "f(z)\n=\n\\frac{1}{2\\pi i}\n\\oint_{\\gamma}\n\\frac{f(\\zeta)}{\\zeta-z}\\,d\\zeta,\n\\qquad\n\\det\\!\\begin{pmatrix}\n\\lambda-a & -b & 0\\\\\n-c & \\lambda-d & -e\\\\\n0 & -f & \\lambda-g\n\\end{pmatrix}\n=0.",
+            "f(z) = 1/(2π i) ∮_γ (f(ζ))/(ζ-z) dζ, det⎛ λ-a │ -b  │ 0   ⎞ = 0.\n                                        ⎜ -c  │ λ-d │ -e  ⎟\n                                        ⎝ 0   │ -f  │ λ-g ⎠",
+        ),
+        (
+            "\\Psi(x,t)=\n\\sum_{n=1}^{\\infty}\n\\underbrace{\nc_n\n\\sqrt{\\frac{2}{L}}\n\\sin\\!\\left(\\frac{n\\pi x}{L}\\right)\n}_{\\text{spatial eigenmode}}\n\\exp\\!\\left(-\\frac{i\\hbar n^2\\pi^2}{2mL^2}t\\right),\n\\qquad\n|\\Psi(x,t)|^2\n=\n\\begin{cases}\n\\Psi^\\ast\\Psi, & 0<x<L,\\\\\n0, & \\text{otherwise}.\n\\end{cases}",
+            "Ψ(x,t) = ∑ₙ₌₁^∞ cₙ √(2/L) sin((nπ x)/L)_(spatial eigenmode) exp(-(iℏ n²π²)/(2mL²)t), |Ψ(x,t)|² = ⎧ Ψ^∗Ψ if 0 < x < L,\n⎩ 0 otherwise.",
+        ),
+        (
+            "x=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}",
+            "x = (-b±√(b²-4ac))/(2a)",
+        ),
+        (
+            "\\int_0^\\infty e^{-x^2}\\,dx=\\frac{\\sqrt{\\pi}}{2}",
+            "∫₀^∞ e^(-x²) dx = (√π)/2",
+        ),
+        (
+            "e^{i\\theta}=\\cos\\theta+i\\sin\\theta",
+            "e^(iθ) = cos θ+i sin θ",
+        ),
+        (
+            "\\sum_{n=1}^{\\infty}\\frac{1}{n^2}=\\frac{\\pi^2}{6}",
+            "∑ₙ₌₁^∞1/(n²) = π²/6",
+        ),
+        (
+            "\\lim_{x\\to 0}\\frac{\\sin x}{x}=1",
+            "lim[x→0] (sin x)/x = 1",
+        ),
+        (
+            "\\lim_{n\\to\\infty}\n\\left(1+\\frac{1}{n}\\right)^n=e",
+            "lim[n→∞] (1+1/n)ⁿ = e",
+        ),
+        (
+            "\\int_0^1 \\frac{x^2}{1+x^3}\\,dx\n=\\frac{1}{3}\\ln 2",
+            "∫₀¹ x²/(1+x³) dx = 1/3 ln 2",
+        ),
+        (
+            "\\sum_{k=1}^{n}\\frac{k}{k+1}\n=n+1-H_{n+1}",
+            "∑ₖ₌₁ⁿk/(k+1) = n+1-Hₙ₊₁",
+        ),
+        (
+            "\\frac{\n  \\displaystyle \\frac{x^2+1}{x-1}\n  -\n  \\displaystyle \\frac{2x}{x+1}\n}{\n  \\displaystyle \\frac{x}{x^2-1}\n}",
+            "((x²+1)/(x-1) - 2x/(x+1))/(x/(x²-1))",
+        ),
+        (
+            "\\lim_{x\\to 0}\n\\frac{\n  \\displaystyle \\frac{\\sin x}{x}-1\n}{\n  \\displaystyle \\frac{e^x-1}{x}-1\n}\n=0",
+            "lim[x→0] ((sin x)/x-1)/((eˣ-1)/x-1) = 0",
+        ),
+        (
+            "\\frac{\n  1+\\displaystyle\\frac{1}{1+\\frac{1}{x}}\n}{\n  1-\\displaystyle\\frac{1}{1-\\frac{1}{x}}\n}",
+            "(1+1/(1+1/x))/(1-1/(1-1/x))",
+        ),
+        (
+            "\\sum_{n=1}^{\\infty}\n\\frac{\n  \\displaystyle \\frac{1}{n}-\\frac{1}{n+1}\n}{\n  \\displaystyle 1+\\frac{1}{n^2}\n}",
+            "∑ₙ₌₁^∞ (1/n-1/(n+1))/(1+1/(n²))",
+        ),
     ];
 
     #[test]
@@ -2161,7 +2368,9 @@ mod tests {
         for (source, expected) in INLINE_CASES {
             match render_latex(source, false) {
                 Some(actual) if actual == *expected => {}
-                other => failures.push(format!("{source:?}\n  want {expected:?}\n  got  {other:?}")),
+                other => {
+                    failures.push(format!("{source:?}\n  want {expected:?}\n  got  {other:?}"))
+                }
             }
         }
         assert!(
@@ -2181,11 +2390,17 @@ mod tests {
             // "stacks operator limits in display mode"
             (r"\sum_{i=0}^n x_i", " n\n ∑  xᵢ\ni=0"),
             (r"\min_{x\in X} f(x)", "min f(x)\nx∈X"),
-            (r"\operatorname*{arg\,max}_{x\in X} f(x)", "arg max f(x)\n  x∈X"),
+            (
+                r"\operatorname*{arg\,max}_{x\in X} f(x)",
+                "arg max f(x)\n  x∈X",
+            ),
             (r"\int\nolimits_0^1 f(x)\,dx", "∫₀¹ f(x) dx"),
             (r"\int\limits_0^1 f(x)\,dx", "1\n∫ f(x) dx\n0"),
             // "stacks fractions in display mode"
-            (r"x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}", "    -b±√(b²-4ac)\nx = ────────────\n         2a"),
+            (
+                r"x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}",
+                "    -b±√(b²-4ac)\nx = ────────────\n         2a",
+            ),
             (r"\frac{x^2+1}{x-1}", "x²+1\n────\nx-1"),
             // "keeps nested display fractions linear"
             (
@@ -2217,7 +2432,9 @@ mod tests {
         for (source, expected) in display {
             match render_latex(source, true) {
                 Some(actual) if actual == *expected => {}
-                other => failures.push(format!("{source:?}\n  want {expected:?}\n  got  {other:?}")),
+                other => {
+                    failures.push(format!("{source:?}\n  want {expected:?}\n  got  {other:?}"))
+                }
             }
         }
         // "normalizes relation, multiplication, and named-operator spacing"
@@ -2234,12 +2451,23 @@ mod tests {
             failures.push(format!("cases → {got:?}"));
         }
         // "returns undefined for unsupported commands" / "for malformed groups and environments"
-        for source in [r"x + \unknown{y}", r"\frac{1}{x", "x}", r"\begin{matrix}1 & 2", "x\\"] {
+        for source in [
+            r"x + \unknown{y}",
+            r"\frac{1}{x",
+            "x}",
+            r"\begin{matrix}1 & 2",
+            "x\\",
+        ] {
             let got = render_latex(source, false);
             if got.is_some() {
                 failures.push(format!("{source:?} must be None, got {got:?}"));
             }
         }
-        assert!(failures.is_empty(), "{} divergences:\n{}", failures.len(), failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "{} divergences:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 }

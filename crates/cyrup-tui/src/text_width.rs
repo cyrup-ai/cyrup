@@ -31,7 +31,9 @@ pub(crate) fn str_width(s: &str) -> usize {
         return Span::raw(s).width();
     }
     // Allocation-free equivalent of upstream's `clean.replace(/\t/g, "   ")` then measure.
-    s.split('\t').map(|part| Span::raw(part).width()).sum::<usize>()
+    s.split('\t')
+        .map(|part| Span::raw(part).width())
+        .sum::<usize>()
         + s.matches('\t').count() * 3
 }
 
@@ -105,7 +107,11 @@ pub(crate) fn truncate_to_width(s: &str, max: usize, ellipsis: &str) -> String {
 /// The ellipsis is appended as a **bare [`Span::raw`]** — deliberately unlike
 /// [`truncate_spans_to_width`], which inherits the last kept span's style. Both behaviours are
 /// upstream-faithful for their own callers; see that function's note.
-pub(crate) fn truncate_line_to_width(line: Line<'static>, max: usize, ellipsis: &str) -> Line<'static> {
+pub(crate) fn truncate_line_to_width(
+    line: Line<'static>,
+    max: usize,
+    ellipsis: &str,
+) -> Line<'static> {
     if spans_width(&line.spans) <= max {
         return line;
     }

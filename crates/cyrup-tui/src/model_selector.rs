@@ -9,15 +9,15 @@
 //! chosen model id via [`SelectorOutcome::Confirm`], which the chrome maps to
 //! [`AppCommand::ConfirmSelection`](crate::app::AppCommand) → `set_model` at the session layer.
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::fuzzy;
 use crate::keymap::{EditorAction, EditorKeymap, SelectAction, SelectKeymap};
-use crate::selector::{border_rule_line, centered_window, Selector, SelectorOutcome};
+use crate::selector::{Selector, SelectorOutcome, border_rule_line, centered_window};
 use crate::text_input::{Input, InputOutcome};
 use crate::theme::UiTheme;
 use crate::transcript::text_lines_of;
@@ -158,7 +158,9 @@ impl ModelSelector {
     fn sort_models(&mut self) {
         let default = self.default_model.clone();
         let is_default = |m: &ModelEntry| {
-            default.as_ref().is_some_and(|(p, i)| *p == m.provider && *i == m.id)
+            default
+                .as_ref()
+                .is_some_and(|(p, i)| *p == m.provider && *i == m.id)
         };
         self.models.sort_by(|a, b| match (a.current, b.current) {
             (true, false) => std::cmp::Ordering::Less,
@@ -178,7 +180,11 @@ impl ModelSelector {
             _ => a.provider.cmp(&b.provider),
         });
         let has_scoped = models.iter().any(|m| m.scoped);
-        let scope = if has_scoped { Scope::Scoped } else { Scope::All };
+        let scope = if has_scoped {
+            Scope::Scoped
+        } else {
+            Scope::All
+        };
         let mut sel = ModelSelector {
             models,
             has_scoped,
@@ -224,13 +230,18 @@ impl ModelSelector {
         }
         let texts: Vec<String> = active.iter().map(|m| self.search_haystack(m)).collect();
         let matches = fuzzy::filter(&texts, query, String::as_str);
-        let fuzzed: Vec<&ModelEntry> =
-            matches.into_iter().filter_map(|mm| active.get(mm.index).copied()).collect();
+        let fuzzed: Vec<&ModelEntry> = matches
+            .into_iter()
+            .filter_map(|mm| active.get(mm.index).copied())
+            .collect();
         if !self.is_default_search(query) {
             return fuzzed;
         }
-        let mut out: Vec<&ModelEntry> =
-            active.iter().copied().filter(|m| self.is_default(m)).collect();
+        let mut out: Vec<&ModelEntry> = active
+            .iter()
+            .copied()
+            .filter(|m| self.is_default(m))
+            .collect();
         out.extend(fuzzed.into_iter().filter(|m| !self.is_default(m)));
         out
     }
@@ -288,7 +299,11 @@ impl ModelSelector {
     /// alongside `install_login_channel` (`app.rs:2045`) — both outside this crate's edit scope.
     pub fn set_refresh_status(&mut self, message: impl Into<String>, success: bool) {
         let message = message.into();
-        self.refresh_status = if message.is_empty() { None } else { Some((message, success)) };
+        self.refresh_status = if message.is_empty() {
+            None
+        } else {
+            Some((message, success))
+        };
     }
 
     /// Set (or clear) the catalog-refresh error (Pi `errorMessage`, `:174-194`). Every
@@ -383,12 +398,18 @@ impl ModelSelector {
             } else {
                 spans.push(Span::styled(format!("  {}", m.id), theme.base_style()));
             }
-            spans.push(Span::styled(format!(" [{}]", m.provider), theme.muted_style()));
+            spans.push(Span::styled(
+                format!(" [{}]", m.provider),
+                theme.muted_style(),
+            ));
             // `const defaultBadge = isDefault ? theme.fg("muted", " · default") : ""`, drawn
             // AFTER the provider badge and BEFORE the `✓` (`model-selector.ts:317`, `:325`,
             // `:330`). The identical string the thinking picker uses (`thinking-selector.ts:73`).
             if self.is_default(m) {
-                spans.push(Span::styled(" \u{b7} default".to_string(), theme.muted_style()));
+                spans.push(Span::styled(
+                    " \u{b7} default".to_string(),
+                    theme.muted_style(),
+                ));
             }
             if m.current {
                 spans.push(Span::styled(" ✓".to_string(), theme.success_style()));
@@ -415,7 +436,10 @@ impl ModelSelector {
                 ));
             }
         } else if len == 0 {
-            lines.push(Line::from(Span::styled("  No matching models", theme.muted_style())));
+            lines.push(Line::from(Span::styled(
+                "  No matching models",
+                theme.muted_style(),
+            )));
         } else if let Some(sel) = filtered.get(self.selected) {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -427,7 +451,11 @@ impl ModelSelector {
         // refresh landed, `muted` while it is in flight. Independent of the branch above.
         if let Some((message, success)) = &self.refresh_status {
             lines.push(Line::from(""));
-            let style = if *success { theme.success_style() } else { theme.muted_style() };
+            let style = if *success {
+                theme.success_style()
+            } else {
+                theme.muted_style()
+            };
             lines.extend(text_lines_of(
                 &Line::from(Span::styled(format!("  {message}"), style)),
                 width,
@@ -454,8 +482,9 @@ pub fn find_exact_model_reference_match<'a>(
     let normalized = trimmed.to_lowercase();
 
     // 1. Canonical `provider/id` (exactly one wins; >1 is ambiguous → reject).
-    let mut canonical =
-        models.iter().filter(|m| format!("{}/{}", m.provider, m.id).to_lowercase() == normalized);
+    let mut canonical = models
+        .iter()
+        .filter(|m| format!("{}/{}", m.provider, m.id).to_lowercase() == normalized);
     match (canonical.next(), canonical.next()) {
         (Some(m), None) => return Some(m),
         (Some(_), Some(_)) => return None,
@@ -490,12 +519,15 @@ pub fn find_exact_model_reference_match<'a>(
 impl Selector for ModelSelector {
     fn desired_height(&self, width: u16) -> u16 {
         let filtered = self.filtered();
-        let body =
-            self.body_lines(&filtered, usize::from(width), UiTheme::default_ref()).len() as u16;
+        let body = self
+            .body_lines(&filtered, usize::from(width), UiTheme::default_ref())
+            .len() as u16;
         // top rule + blank + scope block + blank + search + blank + body + blank + bottom rule
         // (L4/SYS-3 — see `render`). The scope block is TWO rows when scoped models exist (the
         // scope line plus its own hint `Text`, `model-selector.ts:96-100`) and one otherwise.
-        let scope = self.scope_block_lines(usize::from(width), UiTheme::default_ref()).len() as u16;
+        let scope = self
+            .scope_block_lines(usize::from(width), UiTheme::default_ref())
+            .len() as u16;
         body.saturating_add(7).saturating_add(scope)
     }
 
@@ -573,7 +605,11 @@ impl Selector for ModelSelector {
                     return SelectorOutcome::Redraw;
                 }
                 // Wrap to bottom at the top (Pi `:299-303`).
-                self.selected = if self.selected == 0 { len - 1 } else { self.selected - 1 };
+                self.selected = if self.selected == 0 {
+                    len - 1
+                } else {
+                    self.selected - 1
+                };
                 SelectorOutcome::Redraw
             }
             Some(SelectAction::Down) => {
@@ -582,7 +618,11 @@ impl Selector for ModelSelector {
                     return SelectorOutcome::Redraw;
                 }
                 // Wrap to top at the bottom (Pi `:305-309`).
-                self.selected = if self.selected + 1 >= len { 0 } else { self.selected + 1 };
+                self.selected = if self.selected + 1 >= len {
+                    0
+                } else {
+                    self.selected + 1
+                };
                 SelectorOutcome::Redraw
             }
             Some(SelectAction::PageUp) => {
@@ -646,8 +686,8 @@ mod tests {
     use ratatui::crossterm::event::KeyModifiers;
 
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn entry(id: &str, provider: &str, current: bool, scoped: bool) -> ModelEntry {
         ModelEntry {
@@ -712,8 +752,13 @@ mod tests {
         let backend = TestBackend::new(72, 16);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| sel.render(f, f.area(), &theme)).unwrap();
-        let text: String =
-            term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
         assert!(text.contains("Scope:"));
         assert!(text.contains("[anthropic]"));
         assert!(text.contains("[openai]"));
@@ -785,15 +830,27 @@ mod tests {
         // the default scope is `all` and the query filters across every provider.
         let mut sel = ModelSelector::new(unscoped());
         sel.set_search("gpt".to_string());
-        assert_eq!(sel.visible_len(), 1, "picker opens pre-filtered to the seeded term");
+        assert_eq!(
+            sel.visible_len(),
+            1,
+            "picker opens pre-filtered to the seeded term"
+        );
         assert_eq!(sel.current().unwrap().id, "gpt-5.1");
         // The seeded query renders in the search box.
         let theme = UiTheme::default();
         let mut term = Terminal::new(TestBackend::new(72, 16)).unwrap();
         term.draw(|f| sel.render(f, f.area(), &theme)).unwrap();
-        let text: String =
-            term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("gpt"), "seeded search term shown in the box: {text}");
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("gpt"),
+            "seeded search term shown in the box: {text}"
+        );
     }
     // ---- S32 / S30 / S23: the scope block and the refresh-status + error rows ---------------------
 
@@ -841,15 +898,31 @@ mod tests {
         let mut sel = ModelSelector::new(catalog());
         let theme = UiTheme::dark();
         let (rows, buf) = draw(&mut sel, 72, &theme);
-        assert_eq!(rows[2], "Scope: all | scoped", "no leading space (S32): {rows:?}");
-        assert_eq!(rows[3], "tab scope (all/scoped)", "its own row (S30): {rows:?}");
-        assert_eq!(rows[4], "", "Spacer(1) (`:105`) follows the whole scope block: {rows:?}");
-        assert!(!rows[2].contains('⇥'), "the hardcoded glyph is gone: {rows:?}");
+        assert_eq!(
+            rows[2], "Scope: all | scoped",
+            "no leading space (S32): {rows:?}"
+        );
+        assert_eq!(
+            rows[3], "tab scope (all/scoped)",
+            "its own row (S30): {rows:?}"
+        );
+        assert_eq!(
+            rows[4], "",
+            "Spacer(1) (`:105`) follows the whole scope block: {rows:?}"
+        );
+        assert!(
+            !rows[2].contains('⇥'),
+            "the hardcoded glyph is gone: {rows:?}"
+        );
         // Two-tone: the key `dim`, the description `muted` (they are different tokens — `#666666`
         // vs `#808080` — so this cannot pass by accident).
         assert_ne!(theme.dim_style().fg, theme.muted_style().fg);
         assert_eq!(fg_at(&buf, 0, 3), theme.dim_style().fg, "`tab` is dim");
-        assert_eq!(fg_at(&buf, 4, 3), theme.muted_style().fg, "`scope …` is muted");
+        assert_eq!(
+            fg_at(&buf, 4, 3),
+            theme.muted_style().fg,
+            "`scope …` is muted"
+        );
     }
 
     /// The hint row belongs to the SCOPED branch only: `model-selector.ts:101-104`'s `else` adds the
@@ -864,7 +937,10 @@ mod tests {
             rows[2], "Only showing models from configured providers. Use /login to add providers.",
             "no leading space (S32): {rows:?}"
         );
-        assert_eq!(rows[3], "", "no scope-hint row on this branch (S30): {rows:?}");
+        assert_eq!(
+            rows[3], "",
+            "no scope-hint row on this branch (S30): {rows:?}"
+        );
         assert!(rows.iter().all(|r| !r.contains("all/scoped")), "{rows:?}");
     }
 
@@ -876,24 +952,38 @@ mod tests {
         let mut sel = ModelSelector::new(catalog());
         let theme = UiTheme::dark();
         let (before, _) = draw(&mut sel, 72, &theme);
-        assert!(before.iter().all(|r| !r.contains("Refreshing")), "{before:?}");
+        assert!(
+            before.iter().all(|r| !r.contains("Refreshing")),
+            "{before:?}"
+        );
 
         sel.set_refresh_status("Refreshing model catalogs…", false);
         let (rows, buf) = draw(&mut sel, 72, &theme);
         let n = rows.len();
         assert_eq!(rows[n - 3], "  Refreshing model catalogs…", "{rows:?}");
         assert_eq!(rows[n - 4], "", "Spacer(1) above it (`:313`): {rows:?}");
-        assert_eq!(fg_at(&buf, 2, (n - 3) as u16), theme.muted_style().fg, "in flight ⇒ muted");
+        assert_eq!(
+            fg_at(&buf, 2, (n - 3) as u16),
+            theme.muted_style().fg,
+            "in flight ⇒ muted"
+        );
 
         sel.set_refresh_status("Model catalogs refreshed.", true);
         let (rows, buf) = draw(&mut sel, 72, &theme);
         let n = rows.len();
         assert_eq!(rows[n - 3], "  Model catalogs refreshed.", "{rows:?}");
-        assert_eq!(fg_at(&buf, 2, (n - 3) as u16), theme.success_style().fg, "done ⇒ success");
+        assert_eq!(
+            fg_at(&buf, 2, (n - 3) as u16),
+            theme.success_style().fg,
+            "done ⇒ success"
+        );
 
         sel.set_refresh_status("", false);
         let (rows, _) = draw(&mut sel, 72, &theme);
-        assert!(rows.iter().all(|r| !r.contains("catalogs")), "empty clears the row: {rows:?}");
+        assert!(
+            rows.iter().all(|r| !r.contains("catalogs")),
+            "empty clears the row: {rows:?}"
+        );
     }
 
     /// **S23.** `:299-311` is a three-way branch: an `errorMessage` REPLACES both `No matching
@@ -904,7 +994,10 @@ mod tests {
         let mut sel = ModelSelector::new(catalog());
         let theme = UiTheme::dark();
         let (before, _) = draw(&mut sel, 72, &theme);
-        assert!(before.iter().any(|r| r.starts_with("  Model Name:")), "{before:?}");
+        assert!(
+            before.iter().any(|r| r.starts_with("  Model Name:")),
+            "{before:?}"
+        );
 
         sel.set_error_message(Some(
             "Could not refresh openai; showing cached models.\nRetry with /model.".to_string(),
@@ -914,10 +1007,16 @@ mod tests {
             rows.iter().all(|r| !r.contains("Model Name:")),
             "the error block replaces it: {rows:?}"
         );
-        let first =
-            rows.iter().position(|r| r.starts_with("Could not refresh openai")).unwrap_or(usize::MAX);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with("Could not refresh openai"))
+            .unwrap_or(usize::MAX);
         assert!(first != usize::MAX, "error line 1 missing: {rows:?}");
-        assert_eq!(rows[first + 1], "Retry with /model.", "one row per \\n (`:301-304`): {rows:?}");
+        assert_eq!(
+            rows[first + 1],
+            "Retry with /model.",
+            "one row per \\n (`:301-304`): {rows:?}"
+        );
         assert_eq!(fg_at(&buf, 0, first as u16), theme.error_style().fg);
         assert_eq!(fg_at(&buf, 0, (first + 1) as u16), theme.error_style().fg);
     }
@@ -934,7 +1033,10 @@ mod tests {
         let (rows, _) = draw(&mut sel, 72, &theme);
         assert_eq!(sel.visible_len(), 0, "the query matches nothing");
         assert!(rows.iter().any(|r| r == "  No matching models"), "{rows:?}");
-        assert!(rows.iter().any(|r| r == "  Refreshing model catalogs…"), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r == "  Refreshing model catalogs…"),
+            "{rows:?}"
+        );
     }
 
     /// `Ctrl+S` → `ConfirmDefault`, the confirm key → `Confirm`, both carrying the
@@ -1003,8 +1105,17 @@ mod tests {
         let mut sel = ModelSelector::new(catalog());
         let theme = UiTheme::dark();
         let (rows, _) = draw(&mut sel, 72, &theme);
-        for needle in ["toggle", "(unsaved)", "enabled", "provider ·", "Model Configuration"] {
-            assert!(rows.iter().all(|r| !r.contains(needle)), "{needle:?} leaked into /model: {rows:?}");
+        for needle in [
+            "toggle",
+            "(unsaved)",
+            "enabled",
+            "provider ·",
+            "Model Configuration",
+        ] {
+            assert!(
+                rows.iter().all(|r| !r.contains(needle)),
+                "{needle:?} leaked into /model: {rows:?}"
+            );
         }
     }
 }

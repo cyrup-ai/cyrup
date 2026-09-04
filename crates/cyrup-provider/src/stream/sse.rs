@@ -50,9 +50,7 @@
 use crate::HeaderMap;
 use crate::error::ProviderError;
 use crate::utils::error_body::normalize_error_body;
-use crate::utils::provider_retry::{
-    ProviderRetry, is_retryable_provider_error, retry_delay_ms,
-};
+use crate::utils::provider_retry::{ProviderRetry, is_retryable_provider_error, retry_delay_ms};
 use bytes::Bytes;
 use cyrup_core::CancelToken;
 
@@ -307,8 +305,7 @@ pub async fn build_client_for_target_forcing_http1(
 
 type FrameStream = Pin<Box<dyn Stream<Item = Result<SseFrame, ProviderError>> + Send>>;
 
-type EsInner =
-    Pin<Box<dyn Stream<Item = Result<SseFrame, FrameError<reqwest::Error>>> + Send>>;
+type EsInner = Pin<Box<dyn Stream<Item = Result<SseFrame, FrameError<reqwest::Error>>> + Send>>;
 
 struct SseState {
     es: EsInner,
@@ -652,8 +649,12 @@ mod tests {
     /// Accept one connection, read the request, then do `after_accept` — and nothing else, holding
     /// the socket open forever. This is the failure PROV-006 describes: the TCP handshake succeeds,
     /// so no connect timeout fires, and the peer then goes silent.
-    async fn spawn_stalling_server(head: Option<&'static str>) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+    async fn spawn_stalling_server(
+        head: Option<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let handle = tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
@@ -675,7 +676,9 @@ mod tests {
         status_line: &'static str,
         body: String,
     ) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let handle = tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
@@ -696,8 +699,14 @@ mod tests {
     /// Serve `attempts` scripted responses on successive connections, recording how many were made.
     async fn spawn_scripted_server(
         script: Vec<(&'static str, &'static str, String)>,
-    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = hits.clone();
@@ -887,14 +896,21 @@ mod tests {
 
             // Resolution rules.
             configure_http_idle_timeout(1234);
-            assert_eq!(resolve_idle_timeout(None), Some(Duration::from_millis(1234)));
+            assert_eq!(
+                resolve_idle_timeout(None),
+                Some(Duration::from_millis(1234))
+            );
             assert_eq!(resolve_idle_timeout(Some(0)), None, "0 disables, not 0ms");
             assert_eq!(
                 resolve_idle_timeout(Some(50)),
                 Some(Duration::from_millis(50))
             );
             configure_http_idle_timeout(0);
-            assert_eq!(resolve_idle_timeout(None), None, "a disabled global disables");
+            assert_eq!(
+                resolve_idle_timeout(None),
+                None,
+                "a disabled global disables"
+            );
 
             // ...and the global actually reaches a client built with no override. `build_client`
             // is synchronous and reads the global exactly here; `_restore` puts the default back
@@ -962,7 +978,8 @@ mod tests {
         assert_eq!(*status, 502);
         assert_eq!(
             message.chars().count(),
-            crate::utils::error_body::MAX_PROVIDER_ERROR_BODY_CHARS + "... [truncated 1080020 chars]".chars().count(),
+            crate::utils::error_body::MAX_PROVIDER_ERROR_BODY_CHARS
+                + "... [truncated 1080020 chars]".chars().count(),
             "the body must be the 4000-char head plus Pi's marker, got {} chars",
             message.chars().count()
         );
@@ -986,8 +1003,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_small_error_body_is_passed_through_trimmed() {
-        let (url, server) =
-            spawn_fixed_server("HTTP/1.1 400 Bad Request", "  {\"error\":\"nope\"}\n".into()).await;
+        let (url, server) = spawn_fixed_server(
+            "HTTP/1.1 400 Bad Request",
+            "  {\"error\":\"nope\"}\n".into(),
+        )
+        .await;
         let client = build_client_with_proxy(None, Some(5_000)).expect("client");
         let err = expect_err(
             open_sse(
@@ -1035,7 +1055,10 @@ mod tests {
         .await
         .expect("the second attempt succeeds");
 
-        assert_eq!(frames.next().await.expect("frame").expect("ok").data, "hello");
+        assert_eq!(
+            frames.next().await.expect("frame").expect("ok").data,
+            "hello"
+        );
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
         server.abort();
     }
@@ -1056,7 +1079,10 @@ mod tests {
                 CancelToken::new(),
                 None,
                 None,
-                ProviderRetry { max_retries: 3, max_retry_delay_ms: None },
+                ProviderRetry {
+                    max_retries: 3,
+                    max_retry_delay_ms: None,
+                },
             )
             .await,
             "401",
@@ -1090,7 +1116,10 @@ mod tests {
                 CancelToken::new(),
                 None,
                 None,
-                ProviderRetry { max_retries: 3, max_retry_delay_ms: None },
+                ProviderRetry {
+                    max_retries: 3,
+                    max_retry_delay_ms: None,
+                },
             )
             .await,
             "a 10-minute Retry-After exceeds the 60s ceiling",
@@ -1160,7 +1189,10 @@ mod tests {
                     cancel,
                     None,
                     None,
-                    ProviderRetry { max_retries: 3, max_retry_delay_ms: None },
+                    ProviderRetry {
+                        max_retries: 3,
+                        max_retry_delay_ms: None,
+                    },
                 ),
             )
             .await

@@ -14,7 +14,12 @@
 //!
 //! `env!("CARGO_MANIFEST_DIR")).join("../cyrup-ext-sdk")` below still resolves: `crates/cyrup-it`
 //! and `crates/cyrup-ext` are siblings, so the relative path is unchanged by the move.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use cyrup_ext::build::{ArtifactCache, build_component_in, detect_toolchain};
 // `Extension` is imported for its `subscriptions()` method, which is a TRAIT method on the loaded
@@ -46,7 +51,11 @@ async fn tier1_cargo_build_emits_a_component_that_caches_and_instantiates() {
     );
 
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../cyrup-ext-sdk");
-    assert!(crate_dir.join("Cargo.toml").is_file(), "sdk crate dir: {}", crate_dir.display());
+    assert!(
+        crate_dir.join("Cargo.toml").is_file(),
+        "sdk crate dir: {}",
+        crate_dir.display()
+    );
 
     // The cache directory must OUTLIVE both `build_component_in` calls below (the second one is the
     // cache-hit assertion) but must not outlive the test. A `TempDir` gives exactly that: a unique
@@ -65,11 +74,18 @@ async fn tier1_cargo_build_emits_a_component_that_caches_and_instantiates() {
     // First call: a cache MISS -> a real cargo build -> a validated component.
     let bytes = build_component_in(&crate_dir, &cache).expect("tier-1 build produces a component");
     assert_eq!(bytes.get(0..4), Some(&b"\0asm"[..]), "wasm preamble");
-    assert_eq!(bytes.get(6..8), Some(&[0x01, 0x00][..]), "component layer (not a core module)");
+    assert_eq!(
+        bytes.get(6..8),
+        Some(&[0x01, 0x00][..]),
+        "component layer (not a core module)"
+    );
 
     // Second call: a cache HIT returns identical bytes without rebuilding.
     let again = build_component_in(&crate_dir, &cache).expect("cache hit");
-    assert_eq!(bytes, again, "content-addressed cache returns the same artifact");
+    assert_eq!(
+        bytes, again,
+        "content-addressed cache returns the same artifact"
+    );
 
     // ---------------------------------------------------------------------------------------
     // THE WORLD-BUMP PROOF. Everything above is a byte check: the preamble says "a component",
@@ -91,7 +107,10 @@ async fn tier1_cargo_build_emits_a_component_that_caches_and_instantiates() {
     // `crates/cyrup-it/build.rs` builds with a plain `cargo build -p cyrup-ext-sdk`. Nothing
     // instantiated the bytes the PRODUCTION Tier-1 loop returns until this assertion.
     // ---------------------------------------------------------------------------------------
-    assert_eq!(HOST_WORLD, "cyrup:ext@0.8", "the world this artifact is being linked against");
+    assert_eq!(
+        HOST_WORLD, "cyrup:ext@0.8",
+        "the world this artifact is being linked against"
+    );
 
     let host = ExtensionHost::with_wasm(HostConfig {
         mode: cyrup_ext::ExtMode::Tui,

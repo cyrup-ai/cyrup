@@ -73,7 +73,7 @@ use std::time::{Duration, Instant};
 
 use cyrup_core::CancelToken;
 
-use super::run_status::{list_active_runs, ActiveRun};
+use super::run_status::{ActiveRun, list_active_runs};
 use super::{ActivityState, RunState};
 
 /// States that mean a run is still in flight (pi `ACTIVE_STATES`, `runs/background/wait.ts:55` @v0.34.0). Matches exactly
@@ -355,7 +355,13 @@ fn join_ids(runs: &[ActiveRun]) -> String {
 
 fn join_ids_with_state(runs: &[ActiveRun]) -> String {
     runs.iter()
-        .map(|run| format!("{} ({})", run_id_of(run), super::run_status::run_state_label(run.status.state)))
+        .map(|run| {
+            format!(
+                "{} ({})",
+                run_id_of(run),
+                super::run_status::run_state_label(run.status.state)
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -384,7 +390,9 @@ pub async fn wait_for_subagents(
         ));
     }
 
-    let poll_interval = deps.poll_interval.max(Duration::from_millis(MIN_POLL_INTERVAL_MS));
+    let poll_interval = deps
+        .poll_interval
+        .max(Duration::from_millis(MIN_POLL_INTERVAL_MS));
     let timeout = Duration::from_millis(match params.timeout_ms {
         Some(ms) if ms > 0 => ms,
         _ => DEFAULT_TIMEOUT_MS,
@@ -400,7 +408,10 @@ pub async fn wait_for_subagents(
     // full poll interval anyway, which is exactly the latency this closes. `broadcast::Receiver`
     // only delivers values sent after `subscribe()`, so this ordering is the whole correctness
     // argument for the wake.
-    let mut wake = deps.completion_bus.as_ref().map(super::watch::CompletionBus::subscribe);
+    let mut wake = deps
+        .completion_bus
+        .as_ref()
+        .map(super::watch::CompletionBus::subscribe);
 
     let mut active = active_runs(params.id.as_deref(), deps).await?;
 
@@ -413,8 +424,11 @@ pub async fn wait_for_subagents(
 
     let mut effective_id = params.id.clone();
     if let Some(id) = params.id.as_deref() {
-        let exact: Vec<ActiveRun> =
-            active.iter().filter(|run| run_id_of(run) == id).cloned().collect();
+        let exact: Vec<ActiveRun> = active
+            .iter()
+            .filter(|run| run_id_of(run) == id)
+            .cloned()
+            .collect();
         if exact.len() == 1 {
             active = exact;
         } else if active.len() > 1 {
@@ -431,12 +445,21 @@ pub async fn wait_for_subagents(
 
     // The set of runs in flight when the wait began. In first-completion mode we return as soon as
     // any of THESE leaves the active set — a run spawned by a concurrent turn does not satisfy it.
-    let initial_ids: Vec<String> = active.iter().map(|run| run_id_of(run).to_string()).collect();
+    let initial_ids: Vec<String> = active
+        .iter()
+        .map(|run| run_id_of(run).to_string())
+        .collect();
     let initial_count = initial_ids.len();
-    let mut pending: Vec<ActiveRun> =
-        active.iter().filter(|run| !needs_attention(run)).cloned().collect();
-    let mut attention: Vec<ActiveRun> =
-        active.iter().filter(|run| needs_attention(run)).cloned().collect();
+    let mut pending: Vec<ActiveRun> = active
+        .iter()
+        .filter(|run| !needs_attention(run))
+        .cloned()
+        .collect();
+    let mut attention: Vec<ActiveRun> = active
+        .iter()
+        .filter(|run| needs_attention(run))
+        .cloned()
+        .collect();
 
     let done = |pending: &[ActiveRun], attention: &[ActiveRun]| -> bool {
         // A run needing attention always breaks the wait, in either mode: the caller has to act on
@@ -445,10 +468,14 @@ pub async fn wait_for_subagents(
             return true;
         }
         if wait_for_all {
-            return pending.iter().all(|run| !initial_ids.iter().any(|id| id == run_id_of(run)));
+            return pending
+                .iter()
+                .all(|run| !initial_ids.iter().any(|id| id == run_id_of(run)));
         }
-        let still_active_initial =
-            pending.iter().filter(|run| initial_ids.iter().any(|id| id == run_id_of(run))).count();
+        let still_active_initial = pending
+            .iter()
+            .filter(|run| initial_ids.iter().any(|id| id == run_id_of(run)))
+            .count();
         still_active_initial < initial_count
     };
 
@@ -529,7 +556,11 @@ pub async fn wait_for_subagents(
         }
 
         active = active_runs(effective_id.as_deref(), deps).await?;
-        pending = active.iter().filter(|run| !needs_attention(run)).cloned().collect();
+        pending = active
+            .iter()
+            .filter(|run| !needs_attention(run))
+            .cloned()
+            .collect();
         attention = active
             .iter()
             .filter(|run| needs_attention(run) && initial_ids.iter().any(|id| id == run_id_of(run)))
@@ -543,7 +574,8 @@ pub async fn wait_for_subagents(
     // (`subagent-wait.ts:617`), interpolated at `:642`/`:660` immediately after the outcome clause
     // and before the attention note. Empty unless a failed run actually has a revivable child
     // session, so an ordinary wait is unchanged.
-    let resume_guidance = super::resume_guidance::format_resume_first_failed_runs_note(&terminal_runs);
+    let resume_guidance =
+        super::resume_guidance::format_resume_first_failed_runs_note(&terminal_runs);
     let attention_note = if attention.is_empty() {
         String::new()
     } else {
@@ -566,7 +598,11 @@ pub async fn wait_for_subagents(
             Some(id) => format!("run \"{id}\""),
             None => format!("{initial_count} async run(s)"),
         };
-        let status = if attention.is_empty() { "done" } else { "attention required" };
+        let status = if attention.is_empty() {
+            "done"
+        } else {
+            "attention required"
+        };
         let notification = if attention.is_empty() {
             "Completion events have been observed; inspect status if the notification is not \
              visible yet."
@@ -593,7 +629,10 @@ pub async fn wait_for_subagents(
         " No other runs are waitable until attention is handled.".to_string()
     };
     let progress = if !attention.is_empty() && finished_count == 0 {
-        format!("{} of {initial_count} run(s) need attention", attention.len())
+        format!(
+            "{} of {initial_count} run(s) need attention",
+            attention.len()
+        )
     } else {
         format!("{finished_count} of {initial_count} run(s) finished")
     };
@@ -615,7 +654,12 @@ fn elapsed_ms(since: Instant) -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::background::{RunId, RunMode, RunPaths, RunStatus};
@@ -633,7 +677,11 @@ mod tests {
             let results_dir = dir.path().join("results");
             std::fs::create_dir_all(&async_root).expect("mkdir async");
             std::fs::create_dir_all(&results_dir).expect("mkdir results");
-            Self { _dir: dir, async_root, results_dir }
+            Self {
+                _dir: dir,
+                async_root,
+                results_dir,
+            }
         }
 
         fn deps(&self, enabled: bool) -> WaitDeps {
@@ -700,8 +748,11 @@ mod tests {
                 session_file: None,
                 results: Vec::new(),
             };
-            std::fs::write(&paths.result, serde_json::to_string(&result).expect("serializes"))
-                .expect("write result file");
+            std::fs::write(
+                &paths.result,
+                serde_json::to_string(&result).expect("serializes"),
+            )
+            .expect("write result file");
         }
     }
 
@@ -711,7 +762,10 @@ mod tests {
         let text = wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &fx.deps(true))
             .await
             .expect("no runs is not an error");
-        assert_eq!(text, "No active async runs in this session. Nothing to wait for.");
+        assert_eq!(
+            text,
+            "No active async runs in this session. Nothing to wait for."
+        );
     }
 
     /// SUBA-031 — `wait` is scoped to the SESSION, not merely to the cwd, so two cyrup sessions in
@@ -755,7 +809,10 @@ mod tests {
         .await
         .expect("a session-scoped wait must not block on another session's run")
         .expect("no in-scope runs is not an error");
-        assert_eq!(text, "No active async runs in this session. Nothing to wait for.");
+        assert_eq!(
+            text,
+            "No active async runs in this session. Nothing to wait for."
+        );
     }
 
     /// THE behavior SUBA-004 exists for: `wait` actually BLOCKS while a background run is in
@@ -801,7 +858,10 @@ mod tests {
             text.contains("1 of 1 run(s) finished"),
             "the summary must report the finished run: {text}"
         );
-        assert!(text.contains("Outcome: 1 complete."), "and how it came out: {text}");
+        assert!(
+            text.contains("Outcome: 1 complete."),
+            "and how it came out: {text}"
+        );
         assert!(
             !text.contains("Resume-first"),
             "SUBA-060 guidance is for FAILED runs only; a complete run must not carry it: {text}"
@@ -856,7 +916,10 @@ mod tests {
         .expect("a failed run is reported, not errored");
         settle.await.expect("settler task");
 
-        assert!(text.contains("Outcome: 1 failed."), "the run must be seen as failed: {text}");
+        assert!(
+            text.contains("Outcome: 1 failed."),
+            "the run must be seen as failed: {text}"
+        );
         assert!(
             text.contains(&format!(
                 " Resume-first: failed run \"{}\" has a persisted child session. Revive the \
@@ -881,18 +944,33 @@ mod tests {
 
         let started = Instant::now();
         let err = wait_for_subagents(
-            &WaitParams { timeout_ms: Some(400), ..WaitParams::default() },
+            &WaitParams {
+                timeout_ms: Some(400),
+                ..WaitParams::default()
+            },
             &CancelToken::new(),
             &fx.deps(true),
         )
         .await
         .expect_err("a timeout is reported as an error result");
-        assert!(started.elapsed() >= Duration::from_millis(350), "it must actually have waited");
-        assert!(started.elapsed() < Duration::from_secs(5), "and not far past the deadline");
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "it must actually have waited"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "and not far past the deadline"
+        );
         assert!(err.starts_with("Wait timed out after "), "got: {err}");
         assert!(err.contains("1 run(s) still active"), "got: {err}");
-        assert!(err.contains(run_id.as_str()), "the wedged run must be named: {err}");
-        assert!(err.contains("The runs are detached and keep going"), "got: {err}");
+        assert!(
+            err.contains(run_id.as_str()),
+            "the wedged run must be named: {err}"
+        );
+        assert!(
+            err.contains("The runs are detached and keep going"),
+            "got: {err}"
+        );
     }
 
     /// Escape hatch #2: cancelling the turn releases the wait promptly — well inside one production
@@ -933,7 +1011,10 @@ mod tests {
             started.elapsed()
         );
         assert!(err.starts_with("Wait aborted after "), "got: {err}");
-        assert!(err.contains(run_id.as_str()), "the still-active run must be named: {err}");
+        assert!(
+            err.contains(run_id.as_str()),
+            "the still-active run must be named: {err}"
+        );
     }
 
     /// A child that needs attention breaks the wait immediately in either mode — otherwise a stuck
@@ -947,13 +1028,19 @@ mod tests {
 
         let started = Instant::now();
         let text = wait_for_subagents(
-            &WaitParams { all: Some(true), ..WaitParams::default() },
+            &WaitParams {
+                all: Some(true),
+                ..WaitParams::default()
+            },
             &CancelToken::new(),
             &fx.deps(true),
         )
         .await
         .expect("attention resolves the wait");
-        assert!(started.elapsed() < Duration::from_secs(2), "it must not have polled at all");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it must not have polled at all"
+        );
         assert!(text.contains("attention required"), "got: {text}");
         assert!(text.contains("1 run(s) need attention"), "got: {text}");
         assert!(text.contains(run_id.as_str()), "got: {text}");
@@ -975,13 +1062,19 @@ mod tests {
         let blocked = tokio::time::timeout(
             Duration::from_millis(800),
             wait_for_subagents(
-                &WaitParams { all: Some(true), ..WaitParams::default() },
+                &WaitParams {
+                    all: Some(true),
+                    ..WaitParams::default()
+                },
                 &CancelToken::new(),
                 &fx.deps(true),
             ),
         )
         .await;
-        assert!(blocked.is_err(), "all:true must block while both run, got {blocked:?}");
+        assert!(
+            blocked.is_err(),
+            "all:true must block while both run, got {blocked:?}"
+        );
 
         let settle = {
             let a = a.clone();
@@ -1008,7 +1101,10 @@ mod tests {
         let still_blocked = tokio::time::timeout(
             Duration::from_millis(800),
             wait_for_subagents(
-                &WaitParams { all: Some(true), ..WaitParams::default() },
+                &WaitParams {
+                    all: Some(true),
+                    ..WaitParams::default()
+                },
                 &CancelToken::new(),
                 &fx.deps(true),
             ),
@@ -1033,7 +1129,10 @@ mod tests {
         fx.write_status(&b, RunState::Running, false);
 
         let err = wait_for_subagents(
-            &WaitParams { id: Some("abc".to_string()), ..WaitParams::default() },
+            &WaitParams {
+                id: Some("abc".to_string()),
+                ..WaitParams::default()
+            },
             &CancelToken::new(),
             &fx.deps(true),
         )
@@ -1049,7 +1148,10 @@ mod tests {
         let run_id = RunId::new();
         fx.write_status(&run_id, RunState::Running, false);
         let text = wait_for_subagents(
-            &WaitParams { id: Some("nope".to_string()), ..WaitParams::default() },
+            &WaitParams {
+                id: Some("nope".to_string()),
+                ..WaitParams::default()
+            },
             &CancelToken::new(),
             &fx.deps(true),
         )
@@ -1070,16 +1172,27 @@ mod tests {
             .await
             .expect("disabled is not an error");
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(text.starts_with("Wait tool is disabled by config.waitTool or "), "got: {text}");
+        assert!(
+            text.starts_with("Wait tool is disabled by config.waitTool or "),
+            "got: {text}"
+        );
         assert!(text.contains("Active runs keep going"), "got: {text}");
     }
 
     #[test]
     fn the_enabled_gate_resolves_env_over_config_and_defaults_to_on() {
         assert_eq!(resolve_wait_tool_enabled(None, None), Ok(true));
-        assert_eq!(resolve_wait_tool_enabled(Some(&WaitToolSetting::Enabled(false)), None), Ok(false));
         assert_eq!(
-            resolve_wait_tool_enabled(Some(&WaitToolSetting::Object { enabled: Some(false) }), None),
+            resolve_wait_tool_enabled(Some(&WaitToolSetting::Enabled(false)), None),
+            Ok(false)
+        );
+        assert_eq!(
+            resolve_wait_tool_enabled(
+                Some(&WaitToolSetting::Object {
+                    enabled: Some(false)
+                }),
+                None
+            ),
             Ok(false)
         );
         assert_eq!(
@@ -1098,9 +1211,11 @@ mod tests {
         // An unrecognized value is a configuration ERROR, not a silently-ignored one.
         assert_eq!(
             resolve_wait_tool_enabled(None, Some("maybe")),
-            Err("CYRUP_SUBAGENT_WAIT_TOOL_ENABLED must be one of true/false, 1/0, yes/no, on/off, \
+            Err(
+                "CYRUP_SUBAGENT_WAIT_TOOL_ENABLED must be one of true/false, 1/0, yes/no, on/off, \
                  or enabled/disabled."
-                .to_string())
+                    .to_string()
+            )
         );
     }
 
@@ -1113,7 +1228,9 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<WaitToolSetting>(serde_json::json!({"enabled": true}))
                 .expect("object form"),
-            WaitToolSetting::Object { enabled: Some(true) }
+            WaitToolSetting::Object {
+                enabled: Some(true)
+            }
         );
     }
 
@@ -1216,7 +1333,9 @@ mod tests {
                 outcome: crate::background::watch::ClassifiedOutcome::Completed,
             });
             assert!(
-                tokio::time::timeout(Duration::from_millis(60), &mut waiting).await.is_err(),
+                tokio::time::timeout(Duration::from_millis(60), &mut waiting)
+                    .await
+                    .is_err(),
                 "a wake for a still-running run must not resolve the wait"
             );
         }

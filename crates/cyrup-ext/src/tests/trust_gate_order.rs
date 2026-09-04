@@ -51,7 +51,11 @@ fn discovered(origin: ExtOrigin) -> DiscoveredExtension {
 async fn a_pre_trust_extension_with_a_stale_world_is_refused_by_check_world() {
     let host = ExtensionHost::new(HostConfig::default());
     let err = host
-        .load_discovered(&discovered(ExtOrigin::Global), false, Arc::new(DenyServices))
+        .load_discovered(
+            &discovered(ExtOrigin::Global),
+            false,
+            Arc::new(DenyServices),
+        )
         .await
         .expect_err("a stale world is refused");
     assert!(
@@ -67,7 +71,11 @@ async fn a_pre_trust_extension_with_a_stale_world_is_refused_by_check_world() {
 async fn an_untrusted_project_extension_is_untrusted_not_a_world_mismatch() {
     let host = ExtensionHost::new(HostConfig::default());
     let err = host
-        .load_discovered(&discovered(ExtOrigin::Project), false, Arc::new(DenyServices))
+        .load_discovered(
+            &discovered(ExtOrigin::Project),
+            false,
+            Arc::new(DenyServices),
+        )
         .await
         .expect_err("an untrusted project-local extension does not load");
     assert!(
@@ -83,7 +91,11 @@ async fn an_untrusted_project_extension_is_untrusted_not_a_world_mismatch() {
 async fn trusting_the_project_hands_the_same_extension_to_check_world() {
     let host = ExtensionHost::new(HostConfig::default());
     let err = host
-        .load_discovered(&discovered(ExtOrigin::Project), true, Arc::new(DenyServices))
+        .load_discovered(
+            &discovered(ExtOrigin::Project),
+            true,
+            Arc::new(DenyServices),
+        )
         .await
         .expect_err("a stale world is still refused once the project is trusted");
     assert!(

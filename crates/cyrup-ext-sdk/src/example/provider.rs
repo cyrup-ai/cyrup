@@ -6,7 +6,7 @@ use crate::{
     AutocompleteItem, AutocompleteSuggestions, ExtensionApi, OAuthProvider, ProviderConfig,
     ProviderHandlers,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub(super) fn install(api: &mut ExtensionApi) {
     // A custom provider with OAuth + a custom `streamSimple` (Pi `registerProvider({oauth, streamSimple})`,
@@ -22,19 +22,30 @@ pub(super) fn install(api: &mut ExtensionApi) {
         },
         |creds: Value| {
             // Refresh: rotate the access token (Pi refreshToken).
-            let refresh = creds.get("refresh").and_then(|v| v.as_str()).unwrap_or("r-demo");
+            let refresh = creds
+                .get("refresh")
+                .and_then(|v| v.as_str())
+                .unwrap_or("r-demo");
             Ok(json!({ "refresh": refresh, "access": "a-refreshed", "expires": 0 }))
         },
         |creds: &Value| {
             // getApiKey: derive the key string from the credentials.
-            Ok(creds.get("access").and_then(|v| v.as_str()).unwrap_or_default().to_string())
+            Ok(creds
+                .get("access")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string())
         },
     )
     .with_modify_models(|models: Value, _creds: &Value| Ok(models));
 
     let stream = |model: Value, _ctx: Value, _opts: Value, out: &crate::ProviderStream| {
         // Push two assistant-message events then end (Pi createAssistantMessageEventStream).
-        let id = model.get("id").and_then(|v| v.as_str()).unwrap_or("demo-model").to_string();
+        let id = model
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("demo-model")
+            .to_string();
         out.emit(json!({ "type": "text", "text": format!("stream from {id}") }));
         out.emit(json!({ "type": "done" }));
         Ok(())
@@ -69,7 +80,9 @@ pub(super) fn install(api: &mut ExtensionApi) {
             oauth: None,
             has_stream_simple: false,
         },
-        ProviderHandlers::new().with_oauth(oauth).with_stream_simple(stream),
+        ProviderHandlers::new()
+            .with_oauth(oauth)
+            .with_stream_simple(stream),
     );
 
     // A global autocomplete provider (Pi `addAutocompleteProvider`): stack a "demo:" item on top of
@@ -77,8 +90,14 @@ pub(super) fn install(api: &mut ExtensionApi) {
     api.add_autocomplete_provider(
         |query: &crate::AutocompleteQuery, current: Option<&AutocompleteSuggestions>| {
             let mut items = current.map(|c| c.items.clone()).unwrap_or_default();
-            items.push(AutocompleteItem::labelled("demo:run", "demo:run (extension)"));
-            Some(AutocompleteSuggestions { items, prefix: query.current_line().to_string() })
+            items.push(AutocompleteItem::labelled(
+                "demo:run",
+                "demo:run (extension)",
+            ));
+            Some(AutocompleteSuggestions {
+                items,
+                prefix: query.current_line().to_string(),
+            })
         },
     );
 }

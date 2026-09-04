@@ -281,7 +281,11 @@ fn m_read_only_deliverable_verb_noun(text: &str, i: usize) -> Option<usize> {
     if !boundary_before(text, i) {
         return None;
     }
-    let after_verb = alt_word(text, i, &["draft", "write", "compose", "prepare", "produce"])?;
+    let after_verb = alt_word(
+        text,
+        i,
+        &["draft", "write", "compose", "prepare", "produce"],
+    )?;
     let after_verb_ws = ws1(text, after_verb)?;
     // `(?:(?:a|an|the)\s+)?` then `(?:github\s+)?`, each optional and each requiring its own `\s+`.
     let mut cursor = after_verb_ws;
@@ -890,7 +894,10 @@ fn m_may_mutate_verb(text: &str, i: usize) -> Option<usize> {
 /// dashes end the object so `Do not modify tests — implement the fix` leaves the follow-on clause
 /// intact for write-intent testing.
 fn is_prohibition_object_terminator(ch: char) -> bool {
-    matches!(ch, '.' | ';' | ',' | ':' | '!' | '?' | '\n' | '–' | '—' | '-')
+    matches!(
+        ch,
+        '.' | ';' | ',' | ':' | '!' | '?' | '\n' | '–' | '—' | '-'
+    )
 }
 
 /// The `(?!\b(?:but|and|then)\b)` half of the object capture: true when a coordinating word starts
@@ -1012,8 +1019,9 @@ fn is_generic_prohibition_object(object: &str) -> bool {
         }
         qualifiers.iter().any(|qualifier| {
             rest.strip_prefix(qualifier).is_some_and(|tail| {
-                let after_separators =
-                    tail.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '/' | ',' | '-'));
+                let after_separators = tail.trim_start_matches(|c: char| {
+                    c.is_whitespace() || matches!(c, '/' | ',' | '-')
+                });
                 loop_matches(after_separators, qualifiers)
             })
         })
@@ -1035,8 +1043,8 @@ struct NoEditProhibitionAnalysis {
 
 /// Source: `analyzeNoEditProhibitions(taskText)` (`task-intent.ts:121-132`).
 fn analyze_no_edit_prohibitions(task_text_lower: &str) -> NoEditProhibitionAnalysis {
-    let mut present = any_match(task_text_lower, m_review_only)
-        || any_match(task_text_lower, m_no_tool_intent);
+    let mut present =
+        any_match(task_text_lower, m_review_only) || any_match(task_text_lower, m_no_tool_intent);
     let mut blanket = present;
     let stripped = strip_patterns(task_text_lower, &[m_review_only, m_no_tool_intent]);
 
@@ -1296,10 +1304,8 @@ pub fn task_may_mutate(task: &str) -> bool {
     if prohibitions.blanket {
         return false;
     }
-    let without_deliverables = strip_patterns(
-        &prohibitions.stripped_text,
-        READ_ONLY_DELIVERABLE_PATTERNS,
-    );
+    let without_deliverables =
+        strip_patterns(&prohibitions.stripped_text, READ_ONLY_DELIVERABLE_PATTERNS);
     any_match(&without_deliverables, m_may_mutate_verb)
 }
 
@@ -1770,8 +1776,14 @@ mod tests {
     #[test]
     fn strip_severity_compounds_blanks_dashed_severity_verbs_only() {
         assert_eq!(strip_severity_compounds("the must-fix list"), "the   list");
-        assert_eq!(strip_severity_compounds("a should\u{2014}update note"), "a   note");
-        assert_eq!(strip_severity_compounds("needs\u{2010}patch items"), "  items");
+        assert_eq!(
+            strip_severity_compounds("a should\u{2014}update note"),
+            "a   note"
+        );
+        assert_eq!(
+            strip_severity_compounds("needs\u{2010}patch items"),
+            "  items"
+        );
         // Not compounds: no dash, a dash but the verb continues, a dash but no severity word.
         assert_eq!(strip_severity_compounds("must fix it"), "must fix it");
         assert_eq!(strip_severity_compounds("must-fixing"), "must-fixing");
@@ -1784,7 +1796,10 @@ mod tests {
     fn strip_patterns_applies_each_pattern_in_sequence() {
         // Two READ_ONLY_DELIVERABLE patterns can overlap ("produce findings only"); sequential
         // application means the FIRST pattern's match wins, exactly as the source's loop does.
-        let stripped = strip_patterns("please produce findings only", READ_ONLY_DELIVERABLE_PATTERNS);
+        let stripped = strip_patterns(
+            "please produce findings only",
+            READ_ONLY_DELIVERABLE_PATTERNS,
+        );
         assert!(!stripped.contains("findings"), "{stripped:?}");
         // ORDER-DISCRIMINATING: pattern 1 (`produce findings`) consumes less than pattern 3
         // (`produce findings only`), so applying them in source order leaves the trailing `only`
@@ -1803,7 +1818,10 @@ mod tests {
         // Pattern 2, `/\b(?:issue|bug report)\s+(?:draft|body|template)\b/i` (`task-intent.ts:63`):
         // `attach` is not one of pattern 1's verbs and there is no `\s+only`, so patterns 1 and 3
         // both miss.
-        let only_pattern_two = strip_patterns("attach the issue template here", READ_ONLY_DELIVERABLE_PATTERNS);
+        let only_pattern_two = strip_patterns(
+            "attach the issue template here",
+            READ_ONLY_DELIVERABLE_PATTERNS,
+        );
         assert!(
             !only_pattern_two.contains("issue") && !only_pattern_two.contains("template"),
             "pattern 2 must be applied, not just pattern 1: {only_pattern_two:?}"
@@ -1813,7 +1831,10 @@ mod tests {
         // Pattern 3, `/\b(?:return|provide|produce)\s+(?:text|markdown|answer|findings?|recommendations?)\s+only\b/i`
         // (`task-intent.ts:64`): `provide` is absent from pattern 1's verb alternation
         // (`draft|write|compose|prepare|produce`), so only pattern 3 can fire here.
-        let only_pattern_three = strip_patterns("please provide findings only", READ_ONLY_DELIVERABLE_PATTERNS);
+        let only_pattern_three = strip_patterns(
+            "please provide findings only",
+            READ_ONLY_DELIVERABLE_PATTERNS,
+        );
         assert!(
             !only_pattern_three.contains("findings") && !only_pattern_three.contains("only"),
             "pattern 3 must be applied, not just pattern 1: {only_pattern_three:?}"
@@ -1823,12 +1844,24 @@ mod tests {
         // to the original. A merged single pass (union of the two matches over the original text)
         // would consume `only` as well, which is precisely what the first case forbids; asserting
         // the exact string pins that there is no third possibility.
-        assert_eq!(strip_patterns("please produce findings only", READ_ONLY_DELIVERABLE_PATTERNS), "please   only");
+        assert_eq!(
+            strip_patterns(
+                "please produce findings only",
+                READ_ONLY_DELIVERABLE_PATTERNS
+            ),
+            "please   only"
+        );
 
         // A pattern that matches nothing must leave the text byte-identical (`continue`, not a
         // rebuild), and an empty matcher list must be the identity.
-        assert_eq!(strip_patterns("nothing to strip here", READ_ONLY_DELIVERABLE_PATTERNS), "nothing to strip here");
-        assert_eq!(strip_patterns("please produce findings only", &[]), "please produce findings only");
+        assert_eq!(
+            strip_patterns("nothing to strip here", READ_ONLY_DELIVERABLE_PATTERNS),
+            "nothing to strip here"
+        );
+        assert_eq!(
+            strip_patterns("please produce findings only", &[]),
+            "please produce findings only"
+        );
     }
 
     /// The case none of the above can see: TWO INDEPENDENT patterns matching ONE text.
@@ -1897,7 +1930,9 @@ mod tests {
             classify_task_mutation_intent("worker", "Do not modify tests then implement the fix"),
             TaskMutationIntent::Implementation
         );
-        assert!(task_may_mutate("Do not modify tests then implement the fix"));
+        assert!(task_may_mutate(
+            "Do not modify tests then implement the fix"
+        ));
     }
 
     /// The same rule pinned at the PRIMITIVE, so it cannot be proven only through a classifier
@@ -1916,7 +1951,10 @@ mod tests {
                 format!(" {coordinator} implement the fix"),
                 "`{coordinator}` must terminate the object, leaving the follow-on clause"
             );
-            assert!(at_coordinating_word(&task, task.find(coordinator).expect("present")));
+            assert!(at_coordinating_word(
+                &task,
+                task.find(coordinator).expect("present")
+            ));
         }
         // A word that merely STARTS with a coordinator is not one: `\b(?:but|and|then)\b`.
         let task = "do not modify tests andrew owns implement the fix";
@@ -1925,7 +1963,10 @@ mod tests {
             " ",
             "`andrew` must not terminate the object: the whole clause is swallowed as the object"
         );
-        assert!(!at_coordinating_word(task, task.find("andrew").expect("present")));
+        assert!(!at_coordinating_word(
+            task,
+            task.find("andrew").expect("present")
+        ));
         // Punctuation is the other terminator, and is independent of the coordinator alternation.
         assert_eq!(
             analyze_no_edit_prohibitions("do not modify tests; implement the fix").stripped_text,
@@ -1947,7 +1988,10 @@ mod tests {
             "researcher",
             "code researcher",
         ] {
-            assert!(is_research_agent(agent), "{agent:?} must be a research agent");
+            assert!(
+                is_research_agent(agent),
+                "{agent:?} must be a research agent"
+            );
         }
         for agent in [
             "investigator-bot",
@@ -1957,7 +2001,10 @@ mod tests {
             "advisor",
             "reviewer",
         ] {
-            assert!(!is_research_agent(agent), "{agent:?} must NOT be a research agent");
+            assert!(
+                !is_research_agent(agent),
+                "{agent:?} must NOT be a research agent"
+            );
         }
     }
 
@@ -1974,7 +2021,10 @@ mod tests {
         // `^` is not `/m`, so no other offset may use it: the only match in this text is the one
         // reached through the punctuation branch.
         let two_sentences = "review the plan. implement the requested changes";
-        assert_eq!(m_reviewer_sentence_initial_implement(two_sentences, 0), None);
+        assert_eq!(
+            m_reviewer_sentence_initial_implement(two_sentences, 0),
+            None
+        );
         let dot = two_sentences.find('.').expect("dot");
         assert!(m_reviewer_sentence_initial_implement(two_sentences, dot).is_some());
         // Mid-sentence `implement …` is not a mandate: neither branch applies at the verb offset.
@@ -1998,8 +2048,16 @@ mod tests {
         }
         // Every object alternative of `(?:approved|requested|specified|file|code|source|fix(?:es)?|changes?)`.
         for object in [
-            "approved", "requested", "specified", "file", "code", "source", "fix", "fixes",
-            "change", "changes",
+            "approved",
+            "requested",
+            "specified",
+            "file",
+            "code",
+            "source",
+            "fix",
+            "fixes",
+            "change",
+            "changes",
         ] {
             let text = format!("implement the {object}");
             assert!(
@@ -2023,7 +2081,13 @@ mod tests {
     /// matched against the AGENT NAME. Upstream's own cases only ever use `researcher`.
     #[test]
     fn every_research_agent_name_alternative_forces_read_only() {
-        for agent in ["investigate", "investigate-bot", "scout", "deep-scout", "research"] {
+        for agent in [
+            "investigate",
+            "investigate-bot",
+            "scout",
+            "deep-scout",
+            "research",
+        ] {
             assert_eq!(
                 classify_task_mutation_intent(agent, "Implement the fix"),
                 TaskMutationIntent::ReadOnly,

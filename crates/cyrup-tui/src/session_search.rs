@@ -214,7 +214,10 @@ pub fn parse_search_query(query: &str) -> ParsedSearchQuery {
     if had_unclosed_quote {
         let tokens = trimmed
             .split_whitespace()
-            .map(|t| SearchToken { kind: TokenKind::Fuzzy, value: t.to_string() })
+            .map(|t| SearchToken {
+                kind: TokenKind::Fuzzy,
+                value: t.to_string(),
+            })
             .collect();
         return ParsedSearchQuery {
             mode: QueryMode::Tokens,
@@ -224,9 +227,22 @@ pub fn parse_search_query(query: &str) -> ParsedSearchQuery {
         };
     }
 
-    flush(&mut buf, if in_quote { TokenKind::Phrase } else { TokenKind::Fuzzy }, &mut tokens);
+    flush(
+        &mut buf,
+        if in_quote {
+            TokenKind::Phrase
+        } else {
+            TokenKind::Fuzzy
+        },
+        &mut tokens,
+    );
 
-    ParsedSearchQuery { mode: QueryMode::Tokens, tokens, regex: None, error: None }
+    ParsedSearchQuery {
+        mode: QueryMode::Tokens,
+        tokens,
+        regex: None,
+        error: None,
+    }
 }
 
 /// Score `text` against a parsed query (`matchSession`, `session-selector-search.ts:113-152`):
@@ -242,7 +258,11 @@ pub fn match_text(text: &str, parsed: &ParsedSearchQuery) -> Option<f64> {
         // `text.search(re) < 0` is the `None` from `find`. Delta: pi's `String.search` returns a
         // UTF-16 code-unit index while `Match::start` is a byte offset — identical for ASCII, and
         // the score is ordering-only, so non-ASCII text shifts no row's relative position.
-        return parsed.regex.as_ref()?.find(text).map(|m| m.start() as f64 * 0.1);
+        return parsed
+            .regex
+            .as_ref()?
+            .find(text)
+            .map(|m| m.start() as f64 * 0.1);
     }
     if parsed.tokens.is_empty() {
         return Some(0.0);
@@ -321,7 +341,8 @@ pub fn filter_and_sort<T: Clone>(
                 .filter_map(|r| match_text(&r.text, &parsed).map(|s| (r, s)))
                 .collect();
             scored.sort_by(|a, b| {
-                a.1.total_cmp(&b.1).then_with(|| b.0.recency.cmp(&a.0.recency))
+                a.1.total_cmp(&b.1)
+                    .then_with(|| b.0.recency.cmp(&a.0.recency))
             });
             scored.into_iter().map(|(r, _)| r.item.clone()).collect()
         }
@@ -345,8 +366,20 @@ mod tests {
     fn fuzzy_tokens_split_on_whitespace() {
         let parsed = parse_search_query("foo bar");
         assert_eq!(parsed.tokens.len(), 2);
-        assert_eq!(parsed.tokens[0], SearchToken { kind: TokenKind::Fuzzy, value: "foo".into() });
-        assert_eq!(parsed.tokens[1], SearchToken { kind: TokenKind::Fuzzy, value: "bar".into() });
+        assert_eq!(
+            parsed.tokens[0],
+            SearchToken {
+                kind: TokenKind::Fuzzy,
+                value: "foo".into()
+            }
+        );
+        assert_eq!(
+            parsed.tokens[1],
+            SearchToken {
+                kind: TokenKind::Fuzzy,
+                value: "bar".into()
+            }
+        );
     }
 
     #[test]
@@ -354,7 +387,13 @@ mod tests {
         // `foo "node cve" bar` → fuzzy(foo), phrase(node cve), fuzzy(bar).
         let parsed = parse_search_query("foo \"node cve\" bar");
         assert_eq!(parsed.tokens.len(), 3);
-        assert_eq!(parsed.tokens[1], SearchToken { kind: TokenKind::Phrase, value: "node cve".into() });
+        assert_eq!(
+            parsed.tokens[1],
+            SearchToken {
+                kind: TokenKind::Phrase,
+                value: "node cve".into()
+            }
+        );
     }
 
     #[test]
@@ -404,9 +443,24 @@ mod tests {
     #[test]
     fn name_filter_keeps_only_named_sessions() {
         let rows = vec![
-            SearchRow { text: "a one".into(), name: Some("Build".into()), recency: 2, item: 1 },
-            SearchRow { text: "b two".into(), name: None, recency: 1, item: 2 },
-            SearchRow { text: "c three".into(), name: Some("  ".into()), recency: 3, item: 3 },
+            SearchRow {
+                text: "a one".into(),
+                name: Some("Build".into()),
+                recency: 2,
+                item: 1,
+            },
+            SearchRow {
+                text: "b two".into(),
+                name: None,
+                recency: 1,
+                item: 2,
+            },
+            SearchRow {
+                text: "c three".into(),
+                name: Some("  ".into()),
+                recency: 3,
+                item: 3,
+            },
         ];
         let all = filter_and_sort(&rows, "", SortMode::Recent, NameFilter::All);
         assert_eq!(all, vec![1, 2, 3]);
@@ -417,8 +471,18 @@ mod tests {
     #[test]
     fn recent_mode_keeps_incoming_order() {
         let rows = vec![
-            SearchRow { text: "alpha task".into(), name: None, recency: 1, item: "a" },
-            SearchRow { text: "alpha other".into(), name: None, recency: 2, item: "b" },
+            SearchRow {
+                text: "alpha task".into(),
+                name: None,
+                recency: 1,
+                item: "a",
+            },
+            SearchRow {
+                text: "alpha other".into(),
+                name: None,
+                recency: 2,
+                item: "b",
+            },
         ];
         let out = filter_and_sort(&rows, "alpha", SortMode::Recent, NameFilter::All);
         assert_eq!(out, vec!["a", "b"]);
@@ -429,8 +493,18 @@ mod tests {
         // Both match "cve"; the one where it appears earlier scores lower (better) for phrase, but for
         // fuzzy the earlier/consecutive match wins. Tie-break on recency (newer first).
         let rows = vec![
-            SearchRow { text: "zzzz cve".into(), name: None, recency: 10, item: "late" },
-            SearchRow { text: "cve now".into(), name: None, recency: 5, item: "early" },
+            SearchRow {
+                text: "zzzz cve".into(),
+                name: None,
+                recency: 10,
+                item: "late",
+            },
+            SearchRow {
+                text: "cve now".into(),
+                name: None,
+                recency: 5,
+                item: "early",
+            },
         ];
         let out = filter_and_sort(&rows, "\"cve\"", SortMode::Relevance, NameFilter::All);
         // "early" has the phrase at index 0 (score 0), "late" at a larger index → "early" first.
@@ -439,7 +513,12 @@ mod tests {
 
     #[test]
     fn parse_error_yields_empty_result() {
-        let rows = vec![SearchRow { text: "x".into(), name: None, recency: 1, item: 1 }];
+        let rows = vec![SearchRow {
+            text: "x".into(),
+            name: None,
+            recency: 1,
+            item: 1,
+        }];
         let out = filter_and_sort(&rows, "re:", SortMode::Recent, NameFilter::All);
         assert!(out.is_empty());
     }

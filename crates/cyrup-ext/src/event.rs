@@ -2,10 +2,10 @@
 //! `Subscriptions` bitset (arch-08 §3.4). `HostEvent` mirrors the func-08 §5 catalog; `EventKind`
 //! indexes the 64-bit subscription bitset that gates dispatch (R-08-034 / R-ARCH-EXT-014).
 
-use std::sync::Arc;
 use cyrup_agent::{AgentEvent, AgentMessage, ToolResultMessage};
 use cyrup_core::{Content, Message, TerminateHint, ToolCallId};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// A C-like discriminant — one per `HostEvent` arm. Used to index the `Subscriptions` bitset and
 /// (for serialization across the WIT boundary) as the `u8` the guest passes to `subscribe`.
@@ -283,7 +283,11 @@ pub enum InputStreamingBehavior {
 #[derive(Clone, Debug)]
 pub enum HostEvent {
     // 5.4 tools — mutating seams
-    ToolCall { call_id: ToolCallId, name: String, input: Value },
+    ToolCall {
+        call_id: ToolCallId,
+        name: String,
+        input: Value,
+    },
     ToolResult {
         call_id: ToolCallId,
         name: String,
@@ -305,8 +309,12 @@ pub enum HostEvent {
         terminate: TerminateHint,
     },
     // 5.3 agent & turn — mutating + notify
-    Context { messages: Vec<Arc<AgentMessage>> },
-    MessageEnd { message: Message },
+    Context {
+        messages: Vec<Arc<AgentMessage>>,
+    },
+    MessageEnd {
+        message: Message,
+    },
     /// `before_agent_start` (Pi types.ts:665): the user prompt + images + the (chainable)
     /// system prompt and its options. A handler may inject a message and/or replace the prompt;
     /// injected messages ACCUMULATE across handlers (Pi `runner.ts:980` `messages.push`).
@@ -319,49 +327,90 @@ pub enum HostEvent {
         injected: Vec<Message>,
     },
     AgentStart,
-    AgentEnd { messages: Vec<Arc<AgentMessage>> },
+    AgentEnd {
+        messages: Vec<Arc<AgentMessage>>,
+    },
     /// `turn_start` (Pi `TurnStartEvent`, types.ts:688-693): the turn index AND a wall-clock
     /// `timestamp` (Pi `Date.now()`, agent-session.ts:624). `turn_index` is derived in the
     /// `ExtSubscriber` fan-out layer (mirroring Pi's `AgentSession._turnIndex`), not on the raw event.
-    TurnStart { turn_index: u32, timestamp: u64 },
-    TurnEnd { turn_index: u32, message: AgentMessage, tool_results: Vec<ToolResultMessage> },
+    TurnStart {
+        turn_index: u32,
+        timestamp: u64,
+    },
+    TurnEnd {
+        turn_index: u32,
+        message: AgentMessage,
+        tool_results: Vec<ToolResultMessage>,
+    },
     /// `message_start` (Pi `MessageStartEvent`, types.ts:711-715): the full message (user|assistant|
     /// toolResult), serialized — not just its role.
-    MessageStart { message: Value },
+    MessageStart {
+        message: Value,
+    },
     /// `message_update` (Pi `MessageUpdateEvent`, types.ts:717-722): the in-flight `message` AND the
     /// `assistantMessageEvent` provider delta (carried as `delta`).
-    MessageUpdate { message: Value, delta: Value },
-    ToolExecStart { call_id: ToolCallId, name: String, args: Value },
+    MessageUpdate {
+        message: Value,
+        delta: Value,
+    },
+    ToolExecStart {
+        call_id: ToolCallId,
+        name: String,
+        args: Value,
+    },
     /// `tool_execution_update` (pi `ToolExecutionUpdateEvent`, extensions/types.ts:770-776
     /// @v0.83.0): `{type, toolCallId, toolName, args, partialResult}`. `name` and `args` were
     /// dropped here while the arm directly above kept both, so an observer that missed
     /// `tool_execution_start` — late registration, reload, or a run already in flight — could not
     /// filter by tool at all (EXT-014).
-    ToolExecUpdate { call_id: ToolCallId, name: String, args: Value, chunk: Value },
+    ToolExecUpdate {
+        call_id: ToolCallId,
+        name: String,
+        args: Value,
+        chunk: Value,
+    },
     /// `tool_execution_end` (pi `ToolExecutionEndEvent`, extensions/types.ts:779-785 @v0.83.0):
     /// `{type, toolCallId, toolName, result, isError}` (EXT-014).
-    ToolExecEnd { call_id: ToolCallId, name: String, result: Value, is_error: bool },
+    ToolExecEnd {
+        call_id: ToolCallId,
+        name: String,
+        result: Value,
+        is_error: bool,
+    },
     // 5.1/5.2 startup & session
     /// `session_start` (pi `SessionStartEvent`, extensions/types.ts:562-569 @v0.83.0): `reason`
     /// (`"startup"|"reload"|"new"|"resume"|"fork"`) and `previousSessionFile?`, "Present for
     /// \"new\", \"resume\", and \"fork\"" (EXT-015).
-    SessionStart { reason: String, previous_session_file: Option<String> },
+    SessionStart {
+        reason: String,
+        previous_session_file: Option<String>,
+    },
     /// `session_shutdown` (pi `SessionShutdownEvent`, extensions/types.ts:616-621 @v0.83.0):
     /// `reason` and `targetSessionFile?`, "Destination session file when shutting down due to
     /// session replacement" (EXT-015).
-    SessionShutdown { reason: String, target_session_file: Option<String> },
+    SessionShutdown {
+        reason: String,
+        target_session_file: Option<String>,
+    },
     /// `session_info_changed` (pi `SessionInfoChangedEvent`, extensions/types.ts:571-575
     /// @v0.83.0): "Current normalized session name. Undefined when the name is cleared" — so
     /// `None` is upstream's `undefined`, not an empty name (EXT-011).
-    SessionInfoChanged { name: Option<String> },
+    SessionInfoChanged {
+        name: Option<String>,
+    },
     /// `resources_discover` (pi `ResourcesDiscoverEvent`, extensions/types.ts:544-548 @v0.83.0):
     /// `{type, cwd, reason: "startup" | "reload"}` (EXT-016).
-    ResourcesDiscover { cwd: String, reason: String },
+    ResourcesDiscover {
+        cwd: String,
+        reason: String,
+    },
     /// `project_trust` (pi `ProjectTrustEvent`, extensions/types.ts:519-522 @v0.83.0):
     /// `{type, cwd}`. The verdict is per-DIRECTORY upstream — the store is keyed by cwd
     /// (`options.trustStore.set(options.cwd, trusted)`, core/project-trust.ts:63-65) — so without
     /// this a trust-policy extension cannot key an allowlist or honour `remember` (EXT-043).
-    ProjectTrust { cwd: String },
+    ProjectTrust {
+        cwd: String,
+    },
     // 5.5 input / 5.6 provider / model (pi's overload block, extensions/types.ts:1190-1231 @v0.83.0)
     // Carries the submission text AND the attached images (Pi `InputEvent.text`/`.images`,
     // types.ts:792-802) so an `input` handler can `transform` either (Pi runner.ts:1116-1119),
@@ -377,33 +426,57 @@ pub enum HostEvent {
     /// `user_bash` (Pi `UserBashEvent`, types.ts:782-790): the `command`, the `exclude_from_context`
     /// flag (true for the `!!` prefix), and the `cwd`. The `operations`/`result` override is returned
     /// via the `handled` outcome (Pi `UserBashEventResult`), not carried inbound.
-    UserBash { command: String, exclude_from_context: bool, cwd: String },
-    BeforeProviderRequest { payload: Value },
+    UserBash {
+        command: String,
+        exclude_from_context: bool,
+        cwd: String,
+    },
+    BeforeProviderRequest {
+        payload: Value,
+    },
     /// `before_provider_headers` (pi `BeforeProviderHeadersEvent`, extensions/types.ts:686-689
     /// @v0.83.0). `headers` is the assembled header bag. Upstream's doc (:681-685) is exact:
     /// "Handlers mutate `headers` in place … A `null` value deletes that header", so the patch is
     /// an object whose values are `string | null` and a `null` DELETES rather than blanks
     /// (EXT-009).
-    BeforeProviderHeaders { headers: Value },
-    AfterProviderResponse { status: u32, headers: Value },
+    BeforeProviderHeaders {
+        headers: Value,
+    },
+    AfterProviderResponse {
+        status: u32,
+        headers: Value,
+    },
     /// `model_select` (pi `ModelSelectEvent`, extensions/types.ts:794-799 @v0.83.0): `model`,
     /// `previousModel` and `source` are THREE SIBLING fields. cyrup used to nest the latter two
     /// inside `model`, so a ported handler read `event.previousModel` and got `undefined` while
     /// `event.model` was not a `Model` shape either (EXT-042).
-    ModelSelect { model: Value, previous_model: Option<Value>, source: String },
+    ModelSelect {
+        model: Value,
+        previous_model: Option<Value>,
+        source: String,
+    },
     /// `thinking_level_select` (pi `ThinkingLevelSelectEvent`, extensions/types.ts:802-806
     /// @v0.83.0): `{level, previousLevel}`. `previousLevel` is not optional upstream; `None` here
     /// is the first event of a session, where there is genuinely no prior level (EXT-042).
-    ThinkingLevelSelect { level: String, previous_level: Option<String> },
+    ThinkingLevelSelect {
+        level: String,
+        previous_level: Option<String>,
+    },
     // session control lifecycle (pi's overload block, extensions/types.ts:1190-1231 @v0.83.0)
     /// `session_before_switch` (pi `SessionBeforeSwitchEvent`, extensions/types.ts:578-582
     /// @v0.83.0): `reason: "new" | "resume"` and `targetSessionFile?`. cyrup carried a bare
     /// `target_id` and dropped `reason` — the field that distinguishes the two cases a handler
     /// most needs to tell apart (EXT-015).
-    SessionBeforeSwitch { reason: String, target_session_file: Option<String> },
+    SessionBeforeSwitch {
+        reason: String,
+        target_session_file: Option<String>,
+    },
     /// `session_before_fork` (pi `SessionBeforeForkEvent`, extensions/types.ts:585-589 @v0.83.0):
     /// `entryId` and `position: "before" | "at"` (EXT-015).
-    SessionBeforeFork { entry_id: String, position: String },
+    SessionBeforeFork {
+        entry_id: String,
+        position: String,
+    },
     /// `session_before_compact` (Pi `SessionBeforeCompactEvent`, types.ts:577-587): the computed
     /// `preparation` (`CompactionPreparation`, whose `messagesToSummarize`/`turnPrefixMessages`
     /// carry RAW `AgentMessage`s with their roles intact), the `branch_entries` in scope, optional
@@ -435,7 +508,9 @@ pub enum HostEvent {
         /// The guest's tree override, folded from a `mutate` outcome (`None` = no override).
         override_result: Option<Value>,
     },
-    SessionTree { tree: Value },
+    SessionTree {
+        tree: Value,
+    },
     /// `agent_settled` (Pi `AgentSettledEvent`, extensions/types.ts:721-725) — a payload-free
     /// notification that the whole run, including every automatic continuation, has settled.
     ///
@@ -497,51 +572,68 @@ impl HostEvent {
             // `turn_index` is a placeholder here; the `ExtSubscriber` fan-out layer overwrites it
             // with the derived counter value (Pi `AgentSession._turnIndex`). `timestamp` is the
             // wall-clock at emit (Pi `Date.now()`, agent-session.ts:624).
-            AgentEvent::TurnStart => HostEvent::TurnStart { turn_index: 0, timestamp: now_millis() },
-            AgentEvent::MessageStart { message } => {
-                HostEvent::MessageStart { message: serde_json::to_value(message).unwrap_or(Value::Null) }
-            }
-            AgentEvent::MessageUpdate { message, assistant_message_event } => {
-                HostEvent::MessageUpdate {
-                    message: serde_json::to_value(message).unwrap_or(Value::Null),
-                    delta: serde_json::to_value(assistant_message_event).unwrap_or(Value::Null),
-                }
-            }
+            AgentEvent::TurnStart => HostEvent::TurnStart {
+                turn_index: 0,
+                timestamp: now_millis(),
+            },
+            AgentEvent::MessageStart { message } => HostEvent::MessageStart {
+                message: serde_json::to_value(message).unwrap_or(Value::Null),
+            },
+            AgentEvent::MessageUpdate {
+                message,
+                assistant_message_event,
+            } => HostEvent::MessageUpdate {
+                message: serde_json::to_value(message).unwrap_or(Value::Null),
+                delta: serde_json::to_value(assistant_message_event).unwrap_or(Value::Null),
+            },
             // Mutating seam — dispatched exactly once by `ExtensionHost::emit_message_end`
             // (EXT-002). Never routed through the notify subscriber.
             AgentEvent::MessageEnd { .. } => return None,
-            AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
-                HostEvent::ToolExecStart {
-                    call_id: tool_call_id.clone(),
-                    name: tool_name.clone(),
-                    args: args.clone(),
-                }
-            }
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => HostEvent::ToolExecStart {
+                call_id: tool_call_id.clone(),
+                name: tool_name.clone(),
+                args: args.clone(),
+            },
             // EXT-014: `tool_name` and `args` are on the `AgentEvent` and were being discarded
             // by the `..` — pi carries both through to the handler
             // (`ToolExecutionUpdateEvent`, extensions/types.ts:770-776 @v0.83.0).
-            AgentEvent::ToolExecutionUpdate { tool_call_id, tool_name, args, partial_result } => {
-                HostEvent::ToolExecUpdate {
-                    call_id: tool_call_id.clone(),
-                    name: tool_name.clone(),
-                    args: args.clone(),
-                    chunk: partial_result.clone(),
-                }
-            }
-            AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } => {
-                HostEvent::ToolExecEnd {
-                    call_id: tool_call_id.clone(),
-                    name: tool_name.clone(),
-                    result: result.clone(),
-                    is_error: *is_error,
-                }
-            }
-            AgentEvent::TurnEnd { message, tool_results } => HostEvent::TurnEnd {
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+            } => HostEvent::ToolExecUpdate {
+                call_id: tool_call_id.clone(),
+                name: tool_name.clone(),
+                args: args.clone(),
+                chunk: partial_result.clone(),
+            },
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+            } => HostEvent::ToolExecEnd {
+                call_id: tool_call_id.clone(),
+                name: tool_name.clone(),
+                result: result.clone(),
+                is_error: *is_error,
+            },
+            AgentEvent::TurnEnd {
+                message,
+                tool_results,
+            } => HostEvent::TurnEnd {
                 turn_index: 0,
                 message: message.clone(),
                 tool_results: tool_results.clone(),
             },
-            AgentEvent::AgentEnd { messages } => HostEvent::AgentEnd { messages: messages.clone() },
+            AgentEvent::AgentEnd { messages } => HostEvent::AgentEnd {
+                messages: messages.clone(),
+            },
         })
     }
 }

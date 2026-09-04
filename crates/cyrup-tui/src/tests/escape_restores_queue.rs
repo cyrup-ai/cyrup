@@ -15,11 +15,16 @@
 //! `App::restore_queued_to_editor` (the pure half the run loop calls with what
 //! `AgentSession::drain_queue` returned), asserting the queued text actually lands in the RENDERED
 //! editor row — not merely that a function was called.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::*;
 use crate::{App, AppAction, UiTheme};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 fn new_app() -> App<TestBackend> {
     App::new(TestBackend::new(80, 12), UiTheme::dark()).unwrap()
@@ -76,7 +81,11 @@ fn escape_while_idle_does_not_restore_a_queue() {
         AppAction::InterruptRestoreQueued,
         "not streaming ⇒ pi never reaches the restore branch"
     );
-    assert_eq!(out, AppAction::Redraw, "pi's empty-editor arm only arms the double-Escape window");
+    assert_eq!(
+        out,
+        AppAction::Redraw,
+        "pi's empty-editor arm only arms the double-Escape window"
+    );
 }
 
 #[test]
@@ -90,13 +99,23 @@ fn restored_queue_lands_in_the_rendered_editor() {
 
     // What the run loop drains from the session: steering first, then follow-up (Pi's
     // `[...steering, ...followUp]`, interactive-mode.ts:4066).
-    let queued = vec!["use the async api".to_string(), "then run clippy".to_string()];
+    let queued = vec![
+        "use the async api".to_string(),
+        "then run clippy".to_string(),
+    ];
     assert_eq!(app.restore_queued_to_editor(&queued), 2);
 
     app.draw().unwrap();
     let out = screen(&app);
-    for needle in ["use the async api", "then run clippy", "and also check the tests"] {
-        assert!(out.contains(needle), "`{needle}` must be back in the editor:\n{out}");
+    for needle in [
+        "use the async api",
+        "then run clippy",
+        "and also check the tests",
+    ] {
+        assert!(
+            out.contains(needle),
+            "`{needle}` must be back in the editor:\n{out}"
+        );
     }
     // Queued text is PREPENDED, ahead of the partially-typed line (Pi joins
     // `[queuedText, currentText]`, `:4076`).
@@ -116,7 +135,10 @@ fn an_empty_queue_leaves_the_typed_text_untouched() {
     assert_eq!(app.restore_queued_to_editor(&[]), 0);
     app.draw().unwrap();
     let out = screen(&app);
-    assert!(out.contains("half-written prompt"), "typed text survives:\n{out}");
+    assert!(
+        out.contains("half-written prompt"),
+        "typed text survives:\n{out}"
+    );
 }
 
 #[test]
@@ -124,6 +146,9 @@ fn restoring_into_an_empty_editor_adds_no_blank_padding() {
     let mut app = new_app();
     // `[queuedText, currentText].filter((t) => t.trim())` (`:4076`) drops the empty current text, so
     // the restored buffer is exactly the queued text — no trailing blank line.
-    assert_eq!(app.restore_queued_to_editor(&["only queued".to_string()]), 1);
+    assert_eq!(
+        app.restore_queued_to_editor(&["only queued".to_string()]),
+        1
+    );
     assert_eq!(app.editor_mut().text(), "only queued");
 }

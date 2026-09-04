@@ -143,14 +143,21 @@ mod tests {
     #[test]
     fn json_schema_config_uses_pis_snake_case_tag() {
         let v = serde_json::to_value(ConstrainedSampling::Config(
-            ConstrainedSamplingConfig::JsonSchema { strict: StrictSampling::Require },
+            ConstrainedSamplingConfig::JsonSchema {
+                strict: StrictSampling::Require,
+            },
         ))
         .unwrap();
-        assert_eq!(v, serde_json::json!({"type": "json_schema", "strict": "require"}));
+        assert_eq!(
+            v,
+            serde_json::json!({"type": "json_schema", "strict": "require"})
+        );
         let back: ConstrainedSampling = serde_json::from_value(v).unwrap();
         assert!(matches!(
             back.config(),
-            Some(ConstrainedSamplingConfig::JsonSchema { strict: StrictSampling::Require })
+            Some(ConstrainedSamplingConfig::JsonSchema {
+                strict: StrictSampling::Require
+            })
         ));
     }
 

@@ -16,7 +16,9 @@ enum Phase {
     Started,
     /// The terminal has been yielded. `owes_start` remembers whether a `Start` ever was — a
     /// terminal with no prior `start` (pi's `!addedPartial` branch) still owes `message_start`.
-    Terminated { owes_start: bool },
+    Terminated {
+        owes_start: bool,
+    },
 }
 
 /// What the shell must do with one event.
@@ -25,7 +27,10 @@ pub(super) enum Step {
     Start(Arc<AssistantMessage>),
     /// Emit `MessageUpdate { partial, event }` — only after `Start` (pi `if (partialMessage)`,
     /// `agent-loop.ts:335`).
-    Update { partial: Arc<AssistantMessage>, event: StreamEvent },
+    Update {
+        partial: Arc<AssistantMessage>,
+        event: StreamEvent,
+    },
     /// Stop consuming; hand this to [`AssistantStream::settle`].
     Terminal(Arc<AssistantMessage>),
     /// A pre-start block event, a second `Start`, or a post-terminal stray: nothing to emit.
@@ -55,7 +60,11 @@ pub(super) struct AssistantStream {
 impl AssistantStream {
     /// Seeds the `StopReason::Pending` partial (`empty_assistant`) before the first `start`.
     pub(super) fn new(model: &ModelRef) -> Self {
-        Self { model: model.clone(), partial: Arc::new(empty_assistant(model)), phase: Phase::Unstarted }
+        Self {
+            model: model.clone(),
+            partial: Arc::new(empty_assistant(model)),
+            phase: Phase::Unstarted,
+        }
     }
 
     pub(super) fn on_event(&mut self, ev: StreamEvent) -> Step {
@@ -82,11 +91,15 @@ impl AssistantStream {
                 Phase::Started | Phase::Terminated { .. } => Step::Ignore,
             },
             StreamEvent::Done { message, .. } => {
-                self.phase = Phase::Terminated { owes_start: self.owes_start() };
+                self.phase = Phase::Terminated {
+                    owes_start: self.owes_start(),
+                };
                 Step::Terminal(message)
             }
             StreamEvent::Error { error, .. } => {
-                self.phase = Phase::Terminated { owes_start: self.owes_start() };
+                self.phase = Phase::Terminated {
+                    owes_start: self.owes_start(),
+                };
                 Step::Terminal(error)
             }
             // Every other event is a content-block start/delta/end (text, thinking, OR
@@ -94,7 +107,10 @@ impl AssistantStream {
             // exists (Pi emits `message_update` for all nine block events after `start`,
             // agent-loop.ts:326-344).
             event => match self.phase {
-                Phase::Started => Step::Update { partial: Arc::clone(&self.partial), event },
+                Phase::Started => Step::Update {
+                    partial: Arc::clone(&self.partial),
+                    event,
+                },
                 Phase::Unstarted | Phase::Terminated { .. } => Step::Ignore,
             },
         }
@@ -103,7 +119,10 @@ impl AssistantStream {
     /// The `done`/`error` terminal the provider delivered.
     pub(super) fn settle(self, terminal: Arc<AssistantMessage>) -> Settled {
         let start = self.owes_start().then(|| Arc::clone(&terminal));
-        Settled { start, end: terminal }
+        Settled {
+            start,
+            end: terminal,
+        }
     }
 
     /// Cancelled mid-stream. Pi returns the stream's own `result()` terminal on abort
@@ -138,7 +157,10 @@ impl AssistantStream {
     }
 
     fn owes_start(&self) -> bool {
-        matches!(self.phase, Phase::Unstarted | Phase::Terminated { owes_start: true })
+        matches!(
+            self.phase,
+            Phase::Unstarted | Phase::Terminated { owes_start: true }
+        )
     }
 }
 
@@ -150,23 +172,39 @@ mod tests {
     use cyrup_provider::faux::{faux_assistant_message, faux_text};
 
     fn model() -> ModelRef {
-        ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
+        ModelRef {
+            provider: "faux".into(),
+            api: Some("faux".into()),
+            model: "faux-1".into(),
+        }
     }
 
     fn partial(text: &str) -> Arc<AssistantMessage> {
-        Arc::new(faux_assistant_message(vec![faux_text(text)], StopReason::Pending))
+        Arc::new(faux_assistant_message(
+            vec![faux_text(text)],
+            StopReason::Pending,
+        ))
     }
 
     fn start(p: &Arc<AssistantMessage>) -> StreamEvent {
-        StreamEvent::Start { partial: Arc::clone(p) }
+        StreamEvent::Start {
+            partial: Arc::clone(p),
+        }
     }
 
     fn delta(p: &Arc<AssistantMessage>) -> StreamEvent {
-        StreamEvent::TextDelta { content_index: 0, delta: "x".into(), partial: Arc::clone(p) }
+        StreamEvent::TextDelta {
+            content_index: 0,
+            delta: "x".into(),
+            partial: Arc::clone(p),
+        }
     }
 
     fn done(text: &str) -> StreamEvent {
-        StreamEvent::terminal(faux_assistant_message(vec![faux_text(text)], StopReason::Stop))
+        StreamEvent::terminal(faux_assistant_message(
+            vec![faux_text(text)],
+            StopReason::Stop,
+        ))
     }
 
     fn texts(m: &AssistantMessage) -> Vec<String> {
@@ -200,8 +238,14 @@ mod tests {
             _ => panic!("done must be Terminal"),
         };
         let settled = acc.settle(Arc::clone(&terminal));
-        assert!(settled.start.is_none(), "a started stream owes no message_start");
-        assert!(Arc::ptr_eq(&settled.end, &terminal), "the provider's own Arc passes through");
+        assert!(
+            settled.start.is_none(),
+            "a started stream owes no message_start"
+        );
+        assert!(
+            Arc::ptr_eq(&settled.end, &terminal),
+            "the provider's own Arc passes through"
+        );
     }
 
     /// A terminal with no prior `Start` (pi's `!addedPartial` branch) owes a `message_start`, and
@@ -214,7 +258,9 @@ mod tests {
             _ => panic!("done must be Terminal"),
         };
         let settled = acc.settle(terminal);
-        let first = settled.start.expect("unstarted stream owes a message_start");
+        let first = settled
+            .start
+            .expect("unstarted stream owes a message_start");
         assert!(Arc::ptr_eq(&first, &settled.end));
         assert_eq!(settled.end.stop_reason, StopReason::Stop);
     }
@@ -224,13 +270,22 @@ mod tests {
     #[test]
     fn pre_start_block_event_is_ignored_but_an_abort_keeps_its_content() {
         let mut acc = AssistantStream::new(&model());
-        assert!(matches!(acc.on_event(delta(&partial("hello"))), Step::Ignore));
+        assert!(matches!(
+            acc.on_event(delta(&partial("hello"))),
+            Step::Ignore
+        ));
         let settled = acc.settle_aborted();
         assert_eq!(settled.end.stop_reason, StopReason::Aborted);
-        assert_eq!(settled.end.error_message.as_deref(), Some("Request was aborted"));
+        assert_eq!(
+            settled.end.error_message.as_deref(),
+            Some("Request was aborted")
+        );
         assert_eq!(texts(&settled.end), vec!["hello".to_string()]);
         let first = settled.start.expect("unstarted abort owes a message_start");
-        assert!(Arc::ptr_eq(&first, &settled.end), "the start payload is the settled message");
+        assert!(
+            Arc::ptr_eq(&first, &settled.end),
+            "the start payload is the settled message"
+        );
     }
 
     /// After `Start`, an abort owes no `message_start` and stamps only the terminal reason.
@@ -270,7 +325,10 @@ mod tests {
     fn second_start_is_ignored() {
         let mut acc = AssistantStream::new(&model());
         assert!(matches!(acc.on_event(start(&partial(""))), Step::Start(_)));
-        assert!(matches!(acc.on_event(start(&partial("again"))), Step::Ignore));
+        assert!(matches!(
+            acc.on_event(start(&partial("again"))),
+            Step::Ignore
+        ));
     }
 
     /// pi returns on the terminal: whatever a provider sends afterwards can neither emit a stray
@@ -280,9 +338,19 @@ mod tests {
         let mut acc = AssistantStream::new(&model());
         let _ = acc.on_event(start(&partial("first")));
         assert!(matches!(acc.on_event(done("final")), Step::Terminal(_)));
-        assert!(matches!(acc.on_event(delta(&partial("LEAK"))), Step::Ignore));
-        assert!(matches!(acc.on_event(start(&partial("LEAK"))), Step::Ignore));
+        assert!(matches!(
+            acc.on_event(delta(&partial("LEAK"))),
+            Step::Ignore
+        ));
+        assert!(matches!(
+            acc.on_event(start(&partial("LEAK"))),
+            Step::Ignore
+        ));
         let settled = acc.settle_aborted();
-        assert_eq!(texts(&settled.end), vec!["first".to_string()], "the stray never landed");
+        assert_eq!(
+            texts(&settled.end),
+            vec!["first".to_string()],
+            "the stray never landed"
+        );
     }
 }

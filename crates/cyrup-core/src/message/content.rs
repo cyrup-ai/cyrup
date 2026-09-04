@@ -13,7 +13,11 @@ use crate::shared_str::SharedStr;
 /// REJECTED on deserialize, exactly as Pi's typed unions reject it. Producers still build the right
 /// variants by construction.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Content {
     Text {
         text: SharedStr,
@@ -55,7 +59,10 @@ impl serde::Serialize for Content {
     {
         use serde::ser::SerializeStruct as _;
         match self {
-            Content::Text { text, text_signature } => {
+            Content::Text {
+                text,
+                text_signature,
+            } => {
                 let mut st = serializer
                     .serialize_struct("Content", 2 + usize::from(text_signature.is_some()))?;
                 st.serialize_field("type", "text")?;
@@ -66,9 +73,12 @@ impl serde::Serialize for Content {
                 }
                 st.end()
             }
-            Content::Thinking { thinking, thinking_signature, redacted } => {
-                let len =
-                    2 + usize::from(thinking_signature.is_some()) + usize::from(*redacted);
+            Content::Thinking {
+                thinking,
+                thinking_signature,
+                redacted,
+            } => {
+                let len = 2 + usize::from(thinking_signature.is_some()) + usize::from(*redacted);
                 let mut st = serializer.serialize_struct("Content", len)?;
                 st.serialize_field("type", "thinking")?;
                 st.serialize_field("thinking", thinking)?;
@@ -100,14 +110,24 @@ impl serde::Serialize for Content {
 
 impl Content {
     pub fn text(s: impl Into<SharedStr>) -> Self {
-        Content::Text { text: s.into(), text_signature: None }
+        Content::Text {
+            text: s.into(),
+            text_signature: None,
+        }
     }
     pub fn thinking(s: impl Into<SharedStr>) -> Self {
-        Content::Thinking { thinking: s.into(), thinking_signature: None, redacted: false }
+        Content::Thinking {
+            thinking: s.into(),
+            thinking_signature: None,
+            redacted: false,
+        }
     }
     /// A text block carrying a (legacy or [`crate::TextSignatureV1`]-encoded) signature.
     pub fn text_with_signature(s: impl Into<SharedStr>, signature: impl Into<String>) -> Self {
-        Content::Text { text: s.into(), text_signature: Some(signature.into()) }
+        Content::Text {
+            text: s.into(),
+            text_signature: Some(signature.into()),
+        }
     }
 }
 
@@ -224,7 +244,10 @@ mod tests {
         };
         let rv = serde_json::to_value(&redacted).expect("serialize");
         assert_eq!(rv["redacted"], true);
-        assert_eq!(serde_json::from_value::<Content>(rv).expect("deserialize"), redacted);
+        assert_eq!(
+            serde_json::from_value::<Content>(rv).expect("deserialize"),
+            redacted
+        );
     }
 
     #[test]
@@ -239,15 +262,25 @@ mod tests {
         };
         let c = Content::ToolCall(tc);
         let s = serde_json::to_string(&c).expect("serialize");
-        assert_eq!(s.matches("\"type\"").count(), 1, "no duplicate type key: {s}");
-        assert!(s.starts_with("{\"type\":\"toolCall\""), "type emitted first: {s}");
+        assert_eq!(
+            s.matches("\"type\"").count(),
+            1,
+            "no duplicate type key: {s}"
+        );
+        assert!(
+            s.starts_with("{\"type\":\"toolCall\""),
+            "type emitted first: {s}"
+        );
         let v = serde_json::to_value(&c).expect("serialize");
         assert_eq!(v["type"], "toolCall");
         assert_eq!(v["id"], "t");
         assert_eq!(v["name"], "n");
         assert_eq!(v["thoughtSignature"], "g");
         // Round-trip (req 4): Pi input (with `type` present) deserializes back to an equal value.
-        assert_eq!(serde_json::from_value::<Content>(v).expect("deserialize"), c);
+        assert_eq!(
+            serde_json::from_value::<Content>(v).expect("deserialize"),
+            c
+        );
     }
 
     #[test]
@@ -255,7 +288,13 @@ mod tests {
         // Pi-interop: a user message whose `content` is a bare JSON string.
         let json = serde_json::json!({ "role": "user", "content": "hello", "timestamp": 7 });
         let m: Message = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(m, Message::User { content: vec![Content::text("hello")], timestamp: 7 });
+        assert_eq!(
+            m,
+            Message::User {
+                content: vec![Content::text("hello")],
+                timestamp: 7
+            }
+        );
         // The array form still deserializes.
         let json2 = serde_json::json!({
             "role": "user",
@@ -263,7 +302,13 @@ mod tests {
             "timestamp": 0,
         });
         let m2: Message = serde_json::from_value(json2).expect("deserialize");
-        assert_eq!(m2, Message::User { content: vec![Content::text("hi")], timestamp: 0 });
+        assert_eq!(
+            m2,
+            Message::User {
+                content: vec![Content::text("hi")],
+                timestamp: 0
+            }
+        );
     }
 
     #[test]
@@ -279,7 +324,9 @@ mod tests {
         });
         let m = serde_json::from_value::<Message>(json).expect("Pi accepts an off-union block");
         match m {
-            Message::Assistant(a) => assert!(matches!(a.content.as_slice(), [Content::Image { .. }])),
+            Message::Assistant(a) => {
+                assert!(matches!(a.content.as_slice(), [Content::Image { .. }]))
+            }
             other => panic!("expected assistant, got {other:?}"),
         }
     }

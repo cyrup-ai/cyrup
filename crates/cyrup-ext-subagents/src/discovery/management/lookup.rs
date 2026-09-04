@@ -9,8 +9,8 @@ use std::path::Path;
 
 use super::super::types::{AgentDefinition, AgentSource, ChainDefinition, ChainStepConfig};
 use super::super::{AgentDiscoveryResult, AgentNameResolution, resolve_agent_name};
-use super::helpers::{disambiguation_scope, sanitize_name, source_str};
 use super::ManagementOutcome;
+use super::helpers::{disambiguation_scope, sanitize_name, source_str};
 
 /// pi `findAgents` (`agent-management.ts:114-126` @ v0.43.0): ALIAS-AWARE lookup over the management
 /// (disabled-inclusive) view, optionally narrowed to one scope, sorted by source label.
@@ -49,15 +49,18 @@ pub(crate) fn find_agents(
 
     let mut matches: Vec<AgentDefinition> = if let Some(agent) = resolved.agent() {
         let canonical = agent.name.clone();
-        scoped.iter().filter(|a| a.name == canonical).cloned().collect()
+        scoped
+            .iter()
+            .filter(|a| a.name == canonical)
+            .cloned()
+            .collect()
     } else {
         scoped
             .iter()
             .filter(|a| {
                 let one = std::slice::from_ref(*a);
                 resolve_agent_name(raw, one).agent().is_some()
-                    || (sanitized != raw
-                        && resolve_agent_name(&sanitized, one).agent().is_some())
+                    || (sanitized != raw && resolve_agent_name(&sanitized, one).agent().is_some())
             })
             .cloned()
             .collect()
@@ -73,7 +76,12 @@ pub(crate) fn find_agents(
 pub(crate) fn distinct_agent_names<'a>(
     matches: impl IntoIterator<Item = &'a AgentDefinition>,
 ) -> Vec<String> {
-    matches.into_iter().map(|a| a.name.clone()).collect::<BTreeSet<_>>().into_iter().collect()
+    matches
+        .into_iter()
+        .map(|a| a.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// pi `findChains` (`agent-management.ts:128-134`).
@@ -137,7 +145,10 @@ pub(crate) fn name_exists_in_scope(
 
 /// pi `unknownChainAgents` (`agent-management.ts:169-174`): step agents that resolve to no known
 /// agent name, unique and sorted. Dynamic (agent-less) steps are skipped.
-pub(crate) fn unknown_chain_agents(d: &AgentDiscoveryResult, steps: &[ChainStepConfig]) -> Vec<String> {
+pub(crate) fn unknown_chain_agents(
+    d: &AgentDiscoveryResult,
+    steps: &[ChainStepConfig],
+) -> Vec<String> {
     // pi v0.43.0 (`agent-management.ts:169-174`) replaced the `new Set(allAgents(d).map(a => a.name))`
     // membership test with `!resolveAgentName(agentName, agents).agent`, so a step that names an
     // ALIAS is known and no longer warns. An ambiguous name yields no `.agent` and is therefore
@@ -264,10 +275,9 @@ pub(crate) fn resolve_target<T: MutableTarget>(
         )));
     }
     if mutable.len() == 1 {
-        return mutable
-            .into_iter()
-            .next()
-            .ok_or_else(|| ManagementOutcome::err("internal error: empty mutable set".to_string()));
+        return mutable.into_iter().next().ok_or_else(|| {
+            ManagementOutcome::err("internal error: empty mutable set".to_string())
+        });
     }
     let Some(scope) = disambiguation_scope(scope_hint_raw) else {
         let paths: Vec<String> = mutable
@@ -281,7 +291,10 @@ pub(crate) fn resolve_target<T: MutableTarget>(
             paths.join("\n")
         )));
     };
-    let scoped: Vec<T> = mutable.into_iter().filter(|m| m.source() == scope).collect();
+    let scoped: Vec<T> = mutable
+        .into_iter()
+        .filter(|m| m.source() == scope)
+        .collect();
     if scoped.is_empty() {
         return Err(ManagementOutcome::err(format!(
             "{} '{}' not found in scope '{}'.",
@@ -315,8 +328,8 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use super::*;
     use super::super::test_support::sample_agent;
+    use super::*;
 
     #[test]
     fn resolve_target_rejects_package_source_with_read_only_message() {
@@ -329,7 +342,9 @@ mod tests {
             .expect_err("a package-sourced target must be rejected as read-only");
         assert!(outcome.is_error);
         assert!(
-            outcome.text.contains("Agent 'acme.tool' is read-only and cannot be modified"),
+            outcome
+                .text
+                .contains("Agent 'acme.tool' is read-only and cannot be modified"),
             "{}",
             outcome.text
         );

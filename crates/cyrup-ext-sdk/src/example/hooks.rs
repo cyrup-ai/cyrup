@@ -18,21 +18,26 @@ pub(super) fn install(api: &mut ExtensionApi) {
         // deliberately NOT command-tier-gated host-side.
         if ev.name == "abortme" {
             match ctx.abort() {
-                Ok(()) => ctx.ui().notify("demo: abort requested from a tool_call handler"),
+                Ok(()) => ctx
+                    .ui()
+                    .notify("demo: abort requested from a tool_call handler"),
                 Err(e) => ctx.ui().notify(&format!("demo: abort rejected: {e}")),
             }
             return Outcome::block("aborting the run");
         }
         if ev.name == "shutdownme" {
             match ctx.shutdown() {
-                Ok(()) => ctx.ui().notify("demo: shutdown requested from a tool_call handler"),
+                Ok(()) => ctx
+                    .ui()
+                    .notify("demo: shutdown requested from a tool_call handler"),
                 Err(e) => ctx.ui().notify(&format!("demo: shutdown rejected: {e}")),
             }
             return Outcome::block("shutting down");
         }
         if ev.name == "bash" {
             // An `error`-severity notification (Pi `notify(msg, "error")`, types.ts:142 @v0.83.0).
-            ctx.ui().notify_with("permission-gate: blocked a bash call", NotifyKind::Error);
+            ctx.ui()
+                .notify_with("permission-gate: blocked a bash call", NotifyKind::Error);
             Outcome::block("bash is disabled by the demo extension")
         } else {
             Outcome::noop()
@@ -51,9 +56,13 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // Deriving the patch from the received value is what makes it a read proof rather than a
     // constant the guest could have invented.
     api.on_tool_result(|ev, ctx| {
-        let received =
-            ev.usage.as_ref().map(|u| u.to_string()).unwrap_or_else(|| "none".to_string());
-        ctx.ui().notify(&format!("demo: tool_result {} usage={received}", ev.name));
+        let received = ev
+            .usage
+            .as_ref()
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        ctx.ui()
+            .notify(&format!("demo: tool_result {} usage={received}", ev.name));
         match ev.usage.clone() {
             Some(mut usage) if ev.name == "usage_probe" => {
                 let doubled = usage.get("output").and_then(|v| v.as_u64()).unwrap_or(0) * 2;
@@ -93,7 +102,8 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // The host must re-materialize the descriptor into an EXECUTABLE handle; before EXT-004 the
     // wrapping happened once right after `init`, so this tool could never be called.
     api.on_session_start(|ev, ctx| {
-        ctx.ui().notify(&format!("demo: session_start ({})", ev.reason));
+        ctx.ui()
+            .notify(&format!("demo: session_start ({})", ev.reason));
         ctx.register_tool(
             ToolDescriptor::new(
                 "demo_late",
@@ -105,7 +115,11 @@ pub(super) fn install(api: &mut ExtensionApi) {
             )
             .description("Registered after init, from a session_start handler (demo)."),
             |call: ToolCall| {
-                let text = call.params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let text = call
+                    .params
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 Ok(ToolOutput::text(format!("late: {text}")))
             },
         );
@@ -118,7 +132,9 @@ pub(super) fn install(api: &mut ExtensionApi) {
     api.on_before_agent_start(|ev, _ctx| {
         if ev.prompt == "go" {
             Outcome::before_agent_start(crate::BeforeAgentStartResult {
-                message: Some(json!({ "role": "user", "content": "injected by demo", "timestamp": 0 })),
+                message: Some(
+                    json!({ "role": "user", "content": "injected by demo", "timestamp": 0 }),
+                ),
                 system_prompt: Some(format!("INJECTED:{}", ev.system_prompt)),
             })
         } else {
@@ -155,7 +171,9 @@ pub(super) fn install(api: &mut ExtensionApi) {
                 .and_then(|t| t.as_str())
         });
         if role == Some("user") && text == Some("redact me") {
-            Outcome::replace_message(json!({ "role": "user", "content": "[redacted]", "timestamp": 0 }))
+            Outcome::replace_message(
+                json!({ "role": "user", "content": "[redacted]", "timestamp": 0 }),
+            )
         } else if role == Some("user") && text == Some("gap11switch") {
             // GAP-11 INDEPENDENT VERIFICATION: call BOTH set_model and set_thinking_level from this
             // EVENT handler (on_message_end fires DURING the run, while the wasm store is held). Pi
@@ -168,11 +186,17 @@ pub(super) fn install(api: &mut ExtensionApi) {
             // for the host's serde_json parse (live.rs `set_model`). The WIT import returns void
             // — fire-and-forget — so `Ok(())` means only that the op reached the host; the guest
             // observes the EFFECT on the subsequent turn.
-            let _ = ctx.models().set_model(json!({ "provider": "faux", "model": "faux-2" }));
+            let _ = ctx
+                .models()
+                .set_model(json!({ "provider": "faux", "model": "faux-2" }));
             ctx.ui().notify("gap11: set_model called from message_end");
             match ctx.models().set_thinking_level("high") {
-                Ok(()) => ctx.ui().notify("gap11: set_thinking_level ok from message_end"),
-                Err(e) => ctx.ui().notify(&format!("gap11: set_thinking_level err from message_end: {e}")),
+                Ok(()) => ctx
+                    .ui()
+                    .notify("gap11: set_thinking_level ok from message_end"),
+                Err(e) => ctx.ui().notify(&format!(
+                    "gap11: set_thinking_level err from message_end: {e}"
+                )),
             }
             Outcome::noop()
         } else {
@@ -187,10 +211,12 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // the old command-tier gate guarded against: if the drain point were not store-free, this re-entry
     // would deadlock/hang. The handler notifies so a test can prove the re-emit reached the guest.
     api.on_thinking_level_select(|ev, ctx| {
-        ctx.ui().notify(&format!("tls re-emit reached guest: {}", ev.level));
+        ctx.ui()
+            .notify(&format!("tls re-emit reached guest: {}", ev.level));
     });
     api.on_model_select(|ev, ctx| {
-        ctx.ui().notify(&format!("model_select re-emit reached guest: {}", ev.model));
+        ctx.ui()
+            .notify(&format!("model_select re-emit reached guest: {}", ev.model));
     });
 
     // before_provider_request (gap-08 #4): tag the outbound payload — Pi replaces the payload
@@ -232,7 +258,11 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // session_before_tree (L4 gap #5): READ the TreePreparation and override the branch-summary label
     // (Pi `SessionBeforeTreeResult.label`). Proves the typed tree preparation crossed the seam.
     api.on_session_before_tree(|ev, _ctx| {
-        let target = ev.preparation.get("targetId").and_then(|v| v.as_str()).unwrap_or("?");
+        let target = ev
+            .preparation
+            .get("targetId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         Outcome::tree_override(crate::SessionBeforeTreeResult {
             label: Some(format!("demo-tree-label[{target}]")),
             ..Default::default()

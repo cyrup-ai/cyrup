@@ -105,7 +105,6 @@ use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-
 use crate::dirs::McpDirs;
 use crate::errors::{McpError, McpResult};
 
@@ -127,8 +126,12 @@ pub const REPOPROMPT_APP_BINARY: &str =
 
 /// The four markers [`find_project_root`] walks **up** for, in `findProjectRoot`'s own test order.
 /// Upstream's fourth is `.pi`; it is renamed with the rest of the project override directory.
-pub const PROJECT_ROOT_MARKERS: [&str; 4] =
-    [".git", "package.json", PROJECT_CONFIG_NAME, PROJECT_OVERRIDE_DIR];
+pub const PROJECT_ROOT_MARKERS: [&str; 4] = [
+    ".git",
+    "package.json",
+    PROJECT_CONFIG_NAME,
+    PROJECT_OVERRIDE_DIR,
+];
 
 // ===================================================================================================
 // 2 · `ImportKind` — the seven host-config families (MCP-056)
@@ -191,7 +194,9 @@ impl ImportKind {
     /// filter `expandImports` applies implicitly (`IMPORT_PATHS[kind] ?? []` yields no candidates).
     #[must_use]
     pub fn parse(raw: &str) -> Option<ImportKind> {
-        ImportKind::ALL.into_iter().find(|kind| kind.as_str() == raw)
+        ImportKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == raw)
     }
 
     /// `extractServers`' per-family server key. `None` means "the family reads a fixed key that has
@@ -318,7 +323,11 @@ impl RawJson {
             .iter()
             .filter_map(|(key, value)| value.as_str().map(|text| (key.clone(), text.to_string())))
             .collect();
-        if record.is_empty() { None } else { Some(record) }
+        if record.is_empty() {
+            None
+        } else {
+            Some(record)
+        }
     }
 }
 
@@ -540,7 +549,11 @@ impl StringRecord {
                 );
             }
         }
-        Self { raw, values, unhashable }
+        Self {
+            raw,
+            values,
+            unhashable,
+        }
     }
 
     /// The string-valued members. Same map the field used to be.
@@ -597,7 +610,9 @@ impl<'de> Deserialize<'de> for StringRecord {
     /// `Object.entries("abc")`, i.e. `{"0":"a","1":"b","2":"c"}` — a fifth, separate divergence
     /// that is not this change's business and is recorded in `13c-mcp-servers.md`'s MCP-144 notes.)
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Self::from_raw(BTreeMap::<String, RawJson>::deserialize(deserializer)?))
+        Ok(Self::from_raw(BTreeMap::<String, RawJson>::deserialize(
+            deserializer,
+        )?))
     }
 }
 
@@ -656,7 +671,9 @@ impl McpConfig {
     /// `Object.entries(config.mcpServers).filter(([, d]) => !isServerDisabled(d))` — the enabled
     /// servers, in file order.
     pub fn enabled_servers(&self) -> impl Iterator<Item = (&String, &ServerEntry)> {
-        self.mcp_servers.iter().filter(|(_, entry)| !entry.is_disabled())
+        self.mcp_servers
+            .iter()
+            .filter(|(_, entry)| !entry.is_disabled())
     }
 
     /// The `settings` block, or an all-defaults one. Every accessor on [`McpSettings`] encodes its
@@ -699,10 +716,18 @@ impl McpConfig {
 pub struct HttpRequestHeadersCommand {
     /// The executable, `interpolateEnvVars`'d. Spawned directly — **not** through a shell, unlike
     /// the `!`-prefixed `headers` secret form.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub command: Option<String>,
     /// Arguments, each `interpolateEnvVars`'d.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub args: Option<Vec<String>>,
     /// Environment overrides layered over the adapter's own environment, each value
     /// `interpolateEnvVars`'d. No `!`-secret resolution: upstream uses `interpolateEnvVars`, not
@@ -713,11 +738,19 @@ pub struct HttpRequestHeadersCommand {
     /// member here throws exactly as one in the outer map does. The nested block is not a laxer map
     /// than the outer one, and `cyrup_ext_subagents::exec::mcp_direct_tools` already treats it that
     /// way.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub env: Option<StringRecord>,
     /// Per-invocation timeout in **milliseconds**; defaults to `10_000` and must be an integer in
     /// `1..=60000`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub timeout_ms: Option<f64>,
 }
 
@@ -737,10 +770,18 @@ pub struct HttpRequestHeadersCommand {
 pub struct ServerEntry {
     /// stdio transport: the executable. Exactly one of `command` / `url` must be set, checked at
     /// **connect** time.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub command: Option<String>,
     /// Arguments, each `interpolateEnvVars`'d at connect time.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub args: Option<Vec<String>>,
     /// Environment, layered over the full `process.env` and passed through
     /// `resolveCommandSecretsRecord` — unless [`Self::literal_env`] is set.
@@ -749,73 +790,141 @@ pub struct ServerEntry {
     /// upstream's `computeServerHash` throw, and dropping the whole map (which is all `lenient`
     /// could do over a plain map) made this crate call an entry cache-valid that the in-tree reader
     /// called invalid. See [`StringRecord`] for the measurement and the consequence.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub env: Option<StringRecord>,
     /// Working directory, `resolveConfigPath`'d (interpolation + `~`); falls back to the session
     /// cwd.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cwd: Option<String>,
     /// HTTP transport: the endpoint. Passed through `resolveServerUrl`, which **throws** on a
     /// non-string value, a missing interpolation variable, or an invalid URL after interpolation.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub url: Option<String>,
     /// Extra request headers, `!`-secret-resolved and interpolated. Part of the
     /// `computeServerHash` pre-image, and one of `URL_BOUND_AUTH_FIELDS`.
     ///
     /// A [`StringRecord`] for the same reason [`Self::env`] is — `computeServerHash` runs both
     /// through the same `interpolateEnvRecord` (`metadata-cache.ts:90` and `:93`).
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub headers: Option<StringRecord>,
     /// Add or replace HTTP headers by running a trusted command **for each request**
     /// (`types.ts:383`, v2.26.0). Part of the `computeServerHash` pre-image, and one of
     /// `URL_BOUND_AUTH_FIELDS` — it signs requests to *one* endpoint, so it must not follow a
     /// higher-precedence source that only repointed `url`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub request_headers_command: Option<HttpRequestHeadersCommand>,
     /// `"oauth" | "bearer" | false`. **Absent** is not `false`: it means "auto-detect OAuth for a
     /// `url` server".
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auth: Option<AuthMode>,
     /// A literal bearer token. Prefer [`Self::bearer_token_env`]. One of `URL_BOUND_AUTH_FIELDS`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub bearer_token: Option<String>,
     /// The environment variable holding the bearer token. One of `URL_BOUND_AUTH_FIELDS`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub bearer_token_env: Option<String>,
     /// OAuth client configuration, or the literal `false` to disable it. Untagged: only `false` is
     /// legal on the boolean arm, and `oauth: true` is *tolerated* exactly as TypeScript's
     /// structural cast tolerates it — the value simply never satisfies `oauth !== false`, which is
     /// also why `oauth: true` is **not** protected from URL-bound stripping.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub oauth: Option<OAuthSetting>,
     /// When the server's process is spawned and how long it lives. Defaults to
     /// [`ServerLifecycle::Lazy`].
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub lifecycle: Option<ServerLifecycle>,
     /// Idle timeout in **minutes**, overriding the global. `0` disables the idle close.
     /// `eager` and `lazy-keep-alive` with no explicit value are forced to `0` by `init.ts`'s
     /// `persistsAfterFirstSpawn` (MCP-020).
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub idle_timeout: Option<f64>,
     /// Per-request timeout in **milliseconds**. Normalised by `normalizeRequestTimeoutMs`: must be
     /// finite and `> 0`, else it falls through to the global setting.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub request_timeout_ms: Option<f64>,
     /// Whether this server's resources become `read_*` direct tools. Tested `!== false`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expose_resources: Option<bool>,
     /// `true` / `false` / an explicit tool-name list. A per-server value that is merely *present*
     /// beats `settings.directTools` — the test is `!== undefined`, not truthiness.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub direct_tools: Option<BoolOrList>,
     /// Overrides `settings.toolPrefix` for this server (`resolveToolPrefix`).
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tool_prefix: Option<ToolPrefix>,
     /// Glob-or-exact allowlist, applied **before** [`Self::exclude_tools`].
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub include_tools: Option<Vec<String>>,
     /// Glob-or-exact denylist, applied after the allowlist.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub exclude_tools: Option<Vec<String>>,
     /// Extra ranking keywords per tool. Ranking-only: they never appear in a schema, in `describe`
     /// output, or in the metadata cache.
@@ -827,41 +936,77 @@ pub struct ServerEntry {
     /// is assembled in a different order than upstream produces — and that order is observable, it
     /// is the order keywords are scored and reported in. Same family as the `mcp_servers` ordering
     /// trap this module already documents.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub search_keywords: Option<IndexMap<String, Vec<String>>>,
     /// Which of this server's tools skip the approval prompt. Present beats the global.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub approve_tools: Option<BoolOrList>,
     /// `true` ⇒ the child's stderr is **inherited** (visible in the terminal); `false`/absent ⇒
     /// piped. rmcp's `TokioChildProcessBuilder` defaults to `Stdio::inherit()`, so the port sets
     /// `.stderr(Stdio::piped())` on the `false` arm rather than the other way round.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub debug: Option<bool>,
     /// Per-server trace override: `definition.trace ?? settings.trace?.enabled === true`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub trace: Option<bool>,
     /// Which HTTP transport to use. **Cut 1** removes the `sse` value — rmcp 3.1.2 ships no SSE
     /// *client* transport at all — so the field survives with one legal value and an `sse` entry is
     /// rejected at config load with a named diagnostic. Absent means streamable-HTTP with the
     /// upstream SSE fallback, which post-cut is simply streamable-HTTP.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub http_transport: Option<HttpTransport>,
     /// A directory created (`recursive`) before the child spawns. Set only by
     /// [`crate::agent_plugin`], which uses it as `${PLUGIN_DATA}`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub plugin_data_dir: Option<String>,
     /// `true` ⇒ [`Self::env`] values are used **verbatim**: no `!`-secret resolution and no
     /// interpolation. Set only by [`crate::agent_plugin`], and it is half of what keeps a plugin
     /// from reading the user's environment.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub literal_env: Option<bool>,
     /// Protocol-revision negotiation. `undefined` and `"legacy"` are **byte-identical** on the
     /// wire — both send no `versionNegotiation` — and any other value throws
     /// `` `Invalid MCP protocolVersion: ${…}` `` at connect time.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub protocol_version: Option<ProtocolVersionSetting>,
     /// Only the **literal boolean `true`** disables a server; see [`Self::is_disabled`].
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub disabled: Option<bool>,
 }
 
@@ -922,93 +1067,185 @@ impl ServerEntry {
 #[serde(rename_all = "camelCase")]
 pub struct McpSettings {
     /// Default `"server"`. How every direct tool is named.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tool_prefix: Option<ToolPrefix>,
     /// Default `true`. `=== false` swaps the footer's `"🔌 MCP: "` prefix for `"MCP: "` — the
     /// emoji is `U+1F50C ELECTRIC PLUG` followed by `U+0020`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub show_status_icon: Option<bool>,
     /// Default `"full"`. `"off"` clears the footer segment entirely.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mcp_footer_status: Option<FooterStatus>,
     /// Default `true`, tested `!== false`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub notify_on_startup_connect: Option<bool>,
     /// Default `"off"`, via an explicit three-way test rather than a `??`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub host_config_discovery: Option<HostConfigDiscovery>,
     /// Directories handed to [`crate::agent_plugin`].
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub agent_plugin_paths: Option<Vec<String>>,
     /// Global idle timeout in **minutes**. Default `10`, via `typeof === "number" ? v : 10` — so an
     /// explicit `0` is honoured and disables the idle close.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub idle_timeout: Option<f64>,
     /// Global per-request timeout in **milliseconds**. Must be finite **and `> 0`**, else the SDK
     /// default stands.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub request_timeout_ms: Option<f64>,
     /// Default `false`. Per-server `directTools` that is merely *present* wins over this.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub direct_tools: Option<bool>,
     /// Default `true`, tested `!== false` (`types.ts:509`, `direct-tools.ts:227`; upstream
     /// `76a4ea3`, issue #358). Silences the "75+ direct tools resolved" advisory and **nothing
     /// else** — it is not a cap and never drops a spec, so the user who deliberately registered 75
     /// tools keeps all 75 and just stops being told about it once per resolve.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub warn_on_large_direct_tools: Option<bool>,
     /// Default `"compact"`, via `=== "boxed" ? "boxed" : "compact"`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tool_result_rendering: Option<ToolResultRendering>,
     /// A **whitelist** of `1 | 2 | 3`, not a clamp: anything else falls back to the shell default
     /// (1 compact, 3 boxed).
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub collapsed_result_lines: Option<u8>,
     /// Global approval policy; a present per-server value wins.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub approve_tools: Option<BoolOrList>,
     /// Default `false`, tested `!== true` — the proxy tool survives unless this is literally
     /// `true`. **If HA-1 (late tool registration) is not built, this must be treated as
     /// unsupported**: on a cold cache the proxy tool is the *only* model-facing surface.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub disable_proxy_tool: Option<bool>,
     /// Default `false`, tested `=== true`. Freezes the direct-tool set after the first sync so a
     /// reconnect never rebuilds the system prompt — which is what keeps the provider's prompt-cache
     /// prefix valid across reconnects.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub freeze_direct_tools: Option<bool>,
     /// Default `false`, tested `!== true` ⇒ skip. Whether an unauthenticated call may start an
     /// OAuth flow by itself.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auto_auth: Option<bool>,
     /// Sampling is wired only when `!== false && (has_ui || sampling_auto_approve)`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sampling: Option<bool>,
     /// Default `false`, tested `=== true`. Also the gate that lets sampling work with no UI.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sampling_auto_approve: Option<bool>,
     /// Elicitation is wired only when `!== false && has_ui`; the URL mode additionally requires
     /// TUI mode.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub elicitation: Option<bool>,
     /// `true` / `false` / explicit limits. Resolution is
     /// `enabled = envKillSwitch("MCP_OUTPUT_GUARD") ?? configured !== false` — **the env kill
     /// switch outranks the config in both directions**, so `MCP_OUTPUT_GUARD=1` re-enables a config
     /// that said `false`. Defaults: 51200 bytes / 2000 lines / 16384 detail bytes.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub output_guard: Option<OutputGuardSetting>,
     /// Protocol tracing. Disabled by default; the default destination is
     /// `<cwd>/.cyrup/mcp-traces/mcp-<ts>-<rand>.jsonl` (upstream writes `.pi/`).
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub trace: Option<TraceSettings>,
     /// Overrides the built-in "server requires OAuth" text. Formatted with
     /// `template.replaceAll("${server}", serverName)` — **every** occurrence, not the first.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auth_required_message: Option<String>,
     /// OAuth storage root. `resolveConfiguredOAuthDir` **throws** `settings.oauthDir must be a
     /// string` on a non-string, treats blank as absent, and otherwise resolves it against the
     /// session cwd. `$MCP_OAUTH_DIR` outranks it.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub oauth_dir: Option<String>,
 }
 
@@ -1105,7 +1342,8 @@ impl McpSettings {
     /// one into `None`.
     #[must_use]
     pub fn host_config_discovery(&self) -> HostConfigDiscovery {
-        self.host_config_discovery.unwrap_or(HostConfigDiscovery::Off)
+        self.host_config_discovery
+            .unwrap_or(HostConfigDiscovery::Off)
     }
 
     /// `settings?.agentPluginPaths ?? []`.
@@ -1118,14 +1356,17 @@ impl McpSettings {
     /// honoured** and means "never idle out". A clamp here would silently re-enable the sweep.
     #[must_use]
     pub fn idle_timeout_minutes(&self) -> f64 {
-        self.idle_timeout.filter(|value| value.is_finite()).unwrap_or(DEFAULT_IDLE_TIMEOUT_MINUTES)
+        self.idle_timeout
+            .filter(|value| value.is_finite())
+            .unwrap_or(DEFAULT_IDLE_TIMEOUT_MINUTES)
     }
 
     /// `normalizeRequestTimeoutMs` — finite **and `> 0`**, else `undefined` (fall through to the
     /// SDK default).
     #[must_use]
     pub fn request_timeout_ms(&self) -> Option<f64> {
-        self.request_timeout_ms.filter(|value| value.is_finite() && *value > 0.0)
+        self.request_timeout_ms
+            .filter(|value| value.is_finite() && *value > 0.0)
     }
 
     /// `Boolean(settings?.directTools)` — truthiness, not presence. A per-server value that merely
@@ -1214,15 +1455,22 @@ impl McpSettings {
     /// test can inject it. **The kill switch outranks the config in both directions.**
     #[must_use]
     pub fn output_guard(&self, env: Option<&str>) -> ResolvedOutputGuard {
-        let configured_enabled = !matches!(self.output_guard, Some(OutputGuardSetting::Enabled(false)));
+        let configured_enabled =
+            !matches!(self.output_guard, Some(OutputGuardSetting::Enabled(false)));
         let limits = match &self.output_guard {
             Some(OutputGuardSetting::Limits(limits)) => Some(limits),
             _ => None,
         };
         ResolvedOutputGuard {
             enabled: env_kill_switch(env).unwrap_or(configured_enabled),
-            max_bytes: positive_int(limits.and_then(|l| l.max_bytes), DEFAULT_MCP_OUTPUT_MAX_BYTES),
-            max_lines: positive_int(limits.and_then(|l| l.max_lines), DEFAULT_MCP_OUTPUT_MAX_LINES),
+            max_bytes: positive_int(
+                limits.and_then(|l| l.max_bytes),
+                DEFAULT_MCP_OUTPUT_MAX_BYTES,
+            ),
+            max_lines: positive_int(
+                limits.and_then(|l| l.max_lines),
+                DEFAULT_MCP_OUTPUT_MAX_LINES,
+            ),
             details_max_bytes: positive_int(
                 limits.and_then(|l| l.details_max_bytes),
                 DEFAULT_MCP_DETAILS_MAX_BYTES,
@@ -1236,7 +1484,10 @@ impl McpSettings {
     /// [`crate::trace::TraceWriter`].
     #[must_use]
     pub fn trace_max_bytes(&self) -> u64 {
-        positive_int(self.trace.as_ref().and_then(|t| t.max_bytes), DEFAULT_MCP_TRACE_MAX_BYTES)
+        positive_int(
+            self.trace.as_ref().and_then(|t| t.max_bytes),
+            DEFAULT_MCP_TRACE_MAX_BYTES,
+        )
     }
 
     /// `boundedPositiveInteger(settings.trace?.maxEvents, DEFAULT_MCP_TRACE_MAX_EVENTS)`.
@@ -1245,7 +1496,10 @@ impl McpSettings {
     /// [`crate::trace::TraceWriter`].
     #[must_use]
     pub fn trace_max_events(&self) -> u64 {
-        positive_int(self.trace.as_ref().and_then(|t| t.max_events), DEFAULT_MCP_TRACE_MAX_EVENTS)
+        positive_int(
+            self.trace.as_ref().and_then(|t| t.max_events),
+            DEFAULT_MCP_TRACE_MAX_EVENTS,
+        )
     }
 
     /// `settings?.authRequiredMessage` — the template, not the formatted text. Formatting is
@@ -1295,7 +1549,10 @@ impl ServerLifecycle {
     /// explicit `idleTimeout` gets **0**, i.e. never idles out (MCP-020).
     #[must_use]
     pub fn persists_after_first_spawn(self) -> bool {
-        matches!(self, ServerLifecycle::Eager | ServerLifecycle::LazyKeepAlive)
+        matches!(
+            self,
+            ServerLifecycle::Eager | ServerLifecycle::LazyKeepAlive
+        )
     }
 
     /// Whether the startup pass should connect this server before the first prompt.
@@ -1386,7 +1643,13 @@ fn js_string(value: &RawJson) -> String {
         // `Array.prototype.join(",")`, in which `null` and `undefined` render as the empty string.
         RawJson::Array(items) => items
             .iter()
-            .map(|item| if matches!(item, RawJson::Null) { String::new() } else { js_string(item) })
+            .map(|item| {
+                if matches!(item, RawJson::Null) {
+                    String::new()
+                } else {
+                    js_string(item)
+                }
+            })
             .collect::<Vec<_>>()
             .join(","),
         RawJson::Object(_) => "[object Object]".to_string(),
@@ -1486,36 +1749,76 @@ pub enum OAuthSetting {
 #[serde(rename_all = "camelCase")]
 pub struct OAuthConfig {
     /// `"authorization_code"` (the default) or `"client_credentials"`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub grant_type: Option<OAuthGrantType>,
     /// A pre-registered client id. Absent ⇒ dynamic client registration.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub client_id: Option<String>,
     /// The confidential-client secret. Reaches `resolveCommandSecret` with the context
     /// `` `MCP server "${serverName}" OAuth clientSecret` ``, so a `!command` form is live here.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub client_secret: Option<String>,
     /// Requested scopes, space-separated in one string (upstream's shape, not an array).
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub scope: Option<String>,
     /// Extra authorization-URL parameters for provider-specific extensions. Flow-owned parameters
     /// cannot be overridden.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub authorization_params: Option<BTreeMap<String, String>>,
     /// The exact redirect URI a pre-registered client is registered with.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub redirect_uri: Option<String>,
     /// Client display name for dynamic registration; defaults to [`crate::dirs::APP_NAME`].
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub client_name: Option<String>,
     /// Client homepage for dynamic registration; defaults to [`crate::dirs::APP_CLIENT_URI`].
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub client_uri: Option<String>,
     /// Logo shown on the provider's consent screen.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub logo_uri: Option<String>,
     /// A security-weakening escape hatch for known-misconfigured authorization servers.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub skip_issuer_metadata_validation: Option<bool>,
 }
 
@@ -1555,13 +1858,25 @@ pub enum OutputGuardSetting {
 #[serde(rename_all = "camelCase")]
 pub struct OutputGuardLimits {
     /// [`DEFAULT_MCP_OUTPUT_MAX_BYTES`].
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_bytes: Option<f64>,
     /// [`DEFAULT_MCP_OUTPUT_MAX_LINES`].
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_lines: Option<f64>,
     /// [`DEFAULT_MCP_DETAILS_MAX_BYTES`].
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub details_max_bytes: Option<f64>,
 }
 
@@ -1570,16 +1885,32 @@ pub struct OutputGuardLimits {
 #[serde(rename_all = "camelCase")]
 pub struct TraceSettings {
     /// Tested `=== true`; a per-server `trace` overrides it.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub enabled: Option<bool>,
     /// Destination file. Default `<cwd>/.cyrup/mcp-traces/mcp-<ts>-<rand>.jsonl`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub file: Option<String>,
     /// [`DEFAULT_MCP_TRACE_MAX_BYTES`], via `boundedPositiveInteger`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_bytes: Option<f64>,
     /// [`DEFAULT_MCP_TRACE_MAX_EVENTS`], via `boundedPositiveInteger`.
-    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_events: Option<f64>,
 }
 
@@ -1627,8 +1958,11 @@ pub enum ToolResultRendering {
 #[must_use]
 pub fn resolve_from(base: &Path, candidate: &str) -> PathBuf {
     let candidate_path = Path::new(candidate);
-    let joined =
-        if candidate_path.is_absolute() { candidate_path.to_path_buf() } else { base.join(candidate_path) };
+    let joined = if candidate_path.is_absolute() {
+        candidate_path.to_path_buf()
+    } else {
+        base.join(candidate_path)
+    };
     normalize_lexical(&joined)
 }
 
@@ -1649,7 +1983,11 @@ pub fn normalize_lexical(path: &Path) -> PathBuf {
             other => out.push(other.as_os_str()),
         }
     }
-    if out.as_os_str().is_empty() { PathBuf::from(".") } else { out }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
 }
 
 /// `os.homedir()` — the workspace's one home ladder
@@ -1779,14 +2117,25 @@ pub fn validate_config(
     let servers = root
         .get("mcpServers")
         .or_else(|| root.get("mcp-servers"))
-        .map_or_else(IndexMap::new, |value| to_server_entries(value, path, diagnostics));
+        .map_or_else(IndexMap::new, |value| {
+            to_server_entries(value, path, diagnostics)
+        });
     let imports = root
         .get("imports")
         .and_then(RawJson::as_array)
-        .map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     let settings = root.get("settings").and_then(raw_to::<McpSettings>);
-    McpConfig { mcp_servers: servers, settings, imports }
+    McpConfig {
+        mcp_servers: servers,
+        settings,
+        imports,
+    }
 }
 
 /// `toServerEntries(servers)` — keep an entry **iff** it is a non-array object; a malformed entry is
@@ -1902,7 +2251,11 @@ pub fn read_validated_config(
 fn push_load_warning(path: &Path, error: &str, diagnostics: &mut Vec<ConfigDiagnostic>) {
     let message = format!("Failed to load MCP config from {}: {error}", path.display());
     tracing::warn!("{message}");
-    diagnostics.push(ConfigDiagnostic { path: path.to_path_buf(), server: None, message });
+    diagnostics.push(ConfigDiagnostic {
+        path: path.to_path_buf(),
+        server: None,
+        message,
+    });
 }
 
 // ===================================================================================================
@@ -1918,8 +2271,12 @@ fn push_load_warning(path: &Path, error: &str, diagnostics: &mut Vec<ConfigDiagn
 /// **without** a `..` rest pattern so adding a field to [`ServerEntry`] is a compile error there.
 /// The compile error tells you to handle the new field; this list is the second place you must then
 /// add it, and the exhaustiveness test in this module is what checks you did.
-pub const URL_BOUND_AUTH_FIELDS: [&str; 4] =
-    ["headers", "bearerToken", "bearerTokenEnv", "requestHeadersCommand"];
+pub const URL_BOUND_AUTH_FIELDS: [&str; 4] = [
+    "headers",
+    "bearerToken",
+    "bearerTokenEnv",
+    "requestHeadersCommand",
+];
 
 /// `mergeServerMaps`' per-entry half — **the security core of this module** (MCP-053).
 ///
@@ -2076,7 +2433,10 @@ pub fn merge_imports(left: &[String], right: &[String]) -> Vec<String> {
 /// `next.settings.or(base.settings)` — the in-tree `mcp_direct_tools::merge_configs` does that, and
 /// a project file setting only `toolPrefix` would discard every global setting (MCP-094).
 #[must_use]
-pub fn merge_settings(base: Option<&McpSettings>, next: Option<&McpSettings>) -> Option<McpSettings> {
+pub fn merge_settings(
+    base: Option<&McpSettings>,
+    next: Option<&McpSettings>,
+) -> Option<McpSettings> {
     let Some(next) = next else {
         return base.cloned();
     };
@@ -2085,7 +2445,9 @@ pub fn merge_settings(base: Option<&McpSettings>, next: Option<&McpSettings>) ->
         tool_prefix: next.tool_prefix.or(base.tool_prefix),
         show_status_icon: next.show_status_icon.or(base.show_status_icon),
         mcp_footer_status: next.mcp_footer_status.or(base.mcp_footer_status),
-        notify_on_startup_connect: next.notify_on_startup_connect.or(base.notify_on_startup_connect),
+        notify_on_startup_connect: next
+            .notify_on_startup_connect
+            .or(base.notify_on_startup_connect),
         host_config_discovery: next.host_config_discovery.or(base.host_config_discovery),
         agent_plugin_paths: next.agent_plugin_paths.clone().or(base.agent_plugin_paths),
         idle_timeout: next.idle_timeout.or(base.idle_timeout),
@@ -2105,7 +2467,10 @@ pub fn merge_settings(base: Option<&McpSettings>, next: Option<&McpSettings>) ->
         elicitation: next.elicitation.or(base.elicitation),
         output_guard: next.output_guard.clone().or(base.output_guard),
         trace: next.trace.clone().or(base.trace),
-        auth_required_message: next.auth_required_message.clone().or(base.auth_required_message),
+        auth_required_message: next
+            .auth_required_message
+            .clone()
+            .or(base.auth_required_message),
         oauth_dir: next.oauth_dir.clone().or(base.oauth_dir),
     })
 }
@@ -2155,7 +2520,10 @@ pub fn resolve_import_candidates(kind: ImportKind, home: &Path, cwd: &Path) -> V
                 .join("claude_desktop_config.json"),
         ],
         ImportKind::Codex => {
-            vec![home.join(".codex").join("config.toml"), home.join(".codex").join("config.json")]
+            vec![
+                home.join(".codex").join("config.toml"),
+                home.join(".codex").join("config.json"),
+            ]
         }
         ImportKind::Opencode => vec![
             home.join(".config").join("opencode").join("opencode.json"),
@@ -2211,7 +2579,10 @@ pub fn resolve_opencode_project_candidate(cwd: &Path) -> PathBuf {
 /// The only TOML path in the whole package is `~/.codex/config.toml`.
 fn read_imported_config(path: &Path) -> Result<RawJson, String> {
     let raw = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-    if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("toml")) {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+    {
         // `toml`'s deserializer feeds map entries in document order, so `RawJson` keeps it.
         toml::from_str::<RawJson>(&raw).map_err(|error| error.to_string())
     } else {
@@ -2250,7 +2621,10 @@ pub fn load_imported_config(
                 Err(error) => push_import_warning(&path, warning_prefix, &error, diagnostics),
             }
         }
-        return highest.map(|path| ImportedDocument { path, value: RawJson::Object(merged) });
+        return highest.map(|path| ImportedDocument {
+            path,
+            value: RawJson::Object(merged),
+        });
     }
 
     for path in candidates {
@@ -2291,7 +2665,11 @@ fn push_import_warning(
 ) {
     let message = format!("{prefix} {error}");
     tracing::warn!("{message}");
-    diagnostics.push(ConfigDiagnostic { path: path.to_path_buf(), server: None, message });
+    diagnostics.push(ConfigDiagnostic {
+        path: path.to_path_buf(),
+        server: None,
+        message,
+    });
 }
 
 /// `mergeOpenCodeConfigs(base, next)` — MCP-053's credential-unbinding discipline, repeated on a
@@ -2307,14 +2685,19 @@ pub fn merge_opencode_configs(
     base: &IndexMap<String, RawJson>,
     next: &IndexMap<String, RawJson>,
 ) -> IndexMap<String, RawJson> {
-    let base_mcp = base.get("mcp").and_then(RawJson::as_object).cloned().unwrap_or_default();
+    let base_mcp = base
+        .get("mcp")
+        .and_then(RawJson::as_object)
+        .cloned()
+        .unwrap_or_default();
     let mut merged_mcp = base_mcp;
 
     if let Some(next_mcp) = next.get("mcp").and_then(RawJson::as_object) {
         for (name, next_entry) in next_mcp {
-            let (Some(base_fields), Some(override_fields)) =
-                (merged_mcp.get(name).and_then(RawJson::as_object), next_entry.as_object())
-            else {
+            let (Some(base_fields), Some(override_fields)) = (
+                merged_mcp.get(name).and_then(RawJson::as_object),
+                next_entry.as_object(),
+            ) else {
                 merged_mcp.insert(name.clone(), next_entry.clone());
                 continue;
             };
@@ -2385,7 +2768,10 @@ pub fn extract_servers(
     path: &Path,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> IndexMap<String, ServerEntry> {
-    let Some(servers) = document.get_first(kind.server_keys()).and_then(RawJson::as_object) else {
+    let Some(servers) = document
+        .get_first(kind.server_keys())
+        .and_then(RawJson::as_object)
+    else {
         return IndexMap::new();
     };
 
@@ -2423,22 +2809,31 @@ pub fn translate_codex_server(entry: &IndexMap<String, RawJson>) -> RawJson {
     let mut mapped = entry.clone();
 
     if let Some(bearer_env) = entry.get("bearer_token_env_var").and_then(RawJson::as_str) {
-        mapped.insert("bearerTokenEnv".to_string(), RawJson::String(bearer_env.to_string()));
+        mapped.insert(
+            "bearerTokenEnv".to_string(),
+            RawJson::String(bearer_env.to_string()),
+        );
         if !mapped.contains_key("auth") {
             mapped.insert("auth".to_string(), RawJson::String("bearer".to_string()));
         }
     }
     if let Some(http_headers) = entry.get("http_headers").and_then(RawJson::as_object) {
-        let mut headers =
-            mapped.get("headers").and_then(RawJson::as_object).cloned().unwrap_or_default();
+        let mut headers = mapped
+            .get("headers")
+            .and_then(RawJson::as_object)
+            .cloned()
+            .unwrap_or_default();
         for (key, value) in http_headers {
             headers.insert(key.clone(), value.clone());
         }
         mapped.insert("headers".to_string(), RawJson::Object(headers));
     }
     if let Some(env_headers) = entry.get("env_http_headers").and_then(RawJson::as_object) {
-        let mut headers =
-            mapped.get("headers").and_then(RawJson::as_object).cloned().unwrap_or_default();
+        let mut headers = mapped
+            .get("headers")
+            .and_then(RawJson::as_object)
+            .cloned()
+            .unwrap_or_default();
         for (header, env_var) in env_headers {
             if let Some(name) = env_var.as_str()
                 && !headers.contains_key(header)
@@ -2480,13 +2875,19 @@ pub fn translate_opencode_server(entry: &IndexMap<String, RawJson>) -> Option<Ra
         mapped.insert("command".to_string(), RawJson::String((*head).to_string()));
         mapped.insert(
             "args".to_string(),
-            RawJson::Array(tail.iter().map(|arg| RawJson::String((*arg).to_string())).collect()),
+            RawJson::Array(
+                tail.iter()
+                    .map(|arg| RawJson::String((*arg).to_string()))
+                    .collect(),
+            ),
         );
         if let Some(env) = entry.get("environment").and_then(RawJson::to_string_record) {
             mapped.insert(
                 "env".to_string(),
                 RawJson::Object(
-                    env.into_iter().map(|(k, v)| (k, RawJson::String(v))).collect(),
+                    env.into_iter()
+                        .map(|(k, v)| (k, RawJson::String(v)))
+                        .collect(),
                 ),
             );
         }
@@ -2502,7 +2903,12 @@ pub fn translate_opencode_server(entry: &IndexMap<String, RawJson>) -> Option<Ra
         if let Some(headers) = entry.get("headers").and_then(RawJson::to_string_record) {
             mapped.insert(
                 "headers".to_string(),
-                RawJson::Object(headers.into_iter().map(|(k, v)| (k, RawJson::String(v))).collect()),
+                RawJson::Object(
+                    headers
+                        .into_iter()
+                        .map(|(k, v)| (k, RawJson::String(v)))
+                        .collect(),
+                ),
             );
         }
         match entry.get("oauth") {
@@ -2518,8 +2924,10 @@ pub fn translate_opencode_server(entry: &IndexMap<String, RawJson>) -> Option<Ra
                     }
                 }
                 if let Some(RawJson::Bool(skip)) = oauth.get("skipIssuerMetadataValidation") {
-                    projected
-                        .insert("skipIssuerMetadataValidation".to_string(), RawJson::Bool(*skip));
+                    projected.insert(
+                        "skipIssuerMetadataValidation".to_string(),
+                        RawJson::Bool(*skip),
+                    );
                 }
                 mapped.insert("oauth".to_string(), RawJson::Object(projected));
             }
@@ -2597,7 +3005,13 @@ pub fn load_discovered_host_configs(
             continue;
         };
         let servers = extract_servers(&document.value, kind, &document.path, diagnostics);
-        config = merge_configs(&config, &McpConfig { mcp_servers: servers, ..McpConfig::default() });
+        config = merge_configs(
+            &config,
+            &McpConfig {
+                mcp_servers: servers,
+                ..McpConfig::default()
+            },
+        );
     }
     config
 }
@@ -2780,7 +3194,10 @@ impl ConfigContext {
     /// file as its global MCP config path.
     #[must_use]
     pub fn user_path(&self) -> PathBuf {
-        let raw = self.override_path.as_ref().map(|path| path.to_string_lossy());
+        let raw = self
+            .override_path
+            .as_ref()
+            .map(|path| path.to_string_lossy());
         self.dirs.user_config(raw.as_deref())
     }
 
@@ -2835,7 +3252,12 @@ impl ConfigContext {
         // `dirs::agents_global_configs`, which owns the `config.ts:14` grammar.
         let [agents_global, agents_nested] = crate::dirs::agents_global_configs(&self.home);
         let agents_paths = [
-            (SourceId::AgentsGlobal, "user-global .agents MCP", ".agents MCP config", agents_global),
+            (
+                SourceId::AgentsGlobal,
+                "user-global .agents MCP",
+                ".agents MCP config",
+                agents_global,
+            ),
             (
                 SourceId::AgentsNestedGlobal,
                 "user-global .agents nested MCP",
@@ -2930,7 +3352,10 @@ impl ConfigContext {
     /// `getConfiguredHostConfigDiscovery` — the merged `settings.hostConfigDiscovery`, defaulting
     /// `"off"` through an explicit three-way test.
     #[must_use]
-    pub fn host_config_discovery(&self, diagnostics: &mut Vec<ConfigDiagnostic>) -> HostConfigDiscovery {
+    pub fn host_config_discovery(
+        &self,
+        diagnostics: &mut Vec<ConfigDiagnostic>,
+    ) -> HostConfigDiscovery {
         self.merged_settings(diagnostics)
             .as_ref()
             .map_or(HostConfigDiscovery::Off, McpSettings::host_config_discovery)
@@ -2969,15 +3394,17 @@ impl ConfigContext {
             let Some(loaded) = read_validated_config(&source.read_path, &mut diagnostics) else {
                 continue;
             };
-            let expanded =
-                expand_imports(&loaded, &self.home, self.dirs.cwd(), &mut diagnostics);
+            let expanded = expand_imports(&loaded, &self.home, self.dirs.cwd(), &mut diagnostics);
             config = merge_configs(&config, &expanded);
         }
 
         let plugin_config = self.load_plugin_config(&config, &mut diagnostics);
         config = merge_configs(&plugin_config, &config);
 
-        LoadedConfig { config, diagnostics }
+        LoadedConfig {
+            config,
+            diagnostics,
+        }
     }
 
     /// `loadAgentPluginConfigs(config.settings?.agentPluginPaths, cwd)`.
@@ -3023,7 +3450,10 @@ impl ConfigContext {
             });
         }
         McpConfig {
-            mcp_servers: loaded.into_iter().map(|server| (server.name, server.entry)).collect(),
+            mcp_servers: loaded
+                .into_iter()
+                .map(|server| (server.name, server.entry))
+                .collect(),
             ..McpConfig::default()
         }
     }
@@ -3038,7 +3468,9 @@ impl ConfigContext {
 /// **This function cannot fail** — see [`ConfigContext::load`] and MCP-003.
 #[must_use]
 pub fn load_mcp_config(dirs: &McpDirs, explicit_path: Option<&Path>) -> McpConfig {
-    ConfigContext::new(dirs.clone(), explicit_path).load().config
+    ConfigContext::new(dirs.clone(), explicit_path)
+        .load()
+        .config
 }
 
 // ===================================================================================================
@@ -3068,7 +3500,8 @@ pub const LEGACY_SERVERS_KEY: &str = "mcp-servers";
 /// (MCP-099) and a missing newline would show up as a one-line change on every write.
 #[must_use]
 pub fn serialize_raw_object(raw: &RawObject) -> String {
-    serde_json::to_string_pretty(raw).map_or_else(|_| "{}\n".to_string(), |text| format!("{text}\n"))
+    serde_json::to_string_pretty(raw)
+        .map_or_else(|_| "{}\n".to_string(), |text| format!("{text}\n"))
 }
 
 /// A compact `JSON.stringify(value)` — no indent, no newline — used only for the structural
@@ -3122,19 +3555,26 @@ pub fn write_raw_config_object(path: &Path, raw: &RawObject) -> McpResult<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
-            .map_err(|source| McpError::Io { path: parent.to_path_buf(), source })?;
+        std::fs::create_dir_all(parent).map_err(|source| McpError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
 
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
 
-    std::fs::write(&tmp, serialize_raw_object(raw))
-        .map_err(|source| McpError::Io { path: tmp.clone(), source })?;
+    std::fs::write(&tmp, serialize_raw_object(raw)).map_err(|source| McpError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
     if let Err(source) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(McpError::Io { path: path.to_path_buf(), source });
+        return Err(McpError::Io {
+            path: path.to_path_buf(),
+            source,
+        });
     }
     Ok(())
 }
@@ -3218,10 +3658,22 @@ pub fn build_unified_diff(before_text: &str, after_text: &str) -> String {
     for i in (0..rows).rev() {
         for j in (0..cols).rev() {
             let value = if before.get(i) == after.get(j) {
-                lcs.get(i + 1).and_then(|row| row.get(j + 1)).copied().unwrap_or(0).saturating_add(1)
+                lcs.get(i + 1)
+                    .and_then(|row| row.get(j + 1))
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1)
             } else {
-                let down = lcs.get(i + 1).and_then(|row| row.get(j)).copied().unwrap_or(0);
-                let right = lcs.get(i).and_then(|row| row.get(j + 1)).copied().unwrap_or(0);
+                let down = lcs
+                    .get(i + 1)
+                    .and_then(|row| row.get(j))
+                    .copied()
+                    .unwrap_or(0);
+                let right = lcs
+                    .get(i)
+                    .and_then(|row| row.get(j + 1))
+                    .copied()
+                    .unwrap_or(0);
                 down.max(right)
             };
             if let Some(cell) = lcs.get_mut(i).and_then(|row| row.get_mut(j)) {
@@ -3246,8 +3698,16 @@ pub fn build_unified_diff(before_text: &str, after_text: &str) -> String {
         // DP is ported rather than delegated.
         let prefer_addition = j < cols
             && (i == rows || {
-                let right = lcs.get(i).and_then(|row| row.get(j + 1)).copied().unwrap_or(0);
-                let down = lcs.get(i + 1).and_then(|row| row.get(j)).copied().unwrap_or(0);
+                let right = lcs
+                    .get(i)
+                    .and_then(|row| row.get(j + 1))
+                    .copied()
+                    .unwrap_or(0);
+                let down = lcs
+                    .get(i + 1)
+                    .and_then(|row| row.get(j))
+                    .copied()
+                    .unwrap_or(0);
                 right >= down
             });
         if prefer_addition {
@@ -3286,7 +3746,11 @@ pub fn build_unified_diff(before_text: &str, after_text: &str) -> String {
 pub fn build_config_write_preview(path: &Path, next_raw: &RawObject) -> ConfigWritePreview {
     let existed = path.exists();
     let before_raw = read_raw_config_object(path);
-    let before_text = if existed { serialize_raw_object(&before_raw) } else { String::new() };
+    let before_text = if existed {
+        serialize_raw_object(&before_raw)
+    } else {
+        String::new()
+    };
     let after_text = serialize_raw_object(next_raw);
     ConfigWritePreview {
         path: path.to_path_buf(),
@@ -3412,15 +3876,17 @@ pub fn write_direct_tools_config(
     provenance: &IndexMap<String, ServerProvenance>,
     full_config: &McpConfig,
 ) -> McpResult<()> {
-    let mut by_path: IndexMap<PathBuf, Vec<(String, BoolOrList, ServerProvenance)>> = IndexMap::new();
+    let mut by_path: IndexMap<PathBuf, Vec<(String, BoolOrList, ServerProvenance)>> =
+        IndexMap::new();
     for (server_name, value) in changes {
         let Some(prov) = provenance.get(server_name) else {
             continue;
         };
-        by_path
-            .entry(prov.path.clone())
-            .or_default()
-            .push((server_name.clone(), value.clone(), prov.clone()));
+        by_path.entry(prov.path.clone()).or_default().push((
+            server_name.clone(),
+            value.clone(),
+            prov.clone(),
+        ));
     }
 
     for (path, entries) in by_path {
@@ -3542,7 +4008,10 @@ impl ConfigContext {
             Some(current) => compact_json(current) == compact_json(&next),
         };
         if unchanged {
-            return Ok(ServerDisabledOverrideResult { path: file_path, changed: false });
+            return Ok(ServerDisabledOverrideResult {
+                path: file_path,
+                changed: false,
+            });
         }
 
         if next.is_empty() {
@@ -3555,7 +4024,10 @@ impl ConfigContext {
         // spelling the file already used instead of normalising it.
         raw.insert(server_key.to_string(), RawJson::Object(servers));
         write_raw_config_object(&file_path, &raw)?;
-        Ok(ServerDisabledOverrideResult { path: file_path, changed: true })
+        Ok(ServerDisabledOverrideResult {
+            path: file_path,
+            changed: true,
+        })
     }
 
     /// The enabling half of [`Self::write_project_server_disabled_override`]: is the server still
@@ -3603,13 +4075,19 @@ impl ConfigContext {
                 }
                 kinds.push(text.to_string());
             }
-            let own_imports = McpConfig { imports: kinds, ..McpConfig::default() };
+            let own_imports = McpConfig {
+                imports: kinds,
+                ..McpConfig::default()
+            };
             let expanded =
                 expand_imports(&own_imports, &self.home, self.dirs.cwd(), &mut diagnostics);
             lower = merge_configs(&lower, &expanded);
         }
 
-        Ok(lower.mcp_servers.get(server_name).is_some_and(ServerEntry::is_disabled))
+        Ok(lower
+            .mcp_servers
+            .get(server_name)
+            .is_some_and(ServerEntry::is_disabled))
     }
 
     /// `getServerProvenance(overridePath, cwd)` — MCP-064.
@@ -3766,7 +4244,10 @@ impl ConfigContext {
             added.push(*kind);
         }
         if added.is_empty() {
-            return Ok(CompatibilityImportsResult { path: target, added: Vec::new() });
+            return Ok(CompatibilityImportsResult {
+                path: target,
+                added: Vec::new(),
+            });
         }
 
         raw.insert(
@@ -3776,7 +4257,10 @@ impl ConfigContext {
         let servers = get_servers_object(&raw);
         set_servers_object(&mut raw, servers);
         write_raw_config_object(&target, &raw)?;
-        Ok(CompatibilityImportsResult { path: target, added })
+        Ok(CompatibilityImportsResult {
+            path: target,
+            added,
+        })
     }
 
     /// `previewStarterProjectConfig(cwd)` — the `{ "mcpServers": {} }` scaffold's preview.
@@ -3844,14 +4328,21 @@ impl ConfigContext {
 fn current_import_list(raw: &RawObject) -> Vec<String> {
     raw.get("imports")
         .and_then(RawJson::as_array)
-        .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 /// `[...new Set([...currentImports, ...importKinds])]` — first-seen order, deduplicated.
 fn merged_import_list(raw: &RawObject, import_kinds: &[ImportKind]) -> Vec<String> {
-    let requested: Vec<String> =
-        import_kinds.iter().map(|kind| kind.as_str().to_string()).collect();
+    let requested: Vec<String> = import_kinds
+        .iter()
+        .map(|kind| kind.as_str().to_string())
+        .collect();
     merge_imports(&current_import_list(raw), &requested)
 }
 
@@ -4110,15 +4601,24 @@ fn source_fingerprint_tuple(source: &ConfigDiscoverySource) -> RawJson {
 /// fingerprint.
 fn conflict_source_json(source: &ConflictSource) -> RawJson {
     let mut object = RawObject::new();
-    object.insert("kind".to_string(), RawJson::String(source.kind.as_str().to_string()));
-    object.insert("path".to_string(), RawJson::String(source.path.display().to_string()));
+    object.insert(
+        "kind".to_string(),
+        RawJson::String(source.kind.as_str().to_string()),
+    );
+    object.insert(
+        "path".to_string(),
+        RawJson::String(source.path.display().to_string()),
+    );
     RawJson::Object(object)
 }
 
 /// `{ serverName, sources, winner }`, in that order.
 fn conflict_json(conflict: &McpConfigConflict) -> RawJson {
     let mut object = RawObject::new();
-    object.insert("serverName".to_string(), RawJson::String(conflict.server_name.clone()));
+    object.insert(
+        "serverName".to_string(),
+        RawJson::String(conflict.server_name.clone()),
+    );
     object.insert(
         "sources".to_string(),
         RawJson::Array(conflict.sources.iter().map(conflict_source_json).collect()),
@@ -4185,7 +4685,11 @@ impl ConfigContext {
                     label: source.label,
                     exists: source.read_path.exists(),
                     scope: source.scope,
-                    kind: if source.shared { DiscoveryKind::Shared } else { DiscoveryKind::Pi },
+                    kind: if source.shared {
+                        DiscoveryKind::Shared
+                    } else {
+                        DiscoveryKind::Pi
+                    },
                     server_count: loaded.map_or(0, |config| config.mcp_servers.len()),
                     contributes: self.source_contributes(&source),
                     path: source.read_path,
@@ -4249,7 +4753,10 @@ impl ConfigContext {
                 record_conflict_source(
                     &mut seen,
                     name,
-                    ConflictSource { kind: ConflictKind::Host, path: document.path.clone() },
+                    ConflictSource {
+                        kind: ConflictKind::Host,
+                        path: document.path.clone(),
+                    },
                 );
             }
         }
@@ -4277,16 +4784,26 @@ impl ConfigContext {
                     record_conflict_source(
                         &mut seen,
                         name,
-                        ConflictSource { kind: ConflictKind::Host, path: document.path.clone() },
+                        ConflictSource {
+                            kind: ConflictKind::Host,
+                            path: document.path.clone(),
+                        },
                     );
                 }
             }
-            let kind = if source.shared { ConflictKind::Shared } else { ConflictKind::Pi };
+            let kind = if source.shared {
+                ConflictKind::Shared
+            } else {
+                ConflictKind::Pi
+            };
             for name in loaded.mcp_servers.keys() {
                 record_conflict_source(
                     &mut seen,
                     name,
-                    ConflictSource { kind, path: source.read_path.clone() },
+                    ConflictSource {
+                        kind,
+                        path: source.read_path.clone(),
+                    },
                 );
             }
         }
@@ -4296,7 +4813,11 @@ impl ConfigContext {
             .filter(|(_, sources)| sources.len() > 1)
             .filter_map(|(server_name, sources)| {
                 let winner = sources.last()?.clone();
-                Some(McpConfigConflict { server_name, sources, winner })
+                Some(McpConfigConflict {
+                    server_name,
+                    sources,
+                    winner,
+                })
             })
             .collect();
         conflicts.sort_by(|left, right| locale_compare(&left.server_name, &right.server_name));
@@ -4343,7 +4864,11 @@ impl ConfigContext {
                     )?;
                     let server_count =
                         extract_servers(&document.value, kind, &document.path, diagnostics).len();
-                    Some(ImportConfigSummary { kind, path: document.path, server_count })
+                    Some(ImportConfigSummary {
+                        kind,
+                        path: document.path,
+                        server_count,
+                    })
                 })
                 .collect()
         } else {
@@ -4351,8 +4876,9 @@ impl ConfigContext {
         };
 
         let settings = self.merged_settings(diagnostics);
-        let host_config_discovery =
-            settings.as_ref().map_or(HostConfigDiscovery::Off, McpSettings::host_config_discovery);
+        let host_config_discovery = settings
+            .as_ref()
+            .map_or(HostConfigDiscovery::Off, McpSettings::host_config_discovery);
         let host_configs: Vec<HostConfigSummary> = imports
             .iter()
             .map(|entry| HostConfigSummary {
@@ -4544,7 +5070,10 @@ pub fn known_server_presets() -> Vec<KnownServerPreset> {
             summary: "Inspect and automate a local Chrome browser.",
             entry: ServerEntry {
                 command: Some("npx".to_string()),
-                args: Some(vec!["-y".to_string(), "chrome-devtools-mcp@1.6.0".to_string()]),
+                args: Some(vec![
+                    "-y".to_string(),
+                    "chrome-devtools-mcp@1.6.0".to_string(),
+                ]),
                 ..ServerEntry::default()
             },
         },
@@ -4556,7 +5085,10 @@ pub fn known_server_presets() -> Vec<KnownServerPreset> {
 /// `const` ([`REPOPROMPT_APP_BINARY`]).
 #[must_use]
 pub fn repoprompt_binary_candidates(home: &Path) -> [PathBuf; 2] {
-    [home.join("RepoPrompt").join("repoprompt_cli"), PathBuf::from(REPOPROMPT_APP_BINARY)]
+    [
+        home.join("RepoPrompt").join("repoprompt_cli"),
+        PathBuf::from(REPOPROMPT_APP_BINARY),
+    ]
 }
 
 /// `isRepoPromptServer(name, entry)` — four independent tests, all case-insensitive.
@@ -4599,7 +5131,10 @@ pub fn is_repo_prompt_server(name: &str, entry: &ServerEntry) -> bool {
 pub fn find_project_root(cwd: &Path) -> Option<PathBuf> {
     let mut current = normalize_lexical(cwd);
     loop {
-        if PROJECT_ROOT_MARKERS.iter().any(|marker| current.join(marker).exists()) {
+        if PROJECT_ROOT_MARKERS
+            .iter()
+            .any(|marker| current.join(marker).exists())
+        {
             return Some(current);
         }
         let parent = current.parent()?.to_path_buf();
@@ -4645,7 +5180,11 @@ impl ConfigContext {
             let Some(config) = read_validated_config(&source.path, diagnostics) else {
                 continue;
             };
-            if config.mcp_servers.iter().any(|(name, entry)| is_repo_prompt_server(name, entry)) {
+            if config
+                .mcp_servers
+                .iter()
+                .any(|(name, entry)| is_repo_prompt_server(name, entry))
+            {
                 return RepoPromptDiscovery {
                     configured: true,
                     configured_path: Some(source.path.clone()),
@@ -4661,8 +5200,10 @@ impl ConfigContext {
             return RepoPromptDiscovery::default();
         };
 
-        let target_path = find_project_root(self.dirs.cwd())
-            .map_or_else(|| self.generic_global_path(), |root| root.join(PROJECT_CONFIG_NAME));
+        let target_path = find_project_root(self.dirs.cwd()).map_or_else(
+            || self.generic_global_path(),
+            |root| root.join(PROJECT_CONFIG_NAME),
+        );
         RepoPromptDiscovery {
             configured: false,
             configured_path: None,
@@ -4703,7 +5244,12 @@ mod tests {
             std::fs::create_dir_all(&home).unwrap();
             std::fs::create_dir_all(&agent_dir).unwrap();
             std::fs::create_dir_all(&cwd).unwrap();
-            Fixture { _dir: dir, home, agent_dir, cwd }
+            Fixture {
+                _dir: dir,
+                home,
+                agent_dir,
+                cwd,
+            }
         }
 
         fn context(&self) -> ConfigContext {
@@ -4731,7 +5277,9 @@ mod tests {
 
         /// `<cwd>/.cyrup/mcp.json` — the project override the disabled writer owns.
         fn project_override(&self) -> PathBuf {
-            self.cwd.join(PROJECT_OVERRIDE_DIR).join(crate::dirs::MCP_CONFIG_FILE)
+            self.cwd
+                .join(PROJECT_OVERRIDE_DIR)
+                .join(crate::dirs::MCP_CONFIG_FILE)
         }
     }
 
@@ -4760,17 +5308,32 @@ mod tests {
         write_raw_config_object(&path, &raw).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"$schema\""), "an unknown top-level key must survive a write");
-        assert!(text.contains("\"mcpServers\""), "the write normalises the spelling");
-        assert!(!text.contains("\"mcp-servers\""), "and deletes the legacy one");
-        assert!(text.ends_with("}\n"), "2-space JSON plus a trailing newline");
+        assert!(
+            text.contains("\"$schema\""),
+            "an unknown top-level key must survive a write"
+        );
+        assert!(
+            text.contains("\"mcpServers\""),
+            "the write normalises the spelling"
+        );
+        assert!(
+            !text.contains("\"mcp-servers\""),
+            "and deletes the legacy one"
+        );
+        assert!(
+            text.ends_with("}\n"),
+            "2-space JSON plus a trailing newline"
+        );
 
         let leftovers: Vec<_> = std::fs::read_dir(&fixture.agent_dir)
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "the temp file is renamed away, never left behind");
+        assert!(
+            leftovers.is_empty(),
+            "the temp file is renamed away, never left behind"
+        );
     }
 
     #[test]
@@ -4779,9 +5342,15 @@ mod tests {
         let path = fixture.user_path();
         assert!(read_raw_config_object(&path).is_empty(), "missing ⇒ {{}}");
         fixture.write(&path, "{{{");
-        assert!(read_raw_config_object(&path).is_empty(), "unparseable ⇒ {{}}, silently");
+        assert!(
+            read_raw_config_object(&path).is_empty(),
+            "unparseable ⇒ {{}}, silently"
+        );
         fixture.write(&path, "[1, 2]");
-        assert!(read_raw_config_object(&path).is_empty(), "a non-object root ⇒ {{}}");
+        assert!(
+            read_raw_config_object(&path).is_empty(),
+            "a non-object root ⇒ {{}}"
+        );
     }
 
     // -- MCP-062 -----------------------------------------------------------------------------
@@ -4824,8 +5393,14 @@ mod tests {
         let preview = build_config_write_preview(&path, &next);
 
         assert!(preview.existed);
-        assert!(!preview.before_text.contains("//"), "comments are stripped by the parse");
-        assert_eq!(preview.before_text, "{\n  \"mcpServers\": {}\n}\n", "reindented to two spaces");
+        assert!(
+            !preview.before_text.contains("//"),
+            "comments are stripped by the parse"
+        );
+        assert_eq!(
+            preview.before_text, "{\n  \"mcpServers\": {}\n}\n",
+            "reindented to two spaces"
+        );
         // `changed` is computed against that NORMALISED text, so a semantically identical file is
         // `changed: false` — while the bytes on disk still differ from what the write would produce.
         assert!(!preview.changed);
@@ -4849,23 +5424,35 @@ mod tests {
         );
         let context = fixture.context();
 
-        let disabled = context.write_project_server_disabled_override("foo", true).unwrap();
+        let disabled = context
+            .write_project_server_disabled_override("foo", true)
+            .unwrap();
         assert!(disabled.changed);
         assert_eq!(disabled.path, fixture.project_override());
         let text = std::fs::read_to_string(fixture.project_override()).unwrap();
         assert!(text.contains("\"disabled\": true"));
-        assert!(!text.contains("bearerToken"), "a definition is NEVER copied into the project file");
+        assert!(
+            !text.contains("bearerToken"),
+            "a definition is NEVER copied into the project file"
+        );
         assert!(!text.contains("https://foo.example/mcp"));
 
         // Nothing lower is disabled ⇒ enabling deletes the key, and the now-empty entry with it.
-        let enabled = context.write_project_server_disabled_override("foo", false).unwrap();
+        let enabled = context
+            .write_project_server_disabled_override("foo", false)
+            .unwrap();
         assert!(enabled.changed);
         let raw = read_raw_config_object(&fixture.project_override());
         let servers = get_servers_object(&raw);
-        assert!(!servers.contains_key("foo"), "an empty entry is removed, not left as a husk");
+        assert!(
+            !servers.contains_key("foo"),
+            "an empty entry is removed, not left as a husk"
+        );
 
         // A second enable is a no-op: no entry, nothing to write.
-        let again = context.write_project_server_disabled_override("foo", false).unwrap();
+        let again = context
+            .write_project_server_disabled_override("foo", false)
+            .unwrap();
         assert!(!again.changed);
     }
 
@@ -4878,10 +5465,15 @@ mod tests {
         );
         let context = fixture.context();
 
-        let result = context.write_project_server_disabled_override("foo", false).unwrap();
+        let result = context
+            .write_project_server_disabled_override("foo", false)
+            .unwrap();
         assert!(result.changed);
         let text = std::fs::read_to_string(fixture.project_override()).unwrap();
-        assert!(text.contains("\"disabled\": false"), "the override has to out-vote the base");
+        assert!(
+            text.contains("\"disabled\": false"),
+            "the override has to out-vote the base"
+        );
     }
 
     #[test]
@@ -4893,26 +5485,44 @@ mod tests {
 
         fixture.write(&path, "[]");
         assert_eq!(
-            config_message(&context.write_project_server_disabled_override("foo", true).unwrap_err()),
+            config_message(
+                &context
+                    .write_project_server_disabled_override("foo", true)
+                    .unwrap_err()
+            ),
             format!("Failed to read project MCP override at {shown}: root value must be an object")
         );
 
         fixture.write(&path, "{\"mcpServers\": 5}");
         assert_eq!(
-            config_message(&context.write_project_server_disabled_override("foo", true).unwrap_err()),
-            format!("Failed to update project MCP override at {shown}: mcpServers must be an object")
+            config_message(
+                &context
+                    .write_project_server_disabled_override("foo", true)
+                    .unwrap_err()
+            ),
+            format!(
+                "Failed to update project MCP override at {shown}: mcpServers must be an object"
+            )
         );
 
         fixture.write(&path, "{\"mcpServers\": {\"foo\": 5}}");
         assert_eq!(
-            config_message(&context.write_project_server_disabled_override("foo", true).unwrap_err()),
-            format!("Failed to update project MCP override at {shown}: server \"foo\" must be an object")
+            config_message(
+                &context
+                    .write_project_server_disabled_override("foo", true)
+                    .unwrap_err()
+            ),
+            format!(
+                "Failed to update project MCP override at {shown}: server \"foo\" must be an object"
+            )
         );
 
         fixture.write(&path, "{\"imports\": [\"not-a-host\"]}");
         assert_eq!(
             config_message(
-                &context.write_project_server_disabled_override("foo", false).unwrap_err()
+                &context
+                    .write_project_server_disabled_override("foo", false)
+                    .unwrap_err()
             ),
             format!(
                 "Failed to update project MCP override at {shown}: imports contains an unsupported config kind"
@@ -4938,7 +5548,11 @@ mod tests {
         let provenance = context.server_provenance(&mut diagnostics);
 
         let alpha = provenance.get("alpha").unwrap();
-        assert_eq!(alpha.path, fixture.user_path(), "writes never land in the shared file");
+        assert_eq!(
+            alpha.path,
+            fixture.user_path(),
+            "writes never land in the shared file"
+        );
         assert_eq!(alpha.kind, SourceKind::Import);
         assert_eq!(alpha.import_kind.as_deref(), Some("global MCP config"));
 
@@ -4966,7 +5580,10 @@ mod tests {
 
         let mut changes: IndexMap<String, BoolOrList> = IndexMap::new();
         changes.insert("alpha".to_string(), BoolOrList::All(true));
-        changes.insert("beta".to_string(), BoolOrList::Named(vec!["read_x".to_string()]));
+        changes.insert(
+            "beta".to_string(),
+            BoolOrList::Named(vec!["read_x".to_string()]),
+        );
         write_direct_tools_config(&changes, &provenance, &loaded).unwrap();
 
         let text = std::fs::read_to_string(fixture.user_path()).unwrap();
@@ -4975,7 +5592,10 @@ mod tests {
             "an imported server materialises its MERGED definition into the adapter's file"
         );
         assert!(text.contains("\"directTools\": true"));
-        assert!(text.contains("\"customKey\": 1"), "a raw patch keeps unknown keys on the entry");
+        assert!(
+            text.contains("\"customKey\": 1"),
+            "a raw patch keeps unknown keys on the entry"
+        );
         assert!(text.contains("\"read_x\""));
     }
 
@@ -4986,16 +5606,26 @@ mod tests {
         let fixture = Fixture::new();
         let context = fixture.context();
 
-        let first = context.ensure_compatibility_imports(&[ImportKind::Cursor]).unwrap();
+        let first = context
+            .ensure_compatibility_imports(&[ImportKind::Cursor])
+            .unwrap();
         assert_eq!(first.added, vec![ImportKind::Cursor]);
         assert_eq!(first.path, fixture.user_path());
         let after_first = std::fs::read_to_string(fixture.user_path()).unwrap();
         assert!(after_first.contains("\"cursor\""));
-        assert!(after_first.contains("\"mcpServers\": {}"), "setServersObject runs unconditionally");
+        assert!(
+            after_first.contains("\"mcpServers\": {}"),
+            "setServersObject runs unconditionally"
+        );
 
-        let second = context.ensure_compatibility_imports(&[ImportKind::Cursor]).unwrap();
+        let second = context
+            .ensure_compatibility_imports(&[ImportKind::Cursor])
+            .unwrap();
         assert!(second.added.is_empty(), "nothing added ⇒ nothing written");
-        assert_eq!(std::fs::read_to_string(fixture.user_path()).unwrap(), after_first);
+        assert_eq!(
+            std::fs::read_to_string(fixture.user_path()).unwrap(),
+            after_first
+        );
     }
 
     #[test]
@@ -5005,16 +5635,25 @@ mod tests {
 
         let starter = context.write_starter_project_config().unwrap();
         assert_eq!(starter, fixture.cwd.join(PROJECT_CONFIG_NAME));
-        assert_eq!(std::fs::read_to_string(&starter).unwrap(), "{\n  \"mcpServers\": {}\n}\n");
+        assert_eq!(
+            std::fs::read_to_string(&starter).unwrap(),
+            "{\n  \"mcpServers\": {}\n}\n"
+        );
 
-        let entry = ServerEntry { url: Some("https://x.example/mcp".to_string()), ..ServerEntry::default() };
+        let entry = ServerEntry {
+            url: Some("https://x.example/mcp".to_string()),
+            ..ServerEntry::default()
+        };
         let preview = preview_shared_server_entry(&starter, "x", &entry);
         assert!(preview.changed);
         write_shared_server_entry(&starter, "x", &entry).unwrap();
         let text = std::fs::read_to_string(&starter).unwrap();
         assert!(text.contains("\"x\""));
         assert!(text.contains("https://x.example/mcp"));
-        assert!(!text.contains("null"), "absent fields are skipped, never written as null");
+        assert!(
+            !text.contains("null"),
+            "absent fields are skipped, never written as null"
+        );
     }
 
     // -- MCP-059 -----------------------------------------------------------------------------
@@ -5037,15 +5676,24 @@ mod tests {
         );
         assert!(!empty.has_any_config);
 
-        fixture.write(&fixture.user_path(), "{\"mcpServers\":{\"one\":{\"command\":\"x\"}}}");
+        fixture.write(
+            &fixture.user_path(),
+            "{\"mcpServers\":{\"one\":{\"command\":\"x\"}}}",
+        );
         let one = context.mcp_discovery_summary(true, &mut diagnostics);
-        assert_ne!(one.fingerprint, empty.fingerprint, "a new server changes the fingerprint");
+        assert_ne!(
+            one.fingerprint, empty.fingerprint,
+            "a new server changes the fingerprint"
+        );
         assert_eq!(one.total_server_count, 1);
         assert!(one.has_pi_owned_servers && !one.has_shared_servers);
 
         fixture.write(&fixture.cwd.join("unrelated.txt"), "noise");
         let again = context.mcp_discovery_summary(true, &mut diagnostics);
-        assert_eq!(again.fingerprint, one.fingerprint, "an unrelated file does not");
+        assert_eq!(
+            again.fingerprint, one.fingerprint,
+            "an unrelated file does not"
+        );
     }
 
     #[test]
@@ -5069,7 +5717,11 @@ mod tests {
         assert_eq!(conflict.sources.len(), 2);
         assert_eq!(conflict.sources.first().unwrap().kind, ConflictKind::Shared);
         assert_eq!(conflict.winner.kind, ConflictKind::Pi);
-        assert_eq!(conflict.winner.path, fixture.user_path(), "last recorded wins, as the merge does");
+        assert_eq!(
+            conflict.winner.path,
+            fixture.user_path(),
+            "last recorded wins, as the merge does"
+        );
     }
 
     // -- MCP-047 wiring: the plugin ladder rung ----------------------------------------------
@@ -5115,7 +5767,12 @@ mod tests {
 
         // (1) The plugin was found through the relative path, so its VALID server is in the config
         //     under the namespaced name the loader mints.
-        let names: Vec<&str> = loaded.config.mcp_servers.keys().map(String::as_str).collect();
+        let names: Vec<&str> = loaded
+            .config
+            .mcp_servers
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert!(
             names.iter().any(|name| name.contains("good")),
             "a relative `agentPluginPaths` entry must resolve against the context cwd; got {names:?}"
@@ -5133,14 +5790,18 @@ mod tests {
             "exactly one rejection, carrying upstream's text: {:?}",
             loaded.diagnostics
         );
-        let diagnostic = plugin_diagnostics.first().expect("one rejection, asserted above");
+        let diagnostic = plugin_diagnostics
+            .first()
+            .expect("one rejection, asserted above");
         assert!(
             diagnostic.message.contains("skips invalid MCP server bad"),
             "upstream's `skip_message` verbatim, not a re-wrap: {}",
             diagnostic.message
         );
         assert!(
-            !diagnostic.message.starts_with("Skipping Agent Plugin server"),
+            !diagnostic
+                .message
+                .starts_with("Skipping Agent Plugin server"),
             "the old re-wrap is gone: {}",
             diagnostic.message
         );
@@ -5153,8 +5814,16 @@ mod tests {
     #[test]
     fn locale_compare_orders_case_the_way_icu_does() {
         assert_eq!(locale_compare("apple", "banana"), Ordering::Less);
-        assert_eq!(locale_compare("Banana", "apple"), Ordering::Greater, "case-blind primary");
-        assert_eq!(locale_compare("a", "A"), Ordering::Less, "lowercase first at the tie-break");
+        assert_eq!(
+            locale_compare("Banana", "apple"),
+            Ordering::Greater,
+            "case-blind primary"
+        );
+        assert_eq!(
+            locale_compare("a", "A"),
+            Ordering::Less,
+            "lowercase first at the tie-break"
+        );
         assert_eq!(locale_compare("same", "same"), Ordering::Equal);
         // The vector that separates real UCA from the case-folded `str::cmp` this used to be:
         // `é` is U+00E9, so ANY code-point comparison sorts it after `z` (U+007A), while ICU root
@@ -5185,7 +5854,10 @@ mod tests {
         assert!(trusted.load().config.mcp_servers.contains_key("proj"));
 
         let untrusted = fixture.context().with_project_trusted(false);
-        assert!(untrusted.load().config.mcp_servers.is_empty(), "untrusted ⇒ zero servers");
+        assert!(
+            untrusted.load().config.mcp_servers.is_empty(),
+            "untrusted ⇒ zero servers"
+        );
 
         let mut diagnostics = Vec::new();
         let summary = untrusted.config_source_summaries(&mut diagnostics);
@@ -5205,11 +5877,17 @@ mod tests {
         fixture.write(&fixture.user_path(), "{{{");
         let paths = fixture.context().config_discovery_paths();
 
-        assert_eq!(paths.len(), 6, "four to six rungs; nothing is deduped in this layout");
+        assert_eq!(
+            paths.len(),
+            6,
+            "four to six rungs; nothing is deduped in this layout"
+        );
         assert_eq!(paths.first().unwrap().label, "user-global standard MCP");
         assert!(paths.iter().filter(|entry| entry.exists).count() == 1);
         assert!(
-            paths.iter().any(|entry| entry.path == fixture.project_override()),
+            paths
+                .iter()
+                .any(|entry| entry.path == fixture.project_override()),
             "the `.cyrup` rung is present even with no file"
         );
     }
@@ -5221,13 +5899,28 @@ mod tests {
         let presets = known_server_presets();
         assert_eq!(presets.len(), 5);
         let ids: Vec<&str> = presets.iter().map(|preset| preset.id).collect();
-        assert_eq!(ids, ["deepwiki", "context7", "notion", "github", "chrome-devtools"]);
+        assert_eq!(
+            ids,
+            [
+                "deepwiki",
+                "context7",
+                "notion",
+                "github",
+                "chrome-devtools"
+            ]
+        );
 
         let notion = presets.iter().find(|preset| preset.id == "notion").unwrap();
         assert_eq!(notion.name, "Notion");
-        assert_eq!(notion.summary, "Search and work with your Notion workspace.");
+        assert_eq!(
+            notion.summary,
+            "Search and work with your Notion workspace."
+        );
         assert_eq!(notion.entry.auth, Some(AuthMode::Named(AuthKind::Oauth)));
-        assert_eq!(notion.entry.protocol_version, Some(ProtocolVersionSetting::Auto));
+        assert_eq!(
+            notion.entry.protocol_version,
+            Some(ProtocolVersionSetting::Auto)
+        );
 
         let chrome = presets.last().unwrap();
         assert_eq!(chrome.entry.command.as_deref(), Some("npx"));
@@ -5245,7 +5938,11 @@ mod tests {
             let nested = root.join("a").join("b");
             std::fs::create_dir_all(&nested).unwrap();
             std::fs::create_dir_all(root.join(marker)).unwrap();
-            assert_eq!(find_project_root(&nested).as_deref(), Some(root.as_path()), "{marker}");
+            assert_eq!(
+                find_project_root(&nested).as_deref(),
+                Some(root.as_path()),
+                "{marker}"
+            );
         }
     }
 
@@ -5262,8 +5959,14 @@ mod tests {
         let discovery = context.detect_repo_prompt(&sources, &mut diagnostics);
 
         assert!(discovery.configured);
-        assert_eq!(discovery.configured_path.as_deref(), Some(fixture.shared_global().as_path()));
-        assert!(discovery.entry.is_none(), "no proposal when it is already configured");
+        assert_eq!(
+            discovery.configured_path.as_deref(),
+            Some(fixture.shared_global().as_path())
+        );
+        assert!(
+            discovery.entry.is_none(),
+            "no proposal when it is already configured"
+        );
     }
 
     #[test]
@@ -5302,7 +6005,11 @@ mod tests {
             None,
             "the `=` form is unsupported upstream and stays unsupported here"
         );
-        assert_eq!(config_path_from_argv(["cyrup", "--mcp-config"]), None, "nothing follows it");
+        assert_eq!(
+            config_path_from_argv(["cyrup", "--mcp-config"]),
+            None,
+            "nothing follows it"
+        );
         assert_eq!(config_path_from_argv(["cyrup", "chat"]), None);
     }
 
@@ -5310,13 +6017,26 @@ mod tests {
     fn an_override_path_replaces_the_adapter_owned_rung_and_drops_its_duplicate() {
         let fixture = Fixture::new();
         let override_path = fixture.home.join(".config").join("mcp").join("mcp.json");
-        fixture.write(&override_path, "{\"mcpServers\":{\"only\":{\"command\":\"x\"}}}");
-        let context =
-            ConfigContext::new(McpDirs::new(fixture.agent_dir.clone(), fixture.cwd.clone()), Some(&override_path))
-                .with_home(fixture.home.clone());
+        fixture.write(
+            &override_path,
+            "{\"mcpServers\":{\"only\":{\"command\":\"x\"}}}",
+        );
+        let context = ConfigContext::new(
+            McpDirs::new(fixture.agent_dir.clone(), fixture.cwd.clone()),
+            Some(&override_path),
+        )
+        .with_home(fixture.home.clone());
 
-        assert_eq!(context.user_path(), override_path, "`--mcp-config` IS `userPath`");
-        let ids: Vec<SourceId> = context.sources().into_iter().map(|source| source.id).collect();
+        assert_eq!(
+            context.user_path(),
+            override_path,
+            "`--mcp-config` IS `userPath`"
+        );
+        let ids: Vec<SourceId> = context
+            .sources()
+            .into_iter()
+            .map(|source| source.id)
+            .collect();
         assert!(
             !ids.contains(&SourceId::SharedGlobal),
             "the generic global rung is deduped away when it IS the override target"
@@ -5347,7 +6067,10 @@ mod tests {
         assert!(loaded.config.settings.is_none());
         for path in &ladder {
             assert!(
-                loaded.diagnostics.iter().any(|diagnostic| diagnostic.path == *path),
+                loaded
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.path == *path),
                 "every unreadable rung is reported, not swallowed: {}",
                 path.display()
             );
@@ -5366,10 +6089,16 @@ mod tests {
         let config = validate_config(&document, Path::new("test"), &mut diagnostics);
 
         assert!(config.mcp_servers.contains_key("good"));
-        assert!(!config.mcp_servers.contains_key("bad"), "a non-object entry is dropped");
+        assert!(
+            !config.mcp_servers.contains_key("bad"),
+            "a non-object entry is dropped"
+        );
         let typed = config.mcp_servers.get("typed").unwrap();
         assert_eq!(typed.command.as_deref(), Some("y"));
-        assert!(typed.idle_timeout.is_none(), "a wrong-typed FIELD degrades to None, not to an error");
+        assert!(
+            typed.idle_timeout.is_none(),
+            "a wrong-typed FIELD degrades to None, not to an error"
+        );
     }
 
     #[test]
@@ -5409,7 +6138,10 @@ mod tests {
 
         let config = fixture.context().load().config;
         assert_eq!(
-            config.mcp_servers.get("foo").and_then(|entry| entry.command.as_deref()),
+            config
+                .mcp_servers
+                .get("foo")
+                .and_then(|entry| entry.command.as_deref()),
             Some("from-cursor"),
             "imports are first-wins in `imports` order, not last-wins"
         );
@@ -5431,7 +6163,10 @@ mod tests {
         let context = fixture.context();
 
         let off = context.load().config;
-        assert!(!off.mcp_servers.contains_key("host-only"), "the default is `off` — nothing is read");
+        assert!(
+            !off.mcp_servers.contains_key("host-only"),
+            "the default is `off` — nothing is read"
+        );
 
         fixture.write(
             &fixture.user_path(),
@@ -5439,9 +6174,14 @@ mod tests {
              \"mcpServers\":{\"shared-name\":{\"command\":\"from-owned\"}}}",
         );
         let on = context.load().config;
-        assert!(on.mcp_servers.contains_key("host-only"), "`on` folds all seven families in");
+        assert!(
+            on.mcp_servers.contains_key("host-only"),
+            "`on` folds all seven families in"
+        );
         assert_eq!(
-            on.mcp_servers.get("shared-name").and_then(|entry| entry.command.as_deref()),
+            on.mcp_servers
+                .get("shared-name")
+                .and_then(|entry| entry.command.as_deref()),
             Some("from-owned"),
             "host configs are the BASE layer: an opt-in discovery never outranks an owned definition"
         );
@@ -5495,10 +6235,15 @@ mod tests {
         .expect("a wrong-typed field never fails the parse");
 
         // `auth` and `protocolVersion` survive verbatim…
-        assert_eq!(entry.auth, Some(AuthMode::Other(RawJson::String("basic".to_string()))));
+        assert_eq!(
+            entry.auth,
+            Some(AuthMode::Other(RawJson::String("basic".to_string())))
+        );
         assert_eq!(
             entry.protocol_version,
-            Some(ProtocolVersionSetting::Other(RawJson::String("2025-06-18".to_string())))
+            Some(ProtocolVersionSetting::Other(RawJson::String(
+                "2025-06-18".to_string()
+            )))
         );
         // …and neither satisfies any read site, which is what a TypeScript `===` against an unknown
         // value does.
@@ -5520,11 +6265,15 @@ mod tests {
         // And a write-back round-trips the file rather than erasing what it cannot use. The old
         // `Option<BTreeMap<String, String>>` dropped both blocks entirely on every write.
         let raw = raw_from(&entry);
-        let written = serialize_raw_object(raw.as_object().expect("a serialised entry is an object"));
+        let written =
+            serialize_raw_object(raw.as_object().expect("a serialised entry is an object"));
         assert!(written.contains(r#""BAD": 5"#), "{written}");
         assert!(written.contains(r#""X-Bad": null"#), "{written}");
         assert!(written.contains(r#""auth": "basic""#), "{written}");
-        assert!(written.contains(r#""protocolVersion": "2025-06-18""#), "{written}");
+        assert!(
+            written.contains(r#""protocolVersion": "2025-06-18""#),
+            "{written}"
+        );
     }
 
     /// A well-formed record is byte-identical to the `BTreeMap<String, String>` it replaced, and
@@ -5538,7 +6287,10 @@ mod tests {
         assert_eq!(env.unhashable(), None);
         assert_eq!(
             env.values(),
-            &BTreeMap::from([("A".to_string(), "1".to_string()), ("B".to_string(), "2".to_string())])
+            &BTreeMap::from([
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string())
+            ])
         );
         // `Deref` is the whole compatibility story: `.get`, `.len`, `.iter` all reach the strings.
         assert_eq!(env.get("A").map(String::as_str), Some("1"));
@@ -5579,7 +6331,9 @@ mod tests {
             .find(|d| d.server.as_deref() == Some("bad"))
             .expect("a named diagnostic");
         assert!(
-            diagnostic.message.contains("OAuth clientId must be a string"),
+            diagnostic
+                .message
+                .contains("OAuth clientId must be a string"),
             "{}",
             diagnostic.message
         );
@@ -5599,7 +6353,10 @@ mod tests {
         assert!(loaded.config.mcp_servers.contains_key("off"));
         assert!(loaded.config.mcp_servers.contains_key("on"));
         assert!(
-            loaded.diagnostics.iter().all(|d| !d.message.contains("OAuth ")),
+            loaded
+                .diagnostics
+                .iter()
+                .all(|d| !d.message.contains("OAuth ")),
             "{:?}",
             loaded.diagnostics
         );
@@ -5687,7 +6444,10 @@ mod tests {
         // the constant but forgotten in `merge_entry` shows up here as a leftover key.
         let serialized = serde_json::to_string(&merged).unwrap();
         for field in URL_BOUND_AUTH_FIELDS {
-            assert!(!serialized.contains(field), "{field} survived a url repoint: {serialized}");
+            assert!(
+                !serialized.contains(field),
+                "{field} survived a url repoint: {serialized}"
+            );
         }
         assert_eq!(URL_BOUND_AUTH_FIELDS.len(), 4);
     }

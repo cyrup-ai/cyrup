@@ -24,14 +24,19 @@
 //! * `invalidation_is_scoped_to_the_disposed_session` — RED pre-fix for the same reason (its second
 //!   host is only invalidated by the drop).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{SessionBuilder, SessionConfig};
-use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -46,7 +51,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -57,7 +66,10 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 
 async fn build(fx: &Fixture) -> crate::AgentSession {
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    SessionBuilder::new(faux, base_config(fx)).build().await.unwrap()
+    SessionBuilder::new(faux, base_config(fx))
+        .build()
+        .await
+        .unwrap()
 }
 
 /// The ordered path (already green — see the module doc).
@@ -67,7 +79,11 @@ async fn dispose_invalidates_the_extension_host() {
     let session = build(&fx).await;
     let host = session.ext_host().clone();
 
-    assert_eq!(host.live_invalidations(), 0, "a fresh session has invalidated nothing");
+    assert_eq!(
+        host.live_invalidations(),
+        0,
+        "a fresh session has invalidated nothing"
+    );
     session.dispose("quit").await;
     assert!(
         host.live_invalidations() >= 1,
@@ -123,13 +139,25 @@ async fn invalidation_is_scoped_to_the_disposed_session() {
 
     a.dispose("new").await;
     assert!(host_a.live_invalidations() >= 1);
-    assert_eq!(host_b.live_invalidations(), 0, "b's instances are untouched by a's teardown");
+    assert_eq!(
+        host_b.live_invalidations(),
+        0,
+        "b's instances are untouched by a's teardown"
+    );
 
     // The outgoing session is still alive here, exactly as it is between `dispose_with` and the
     // last `Arc` clone being released on a replacement path.
     drop(a);
-    assert_eq!(host_b.live_invalidations(), 0, "still untouched after a is dropped");
+    assert_eq!(
+        host_b.live_invalidations(),
+        0,
+        "still untouched after a is dropped"
+    );
 
     drop(b);
-    assert_eq!(host_b.live_invalidations(), 1, "b invalidates on its own drop, and only then");
+    assert_eq!(
+        host_b.live_invalidations(),
+        1,
+        "b invalidates on its own drop, and only then"
+    );
 }

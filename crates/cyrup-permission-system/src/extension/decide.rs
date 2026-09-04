@@ -72,7 +72,10 @@ impl PermissionSystemExtension {
     ) -> HookOutcome {
         let normalized = tool_name.trim();
         if normalized.is_empty() {
-            return HookOutcome::Block { reason: Some(gate::format_missing_tool_name_reason()), terminate: TerminateHint::Unspecified };
+            return HookOutcome::Block {
+                reason: Some(gate::format_missing_tool_name_reason()),
+                terminate: TerminateHint::Unspecified,
+            };
         }
         let agent_name = self.agent_name.as_deref();
 
@@ -87,7 +90,10 @@ impl PermissionSystemExtension {
         // unknown-tool allowlist.
         let registered = self.registered_tool_names().unwrap_or_default();
         if let Some(reason) = gate::check_requested_tool_registration(normalized, &registered) {
-            return HookOutcome::Block { reason: Some(reason), terminate: TerminateHint::Unspecified };
+            return HookOutcome::Block {
+                reason: Some(reason),
+                terminate: TerminateHint::Unspecified,
+            };
         }
 
         // pi `index.ts:2305-2309`: anchor a path-bearing input's resource resolution to the SESSION
@@ -102,7 +108,13 @@ impl PermissionSystemExtension {
         // read-tool policy. `None` = no skill matched → fall through to the external-dir + main checks.
         // The per-call identity every gated layer audits against (pi threads `event.toolCallId` /
         // `toolName` / `input` / `ctx.cwd` / `agentName` into each `writeReviewEntry` by hand).
-        let call = GateCall { call_id, tool_name: normalized, input, cwd: &cwd, agent_name };
+        let call = GateCall {
+            call_id,
+            tool_name: normalized,
+            input,
+            cwd: &cwd,
+            agent_name,
+        };
 
         if normalized == "read"
             && let Some(outcome) = self.resolve_skill_read(&call, ctx).await
@@ -145,7 +157,10 @@ impl PermissionSystemExtension {
                     }),
                 );
                 self.logger.flush();
-                HookOutcome::Block { reason: Some(gate::format_deny_reason(&check, agent_name)), terminate: TerminateHint::Unspecified }
+                HookOutcome::Block {
+                    reason: Some(gate::format_deny_reason(&check, agent_name)),
+                    terminate: TerminateHint::Unspecified,
+                }
             }
             PermissionState::Allow => HookOutcome::Noop,
             PermissionState::Ask => self.resolve_ask(call_id, input, &check, ctx).await,
@@ -167,9 +182,18 @@ impl PermissionSystemExtension {
     /// `Some(HookOutcome)` when a skill matched (a terminal decision, allow via `Noop`), `None` when no
     /// skill matched (the caller falls through to the external-dir + main checks).
     async fn resolve_skill_read(&self, call: &GateCall<'_>, ctx: &HostCtx) -> Option<HookOutcome> {
-        let GateCall { call_id, tool_name, input, cwd, agent_name } = *call;
-        let read_path =
-            to_record(input).get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let GateCall {
+            call_id,
+            tool_name,
+            input,
+            cwd,
+            agent_name,
+        } = *call;
+        let read_path = to_record(input)
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let normalized_read_path = common::normalize_path_for_comparison(&read_path, cwd);
 
         // A tracked-entry match (pi `findSkillPathMatch`), else an inferred skills-root entry whose
@@ -191,7 +215,11 @@ impl PermissionSystemExtension {
                     PermissionState::Ask,
                 )?;
                 inferred.state = guard(&self.manager)
-                    .check_permission("skill", &json!({ "name": inferred.name.clone() }), agent_name)
+                    .check_permission(
+                        "skill",
+                        &json!({ "name": inferred.name.clone() }),
+                        agent_name,
+                    )
                     .state;
                 inferred
             }
@@ -217,7 +245,10 @@ impl PermissionSystemExtension {
                         }),
                     );
                     return Some(HookOutcome::Block {
-                        reason: Some(skill::format_skill_path_deny_reason(&read_skill, agent_name)),
+                        reason: Some(skill::format_skill_path_deny_reason(
+                            &read_skill,
+                            agent_name,
+                        )),
                         terminate: TerminateHint::Unspecified,
                     });
                 }
@@ -289,9 +320,16 @@ impl PermissionSystemExtension {
         path: &str,
         ctx: &HostCtx,
     ) -> Option<HookOutcome> {
-        let GateCall { call_id, tool_name, input, cwd, agent_name } = *call;
+        let GateCall {
+            call_id,
+            tool_name,
+            input,
+            cwd,
+            agent_name,
+        } = *call;
         let ext_input = json!({ "path": path, "cwd": cwd });
-        let raw = guard(&self.manager).check_permission("external_directory", &ext_input, agent_name);
+        let raw =
+            guard(&self.manager).check_permission("external_directory", &ext_input, agent_name);
         // pi `:2319-2321`: the session overlay is applied ONLY on an `ask` result.
         let ext_check = if raw.state == PermissionState::Ask {
             let session_rules = guard(&self.session_approvals).get_rules();
@@ -374,7 +412,8 @@ impl PermissionSystemExtension {
                         // pi `persistPatternApprovalDecision` (`:2391`): an approved-Always persists an
                         // allow rule to the SESSION store, then the call FALLS THROUGH to the main check.
                         if d.state == PermissionDecisionState::Always {
-                            let subject = gate::get_pattern_approval_subject(&ext_check, &ext_input);
+                            let subject =
+                                gate::get_pattern_approval_subject(&ext_check, &ext_input);
                             if !subject.is_empty() {
                                 guard(&self.session_approvals)
                                     .approve_always(&ext_check.tool_name, &subject);

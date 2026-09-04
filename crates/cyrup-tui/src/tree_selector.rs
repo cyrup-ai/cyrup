@@ -10,15 +10,15 @@
 //! events but no flat-tree *getter* yet — tracked in the residual ledger); the **rendering + fold +
 //! filter + connector** engine that is the bulk of the 47KB is built and tested here.
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap, TreeAction, TreeKeymap};
-use crate::selector::{border_rule, centered_window, Selector, SelectorOutcome};
+use crate::selector::{Selector, SelectorOutcome, border_rule, centered_window};
 use crate::theme::UiTheme;
 
 /// pi's floor on the `/tree` body window — the `5` in
@@ -184,7 +184,13 @@ impl TreeEntryRole {
     /// `:851` `return isSelected ? theme.bold(result) : result;` — the selected row is **bolded**,
     /// keeping every per-role colour. It is not repainted in `accent`.
     fn spans(self, label: &str, is_sel: bool, theme: &UiTheme) -> Vec<Span<'static>> {
-        let bold = |s: Style| if is_sel { s.add_modifier(Modifier::BOLD) } else { s };
+        let bold = |s: Style| {
+            if is_sel {
+                s.add_modifier(Modifier::BOLD)
+            } else {
+                s
+            }
+        };
         let split = |prefix_len: usize, prefix_style: Style, body_style: Style| {
             let (prefix, body) = label.split_at(prefix_len.min(label.len()));
             let mut out = vec![Span::styled(prefix.to_string(), bold(prefix_style))];
@@ -195,15 +201,17 @@ impl TreeEntryRole {
         };
         let whole = |style: Style| vec![Span::styled(label.to_string(), bold(style))];
         match self {
-            TreeEntryRole::User => {
-                split("user: ".len(), theme.accent_style(), theme.base_style())
-            }
-            TreeEntryRole::Assistant => {
-                split("assistant: ".len(), theme.success_style(), theme.base_style())
-            }
-            TreeEntryRole::AssistantPlaceholder => {
-                split("assistant: ".len(), theme.success_style(), theme.muted_style())
-            }
+            TreeEntryRole::User => split("user: ".len(), theme.accent_style(), theme.base_style()),
+            TreeEntryRole::Assistant => split(
+                "assistant: ".len(),
+                theme.success_style(),
+                theme.base_style(),
+            ),
+            TreeEntryRole::AssistantPlaceholder => split(
+                "assistant: ".len(),
+                theme.success_style(),
+                theme.muted_style(),
+            ),
             TreeEntryRole::ToolResult => whole(theme.muted_style()),
             TreeEntryRole::Bash => whole(theme.dim_style()),
             // `:819` is a bare `theme.fg("customMessageLabel", …)`. The bold that
@@ -212,13 +220,17 @@ impl TreeEntryRole {
             // and there is no such wrapper here, so it is removed rather than inherited. (`:851`
             // adds bold back on the selected row, which is a different thing and applies to every
             // role alike.)
-            TreeEntryRole::CustomMessage => {
-                whole(theme.custom_message_label_style().remove_modifier(Modifier::BOLD))
-            }
+            TreeEntryRole::CustomMessage => whole(
+                theme
+                    .custom_message_label_style()
+                    .remove_modifier(Modifier::BOLD),
+            ),
             TreeEntryRole::Compaction => whole(theme.border_accent_style()),
-            TreeEntryRole::BranchSummary => {
-                split("branch summary: ".len(), theme.warning_style(), theme.base_style())
-            }
+            TreeEntryRole::BranchSummary => split(
+                "branch summary: ".len(),
+                theme.warning_style(),
+                theme.base_style(),
+            ),
             TreeEntryRole::Dim => whole(theme.dim_style()),
             TreeEntryRole::Plain => whole(theme.base_style()),
         }
@@ -469,7 +481,10 @@ impl TreeSelector {
     /// The currently-highlighted node's entry id, if any.
     pub fn selected_id(&self) -> Option<String> {
         let visible = self.visible_indices();
-        visible.get(self.selected).and_then(|&i| self.nodes.get(i)).map(|n| n.id.clone())
+        visible
+            .get(self.selected)
+            .and_then(|&i| self.nodes.get(i))
+            .map(|n| n.id.clone())
     }
 
     /// Move the highlight to `id` if it is currently visible — Pi's `showTreeSelector(entryId)`
@@ -609,7 +624,11 @@ impl TreeSelector {
     /// returns to `default`; otherwise it selects that mode. `app.tree.filter.default` is the one
     /// arm that is not a toggle (`:1036-1038`).
     fn toggle_filter_mode(&mut self, mode: FilterMode) {
-        let next = if self.filter == mode { FilterMode::Default } else { mode };
+        let next = if self.filter == mode {
+            FilterMode::Default
+        } else {
+            mode
+        };
         self.apply_filter_mode(next);
     }
 
@@ -624,7 +643,11 @@ impl TreeSelector {
             FilterMode::All,
         ];
         let cur = MODES.iter().position(|m| *m == self.filter).unwrap_or(0);
-        let next = if forward { (cur + 1) % MODES.len() } else { (cur + MODES.len() - 1) % MODES.len() };
+        let next = if forward {
+            (cur + 1) % MODES.len()
+        } else {
+            (cur + MODES.len() - 1) % MODES.len()
+        };
         // `.get()` rather than `MODES[next]`: the index is already in range by construction (`% len`),
         // but the workspace denies `clippy::indexing_slicing` and this line was tripping it.
         if let Some(mode) = MODES.get(next) {
@@ -639,8 +662,10 @@ impl TreeSelector {
     /// pre-fill — the user types the new label from scratch.
     fn begin_label_edit(&mut self) {
         if let Some(entry_id) = self.selected_id() {
-            self.label_edit =
-                Some(LabelEdit { entry_id, input: crate::text_input::Input::new() });
+            self.label_edit = Some(LabelEdit {
+                entry_id,
+                input: crate::text_input::Input::new(),
+            });
         }
     }
 
@@ -662,7 +687,9 @@ impl TreeSelector {
     fn handle_label_edit(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
         match keymap.action_for(key) {
             Some(SelectAction::Confirm) => {
-                let Some(edit) = self.label_edit.take() else { return SelectorOutcome::Redraw };
+                let Some(edit) = self.label_edit.take() else {
+                    return SelectorOutcome::Redraw;
+                };
                 let label = edit.input.value().trim().to_string();
                 self.update_node_label(&edit.entry_id, !label.is_empty());
                 SelectorOutcome::Apply(format!("{}{}{}", edit.entry_id, crate::FIELD_SEP, label))
@@ -674,7 +701,9 @@ impl TreeSelector {
             // "everything printable types into the buffer" is now the whole shared editing
             // surface — word motion, kill ring, undo and paste included.
             _ => {
-                let Some(edit) = self.label_edit.as_mut() else { return SelectorOutcome::Redraw };
+                let Some(edit) = self.label_edit.as_mut() else {
+                    return SelectorOutcome::Redraw;
+                };
                 match edit.input.handle_key(key) {
                     crate::text_input::InputOutcome::Ignored => SelectorOutcome::Ignored,
                     _ => SelectorOutcome::Redraw,
@@ -686,7 +715,12 @@ impl TreeSelector {
     /// The label-input body lines (`LabelInput.render`, `tree-selector.ts:1256-1270`): a muted prompt,
     /// the live buffer with a visible caret, and the save/cancel hint — shown in the tree body while a
     /// rename is in progress.
-    fn label_edit_lines(&self, edit: &LabelEdit, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+    fn label_edit_lines(
+        &self,
+        edit: &LabelEdit,
+        width: u16,
+        theme: &UiTheme,
+    ) -> Vec<Line<'static>> {
         // S31: `LabelInput.render` splices the `Input`'s own line in behind a literal two-space
         // `indent` — `lines.push(...this.input.render(availableWidth).map(line => `${indent}${line}`))`
         // (`tree-selector.ts:1299,1302`) — so the row reads `"  " + "> " + value`. cyrup drew the
@@ -700,7 +734,10 @@ impl TreeSelector {
             theme,
         ));
         vec![
-            Line::from(Span::styled("  Label (empty to remove):", theme.muted_style())),
+            Line::from(Span::styled(
+                "  Label (empty to remove):",
+                theme.muted_style(),
+            )),
             Line::from(input),
             Line::from(Span::styled("  enter save   esc cancel", theme.dim_style())),
         ]
@@ -721,7 +758,9 @@ impl TreeSelector {
     /// whole prefix is then styled `theme.fg("dim", prefix)` (`:746`), which is why the fold cell is
     /// dim here rather than accent — only the connector-less fallback marker at `:734` is accent.
     fn connector_prefix(&self, idx: usize) -> String {
-        let Some(node) = self.nodes.get(idx) else { return String::new() };
+        let Some(node) = self.nodes.get(idx) else {
+            return String::new();
+        };
         if node.depth == 0 {
             return String::new();
         }
@@ -735,7 +774,11 @@ impl TreeSelector {
                 prefix.push_str("   ");
             }
         }
-        prefix.push(if self.is_last_child(idx) { '└' } else { '├' });
+        prefix.push(if self.is_last_child(idx) {
+            '└'
+        } else {
+            '├'
+        });
         // `:722` verbatim — `isFolded` is tested FIRST and independently of `foldable`.
         prefix.push(if node.folded {
             '⊞'
@@ -751,7 +794,9 @@ impl TreeSelector {
     /// Whether the node at `idx` is the last child of its parent (no later node at the same depth
     /// before a shallower node).
     fn is_last_child(&self, idx: usize) -> bool {
-        let Some(d) = self.nodes.get(idx).map(|n| n.depth) else { return true };
+        let Some(d) = self.nodes.get(idx).map(|n| n.depth) else {
+            return true;
+        };
         for n in self.nodes.iter().skip(idx + 1) {
             if n.depth < d {
                 return true;
@@ -794,7 +839,9 @@ impl TreeSelector {
         let (start, end) = centered_window(self.selected, visible.len(), self.max_visible);
         let mut lines = Vec::with_capacity(end.saturating_sub(start));
         for (row, &idx) in visible.iter().enumerate().take(end).skip(start) {
-            let Some(node) = self.nodes.get(idx) else { continue };
+            let Some(node) = self.nodes.get(idx) else {
+                continue;
+            };
             let is_sel = row == self.selected;
             let mut spans: Vec<Span<'static>> = Vec::new();
             // Cursor gutter — `tree-selector.ts:689`:
@@ -826,16 +873,25 @@ impl TreeSelector {
                 spans.push(Span::styled("⊞ ", theme.accent_style()));
             }
             // Glyph + label.
-            let glyph_style = if is_sel { theme.accent_style() } else { theme.base_style() };
+            let glyph_style = if is_sel {
+                theme.accent_style()
+            } else {
+                theme.base_style()
+            };
             spans.push(Span::styled(format!("{} ", node.kind.glyph()), glyph_style));
             // S24(b): the entry text is coloured PER ROLE, with a coloured role prefix, and the
             // selected row is only BOLDED (`:851`), never repainted `accent` — see
             // [`TreeEntryRole`].
-            spans.extend(
-                TreeEntryRole::classify(node.kind, &node.label).spans(&node.label, is_sel, theme),
-            );
+            spans.extend(TreeEntryRole::classify(node.kind, &node.label).spans(
+                &node.label,
+                is_sel,
+                theme,
+            ));
             if node.has_label {
-                spans.push(Span::styled("  ☆labeled".to_string(), theme.warning_style()));
+                spans.push(Span::styled(
+                    "  ☆labeled".to_string(),
+                    theme.warning_style(),
+                ));
             }
             // Right-aligned label-timestamp column.
             //
@@ -869,10 +925,13 @@ impl TreeSelector {
                 right.push_str(t);
             }
             if !right.is_empty() {
-                let pad =
-                    (width as usize).saturating_sub(left_len + Span::raw(&right).width() + 1);
+                let pad = (width as usize).saturating_sub(left_len + Span::raw(&right).width() + 1);
                 spans.push(Span::raw(" ".repeat(pad + 1)));
-                let style = if is_sel { theme.accent_style() } else { theme.dim_style() };
+                let style = if is_sel {
+                    theme.accent_style()
+                } else {
+                    theme.dim_style()
+                };
                 spans.push(Span::styled(right, style));
             }
             // S2/SYS-4: the selected row carries the `selectedBg` fill. `tree-selector.ts:750-753`
@@ -910,7 +969,10 @@ impl TreeSelector {
                 theme.accent_style().add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("   Filter: {}   ({visible}/{total}){label_time}", self.filter.label()),
+                format!(
+                    "   Filter: {}   ({visible}/{total}){label_time}",
+                    self.filter.label()
+                ),
                 theme.dim_style(),
             ),
         ])
@@ -919,10 +981,15 @@ impl TreeSelector {
     /// pi's `SearchLine.render` (`tree-selector.ts:1165-1172`): the muted `Type to search:` prompt
     /// unconditionally, plus the live query in `accent` when there is one.
     fn search_line(&self, theme: &UiTheme) -> Line<'static> {
-        let mut spans =
-            vec![Span::styled("  Type to search:".to_string(), theme.dim_style())];
+        let mut spans = vec![Span::styled(
+            "  Type to search:".to_string(),
+            theme.dim_style(),
+        )];
         if !self.search_query.is_empty() {
-            spans.push(Span::styled(format!(" {}", self.search_query), theme.accent_style()));
+            spans.push(Span::styled(
+                format!(" {}", self.search_query),
+                theme.accent_style(),
+            ));
         }
         Line::from(spans)
     }
@@ -937,7 +1004,10 @@ impl TreeSelector {
     fn help_text(&self) -> String {
         let mut items: Vec<String> = vec!["↑/↓ move".to_string(), "←/→ page".to_string()];
         let pair = |a: TreeAction, b: TreeAction| -> Option<String> {
-            match (self.keymap.first_key_label(a), self.keymap.first_key_label(b)) {
+            match (
+                self.keymap.first_key_label(a),
+                self.keymap.first_key_label(b),
+            ) {
                 (Some(x), Some(y)) => Some(format!("{x}/{y}")),
                 (Some(x), None) | (None, Some(x)) => Some(x),
                 (None, None) => None,
@@ -954,7 +1024,10 @@ impl TreeSelector {
         if let Some(k) = self.keymap.first_key_label(TreeAction::EditLabel) {
             items.push(format!("{k} label"));
         }
-        if let Some(k) = self.keymap.first_key_label(TreeAction::ToggleLabelTimestamp) {
+        if let Some(k) = self
+            .keymap
+            .first_key_label(TreeAction::ToggleLabelTimestamp)
+        {
             items.push(format!("{k} label time"));
         }
         let filters: Vec<String> = [
@@ -970,9 +1043,10 @@ impl TreeSelector {
         if !filters.is_empty() {
             items.push(format!("filters {}", filters.join("/")));
         }
-        if let Some(k) =
-            pair(TreeAction::FilterCycleForward, TreeAction::FilterCycleBackward)
-        {
+        if let Some(k) = pair(
+            TreeAction::FilterCycleForward,
+            TreeAction::FilterCycleBackward,
+        ) {
             items.push(format!("cycle {k}"));
         }
         format!(" {}", items.join(" · "))
@@ -996,7 +1070,10 @@ impl Selector for TreeSelector {
             // WINDOWED at `max_visible`, matching what [`Self::rows`] actually emits
             // (`tree-selector.ts:673-681`); an unbounded `visible_indices().len()` asked for one
             // row per session entry and could never be granted.
-            self.visible_indices().len().min(self.max_visible).min(u16::MAX as usize) as u16
+            self.visible_indices()
+                .len()
+                .min(self.max_visible)
+                .min(u16::MAX as usize) as u16
         };
         body.saturating_add(6)
     }
@@ -1147,9 +1224,9 @@ impl Selector for TreeSelector {
                 // CONTROL/ALT/SUPER is a chord, not text, so it is not search input either.
                 if let KeyCode::Char(c) = key.code
                     && !c.is_control()
-                    && !key.modifiers.intersects(
-                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                    )
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
                 {
                     self.search_query.push(c);
                     self.clear_folds();
@@ -1171,7 +1248,9 @@ impl Selector for TreeSelector {
     }
 
     fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
-        let Some(edit) = self.label_edit.as_mut() else { return SelectorOutcome::Ignored };
+        let Some(edit) = self.label_edit.as_mut() else {
+            return SelectorOutcome::Ignored;
+        };
         edit.input.paste(text);
         SelectorOutcome::Redraw
     }

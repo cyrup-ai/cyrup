@@ -1,9 +1,14 @@
 //! Custom-provider registration fidelity (arch-08 §5.6; A-08-7). Exercises API-key resolution
 //! (literal / `$ENV`/`${ENV}` / `!command`) and the [`ProviderHub`] defer→bind→flush lifecycle (Pi
 //! `registerProvider`/`bindCore`), including post-bind immediate upsert and `unregisterProvider`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
-use crate::provider::{resolve_api_key, ModelRegistrySink, ProviderHub, ProviderRegistration};
+use crate::provider::{ModelRegistrySink, ProviderHub, ProviderRegistration, resolve_api_key};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +29,10 @@ impl ModelRegistrySink for FakeSink {
 #[test]
 fn api_key_resolution_literal_env_command() {
     // literal
-    assert_eq!(resolve_api_key(Some("sk-literal")).unwrap(), Some("sk-literal".to_string()));
+    assert_eq!(
+        resolve_api_key(Some("sk-literal")).unwrap(),
+        Some("sk-literal".to_string())
+    );
     // absent
     assert_eq!(resolve_api_key(None).unwrap(), None);
     assert_eq!(resolve_api_key(Some("")).unwrap(), None);
@@ -38,9 +46,15 @@ fn api_key_resolution_literal_env_command() {
         );
     }
     // unknown var expands to empty (Pi behavior).
-    assert_eq!(resolve_api_key(Some("$CYRUP_DEFINITELY_UNSET_VAR_XZ")).unwrap(), Some(String::new()));
+    assert_eq!(
+        resolve_api_key(Some("$CYRUP_DEFINITELY_UNSET_VAR_XZ")).unwrap(),
+        Some(String::new())
+    );
     // `!command`: stdout, trimmed.
-    assert_eq!(resolve_api_key(Some("!printf secret123")).unwrap(), Some("secret123".to_string()));
+    assert_eq!(
+        resolve_api_key(Some("!printf secret123")).unwrap(),
+        Some("secret123".to_string())
+    );
 }
 
 /// PROV-001, extension surface: Pi's `ProviderModelConfig.cost` is a full `ModelCost`, tiers
@@ -85,7 +99,10 @@ fn registered_model_carries_long_context_pricing_tiers_across_the_seam() {
     assert_eq!(tiers[0].input_tokens_above, 272_000);
 
     // Observable consequence: a 300k-token request bills at the tier rate, not the base rate.
-    let mut usage = cyrup_core::Usage { input: 300_000, ..Default::default() };
+    let mut usage = cyrup_core::Usage {
+        input: 300_000,
+        ..Default::default()
+    };
     cyrup_provider::apply_cost(cost, &mut usage);
     assert!(
         (usage.cost.input - 1.5).abs() < 1e-9,
@@ -119,16 +136,23 @@ fn provider_hub_defers_until_bind_then_flushes() {
     hub.bind(sink.clone());
     assert!(hub.is_bound());
     assert!(hub.pending_ids().is_empty());
-    assert_eq!(sink.upserts.lock().unwrap().clone(), vec!["acme".to_string()]);
+    assert_eq!(
+        sink.upserts.lock().unwrap().clone(),
+        vec!["acme".to_string()]
+    );
 
     // Post-bind registration upserts immediately (no queue).
-    hub.register("beta".into(), &json!({ "name": "Beta" })).unwrap();
+    hub.register("beta".into(), &json!({ "name": "Beta" }))
+        .unwrap();
     assert_eq!(sink.upserts.lock().unwrap().len(), 2);
     assert!(hub.pending_ids().is_empty());
 
     // unregister notifies the sink + drops the registration (Pi unregisterProvider).
     assert!(hub.unregister("acme"));
-    assert_eq!(sink.removes.lock().unwrap().clone(), vec!["acme".to_string()]);
+    assert_eq!(
+        sink.removes.lock().unwrap().clone(),
+        vec!["acme".to_string()]
+    );
     assert!(hub.get("acme").is_none());
     assert!(!hub.unregister("acme"), "second unregister is a no-op");
 }
@@ -152,11 +176,18 @@ fn ext051_oauth_is_subscription_is_readable_on_a_guest_provider() {
         &json!({ "name": "Metered", "oauth": { "name": "Metered Login" } }),
     )
     .unwrap();
-    hub.register("keyed".into(), &json!({ "name": "Keyed", "apiKey": "sk-x" })).unwrap();
+    hub.register(
+        "keyed".into(),
+        &json!({ "name": "Keyed", "apiKey": "sk-x" }),
+    )
+    .unwrap();
 
     let sub = hub.get("sub").expect("registered");
     assert!(sub.has_oauth());
-    assert!(sub.oauth_is_subscription(), "a declared isSubscription must reach the host typed");
+    assert!(
+        sub.oauth_is_subscription(),
+        "a declared isSubscription must reach the host typed"
+    );
 
     let metered = hub.get("metered").expect("registered");
     assert!(metered.has_oauth());
@@ -167,5 +198,8 @@ fn ext051_oauth_is_subscription_is_readable_on_a_guest_provider() {
 
     let keyed = hub.get("keyed").expect("registered");
     assert!(!keyed.has_oauth());
-    assert!(!keyed.oauth_is_subscription(), "no oauth block at all is not a subscription");
+    assert!(
+        !keyed.oauth_is_subscription(),
+        "no oauth block at all is not a subscription"
+    );
 }

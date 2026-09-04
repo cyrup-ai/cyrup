@@ -105,8 +105,12 @@ pub(crate) async fn probe_model(
     match spawn {
         Some(command) => probe_model_with(command, full_id, PROBE_TIMEOUT_MS).await,
         None => {
-            probe_model_with(&crate::spawn::resolve_spawn_command(), full_id, PROBE_TIMEOUT_MS)
-                .await
+            probe_model_with(
+                &crate::spawn::resolve_spawn_command(),
+                full_id,
+                PROBE_TIMEOUT_MS,
+            )
+            .await
         }
     }
 }
@@ -174,7 +178,10 @@ async fn probe_model_with(
                 } else {
                     stdout
                 };
-                ProbeOutcome { status: ProbeStatus::Ok, message: Some(message) }
+                ProbeOutcome {
+                    status: ProbeStatus::Ok,
+                    message: Some(message),
+                }
             } else {
                 let status = resolve_probe_status(combined, false);
                 let message = if combined.is_empty() {
@@ -188,7 +195,10 @@ async fn probe_model_with(
                 } else {
                     combined.to_string()
                 };
-                ProbeOutcome { status, message: Some(message) }
+                ProbeOutcome {
+                    status,
+                    message: Some(message),
+                }
             }
         }
     }
@@ -203,7 +213,12 @@ pub(crate) fn probe_status_is_usable(status: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use std::path::PathBuf;
@@ -215,9 +230,18 @@ mod tests {
     fn resolve_probe_status_matches_pi_precedence() {
         assert_eq!(resolve_probe_status("anything", true), ProbeStatus::Timeout);
         assert_eq!(resolve_probe_status("", false), ProbeStatus::Error);
-        assert_eq!(resolve_probe_status("401 Unauthorized: bad API key", false), ProbeStatus::Auth);
-        assert_eq!(resolve_probe_status("Error: model not found", false), ProbeStatus::Unavailable);
-        assert_eq!(resolve_probe_status("connection reset by peer", false), ProbeStatus::Error);
+        assert_eq!(
+            resolve_probe_status("401 Unauthorized: bad API key", false),
+            ProbeStatus::Auth
+        );
+        assert_eq!(
+            resolve_probe_status("Error: model not found", false),
+            ProbeStatus::Unavailable
+        );
+        assert_eq!(
+            resolve_probe_status("connection reset by peer", false),
+            ProbeStatus::Error
+        );
     }
 
     /// pi `catalogModelIsUsable` (profiles.ts:417-419): only `unavailable`/`auth`/`timeout`/`error`
@@ -261,5 +285,4 @@ mod tests {
         let timeout_outcome = probe_model_with(&sleeper, "irrelevant/model", 50).await;
         assert_eq!(timeout_outcome.status, ProbeStatus::Timeout);
     }
-
 }

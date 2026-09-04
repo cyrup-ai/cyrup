@@ -69,18 +69,17 @@ pub(crate) mod models;
 mod tool;
 mod wait_tool;
 
+pub use executor::SubagentExecutor;
 pub use executor::requests::{
     BackgroundSingleRequest, BackgroundStepsSpec, ForegroundRunRequest, GraphRunOutcome,
     SingleRunOverrides, StatusViewSelector,
 };
-pub use executor::SubagentExecutor;
-pub use host::registration::{
-    is_installed, is_installed_with, registration_mode_from_env, resolve_registration_mode,
-    subagent_extension_for,
-    subagent_extension_for_env, subagent_extension_for_env_with_channels, INSTALL_ENV_VAR,
-    RegistrationMode,
-};
 pub use host::SubagentsExtension;
+pub use host::registration::{
+    INSTALL_ENV_VAR, RegistrationMode, is_installed, is_installed_with, registration_mode_from_env,
+    resolve_registration_mode, subagent_extension_for, subagent_extension_for_env,
+    subagent_extension_for_env_with_channels,
+};
 pub use tool::SubagentTool;
 pub use wait_tool::WaitTool;
 

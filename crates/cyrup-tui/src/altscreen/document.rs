@@ -71,7 +71,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use ratatui::text::Line;
 
 use crate::theme::UiTheme;
-use crate::transcript::{entry_lines, wrap_line, wrapped_height, Entry, ImageOpts, TranscriptView};
+use crate::transcript::{Entry, ImageOpts, TranscriptView, entry_lines, wrap_line, wrapped_height};
 
 /// Render the whole retained document at `width` — pi's `TuiBase.render(width)` (`tui.ts:235-245`),
 /// with `child.render(width)` spelled [`crate::transcript::entry_lines`].
@@ -218,7 +218,11 @@ pub(super) fn document_key(
 /// A caller that keeps the previous map beside the cached rows (which [`document_key`] already
 /// obliges it to) therefore has this for free. Deriving it from the *new* map instead cannot work:
 /// `row_starts[0]` of a freshly built document is `0` by construction, whatever was trimmed.
-pub(super) fn rows_dropped(previous: &[usize], entries_dropped: u64, previous_rows: usize) -> usize {
+pub(super) fn rows_dropped(
+    previous: &[usize],
+    entries_dropped: u64,
+    previous_rows: usize,
+) -> usize {
     let dropped = usize::try_from(entries_dropped).unwrap_or(usize::MAX);
     match previous.get(dropped) {
         Some(row) => *row,

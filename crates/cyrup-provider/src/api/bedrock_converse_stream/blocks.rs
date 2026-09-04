@@ -1,13 +1,13 @@
 //! Streaming-decode state (pi's `output` accumulation, `bedrock-converse-stream.ts:114-132`).
 
+use crate::api::content_cache::ContentCache;
 use crate::model::Model;
 use crate::usage::compute_cost;
-use crate::api::content_cache::ContentCache;
 use crate::utils::provider_plumbing::now_millis;
-use std::sync::Arc;
 use cyrup_core::{
     ApiId, AssistantMessage, Content, LazyArgs, SharedStr, StopReason, ToolCall, ToolCallId, Usage,
 };
+use std::sync::Arc;
 
 /// One in-progress content block, keyed by Bedrock's `contentBlockIndex` (pi's `Block` type,
 /// `bedrock-converse-stream.ts:102`). `index` and `partial_json` are the streaming scratch fields

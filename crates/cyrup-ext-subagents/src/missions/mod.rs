@@ -54,24 +54,24 @@ pub mod types;
 pub mod workflow_state;
 
 pub use actions::{
-    handle_mission_action, validate_mission_launch, MissionAction, MissionActionContext,
-    MissionActionOutcome, MissionActionParams, MissionLaunchInput, MISSION_ACTIONS,
+    MISSION_ACTIONS, MissionAction, MissionActionContext, MissionActionOutcome,
+    MissionActionParams, MissionLaunchInput, handle_mission_action, validate_mission_launch,
 };
-pub use goal_driver::{collect_goal_continuation_notices, GoalContinuationNotice, RetainedChild};
+pub use goal_driver::{GoalContinuationNotice, RetainedChild, collect_goal_continuation_notices};
 pub use lifecycle::{
+    LaunchOutcome, MISSION_BINDING_FILE, MissionLaunchBinding, MissionLaunchParams,
     attach_mission_to_launch_result, prepare_mission_launch, read_mission_binding,
-    sync_mission_from_async_completion, LaunchOutcome, MissionLaunchBinding, MissionLaunchParams,
-    MISSION_BINDING_FILE,
+    sync_mission_from_async_completion,
 };
 pub use store::{
-    create_mission, list_global_missions, list_missions, mission_record_path, parse_mission_record,
-    read_mission, resolve_mission_store_location, update_mission, validate_mission_id,
-    validate_mission_id_str, validate_mission_store_config, DEFAULT_TERMINAL_MISSION_RETENTION,
+    DEFAULT_TERMINAL_MISSION_RETENTION, create_mission, list_global_missions, list_missions,
+    mission_record_path, parse_mission_record, read_mission, resolve_mission_store_location,
+    update_mission, validate_mission_id, validate_mission_id_str, validate_mission_store_config,
 };
 pub use types::*;
 pub use workflow_state::{
-    create_mission_workflow_state, mission_state_path, MissionWorkflowState,
-    MISSION_STATE_MAX_BYTES,
+    MISSION_STATE_MAX_BYTES, MissionWorkflowState, create_mission_workflow_state,
+    mission_state_path,
 };
 
 use std::path::{Path, PathBuf};
@@ -116,7 +116,10 @@ impl MissionError {
 
     /// Build an [`MissionError::Io`] tagged with the path it happened on.
     pub(crate) fn io(path: &Path, source: std::io::Error) -> Self {
-        Self::Io { path: path.to_string_lossy().into_owned(), source }
+        Self::Io {
+            path: path.to_string_lossy().into_owned(),
+            source,
+        }
     }
 
     /// `true` for [`Self::NotFound`] — pi's `error instanceof MissionNotFoundError`
@@ -156,4 +159,3 @@ pub(crate) fn write_private_atomic_json<T: serde::Serialize>(
 pub(crate) fn format_iso8601_millis(ms: i64) -> String {
     crate::background::run_status::format_iso8601_millis(ms)
 }
-

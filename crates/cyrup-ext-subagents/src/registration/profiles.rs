@@ -55,7 +55,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-
 use crate::discovery::types::{AgentOverrideConfig, OverrideField, SubagentSettings};
 use crate::error::SubagentError;
 
@@ -553,27 +552,26 @@ pub fn apply_profile_to_settings_file(
     settings_path: &Path,
     profile: &NamedProfile,
 ) -> Result<(), SubagentError> {
-    let mut root: serde_json::Map<String, serde_json::Value> = match std::fs::read_to_string(
-        settings_path,
-    ) {
-        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(serde_json::Value::Object(map)) => map,
-            Ok(_) => {
-                return Err(SubagentError::MalformedSettings(format!(
-                    "settings file {} must contain a JSON object",
-                    settings_path.display()
-                )));
-            }
-            Err(e) => {
-                return Err(SubagentError::MalformedSettings(format!(
-                    "settings file {}: {e}",
-                    settings_path.display()
-                )));
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
-        Err(e) => return Err(SubagentError::Spawn(e)),
-    };
+    let mut root: serde_json::Map<String, serde_json::Value> =
+        match std::fs::read_to_string(settings_path) {
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(serde_json::Value::Object(map)) => map,
+                Ok(_) => {
+                    return Err(SubagentError::MalformedSettings(format!(
+                        "settings file {} must contain a JSON object",
+                        settings_path.display()
+                    )));
+                }
+                Err(e) => {
+                    return Err(SubagentError::MalformedSettings(format!(
+                        "settings file {}: {e}",
+                        settings_path.display()
+                    )));
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+            Err(e) => return Err(SubagentError::Spawn(e)),
+        };
 
     let subagents_value = serde_json::to_value(&profile.subagents).map_err(|e| {
         SubagentError::MalformedSettings(format!("could not serialize profile subagents: {e}"))
@@ -640,10 +638,7 @@ pub fn provider_models_dir(profiles_dir: &Path) -> PathBuf {
 /// # Errors
 ///
 /// Returns [`SubagentError::UnsafePathToken`] if `provider` fails the R-SA-142 allowlist.
-pub fn provider_models_path(
-    profiles_dir: &Path,
-    provider: &str,
-) -> Result<PathBuf, SubagentError> {
+pub fn provider_models_path(profiles_dir: &Path, provider: &str) -> Result<PathBuf, SubagentError> {
     validate_profile_name(provider)?;
     Ok(provider_models_dir(profiles_dir).join(format!("{provider}.models.json")))
 }
@@ -994,8 +989,7 @@ mod tests {
             .expect("stat locked dir")
             .permissions();
         perms.set_mode(0o000);
-        std::fs::set_permissions(&locked_dir, perms.clone())
-            .expect("chmod 000 the locked dir");
+        std::fs::set_permissions(&locked_dir, perms.clone()).expect("chmod 000 the locked dir");
 
         // Restore permissions on scope exit so `tempfile`'s own Drop cleanup can remove the
         // directory regardless of test outcome (a chmod-000 dir cannot be traversed for deletion
@@ -1089,9 +1083,7 @@ mod tests {
         overrides.insert(
             "reviewer".to_string(),
             crate::discovery::types::AgentOverrideConfig {
-                model: crate::discovery::types::OverrideField::Value(
-                    "claude-opus".to_string(),
-                ),
+                model: crate::discovery::types::OverrideField::Value("claude-opus".to_string()),
                 ..Default::default()
             },
         );
@@ -1110,11 +1102,7 @@ mod tests {
             Some("claude-sonnet")
         );
         assert_eq!(
-            loaded
-                .subagents
-                .overrides
-                .get("reviewer")
-                .map(|o| &o.model),
+            loaded.subagents.overrides.get("reviewer").map(|o| &o.model),
             Some(&crate::discovery::types::OverrideField::Value(
                 "claude-opus".to_string()
             ))
@@ -1181,8 +1169,14 @@ mod tests {
         assert_eq!(profile.subagents.overrides.len(), 6);
 
         // scout/delegate -> cheap
-        assert_eq!(override_model(&profile, "scout").as_deref(), Some("prov/cheap-1"));
-        assert_eq!(override_model(&profile, "delegate").as_deref(), Some("prov/cheap-1"));
+        assert_eq!(
+            override_model(&profile, "scout").as_deref(),
+            Some("prov/cheap-1")
+        );
+        assert_eq!(
+            override_model(&profile, "delegate").as_deref(),
+            Some("prov/cheap-1")
+        );
         // researcher -> medium (its two former medium-tier companions, `planner` and
         // `context-builder`, were deleted upstream in `83b9872`)
         assert_eq!(
@@ -1190,9 +1184,18 @@ mod tests {
             Some("prov/medium-1")
         );
         // worker/reviewer/oracle -> strong
-        assert_eq!(override_model(&profile, "worker").as_deref(), Some("prov/strong-1"));
-        assert_eq!(override_model(&profile, "reviewer").as_deref(), Some("prov/strong-1"));
-        assert_eq!(override_model(&profile, "oracle").as_deref(), Some("prov/strong-1"));
+        assert_eq!(
+            override_model(&profile, "worker").as_deref(),
+            Some("prov/strong-1")
+        );
+        assert_eq!(
+            override_model(&profile, "reviewer").as_deref(),
+            Some("prov/strong-1")
+        );
+        assert_eq!(
+            override_model(&profile, "oracle").as_deref(),
+            Some("prov/strong-1")
+        );
 
         // The removed roles must carry NO override at all — a profile that still pinned a model on
         // a role that no longer exists would silently resurrect it in `settings.json`.
@@ -1351,7 +1354,10 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
                 .expect("parse");
         // Sibling top-level key untouched.
-        assert_eq!(written.get("defaultModel").and_then(|v| v.as_str()), Some("openai/gpt-5"));
+        assert_eq!(
+            written.get("defaultModel").and_then(|v| v.as_str()),
+            Some("openai/gpt-5")
+        );
         // subagents replaced wholesale with the profile's 8-agent map.
         let scout = written
             .get("subagents")
@@ -1444,7 +1450,10 @@ mod tests {
             Some(&serde_json::json!("openai-codex/gpt-5.3-codex-spark"))
         );
         // Sibling top-level keys are still untouched.
-        assert_eq!(written.get("defaultModel"), Some(&serde_json::json!("openai/gpt-5")));
+        assert_eq!(
+            written.get("defaultModel"),
+            Some(&serde_json::json!("openai/gpt-5"))
+        );
     }
 
     /// Layer 2 in isolation: a key the profile DOES declare must WIN over the value already on
@@ -1658,9 +1667,11 @@ mod tests {
             .expect("catalog present");
         assert_eq!(read, catalog);
 
-        assert!(read_provider_catalog(tmp.path(), "never-refreshed")
-            .expect("read absent")
-            .is_none());
+        assert!(
+            read_provider_catalog(tmp.path(), "never-refreshed")
+                .expect("read absent")
+                .is_none()
+        );
 
         let day_ms: u64 = 24 * 60 * 60 * 1000;
         // Within the window: fresh.

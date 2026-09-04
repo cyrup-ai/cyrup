@@ -16,15 +16,20 @@
 //! The tests drive the real `ThemeController::sync_with_terminal` with a scripted probe and assert
 //! against the **assembled, rendered buffer** — the light theme's foreground has to reach real
 //! cells and the dark one must not — plus the parser-level contract that decides it.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::cell::RefCell;
 use std::time::Duration;
 
 use crate::{
-    detect_terminal_background_theme, detect_terminal_theme_for_auto, App, ColorMode,
-    DetectionConfidence, NoTerminalProbe, TerminalProbe, TerminalTheme, TerminalThemeSource,
-    ThemeController, UiTheme,
+    App, ColorMode, DetectionConfidence, NoTerminalProbe, TerminalProbe, TerminalTheme,
+    TerminalThemeSource, ThemeController, UiTheme, detect_terminal_background_theme,
+    detect_terminal_theme_for_auto,
 };
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
@@ -42,10 +47,16 @@ struct ScriptedProbe {
 
 impl ScriptedProbe {
     fn background(rgb: (u8, u8, u8)) -> Self {
-        ScriptedProbe { background: Some(rgb), ..Default::default() }
+        ScriptedProbe {
+            background: Some(rgb),
+            ..Default::default()
+        }
     }
     fn color_scheme(scheme: TerminalTheme) -> Self {
-        ScriptedProbe { color_scheme: Some(scheme), ..Default::default() }
+        ScriptedProbe {
+            color_scheme: Some(scheme),
+            ..Default::default()
+        }
     }
 }
 
@@ -62,7 +73,12 @@ impl TerminalProbe for ScriptedProbe {
 
 /// Whether any cell in the assembled buffer carries `color` as its foreground.
 fn any_fg(app: &App<TestBackend>, color: Color) -> bool {
-    app.terminal().backend().buffer().content().iter().any(|c| c.fg == color)
+    app.terminal()
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .any(|c| c.fg == color)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -82,7 +98,10 @@ fn an_osc11_light_background_repaints_the_assembled_app_light() {
 
     let light = UiTheme::builtin("light");
     let dark = UiTheme::builtin("dark");
-    assert_ne!(light.foreground, dark.foreground, "light/dark builtins must differ");
+    assert_ne!(
+        light.foreground, dark.foreground,
+        "light/dark builtins must differ"
+    );
     let light_fg = light.foreground.expect("light theme has a foreground");
     let dark_fg = dark.foreground.expect("dark theme has a foreground");
     assert!(any_fg(&app, dark_fg), "pre-probe boot is the dark fallback");
@@ -96,13 +115,24 @@ fn an_osc11_light_background_repaints_the_assembled_app_light() {
     app.draw().unwrap();
 
     assert_eq!(controller.active_name(), "light");
-    assert_eq!(app.state().theme.name, light.name, "app did not adopt the queried light theme");
-    assert!(any_fg(&app, light_fg), "the light foreground never reached a rendered cell");
+    assert_eq!(
+        app.state().theme.name,
+        light.name,
+        "app did not adopt the queried light theme"
+    );
+    assert!(
+        any_fg(&app, light_fg),
+        "the light foreground never reached a rendered cell"
+    );
     assert!(
         !any_fg(&app, dark_fg),
         "dark palette still painted after a light OSC 11 reply (COLORFGBG-only detection)"
     );
-    assert_eq!(probe.asked.borrow().as_slice(), ["osc11"], "the terminal must actually be queried");
+    assert_eq!(
+        probe.asked.borrow().as_slice(),
+        ["osc11"],
+        "the terminal must actually be queried"
+    );
 }
 
 #[test]
@@ -124,12 +154,20 @@ fn the_terminal_reply_outranks_colorfgbg() {
     // white. Pi asks first and only falls back on failure (`theme.ts:773-787`), so light wins.
     let mut controller = ThemeController::boot_from_env(None);
     let probe = ScriptedProbe::background((0xff, 0xff, 0xff));
-    assert!(controller.sync_with_terminal(&probe, TIMEOUT, "15;0").is_some());
+    assert!(
+        controller
+            .sync_with_terminal(&probe, TIMEOUT, "15;0")
+            .is_some()
+    );
     assert_eq!(controller.active_name(), "light");
 
     // And with no reply, `COLORFGBG` is still honoured: index 15 is white ⇒ light.
     let mut controller = ThemeController::boot_from_env(None);
-    assert!(controller.sync_with_terminal(&NoTerminalProbe, TIMEOUT, "0;15").is_some());
+    assert!(
+        controller
+            .sync_with_terminal(&NoTerminalProbe, TIMEOUT, "0;15")
+            .is_some()
+    );
     assert_eq!(controller.active_name(), "light");
 }
 
@@ -138,12 +176,27 @@ fn an_auto_setting_prefers_the_color_scheme_report() {
     // `detectTerminalThemeForAuto` (`theme.ts:790-801`) tries DSR `?996` FIRST; a terminal that
     // reports `light` picks the light arm without any OSC 11 round trip.
     let mut controller = ThemeController::boot_from_env(Some("light/dark"));
-    assert_eq!(controller.active_name(), "dark", "no hint ⇒ the dark arm at boot");
+    assert_eq!(
+        controller.active_name(),
+        "dark",
+        "no hint ⇒ the dark arm at boot"
+    );
     let probe = ScriptedProbe::color_scheme(TerminalTheme::Light);
     assert!(controller.sync_with_terminal(&probe, TIMEOUT, "").is_some());
-    assert_eq!(controller.active_name(), "light", "auto setting follows the ?997 report");
-    assert!(controller.auto_sync(), "an auto setting arms Pi's color-scheme sync");
-    assert_eq!(probe.asked.borrow().as_slice(), ["dsr996"], "OSC 11 is not needed once ?997 answers");
+    assert_eq!(
+        controller.active_name(),
+        "light",
+        "auto setting follows the ?997 report"
+    );
+    assert!(
+        controller.auto_sync(),
+        "an auto setting arms Pi's color-scheme sync"
+    );
+    assert_eq!(
+        probe.asked.borrow().as_slice(),
+        ["dsr996"],
+        "OSC 11 is not needed once ?997 answers"
+    );
 }
 
 #[test]
@@ -153,7 +206,11 @@ fn an_auto_setting_falls_through_to_osc11_when_dsr_is_unsupported() {
     let probe = ScriptedProbe::background((0xf5, 0xf5, 0xf5));
     assert!(controller.sync_with_terminal(&probe, TIMEOUT, "").is_some());
     assert_eq!(controller.active_name(), "light");
-    assert_eq!(probe.asked.borrow().as_slice(), ["dsr996", "osc11"], "DSR first, then OSC 11");
+    assert_eq!(
+        probe.asked.borrow().as_slice(),
+        ["dsr996", "osc11"],
+        "DSR first, then OSC 11"
+    );
 }
 
 #[test]
@@ -162,8 +219,15 @@ fn an_explicit_setting_is_never_second_guessed() {
     let mut controller = ThemeController::boot_from_env(Some("dark"));
     let probe = ScriptedProbe::background((0xff, 0xff, 0xff));
     assert!(controller.sync_with_terminal(&probe, TIMEOUT, "").is_none());
-    assert_eq!(controller.active_name(), "dark", "an explicit theme is not overridden by the probe");
-    assert!(probe.asked.borrow().is_empty(), "the terminal must not be queried at all");
+    assert_eq!(
+        controller.active_name(),
+        "dark",
+        "an explicit theme is not overridden by the probe"
+    );
+    assert!(
+        probe.asked.borrow().is_empty(),
+        "the terminal must not be queried at all"
+    );
     assert!(!controller.auto_sync());
 }
 
@@ -175,18 +239,29 @@ fn an_explicit_setting_is_never_second_guessed() {
 fn only_a_high_confidence_detection_is_offered_for_persistence() {
     let mut queried = ThemeController::boot_from_env(None);
     queried.sync_with_terminal(&ScriptedProbe::background((0xff, 0xff, 0xff)), TIMEOUT, "");
-    assert_eq!(queried.theme_to_persist(), Some("light"), "an OSC 11 answer is high confidence");
+    assert_eq!(
+        queried.theme_to_persist(),
+        Some("light"),
+        "an OSC 11 answer is high confidence"
+    );
 
     // Nothing answered and no `COLORFGBG` ⇒ Pi's low-confidence `fallback`; never written to disk.
     let mut guessed = ThemeController::boot_from_env(None);
     guessed.sync_with_terminal(&NoTerminalProbe, TIMEOUT, "");
-    assert_eq!(guessed.theme_to_persist(), None, "a fallback guess must not be persisted");
+    assert_eq!(
+        guessed.theme_to_persist(),
+        None,
+        "a fallback guess must not be persisted"
+    );
 }
 
 #[test]
 fn detection_records_pis_source_and_confidence() {
-    let queried =
-        detect_terminal_background_theme(&ScriptedProbe::background((0x28, 0x28, 0x28)), TIMEOUT, "");
+    let queried = detect_terminal_background_theme(
+        &ScriptedProbe::background((0x28, 0x28, 0x28)),
+        TIMEOUT,
+        "",
+    );
     assert_eq!(queried.theme, TerminalTheme::Dark);
     assert_eq!(queried.source, TerminalThemeSource::TerminalBackground);
     assert_eq!(queried.confidence, DetectionConfidence::High);
@@ -204,7 +279,11 @@ fn detection_records_pis_source_and_confidence() {
 
     // The auto path returns the polarity only (Pi `detectTerminalThemeForAuto`).
     assert_eq!(
-        detect_terminal_theme_for_auto(&ScriptedProbe::color_scheme(TerminalTheme::Light), TIMEOUT, ""),
+        detect_terminal_theme_for_auto(
+            &ScriptedProbe::color_scheme(TerminalTheme::Light),
+            TIMEOUT,
+            ""
+        ),
         TerminalTheme::Light
     );
 }
@@ -219,7 +298,14 @@ fn a_silent_terminal_costs_nothing_and_changes_nothing() {
     // where `COLORFGBG` left it, and must not stall the boot.
     let started = std::time::Instant::now();
     let mut controller = ThemeController::boot_from_env(None);
-    assert!(controller.sync_with_terminal(&NoTerminalProbe, Duration::from_secs(5), "").is_none());
+    assert!(
+        controller
+            .sync_with_terminal(&NoTerminalProbe, Duration::from_secs(5), "")
+            .is_none()
+    );
     assert_eq!(controller.active_name(), "dark");
-    assert!(started.elapsed() < Duration::from_secs(1), "a silent terminal must not stall the boot");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a silent terminal must not stall the boot"
+    );
 }

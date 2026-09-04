@@ -23,7 +23,12 @@
 //! [`AuditTrail::detached`] takes, which reaches the identical `write_line`. Directing the trail at
 //! a temp dir by construction tests the same writer with no process-global hazard.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,8 +55,16 @@ fn entries(logs_dir: &Path) -> Vec<(String, String, serde_json::Value)> {
             let value: serde_json::Value =
                 serde_json::from_str(line).expect("every trail line is one JSON object");
             (
-                value.get("stream").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                value.get("event").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                value
+                    .get("stream")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                value
+                    .get("event")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
                 value,
             )
         })
@@ -59,7 +72,10 @@ fn entries(logs_dir: &Path) -> Vec<(String, String, serde_json::Value)> {
 }
 
 fn events(logs_dir: &Path) -> Vec<String> {
-    entries(logs_dir).into_iter().map(|(_, event, _)| event).collect()
+    entries(logs_dir)
+        .into_iter()
+        .map(|(_, event, _)| event)
+        .collect()
 }
 
 fn record<'a>(
@@ -69,7 +85,12 @@ fn record<'a>(
     all.iter()
         .find(|(_, name, _)| name == event)
         .map(|(_, _, value)| value)
-        .unwrap_or_else(|| panic!("no `{event}` entry; got {:?}", all.iter().map(|e| &e.1).collect::<Vec<_>>()))
+        .unwrap_or_else(|| {
+            panic!(
+                "no `{event}` entry; got {:?}",
+                all.iter().map(|e| &e.1).collect::<Vec<_>>()
+            )
+        })
 }
 
 /// A backend that resolves its own session id and refuses every dialog — the approval below comes
@@ -87,7 +108,11 @@ impl HostServices for SessionOnlyServices {
 
 fn seed_request(agent_dir: &Path, session_id: &str) -> PathBuf {
     let location = forwarding_location(agent_dir, session_id).expect("derives a location");
-    for dir in [&location.session_root, &location.requests_dir, &location.responses_dir] {
+    for dir in [
+        &location.session_root,
+        &location.requests_dir,
+        &location.responses_dir,
+    ] {
         std::fs::create_dir_all(dir).expect("creates the spool dirs");
     }
     let path = location.requests_dir.join("req-1.json");
@@ -136,7 +161,10 @@ async fn a_forwarded_ask_that_times_out_leaves_the_created_warning_and_timed_out
         &audit,
     )
     .await;
-    assert!(!decision.approved, "an unanswered forwarded ask fails CLOSED");
+    assert!(
+        !decision.approved,
+        "an unanswered forwarded ask fails CLOSED"
+    );
 
     let all = entries(&logs_dir);
     let names: Vec<&str> = all.iter().map(|(_, event, _)| event.as_str()).collect();
@@ -163,8 +191,16 @@ async fn a_forwarded_ask_that_times_out_leaves_the_created_warning_and_timed_out
     let created = record(&all, "forwarded_permission.request_created");
     assert_eq!(created["requesterAgentName"], "coder");
     assert_eq!(created["targetSessionId"], "parent-session-audit");
-    assert!(created["requestId"].as_str().is_some_and(|id| !id.is_empty()));
-    assert!(created["responsePath"].as_str().is_some_and(|p| p.ends_with(".json")));
+    assert!(
+        created["requestId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert!(
+        created["responsePath"]
+            .as_str()
+            .is_some_and(|p| p.ends_with(".json"))
+    );
 
     // …and the timed-out entry names the SAME request.
     let timed_out = record(&all, "forwarded_permission.response_timed_out");
@@ -188,7 +224,10 @@ async fn a_serviced_request_leaves_the_auto_approved_and_approved_entries() {
         &services,
         // yolo is upstream's `shouldAutoApprovePermissionState("ask", …)` arm, which resolves the
         // decision with no dialog — so the approval is deterministic, not scripted through a mock.
-        &ExtensionConfig { yolo_mode: true, ..ExtensionConfig::default() },
+        &ExtensionConfig {
+            yolo_mode: true,
+            ..ExtensionConfig::default()
+        },
         ProcessForwardedOptions::preserve_location(),
         &audit,
         true,
@@ -205,8 +244,14 @@ async fn a_serviced_request_leaves_the_auto_approved_and_approved_entries() {
         .iter()
         .position(|e| e == "forwarded_permission.approved")
         .unwrap_or_else(|| panic!("no `.approved` entry: {names:?}"));
-    let auto_at = names.iter().position(|e| e == "forwarded_permission.auto_approved").unwrap();
-    assert!(auto_at < approved_at, "the decision entry follows the resolution entry");
+    let auto_at = names
+        .iter()
+        .position(|e| e == "forwarded_permission.auto_approved")
+        .unwrap();
+    assert!(
+        auto_at < approved_at,
+        "the decision entry follows the resolution entry"
+    );
     assert!(
         !names.contains(&"forwarded_permission.denied".to_string()),
         "an approved request must not also record a denial"
@@ -248,7 +293,11 @@ async fn an_off_session_request_and_a_malformed_one_each_warn() {
     let audit = AuditTrail::detached(logs_dir.clone());
     let session_id = "parent-session-offsession";
     let location = forwarding_location(agent_dir.path(), session_id).expect("derives a location");
-    for dir in [&location.session_root, &location.requests_dir, &location.responses_dir] {
+    for dir in [
+        &location.session_root,
+        &location.requests_dir,
+        &location.responses_dir,
+    ] {
         std::fs::create_dir_all(dir).expect("creates the spool dirs");
     }
     // Sorted scan order (pi `.sort()`, `index.ts:1375`) puts `broken` before `elsewhere`.
@@ -310,7 +359,9 @@ async fn an_off_session_request_and_a_malformed_one_each_warn() {
     );
     let broken_entry = &all[0].2;
     assert!(
-        broken_entry["error"].as_str().is_some_and(|e| !e.is_empty()),
+        broken_entry["error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty()),
         "pi passes the caught error to this call site, so the entry carries a cause: {broken_entry}"
     );
 
@@ -347,7 +398,11 @@ async fn a_structurally_invalid_request_warns_about_its_format() {
     let audit = AuditTrail::detached(logs_dir.clone());
     let session_id = "parent-session-shape";
     let location = forwarding_location(agent_dir.path(), session_id).expect("derives a location");
-    for dir in [&location.session_root, &location.requests_dir, &location.responses_dir] {
+    for dir in [
+        &location.session_root,
+        &location.requests_dir,
+        &location.responses_dir,
+    ] {
         std::fs::create_dir_all(dir).expect("creates the spool dirs");
     }
     // Valid JSON, valid object, every field the right TYPE — and `message` simply absent. This is
@@ -484,7 +539,10 @@ async fn a_forged_and_a_misaddressed_response_are_each_named_in_the_trail() {
     respond(&nonce, target, true);
 
     let decision = waiter.await.expect("the waiter task completes");
-    assert!(decision.approved, "the third, genuine response must be honoured");
+    assert!(
+        decision.approved,
+        "the third, genuine response must be honoured"
+    );
 
     let all = entries(&logs_dir);
     let warnings: Vec<&str> = all
@@ -492,7 +550,11 @@ async fn a_forged_and_a_misaddressed_response_are_each_named_in_the_trail() {
         .filter(|(_, event, _)| event == "permission_forwarding.warning")
         .filter_map(|(_, _, value)| value["message"].as_str())
         .collect();
-    assert_eq!(warnings.len(), 2, "exactly one warning per rejected response: {warnings:?}");
+    assert_eq!(
+        warnings.len(),
+        2,
+        "exactly one warning per rejected response: {warnings:?}"
+    );
     assert!(
         warnings[0].contains("is not bound to request")
             && warnings[0].contains(&request_id)
@@ -510,7 +572,9 @@ async fn a_forged_and_a_misaddressed_response_are_each_named_in_the_trail() {
     // Presence-before-absence: the review entry for every observed response is still written, so
     // the two warnings are an ADDITION to the trail, not a replacement for it.
     assert_eq!(
-        all.iter().filter(|(_, e, _)| e == "forwarded_permission.response_received").count(),
+        all.iter()
+            .filter(|(_, e, _)| e == "forwarded_permission.response_received")
+            .count(),
         3,
         "all three response files are still recorded as received"
     );
@@ -520,5 +584,8 @@ async fn a_forged_and_a_misaddressed_response_are_each_named_in_the_trail() {
 fn cyrup_permission_system_request(path: &Path) -> Option<(String, String)> {
     let text = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    Some((value["id"].as_str()?.to_string(), value["responseNonce"].as_str()?.to_string()))
+    Some((
+        value["id"].as_str()?.to_string(),
+        value["responseNonce"].as_str()?.to_string(),
+    ))
 }

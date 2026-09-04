@@ -50,8 +50,12 @@ pub fn snapshot<T: Serialize>(items: &[T]) -> String {
 }
 
 fn update_requested() -> bool {
-    std::env::var("UPDATE_GOLDEN").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
-        || std::env::var("CYRUP_UPDATE_GOLDEN").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+    std::env::var("UPDATE_GOLDEN")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+        || std::env::var("CYRUP_UPDATE_GOLDEN")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
 }
 
 /// Compare `actual` against the golden file at `path` (Pi golden compare). A missing file or an

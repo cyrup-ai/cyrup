@@ -103,8 +103,8 @@ fn normalize_criterion_status(value: &Value) -> Value {
     };
     let token = normalized_token(text);
     match token.as_str() {
-        "satisfied" | "met" | "complete" | "completed" | "done" | "pass" | "passed"
-        | "success" | "succeeded" => Value::String("satisfied".to_string()),
+        "satisfied" | "met" | "complete" | "completed" | "done" | "pass" | "passed" | "success"
+        | "succeeded" => Value::String("satisfied".to_string()),
         "not-satisfied" | "not-met" | "unmet" | "incomplete" | "fail" | "failed" => {
             Value::String("not-satisfied".to_string())
         }
@@ -126,9 +126,7 @@ fn normalize_command_result(value: &Value) -> Value {
             Value::String("passed".to_string())
         }
         "failed" | "fail" | "failure" | "error" => Value::String("failed".to_string()),
-        "not-run" | "not-executed" | "skip" | "skipped" => {
-            Value::String("not-run".to_string())
-        }
+        "not-run" | "not-executed" | "skip" | "skipped" => Value::String("not-run".to_string()),
         _ => value.clone(),
     }
 }
@@ -200,7 +198,10 @@ pub(crate) struct NormalizedReportValue {
 /// simultaneously-present wrapper keys is picked as `wrapperKey` (upstream picks the first
 /// authored, this picks the alphabetically first — and either way the ambiguity itself is
 /// reported), and the ORDER of the accumulated error strings.
-pub(crate) fn normalize_acceptance_report_value(value: &Value, path_label: &str) -> NormalizedReportValue {
+pub(crate) fn normalize_acceptance_report_value(
+    value: &Value,
+    path_label: &str,
+) -> NormalizedReportValue {
     let mut errors: Vec<String> = Vec::new();
     let mut report_value = value.clone();
     let mut report_path = path_label.to_string();
@@ -288,7 +289,10 @@ pub(crate) fn normalize_acceptance_report_value(value: &Value, path_label: &str)
                     Option::None => field.clone(),
                 }
             }
-            "changedFiles" | "testsAddedOrUpdated" | "validationOutput" | "residualRisks"
+            "changedFiles"
+            | "testsAddedOrUpdated"
+            | "validationOutput"
+            | "residualRisks"
             | "reviewFindings" => match field {
                 Value::String(_) => Value::Array(vec![field.clone()]),
                 _ => field.clone(),

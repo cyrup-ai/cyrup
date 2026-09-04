@@ -17,14 +17,18 @@
 //! physically down right now" — is not implemented in this crate and is not covered by anything
 //! here; with no probe installed the rescue is inert, exactly as upstream is when its `.node`
 //! addon is missing (`native-modifiers.ts:54`, `terminal.ts:305`).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::{
-    clear_native_modifier_probe, host_platform, is_apple_terminal_session,
-    is_native_modifier_pressed, normalize_native_shift_enter, rescue_native_shift_enter,
-    set_native_modifier_probe, should_detect_native_shift_enter, App, AppAction, InputEvent,
-    ModifierKey, UiTheme,
+    App, AppAction, InputEvent, ModifierKey, UiTheme, clear_native_modifier_probe, host_platform,
+    is_apple_terminal_session, is_native_modifier_pressed, normalize_native_shift_enter,
+    rescue_native_shift_enter, set_native_modifier_probe, should_detect_native_shift_enter,
 };
 use ratatui::backend::TestBackend;
 
@@ -52,7 +56,10 @@ fn apple_terminal_is_darwin_plus_an_exact_term_program() {
     assert!(!is_apple_terminal_session("darwin", None));
     // Upstream's `===` is case-sensitive and exact; no substring or lowercasing.
     assert!(!is_apple_terminal_session("darwin", Some("apple_terminal")));
-    assert!(!is_apple_terminal_session("darwin", Some("Apple_Terminal_2")));
+    assert!(!is_apple_terminal_session(
+        "darwin",
+        Some("Apple_Terminal_2")
+    ));
 }
 
 // ---- shouldDetectNativeShiftEnter (`terminal.ts:319-320`) -----------------------------------
@@ -60,7 +67,10 @@ fn apple_terminal_is_darwin_plus_an_exact_term_program() {
 #[test]
 fn only_a_bare_enter_on_a_swallowing_platform_needs_the_probe() {
     let apple = Some("Apple_Terminal");
-    assert!(should_detect_native_shift_enter(&enter(), "darwin", apple), "v0.83.0 arm");
+    assert!(
+        should_detect_native_shift_enter(&enter(), "darwin", apple),
+        "v0.83.0 arm"
+    );
     // v0.84.1 arm — `|| process.platform === "win32"`, with no TERM_PROGRAM condition.
     assert!(should_detect_native_shift_enter(&enter(), "win32", None));
 
@@ -71,9 +81,16 @@ fn only_a_bare_enter_on_a_swallowing_platform_needs_the_probe() {
     let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
     assert!(!should_detect_native_shift_enter(&a, "darwin", apple));
     assert!(!should_detect_native_shift_enter(&enter(), "linux", None));
-    assert!(!should_detect_native_shift_enter(&enter(), "darwin", Some("iTerm.app")));
+    assert!(!should_detect_native_shift_enter(
+        &enter(),
+        "darwin",
+        Some("iTerm.app")
+    ));
     // Releases never reach upstream's handler.
-    let release = KeyEvent { kind: KeyEventKind::Release, ..enter() };
+    let release = KeyEvent {
+        kind: KeyEventKind::Release,
+        ..enter()
+    };
     assert!(!should_detect_native_shift_enter(&release, "darwin", apple));
 }
 
@@ -140,12 +157,18 @@ fn the_probe_registry_defaults_to_inert_and_is_consulted_once_installed() {
     assert!(!is_native_modifier_pressed(ModifierKey::Option));
 
     assert!(clear_native_modifier_probe().is_some());
-    assert!(!is_native_modifier_pressed(ModifierKey::Shift), "clearing restores the inert state");
+    assert!(
+        !is_native_modifier_pressed(ModifierKey::Shift),
+        "clearing restores the inert state"
+    );
 }
 
 #[test]
 fn host_platform_uses_upstreams_process_platform_spelling() {
-    assert!(matches!(host_platform(), "darwin" | "win32" | "linux" | "unknown"));
+    assert!(matches!(
+        host_platform(),
+        "darwin" | "win32" | "linux" | "unknown"
+    ));
     // This box: the platform paths above are therefore NOT exercised by the live composition.
     #[cfg(target_os = "linux")]
     assert_eq!(host_platform(), "linux");
@@ -158,11 +181,14 @@ fn a_rescued_shift_enter_inserts_a_newline_instead_of_submitting() {
     // What the rescue produces (`Enter` + `SHIFT`) must reach the app as `tui.input.newLine`.
     let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
     app.editor_mut().set_text("hello");
-    let rescued =
-        rescue_native_shift_enter(enter(), "darwin", Some("Apple_Terminal"), shift_down);
+    let rescued = rescue_native_shift_enter(enter(), "darwin", Some("Apple_Terminal"), shift_down);
     let action = app.handle_input(&InputEvent::Key(rescued));
     assert_eq!(action, AppAction::Redraw, "no submission");
-    assert_eq!(app.state().editor.text(), "hello\n", "a newline was inserted");
+    assert_eq!(
+        app.state().editor.text(),
+        "hello\n",
+        "a newline was inserted"
+    );
     assert_eq!(app.state().editor.line_count(), 2);
 }
 
@@ -181,13 +207,18 @@ fn an_unrescued_enter_still_submits() {
 /// with a synthesized `process.platform` / `TERM_PROGRAM` / native helper. The macOS and Windows
 /// probe bodies are unimplemented and unexercised — see `tests/native_shift_enter.rs`.
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod native_shift_enter_mapping_tests {
+    use crate::InputEvent;
     use crate::app::*;
     use crate::native_modifiers::ModifierKey;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use crate::InputEvent;
     use ratatui::crossterm::event::Event;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn enter() -> Event {
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -205,26 +236,41 @@ mod native_shift_enter_mapping_tests {
         let mapped = map_event_on(enter(), "darwin", Some("Apple_Terminal"), |k| {
             k == ModifierKey::Shift
         });
-        assert_eq!(mapped_key(mapped), KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(
+            mapped_key(mapped),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+        );
     }
 
     #[test]
     fn the_reader_leaves_a_plain_enter_alone_when_shift_is_up() {
         let mapped = map_event_on(enter(), "darwin", Some("Apple_Terminal"), |_| false);
-        assert_eq!(mapped_key(mapped), KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            mapped_key(mapped),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        );
     }
 
     #[test]
     fn the_reader_never_probes_on_a_platform_that_encodes_modifiers() {
-        let mapped =
-            map_event_on(enter(), "linux", None, |_| panic!("the probe must not run on linux"));
-        assert_eq!(mapped_key(mapped), KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let mapped = map_event_on(enter(), "linux", None, |_| {
+            panic!("the probe must not run on linux")
+        });
+        assert_eq!(
+            mapped_key(mapped),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        );
     }
 
     #[test]
     fn non_key_events_are_unaffected() {
         assert!(matches!(
-            map_event_on(Event::Resize(10, 20), "darwin", Some("Apple_Terminal"), |_| true),
+            map_event_on(
+                Event::Resize(10, 20),
+                "darwin",
+                Some("Apple_Terminal"),
+                |_| true
+            ),
             Some(InputEvent::Resize(10, 20))
         ));
         assert!(
@@ -242,4 +288,3 @@ mod native_shift_enter_mapping_tests {
         );
     }
 }
-

@@ -19,14 +19,14 @@
     clippy::string_slice
 )]
 
+use super::harness::*;
+use crate::{App, UiTheme};
 use cyrup_agent::AgentMessage;
 use cyrup_core::{ApiId, AssistantMessage, Content, ProviderId, StopReason};
 use cyrup_provider::StreamEvent;
 use cyrup_session_svc::AgentSessionEvent;
-use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
-use super::harness::*;
 
 const REASONING: &str = "the user wants the parser rewritten";
 const ANSWER: &str = "Here is the plan.";
@@ -36,11 +36,18 @@ fn new_app() -> App<TestBackend> {
 }
 
 fn thinking(t: &str) -> Content {
-    Content::Thinking { thinking: t.into(), thinking_signature: None, redacted: false }
+    Content::Thinking {
+        thinking: t.into(),
+        thinking_signature: None,
+        redacted: false,
+    }
 }
 
 fn text(t: &str) -> Content {
-    Content::Text { text: t.into(), text_signature: None }
+    Content::Text {
+        text: t.into(),
+        text_signature: None,
+    }
 }
 
 /// An assistant message shell (no content) — the `partial` a streaming frame carries.
@@ -99,9 +106,8 @@ fn styled_thinking(app: &App<TestBackend>, needle: &str) -> bool {
             .find(|s| s.content.contains(needle))
             .map(|s| line.style.patch(s.style));
         joined.contains(needle)
-            && effective.is_some_and(|st| {
-                st.fg == want.fg && st.add_modifier.contains(Modifier::ITALIC)
-            })
+            && effective
+                .is_some_and(|st| st.fg == want.fg && st.add_modifier.contains(Modifier::ITALIC))
     })
 }
 
@@ -139,12 +145,24 @@ fn terminal_thinking_blocks_commit_above_the_answer() {
     app.draw().unwrap();
 
     let out = app.scrollback_text();
-    assert!(out.contains(REASONING), "committed scrollback must carry the reasoning; got:\n{out}");
-    assert!(out.contains(ANSWER), "committed scrollback must carry the answer; got:\n{out}");
+    assert!(
+        out.contains(REASONING),
+        "committed scrollback must carry the reasoning; got:\n{out}"
+    );
+    assert!(
+        out.contains(ANSWER),
+        "committed scrollback must carry the answer; got:\n{out}"
+    );
     let think_at = out.find(REASONING).unwrap();
     let answer_at = out.find(ANSWER).unwrap();
-    assert!(think_at < answer_at, "reasoning must precede the answer; got:\n{out}");
-    assert!(styled_thinking(&app, REASONING), "reasoning must use the italic thinkingText role");
+    assert!(
+        think_at < answer_at,
+        "reasoning must precede the answer; got:\n{out}"
+    );
+    assert!(
+        styled_thinking(&app, REASONING),
+        "reasoning must use the italic thinkingText role"
+    );
 }
 
 /// Adjacent thinking blocks are coalesced into one section joined by `\n\n`
@@ -152,7 +170,14 @@ fn terminal_thinking_blocks_commit_above_the_answer() {
 #[test]
 fn adjacent_thinking_blocks_are_coalesced() {
     let mut app = new_app();
-    feed(&mut app, done(vec![thinking("first  "), thinking("  second"), text(ANSWER)]));
+    feed(
+        &mut app,
+        done(vec![
+            thinking("first  "),
+            thinking("  second"),
+            text(ANSWER),
+        ]),
+    );
     app.draw().unwrap();
 
     let out = app.scrollback_text();
@@ -178,10 +203,22 @@ fn hidden_thinking_renders_the_static_label_only() {
     app.draw().unwrap();
 
     let out = app.scrollback_text();
-    assert!(out.contains("Thinking..."), "hidden reasoning shows the label; got:\n{out}");
-    assert!(!out.contains(REASONING), "hidden reasoning must NOT show the body; got:\n{out}");
-    assert!(out.contains(ANSWER), "the answer still renders; got:\n{out}");
-    assert!(styled_thinking(&app, "Thinking..."), "the label uses the italic thinkingText role");
+    assert!(
+        out.contains("Thinking..."),
+        "hidden reasoning shows the label; got:\n{out}"
+    );
+    assert!(
+        !out.contains(REASONING),
+        "hidden reasoning must NOT show the body; got:\n{out}"
+    );
+    assert!(
+        out.contains(ANSWER),
+        "the answer still renders; got:\n{out}"
+    );
+    assert!(
+        styled_thinking(&app, "Thinking..."),
+        "the label uses the italic thinkingText role"
+    );
 }
 
 /// A turn with no reasoning commits no thinking entry — and whitespace-only reasoning is dropped
@@ -193,7 +230,10 @@ fn empty_reasoning_commits_nothing() {
     app.draw().unwrap();
 
     let out = app.scrollback_text();
-    assert!(!out.contains("Thinking..."), "no label for empty reasoning; got:\n{out}");
+    assert!(
+        !out.contains("Thinking..."),
+        "no label for empty reasoning; got:\n{out}"
+    );
     assert!(out.contains(ANSWER));
 }
 
@@ -214,5 +254,8 @@ fn interrupt_discards_the_live_reasoning() {
 
     assert_eq!(app.transcript_mut().thinking(), None);
     let live = live_text(&app);
-    assert!(!live.contains(REASONING), "aborted reasoning must not linger; got:\n{live}");
+    assert!(
+        !live.contains(REASONING),
+        "aborted reasoning must not linger; got:\n{live}"
+    );
 }

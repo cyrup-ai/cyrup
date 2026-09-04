@@ -1,5 +1,5 @@
-use super::*;
 use super::layout::wrap_all_owned;
+use super::*;
 
 impl TranscriptView {
     /// Invalidate the render cache. Called by every mutator on the bump list below; the next
@@ -100,7 +100,10 @@ impl TranscriptView {
         // `Markdown` child on the same `content.text.trim()`. So an assistant turn that has streamed
         // nothing but whitespace is not visible content: no blank, and no body either.
         let thinking_visible = self.thinking.as_ref().is_some_and(|t| !t.trim().is_empty());
-        let stream_visible = self.streaming.as_ref().is_some_and(|s| !s.trim().is_empty());
+        let stream_visible = self
+            .streaming
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
         if thinking_visible || stream_visible {
             lines.push(Line::default());
         }
@@ -121,7 +124,10 @@ impl TranscriptView {
         // is what this renders when the pass has produced anything. Falling back to the raw buffer
         // keeps the frame between a delta and the next pass drawing untransformed text rather than
         // none.
-        let thinking_body = self.thinking_display.as_deref().or(self.thinking.as_deref());
+        let thinking_body = self
+            .thinking_display
+            .as_deref()
+            .or(self.thinking.as_deref());
         if let Some(thinking) = thinking_body.filter(|_| thinking_visible) {
             let mut td = thinking_lines(
                 thinking,
@@ -146,7 +152,10 @@ impl TranscriptView {
         // RAW buffer — upstream's `hasVisibleContent` tests `content.text.trim()`, the untransformed
         // message content (`assistant-message.ts:96-98`), so a transformer cannot conjure or erase
         // the leading `Spacer(1)`.
-        let stream_body = self.streaming_display.as_deref().or(self.streaming.as_deref());
+        let stream_body = self
+            .streaming_display
+            .as_deref()
+            .or(self.streaming.as_deref());
         if let Some(partial) = stream_body.filter(|_| stream_visible) {
             // X1 — no role label and no `▌` caret. `assistant-message.ts:104-114` adds exactly one
             // child per text block, `new Markdown(content.text.trim(), this.outputPad, 0, …)`; the
@@ -241,8 +250,10 @@ impl Component for TranscriptView {
         // `.wrap()` (they already fit) nor `.scroll()` (we sliced instead), and the copy below is
         // bounded by the VIEWPORT rather than by the turn.
         let first = max_scroll.saturating_sub(self.scroll_offset);
-        let window: Vec<Line<'static>> =
-            rows.get(first..(first + inner_h).min(total)).unwrap_or(&[]).to_vec();
+        let window: Vec<Line<'static>> = rows
+            .get(first..(first + inner_h).min(total))
+            .unwrap_or(&[])
+            .to_vec();
         frame.render_widget(Paragraph::new(window).style(theme.base_style()), area);
         // TUI-020 — same ordering rule as the scrollback flush: inject only once the cells exist.
         // `ForcedWidth` keeps `Buffer::diff_iter` advancing one column per escaped cell, so the

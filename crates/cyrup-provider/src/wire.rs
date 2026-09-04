@@ -391,7 +391,8 @@ mod tests {
                 arguments: serde_json::json!({"x": 1})
                     .as_object()
                     .cloned()
-                    .expect("object").into(),
+                    .expect("object")
+                    .into(),
                 thought_signature: None,
             };
             sink.send(StreamEvent::ToolCallEnd {
@@ -409,7 +410,8 @@ mod tests {
                         arguments: serde_json::json!({"x": 1})
                             .as_object()
                             .cloned()
-                            .expect("object").into(),
+                            .expect("object")
+                            .into(),
                         thought_signature: None,
                     }),
                 ],

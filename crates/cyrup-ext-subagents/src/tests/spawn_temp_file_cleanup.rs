@@ -47,7 +47,11 @@ use crate::spawn::{ChildSpawnSpec, SpawnCommand, SpawnedChild};
 /// holding the child's prompt text) and return its path.
 fn write_task_temp_file(dir: &Path, name: &str) -> PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, "the long task prompt that overflowed the argv inline threshold").unwrap();
+    std::fs::write(
+        &path,
+        "the long task prompt that overflowed the argv inline threshold",
+    )
+    .unwrap();
     assert!(path.exists(), "precondition: the temp file was created");
     path
 }
@@ -58,7 +62,11 @@ fn spec_with_temp_files(binary: PathBuf, cwd: &Path, temp_files: Vec<PathBuf>) -
             binary,
             base_args: Vec::new(),
         },
-        args: vec!["--print".to_string(), "--mode".to_string(), "json".to_string()],
+        args: vec![
+            "--print".to_string(),
+            "--mode".to_string(),
+            "json".to_string(),
+        ],
         task_arg: format!("@{}", temp_files[0].display()),
         env_overlay: HashMap::new(),
         cwd: cwd.to_path_buf(),
@@ -75,7 +83,10 @@ async fn spawn_failure_removes_the_specs_temp_files() {
     let temp_b = write_task_temp_file(dir.path(), "subagent-prompt-override-b.txt");
 
     let missing_binary = dir.path().join("definitely-not-an-executable-binary");
-    assert!(!missing_binary.exists(), "precondition: the binary is absent");
+    assert!(
+        !missing_binary.exists(),
+        "precondition: the binary is absent"
+    );
 
     let spec = spec_with_temp_files(
         missing_binary,

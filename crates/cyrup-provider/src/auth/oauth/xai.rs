@@ -514,7 +514,10 @@ impl XaiOAuth {
 
     /// Point the flow at different endpoints. Exists only because Rust has no ambient `fetch` for
     /// a test to stub the way upstream's would; production code uses [`XaiOAuth::new`].
-    pub fn with_endpoints(device_code_url: impl Into<String>, token_url: impl Into<String>) -> Self {
+    pub fn with_endpoints(
+        device_code_url: impl Into<String>,
+        token_url: impl Into<String>,
+    ) -> Self {
         XaiOAuth {
             device_code_url: device_code_url.into(),
             token_url: token_url.into(),
@@ -765,7 +768,13 @@ mod tests {
     #[test]
     fn unparseable_verification_uris_are_rejected() {
         // xai.ts:53-57 — `new URL` throws.
-        for raw in ["", "auth.x.ai/device", "://auth.x.ai", "https://", "1https://x"] {
+        for raw in [
+            "",
+            "auth.x.ai/device",
+            "://auth.x.ai",
+            "https://",
+            "1https://x",
+        ] {
             assert_eq!(
                 validate_verification_uri(raw).unwrap_err().to_string(),
                 "Untrusted verification URI in xAI OAuth response",
@@ -816,14 +825,20 @@ mod tests {
         assert_eq!(
             request_failure(
                 "device authorization",
-                &response(400, r#"{"error":"invalid_client","error_description":"unknown"}"#)
+                &response(
+                    400,
+                    r#"{"error":"invalid_client","error_description":"unknown"}"#
+                )
             )
             .to_string(),
             "xAI OAuth device authorization failed (HTTP 400): invalid_client: unknown"
         );
         assert_eq!(
-            request_failure("token refresh", &response(401, r#"{"error":"invalid_grant"}"#))
-                .to_string(),
+            request_failure(
+                "token refresh",
+                &response(401, r#"{"error":"invalid_grant"}"#)
+            )
+            .to_string(),
             "xAI OAuth token refresh failed (HTTP 401): invalid_grant"
         );
         assert_eq!(
@@ -924,13 +939,19 @@ mod tests {
             r#"{"user_code":"U","verification_uri":"https://auth.x.ai/d","expires_in":600}"#,
         ))
         .unwrap_err();
-        assert_eq!(err.to_string(), "Invalid xAI OAuth response field: device_code");
+        assert_eq!(
+            err.to_string(),
+            "Invalid xAI OAuth response field: device_code"
+        );
 
         let err = parse_device_code(&object(
             r#"{"device_code":"DC","user_code":"U","verification_uri":"https://auth.x.ai/d"}"#,
         ))
         .unwrap_err();
-        assert_eq!(err.to_string(), "Invalid xAI OAuth response field: expires_in");
+        assert_eq!(
+            err.to_string(),
+            "Invalid xAI OAuth response field: expires_in"
+        );
 
         // xai.ts:121 — `verification_uri` is validated as well as required.
         let err = parse_device_code(&object(
@@ -1111,7 +1132,10 @@ mod tests {
 
         let recorded = server.recorded();
         let (head, body) = recorded.first().cloned().unwrap();
-        assert!(head.starts_with("POST /oauth2/device/code HTTP/1.1"), "{head}");
+        assert!(
+            head.starts_with("POST /oauth2/device/code HTTP/1.1"),
+            "{head}"
+        );
         // xai.ts:69-72
         let lower = head.to_lowercase();
         assert!(lower.contains("accept: application/json"), "{head}");
@@ -1141,7 +1165,10 @@ mod tests {
         );
         let flow = XaiOAuth::with_endpoints(&server.url, TOKEN_URL);
         assert_eq!(
-            flow.request_device_code(None).await.unwrap_err().to_string(),
+            flow.request_device_code(None)
+                .await
+                .unwrap_err()
+                .to_string(),
             "xAI OAuth device authorization failed (HTTP 400): invalid_client: bad client"
         );
     }
@@ -1152,7 +1179,10 @@ mod tests {
         let server = FakeEndpoint::one("/oauth2/device/code", 200, "<html>nope</html>");
         let flow = XaiOAuth::with_endpoints(&server.url, TOKEN_URL);
         assert_eq!(
-            flow.request_device_code(None).await.unwrap_err().to_string(),
+            flow.request_device_code(None)
+                .await
+                .unwrap_err()
+                .to_string(),
             "xAI OAuth returned invalid JSON (HTTP 200)"
         );
     }
@@ -1164,7 +1194,10 @@ mod tests {
         let server = FakeEndpoint::one("/oauth2/device/code", 200, r#"["nope"]"#);
         let flow = XaiOAuth::with_endpoints(&server.url, TOKEN_URL);
         assert_eq!(
-            flow.request_device_code(None).await.unwrap_err().to_string(),
+            flow.request_device_code(None)
+                .await
+                .unwrap_err()
+                .to_string(),
             "Invalid xAI OAuth response field: device_code"
         );
     }
@@ -1212,7 +1245,11 @@ mod tests {
         // xai.ts:178-180
         assert_eq!(
             describe(
-                &poll_once(200, r#"{"access_token":"a","refresh_token":"r","expires_in":60}"#).await
+                &poll_once(
+                    200,
+                    r#"{"access_token":"a","refresh_token":"r","expires_in":60}"#
+                )
+                .await
             ),
             "complete:a"
         );
@@ -1250,7 +1287,13 @@ mod tests {
         );
         // xai.ts:196 — anything else, including a non-string `error`.
         assert_eq!(
-            describe(&poll_once(500, r#"{"error":"server_error","error_description":"boom"}"#).await),
+            describe(
+                &poll_once(
+                    500,
+                    r#"{"error":"server_error","error_description":"boom"}"#
+                )
+                .await
+            ),
             "failed:xAI OAuth device token polling failed (HTTP 500): server_error: boom"
         );
         assert_eq!(
@@ -1311,7 +1354,10 @@ mod tests {
         let server = FakeEndpoint::one("/oauth2/token", 401, r#"{"error":"invalid_grant"}"#);
         let flow = XaiOAuth::with_endpoints(DEVICE_CODE_URL, &server.url);
         assert_eq!(
-            flow.refresh_token("dead", None).await.unwrap_err().to_string(),
+            flow.refresh_token("dead", None)
+                .await
+                .unwrap_err()
+                .to_string(),
             "xAI OAuth token refresh failed (HTTP 401): invalid_grant"
         );
     }
@@ -1384,11 +1430,7 @@ mod tests {
             200,
             r#"{"device_code":"DC","user_code":"U","verification_uri":"https://auth.x.ai/device","interval":1,"expires_in":600}"#,
         );
-        let token_server = FakeEndpoint::one(
-            "/oauth2/token",
-            400,
-            r#"{"error":"access_denied"}"#,
-        );
+        let token_server = FakeEndpoint::one("/oauth2/token", 400, r#"{"error":"access_denied"}"#);
         let flow = XaiOAuth::with_endpoints(&device_server.url, &token_server.url);
         let interaction = ScriptedInteraction::new(Vec::new());
         let err = flow.login(&interaction).await.unwrap_err();
@@ -1415,7 +1457,8 @@ mod tests {
             200,
             r#"{"device_code":"DC","user_code":"U","verification_uri":"https://auth.x.ai/device","interval":1,"expires_in":600}"#,
         );
-        let token_server = FakeEndpoint::one("/oauth2/token", 400, r#"{"error":"authorization_pending"}"#);
+        let token_server =
+            FakeEndpoint::one("/oauth2/token", 400, r#"{"error":"authorization_pending"}"#);
         let flow = XaiOAuth::with_endpoints(&device_server.url, &token_server.url);
         let token = CancelToken::new();
         token.cancel();

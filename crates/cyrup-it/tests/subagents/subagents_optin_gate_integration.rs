@@ -11,18 +11,20 @@
 //! present anywhere — attaches NOTHING again. This mirrors `cyrup_intercom` / `cyrup_permission_system`
 //! opt-in semantics exactly.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use cyrup_ext::EventKind;
 use cyrup_ext::native::InitApi;
 use cyrup_ext_subagents::extension::{is_installed_with, subagent_extension_for};
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
-
-
 #[tokio::test]
 async fn cyrup_subagents_env_opts_a_top_level_session_into_the_full_surface() {
-
     // Empty dirs: NO on-disk config anywhere, so the ONLY install signal under test is the env var.
     let agent_dir = tempfile::tempdir().expect("agent dir");
     let cwd = tempfile::tempdir().expect("cwd");

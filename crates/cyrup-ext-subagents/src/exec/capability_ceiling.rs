@@ -111,7 +111,10 @@ fn validate_text(value: Option<&serde_json::Value>, field: &str) -> Result<Strin
         return Err(invalid());
     };
     // pi tests the RAW value for control characters and the TRIMMED one for length.
-    if text.chars().any(|c| c.is_control() && (c as u32) < 0x20 || c as u32 == 0x7f) {
+    if text
+        .chars()
+        .any(|c| c.is_control() && (c as u32) < 0x20 || c as u32 == 0x7f)
+    {
         return Err(invalid());
     }
     let trimmed = text.trim();
@@ -183,7 +186,10 @@ pub fn normalize_ceiling(value: &serde_json::Value) -> Result<ResolvedCapability
                 .to_string(),
         );
     }
-    if has_deny_extensions && !ceiling.get("denyExtensions").is_some_and(serde_json::Value::is_boolean)
+    if has_deny_extensions
+        && !ceiling
+            .get("denyExtensions")
+            .is_some_and(serde_json::Value::is_boolean)
     {
         return Err("Invalid capability ceiling denyExtensions; expected a boolean.".to_string());
     }
@@ -336,14 +342,20 @@ pub fn register_capability_ceiling(
         Some(&serde_json::Value::String(session_id.to_string())),
         "sessionId",
     )?;
-    let source = validate_text(Some(&serde_json::Value::String(source.to_string())), "source")?;
+    let source = validate_text(
+        Some(&serde_json::Value::String(source.to_string())),
+        "source",
+    )?;
     let mut normalized = normalize_ceiling(ceiling)?;
     // pi `normalized.sources = [source]` — a registration always attributes itself, overwriting any
     // `sources` the caller supplied.
     normalized.sources = vec![source.clone()];
     let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut store) = registry().lock() {
-        store.entry(session_id.clone()).or_default().insert(token, normalized);
+        store
+            .entry(session_id.clone())
+            .or_default()
+            .insert(token, normalized);
     }
     Ok(CapabilityCeilingHandle {
         session_id,
@@ -538,7 +550,12 @@ fn ceiling_for_test_tools_only() -> ResolvedCapabilityCeiling {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -683,9 +700,11 @@ mod tests {
 
         assert_eq!(decode_capability_ceiling(None).expect("absent"), None);
         assert_eq!(decode_capability_ceiling(Some("")).expect("empty"), None);
-        assert!(decode_capability_ceiling(Some("!!!not base64!!!"))
-            .expect_err("refused")
-            .starts_with("Invalid inherited capability ceiling: "));
+        assert!(
+            decode_capability_ceiling(Some("!!!not base64!!!"))
+                .expect_err("refused")
+                .starts_with("Invalid inherited capability ceiling: ")
+        );
 
         use base64::Engine as _;
         let wrong_version = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -722,7 +741,10 @@ mod tests {
                  agents: reviewer."
             );
             // A DIFFERENT session is untouched.
-            assert_eq!(resolve_capability_ceiling(Some("other-session"), None), None);
+            assert_eq!(
+                resolve_capability_ceiling(Some("other-session"), None),
+                None
+            );
         }
 
         assert_eq!(
@@ -818,4 +840,3 @@ mod tests {
         );
     }
 }
-

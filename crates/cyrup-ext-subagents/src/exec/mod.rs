@@ -36,26 +36,26 @@
 
 pub mod acceptance;
 pub mod agent_refinements;
+pub mod capability_ceiling;
 pub mod child_protocol;
 pub mod completion_guard;
 pub mod control;
-pub mod mcp_direct_tools;
 pub mod fallback;
+pub mod mcp_direct_tools;
 pub mod model_scope;
 pub mod ndjson;
 pub mod output;
+pub mod permissions;
+pub mod spawn_budget;
 pub mod structured;
 pub mod task_intent;
-pub mod tool_call_summary;
-pub mod tool_budget;
-pub mod turn_budget;
-pub mod capability_ceiling;
 /// SUBA-078 — the `subagents.maxThinking` reasoning-level ceiling.
 pub mod thinking_ceiling;
-pub mod permissions;
-pub mod usage_budget;
-pub mod spawn_budget;
 pub mod tool_availability;
+pub mod tool_budget;
+pub mod tool_call_summary;
+pub mod turn_budget;
+pub mod usage_budget;
 
 /// The static, execution-ready "what to run and how" input surface: [`AgentConfig`],
 /// [`ResolvedAgentPersona`], [`resolve_step_agent_config`], [`RunOptions`], [`LiveEventSink`]
@@ -104,15 +104,15 @@ use std::path::PathBuf;
 
 use cyrup_core::{ModelId, Usage};
 
-use crate::discovery::types::{
-    AgentDefinition, OutputMode,
-};
+use crate::discovery::types::{AgentDefinition, OutputMode};
 use crate::error::SubagentError;
 use crate::exec::acceptance::{
     AcceptanceContract, CleanCompletionGate, apply_post_hoc_correction,
     build_timed_out_acceptance_ledger,
 };
-use crate::exec::completion_guard::{CompletionMutationGuardResult, evaluate_completion_mutation_guard};
+use crate::exec::completion_guard::{
+    CompletionMutationGuardResult, evaluate_completion_mutation_guard,
+};
 use crate::exec::fallback::{AttemptSignal, run_fallback_ladder};
 use crate::exec::output::{
     resolve_output_handoff, snapshot_output_file, truncate_output, validate_file_only_requires_path,
@@ -325,7 +325,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     }
 
     // Step 1 (R-SA-025): fail fast before any subprocess spawns.
-    if let Some(err) = validate_file_only_requires_path(opts.output_mode, opts.output_path.as_deref())
+    if let Some(err) =
+        validate_file_only_requires_path(opts.output_mode, opts.output_path.as_deref())
     {
         return pre_spawn_failure(agent, task, err.to_string());
     }
@@ -335,8 +336,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
 
     let candidates = resolve_model_candidates(agent, opts);
     if candidates.is_empty() {
-        let error =
-            "no candidate model available for this subagent run (empty fallback ladder)".to_string();
+        let error = "no candidate model available for this subagent run (empty fallback ladder)"
+            .to_string();
         return pre_spawn_failure(agent, task, error);
     }
 
@@ -356,12 +357,13 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // the operator's bound excluded, would both hide the misconfiguration.
     // Fail-CLOSED on BOTH steps: a malformed inherited ceiling, and an unrankable level in the
     // fold itself, are each an error rather than "unbounded".
-    let folded = crate::exec::thinking_ceiling::inherited_thinking_ceiling().and_then(|inherited| {
-        crate::exec::thinking_ceiling::intersect_thinking_ceilings(&[
-            opts.thinking_ceiling.as_deref(),
-            inherited.as_deref(),
-        ])
-    });
+    let folded =
+        crate::exec::thinking_ceiling::inherited_thinking_ceiling().and_then(|inherited| {
+            crate::exec::thinking_ceiling::intersect_thinking_ceilings(&[
+                opts.thinking_ceiling.as_deref(),
+                inherited.as_deref(),
+            ])
+        });
     let thinking_ceiling = match folded {
         Ok(ceiling) => ceiling,
         Err(error) => return pre_spawn_failure(agent, task, error),
@@ -390,7 +392,9 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         Err(failure) => return *failure,
     };
     let mut structured_guard = setup.structured_guard;
-    let structured_runtime = structured_guard.as_ref().map(|guard| guard.runtime().clone());
+    let structured_runtime = structured_guard
+        .as_ref()
+        .map(|guard| guard.runtime().clone());
 
     let outcome = drive_fallback_ladder(
         agent,
@@ -423,21 +427,44 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         .as_ref()
         .map(|record| record.turn_budget.clone())
         .unwrap_or_default();
-    let final_output =
-        apply_terminal_preamble(final_output, timed_out, opts.timeout_ms, &turn_budget_tracker);
+    let final_output = apply_terminal_preamble(
+        final_output,
+        timed_out,
+        opts.timeout_ms,
+        &turn_budget_tracker,
+    );
 
-    let (final_output, full_output_for_reference, saved_output_path) =
-        resolve_saved_output(opts, exit_code, final_output, setup.output_snapshot, &mut error);
+    let (final_output, full_output_for_reference, saved_output_path) = resolve_saved_output(
+        opts,
+        exit_code,
+        final_output,
+        setup.output_snapshot,
+        &mut error,
+    );
 
     let (progress, mut control) = winning_attempt_state(last_attempt);
 
-    let mut gates = GateState { exit_code, error, detached, interrupted, timed_out };
+    let mut gates = GateState {
+        exit_code,
+        error,
+        detached,
+        interrupted,
+        timed_out,
+    };
     let structured_output = gates.apply_structured_output(structured_runtime.as_ref(), opts);
     let guard_result = gates.apply_completion_guard(agent, task, &progress, &mut control);
     let acceptance_ledger = gates
-        .apply_acceptance(&contract, &progress, opts, final_output.as_deref(), guard_result)
+        .apply_acceptance(
+            &contract,
+            &progress,
+            opts,
+            final_output.as_deref(),
+            guard_result,
+        )
         .await;
-    let GateState { exit_code, error, .. } = gates;
+    let GateState {
+        exit_code, error, ..
+    } = gates;
 
     let (final_output, output_truncated) = finalize_delivered_output(
         final_output,
@@ -642,10 +669,15 @@ fn resolve_terminal_usage_budget(
     opts: &RunOptions,
     aggregate_usage: &Usage,
     error: Option<String>,
-) -> (Option<crate::exec::usage_budget::UsageBudgetState>, Option<String>) {
+) -> (
+    Option<crate::exec::usage_budget::UsageBudgetState>,
+    Option<String>,
+) {
     let usage_budget = crate::exec::usage_budget::usage_budget_state(
         opts.usage_budget,
-        Some(crate::exec::usage_budget::UsageTotals::from(aggregate_usage)),
+        Some(crate::exec::usage_budget::UsageTotals::from(
+            aggregate_usage,
+        )),
     );
     let error = match (&error, usage_budget.as_ref()) {
         (None, Some(state)) if state.exhausted => Some(
@@ -803,7 +835,11 @@ async fn prepare_ladder(
     if let Some(acks) = opts.steer_ack_dir.as_deref() {
         let _ = std::fs::create_dir_all(acks);
     }
-    if let Some(parent) = opts.steer_capability_path.as_deref().and_then(std::path::Path::parent) {
+    if let Some(parent) = opts
+        .steer_capability_path
+        .as_deref()
+        .and_then(std::path::Path::parent)
+    {
         let _ = std::fs::create_dir_all(parent);
     }
 
@@ -876,7 +912,9 @@ impl SettledAttempt {
                 interrupted: record.interrupted,
                 detached: signal.detached,
                 process_signal: signal.startup.process_signal.clone(),
-                exit_code: signal.exit_code.unwrap_or(if signal.success { 0 } else { 1 }),
+                exit_code: signal
+                    .exit_code
+                    .unwrap_or(if signal.success { 0 } else { 1 }),
                 error: signal.error.clone(),
                 final_output: record.final_output.clone(),
             },
@@ -1478,7 +1516,9 @@ pub async fn plan_batch(
         // SUBA-075: upstream's `forceThinkingOffForIndex?.(index) ?? true` fallback. A
         // [`BatchForkRequest`] names a step's context mode and index only — it carries no model
         // ladder — so the batch planner cannot answer the gate and takes the conservative arm.
-        let ctx = resolver.resolve(request.requested, request.index, true).await?;
+        let ctx = resolver
+            .resolve(request.requested, request.index, true)
+            .await?;
         resolved.push(ctx);
     }
     Ok(resolved)
@@ -1497,7 +1537,6 @@ mod tests {
     use crate::exec::acceptance::AcceptanceStatus;
     use crate::exec::testsupport::{base_opts, sample_agent_config};
     use crate::spawn::depth::DepthEnvelope;
-
 
     // ---- SUBA-075: the progress snapshot reports the model the child REALLY launched with ----
 
@@ -1522,7 +1561,17 @@ mod tests {
         let winning = ModelId::from("m1");
 
         let snapshot = build_progress_snapshot(
-            &progress, &opts, &agent, "task", None, Some(&winning), &control, false, true, 0, None,
+            &progress,
+            &opts,
+            &agent,
+            "task",
+            None,
+            Some(&winning),
+            &control,
+            false,
+            true,
+            0,
+            None,
         )
         .expect("progress was requested");
         assert_eq!(
@@ -1537,7 +1586,17 @@ mod tests {
             thinking_override: Some("off".to_string()),
         };
         let snapshot = build_progress_snapshot(
-            &progress, &opts, &agent, "task", None, Some(&winning), &control, false, true, 0, None,
+            &progress,
+            &opts,
+            &agent,
+            "task",
+            None,
+            Some(&winning),
+            &control,
+            false,
+            true,
+            0,
+            None,
         )
         .expect("progress was requested");
         assert_eq!(
@@ -1589,7 +1648,6 @@ mod tests {
         assert!(resolve_run_acceptance(&opts, &agent, "Implement the fix").is_no_op());
     }
 
-
     // ---- SUBA-082: the agent's DECLARED role reaches the inferred floor at this seam ----
 
     /// `resolveEffectiveAcceptance({ …, acceptanceRole: agent.acceptanceRole, … })`
@@ -1609,13 +1667,15 @@ mod tests {
         let mut reviewer = sample_agent_config("m1", &[]);
         reviewer.name = "reviewer".to_string();
         assert_eq!(
-            resolve_run_acceptance(&opts, &reviewer, "Handle the authentication flow").required_level,
+            resolve_run_acceptance(&opts, &reviewer, "Handle the authentication flow")
+                .required_level,
             AcceptanceStatus::Attested,
             "control: the NAME alternation still decides when no role is declared"
         );
         reviewer.acceptance_role = Some(AcceptanceRole::Writer);
         assert_eq!(
-            resolve_run_acceptance(&opts, &reviewer, "Handle the authentication flow").required_level,
+            resolve_run_acceptance(&opts, &reviewer, "Handle the authentication flow")
+                .required_level,
             AcceptanceStatus::Checked,
             "a declared `writer` role replaces the reviewer-name guess"
         );
@@ -1623,12 +1683,14 @@ mod tests {
         let mut worker = sample_agent_config("m1", &[]);
         worker.acceptance_role = Some(AcceptanceRole::ReadOnly);
         assert_eq!(
-            resolve_run_acceptance(&opts, &worker, "Explore the authentication flow").required_level,
+            resolve_run_acceptance(&opts, &worker, "Explore the authentication flow")
+                .required_level,
             AcceptanceStatus::Attested,
             "a declared `read-only` role replaces the worker-name guess"
         );
         assert_eq!(
-            resolve_run_acceptance(&opts, &worker, "Implement the authentication fix").required_level,
+            resolve_run_acceptance(&opts, &worker, "Implement the authentication fix")
+                .required_level,
             AcceptanceStatus::Checked,
             "explicit task mutation intent still wins over a declared read-only role"
         );
@@ -1656,7 +1718,10 @@ mod tests {
 
         let result = run_sync(&agent, "do something", &opts).await;
 
-        assert_eq!(result.exit_code, 1, "an unsupported runner must fail the run: {result:?}");
+        assert_eq!(
+            result.exit_code, 1,
+            "an unsupported runner must fail the run: {result:?}"
+        );
         let error = result.error.as_deref().unwrap_or_default();
         assert!(error.contains("runner.type='external-cli'"), "{error}");
         assert!(error.contains("full-capability native child"), "{error}");
@@ -1679,7 +1744,11 @@ mod tests {
         let result = run_sync(&agent, "do something", &opts).await;
 
         assert!(
-            !result.error.as_deref().unwrap_or_default().contains("not yet supported by cyrup"),
+            !result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not yet supported by cyrup"),
             "a `pi` runner is the native child and must never hit the SUBA-074 refusal: {result:?}"
         );
     }
@@ -1700,7 +1769,10 @@ mod tests {
 
         let result = run_sync(&agent, "do something", &opts).await;
 
-        assert_eq!(result.exit_code, 1, "a blocked depth attempt must report failure: {result:?}");
+        assert_eq!(
+            result.exit_code, 1,
+            "a blocked depth attempt must report failure: {result:?}"
+        );
         assert!(
             result
                 .error
@@ -1710,7 +1782,10 @@ mod tests {
             "expected a DepthExceeded-shaped error message, got: {:?}",
             result.error
         );
-        assert!(result.attempted_models.is_empty(), "no model attempt may ever be made");
+        assert!(
+            result.attempted_models.is_empty(),
+            "no model attempt may ever be made"
+        );
         assert!(result.model_attempts.is_empty());
         assert_eq!(result.usage, Usage::default(), "no usage can have accrued");
         // The load-bearing proof that this rejection happens BEFORE any spawn setup: `run_sync`'s
@@ -1721,7 +1796,6 @@ mod tests {
             "the depth guard must reject before the spawn-scratch directory is ever created"
         );
     }
-
 
     #[tokio::test]
     async fn run_sync_rejects_when_depth_has_defensively_exceeded_the_ceiling() {
@@ -1741,7 +1815,6 @@ mod tests {
         assert_eq!(result.exit_code, 1);
         assert!(!dir.path().join(".cyrup-subagent-scratch").exists());
     }
-
 
     #[tokio::test]
     async fn run_sync_proceeds_normally_when_strictly_below_the_depth_ceiling() {
@@ -1774,7 +1847,6 @@ mod tests {
         );
     }
 
-
     // ---- run_sync: pre-spawn fail-fast (R-SA-025) ----
 
     #[tokio::test]
@@ -1798,7 +1870,6 @@ mod tests {
         assert!(!dir.path().join(".cyrup-subagent-scratch").exists());
     }
 
-
     #[tokio::test]
     async fn run_sync_fails_with_empty_ladder_when_no_model_is_resolvable() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1809,7 +1880,6 @@ mod tests {
         assert_eq!(result.exit_code, 1);
         assert!(result.attempted_models.is_empty());
     }
-
 
     // ---- SUBA-078: the maxThinking ceiling refuses the RUN, before any child spawns ----
 
@@ -1924,8 +1994,11 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let cwd = PathBuf::from("/proj/plan-batch-test");
         let layout = cyrup_session::SessionLayout::new(root.path().to_path_buf(), cwd.clone());
-        let manager = cyrup_session::SessionManager::in_memory(&cwd, cyrup_session::NewSessionOpts::default())
-            .expect("create in-memory session");
+        let manager = cyrup_session::SessionManager::in_memory(
+            &cwd,
+            cyrup_session::NewSessionOpts::default(),
+        )
+        .expect("create in-memory session");
         let manager = std::sync::Arc::new(tokio::sync::Mutex::new(manager));
         let resolver = ForkContextResolver::new(manager, layout);
 
@@ -1944,15 +2017,17 @@ mod tests {
         assert!(resolved.iter().all(|ctx| ctx.mode == ContextMode::Fresh));
     }
 
-
     #[tokio::test]
     async fn plan_batch_aborts_whole_batch_on_first_fork_failure_zero_side_effects() {
         let root = tempfile::tempdir().expect("tempdir");
         let cwd = PathBuf::from("/proj/plan-batch-abort-test");
         let layout = cyrup_session::SessionLayout::new(root.path().to_path_buf(), cwd.clone());
         // Unpersisted in-memory session: any Fork request must fail hard (R-SA-137/DI-SA-2).
-        let manager = cyrup_session::SessionManager::in_memory(&cwd, cyrup_session::NewSessionOpts::default())
-            .expect("create in-memory session");
+        let manager = cyrup_session::SessionManager::in_memory(
+            &cwd,
+            cyrup_session::NewSessionOpts::default(),
+        )
+        .expect("create in-memory session");
         let manager = std::sync::Arc::new(tokio::sync::Mutex::new(manager));
         let resolver = ForkContextResolver::new(manager, layout);
 
@@ -1985,5 +2060,4 @@ mod tests {
             .unwrap_or(false);
         assert!(!any_files);
     }
-
 }

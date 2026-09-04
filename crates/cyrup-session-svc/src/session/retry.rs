@@ -4,10 +4,10 @@
 //! (`max_retries`/`max_retry_delay_ms`); this decides whether a final assistant turn carrying a
 //! transient error is worth an exponential backoff and an `agent.continue()`.
 
-use std::sync::Arc;
 use cyrup_agent::AgentMessage;
 use cyrup_core::AssistantMessage;
 use cyrup_provider::{RetryPolicy, is_context_overflow, is_retryable_assistant_error};
+use std::sync::Arc;
 
 use crate::event::AgentSessionEvent;
 
@@ -63,7 +63,13 @@ impl AgentSession {
     pub fn is_retryable_error(&self, message: &AssistantMessage) -> bool {
         // Pi `if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;`
         // (agent-session.ts:2637).
-        let window = { Some(Self::lock(&self.compaction_model).as_ref().map_or(0, |m| m.context_window)) };
+        let window = {
+            Some(
+                Self::lock(&self.compaction_model)
+                    .as_ref()
+                    .map_or(0, |m| m.context_window),
+            )
+        };
         if is_context_overflow(message, window) {
             return false;
         }
@@ -111,7 +117,10 @@ impl AgentSession {
             attempt,
             max_attempts: self.retry_max_retries,
             delay_ms,
-            error_message: message.error_message.clone().unwrap_or_else(|| "Unknown error".into()),
+            error_message: message
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "Unknown error".into()),
         })
         .await;
         // Drop the trailing error message from the agent transcript (kept in session for history).
@@ -120,7 +129,9 @@ impl AgentSession {
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.retry_cancel) = Some(cancel.clone());
         let slept = cancel
-            .run_until_cancelled(tokio::time::sleep(std::time::Duration::from_millis(delay_ms)))
+            .run_until_cancelled(tokio::time::sleep(std::time::Duration::from_millis(
+                delay_ms,
+            )))
             .await
             .is_some();
         *Self::lock(&self.retry_cancel) = None;

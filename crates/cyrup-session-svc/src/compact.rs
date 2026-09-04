@@ -12,7 +12,7 @@ use std::sync::Arc;
 use cyrup_core::{AssistantMessage, CancelToken};
 use cyrup_provider::{Model, Provider, RetryObserver, RetryPolicy};
 use cyrup_session::compaction::{
-    complete_summarization, CompactionError, SummarizationRequest, Summarizer,
+    CompactionError, SummarizationRequest, Summarizer, complete_summarization,
 };
 use tokio::sync::mpsc;
 
@@ -33,7 +33,12 @@ pub(crate) struct DynSummarizer {
 
 impl DynSummarizer {
     pub(crate) fn new(provider: Arc<dyn Provider>, model: Model, retry: RetryPolicy) -> Self {
-        Self { provider, model, retry, observer: None }
+        Self {
+            provider,
+            model,
+            retry,
+            observer: None,
+        }
     }
 
     /// Attach the `summarization_retry_*` event emitter for this call — Pi passes
@@ -88,18 +93,22 @@ impl RetryObserver for RetryEventEmitter {
         delay_ms: u64,
         error_message: &str,
     ) {
-        let _ = self.tx.send(AgentSessionEvent::SummarizationRetryScheduled {
-            attempt,
-            max_attempts,
-            delay_ms,
-            error_message: error_message.to_string(),
-        });
+        let _ = self
+            .tx
+            .send(AgentSessionEvent::SummarizationRetryScheduled {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message: error_message.to_string(),
+            });
     }
 
     fn on_retry_attempt_start(&self) {
         let _ = self
             .tx
-            .send(AgentSessionEvent::SummarizationRetryAttemptStart { source: self.source });
+            .send(AgentSessionEvent::SummarizationRetryAttemptStart {
+                source: self.source,
+            });
     }
 
     /// Pi's `onRetryFinished` receives `(success, attempt, finalError)` and discards all three
@@ -114,7 +123,10 @@ impl RetryObserver for RetryEventEmitter {
 /// `AgentSession::spawn_event_pump`.
 pub(crate) fn summarization_retry_channel(
     source: SummarizationRetrySource,
-) -> (Arc<dyn RetryObserver>, mpsc::UnboundedReceiver<AgentSessionEvent>) {
+) -> (
+    Arc<dyn RetryObserver>,
+    mpsc::UnboundedReceiver<AgentSessionEvent>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
     (Arc::new(RetryEventEmitter { tx, source }), rx)
 }

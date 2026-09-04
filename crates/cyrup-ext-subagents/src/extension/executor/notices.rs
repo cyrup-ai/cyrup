@@ -112,14 +112,17 @@ impl ForegroundControlNotifier {
     /// for", and both simply return.
     pub(crate) async fn flush(&self) {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        if self.tx.send(ForegroundControlPumpMsg::Flush(ack_tx)).is_err() {
+        if self
+            .tx
+            .send(ForegroundControlPumpMsg::Flush(ack_tx))
+            .is_err()
+        {
             return;
         }
         let _ = tokio::time::timeout(FOREGROUND_CONTROL_FLUSH_TIMEOUT, ack_rx).await;
     }
 }
 impl SubagentExecutor {
-
     /// The effective background-completion sink to install this session (R-SA-101). Precedence:
     /// an explicitly-injected [`Self::with_completion_sink`] override (a test's scripted sink) →
     /// a live [`crate::background::watch::HostServicesCompletionSink`] when the P-1 `host_services` slot is bound (the real
@@ -130,7 +133,9 @@ impl SubagentExecutor {
             return sink.clone();
         }
         if let Some(services) = self.host_services() {
-            return Arc::new(crate::background::watch::HostServicesCompletionSink::new(services));
+            return Arc::new(crate::background::watch::HostServicesCompletionSink::new(
+                services,
+            ));
         }
         Arc::new(crate::background::watch::LoggingCompletionSink)
     }
@@ -145,7 +150,9 @@ impl SubagentExecutor {
             return Arc::clone(sink);
         }
         if let Some(services) = self.host_services() {
-            return Arc::new(crate::tui::notices::HostServicesControlNoticeSink::new(services));
+            return Arc::new(crate::tui::notices::HostServicesControlNoticeSink::new(
+                services,
+            ));
         }
         Arc::new(crate::tui::notices::LoggingControlNoticeSink)
     }
@@ -268,7 +275,9 @@ impl SubagentExecutor {
                     agent: Some(pump_agent.clone()),
                     step_index: event.index,
                     reason: crate::exec::control::control_event_reason_wire(
-                        event.reason.unwrap_or(crate::exec::control::ControlEventReason::Idle),
+                        event
+                            .reason
+                            .unwrap_or(crate::exec::control::ControlEventReason::Idle),
                     )
                     .to_string(),
                     // pi's `noticeText` (`subagent-executor.ts:519`) — the full rendered body,
@@ -360,10 +369,11 @@ impl SubagentExecutor {
     /// host-services/logging pair — the seam a test uses to capture what the notice pipeline
     /// actually delivered. Mirrors [`Self::with_completion_sink`]'s precedence exactly.
     #[must_use]
-    pub fn with_control_notice_sink(
-        sink: Arc<dyn crate::tui::notices::ControlNoticeSink>,
-    ) -> Self {
-        Self { control_notice_sink_override: Some(sink), ..Self::new() }
+    pub fn with_control_notice_sink(sink: Arc<dyn crate::tui::notices::ControlNoticeSink>) -> Self {
+        Self {
+            control_notice_sink_override: Some(sink),
+            ..Self::new()
+        }
     }
 
     /// Override the control-notice debounce window (production: 1000ms, pi's
@@ -384,7 +394,10 @@ impl SubagentExecutor {
     pub async fn install_completion_watcher(&self, cwd: &Path) {
         let roots = self.config_snapshot().await.roots;
         let results_dir = default_results_dir_in(&roots, cwd);
-        if crate::background::ensure_accessible_dir(&results_dir).await.is_err() {
+        if crate::background::ensure_accessible_dir(&results_dir)
+            .await
+            .is_err()
+        {
             return;
         }
         match crate::background::watch::install_completion_watcher_with_observer(
@@ -394,18 +407,20 @@ impl SubagentExecutor {
             // (`extension/index.ts:648-659` @v0.43.0 registers three; `wait-subscriptions.ts` adds
             // the wait wake-up). cyrup's one-observer seam could only model the mission sync, so
             // both now hang off a `CompositeCompletionObserver` in the same registration order.
-            Some(Arc::new(crate::background::watch::CompositeCompletionObserver::new(vec![
-                // pi `asyncCompleteHandler`'s third subscriber (`extension/index.ts:655`):
-                // `syncMissionFromAsyncCompletion(payload)`. A background run that carries a
-                // `mission.json` binding gets its mission reconciled the moment its result file is
-                // observed — including in a LATER process than the one that launched it, which is
-                // the whole reason the binding file exists.
-                Arc::new(MissionSyncCompletionObserver {
-                    async_root: default_async_root_in(&roots, cwd),
-                }),
-                // SUBA-034: the wake-up every in-flight `wait` is selecting on.
-                Arc::new(self.completion_bus.clone()),
-            ]))),
+            Some(Arc::new(
+                crate::background::watch::CompositeCompletionObserver::new(vec![
+                    // pi `asyncCompleteHandler`'s third subscriber (`extension/index.ts:655`):
+                    // `syncMissionFromAsyncCompletion(payload)`. A background run that carries a
+                    // `mission.json` binding gets its mission reconciled the moment its result file is
+                    // observed — including in a LATER process than the one that launched it, which is
+                    // the whole reason the binding file exists.
+                    Arc::new(MissionSyncCompletionObserver {
+                        async_root: default_async_root_in(&roots, cwd),
+                    }),
+                    // SUBA-034: the wake-up every in-flight `wait` is selecting on.
+                    Arc::new(self.completion_bus.clone()),
+                ]),
+            )),
         ) {
             Ok(handle) => {
                 *self.completion_watcher.lock().await = Some(handle);
@@ -430,16 +445,19 @@ impl SubagentExecutor {
     /// The notice's `source` is [`crate::tui::RunSource::Goal`] — delivered immediately (there is
     /// no live run for a debounce to re-validate against) but WITHOUT triggering a turn.
     pub async fn raise_goal_continuation_notices(&self, cwd: &Path) -> usize {
-        let Some(owner_session_id) =
-            self.host_services().and_then(|services| services.session_id())
+        let Some(owner_session_id) = self
+            .host_services()
+            .and_then(|services| services.session_id())
         else {
             // pi `:587-588`: no session id, no goal scan.
             return 0;
         };
-        let turn_id = self.goal_turn_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let turn_id = self
+            .goal_turn_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         let config = self.config_snapshot().await.missions.clone();
-        let location =
-            crate::missions::resolve_mission_store_location(cwd, config.as_ref(), None);
+        let location = crate::missions::resolve_mission_store_location(cwd, config.as_ref(), None);
         // [CYRUP-DELTA] pi passes `listRetainedChildren(DIRS.async, ownerSessionId)`. That list is
         // built from async runs carrying a `parentWorkflowRunId` — a `workflowScript` concept this
         // crate has no runtime for — so it is necessarily empty here and is passed as such rather
@@ -475,7 +493,10 @@ impl SubagentExecutor {
                     agent: Some(notice.event.agent.clone()),
                     step_index: None,
                     reason: crate::exec::control::control_event_reason_wire(
-                        notice.event.reason.unwrap_or(crate::exec::control::ControlEventReason::Idle),
+                        notice
+                            .event
+                            .reason
+                            .unwrap_or(crate::exec::control::ControlEventReason::Idle),
                     )
                     .to_string(),
                     message: notice.message,
@@ -499,7 +520,12 @@ impl SubagentExecutor {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::testsupport::FixedSessionIdHost;
@@ -553,7 +579,9 @@ mod tests {
             action: "interrupt".to_string(),
             message: None,
         };
-        let (ok, message) = executor.resolve_nested_control_request(&unknown_request).await;
+        let (ok, message) = executor
+            .resolve_nested_control_request(&unknown_request)
+            .await;
         assert!(!ok);
         assert_eq!(
             message,
@@ -572,13 +600,20 @@ mod tests {
             action: "interrupt".to_string(),
             message: None,
         };
-        let (ok, message) = executor.resolve_nested_control_request(&interrupt_request).await;
+        let (ok, message) = executor
+            .resolve_nested_control_request(&interrupt_request)
+            .await;
         assert!(ok, "the first interrupt on a live token must succeed");
         assert_eq!(message, "Interrupt requested for nested run run-nested-1.");
-        assert!(token.is_cancelled(), "the run's real interrupt token must now be cancelled");
+        assert!(
+            token.is_cancelled(),
+            "the run's real interrupt token must now be cancelled"
+        );
 
         // A second interrupt on the now-already-cancelled token has nothing left to interrupt.
-        let (ok, message) = executor.resolve_nested_control_request(&interrupt_request).await;
+        let (ok, message) = executor
+            .resolve_nested_control_request(&interrupt_request)
+            .await;
         assert!(!ok);
         assert_eq!(
             message,
@@ -626,7 +661,9 @@ mod tests {
             action: "resume".to_string(),
             message: Some("   ".to_string()),
         };
-        let (ok, message) = executor.resolve_nested_control_request(&blank_message_request).await;
+        let (ok, message) = executor
+            .resolve_nested_control_request(&blank_message_request)
+            .await;
         assert!(!ok);
         assert_eq!(message, "Nested resume requires message.");
     }
@@ -691,12 +728,17 @@ mod tests {
         let captured = Arc::clone(&delivered);
         let executor = SubagentExecutor::with_control_notice_sink(Arc::new(
             move |notice: crate::tui::ControlNotice, _trigger: bool| {
-                captured.lock().unwrap_or_else(|e| e.into_inner()).push(notice);
+                captured
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(notice);
             },
         ));
         // Long enough that no timer can fire during this test: every assertion below is about the
         // PUMP, not about delivery.
-        executor.set_control_notice_debounce(std::time::Duration::from_secs(600)).await;
+        executor
+            .set_control_notice_debounce(std::time::Duration::from_secs(600))
+            .await;
 
         let run_id = RunId::new();
         let notifier = executor.foreground_control_notifier(
@@ -791,7 +833,10 @@ mod tests {
             }
         }
         assert!(
-            delivered.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            delivered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
             "with a 600s debounce nothing may have been delivered"
         );
     }
@@ -818,7 +863,9 @@ mod tests {
             (Vec::new(), false),
         ] {
             let executor = SubagentExecutor::new();
-            executor.set_control_notice_debounce(std::time::Duration::from_secs(600)).await;
+            executor
+                .set_control_notice_debounce(std::time::Duration::from_secs(600))
+                .await;
             let run_id = RunId::new();
             let notifier = executor.foreground_control_notifier(
                 run_id.clone(),
@@ -847,7 +894,9 @@ mod tests {
 
         // `active_long_running` is telemetry only — never a transcript notice, on any channel set.
         let executor = SubagentExecutor::new();
-        executor.set_control_notice_debounce(std::time::Duration::from_secs(600)).await;
+        executor
+            .set_control_notice_debounce(std::time::Duration::from_secs(600))
+            .await;
         let run_id = RunId::new();
         let notifier = executor.foreground_control_notifier(
             run_id.clone(),
@@ -903,8 +952,10 @@ mod tests {
         let sink = Arc::new(Recording::default());
         let executor = Arc::new(SubagentExecutor::with_control_notice_sink(sink.clone()));
         arm_scoped_missions(&executor, dir.path()).await;
-        let services: Arc<dyn cyrup_ext::host::HostServices> =
-            Arc::new(FixedSessionIdHost { id: Some("goal-session".to_string()), file: None });
+        let services: Arc<dyn cyrup_ext::host::HostServices> = Arc::new(FixedSessionIdHost {
+            id: Some("goal-session".to_string()),
+            file: None,
+        });
         executor.set_host_services(services);
 
         let location = crate::missions::resolve_mission_store_location(
@@ -928,37 +979,72 @@ mod tests {
         )
         .expect("create goal mission");
 
-        assert_eq!(executor.raise_goal_continuation_notices(dir.path()).await, 1);
-        let delivered =
-            sink.delivered.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        assert_eq!(delivered.len(), 1, "exactly one notice per idle goal mission per turn");
+        assert_eq!(
+            executor.raise_goal_continuation_notices(dir.path()).await,
+            1
+        );
+        let delivered = sink
+            .delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            delivered.len(),
+            1,
+            "exactly one notice per idle goal mission per turn"
+        );
         let (notice, trigger_turn) = &delivered[0];
-        assert!(!trigger_turn, "a goal notice must NOT trigger a turn (pi source === \"async\")");
+        assert!(
+            !trigger_turn,
+            "a goal notice must NOT trigger a turn (pi source === \"async\")"
+        );
         assert_eq!(notice.source, crate::tui::RunSource::Goal);
         assert_eq!(notice.agent.as_deref(), Some("goal mission"));
-        assert_eq!(notice.key.run_id.as_str(), format!("goal-{}-turn-1", record.id));
+        assert_eq!(
+            notice.key.run_id.as_str(),
+            format!("goal-{}-turn-1", record.id)
+        );
         assert!(
-            notice.message.contains("Goal mission needs attention: Keep going"),
+            notice
+                .message
+                .contains("Goal mission needs attention: Keep going"),
             "{}",
             notice.message
         );
         assert!(
-            notice.message.contains("Remaining budget: 5000 tokens (0/5000 used)"),
+            notice
+                .message
+                .contains("Remaining budget: 5000 tokens (0/5000 used)"),
             "{}",
             notice.message
         );
         assert!(
-            notice.message.contains("Next ready action: Continue objective: finish the long thing"),
+            notice
+                .message
+                .contains("Next ready action: Continue objective: finish the long thing"),
             "{}",
             notice.message
         );
 
         // A SECOND turn raises a second, non-deduplicated notice (the run id carries the turn).
-        assert_eq!(executor.raise_goal_continuation_notices(dir.path()).await, 1);
-        let delivered =
-            sink.delivered.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        assert_eq!(delivered.len(), 2, "the per-turn run id must defeat the at-most-once dedup");
-        assert_eq!(delivered[1].0.key.run_id.as_str(), format!("goal-{}-turn-2", record.id));
+        assert_eq!(
+            executor.raise_goal_continuation_notices(dir.path()).await,
+            1
+        );
+        let delivered = sink
+            .delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            delivered.len(),
+            2,
+            "the per-turn run id must defeat the at-most-once dedup"
+        );
+        assert_eq!(
+            delivered[1].0.key.run_id.as_str(),
+            format!("goal-{}-turn-2", record.id)
+        );
     }
 
     /// G77 — a live FOREGROUND run gets its own refusal pointing at `interrupt`
@@ -1000,5 +1086,4 @@ mod tests {
             "action='stop' supports async runs only. Use action='interrupt' for foreground runs."
         );
     }
-
 }

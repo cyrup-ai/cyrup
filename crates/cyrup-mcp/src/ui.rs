@@ -68,10 +68,7 @@ use crate::config::{
     ConfigWritePreview, ImportKind, KnownServerPreset, McpConfig, McpDiscoverySummary, ServerEntry,
     ServerProvenance, SourceId, SourceKind, ToolPrefix,
 };
-use crate::dirs::{
-    CachedTool, MetadataCache, ServerCacheEntry,
-    CACHE_MAX_AGE_MS,
-};
+use crate::dirs::{CACHE_MAX_AGE_MS, CachedTool, MetadataCache, ServerCacheEntry};
 use crate::onboarding::OnboardingState;
 use crate::registration::{
     matches_tool_pattern, resolve_tool_prefix, resource_base_tool_name, tool_name_candidates,
@@ -130,7 +127,9 @@ const PREVIEW_MAX_DIFF_LINES: usize = 18;
 /// surviving into a measured string is precisely what those two exist to prevent.
 fn graphemes(text: &str) -> Vec<String> {
     let span = RtSpan::raw(text);
-    span.styled_graphemes(RtStyle::default()).map(|g| g.symbol.to_string()).collect()
+    span.styled_graphemes(RtStyle::default())
+        .map(|g| g.symbol.to_string())
+        .collect()
 }
 
 /// pi `visibleWidth(text)` (`pi/packages/tui/src/utils.ts` @v0.84.1) for escape-free input.
@@ -157,7 +156,11 @@ pub fn truncate_to_width(text: &str, max_width: usize, ellipsis: &str, pad: bool
         return String::new();
     }
     if text.is_empty() {
-        return if pad { " ".repeat(max_width) } else { String::new() };
+        return if pad {
+            " ".repeat(max_width)
+        } else {
+            String::new()
+        };
     }
 
     let ellipsis_width = visible_width(ellipsis);
@@ -170,7 +173,11 @@ pub fn truncate_to_width(text: &str, max_width: usize, ellipsis: &str, pad: bool
         }
         let (clipped, clipped_width) = take_prefix(ellipsis, max_width);
         if clipped_width == 0 {
-            return if pad { " ".repeat(max_width) } else { String::new() };
+            return if pad {
+                " ".repeat(max_width)
+            } else {
+                String::new()
+            };
         }
         return pad_to(&clipped, clipped_width, max_width, pad);
     }
@@ -258,8 +265,11 @@ pub fn wrap_text_hard(text: &str, width: usize) -> Vec<String> {
     }
 
     for word in text.split_whitespace() {
-        let candidate =
-            if current.is_empty() { word.to_string() } else { format!("{current} {word}") };
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
         if visible_width(&candidate) <= max {
             current = candidate;
         } else {
@@ -290,8 +300,11 @@ pub fn wrap_text_soft(text: &str, width: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
-        let candidate =
-            if current.is_empty() { word.to_string() } else { format!("{current} {word}") };
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
         if visible_width(&candidate) <= width {
             current = candidate;
             continue;
@@ -375,7 +388,9 @@ fn ansi_escape_len(chars: &[char], at: usize) -> Option<usize> {
         };
     }
     match chars.get(at + 1) {
-        Some(c) if ('\u{40}'..='\u{5a}').contains(c) || ('\u{5c}'..='\u{5f}').contains(c) => Some(2),
+        Some(c) if ('\u{40}'..='\u{5a}').contains(c) || ('\u{5c}'..='\u{5f}').contains(c) => {
+            Some(2)
+        }
         _ => None,
     }
 }
@@ -478,7 +493,10 @@ pub fn sanitize_row_content(spans: &[OverlaySpan]) -> Vec<OverlaySpan> {
             last_was_space = ch == ' ';
         }
         if !text.is_empty() {
-            out.push(OverlaySpan { text, ..span.clone() });
+            out.push(OverlaySpan {
+                text,
+                ..span.clone()
+            });
         }
     }
     out
@@ -499,7 +517,11 @@ pub fn fuzzy_score(query: &str, text: &str) -> f64 {
     let lq: Vec<char> = lq_s.chars().collect();
     let lt: Vec<char> = lt_s.chars().collect();
     if lt_s.contains(&lq_s) {
-        let ratio = if lt.is_empty() { 0.0 } else { lq.len() as f64 / lt.len() as f64 };
+        let ratio = if lt.is_empty() {
+            0.0
+        } else {
+            lq.len() as f64 / lt.len() as f64
+        };
         return 100.0 + ratio * 50.0;
     }
     let mut score = 0f64;
@@ -517,11 +539,7 @@ pub fn fuzzy_score(query: &str, text: &str) -> f64 {
             consecutive = 0.0;
         }
     }
-    if qi == lq.len() {
-        score
-    } else {
-        0.0
-    }
+    if qi == lq.len() { score } else { 0.0 }
 }
 
 /// JS `String.prototype.length` — UTF-16 code units, not bytes and not `char`s.
@@ -605,17 +623,35 @@ impl Style {
     /// No styling at all.
     #[must_use]
     pub const fn plain() -> Self {
-        Self { fg: None, bold: false, dim: false, italic: false, reversed: false }
+        Self {
+            fg: None,
+            bold: false,
+            dim: false,
+            italic: false,
+            reversed: false,
+        }
     }
     /// A foreground colour alone.
     #[must_use]
     pub const fn fg(color: OverlayColor) -> Self {
-        Self { fg: Some(color), bold: false, dim: false, italic: false, reversed: false }
+        Self {
+            fg: Some(color),
+            bold: false,
+            dim: false,
+            italic: false,
+            reversed: false,
+        }
     }
     /// SGR 2.
     #[must_use]
     pub const fn dim() -> Self {
-        Self { fg: None, bold: false, dim: true, italic: false, reversed: false }
+        Self {
+            fg: None,
+            bold: false,
+            dim: true,
+            italic: false,
+            reversed: false,
+        }
     }
     /// `bold(s)` — SGR 1/22.
     #[must_use]
@@ -815,7 +851,11 @@ pub fn truncate_spans(
     let total_width: usize = spans.iter().map(|s| visible_width(&s.text)).sum();
     let is_empty = spans.iter().all(|s| s.text.is_empty());
     if is_empty {
-        return if pad { vec![OverlaySpan::raw(" ".repeat(max_width))] } else { Vec::new() };
+        return if pad {
+            vec![OverlaySpan::raw(" ".repeat(max_width))]
+        } else {
+            Vec::new()
+        };
     }
 
     let ellipsis_width = visible_width(ellipsis);
@@ -837,7 +877,10 @@ pub fn truncate_spans(
             let w = visible_width(&cluster);
             if kept_width + w > target {
                 if !kept.is_empty() {
-                    out.push(OverlaySpan { text: kept, ..span.clone() });
+                    out.push(OverlaySpan {
+                        text: kept,
+                        ..span.clone()
+                    });
                 }
                 last_style = Some(span.clone());
                 break 'outer;
@@ -846,14 +889,20 @@ pub fn truncate_spans(
             kept_width += w;
         }
         if !kept.is_empty() {
-            out.push(OverlaySpan { text: kept, ..span.clone() });
+            out.push(OverlaySpan {
+                text: kept,
+                ..span.clone()
+            });
         }
         last_style = Some(span.clone());
     }
 
     if ellipsis_width > 0 && ellipsis_width <= max_width {
         let style = last_style.unwrap_or_default();
-        out.push(OverlaySpan { text: ellipsis.to_string(), ..style });
+        out.push(OverlaySpan {
+            text: ellipsis.to_string(),
+            ..style
+        });
         kept_width += ellipsis_width;
     }
     if pad && kept_width < max_width {
@@ -942,7 +991,12 @@ impl KeySpec {
                 }
             }
         }
-        code.map(|code| KeySpec { code, ctrl, alt, shift })
+        code.map(|code| KeySpec {
+            code,
+            ctrl,
+            alt,
+            shift,
+        })
     }
 
     /// Does `key` satisfy this spec?
@@ -1033,9 +1087,11 @@ impl Default for PanelKeys {
 fn key_ids(value: &serde_json::Value) -> Option<Vec<String>> {
     match value {
         serde_json::Value::String(one) => Some(vec![one.clone()]),
-        serde_json::Value::Array(many) => {
-            Some(many.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-        }
+        serde_json::Value::Array(many) => Some(
+            many.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        ),
         _ => None,
     }
 }
@@ -1048,7 +1104,10 @@ impl PanelKeys {
     #[must_use]
     pub fn from_user_bindings(bindings: &[(String, serde_json::Value)]) -> Self {
         let lookup = |id: &str| -> Option<Vec<String>> {
-            bindings.iter().find(|(key, _)| key == id).and_then(|(_, value)| key_ids(value))
+            bindings
+                .iter()
+                .find(|(key, _)| key == id)
+                .and_then(|(_, value)| key_ids(value))
         };
         let specs = |ids: Option<Vec<String>>, fallback: &str| -> Vec<KeySpec> {
             match ids {
@@ -1069,7 +1128,10 @@ impl PanelKeys {
                 KeySpec::parse(DEFAULT_SAVE_KEY).into_iter().collect()
             }
         } else {
-            save_ids.iter().filter_map(|id| KeySpec::parse(id)).collect()
+            save_ids
+                .iter()
+                .filter_map(|id| KeySpec::parse(id))
+                .collect()
         };
         // `saveLabel() = keys[0] ?? (configured ? null : "ctrl+s")`
         let save_label = save_ids.first().cloned().or(if configured {
@@ -1312,9 +1374,7 @@ impl DirectToolsChange {
         match self {
             DirectToolsChange::All => crate::config::BoolOrList::All(true),
             DirectToolsChange::None => crate::config::BoolOrList::All(false),
-            DirectToolsChange::Named(names) => {
-                crate::config::BoolOrList::Named(names.clone())
-            }
+            DirectToolsChange::Named(names) => crate::config::BoolOrList::Named(names.clone()),
         }
     }
 }
@@ -1323,7 +1383,10 @@ impl McpPanelResult {
     /// `done({ cancelled: true, changes: new Map() })`.
     #[must_use]
     pub fn cancelled() -> Self {
-        Self { changes: IndexMap::new(), cancelled: true }
+        Self {
+            changes: IndexMap::new(),
+            cancelled: true,
+        }
     }
 
     /// The write-back argument, in `servers` order.
@@ -1454,8 +1517,10 @@ pub trait McpPanelCallbacks: Send + Sync + 'static {
     ) -> futures::future::BoxFuture<'static, Result<McpAuthResult, String>>;
 
     /// `reconnect(serverName): Promise<boolean>`.
-    fn reconnect(&self, server: String)
-        -> futures::future::BoxFuture<'static, Result<bool, String>>;
+    fn reconnect(
+        &self,
+        server: String,
+    ) -> futures::future::BoxFuture<'static, Result<bool, String>>;
 }
 
 /// `computeServerHash(definition)` as an injectable seam.
@@ -1678,9 +1743,7 @@ impl McpPanelModel {
             };
             let is_direct_for = |name: &str| match &tool_filter {
                 Some(crate::config::BoolOrList::All(all)) => *all,
-                Some(crate::config::BoolOrList::Named(list)) => {
-                    list.iter().any(|n| n == name)
-                }
+                Some(crate::config::BoolOrList::Named(list)) => list.iter().any(|n| n == name),
                 None => false,
             };
 
@@ -1743,9 +1806,10 @@ impl McpPanelModel {
                         }
                         tools.push(ToolState {
                             name: base_name.clone(),
-                            description: resource.description.clone().unwrap_or_else(|| {
-                                format!("Read resource: {}", resource.uri)
-                            }),
+                            description: resource
+                                .description
+                                .clone()
+                                .unwrap_or_else(|| format!("Read resource: {}", resource.uri)),
                             is_direct: is_direct_for(&base_name),
                             was_direct: is_direct_for(&base_name),
                             // Deliberately no input schema: a resource tool's estimate is meant to
@@ -1782,7 +1846,11 @@ impl McpPanelModel {
     }
 
     /// `cache?.servers?.[name]` **only if** `isServerCacheValid(entry, definition)`.
-    fn valid_entry(&self, server_name: &str, definition: &ServerEntry) -> Option<&ServerCacheEntry> {
+    fn valid_entry(
+        &self,
+        server_name: &str,
+        definition: &ServerEntry,
+    ) -> Option<&ServerCacheEntry> {
         let entry = self.cache.as_ref()?.servers.get(server_name)?;
         // MCP-141 leg (b): the `None` arm used to be `ResolvedIdentity::verbatim`, which resolves
         // nothing — so a panel opened against a server whose `env`/`headers`/`url`/`bearerToken`
@@ -1832,14 +1900,22 @@ impl McpPanelModel {
                 if !ui_visible_to_model(tool) {
                     continue;
                 }
-                candidates
-                    .extend(tool_name_candidates(&tool.name, other_name, other_prefix, false));
+                candidates.extend(tool_name_candidates(
+                    &tool.name,
+                    other_name,
+                    other_prefix,
+                    false,
+                ));
             }
             if other_definition.expose_resources() {
                 for resource in &entry.resources {
                     let base_name = resource_base_tool_name(&resource.name);
-                    candidates
-                        .extend(tool_name_candidates(&base_name, other_name, other_prefix, false));
+                    candidates.extend(tool_name_candidates(
+                        &base_name,
+                        other_name,
+                        other_prefix,
+                        false,
+                    ));
                 }
             }
         }
@@ -1867,7 +1943,11 @@ impl McpPanelModel {
             if !query.is_empty() && self.auth_only {
                 // `mode === "name" ? fuzzyScore(query, server.name) : 0` — desc search is refused in
                 // authOnly, so the `0` arm is unreachable and kept only for shape.
-                let score = if desc_mode { 0.0 } else { fuzzy_score(&query, &server.name) };
+                let score = if desc_mode {
+                    0.0
+                } else {
+                    fuzzy_score(&query, &server.name)
+                };
                 if score > 0.0 {
                     items.push(VisibleItem::Server { server_index: si });
                 }
@@ -1887,7 +1967,10 @@ impl McpPanelModel {
                             continue;
                         }
                     }
-                    items.push(VisibleItem::Tool { server_index: si, tool_index: ti });
+                    items.push(VisibleItem::Tool {
+                        server_index: si,
+                        tool_index: ti,
+                    });
                 }
             }
         }
@@ -1910,8 +1993,9 @@ impl McpPanelModel {
     /// The clamp that follows **every** `rebuildVisibleItems` call: the cursor is clamped, never
     /// reset to 0.
     fn clamp_cursor(&mut self) {
-        self.cursor_index =
-            self.cursor_index.min(self.visible_items.len().saturating_sub(1));
+        self.cursor_index = self
+            .cursor_index
+            .min(self.visible_items.len().saturating_sub(1));
     }
 
     fn rebuild_and_clamp(&mut self) {
@@ -1965,7 +2049,10 @@ impl McpPanelModel {
             };
             changes.insert(server.name.clone(), change);
         }
-        McpPanelResult { changes, cancelled: false }
+        McpPanelResult {
+            changes,
+            cancelled: false,
+        }
     }
 
     /// The result `done(...)` published, or `None` while the panel is still open (MCP-369).
@@ -2183,8 +2270,7 @@ impl McpPanelModel {
                     tool.is_direct = !tool.is_direct;
                     let now_direct = tool.is_direct;
                     if now_direct && source == SourceKind::Import {
-                        self.import_notice =
-                            Some(Self::import_notice_text(import_kind.as_deref()));
+                        self.import_notice = Some(Self::import_notice_text(import_kind.as_deref()));
                     }
                     self.update_dirty();
                     PanelInputOutcome::Redraw
@@ -2356,7 +2442,10 @@ impl McpPanelModel {
             return None;
         }
         server.connection_status = ConnectionStatus::Connecting;
-        Some(PanelJob::Reconnect { server: server.name.clone(), after_auth })
+        Some(PanelJob::Reconnect {
+            server: server.name.clone(),
+            after_auth,
+        })
     }
 
     /// `ctrl+y` (13h §1.9) — requires `status == "failed"` **and** a failure message, and copies the
@@ -2388,7 +2477,10 @@ impl McpPanelModel {
             .and_then(|item| self.servers.get(item.server_index()))
             .is_some_and(|server| {
                 server.connection_status == ConnectionStatus::Failed
-                    && server.failure_message.as_deref().is_some_and(|m| !m.is_empty())
+                    && server
+                        .failure_message
+                        .as_deref()
+                        .is_some_and(|m| !m.is_empty())
             })
     }
 
@@ -2439,7 +2531,11 @@ impl McpPanelModel {
                 }
                 None
             }
-            PanelJobResult::Reconnected { server, after_auth, outcome } => {
+            PanelJobResult::Reconnected {
+                server,
+                after_auth,
+                outcome,
+            } => {
                 let display = sanitize_display_text(Some(&server));
                 let index = self.server_index(&server)?;
                 match outcome {
@@ -2453,8 +2549,7 @@ impl McpPanelModel {
                         if status == ConnectionStatus::Connected {
                             let entry = self.callbacks.refresh_cache_after_reconnect(&server);
                             if let Some(entry) = entry {
-                                let cache =
-                                    self.cache.get_or_insert_with(MetadataCache::default);
+                                let cache = self.cache.get_or_insert_with(MetadataCache::default);
                                 cache.servers.insert(server.clone(), entry.clone());
                                 self.rebuild_server_tools(index, &entry);
                             }
@@ -2617,7 +2712,10 @@ pub fn rainbow_progress(filled: usize, total: usize) -> StyledText {
         }
         let color = RAINBOW_COLORS.get(i % RAINBOW_COLORS.len()).copied();
         let Some(color) = color else { continue };
-        out.push(Style::fg(color), if i < filled { "\u{25cf}" } else { "\u{25cb}" });
+        out.push(
+            Style::fg(color),
+            if i < filled { "\u{25cf}" } else { "\u{25cb}" },
+        );
     }
     out
 }
@@ -2645,10 +2743,11 @@ impl McpPanelModel {
 
     /// `divider()`.
     fn divider(&self, inner_w: usize) -> OverlayLine {
-        OverlayLine::new(vec![self.theme.border.span(format!(
-            "\u{251c}{}\u{2524}",
-            "\u{2500}".repeat(inner_w)
-        ))])
+        OverlayLine::new(vec![
+            self.theme
+                .border
+                .span(format!("\u{251c}{}\u{2524}", "\u{2500}".repeat(inner_w))),
+        ])
     }
 
     /// `render(width)` — the whole frame, top to bottom (13h §1.11, MCP-366).
@@ -2663,14 +2762,20 @@ impl McpPanelModel {
         let mut lines: Vec<OverlayLine> = Vec::new();
 
         // 1 — title bar, centred by width, not by character count.
-        let title_text = if self.auth_only { " MCP OAuth " } else { " MCP Servers " };
+        let title_text = if self.auth_only {
+            " MCP OAuth "
+        } else {
+            " MCP Servers "
+        };
         let border_len = inner_w.saturating_sub(visible_width(title_text));
         let left_b = border_len / 2;
         let right_b = border_len - left_b;
         lines.push(OverlayLine::new(vec![
-            t.border.span(format!("\u{256d}{}", "\u{2500}".repeat(left_b))),
+            t.border
+                .span(format!("\u{256d}{}", "\u{2500}".repeat(left_b))),
             t.title.span(title_text),
-            t.border.span(format!("{}\u{256e}", "\u{2500}".repeat(right_b))),
+            t.border
+                .span(format!("{}\u{256e}", "\u{2500}".repeat(right_b))),
         ]));
 
         // 2 — a blank row.
@@ -2680,7 +2785,10 @@ impl McpPanelModel {
         let mut search = StyledText::new();
         search.push(t.border, "\u{25ce}").raw("  ");
         if self.desc_search_active {
-            search.push(t.needs_auth, "desc:").raw(" ").raw(self.desc_query.clone());
+            search
+                .push(t.needs_auth, "desc:")
+                .raw(" ")
+                .raw(self.desc_query.clone());
             search.push(t.selected, "\u{2502}");
         } else if !self.name_query.is_empty() {
             search.raw(self.name_query.clone());
@@ -2696,10 +2804,7 @@ impl McpPanelModel {
             for notice in &self.notice_lines {
                 lines.push(self.row(
                     inner_w,
-                    &StyledText::styled(
-                        t.hint.italic(),
-                        sanitize_display_text(Some(notice)),
-                    ),
+                    &StyledText::styled(t.hint.italic(), sanitize_display_text(Some(notice))),
                 ));
             }
             lines.push(self.empty_row(inner_w));
@@ -2730,15 +2835,21 @@ impl McpPanelModel {
             let signed_total = i64::try_from(total).unwrap_or(i64::MAX);
             let signed_cursor = i64::try_from(self.cursor_index).unwrap_or(0);
             let signed_max = i64::try_from(max_vis).unwrap_or(0);
-            let start = (signed_cursor - signed_max / 2).min(signed_total - signed_max).max(0);
+            let start = (signed_cursor - signed_max / 2)
+                .min(signed_total - signed_max)
+                .max(0);
             let start_idx = usize::try_from(start).unwrap_or(0);
             let end_idx = start_idx.saturating_add(max_vis).min(total);
 
             lines.push(self.empty_row(inner_w));
             for i in start_idx..end_idx {
-                let Some(item) = self.visible_items.get(i) else { continue };
+                let Some(item) = self.visible_items.get(i) else {
+                    continue;
+                };
                 let is_cursor = i == self.cursor_index;
-                let Some(server) = self.servers.get(item.server_index()) else { continue };
+                let Some(server) = self.servers.get(item.server_index()) else {
+                    continue;
+                };
                 match item {
                     VisibleItem::Server { .. } => {
                         lines.push(self.row(inner_w, &self.render_server_row(server, is_cursor)));
@@ -2819,17 +2930,27 @@ impl McpPanelModel {
                 &StyledText::styled(t.description, "select a server to authenticate"),
             ));
         } else {
-            let direct_count: usize =
-                self.servers.iter().map(|s| s.tools.iter().filter(|t| t.is_direct).count()).sum();
+            let direct_count: usize = self
+                .servers
+                .iter()
+                .map(|s| s.tools.iter().filter(|t| t.is_direct).count())
+                .sum();
             let total_tokens: usize = self
                 .servers
                 .iter()
                 .map(|s| {
-                    s.tools.iter().filter(|t| t.is_direct).map(|t| t.estimated_tokens).sum::<usize>()
+                    s.tools
+                        .iter()
+                        .filter(|t| t.is_direct)
+                        .map(|t| t.estimated_tokens)
+                        .sum::<usize>()
                 })
                 .sum();
             let stats = if direct_count > 0 {
-                format!("{direct_count} direct  ~{} tokens", to_locale_string(total_tokens))
+                format!(
+                    "{direct_count} direct  ~{} tokens",
+                    to_locale_string(total_tokens)
+                )
             } else {
                 "no direct tools".to_string()
             };
@@ -2850,10 +2971,10 @@ impl McpPanelModel {
         }
 
         // 11 — the bottom border.
-        lines.push(OverlayLine::new(vec![t.border.span(format!(
-            "\u{2570}{}\u{256f}",
-            "\u{2500}".repeat(inner_w)
-        ))]));
+        lines.push(OverlayLine::new(vec![
+            t.border
+                .span(format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(inner_w))),
+        ]));
 
         lines
     }
@@ -2918,18 +3039,33 @@ impl McpPanelModel {
     /// `"import"`, while [`Self::import_notice_text`]'s notice falls back to `"external"`.
     fn render_server_row(&self, server: &ServerState, is_cursor: bool) -> StyledText {
         let t = self.theme;
-        let expand_icon = if server.expanded { "\u{25be}" } else { "\u{25b8}" };
+        let expand_icon = if server.expanded {
+            "\u{25be}"
+        } else {
+            "\u{25b8}"
+        };
         let mut row = StyledText::new();
         if is_cursor {
             row.push(t.selected, expand_icon);
         } else {
-            row.push(t.border, if server.expanded { expand_icon } else { "\u{b7}" });
+            row.push(
+                t.border,
+                if server.expanded {
+                    expand_icon
+                } else {
+                    "\u{b7}"
+                },
+            );
         }
 
         let server_name = sanitize_display_text(Some(&server.name));
         let import_kind =
             sanitize_display_text(Some(server.import_kind.as_deref().unwrap_or("import")));
-        let name_style = if is_cursor { t.selected.bold() } else { Style::plain() };
+        let name_style = if is_cursor {
+            t.selected.bold()
+        } else {
+            Style::plain()
+        };
         let status_label = self.render_connection_status(server);
 
         if !server.has_cached_data && !self.auth_only {
@@ -3030,7 +3166,14 @@ impl McpPanelModel {
             row.push(t.description, "\u{25cb}");
         }
         row.raw(" ");
-        row.push(if is_cursor { t.selected.bold() } else { Style::plain() }, tool_name);
+        row.push(
+            if is_cursor {
+                t.selected.bold()
+            } else {
+                Style::plain()
+            },
+            tool_name,
+        );
         row.raw(" ");
         if max_desc_len > 5 && !description.is_empty() {
             row.push(
@@ -3052,8 +3195,11 @@ impl McpPanelModel {
 /// The clipboard writers, in the order `cyrup-tui`'s own `copy_to_clipboard` tries them: first that
 /// **spawns** wins.
 #[cfg(unix)]
-const CLIPBOARD_COMMANDS: [(&str, &[&str]); 3] =
-    [("pbcopy", &[]), ("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
+const CLIPBOARD_COMMANDS: [(&str, &[&str]); 3] = [
+    ("pbcopy", &[]),
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard"]),
+];
 /// Windows' built-in `clip`. `cyrup-tui`'s helper is `#[cfg(unix)]` and silently no-ops here, which
 /// would tell a Windows user "Copied error to clipboard" over an empty clipboard.
 #[cfg(windows)]
@@ -3093,10 +3239,16 @@ pub async fn copy_to_clipboard(text: &str) -> Result<(), String> {
                 .write_all(text.as_bytes())
                 .await
                 .map_err(|error| format!("{program}: {error}"))?;
-            stdin.shutdown().await.map_err(|error| format!("{program}: {error}"))?;
+            stdin
+                .shutdown()
+                .await
+                .map_err(|error| format!("{program}: {error}"))?;
             drop(stdin);
         }
-        let status = child.wait().await.map_err(|error| format!("{program}: {error}"))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| format!("{program}: {error}"))?;
         return if status.success() {
             Ok(())
         } else {
@@ -3106,7 +3258,10 @@ pub async fn copy_to_clipboard(text: &str) -> Result<(), String> {
     Err(if spawn_errors.is_empty() {
         "no clipboard command is available on this platform".to_string()
     } else {
-        format!("no clipboard command could be started ({})", spawn_errors.join("; "))
+        format!(
+            "no clipboard command could be started ({})",
+            spawn_errors.join("; ")
+        )
     })
 }
 
@@ -3121,8 +3276,15 @@ pub async fn open_path(target: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let (program, args): (&str, Vec<String>) = ("open", vec![display.clone()]);
     #[cfg(target_os = "windows")]
-    let (program, args): (&str, Vec<String>) =
-        ("cmd", vec!["/c".to_string(), "start".to_string(), String::new(), display.clone()]);
+    let (program, args): (&str, Vec<String>) = (
+        "cmd",
+        vec![
+            "/c".to_string(),
+            "start".to_string(),
+            String::new(),
+            display.clone(),
+        ],
+    );
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let (program, args): (&str, Vec<String>) = ("xdg-open", vec![display.clone()]);
 
@@ -3138,7 +3300,10 @@ pub async fn open_path(target: &Path) -> Result<(), String> {
     Err(if stderr.is_empty() {
         format!(
             "Failed to open path (exit code {})",
-            output.status.code().map_or_else(|| "unknown".to_string(), |c| c.to_string())
+            output
+                .status
+                .code()
+                .map_or_else(|| "unknown".to_string(), |c| c.to_string())
         )
     } else {
         stderr
@@ -3228,7 +3393,11 @@ impl McpPanelOverlay {
                 }
                 PanelJob::Reconnect { server, after_auth } => {
                     let outcome = callbacks.reconnect(server.clone()).await;
-                    PanelJobResult::Reconnected { server, after_auth, outcome }
+                    PanelJobResult::Reconnected {
+                        server,
+                        after_auth,
+                        outcome,
+                    }
                 }
                 PanelJob::CopyError { server, text } => {
                     let outcome = copy_to_clipboard(&text).await;
@@ -3244,23 +3413,27 @@ impl McpPanelOverlay {
     fn cancelled_result(job: &PanelJob) -> PanelJobResult {
         let message = "The MCP panel action was cancelled.".to_string();
         match job {
-            PanelJob::Authenticate(server) => {
-                PanelJobResult::Authenticated { server: server.clone(), outcome: Err(message) }
-            }
+            PanelJob::Authenticate(server) => PanelJobResult::Authenticated {
+                server: server.clone(),
+                outcome: Err(message),
+            },
             PanelJob::Reconnect { server, after_auth } => PanelJobResult::Reconnected {
                 server: server.clone(),
                 after_auth: *after_auth,
                 outcome: Err(message),
             },
-            PanelJob::CopyError { server, .. } => {
-                PanelJobResult::Copied { server: server.clone(), outcome: Err(message) }
-            }
+            PanelJob::CopyError { server, .. } => PanelJobResult::Copied {
+                server: server.clone(),
+                outcome: Err(message),
+            },
         }
     }
 
     /// Poll the in-flight job; `true` when the frame would differ.
     fn drain_job(&mut self) -> bool {
-        let Some((job, rx)) = self.job.as_mut() else { return false };
+        let Some((job, rx)) = self.job.as_mut() else {
+            return false;
+        };
         let settled = match rx.try_recv() {
             Ok(result) => result,
             // The task vanished without answering. Settling it anyway is what clears the busy latch
@@ -3727,7 +3900,9 @@ impl McpSetupPanelModel {
     /// The current notice, if any.
     #[must_use]
     pub fn notice(&self) -> Option<(&str, NoticeTone)> {
-        self.notice.as_ref().map(|(text, tone)| (text.as_str(), *tone))
+        self.notice
+            .as_ref()
+            .map(|(text, tone)| (text.as_str(), *tone))
     }
 
     /// Whether `done()` has been called.
@@ -3785,8 +3960,7 @@ impl McpSetupPanelModel {
             return SetupInputOutcome::Redraw;
         }
         if self.keys.select_down(&key) {
-            self.action_cursor =
-                (self.action_cursor + 1).min(actions.len().saturating_sub(1));
+            self.action_cursor = (self.action_cursor + 1).min(actions.len().saturating_sub(1));
             return SetupInputOutcome::Redraw;
         }
         if self.keys.select_confirm(&key) {
@@ -3937,8 +4111,7 @@ impl McpSetupPanelModel {
                         NoticeTone::Muted,
                     )
                 } else {
-                    let added: Vec<&str> =
-                        outcome.added.iter().map(|kind| kind.as_str()).collect();
+                    let added: Vec<&str> = outcome.added.iter().map(|kind| kind.as_str()).collect();
                     (
                         format!(
                             "Added {} to {}. Pi will reload after this panel closes.",
@@ -3978,8 +4151,7 @@ impl McpSetupPanelModel {
                 ));
             }
             SetupJobResult::OpenPath(path, Ok(())) => {
-                self.notice =
-                    Some((format!("Opened {}", path.display()), NoticeTone::Success));
+                self.notice = Some((format!("Opened {}", path.display()), NoticeTone::Success));
             }
             SetupJobResult::AdoptImports(Err(error))
             | SetupJobResult::ScaffoldProject(Err(error))
@@ -4025,7 +4197,9 @@ impl McpSetupPanelModel {
         let fitted_width: usize = fitted.iter().map(|s| visible_width(&s.text)).sum();
         let mut spans = vec![OverlaySpan::raw("\u{2502}"), OverlaySpan::raw("  ")];
         spans.extend(fitted);
-        spans.push(OverlaySpan::raw(" ".repeat(content_w.saturating_sub(fitted_width))));
+        spans.push(OverlaySpan::raw(
+            " ".repeat(content_w.saturating_sub(fitted_width)),
+        ));
         spans.push(OverlaySpan::raw("  "));
         spans.push(OverlaySpan::raw("\u{2502}"));
         OverlayLine::new(spans)
@@ -4104,7 +4278,9 @@ impl McpSetupPanelModel {
         // whole screen — 23 rows for a six-rung ladder — and the adapter clipped the excess with
         // `.take(rect.height)`. That is the same silent truncation MCP-377 removed from the action
         // list, on the two screens the sweep did not cover.
-        let body_rows = max_rows.saturating_sub(lines.len()).saturating_sub(SETUP_CHROME_ROWS);
+        let body_rows = max_rows
+            .saturating_sub(lines.len())
+            .saturating_sub(SETUP_CHROME_ROWS);
         match self.screen {
             SetupScreen::Imports => lines.extend(self.render_imports(inner_w, body_rows)),
             SetupScreen::Paths => lines.extend(self.render_paths(inner_w, body_rows)),
@@ -4179,8 +4355,10 @@ impl McpSetupPanelModel {
         // cannot be chosen without its height. Both markers are reserved unconditionally: reserving
         // only the ones that will render would need the window that depends on them, and the cost
         // of guessing high is one blank row.
-        let preview =
-            self.action_preview(self.selected_action().as_ref(), Self::preview_width(inner_w));
+        let preview = self.action_preview(
+            self.selected_action().as_ref(),
+            Self::preview_width(inner_w),
+        );
         let budget = action_rows
             .saturating_sub(preview.len())
             .saturating_sub(TRAILING_ROWS)
@@ -4203,7 +4381,9 @@ impl McpSetupPanelModel {
             lines.push(self.pad_text(inner_w, t.muted, format!("\u{2026} {start} more above")));
         }
         for index in start..end {
-            let Some(action) = actions.get(index) else { continue };
+            let Some(action) = actions.get(index) else {
+                continue;
+            };
             // The heading is emitted when the preset is the first *visible* row, not only the first
             // row overall — which is what makes it interact correctly with the compact window.
             if action.id == SetupActionId::AddKnownServer
@@ -4299,7 +4479,9 @@ impl McpSetupPanelModel {
             lines.push(self.pad_text(inner_w, t.muted, format!("\u{2026} {start} more above")));
         }
         for index in start..end {
-            let Some(entry) = self.discovery.imports.get(index) else { continue };
+            let Some(entry) = self.discovery.imports.get(index) else {
+                continue;
+            };
             let mut row = StyledText::new();
             if index == self.import_cursor {
                 row.push(t.selected, "\u{203a}");
@@ -4308,7 +4490,11 @@ impl McpSetupPanelModel {
             }
             row.raw(format!(
                 " {} {}  {}",
-                if self.selected_imports.contains(&entry.kind) { "[x]" } else { "[ ]" },
+                if self.selected_imports.contains(&entry.kind) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                },
                 entry.kind.as_str(),
                 entry.path.display()
             ));
@@ -4344,14 +4530,18 @@ impl McpSetupPanelModel {
         let paths = self.detected_paths();
         // No preview block on this screen, so the only non-row cost is the two intro rows above
         // and both markers.
-        let budget = body_rows.saturating_sub(lines.len()).saturating_sub(MARKER_ROWS);
+        let budget = body_rows
+            .saturating_sub(lines.len())
+            .saturating_sub(MARKER_ROWS);
         let (start, end) = Self::window_within(self.path_cursor, paths.len(), budget);
 
         if start > 0 {
             lines.push(self.pad_text(inner_w, t.muted, format!("\u{2026} {start} more above")));
         }
         for index in start..end {
-            let Some(path) = paths.get(index) else { continue };
+            let Some(path) = paths.get(index) else {
+                continue;
+            };
             let mut row = StyledText::new();
             if index == self.path_cursor {
                 row.push(t.selected, "\u{203a}");
@@ -4463,7 +4653,10 @@ impl McpSetupPanelModel {
 
     /// `formatPreview(lines, width)`.
     fn format_preview(lines: &[String], width: usize) -> Vec<String> {
-        lines.iter().flat_map(|line| wrap_text_soft(line, width)).collect()
+        lines
+            .iter()
+            .flat_map(|line| wrap_text_soft(line, width))
+            .collect()
     }
 
     /// `formatWritePreview(title, preview, intro, width)` (MCP-376).
@@ -4486,7 +4679,10 @@ impl McpSetupPanelModel {
         if !intro.is_empty() {
             lines.push(String::new());
         }
-        lines.extend(wrap_text_soft(&format!("{title}: {}", preview.path.display()), width));
+        lines.extend(wrap_text_soft(
+            &format!("{title}: {}", preview.path.display()),
+            width,
+        ));
         lines.extend(wrap_text_soft(
             if preview.existed {
                 "Existing file detected. Showing exact before/after diff."
@@ -4759,7 +4955,9 @@ impl McpSetupOverlay {
     }
 
     fn drain_job(&mut self) -> bool {
-        let Some((job, rx)) = self.job.as_mut() else { return false };
+        let Some((job, rx)) = self.job.as_mut() else {
+            return false;
+        };
         let settled = match rx.try_recv() {
             Ok(result) => result,
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Self::cancelled_result(job),
@@ -4858,8 +5056,17 @@ impl FooterCounts {
     #[must_use]
     pub fn from_config(config: &McpConfig, connected: usize) -> Self {
         let configured = config.mcp_servers.len();
-        let disabled = config.mcp_servers.values().filter(|entry| entry.is_disabled()).count();
-        Self { configured, connected, enabled: configured - disabled, disabled }
+        let disabled = config
+            .mcp_servers
+            .values()
+            .filter(|entry| entry.is_disabled())
+            .count();
+        Self {
+            configured,
+            connected,
+            enabled: configured - disabled,
+            disabled,
+        }
     }
 }
 
@@ -4904,7 +5111,11 @@ pub fn footer_status_text(config: &McpConfig, counts: FooterCounts) -> Option<St
             let mut status = format!(
                 "{} {} enabled",
                 counts.enabled,
-                if counts.enabled == 1 { "server" } else { "servers" }
+                if counts.enabled == 1 {
+                    "server"
+                } else {
+                    "servers"
+                }
             );
             if counts.connected > 0 {
                 status.push_str(&format!(" ({} connected)", counts.connected));
@@ -5085,7 +5296,12 @@ pub fn open_mcp_setup_panel(
 // =================================================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::config::{BoolOrList, McpSettings};
@@ -5106,7 +5322,10 @@ mod tests {
         let hostile = "\u{1b}[31mred\u{1b}[0m\u{1b}]8;;https://evil.invalid\u{7}link\tafter\0end";
         let clean = sanitize_terminal_text(hostile);
         assert!(!clean.contains('\u{1b}'), "no escape survives: {clean:?}");
-        assert!(!clean.contains("evil.invalid"), "the OSC payload is gone: {clean:?}");
+        assert!(
+            !clean.contains("evil.invalid"),
+            "the OSC payload is gone: {clean:?}"
+        );
         assert!(clean.contains("red"));
         assert!(clean.contains("after"));
     }
@@ -5122,7 +5341,10 @@ mod tests {
 
     #[test]
     fn row_sanitation_drops_controls_and_inserts_at_most_one_space() {
-        let spans = vec![OverlaySpan::raw("ab\u{1}\u{2}cd"), OverlaySpan::raw("\u{7}ef")];
+        let spans = vec![
+            OverlaySpan::raw("ab\u{1}\u{2}cd"),
+            OverlaySpan::raw("\u{7}ef"),
+        ];
         let out = sanitize_row_content(&spans);
         let text: String = out.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(text, "ab cd ef");
@@ -5134,7 +5356,10 @@ mod tests {
         let model = fixture_panel(false);
         for line in model.render(82) {
             let text = line.plain_text();
-            assert!(!text.chars().any(char::is_control), "control byte in {text:?}");
+            assert!(
+                !text.chars().any(char::is_control),
+                "control byte in {text:?}"
+            );
         }
     }
 
@@ -5157,7 +5382,10 @@ mod tests {
     #[test]
     fn token_estimation_matches_the_literal_formula() {
         // ceil((name + desc + "{}") / 4) + 10, with the empty schema stringifying to two chars.
-        assert_eq!(estimate_tokens("ab", None, None), (2 + 2usize).div_ceil(4) + 10);
+        assert_eq!(
+            estimate_tokens("ab", None, None),
+            (2 + 2usize).div_ceil(4) + 10
+        );
         let schema = serde_json::json!({"type": "object"});
         let schema_len = serde_json::to_string(&schema).unwrap().chars().count();
         assert_eq!(
@@ -5182,8 +5410,14 @@ mod tests {
     fn truncation_pads_to_exactly_the_requested_width() {
         assert_eq!(truncate_to_width("", 5, "\u{2026}", true), "     ");
         assert_eq!(truncate_to_width("abc", 5, "\u{2026}", true), "abc  ");
-        assert_eq!(truncate_to_width("abcdefgh", 5, "\u{2026}", true), "abcd\u{2026}");
-        assert_eq!(truncate_to_width("abcdefgh", 5, "\u{2026}", false), "abcd\u{2026}");
+        assert_eq!(
+            truncate_to_width("abcdefgh", 5, "\u{2026}", true),
+            "abcd\u{2026}"
+        );
+        assert_eq!(
+            truncate_to_width("abcdefgh", 5, "\u{2026}", false),
+            "abcd\u{2026}"
+        );
     }
 
     #[test]
@@ -5192,7 +5426,11 @@ mod tests {
         assert_eq!(wrap_text_hard("aaaaaaaaaaaa", 8), vec!["aaaaaaaa", "aaaa"]);
         // The setup panel's does not.
         assert_eq!(wrap_text_soft("aaaaaaaaaaaa", 12), vec!["aaaaaaaaaaaa"]);
-        assert_eq!(wrap_text_soft("anything", 8), vec!["anything"], "width <= 8 is verbatim");
+        assert_eq!(
+            wrap_text_soft("anything", 8),
+            vec!["anything"],
+            "width <= 8 is verbatim"
+        );
         assert_eq!(wrap_text_soft("", 40), vec![String::new()]);
     }
 
@@ -5233,10 +5471,8 @@ mod tests {
 
     #[test]
     fn rebinding_the_canonical_select_ids_moves_the_cursor_on_the_new_key() {
-        let keys = PanelKeys::from_user_bindings(&[(
-            "tui.select.up".into(),
-            serde_json::json!("ctrl+p"),
-        )]);
+        let keys =
+            PanelKeys::from_user_bindings(&[("tui.select.up".into(), serde_json::json!("ctrl+p"))]);
         assert!(keys.select_up(&OverlayKey::ctrl(OverlayKeyCode::Char('p'))));
         assert!(!keys.select_up(&key(OverlayKeyCode::Up)));
         // The other two keep their defaults.
@@ -5269,7 +5505,11 @@ mod tests {
 
     impl Default for StubCallbacks {
         fn default() -> Self {
-            Self { status: ConnectionStatus::Idle, failure: None, can_auth: false }
+            Self {
+                status: ConnectionStatus::Idle,
+                failure: None,
+                can_auth: false,
+            }
         }
     }
 
@@ -5287,7 +5527,12 @@ mod tests {
             &self,
             _server: String,
         ) -> futures::future::BoxFuture<'static, Result<McpAuthResult, String>> {
-            Box::pin(async { Ok(McpAuthResult { ok: true, message: None }) })
+            Box::pin(async {
+                Ok(McpAuthResult {
+                    ok: true,
+                    message: None,
+                })
+            })
         }
         fn reconnect(
             &self,
@@ -5324,29 +5569,41 @@ mod tests {
 
     fn fixture_panel(auth_only: bool) -> McpPanelModel {
         let mut config = McpConfig::default();
-        let stdio = ServerEntry { command: Some("echo".into()), ..ServerEntry::default() };
-        let disabled =
-            ServerEntry { command: Some("echo".into()), disabled: Some(true), ..ServerEntry::default() };
+        let stdio = ServerEntry {
+            command: Some("echo".into()),
+            ..ServerEntry::default()
+        };
+        let disabled = ServerEntry {
+            command: Some("echo".into()),
+            disabled: Some(true),
+            ..ServerEntry::default()
+        };
         config.mcp_servers.insert("atlassian".into(), stdio.clone());
         config.mcp_servers.insert("stale".into(), stdio.clone());
         config.mcp_servers.insert("off".into(), disabled.clone());
 
         let mut cache = MetadataCache::default();
-        cache
-            .servers
-            .insert("atlassian".into(), valid_cache_entry(&stdio, &["search_issues", "create"]));
+        cache.servers.insert(
+            "atlassian".into(),
+            valid_cache_entry(&stdio, &["search_issues", "create"]),
+        );
         // A stale entry: the hash does not match, so the panel treats it as absent.
         let mut bad = valid_cache_entry(&stdio, &["ignored"]);
         bad.config_hash = "0".repeat(64);
         cache.servers.insert("stale".into(), bad);
-        cache.servers.insert("off".into(), valid_cache_entry(&disabled, &["never"]));
+        cache
+            .servers
+            .insert("off".into(), valid_cache_entry(&disabled, &["never"]));
 
         McpPanelModel::new(
             &config,
             Some(cache),
             &IndexMap::new(),
             Arc::new(StubCallbacks::default()),
-            PanelOptions { auth_only, ..PanelOptions::default() },
+            PanelOptions {
+                auth_only,
+                ..PanelOptions::default()
+            },
         )
     }
 
@@ -5358,26 +5615,44 @@ mod tests {
     fn construction_honours_config_order_cache_validity_and_the_disabled_gate() {
         let model = fixture_panel(false);
         let names: Vec<&str> = model.servers().iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["atlassian", "stale", "off"], "file order is row order");
+        assert_eq!(
+            names,
+            vec!["atlassian", "stale", "off"],
+            "file order is row order"
+        );
 
         assert!(model.servers()[0].has_cached_data);
         assert_eq!(model.servers()[0].tools.len(), 2);
 
-        assert!(!model.servers()[1].has_cached_data, "a hash mismatch reads as not cached");
+        assert!(
+            !model.servers()[1].has_cached_data,
+            "a hash mismatch reads as not cached"
+        );
         assert!(model.servers()[1].tools.is_empty());
 
         assert!(model.servers()[2].has_cached_data, "the entry is valid ...");
-        assert!(model.servers()[2].tools.is_empty(), "... but a disabled server lists no tools");
+        assert!(
+            model.servers()[2].tools.is_empty(),
+            "... but a disabled server lists no tools"
+        );
     }
 
     #[test]
     fn a_global_direct_tools_true_pre_ticks_every_tool() {
         let mut config = McpConfig::default();
-        let stdio = ServerEntry { command: Some("echo".into()), ..ServerEntry::default() };
+        let stdio = ServerEntry {
+            command: Some("echo".into()),
+            ..ServerEntry::default()
+        };
         config.mcp_servers.insert("a".into(), stdio.clone());
-        config.settings = Some(McpSettings { direct_tools: Some(true), ..McpSettings::default() });
+        config.settings = Some(McpSettings {
+            direct_tools: Some(true),
+            ..McpSettings::default()
+        });
         let mut cache = MetadataCache::default();
-        cache.servers.insert("a".into(), valid_cache_entry(&stdio, &["one", "two"]));
+        cache
+            .servers
+            .insert("a".into(), valid_cache_entry(&stdio, &["one", "two"]));
         let model = McpPanelModel::new(
             &config,
             Some(cache),
@@ -5385,8 +5660,16 @@ mod tests {
             Arc::new(StubCallbacks::default()),
             PanelOptions::default(),
         );
-        assert!(model.servers()[0].tools.iter().all(|t| t.is_direct && t.was_direct));
-        assert!(!model.is_dirty(), "the baseline equals the live value at construction");
+        assert!(
+            model.servers()[0]
+                .tools
+                .iter()
+                .all(|t| t.is_direct && t.was_direct)
+        );
+        assert!(
+            !model.is_dirty(),
+            "the baseline equals the live value at construction"
+        );
     }
 
     #[test]
@@ -5398,9 +5681,14 @@ mod tests {
             ..ServerEntry::default()
         };
         config.mcp_servers.insert("a".into(), stdio.clone());
-        config.settings = Some(McpSettings { direct_tools: Some(true), ..McpSettings::default() });
+        config.settings = Some(McpSettings {
+            direct_tools: Some(true),
+            ..McpSettings::default()
+        });
         let mut cache = MetadataCache::default();
-        cache.servers.insert("a".into(), valid_cache_entry(&stdio, &["one"]));
+        cache
+            .servers
+            .insert("a".into(), valid_cache_entry(&stdio, &["one"]));
         let model = McpPanelModel::new(
             &config,
             Some(cache),
@@ -5414,7 +5702,10 @@ mod tests {
     #[test]
     fn a_resource_becomes_a_read_tool_with_a_smaller_estimate_than_a_real_tool() {
         let mut config = McpConfig::default();
-        let stdio = ServerEntry { command: Some("echo".into()), ..ServerEntry::default() };
+        let stdio = ServerEntry {
+            command: Some("echo".into()),
+            ..ServerEntry::default()
+        };
         config.mcp_servers.insert("a".into(), stdio.clone());
         let mut entry = valid_cache_entry(&stdio, &[]);
         entry.tools.push(CachedTool {
@@ -5439,9 +5730,16 @@ mod tests {
             Arc::new(StubCallbacks::default()),
             PanelOptions::default(),
         );
-        let names: Vec<&str> =
-            model.servers()[0].tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["read_docs", "read_docs"], "the resource's base name collides");
+        let names: Vec<&str> = model.servers()[0]
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["read_docs", "read_docs"],
+            "the resource's base name collides"
+        );
         assert_eq!(
             model.servers()[0].tools[1].description,
             "Read resource: file:///docs",
@@ -5481,19 +5779,37 @@ mod tests {
         for ch in "atlas".chars() {
             model.handle_key(key(OverlayKeyCode::Char(ch)));
         }
-        let tools =
-            model.visible_items().iter().filter(|i| matches!(i, VisibleItem::Tool { .. })).count();
-        assert_eq!(tools, 2, "both tools survive on the server-name match alone");
+        let tools = model
+            .visible_items()
+            .iter()
+            .filter(|i| matches!(i, VisibleItem::Tool { .. }))
+            .count();
+        assert_eq!(
+            tools, 2,
+            "both tools survive on the server-name match alone"
+        );
     }
 
     #[test]
     fn auth_only_lists_no_tools_and_skips_servers_that_cannot_authenticate() {
         let model = fixture_panel(true);
         assert!(model.servers().is_empty(), "the stub refuses every server");
-        let frame: Vec<String> = model.render(82).iter().map(OverlayLine::plain_text).collect();
+        let frame: Vec<String> = model
+            .render(82)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect();
         assert!(frame.iter().any(|l| l.contains("MCP OAuth")));
-        assert!(frame.iter().any(|l| l.contains("No OAuth-capable MCP servers configured.")));
-        assert!(frame.iter().any(|l| l.contains("select a server to authenticate")));
+        assert!(
+            frame
+                .iter()
+                .any(|l| l.contains("No OAuth-capable MCP servers configured."))
+        );
+        assert!(
+            frame
+                .iter()
+                .any(|l| l.contains("select a server to authenticate"))
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -5511,7 +5827,10 @@ mod tests {
             "all on"
         );
         model.handle_key(key(OverlayKeyCode::Char(' ')));
-        assert!(model.build_result().changes.is_empty(), "back to the baseline: no change at all");
+        assert!(
+            model.build_result().changes.is_empty(),
+            "back to the baseline: no change at all"
+        );
 
         // A partial selection: expand, move to the first tool, toggle it.
         model.handle_key(key(OverlayKeyCode::Enter));
@@ -5537,9 +5856,16 @@ mod tests {
         let mut model = fixture_panel(false);
         model.handle_key(key(OverlayKeyCode::Char(' ')));
         assert!(model.is_dirty());
-        assert_eq!(model.handle_key(key(OverlayKeyCode::Escape)), PanelInputOutcome::Redraw);
+        assert_eq!(
+            model.handle_key(key(OverlayKeyCode::Escape)),
+            PanelInputOutcome::Redraw
+        );
 
-        let frame: Vec<String> = model.render(82).iter().map(OverlayLine::plain_text).collect();
+        let frame: Vec<String> = model
+            .render(82)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect();
         assert!(frame.iter().any(|l| l.contains("Discard unsaved changes?")));
 
         // `ctrl+s` is ignored while the modal is up — clause 1 and clause 2 in one bug otherwise.
@@ -5547,13 +5873,22 @@ mod tests {
             model.handle_key(OverlayKey::ctrl(OverlayKeyCode::Char('s'))),
             PanelInputOutcome::Ignored
         );
-        assert!(model.result().is_none(), "nothing was saved from inside the modal");
+        assert!(
+            model.result().is_none(),
+            "nothing was saved from inside the modal"
+        );
 
         // Enter on the preselected `Keep & Close` keeps the changes.
-        assert_eq!(model.handle_key(key(OverlayKeyCode::Enter)), PanelInputOutcome::Close);
+        assert_eq!(
+            model.handle_key(key(OverlayKeyCode::Enter)),
+            PanelInputOutcome::Close
+        );
         let result = model.result().unwrap();
         assert!(!result.cancelled);
-        assert_eq!(result.changes.get("atlassian"), Some(&DirectToolsChange::All));
+        assert_eq!(
+            result.changes.get("atlassian"),
+            Some(&DirectToolsChange::All)
+        );
     }
 
     #[test]
@@ -5572,7 +5907,11 @@ mod tests {
     fn ctrl_s_saves_from_inside_description_search_but_question_mark_never_reaches_the_query() {
         let mut model = fixture_panel(false);
         model.handle_key(key(OverlayKeyCode::Char('?')));
-        let frame: Vec<String> = model.render(82).iter().map(OverlayLine::plain_text).collect();
+        let frame: Vec<String> = model
+            .render(82)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect();
         assert!(frame.iter().any(|l| l.contains("desc:")));
         // `?` is claimed at step 12, above the printable catch-all, so it never lands in a query.
         model.handle_key(key(OverlayKeyCode::Char(' ')));
@@ -5592,9 +5931,19 @@ mod tests {
             model.handle_key(key(OverlayKeyCode::Char(ch)));
         }
         model.handle_key(key(OverlayKeyCode::Escape));
-        let frame: Vec<String> = model.render(82).iter().map(OverlayLine::plain_text).collect();
-        assert!(!frame.iter().any(|l| l.contains("desc:")), "the modal is gone");
-        assert!(frame.iter().any(|l| l.contains("search...")), "and the query is empty");
+        let frame: Vec<String> = model
+            .render(82)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect();
+        assert!(
+            !frame.iter().any(|l| l.contains("desc:")),
+            "the modal is gone"
+        );
+        assert!(
+            frame.iter().any(|l| l.contains("search...")),
+            "and the query is empty"
+        );
     }
 
     #[test]
@@ -5620,9 +5969,15 @@ mod tests {
             model.handle_key(OverlayKey::ctrl(OverlayKeyCode::Char('a'))),
             PanelInputOutcome::Redraw
         );
-        let frame: Vec<String> = model.render(82).iter().map(OverlayLine::plain_text).collect();
+        let frame: Vec<String> = model
+            .render(82)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect();
         assert!(
-            frame.iter().any(|l| l.contains("atlassian does not use OAuth authentication.")),
+            frame
+                .iter()
+                .any(|l| l.contains("atlassian does not use OAuth authentication.")),
             "{frame:#?}"
         );
     }
@@ -5641,7 +5996,12 @@ mod tests {
                 &self,
                 _server: String,
             ) -> futures::future::BoxFuture<'static, Result<McpAuthResult, String>> {
-                Box::pin(async { Ok(McpAuthResult { ok: false, message: None }) })
+                Box::pin(async {
+                    Ok(McpAuthResult {
+                        ok: false,
+                        message: None,
+                    })
+                })
             }
             fn reconnect(
                 &self,
@@ -5653,7 +6013,10 @@ mod tests {
         let mut config = McpConfig::default();
         config.mcp_servers.insert(
             "notion".into(),
-            ServerEntry { url: Some("https://x.invalid/mcp".into()), ..ServerEntry::default() },
+            ServerEntry {
+                url: Some("https://x.invalid/mcp".into()),
+                ..ServerEntry::default()
+            },
         );
         let mut model = McpPanelModel::new(
             &config,
@@ -5664,7 +6027,10 @@ mod tests {
         );
 
         let outcome = model.handle_key(OverlayKey::ctrl(OverlayKeyCode::Char('a')));
-        assert_eq!(outcome, PanelInputOutcome::Run(PanelJob::Authenticate("notion".into())));
+        assert_eq!(
+            outcome,
+            PanelInputOutcome::Run(PanelJob::Authenticate("notion".into()))
+        );
         // A second attempt is refused while the first is in flight.
         assert_eq!(
             model.handle_key(OverlayKey::ctrl(OverlayKeyCode::Char('a'))),
@@ -5672,8 +6038,7 @@ mod tests {
         );
 
         // The task vanished: the overlay settles it as a rejection, which must clear the latch.
-        let cancelled =
-            McpPanelOverlay::cancelled_result(&PanelJob::Authenticate("notion".into()));
+        let cancelled = McpPanelOverlay::cancelled_result(&PanelJob::Authenticate("notion".into()));
         assert!(model.finish_job(cancelled).is_none());
         assert_eq!(
             model.handle_key(OverlayKey::ctrl(OverlayKeyCode::Char('a'))),
@@ -5688,13 +6053,22 @@ mod tests {
 
         model.finish_job(PanelJobResult::Authenticated {
             server: "atlassian".into(),
-            outcome: Ok(McpAuthResult { ok: false, message: Some("bad token".into()) }),
+            outcome: Ok(McpAuthResult {
+                ok: false,
+                message: Some("bad token".into()),
+            }),
         });
-        assert_eq!(model.auth_notice(), Some("OAuth failed for atlassian: bad token"));
+        assert_eq!(
+            model.auth_notice(),
+            Some("OAuth failed for atlassian: bad token")
+        );
 
         model.finish_job(PanelJobResult::Authenticated {
             server: "atlassian".into(),
-            outcome: Ok(McpAuthResult { ok: false, message: None }),
+            outcome: Ok(McpAuthResult {
+                ok: false,
+                message: None,
+            }),
         });
         assert_eq!(
             model.auth_notice(),
@@ -5718,20 +6092,34 @@ mod tests {
             after_auth: false,
             outcome: Err("socket closed".into()),
         });
-        assert_eq!(model.auth_notice(), Some("Reconnect failed for atlassian: socket closed"));
-        assert_eq!(model.servers()[0].connection_status, ConnectionStatus::Failed);
+        assert_eq!(
+            model.auth_notice(),
+            Some("Reconnect failed for atlassian: socket closed")
+        );
+        assert_eq!(
+            model.servers()[0].connection_status,
+            ConnectionStatus::Failed
+        );
         // The notice is rendered, truncated to the panel width, in the needsAuth slot.
-        let frame: String =
-            model.render(82).iter().map(OverlayLine::plain_text).collect::<Vec<_>>().join("\n");
+        let frame: String = model
+            .render(82)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(frame.contains("Reconnect failed for atlassian"));
     }
 
     #[test]
     fn ctrl_y_copies_the_sanitized_failure_text_and_gates_its_own_hint() {
         let mut config = McpConfig::default();
-        config
-            .mcp_servers
-            .insert("dock\u{7}er".into(), ServerEntry { command: Some("x".into()), ..ServerEntry::default() });
+        config.mcp_servers.insert(
+            "dock\u{7}er".into(),
+            ServerEntry {
+                command: Some("x".into()),
+                ..ServerEntry::default()
+            },
+        );
         let mut model = McpPanelModel::new(
             &config,
             None,
@@ -5744,15 +6132,22 @@ mod tests {
             PanelOptions::default(),
         );
         assert!(model.selected_server_has_failure_message());
-        let frame: String =
-            model.render(82).iter().map(OverlayLine::plain_text).collect::<Vec<_>>().join("\n");
+        let frame: String = model
+            .render(82)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(frame.contains("ctrl+y copy error"), "the hint is shown");
 
         let outcome = model.handle_key(OverlayKey::ctrl(OverlayKeyCode::Char('y')));
         match outcome {
             PanelInputOutcome::Run(PanelJob::CopyError { server, text }) => {
                 assert_eq!(server, "dock er", "the name is sanitized");
-                assert_eq!(text, "spawn ENOENT", "the copied text is the sanitized form");
+                assert_eq!(
+                    text, "spawn ENOENT",
+                    "the copied text is the sanitized form"
+                );
                 model.finish_job(PanelJobResult::Copied {
                     server,
                     outcome: Err("pbcopy exited with 1".into()),
@@ -5760,8 +6155,12 @@ mod tests {
             }
             other => panic!("expected a copy job, got {other:?}"),
         }
-        let frame: String =
-            model.render(82).iter().map(OverlayLine::plain_text).collect::<Vec<_>>().join("\n");
+        let frame: String = model
+            .render(82)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(frame.contains("Failed to copy error for dock er: pbcopy exited with 1"));
     }
 
@@ -5795,11 +6194,19 @@ mod tests {
         }
 
         let mut config = McpConfig::default();
-        let stdio = ServerEntry { command: Some("echo".into()), ..ServerEntry::default() };
+        let stdio = ServerEntry {
+            command: Some("echo".into()),
+            ..ServerEntry::default()
+        };
         config.mcp_servers.insert("a".into(), stdio.clone());
-        config.settings = Some(McpSettings { direct_tools: Some(true), ..McpSettings::default() });
+        config.settings = Some(McpSettings {
+            direct_tools: Some(true),
+            ..McpSettings::default()
+        });
         let mut cache = MetadataCache::default();
-        cache.servers.insert("a".into(), valid_cache_entry(&stdio, &["keep", "gone"]));
+        cache
+            .servers
+            .insert("a".into(), valid_cache_entry(&stdio, &["keep", "gone"]));
         // After the reconnect `gone` is absent and `fresh` is new.
         let rebuilt = valid_cache_entry(&stdio, &["keep", "fresh"]);
 
@@ -5820,7 +6227,10 @@ mod tests {
         let tools = &model.servers()[0].tools;
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].name, "keep");
-        assert!(tools[0].is_direct && tools[0].was_direct, "a survivor keeps both");
+        assert!(
+            tools[0].is_direct && tools[0].was_direct,
+            "a survivor keeps both"
+        );
         assert_eq!(tools[1].name, "fresh");
         assert!(
             !tools[1].is_direct && !tools[1].was_direct,
@@ -5852,9 +6262,13 @@ mod tests {
     fn a_long_failure_message_wraps_under_its_server_rather_than_truncating() {
         let long = "spawn docker ENOENT: could not start the container runtime for the atlassian mcp server";
         let mut config = McpConfig::default();
-        config
-            .mcp_servers
-            .insert("atlassian".into(), ServerEntry { command: Some("x".into()), ..ServerEntry::default() });
+        config.mcp_servers.insert(
+            "atlassian".into(),
+            ServerEntry {
+                command: Some("x".into()),
+                ..ServerEntry::default()
+            },
+        );
         let model = McpPanelModel::new(
             &config,
             None,
@@ -5866,8 +6280,12 @@ mod tests {
             }),
             PanelOptions::default(),
         );
-        let frame: String =
-            model.render(82).iter().map(OverlayLine::plain_text).collect::<Vec<_>>().join("\n");
+        let frame: String = model
+            .render(82)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
         for word in long.split(' ') {
             assert!(frame.contains(word), "{word:?} is missing from the frame");
         }
@@ -5877,12 +6295,17 @@ mod tests {
     #[test]
     fn a_long_list_shows_the_progress_counter_and_windows_to_twelve_rows() {
         let mut config = McpConfig::default();
-        let stdio = ServerEntry { command: Some("echo".into()), ..ServerEntry::default() };
+        let stdio = ServerEntry {
+            command: Some("echo".into()),
+            ..ServerEntry::default()
+        };
         let mut cache = MetadataCache::default();
         for i in 0..20 {
             let name = format!("s{i}");
             config.mcp_servers.insert(name.clone(), stdio.clone());
-            cache.servers.insert(name, valid_cache_entry(&stdio, &["t"]));
+            cache
+                .servers
+                .insert(name, valid_cache_entry(&stdio, &["t"]));
         }
         let model = McpPanelModel::new(
             &config,
@@ -5891,9 +6314,19 @@ mod tests {
             Arc::new(StubCallbacks::default()),
             PanelOptions::default(),
         );
-        let frame: Vec<String> = model.render(82).iter().map(OverlayLine::plain_text).collect();
-        assert!(frame.iter().any(|l| l.contains("1/20")), "the counter is shown");
-        let server_rows = frame.iter().filter(|l| l.contains("s1") || l.contains("s0")).count();
+        let frame: Vec<String> = model
+            .render(82)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect();
+        assert!(
+            frame.iter().any(|l| l.contains("1/20")),
+            "the counter is shown"
+        );
+        let server_rows = frame
+            .iter()
+            .filter(|l| l.contains("s1") || l.contains("s0"))
+            .count();
         assert!(server_rows <= MAX_VISIBLE, "the body is windowed");
     }
 
@@ -5901,7 +6334,10 @@ mod tests {
     fn the_hint_bar_wraps_instead_of_overflowing_the_frame() {
         let model = fixture_panel(false);
         let rows = model.hint_rows(58);
-        assert!(rows.len() > 1, "at 60 columns the hints do not fit on one line");
+        assert!(
+            rows.len() > 1,
+            "at 60 columns the hints do not fit on one line"
+        );
         for row in rows {
             assert!(row.width() <= 56, "each line fits in innerW - 2");
         }
@@ -6119,9 +6555,12 @@ mod tests {
     /// can hold the chrome at all rather than pretending any `n` is honourable.
     #[test]
     fn render_bounded_never_exceeds_its_budget() {
-        for screen in
-            [SetupScreen::Setup, SetupScreen::Empty, SetupScreen::Imports, SetupScreen::Paths]
-        {
+        for screen in [
+            SetupScreen::Setup,
+            SetupScreen::Empty,
+            SetupScreen::Imports,
+            SetupScreen::Paths,
+        ] {
             let model = populated_setup_model(screen);
             let unbounded = model.render_bounded(80, usize::MAX).len();
             let floor = model.render_bounded(80, 1).len();
@@ -6173,7 +6612,10 @@ mod tests {
             .expect("some budget renders the panel whole");
 
         let at = model.render_bounded(80, boundary);
-        assert!(!render_text(&at).contains("more below"), "at the boundary, nothing is truncated");
+        assert!(
+            !render_text(&at).contains("more below"),
+            "at the boundary, nothing is truncated"
+        );
         assert!(at.len() <= boundary, "and the budget still holds");
 
         assert!(
@@ -6204,22 +6646,40 @@ mod tests {
         assert_eq!(ids.first(), Some(&SetupActionId::RunSetup));
         assert_eq!(ids.last(), Some(&SetupActionId::Close));
         assert_eq!(
-            ids.iter().filter(|id| **id == SetupActionId::AddKnownServer).count(),
+            ids.iter()
+                .filter(|id| **id == SetupActionId::AddKnownServer)
+                .count(),
             5,
             "five presets"
         );
-        assert!(!ids.contains(&SetupActionId::AdoptImports), "no imports were detected");
-        assert!(!ids.contains(&SetupActionId::OpenPaths), "no paths were detected");
-        assert!(ids.contains(&SetupActionId::ScaffoldProject), "no shared-project source exists");
+        assert!(
+            !ids.contains(&SetupActionId::AdoptImports),
+            "no imports were detected"
+        );
+        assert!(
+            !ids.contains(&SetupActionId::OpenPaths),
+            "no paths were detected"
+        );
+        assert!(
+            ids.contains(&SetupActionId::ScaffoldProject),
+            "no shared-project source exists"
+        );
     }
 
     #[test]
     fn run_setup_changes_the_screen_and_therefore_the_action_list() {
         let mut model = setup_model(SetupScreen::Empty);
         let before = model.actions().len();
-        assert_eq!(model.handle_key(key(OverlayKeyCode::Enter)), SetupInputOutcome::Redraw);
+        assert_eq!(
+            model.handle_key(key(OverlayKeyCode::Enter)),
+            SetupInputOutcome::Redraw
+        );
         assert_eq!(model.screen(), SetupScreen::Setup);
-        assert_eq!(model.actions().len(), before - 1, "`run-setup` is gone from the setup screen");
+        assert_eq!(
+            model.actions().len(),
+            before - 1,
+            "`run-setup` is gone from the setup screen"
+        );
     }
 
     #[test]
@@ -6239,20 +6699,32 @@ mod tests {
             SetupInputOutcome::Run(SetupJob::ScaffoldProject)
         ));
         assert!(model.is_busy());
-        assert_eq!(model.handle_key(key(OverlayKeyCode::Down)), SetupInputOutcome::Ignored);
-        assert_eq!(model.handle_key(key(OverlayKeyCode::Escape)), SetupInputOutcome::Close);
+        assert_eq!(
+            model.handle_key(key(OverlayKeyCode::Down)),
+            SetupInputOutcome::Ignored
+        );
+        assert_eq!(
+            model.handle_key(key(OverlayKeyCode::Escape)),
+            SetupInputOutcome::Close
+        );
         assert!(model.is_closed());
     }
 
     #[test]
     fn a_read_only_action_only_sets_the_review_notice() {
         let mut model = setup_model(SetupScreen::Setup);
-        let index =
-            model.actions().iter().position(|a| a.id == SetupActionId::ViewExample).unwrap();
+        let index = model
+            .actions()
+            .iter()
+            .position(|a| a.id == SetupActionId::ViewExample)
+            .unwrap();
         for _ in 0..index {
             model.handle_key(key(OverlayKeyCode::Down));
         }
-        assert_eq!(model.handle_key(key(OverlayKeyCode::Enter)), SetupInputOutcome::Redraw);
+        assert_eq!(
+            model.handle_key(key(OverlayKeyCode::Enter)),
+            SetupInputOutcome::Redraw
+        );
         assert_eq!(
             model.notice().map(|(text, _)| text.to_string()),
             Some(
@@ -6275,8 +6747,13 @@ mod tests {
         }
         model.handle_key(key(OverlayKeyCode::Enter));
         assert!(model.is_busy());
-        model.finish_job(McpSetupOverlay::cancelled_result(&SetupJob::ScaffoldProject));
-        assert!(!model.is_busy(), "the finally clause must run on the rejection arm too");
+        model.finish_job(McpSetupOverlay::cancelled_result(
+            &SetupJob::ScaffoldProject,
+        ));
+        assert!(
+            !model.is_busy(),
+            "the finally clause must run on the rejection arm too"
+        );
     }
 
     #[test]
@@ -6302,7 +6779,10 @@ mod tests {
     #[test]
     fn the_empty_import_selection_warns_without_starting_a_job() {
         let mut model = setup_model(SetupScreen::Imports);
-        assert_eq!(model.handle_key(key(OverlayKeyCode::Enter)), SetupInputOutcome::Redraw);
+        assert_eq!(
+            model.handle_key(key(OverlayKeyCode::Enter)),
+            SetupInputOutcome::Redraw
+        );
         assert_eq!(
             model.notice().map(|(text, tone)| (text.to_string(), tone)),
             Some((
@@ -6316,19 +6796,34 @@ mod tests {
     #[test]
     fn the_diff_cap_is_eighteen_lines_with_a_singular_overflow_at_one() {
         let mut preview = empty_preview();
-        preview.diff_text = (0..25).map(|i| format!("+line{i}")).collect::<Vec<_>>().join("\n");
+        preview.diff_text = (0..25)
+            .map(|i| format!("+line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let lines = McpSetupPanelModel::format_write_preview("T", &preview, &[], 74);
-        assert!(lines.contains(&"\u{2026} 7 more diff lines".to_string()), "{lines:#?}");
+        assert!(
+            lines.contains(&"\u{2026} 7 more diff lines".to_string()),
+            "{lines:#?}"
+        );
 
-        preview.diff_text = (0..19).map(|i| format!("+line{i}")).collect::<Vec<_>>().join("\n");
+        preview.diff_text = (0..19)
+            .map(|i| format!("+line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let lines = McpSetupPanelModel::format_write_preview("T", &preview, &[], 74);
-        assert!(lines.contains(&"\u{2026} 1 more diff line".to_string()), "{lines:#?}");
+        assert!(
+            lines.contains(&"\u{2026} 1 more diff line".to_string()),
+            "{lines:#?}"
+        );
     }
 
     #[test]
     fn the_two_summary_lines_follow_their_own_pluralisation_rules() {
         let model = setup_model(SetupScreen::Empty);
-        assert_eq!(model.discovery_summary_line().1, "No MCP config is active yet.");
+        assert_eq!(
+            model.discovery_summary_line().1,
+            "No MCP config is active yet."
+        );
         assert_eq!(
             model.secondary_summary_line(),
             "Create a shared .mcp.json, adopt host imports, or quick-add RepoPrompt from this screen."
@@ -6336,7 +6831,10 @@ mod tests {
 
         let mut completed = setup_model(SetupScreen::Empty);
         completed.onboarding.setup_completed = true;
-        assert_eq!(completed.discovery_summary_line().1, "No MCP servers are active right now.");
+        assert_eq!(
+            completed.discovery_summary_line().1,
+            "No MCP servers are active right now."
+        );
     }
 
     #[test]
@@ -6351,7 +6849,10 @@ mod tests {
         let preview = model.action_preview(Some(&action), 74);
         assert!(preview.contains(&"5. .mcp.json".to_string()));
         assert!(
-            preview.contains(&format!("6. {}/mcp.json", crate::config::PROJECT_OVERRIDE_DIR)),
+            preview.contains(&format!(
+                "6. {}/mcp.json",
+                crate::config::PROJECT_OVERRIDE_DIR
+            )),
             "{preview:#?}"
         );
         assert!(!preview.iter().any(|l| l.contains(".pi/mcp.json")));
@@ -6368,10 +6869,17 @@ mod tests {
         let (start, end) = model.visible_action_range(total);
         assert_eq!(end - start, COMPACT_ACTION_ROWS);
         assert_eq!(end, total, "the cursor is on the last row");
-        let frame: Vec<String> = model.render(60).iter().map(OverlayLine::plain_text).collect();
+        let frame: Vec<String> = model
+            .render(60)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect();
         assert!(frame.iter().any(|l| l.contains("more above")), "{frame:#?}");
         assert!(!frame.iter().any(|l| l.contains("more below")));
-        assert!(frame.iter().any(|l| l.contains("Enter select")), "the compact hint");
+        assert!(
+            frame.iter().any(|l| l.contains("Enter select")),
+            "the compact hint"
+        );
     }
 
     #[test]
@@ -6379,7 +6887,12 @@ mod tests {
         for width in [60usize, 92] {
             let model = setup_model(SetupScreen::Setup);
             for line in model.render(width) {
-                assert_eq!(visible_width(&line.plain_text()), width, "{:?}", line.plain_text());
+                assert_eq!(
+                    visible_width(&line.plain_text()),
+                    width,
+                    "{:?}",
+                    line.plain_text()
+                );
             }
         }
     }
@@ -6391,30 +6904,56 @@ mod tests {
     #[test]
     fn the_footer_segment_has_three_shapes_and_one_cleared_state() {
         let mut config = McpConfig::default();
-        config
-            .mcp_servers
-            .insert("a".into(), ServerEntry { command: Some("x".into()), ..ServerEntry::default() });
+        config.mcp_servers.insert(
+            "a".into(),
+            ServerEntry {
+                command: Some("x".into()),
+                ..ServerEntry::default()
+            },
+        );
         config.mcp_servers.insert(
             "b".into(),
-            ServerEntry { command: Some("x".into()), disabled: Some(true), ..ServerEntry::default() },
+            ServerEntry {
+                command: Some("x".into()),
+                disabled: Some(true),
+                ..ServerEntry::default()
+            },
         );
         let counts = FooterCounts::from_config(&config, 1);
-        assert_eq!(counts, FooterCounts { configured: 2, connected: 1, enabled: 1, disabled: 1 });
+        assert_eq!(
+            counts,
+            FooterCounts {
+                configured: 2,
+                connected: 1,
+                enabled: 1,
+                disabled: 1
+            }
+        );
 
         assert_eq!(
             footer_status_text(&config, counts).as_deref(),
             Some("\u{1f50c} MCP: 1 server enabled (1 connected) (1 disabled)")
         );
 
-        config.settings =
-            Some(McpSettings { mcp_footer_status: Some(crate::config::FooterStatus::Compact), ..McpSettings::default() });
-        assert_eq!(footer_status_text(&config, counts).as_deref(), Some("MCP 1/1"));
+        config.settings = Some(McpSettings {
+            mcp_footer_status: Some(crate::config::FooterStatus::Compact),
+            ..McpSettings::default()
+        });
+        assert_eq!(
+            footer_status_text(&config, counts).as_deref(),
+            Some("MCP 1/1")
+        );
 
-        config.settings =
-            Some(McpSettings { mcp_footer_status: Some(crate::config::FooterStatus::Off), ..McpSettings::default() });
+        config.settings = Some(McpSettings {
+            mcp_footer_status: Some(crate::config::FooterStatus::Off),
+            ..McpSettings::default()
+        });
         assert_eq!(footer_status_text(&config, counts), None);
 
-        assert_eq!(footer_status_text(&McpConfig::default(), FooterCounts::default()), None);
+        assert_eq!(
+            footer_status_text(&McpConfig::default(), FooterCounts::default()),
+            None
+        );
     }
 
     #[test]
@@ -6441,7 +6980,10 @@ mod tests {
         );
         assert_eq!(fingerprint.as_deref(), Some("fp-1"));
 
-        let shown = OnboardingState { shared_config_hint_shown: true, ..OnboardingState::default() };
+        let shown = OnboardingState {
+            shared_config_hint_shown: true,
+            ..OnboardingState::default()
+        };
         assert!(shared_config_notice_lines(&summary, &shown).0.is_empty());
         // A changed fingerprint does NOT re-arm it: the flag is a plain boolean.
         let shown_with_old_fingerprint = OnboardingState {
@@ -6449,7 +6991,11 @@ mod tests {
             last_discovery_fingerprint: Some("fp-0".into()),
             ..OnboardingState::default()
         };
-        assert!(shared_config_notice_lines(&summary, &shown_with_old_fingerprint).0.is_empty());
+        assert!(
+            shared_config_notice_lines(&summary, &shown_with_old_fingerprint)
+                .0
+                .is_empty()
+        );
     }
 
     // ---------------------------------------------------------------------------------------

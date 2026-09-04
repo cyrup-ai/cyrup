@@ -1,19 +1,23 @@
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod x13_live_bash_tests {
+    use crate::UiTheme;
     use crate::app::*;
-    use cyrup_provider::faux::FauxProvider;
     use cyrup_provider::Provider;
+    use cyrup_provider::faux::FauxProvider;
+    use cyrup_session_svc::AgentSession;
     use cyrup_session_svc::{SessionBuilder, SessionConfig};
     use ratatui::backend::TestBackend;
     use std::sync::Arc;
-    use cyrup_session_svc::AgentSession;
-    use crate::UiTheme;
 
     /// ~3000 lines x ~40 bytes ≈ 120 KB — comfortably past `truncate.ts:11-12`'s 2000-line / 50 KB
     /// pair, so `bash-executor.ts`'s `ensureTempFile` spill and `truncateTail` both fire.
-    const BIG: &str =
-        "for i in $(seq 1 3000); do echo \"line-number-$i-padding-xxxxxxxxxx\"; done";
+    const BIG: &str = "for i in $(seq 1 3000); do echo \"line-number-$i-padding-xxxxxxxxxx\"; done";
 
     async fn session(dir: &std::path::Path) -> Arc<AgentSession> {
         let cwd = dir.join("project");
@@ -29,12 +33,19 @@ mod x13_live_bash_tests {
     /// Drive `spawn_session_bash` with EXACTLY the two `select!` arms the run loop uses, so the
     /// assertion covers the real wiring and not a re-implementation of it.
     async fn run_block(app: &mut App<TestBackend>, session: Arc<AgentSession>, command: &str) {
-        app.state_mut().transcript.start_bash(command.to_string(), false, None, None);
+        app.state_mut()
+            .transcript
+            .start_bash(command.to_string(), false, None, None);
         let mut rx = spawn_session_bash(session, command.to_string(), false);
         while let Some(msg) = rx.recv().await {
             match msg {
                 BashMsg::Chunk(chunk) => app.state_mut().transcript.bash_append(&chunk),
-                BashMsg::Done { exit_code, cancelled, truncated, full_output_path } => {
+                BashMsg::Done {
+                    exit_code,
+                    cancelled,
+                    truncated,
+                    full_output_path,
+                } => {
                     app.state_mut().transcript.bash_complete(
                         exit_code,
                         cancelled,
@@ -90,13 +101,22 @@ mod x13_live_bash_tests {
             .next()
             .unwrap_or_else(|| panic!("the truncation row named no file:\n{out}"))
             .to_string();
-        assert!(path.contains("cyrup-bash-"), "the spool file is the executor's: {path}");
+        assert!(
+            path.contains("cyrup-bash-"),
+            "the spool file is the executor's: {path}"
+        );
 
         // The named file really holds the FULL output — the row is not a decorative string.
         let spooled = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("the spool file must be readable at {path}: {e}"));
-        assert!(spooled.contains("line-number-1-padding"), "nothing dropped from the front");
-        assert!(spooled.contains("line-number-3000-padding"), "nor from the tail");
+        assert!(
+            spooled.contains("line-number-1-padding"),
+            "nothing dropped from the front"
+        );
+        assert!(
+            spooled.contains("line-number-3000-padding"),
+            "nor from the tail"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -111,7 +131,10 @@ mod x13_live_bash_tests {
 
         let out = app.scrollback_text();
         assert!(out.contains("hello-small"), "the output rendered:\n{out}");
-        assert!(!out.contains("Output truncated"), "and nothing was spooled:\n{out}");
+        assert!(
+            !out.contains("Output truncated"),
+            "and nothing was spooled:\n{out}"
+        );
     }
 
     /// The run is recorded through the session's own `recordBashResult` (`agent-session.ts:2628`)
@@ -127,17 +150,19 @@ mod x13_live_bash_tests {
         let payload = msgs
             .iter()
             .find_map(|m| match m {
-                cyrup_agent::AgentMessage::App { role: cyrup_agent::AppRole::BashExecution, payload, .. } =>
-                {
-                    Some(serde_json::Value::Object(payload.clone()))
-                }
+                cyrup_agent::AgentMessage::App {
+                    role: cyrup_agent::AppRole::BashExecution,
+                    payload,
+                    ..
+                } => Some(serde_json::Value::Object(payload.clone())),
                 _ => None,
             })
             .expect("`executeBash` records the run itself — the caller must not append its own");
         assert_eq!(payload["truncated"], true);
-        let path = payload["fullOutputPath"].as_str().expect("the spool path persisted");
+        let path = payload["fullOutputPath"]
+            .as_str()
+            .expect("the spool path persisted");
         assert!(path.contains("cyrup-bash-"));
         let _ = std::fs::remove_file(path);
     }
 }
-

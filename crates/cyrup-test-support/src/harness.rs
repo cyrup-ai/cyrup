@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use cyrup_config::{AppMode, AuthStore, Settings};
 use cyrup_core::{Content, Message, ProviderId, Tool};
 use cyrup_ext::NativeExtension;
 use cyrup_provider::faux::FauxModelDefinition;
@@ -16,16 +17,15 @@ use cyrup_provider::{Model, Provider};
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, SessionBuilder, SessionConfig, SessionServiceError,
 };
-use cyrup_config::{AppMode, AuthStore, Settings};
 use cyrup_tools::{Availability, PermissionPolicy};
 use futures::StreamExt;
 
 use crate::response::{
-    faux_model, faux_model_from_def, faux_model_with_context_window, FauxResponse,
+    FauxResponse, faux_model, faux_model_from_def, faux_model_with_context_window,
 };
 use crate::scripted::{
-    create_faux_stream_fn_queued, create_faux_stream_fn_with_models, FauxStreamFnState,
-    ScriptedProvider,
+    FauxStreamFnState, ScriptedProvider, create_faux_stream_fn_queued,
+    create_faux_stream_fn_with_models,
 };
 use crate::tempdir::TestTempDir;
 use crate::tool_ext::ToolExtension;
@@ -127,7 +127,10 @@ impl Default for HarnessOptions {
 impl HarnessOptions {
     /// Options scripted with the given responses (everything else default).
     pub fn with_responses(responses: Vec<FauxResponse>) -> Self {
-        Self { responses, ..Default::default() }
+        Self {
+            responses,
+            ..Default::default()
+        }
     }
 }
 
@@ -188,7 +191,10 @@ impl Harness {
 
     /// Snapshot of the faux call state (call count + captured contexts; Pi `harness.faux`).
     pub fn faux(&self) -> FauxStreamFnState {
-        self.faux_state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.faux_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Drive one prompt turn to completion, returning that run's events (also appended to the
@@ -202,20 +208,29 @@ impl Harness {
         let mut run_events = Vec::new();
         while let Some(ev) = stream.next().await {
             run_events.push(ev.clone());
-            self.events.lock().unwrap_or_else(|e| e.into_inner()).push(ev);
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ev);
         }
         Ok(run_events)
     }
 
     /// All events captured across every [`Self::run`], in order (Pi `harness.events`).
     pub fn events(&self) -> Vec<AgentSessionEvent> {
-        self.events.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Filter captured events by their `kind` discriminant (Pi `eventsOfType<T>`,
     /// test-harness.ts:424). cyrup keys on the snake_case `type` tag string.
     pub fn events_of_kind(&self, kind: &str) -> Vec<AgentSessionEvent> {
-        self.events().into_iter().filter(|e| e.kind() == kind).collect()
+        self.events()
+            .into_iter()
+            .filter(|e| e.kind() == kind)
+            .collect()
     }
 
     /// The persisted user-message texts on the current branch (Pi `getUserTexts`,
@@ -396,7 +411,10 @@ pub async fn create_test_session(
     config.model_pattern = options.model_pattern;
     config.trust_override = Some(true);
     let session = SessionBuilder::new(provider, config).build().await?;
-    Ok(TestSession { session, _temp: temp })
+    Ok(TestSession {
+        session,
+        _temp: temp,
+    })
 }
 
 /// Build a headless harness with inline native extensions (Pi `createHarnessWithExtensions`,

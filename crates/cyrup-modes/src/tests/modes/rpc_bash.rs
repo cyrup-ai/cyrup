@@ -35,19 +35,30 @@ async fn rpc_bash_backend_failure_is_not_fabricated_into_a_success() {
     let input = concat!(r#"{"type":"bash","id":"b1","command":"echo hi"}"#, "\n");
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
 
     let lines = parse_lines(&out);
-    let bash_resp = lines.iter().find(|l| l["id"] == "b1").expect("bash response");
+    let bash_resp = lines
+        .iter()
+        .find(|l| l["id"] == "b1")
+        .expect("bash response");
     assert_eq!(
         bash_resp["success"], false,
         "a genuine backend failure must not report success: {bash_resp}"
     );
     assert!(
-        bash_resp["error"].as_str().unwrap_or_default().contains("Working directory does not exist"),
+        bash_resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Working directory does not exist"),
         "the real backend error message must surface verbatim: {bash_resp}"
     );
-    assert!(bash_resp["data"].is_null(), "a failed bash call carries no data payload: {bash_resp}");
+    assert!(
+        bash_resp["data"].is_null(),
+        "a failed bash call carries no data payload: {bash_resp}"
+    );
 
     // `cyrup_agent::AgentMessage` isn't a direct dependency of this crate; serialize the live agent
     // state generically (its `Custom{kind:"bashExecution",..}` variant always serializes with that
@@ -90,13 +101,24 @@ async fn rpc_abort_bash_interrupts_a_running_bash_command() {
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
 
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
 
     let lines = parse_lines(&out);
-    let bash = lines.iter().find(|l| l["id"] == "b1").expect("bash response");
-    let abort = lines.iter().find(|l| l["id"] == "ab").expect("abort_bash response");
+    let bash = lines
+        .iter()
+        .find(|l| l["id"] == "b1")
+        .expect("bash response");
+    let abort = lines
+        .iter()
+        .find(|l| l["id"] == "ab")
+        .expect("abort_bash response");
     assert_eq!(abort["command"], "abort_bash");
-    assert_eq!(abort["success"], true, "abort_bash must be acknowledged: {abort}");
+    assert_eq!(
+        abort["success"], true,
+        "abort_bash must be acknowledged: {abort}"
+    );
 
     // SEAM-030 — the wall-clock assertion that used to sit here (`elapsed < 3s`, "proving the
     // command loop is serialized") is DELETED. It asserted a scheduling outcome the test cannot
@@ -150,12 +172,16 @@ impl cyrup_ext::NativeExtension for RpcUserBashProbe {
         ev: &cyrup_ext::HostEvent,
         _ctx: &cyrup_ext::HostCtx,
     ) -> cyrup_ext::HookOutcome {
-        if let cyrup_ext::HostEvent::UserBash { command, exclude_from_context, cwd } = ev {
-            self.seen.lock().unwrap().push((
-                command.clone(),
-                *exclude_from_context,
-                cwd.clone(),
-            ));
+        if let cyrup_ext::HostEvent::UserBash {
+            command,
+            exclude_from_context,
+            cwd,
+        } = ev
+        {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((command.clone(), *exclude_from_context, cwd.clone()));
             if let Some(result) = &self.override_result {
                 return cyrup_ext::HookOutcome::Handled(cyrup_ext::HandledValue(
                     serde_json::json!({ "result": result }),
@@ -176,7 +202,10 @@ async fn rpc_bash_delivers_user_bash_to_an_extension() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let probe = Arc::new(RpcUserBashProbe { seen: seen.clone(), override_result: None });
+    let probe = Arc::new(RpcUserBashProbe {
+        seen: seen.clone(),
+        override_result: None,
+    });
     let runtime = build_runtime_with_ext(&fx, faux, probe).await;
 
     let input = concat!(
@@ -185,7 +214,9 @@ async fn rpc_bash_delivers_user_bash_to_an_extension() {
     );
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
 
     let delivered = seen.lock().unwrap().clone();
     assert_eq!(
@@ -194,9 +225,19 @@ async fn rpc_bash_delivers_user_bash_to_an_extension() {
         "the extension must RECEIVE exactly one user_bash event from the RPC bash command: \
          {delivered:?}"
     );
-    assert_eq!(delivered[0].0, "echo rpc-hello", "the live command crosses the seam");
-    assert!(delivered[0].1, "the RPC excludeFromContext flag crosses the seam");
-    assert_eq!(delivered[0].2, fx.cwd.display().to_string(), "the session cwd crosses the seam");
+    assert_eq!(
+        delivered[0].0, "echo rpc-hello",
+        "the live command crosses the seam"
+    );
+    assert!(
+        delivered[0].1,
+        "the RPC excludeFromContext flag crosses the seam"
+    );
+    assert_eq!(
+        delivered[0].2,
+        fx.cwd.display().to_string(),
+        "the session cwd crosses the seam"
+    );
 
     // With no override, the command still really ran. Select the RESPONSE, not the
     // `bash_execution_update` event that shares the request id (DRIFT-006).
@@ -205,9 +246,15 @@ async fn rpc_bash_delivers_user_bash_to_an_extension() {
         .iter()
         .find(|l| l["command"] == "bash" && l["id"] == "b1")
         .expect("bash response");
-    assert_eq!(resp["success"], true, "an un-overridden RPC bash still executes: {resp}");
+    assert_eq!(
+        resp["success"], true,
+        "an un-overridden RPC bash still executes: {resp}"
+    );
     assert!(
-        resp["data"]["output"].as_str().unwrap_or_default().contains("rpc-hello"),
+        resp["data"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rpc-hello"),
         "the real command output is returned: {resp}"
     );
 }
@@ -234,11 +281,15 @@ async fn rpc_bash_honors_a_user_bash_result_override() {
     let runtime = build_runtime_with_ext(&fx, faux, probe).await;
     let session = runtime.session().await;
 
-    let input =
-        concat!(r#"{"type":"bash","id":"b1","command":"echo locally-executed"}"#, "\n");
+    let input = concat!(
+        r#"{"type":"bash","id":"b1","command":"echo locally-executed"}"#,
+        "\n"
+    );
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
 
     assert_eq!(seen.lock().unwrap().len(), 1, "the handler was consulted");
 
@@ -251,13 +302,19 @@ async fn rpc_bash_honors_a_user_bash_result_override() {
         .iter()
         .find(|l| l["command"] == "bash" && l["id"] == "b1")
         .expect("bash response");
-    assert_eq!(resp["success"], true, "an overridden bash is a success response: {resp}");
+    assert_eq!(
+        resp["success"], true,
+        "an overridden bash is a success response: {resp}"
+    );
     assert_eq!(
         resp["data"]["output"], "handled-by-extension",
         "the extension's result override is returned verbatim: {resp}"
     );
     assert!(
-        !resp["data"]["output"].as_str().unwrap_or_default().contains("locally-executed"),
+        !resp["data"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("locally-executed"),
         "a result override must short-circuit local execution entirely: {resp}"
     );
 
@@ -297,10 +354,15 @@ async fn rpc_bash_honors_a_partial_user_bash_result_override() {
     let runtime = build_runtime_with_ext(&fx, faux, probe).await;
     let session = runtime.session().await;
 
-    let input = concat!(r#"{"type":"bash","id":"b1","command":"echo locally-executed"}"#, "\n");
+    let input = concat!(
+        r#"{"type":"bash","id":"b1","command":"echo locally-executed"}"#,
+        "\n"
+    );
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
 
     assert_eq!(seen.lock().unwrap().len(), 1, "the handler was consulted");
 
@@ -313,14 +375,26 @@ async fn rpc_bash_honors_a_partial_user_bash_result_override() {
         .iter()
         .find(|l| l["command"] == "bash" && l["id"] == "b1")
         .expect("bash response");
-    assert_eq!(resp["data"]["output"], "sandboxed-elsewhere", "partial override honored: {resp}");
+    assert_eq!(
+        resp["data"]["output"], "sandboxed-elsewhere",
+        "partial override honored: {resp}"
+    );
     assert!(
-        !resp["data"]["output"].as_str().unwrap_or_default().contains("locally-executed"),
+        !resp["data"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("locally-executed"),
         "the command must NOT have reached the local shell: {resp}"
     );
     // Omitted fields fall back to their defaults rather than voiding the whole override.
-    assert_eq!(resp["data"]["cancelled"], false, "omitted `cancelled` defaults: {resp}");
-    assert_eq!(resp["data"]["truncated"], false, "omitted `truncated` defaults: {resp}");
+    assert_eq!(
+        resp["data"]["cancelled"], false,
+        "omitted `cancelled` defaults: {resp}"
+    );
+    assert_eq!(
+        resp["data"]["truncated"], false,
+        "omitted `truncated` defaults: {resp}"
+    );
 
     let msgs = session.agent_messages().await;
     let msgs_json = serde_json::to_value(&msgs).expect("agent messages serialize");

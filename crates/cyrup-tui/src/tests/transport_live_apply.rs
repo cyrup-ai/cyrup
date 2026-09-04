@@ -26,20 +26,25 @@
 //! struct an embedder-supplied `StreamFn` (`ProxyStreamFn`, which forwards it onto the proxy wire
 //! body — `cyrup-agent/src/proxy.rs:580`, Pi `proxy.ts:110`) and every wire API read from.
 //! `FauxProvider` is a real `Provider`, so these turns take the production stream path offline.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
-use cyrup_provider::{Provider, Transport};
-use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, Settings};
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
 use crate::{App, AppAction, AppCommand, SelectorKind, UiTheme};
+use cyrup_core::StopReason;
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
+use cyrup_provider::{Provider, Transport};
+use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, Settings};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
-use super::harness::*;
 
 /// Every `StreamOptions.transport` the provider was called with, in call order.
 type Seen = Arc<Mutex<Vec<Option<Transport>>>>;
@@ -56,7 +61,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn app() -> App<TestBackend> {
@@ -86,8 +95,11 @@ async fn session_recording_transport(
     let provider: Arc<dyn Provider> = faux;
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
     cfg.trust_override = Some(true);
-    let session =
-        SessionBuilder::new(provider, cfg).cli_settings(cli).build().await.unwrap();
+    let session = SessionBuilder::new(provider, cfg)
+        .cli_settings(cli)
+        .build()
+        .await
+        .unwrap();
     (Arc::new(session), seen)
 }
 
@@ -133,7 +145,10 @@ async fn applying_the_transport_row_changes_the_next_request() {
 
     // The real user path — the command `/settings` Enter-cycling emits.
     app.execute_command(
-        AppCommand::ApplySetting { id: "transport".to_string(), value: "sse".to_string() },
+        AppCommand::ApplySetting {
+            id: "transport".to_string(),
+            value: "sse".to_string(),
+        },
         &session,
         None,
     )
@@ -168,7 +183,10 @@ async fn websocket_cached_reaches_the_provider_distinctly() {
     assert_eq!(nth(&seen, 0), Some(Transport::WebsocketCached));
 
     app.execute_command(
-        AppCommand::ApplySetting { id: "transport".to_string(), value: "websocket".to_string() },
+        AppCommand::ApplySetting {
+            id: "transport".to_string(),
+            value: "websocket".to_string(),
+        },
         &session,
         None,
     )
@@ -215,7 +233,12 @@ async fn the_settings_row_cycles_through_all_four_pi_transports() {
     let (session, _seen) = session_recording_transport(&fx, Settings::new(), 1).await;
     let mut app = app();
 
-    app.execute_command(AppCommand::OpenSelector(SelectorKind::Settings), &session, None).await;
+    app.execute_command(
+        AppCommand::OpenSelector(SelectorKind::Settings),
+        &session,
+        None,
+    )
+    .await;
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::Settings));
 
     // Walk down to the Transport row by its RENDERED highlight (`→ ` prefix, select_list.rs:217)
@@ -223,23 +246,36 @@ async fn the_settings_row_cycles_through_all_four_pi_transports() {
     let mut found = false;
     for _ in 0..256 {
         app.draw().unwrap();
-        if buf_text(&app).lines().any(|l| l.trim_end().starts_with("→ Transport")) {
+        if buf_text(&app)
+            .lines()
+            .any(|l| l.trim_end().starts_with("→ Transport"))
+        {
             found = true;
             break;
         }
         let _ = app.handle_input(&key(KeyCode::Down));
     }
-    assert!(found, "the /settings grid never highlighted a `Transport` row:\n{}", buf_text(&app));
+    assert!(
+        found,
+        "the /settings grid never highlighted a `Transport` row:\n{}",
+        buf_text(&app)
+    );
 
     // A full lap: four Enters must visit four distinct values and return to the start.
     let mut values: Vec<String> = Vec::new();
     for _ in 0..4 {
         match app.handle_input(&key(KeyCode::Enter)) {
             AppAction::Command(AppCommand::ApplySetting { id, value }) => {
-                assert_eq!(id, "transport", "the highlighted row emitted the wrong setting id");
+                assert_eq!(
+                    id, "transport",
+                    "the highlighted row emitted the wrong setting id"
+                );
                 // Feed it through the same handler the run loop uses, so this is the whole path.
                 app.execute_command(
-                    AppCommand::ApplySetting { id, value: value.clone() },
+                    AppCommand::ApplySetting {
+                        id,
+                        value: value.clone(),
+                    },
                     &session,
                     None,
                 )

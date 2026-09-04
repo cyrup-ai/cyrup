@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::frontmatter::parse_frontmatter_block;
+use super::package_name::normalize_valid_package_name;
 use super::types::{
     AgentSource, ChainDefinition, ChainDiscoveryDiagnostic, ChainListBinding, ChainOutputBinding,
     ChainStepConfig, OutputMode,
@@ -48,7 +49,6 @@ use super::types::{
 use crate::spawn::chain_graph::{
     DynamicGroupSpec, OnEmpty, ParallelGroupSpec, RunnerStep, SingleStepSpec,
 };
-use super::package_name::normalize_valid_package_name;
 
 /// File extension suffix recognized for JSON-format chain files (higher precedence, R-SA-015).
 const CHAIN_JSON_SUFFIX: &str = ".chain.json";
@@ -244,7 +244,9 @@ fn parse_chain_json(path: &Path, source: AgentSource) -> Result<ChainDefinition,
     let parsed: Value = serde_json::from_str(&raw)
         .map_err(|e| format!("Invalid JSON chain '{file_display}': {e}"))?;
     let Value::Object(input) = &parsed else {
-        return Err(format!("JSON chain '{file_display}' must contain an object root."));
+        return Err(format!(
+            "JSON chain '{file_display}' must contain an object root."
+        ));
     };
 
     let name = input
@@ -261,7 +263,9 @@ fn parse_chain_json(path: &Path, source: AgentSource) -> Result<ChainDefinition,
         .ok_or_else(|| format!("JSON chain '{file_display}' must include string description."))?;
 
     let Some(Value::Array(chain)) = input.get("chain") else {
-        return Err(format!("JSON chain '{file_display}' must include array chain."));
+        return Err(format!(
+            "JSON chain '{file_display}' must include array chain."
+        ));
     };
 
     for (index, step) in chain.iter().enumerate() {
@@ -271,8 +275,10 @@ fn parse_chain_json(path: &Path, source: AgentSource) -> Result<ChainDefinition,
                 "JSON chain '{file_display}' step {step_no} must be an object."
             ));
         }
-        let acceptance_errors =
-            validate_acceptance_input(step.get("acceptance"), &format!("step {step_no} acceptance"));
+        let acceptance_errors = validate_acceptance_input(
+            step.get("acceptance"),
+            &format!("step {step_no} acceptance"),
+        );
         if !acceptance_errors.is_empty() {
             return Err(format!(
                 "Invalid JSON chain '{file_display}': {}",
@@ -287,10 +293,7 @@ fn parse_chain_json(path: &Path, source: AgentSource) -> Result<ChainDefinition,
                     }
                     let task_errors = validate_acceptance_input(
                         task.get("acceptance"),
-                        &format!(
-                            "step {step_no} parallel task {} acceptance",
-                            task_index + 1
-                        ),
+                        &format!("step {step_no} parallel task {} acceptance", task_index + 1),
                     );
                     if !task_errors.is_empty() {
                         return Err(format!(
@@ -615,9 +618,6 @@ fn parse_chain_package_name(value: Option<&str>, label: &str) -> Result<Option<S
         .ok_or_else(|| format!("{label} is invalid after sanitization."))
 }
 
-
-
-
 // -------------------------------------------------------------------------------------------
 // Acceptance validation (acceptance.ts::validateAcceptanceInput)
 // -------------------------------------------------------------------------------------------
@@ -864,9 +864,16 @@ pub(crate) fn validate_dynamic_step_shape(
         return Err(format!("{prefix} requires expand.from."));
     };
     assert_only_keys(expand, DYNAMIC_EXPAND_KEYS, &format!("{prefix} expand"))?;
-    assert_only_keys(from, DYNAMIC_EXPAND_FROM_KEYS, &format!("{prefix} expand.from"))?;
+    assert_only_keys(
+        from,
+        DYNAMIC_EXPAND_FROM_KEYS,
+        &format!("{prefix} expand.from"),
+    )?;
 
-    let output = from.get("output").and_then(Value::as_str).unwrap_or_default();
+    let output = from
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if !is_safe_output_name(output) {
         return Err(format!(
             "{prefix} has invalid expand.from.output '{output}'."
@@ -1024,9 +1031,7 @@ fn is_non_negative_integer(value: &Value) -> bool {
     if value.as_u64().is_some() {
         return true;
     }
-    value
-        .as_f64()
-        .is_some_and(|f| f >= 0.0 && f.fract() == 0.0)
+    value.as_f64().is_some_and(|f| f >= 0.0 && f.fract() == 0.0)
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1051,7 +1056,8 @@ fn is_non_negative_integer(value: &Value) -> bool {
 /// runtime contract is `run_single`'s job, at dispatch, exactly as upstream does it.
 pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u32) -> RunnerStep {
     if let Some(Value::Array(items)) = &step.parallel {
-        let steps: Vec<SingleStepSpec> = items.iter().filter_map(value_to_single_step_spec).collect();
+        let steps: Vec<SingleStepSpec> =
+            items.iter().filter_map(value_to_single_step_spec).collect();
         return RunnerStep::ParallelGroup(ParallelGroupSpec {
             steps,
             concurrency: chain_concurrency(step, default_concurrency),
@@ -1089,7 +1095,10 @@ pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u3
                 .get("item")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            key: expand.get("key").and_then(Value::as_str).map(str::to_string),
+            key: expand
+                .get("key")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             max_items: expand
                 .get("maxItems")
                 .and_then(Value::as_u64)
@@ -1105,10 +1114,7 @@ pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u3
             // `DYNAMIC_STEP_KEYS`) and `chain-execution.ts:1034-1055` evaluates it against the
             // aggregate child report once the group settles, failing the whole chain on rejection.
             // Dropping it here — as this arm did before — left a validator-accepted gate inert.
-            acceptance: step
-                .acceptance
-                .clone()
-                .filter(|value| !value.is_null()),
+            acceptance: step.acceptance.clone().filter(|value| !value.is_null()),
         });
     }
 
@@ -1179,9 +1185,7 @@ fn chain_step_to_single_step_spec(step: &ChainStepConfig) -> SingleStepSpec {
         },
         output_mode: step.output_mode.as_deref().and_then(parse_output_mode),
         reads: match &step.reads {
-            Some(ChainListBinding::List(paths)) => {
-                Some(paths.iter().map(PathBuf::from).collect())
-            }
+            Some(ChainListBinding::List(paths)) => Some(paths.iter().map(PathBuf::from).collect()),
             Some(ChainListBinding::Toggle(_)) | None => None,
         },
         // SUBA-N04: the RAW acceptance value, carried whole. This used to be
@@ -1384,8 +1388,12 @@ mod tests {
         let content = "{\"name\":\"bad-acceptance\",\"description\":\"Bad acceptance\",\"chain\":[{\"agent\":\"worker\",\"acceptance\":{\"level\":\"none\"}}]}";
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = write(tmp.path(), "bad-acceptance.chain.json", content);
-        let err = parse_chain_json(&path, AgentSource::User).expect_err("acceptance reason required");
-        assert!(err.contains("step 1 acceptance.reason is required"), "{err}");
+        let err =
+            parse_chain_json(&path, AgentSource::User).expect_err("acceptance reason required");
+        assert!(
+            err.contains("step 1 acceptance.reason is required"),
+            "{err}"
+        );
     }
 
     /// G78 — the chain-JSON validator is a SECOND copy of `validateAcceptanceInput`, so it has to
@@ -1418,9 +1426,7 @@ mod tests {
             ),
         ];
         for (step, expected) in cases {
-            let content = format!(
-                "{{\"name\":\"c\",\"description\":\"d\",\"chain\":[{step}]}}"
-            );
+            let content = format!("{{\"name\":\"c\",\"description\":\"d\",\"chain\":[{step}]}}");
             let path = write(tmp.path(), "levels.chain.json", &content);
             let err = parse_chain_json(&path, AgentSource::User)
                 .expect_err("the level must be refused at parse time");
@@ -1509,7 +1515,9 @@ mod tests {
         assert_eq!(def.steps.len(), 2);
         assert_eq!(
             def.steps[0].acceptance,
-            Some(serde_json::json!({ "level": "checked", "evidence": ["changed-files", "commands-run"] }))
+            Some(
+                serde_json::json!({ "level": "checked", "evidence": ["changed-files", "commands-run"] })
+            )
         );
     }
 
@@ -1518,7 +1526,8 @@ mod tests {
         let content = "{\"name\":\"bad-dynamic-review\",\"description\":\"Bad dynamic targets\",\"chain\":[{\"agent\":\"scout\",\"task\":\"Return targets\",\"as\":\"targets\",\"outputSchema\":{\"type\":\"object\"}},{\"expand\":{\"from\":{\"output\":\"targets\",\"path\":\"/items\"},\"maxItems\":4},\"parallel\":[{\"agent\":\"reviewer\",\"task\":\"Review\"}],\"collect\":{\"as\":\"reviews\"}}]}";
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = write(tmp.path(), "bad-dynamic-review.chain.json", content);
-        let err = parse_chain_json(&path, AgentSource::Project).expect_err("static parallel arrays");
+        let err =
+            parse_chain_json(&path, AgentSource::Project).expect_err("static parallel arrays");
         assert!(err.contains("static parallel arrays"), "{err}");
     }
 
@@ -1595,7 +1604,11 @@ mod tests {
             ChainFileFormat::Md,
         );
         assert_eq!(
-            by_name.get("release").expect("winner present").definition.file_path,
+            by_name
+                .get("release")
+                .expect("winner present")
+                .definition
+                .file_path,
             PathBuf::from("/scope/release.chain.json")
         );
 
@@ -1623,7 +1636,11 @@ mod tests {
             ChainFileFormat::Json,
         );
         assert_eq!(
-            by_name2.get("release").expect("winner present").definition.file_path,
+            by_name2
+                .get("release")
+                .expect("winner present")
+                .definition
+                .file_path,
             PathBuf::from("/scope/release.chain.json")
         );
     }
@@ -1633,14 +1650,22 @@ mod tests {
         let json_tmp = tempfile::tempdir().expect("tempdir");
         write(json_tmp.path(), "release.chain.json", &sample_json(2));
         let json_result = scan_chain_dir(json_tmp.path(), AgentSource::User);
-        assert!(json_result.diagnostics.is_empty(), "{:?}", json_result.diagnostics);
+        assert!(
+            json_result.diagnostics.is_empty(),
+            "{:?}",
+            json_result.diagnostics
+        );
         assert_eq!(json_result.chains.len(), 1);
         let from_json = &json_result.chains[0];
 
         let md_tmp = tempfile::tempdir().expect("tempdir");
         write(md_tmp.path(), "release.chain.md", &sample_md(2));
         let md_result = scan_chain_dir(md_tmp.path(), AgentSource::User);
-        assert!(md_result.diagnostics.is_empty(), "{:?}", md_result.diagnostics);
+        assert!(
+            md_result.diagnostics.is_empty(),
+            "{:?}",
+            md_result.diagnostics
+        );
         assert_eq!(md_result.chains.len(), 1);
         let from_md = &md_result.chains[0];
 
@@ -1663,7 +1688,12 @@ mod tests {
 
         assert_eq!(result.chains.len(), 2);
         assert!(result.chains.iter().any(|c| c.source == AgentSource::User));
-        assert!(result.chains.iter().any(|c| c.source == AgentSource::Project));
+        assert!(
+            result
+                .chains
+                .iter()
+                .any(|c| c.source == AgentSource::Project)
+        );
     }
 
     #[test]
@@ -1674,7 +1704,11 @@ mod tests {
 
         let result = scan_chain_dir(tmp.path(), AgentSource::Project);
         assert_eq!(result.diagnostics.len(), 1);
-        assert!(result.diagnostics[0].file_path.ends_with("broken.chain.json"));
+        assert!(
+            result.diagnostics[0]
+                .file_path
+                .ends_with("broken.chain.json")
+        );
         assert_eq!(result.chains.len(), 1);
         assert_eq!(result.chains[0].name, "release");
     }
@@ -1682,7 +1716,11 @@ mod tests {
     #[test]
     fn malformed_md_chain_file_missing_frontmatter_produces_diagnostic() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "broken.chain.md", "no frontmatter here at all\n");
+        write(
+            tmp.path(),
+            "broken.chain.md",
+            "no frontmatter here at all\n",
+        );
 
         let result = scan_chain_dir(tmp.path(), AgentSource::User);
         assert_eq!(result.diagnostics.len(), 1);
@@ -1746,7 +1784,11 @@ mod tests {
         let result = scan_chain_dir(tmp.path(), AgentSource::User);
         assert!(result.chains.is_empty());
         assert_eq!(result.diagnostics.len(), 1);
-        assert!(result.diagnostics[0].message.contains("must include string name"));
+        assert!(
+            result.diagnostics[0]
+                .message
+                .contains("must include string name")
+        );
     }
 
     // ---- Authoring -> runtime bridge ----
@@ -1882,7 +1924,10 @@ mod tests {
         match chain_step_to_runner_step(&group, 8) {
             RunnerStep::ParallelGroup(group) => {
                 assert_eq!(group.steps[0].acceptance, Some(serde_json::json!(false)));
-                assert_eq!(group.steps[1].acceptance, Some(serde_json::json!("checked")));
+                assert_eq!(
+                    group.steps[1].acceptance,
+                    Some(serde_json::json!("checked"))
+                );
             }
             other => panic!("expected ParallelGroup, got {other:?}"),
         }

@@ -1,7 +1,7 @@
 //! The assistant turn: [`AssistantMessage`], the [`DeferredHandle`] it carries for a deferred
 //! stop reason, and the [`UNRESOLVED_API`] sentinel (func-01 §4.3).
 
-use super::content::{de_assistant_content, Content};
+use super::content::{Content, de_assistant_content};
 use super::stop_reason::StopReason;
 use super::usage::Usage;
 use crate::diagnostics::AssistantMessageDiagnostic;
@@ -279,22 +279,42 @@ mod tests {
         };
         // Standalone (as embedded in `StreamEvent.partial`): role:"assistant" FIRST, Pi field order.
         let s = serde_json::to_string(&m).expect("serialize");
-        assert!(s.starts_with(r#"{"role":"assistant","content":"#), "role first: {s}");
+        assert!(
+            s.starts_with(r#"{"role":"assistant","content":"#),
+            "role first: {s}"
+        );
         let order: Vec<usize> = [
-            "\"role\"", "\"content\"", "\"api\"", "\"provider\"", "\"model\"", "\"usage\"",
-            "\"stopReason\"", "\"timestamp\"",
+            "\"role\"",
+            "\"content\"",
+            "\"api\"",
+            "\"provider\"",
+            "\"model\"",
+            "\"usage\"",
+            "\"stopReason\"",
+            "\"timestamp\"",
         ]
         .iter()
         .map(|k| s.find(k).expect("key present"))
         .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "Pi field order: {s}");
-        assert_eq!(s.matches("\"role\"").count(), 1, "exactly one role key: {s}");
+        assert_eq!(
+            s.matches("\"role\"").count(),
+            1,
+            "exactly one role key: {s}"
+        );
         let back: AssistantMessage = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, m);
         // Wrapped in Message::Assistant (the JSONL form): STILL exactly one role key, role first.
         let wrapped = serde_json::to_string(&Message::Assistant(m)).expect("serialize");
-        assert_eq!(wrapped.matches("\"role\"").count(), 1, "no duplicate role in Message: {wrapped}");
-        assert!(wrapped.starts_with(r#"{"role":"assistant","content":"#), "{wrapped}");
+        assert_eq!(
+            wrapped.matches("\"role\"").count(),
+            1,
+            "no duplicate role in Message: {wrapped}"
+        );
+        assert!(
+            wrapped.starts_with(r#"{"role":"assistant","content":"#),
+            "{wrapped}"
+        );
     }
 
     #[test]
@@ -325,7 +345,9 @@ mod tests {
             "boom",
         );
         assert!(m.diagnostics.is_none());
-        m.append_diagnostic(create_assistant_message_diagnostic_from("retry", None, None));
+        m.append_diagnostic(create_assistant_message_diagnostic_from(
+            "retry", None, None,
+        ));
         assert_eq!(m.diagnostics.as_ref().map(Vec::len), Some(1));
     }
 }

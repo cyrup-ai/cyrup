@@ -89,7 +89,12 @@ impl SessionManager {
         // Pass 1: id index + labels (so parent existence can be checked in pass 2).
         for (idx, e) in self.entries.iter().enumerate() {
             self.by_id.insert(e.id(), idx);
-            if let Entry::Known(KnownEntry::Label { target_id, label, base }) = e {
+            if let Entry::Known(KnownEntry::Label {
+                target_id,
+                label,
+                base,
+            }) = e
+            {
                 apply_label(&mut self.labels, target_id, label, &base.timestamp);
             }
         }
@@ -111,7 +116,12 @@ impl SessionManager {
     // -------------------------------------------------------- write path (R-04-016/032/036) ---
 
     fn make_base(&self) -> EntryBase {
-        EntryBase { id: self.mint_id(), parent_id: self.leaf.clone(), timestamp: now_ts(), extra: Default::default() }
+        EntryBase {
+            id: self.mint_id(),
+            parent_id: self.leaf.clone(),
+            timestamp: now_ts(),
+            extra: Default::default(),
+        }
     }
 
     fn mint_id(&self) -> EntryId {
@@ -128,7 +138,12 @@ impl SessionManager {
         let id = entry.id();
         let parent = entry.parent_id();
         let idx = self.entries.len();
-        if let Entry::Known(KnownEntry::Label { target_id, label, base }) = &entry {
+        if let Entry::Known(KnownEntry::Label {
+            target_id,
+            label,
+            base,
+        }) = &entry
+        {
             let ts = base.timestamp.clone();
             let (t, l) = (target_id.clone(), label.clone());
             apply_label(&mut self.labels, &t, &l, &ts);

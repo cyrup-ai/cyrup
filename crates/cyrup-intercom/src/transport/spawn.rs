@@ -54,7 +54,8 @@ const SPAWN_LOCK_MAX_RETRIES: u32 = 5;
 /// [`IntercomError::Broker`] if the broker could not be spawned or did not become healthy in time.
 pub async fn ensure_broker(agent_dir: &Path) -> Result<()> {
     let intercom_dir = paths::intercom_dir_path(agent_dir);
-    paths::ensure_intercom_runtime_dir(&intercom_dir).map_err(|e| IntercomError::Broker(e.to_string()))?;
+    paths::ensure_intercom_runtime_dir(&intercom_dir)
+        .map_err(|e| IntercomError::Broker(e.to_string()))?;
     let pid_path = paths::broker_pid_path(&intercom_dir);
     let lock_path = paths::broker_spawn_lock_path(&intercom_dir);
     // `ensureConnected` passes `config.brokerCommand`/`config.brokerArgs` straight through to
@@ -72,7 +73,13 @@ pub async fn ensure_broker(agent_dir: &Path) -> Result<()> {
     }
 
     // Owner path — release the lock on every exit (spawn.ts:238-240).
-    let result = spawn_owner(agent_dir, &pid_path, &config.broker_command, &config.broker_args).await;
+    let result = spawn_owner(
+        agent_dir,
+        &pid_path,
+        &config.broker_command,
+        &config.broker_args,
+    )
+    .await;
     release_spawn_lock(&lock_path);
     result
 }
@@ -130,11 +137,17 @@ fn uses_default_broker_command(broker_command: &str, broker_args: &[String]) -> 
 /// `__intercom-broker` subcommand appended as the final arg (cyrup's re-exec analog of pi appending
 /// `brokerPath`, `spawn.ts:149-153`).
 #[must_use]
-pub fn resolve_broker_command(broker_command: &str, broker_args: &[String]) -> (PathBuf, Vec<String>) {
+pub fn resolve_broker_command(
+    broker_command: &str,
+    broker_args: &[String],
+) -> (PathBuf, Vec<String>) {
     if let Ok(bin) = std::env::var(ENV_INTERCOM_BROKER_BINARY)
         && !bin.trim().is_empty()
     {
-        return (PathBuf::from(bin), vec![INTERCOM_BROKER_SUBCOMMAND.to_string()]);
+        return (
+            PathBuf::from(bin),
+            vec![INTERCOM_BROKER_SUBCOMMAND.to_string()],
+        );
     }
     if uses_default_broker_command(broker_command, broker_args) {
         let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cyrup"));
@@ -186,7 +199,9 @@ fn spawn_detached_broker(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
-    let mut child = command.spawn().map_err(|e| IntercomError::Broker(format!("failed to spawn intercom broker: {e}")))?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| IntercomError::Broker(format!("failed to spawn intercom broker: {e}")))?;
     let tail = BrokerStderrTail::drain(child.stderr.take());
     Ok((child, tail))
 }
@@ -242,7 +257,12 @@ impl BrokerStderrTail {
     /// `brokerStartupError(message, cause)` (`v0.10.1 broker/spawn.ts:219-223`): append
     /// `\nBroker stderr:\n{stderr}` when the captured tail is non-empty.
     fn decorate(&self, error: IntercomError) -> IntercomError {
-        let tail = self.buffer.lock().unwrap_or_else(|e| e.into_inner()).trim().to_string();
+        let tail = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .trim()
+            .to_string();
         if tail.is_empty() {
             return error;
         }
@@ -265,18 +285,28 @@ fn broker_wait_error(wait_result: std::io::Result<std::process::ExitStatus>) -> 
         if let Some(sig) = status.signal() {
             let name = nix::sys::signal::Signal::try_from(sig)
                 .map_or_else(|_| sig.to_string(), |s| s.to_string());
-            return IntercomError::Broker(format!("intercom broker exited before startup with signal {name}"));
+            return IntercomError::Broker(format!(
+                "intercom broker exited before startup with signal {name}"
+            ));
         }
     }
     match status.code() {
-        Some(code) => IntercomError::Broker(format!("intercom broker exited before startup with code {code}")),
-        None => IntercomError::Broker("intercom broker exited before startup with code unknown".to_string()),
+        Some(code) => IntercomError::Broker(format!(
+            "intercom broker exited before startup with code {code}"
+        )),
+        None => IntercomError::Broker(
+            "intercom broker exited before startup with code unknown".to_string(),
+        ),
     }
 }
 
 /// `isBrokerRunning` (`spawn.ts:243-259`) against an explicit socket/pipe path.
 pub async fn is_broker_running(socket_path: &Path, pid_path: &Path) -> bool {
-    is_broker_running_target(&BrokerConnectTarget::Socket(socket_path.to_path_buf()), pid_path).await
+    is_broker_running_target(
+        &BrokerConnectTarget::Socket(socket_path.to_path_buf()),
+        pid_path,
+    )
+    .await
 }
 
 /// `isBrokerRunning` (`spawn.ts:243-259`): a health-connectable target, OR a live pid file
@@ -344,8 +374,11 @@ pub async fn check_target_connectable(target: &BrokerConnectTarget) -> bool {
             let chunk = buf.get(..n).unwrap_or(&[]);
             let frames = reader.push(chunk).ok()?;
             for payload in frames {
-                if let Ok(HealthMessage::HealthOk { request_id: rid, protocol, version }) =
-                    serde_json::from_slice::<HealthMessage>(&payload)
+                if let Ok(HealthMessage::HealthOk {
+                    request_id: rid,
+                    protocol,
+                    version,
+                }) = serde_json::from_slice::<HealthMessage>(&payload)
                     && rid == request_id
                     && protocol == PROTOCOL_NAME
                     && version == PROTOCOL_VERSION
@@ -355,7 +388,10 @@ pub async fn check_target_connectable(target: &BrokerConnectTarget) -> bool {
             }
         }
     };
-    matches!(tokio::time::timeout(HEALTH_TIMEOUT, probe).await, Ok(Some(())))
+    matches!(
+        tokio::time::timeout(HEALTH_TIMEOUT, probe).await,
+        Ok(Some(()))
+    )
 }
 
 /// `waitForBroker` (`spawn.ts:378-387`) against an explicit socket/pipe path.
@@ -396,7 +432,9 @@ where
         }
         tokio::time::sleep(WAIT_POLL_INTERVAL).await;
     }
-    Err(IntercomError::Broker("broker failed to start within timeout".to_string()))
+    Err(IntercomError::Broker(
+        "broker failed to start within timeout".to_string(),
+    ))
 }
 
 /// `acquireSpawnLock` (`spawn.ts:315-341`): exclusive-create `broker.spawn.lock` (`O_EXCL`) with body
@@ -404,7 +442,11 @@ where
 /// (≤5); a live lock returns `false` (this process is not the spawn owner).
 fn acquire_spawn_lock(lock_path: &Path) -> bool {
     for _ in 0..SPAWN_LOCK_MAX_RETRIES {
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(lock_path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
             Ok(mut file) => {
                 use std::io::Write;
                 let body = format!("{}\n{}\n", std::process::id(), now_ms());
@@ -477,7 +519,12 @@ fn pid_alive(pid: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
     use super::*;
     use crate::transport::target::{BrokerTcpEndpoint, INTERCOM_TCP_HOST};
 
@@ -500,7 +547,10 @@ mod tests {
                 if let Some(obj) = reply.as_object_mut() {
                     obj.insert("requestId".to_string(), probe["requestId"].clone());
                 }
-                stream.write_all(&encode_json(&reply).unwrap()).await.unwrap();
+                stream
+                    .write_all(&encode_json(&reply).unwrap())
+                    .await
+                    .unwrap();
                 return probe;
             }
         }
@@ -516,7 +566,9 @@ mod tests {
     /// `TcpListener` bound to `127.0.0.1:0` — no network.
     #[tokio::test]
     async fn health_probe_over_tcp_carries_the_endpoint_state_id() {
-        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0))
+            .await
+            .unwrap();
         let port = listener.local_addr().unwrap().port();
         let broker = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -528,11 +580,17 @@ mod tests {
             port,
             state_id: Some("state-1".to_string()),
         });
-        assert!(check_target_connectable(&target).await, "a valid health_ok means connectable");
+        assert!(
+            check_target_connectable(&target).await,
+            "a valid health_ok means connectable"
+        );
 
         let probe = broker.await.unwrap();
         assert_eq!(probe["type"], "health");
-        assert_eq!(probe["stateId"], "state-1", "spawn.ts:290 spreads the endpoint stateId");
+        assert_eq!(
+            probe["stateId"], "state-1",
+            "spawn.ts:290 spreads the endpoint stateId"
+        );
         assert!(probe["requestId"].is_string());
     }
 
@@ -555,14 +613,19 @@ mod tests {
         assert!(check_socket_connectable(&socket_path).await);
         let probe = broker.await.unwrap();
         assert_eq!(probe["type"], "health");
-        assert!(probe.get("stateId").is_none(), "socket probes carry no credential: {probe}");
+        assert!(
+            probe.get("stateId").is_none(),
+            "socket probes carry no credential: {probe}"
+        );
     }
 
     /// `isBrokerHealthOkMessage` (`spawn.ts:97-106`) — a reply whose `protocol` is not
     /// `pi-intercom` is not a healthy broker, over TCP just as over a socket.
     #[tokio::test]
     async fn tcp_health_probe_rejects_a_foreign_protocol_reply() {
-        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0))
+            .await
+            .unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -591,14 +654,17 @@ mod tests {
         // No broker, no socket, no pid file: the socket target simply is not connectable.
         assert!(!is_broker_running_for(dir.path(), &pid_path).await);
         assert!(
-            wait_for_broker_for(dir.path(), Duration::from_millis(250)).await.is_err(),
+            wait_for_broker_for(dir.path(), Duration::from_millis(250))
+                .await
+                .is_err(),
             "the poll ladder must time out, not hang or panic"
         );
     }
 
     #[test]
     fn resolve_broker_command_appends_subcommand() {
-        let (_bin, args) = resolve_broker_command("npx", &["--no-install".to_string(), "tsx".to_string()]);
+        let (_bin, args) =
+            resolve_broker_command("npx", &["--no-install".to_string(), "tsx".to_string()]);
         assert_eq!(args, vec![INTERCOM_BROKER_SUBCOMMAND.to_string()]);
     }
 
@@ -609,14 +675,26 @@ mod tests {
     fn resolve_broker_command_honors_configured_custom_command() {
         let (bin, args) = resolve_broker_command("my-custom-broker", &["--flag".to_string()]);
         assert_eq!(bin, PathBuf::from("my-custom-broker"));
-        assert_eq!(args, vec!["--flag".to_string(), INTERCOM_BROKER_SUBCOMMAND.to_string()]);
+        assert_eq!(
+            args,
+            vec!["--flag".to_string(), INTERCOM_BROKER_SUBCOMMAND.to_string()]
+        );
     }
 
     #[test]
     fn uses_default_broker_command_matches_pis_literal_default() {
-        assert!(uses_default_broker_command("npx", &["--no-install".to_string(), "tsx".to_string()]));
-        assert!(!uses_default_broker_command("npx", &["--no-install".to_string()]));
-        assert!(!uses_default_broker_command("yarn", &["--no-install".to_string(), "tsx".to_string()]));
+        assert!(uses_default_broker_command(
+            "npx",
+            &["--no-install".to_string(), "tsx".to_string()]
+        ));
+        assert!(!uses_default_broker_command(
+            "npx",
+            &["--no-install".to_string()]
+        ));
+        assert!(!uses_default_broker_command(
+            "yarn",
+            &["--no-install".to_string(), "tsx".to_string()]
+        ));
     }
 
     /// Regression for the dossier item: a broker that dies immediately on startup must be reported
@@ -634,9 +712,15 @@ mod tests {
         let result = spawn_owner(dir.path(), &pid_path, "false", &[]).await;
         let elapsed = start.elapsed();
 
-        assert!(result.is_err(), "a broker that exits immediately must be reported as an error");
+        assert!(
+            result.is_err(),
+            "a broker that exits immediately must be reported as an error"
+        );
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("exited before startup"), "error should describe the early exit: {msg}");
+        assert!(
+            msg.contains("exited before startup"),
+            "error should describe the early exit: {msg}"
+        );
         assert!(
             elapsed < Duration::from_secs(2),
             "must fail fast on early exit, not wait the full 5s timeout: {elapsed:?}"
@@ -654,7 +738,10 @@ mod tests {
 
         // A live, fresh lock (this process's own pid, just written) is not stale → contended.
         assert!(!is_spawn_lock_stale(&lock));
-        assert!(!acquire_spawn_lock(&lock), "a live lock must not be re-acquired");
+        assert!(
+            !acquire_spawn_lock(&lock),
+            "a live lock must not be re-acquired"
+        );
 
         release_spawn_lock(&lock);
         assert!(!lock.exists());
@@ -670,7 +757,10 @@ mod tests {
         // pid 0 is never a real user process → `kill(0, None)` targets the whole group, so use a pid
         // that cannot be alive: a very large pid unlikely to exist.
         std::fs::write(&lock, format!("2147483646\n{}\n", now_ms())).unwrap();
-        assert!(is_spawn_lock_stale(&lock), "a lock whose creator pid is gone is stale");
+        assert!(
+            is_spawn_lock_stale(&lock),
+            "a lock whose creator pid is gone is stale"
+        );
     }
 
     #[test]
@@ -678,8 +768,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("broker.spawn.lock");
         // Our own live pid but a very old timestamp → stale by age (> 10s).
-        std::fs::write(&lock, format!("{}\n{}\n", std::process::id(), now_ms().saturating_sub(20_000))).unwrap();
-        assert!(is_spawn_lock_stale(&lock), "a lock older than 10s is stale even with a live pid");
+        std::fs::write(
+            &lock,
+            format!(
+                "{}\n{}\n",
+                std::process::id(),
+                now_ms().saturating_sub(20_000)
+            ),
+        )
+        .unwrap();
+        assert!(
+            is_spawn_lock_stale(&lock),
+            "a lock older than 10s is stale even with a live pid"
+        );
     }
 
     #[test]

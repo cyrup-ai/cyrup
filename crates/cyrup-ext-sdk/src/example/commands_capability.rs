@@ -19,7 +19,8 @@ pub(super) fn install(api: &mut ExtensionApi) {
             &ExecOptions::default(),
         ) {
             Ok(r) => {
-                ctx.ui().notify(&format!("exec stdout: {}", r.stdout.trim_end()));
+                ctx.ui()
+                    .notify(&format!("exec stdout: {}", r.stdout.trim_end()));
                 Ok(Some(format!("exec code {} killed {}", r.code, r.killed)))
             }
             Err(e) => {
@@ -44,7 +45,8 @@ pub(super) fn install(api: &mut ExtensionApi) {
         {
             Ok(r) => {
                 let body = String::from_utf8_lossy(&r.body).into_owned();
-                ctx.ui().notify(&format!("http status: {} body: {}", r.status, body));
+                ctx.ui()
+                    .notify(&format!("http status: {} body: {}", r.status, body));
                 Ok(Some(format!("http status {} body {}", r.status, body)))
             }
             Err(e) => {
@@ -173,7 +175,11 @@ pub(super) fn install(api: &mut ExtensionApi) {
             let marker = args.trim();
             match ctx.ctx().proc_spawn(
                 "sh",
-                &["-c", "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done", marker],
+                &[
+                    "-c",
+                    "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+                    marker,
+                ],
                 &ProcSpawnOptions::default(),
             ) {
                 Ok(handle) => {
@@ -194,20 +200,18 @@ pub(super) fn install(api: &mut ExtensionApi) {
     api.register_command(
         "procspawnexit",
         CommandDescriptor::new("Spawn a proc that exits on its own with code 7 (demo)."),
-        |_args: &str, ctx: &crate::CommandCtx| {
-            match ctx.ctx().proc_spawn(
-                "sh",
-                &["-c", "sleep 0.1; exit 7"],
-                &ProcSpawnOptions::default(),
-            ) {
-                Ok(handle) => {
-                    ctx.ui().notify(&format!("proc spawned handle:{handle}"));
-                    Ok(Some(format!("proc spawned handle:{handle}")))
-                }
-                Err(e) => {
-                    ctx.ui().notify(&format!("proc denied: {e}"));
-                    Ok(Some(format!("proc denied: {e}")))
-                }
+        |_args: &str, ctx: &crate::CommandCtx| match ctx.ctx().proc_spawn(
+            "sh",
+            &["-c", "sleep 0.1; exit 7"],
+            &ProcSpawnOptions::default(),
+        ) {
+            Ok(handle) => {
+                ctx.ui().notify(&format!("proc spawned handle:{handle}"));
+                Ok(Some(format!("proc spawned handle:{handle}")))
+            }
+            Err(e) => {
+                ctx.ui().notify(&format!("proc denied: {e}"));
+                Ok(Some(format!("proc denied: {e}")))
             }
         },
     );
@@ -215,7 +219,9 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // `procwrite <handle> <text>`: write `<text>\n` to the child's REAL stdin.
     api.register_command(
         "procwrite",
-        CommandDescriptor::new("Write a line to a spawned proc's stdin (demo). args: <handle> <text>"),
+        CommandDescriptor::new(
+            "Write a line to a spawned proc's stdin (demo). args: <handle> <text>",
+        ),
         |args: &str, ctx: &crate::CommandCtx| {
             let mut it = args.trim().splitn(2, ' ');
             let handle: u32 = it.next().unwrap_or_default().parse().unwrap_or(0);
@@ -224,7 +230,8 @@ pub(super) fn install(api: &mut ExtensionApi) {
             line.push('\n');
             match ctx.ctx().proc_write_stdin(handle, line.as_bytes()) {
                 Ok(n) => {
-                    ctx.ui().notify(&format!("proc wrote handle:{handle} bytes:{n}"));
+                    ctx.ui()
+                        .notify(&format!("proc wrote handle:{handle} bytes:{n}"));
                     Ok(Some(format!("proc wrote {n} bytes")))
                 }
                 Err(e) => {
@@ -263,7 +270,9 @@ pub(super) fn install(api: &mut ExtensionApi) {
                 }
             }
             let acc_text = String::from_utf8_lossy(&acc).into_owned();
-            ctx.ui().notify(&format!("proc read handle:{handle} seen:{seen} acc:{acc_text}"));
+            ctx.ui().notify(&format!(
+                "proc read handle:{handle} seen:{seen} acc:{acc_text}"
+            ));
             Ok(Some(format!("proc read seen:{seen}")))
         },
     );
@@ -275,7 +284,8 @@ pub(super) fn install(api: &mut ExtensionApi) {
         |args: &str, ctx: &crate::CommandCtx| {
             let handle: u32 = args.trim().parse().unwrap_or(0);
             let code = ctx.ctx().proc_poll_exit(handle);
-            ctx.ui().notify(&format!("proc pollexit handle:{handle} code:{code:?}"));
+            ctx.ui()
+                .notify(&format!("proc pollexit handle:{handle} code:{code:?}"));
             Ok(Some(format!("proc pollexit code:{code:?}")))
         },
     );

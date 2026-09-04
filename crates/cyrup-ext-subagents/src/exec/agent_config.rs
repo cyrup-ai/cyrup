@@ -12,13 +12,10 @@ use crate::discovery::types::{
     AgentDefinition, AgentReadScope, OutputMode, OutputSpec, SystemPromptMode, ToolRef,
 };
 use crate::exec::acceptance::AcceptanceContract;
-use crate::exec::fallback::{
-    ModelOverride,
-};
+use crate::exec::fallback::ModelOverride;
 use crate::exec::output::OutputCap;
 use crate::fork_context::{ContextMode, ForkContext};
 use crate::spawn::depth::DepthEnvelope;
-
 
 // ================================================================================================
 // AgentConfig / RunOptions / SingleResult (arch-SA §3.4)
@@ -761,7 +758,6 @@ mod tests {
 
     use super::*;
 
-
     // ---- T0.1 (C13): ResolvedAgentPersona is the serializable plan-time projection that lets a
     // chain/parallel/background step dispatch the REAL named persona instead of a placeholder. ----
 
@@ -802,9 +798,11 @@ mod tests {
         };
         let json = serde_json::to_string(&persona).expect("serialize");
         let back: ResolvedAgentPersona = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, persona, "the persona must survive a RunnerConfig JSON round-trip intact");
+        assert_eq!(
+            back, persona,
+            "the persona must survive a RunnerConfig JSON round-trip intact"
+        );
     }
-
 
     #[test]
     fn to_agent_config_stamps_the_live_depth_and_reproduces_the_persona() {
@@ -853,14 +851,20 @@ mod tests {
         assert_eq!(cfg.name, "reviewer");
         assert_eq!(cfg.system_prompt_body, "You are the REVIEWER persona.");
         assert_eq!(cfg.system_prompt_mode, SystemPromptMode::Append);
-        assert_eq!(cfg.model.as_ref().map(ModelId::as_str), Some("reviewer-model"));
+        assert_eq!(
+            cfg.model.as_ref().map(ModelId::as_str),
+            Some("reviewer-model")
+        );
         assert_eq!(cfg.fallback_models, vec![ModelId::from("backup-model")]);
         assert_eq!(cfg.completion_guard, Some(true));
         assert_eq!(cfg.tools, Some(vec![ToolRef::Builtin("read".to_string())]));
         assert_eq!(cfg.max_subagent_depth, Some(1));
         assert_eq!(cfg.thinking, Some("high".to_string()));
         assert_eq!(cfg.extensions, Some(vec!["./allowed-ext.ts".to_string()]));
-        assert_eq!(cfg.subagent_only_extensions, vec!["./child-tool.ts".to_string()]);
+        assert_eq!(
+            cfg.subagent_only_extensions,
+            vec!["./child-tool.ts".to_string()]
+        );
         assert_eq!(cfg.runner, persona.runner);
         assert!(cfg.inherit_project_context);
         assert!(!cfg.inherit_skills);
@@ -870,5 +874,4 @@ mod tests {
         // The depth is the caller-stamped live envelope, not a plan-time value.
         assert_eq!(cfg.depth, live_depth);
     }
-
 }

@@ -3,18 +3,16 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use super::*;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 pub(crate) fn cfg(config: AcceptanceConfig) -> Option<AcceptanceInput> {
     Some(AcceptanceInput::Config(config))
 }
 
-
 pub(crate) fn resolve(input: AcceptanceResolveInput) -> ResolvedAcceptanceConfig {
     resolve_effective_acceptance(&input)
 }
-
 
 pub(crate) fn report_text(overrides: Value, fence: &str) -> String {
     format!(
@@ -23,13 +21,11 @@ pub(crate) fn report_text(overrides: Value, fence: &str) -> String {
     )
 }
 
-
 pub(crate) fn temp_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("file.txt"), "hello\n").expect("seed");
     dir
 }
-
 
 // ---- evaluateAcceptance (async, real subprocess / real git) ----
 

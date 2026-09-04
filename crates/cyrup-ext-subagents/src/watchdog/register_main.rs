@@ -39,9 +39,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::model_selection::{
-    parse_watchdog_thinking_input, recommend_strong_watchdog_model, resolve_watchdog_model_input,
-    WatchdogModelContext, WatchdogModelInfo, WatchdogModelRegistry, WatchdogThinkingInput,
-    THINKING_LEVELS,
+    THINKING_LEVELS, WatchdogModelContext, WatchdogModelInfo, WatchdogModelRegistry,
+    WatchdogThinkingInput, parse_watchdog_thinking_input, recommend_strong_watchdog_model,
+    resolve_watchdog_model_input,
 };
 use super::render::render_watchdog_warning;
 use super::runtime::{
@@ -49,17 +49,17 @@ use super::runtime::{
     WatchdogRuntimeSnapshot,
 };
 use super::settings::{
-    get_watchdog_user_settings_path, write_user_watchdog_enabled, write_watchdog_model_settings,
     WatchdogModelSettingsTarget, WatchdogModelSettingsWrite, WatchdogSettingsWriteScope,
+    get_watchdog_user_settings_path, write_user_watchdog_enabled, write_watchdog_model_settings,
 };
 use super::types::{
-    ThinkingSetting, WatchdogCategory, WatchdogConfidence, WatchdogRuntimeStatus,
-    WatchdogSettingsSource, WatchdogSeverity, WatchdogWarning, WatchdogWarningDetails,
-    WatchdogWarningSource, WatchdogWarningState, SUBAGENT_WATCHDOG_WARNING_TYPE,
+    SUBAGENT_WATCHDOG_WARNING_TYPE, ThinkingSetting, WatchdogCategory, WatchdogConfidence,
+    WatchdogRuntimeStatus, WatchdogSettingsSource, WatchdogSeverity, WatchdogWarning,
+    WatchdogWarningDetails, WatchdogWarningSource, WatchdogWarningState,
 };
 use super::warning_format::{
-    create_watchdog_warning_message_from_details, normalize_watchdog_warning_details,
-    WatchdogWarningDetailsPatch,
+    WatchdogWarningDetailsPatch, create_watchdog_warning_message_from_details,
+    normalize_watchdog_warning_details,
 };
 
 /// The slash command upstream registers (`register-main.ts:403-404`).
@@ -156,11 +156,10 @@ pub fn register_main_watchdog(
     let review: Arc<dyn WatchdogReview> = options.review.unwrap_or_else(move || {
         // The registry MUST see the process's real `auth.json` — see [`watchdog_config_dirs`] for
         // why `BuiltinWatchdogModelRegistry::new(None)` cannot resolve any configured model.
-        let registry: Arc<dyn WatchdogModelRegistry> = Arc::new(
-            super::model_selection::BuiltinWatchdogModelRegistry::new(
+        let registry: Arc<dyn WatchdogModelRegistry> =
+            Arc::new(super::model_selection::BuiltinWatchdogModelRegistry::new(
                 watchdog_config_dirs().as_ref(),
-            ),
-        );
+            ));
         let session_registry = Arc::clone(&registry);
         Arc::new(
             super::review::MainWatchdogReview::new(
@@ -188,7 +187,12 @@ pub fn register_main_watchdog(
         // "injected seam" when the caller supplied one. A runtime with NO review seam reports the
         // constructor's own "not wired", which is what `/subagents-watchdog status` then prints.
         review_description: Some(
-            if injected_review { "injected seam" } else { "real model review" }.to_string(),
+            if injected_review {
+                "injected seam"
+            } else {
+                "real model review"
+            }
+            .to_string(),
         ),
         display_warning: Some(Arc::new(move |details, delivery| {
             let Some(services) = display_services() else {
@@ -251,11 +255,7 @@ impl WatchdogCommandContext<'_> {
 
 /// `boolLabel` (`register-main.ts:31-33`).
 fn bool_label(value: bool) -> &'static str {
-    if value {
-        "on"
-    } else {
-        "off"
-    }
+    if value { "on" } else { "off" }
 }
 
 /// `statusLabel` (`register-main.ts:35-37`).
@@ -287,12 +287,17 @@ fn current_session_model_line(ctx: &WatchdogCommandContext<'_>) -> String {
 /// `splitKnownThinkingSuffix(model).baseModel` (`shared/model-info.ts:43-51`), reusing this crate's
 /// existing port.
 fn base_model(model: &str) -> String {
-    crate::exec::split_known_thinking_suffix(model).0.to_string()
+    crate::exec::split_known_thinking_suffix(model)
+        .0
+        .to_string()
 }
 
 /// `resolveEffectiveThinking(model, configThinking)` (`shared/model-info.ts:34-40`): a `:level`
 /// suffix on the model wins; otherwise the configured level, but only when it is a recognized one.
-fn resolve_effective_thinking(model: &str, config_thinking: Option<&ThinkingSetting>) -> Option<String> {
+fn resolve_effective_thinking(
+    model: &str,
+    config_thinking: Option<&ThinkingSetting>,
+) -> Option<String> {
     if model.is_empty() {
         return None;
     }
@@ -309,7 +314,10 @@ fn resolve_effective_thinking(model: &str, config_thinking: Option<&ThinkingSett
 }
 
 /// `mainThinkingLine` (`register-main.ts:50-62`).
-fn main_thinking_line(snapshot: &WatchdogRuntimeSnapshot, ctx: &WatchdogCommandContext<'_>) -> String {
+fn main_thinking_line(
+    snapshot: &WatchdogRuntimeSnapshot,
+    ctx: &WatchdogCommandContext<'_>,
+) -> String {
     let configured_model = snapshot.config.main.model.as_deref();
     let configured_thinking = snapshot.config.main.thinking.as_ref();
     if let Some(model) = configured_model {
@@ -463,7 +471,11 @@ pub fn build_watchdog_status(
         ),
         format!(
             "Scope context: {}",
-            if snapshot.config.scope.enabled { "on" } else { "off" }
+            if snapshot.config.scope.enabled {
+                "on"
+            } else {
+                "off"
+            }
         ),
         format!(
             "Cadence: {}",
@@ -484,7 +496,10 @@ pub fn build_watchdog_status(
         format!("Main thinking: {}", main_thinking_line(snapshot, ctx)),
         children_line(snapshot),
         recommendation_line(ctx),
-        format!("Agent-end timeout: {}ms", snapshot.config.agent_end_timeout_ms),
+        format!(
+            "Agent-end timeout: {}ms",
+            snapshot.config.agent_end_timeout_ms
+        ),
         format!(
             "Auto-follow: {} · attempts {}{}{}{}",
             if snapshot.enabled && snapshot.config.auto_follow.blockers {
@@ -497,8 +512,16 @@ pub fn build_watchdog_status(
                 None => String::new(),
                 Some(max) => format!("/{max}"),
             },
-            if snapshot.auto_follow_queued { " · queued" } else { "" },
-            if snapshot.auto_follow_stalemate { " · stalemate" } else { "" }
+            if snapshot.auto_follow_queued {
+                " · queued"
+            } else {
+                ""
+            },
+            if snapshot.auto_follow_stalemate {
+                " · stalemate"
+            } else {
+                ""
+            }
         ),
         format!("Review model call: {}", snapshot.review_description),
     ];
@@ -524,7 +547,9 @@ pub fn build_watchdog_status(
         lines.push(format!(
             "Last warning: {} · {} · {}",
             warning.severity.as_str(),
-            warning.state.map_or("candidate", WatchdogWarningState::as_str),
+            warning
+                .state
+                .map_or("candidate", WatchdogWarningState::as_str),
             warning.summary
         ));
     }
@@ -709,7 +734,10 @@ fn build_check_text(
         }
         None => lines.push(format!("Main model: {}", current_session_model_line(ctx))),
     }
-    lines.push(format!("Main thinking: {}", main_thinking_line(&snapshot, ctx)));
+    lines.push(format!(
+        "Main thinking: {}",
+        main_thinking_line(&snapshot, ctx)
+    ));
     lines.push(lsp_line(&snapshot));
     match recommend_strong_watchdog_model(&ctx.model_context()) {
         Ok(recommendation) => lines.push(format!(
@@ -806,8 +834,7 @@ pub fn handle_watchdog_command(
                         "Main now: {}{}",
                         bool_label(snapshot.enabled),
                         match snapshot.session_override {
-                            Some(value) =>
-                                format!(" (session override {})", bool_label(value)),
+                            Some(value) => format!(" (session override {})", bool_label(value)),
                             None => String::new(),
                         }
                     ),
@@ -823,16 +850,18 @@ pub fn handle_watchdog_command(
     if input == "session on" || input == "session off" {
         let enabled = input.ends_with("on");
         let snapshot = runtime.set_session_enabled(enabled, &ctx.cwd);
-        return text([
-            format!(
-                "Subagent watchdog session override: {}.",
-                bool_label(enabled)
-            ),
-            "No settings files were changed.".to_string(),
-            String::new(),
-            build_watchdog_status(&snapshot, ctx),
-        ]
-        .join("\n"));
+        return text(
+            [
+                format!(
+                    "Subagent watchdog session override: {}.",
+                    bool_label(enabled)
+                ),
+                "No settings files were changed.".to_string(),
+                String::new(),
+                build_watchdog_status(&snapshot, ctx),
+            ]
+            .join("\n"),
+        );
     }
     if let Some(raw_model) = input.strip_prefix("session model ") {
         return text(match resolve_model_command_value(ctx, raw_model) {
@@ -886,9 +915,9 @@ pub fn handle_watchdog_command(
                     ]
                     .join("\n")
                 }
-                Err(message) => format!(
-                    "Subagent watchdog model\n\n{message}\nNo settings files were changed."
-                ),
+                Err(message) => {
+                    format!("Subagent watchdog model\n\n{message}\nNo settings files were changed.")
+                }
             },
         );
     }
@@ -981,7 +1010,9 @@ fn message_text(message: &serde_json::Value) -> Option<String> {
             Some(serde_json::Value::Array(blocks)) => {
                 let joined: Vec<&str> = blocks
                     .iter()
-                    .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                    .filter(|block| {
+                        block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    })
                     .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
                     .collect();
                 return Some(joined.join("\n"));
@@ -1059,13 +1090,13 @@ fn unescape_xml(value: &str) -> String {
     clippy::panic
 )]
 mod tests {
-    use super::*;
     use super::super::runtime::WatchdogRuntimeSnapshot;
     use super::super::settings::default_watchdog_config;
     use super::super::types::{
         WatchdogLspResult, WatchdogLspRuntimeSnapshot, WatchdogLspStatus, WatchdogSettingsScope,
     };
     use super::super::warning_format::format_watchdog_warning_content;
+    use super::*;
 
     struct EmptyRegistry;
 
@@ -1138,7 +1169,10 @@ mod tests {
     #[test]
     fn the_status_block_reports_the_default_off_state_verbatim() {
         let status = build_watchdog_status(&snapshot(), &ctx());
-        assert!(status.starts_with("Subagent watchdog\nMain: off (default off)\n"), "{status}");
+        assert!(
+            status.starts_with("Subagent watchdog\nMain: off (default off)\n"),
+            "{status}"
+        );
         assert!(status.contains("Runtime: idle\n"));
         assert!(status.contains("Review trigger: repo edits only\n"));
         assert!(status.contains("Scope context: on\n"));
@@ -1146,7 +1180,9 @@ mod tests {
         assert!(status.contains("Session override: none\n"));
         assert!(status.contains("Main model: current session (anthropic/claude-sonnet-4)\n"));
         assert!(status.contains("Main thinking: current session (medium)\n"));
-        assert!(status.contains("Children: off · model current child session · thinking current child session\n"));
+        assert!(status.contains(
+            "Children: off · model current child session · thinking current child session\n"
+        ));
         assert!(status.contains("Agent-end timeout: 30000ms\n"));
         assert!(status.contains("Auto-follow: off · attempts 0/3\n"));
         assert!(status.contains("Review model call: not wired\n"));
@@ -1179,7 +1215,12 @@ mod tests {
             message: "bad field".to_string(),
         }];
         let status = build_watchdog_status(&snap, &ctx());
-        assert!(status.contains("\nConfig errors:\n- bad field\nWatchdog is disabled until the config is fixed."), "{status}");
+        assert!(
+            status.contains(
+                "\nConfig errors:\n- bad field\nWatchdog is disabled until the config is fixed."
+            ),
+            "{status}"
+        );
     }
 
     #[test]
@@ -1229,7 +1270,10 @@ mod tests {
             Some(ThinkingSetting::Off)
         );
         let error = parse_thinking_command("nonsense").unwrap_err();
-        assert!(error.starts_with("Unsupported watchdog thinking 'nonsense'"), "{error}");
+        assert!(
+            error.starts_with("Unsupported watchdog thinking 'nonsense'"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1239,8 +1283,14 @@ mod tests {
         assert!(details.is_none());
         match outcome {
             WatchdogCommandOutcome::UsageError(message) => {
-                assert!(message.starts_with("Usage: /subagents-watchdog [status|on|off|"), "{message}");
-                assert!(message.contains("thinking off|minimal|low|medium|high|xhigh|max|"), "{message}");
+                assert!(
+                    message.starts_with("Usage: /subagents-watchdog [status|on|off|"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("thinking off|minimal|low|medium|high|xhigh|max|"),
+                    "{message}"
+                );
             }
             other => panic!("expected a usage error, got {other:?}"),
         }
@@ -1331,8 +1381,7 @@ mod tests {
     #[test]
     fn a_bad_session_model_reports_the_error_and_changes_nothing() {
         let runtime = MainWatchdogRuntime::default();
-        let (outcome, _) =
-            handle_watchdog_command(&runtime, "session model not-a-model", &ctx());
+        let (outcome, _) = handle_watchdog_command(&runtime, "session model not-a-model", &ctx());
         match outcome {
             WatchdogCommandOutcome::Text(text) => assert!(
                 text.starts_with("Subagent watchdog session model\n\nWatchdog model 'not-a-model' did not resolve to provider/model."),
@@ -1377,11 +1426,19 @@ mod tests {
     #[test]
     fn the_warning_content_round_trips_back_into_details() {
         let original = details_fixture();
-        let content = format_watchdog_warning_content(&super::super::warning_format::details_as_warning(&original));
+        let content = format_watchdog_warning_content(
+            &super::super::warning_format::details_as_warning(&original),
+        );
         let parsed = parse_watchdog_warning_content(&content).expect("parsed");
         assert_eq!(parsed.severity, original.severity);
-        assert_eq!(parsed.summary, original.summary, "the escaped `<>` survived");
-        assert_eq!(parsed.evidence, original.evidence, "the escaped `&` survived");
+        assert_eq!(
+            parsed.summary, original.summary,
+            "the escaped `<>` survived"
+        );
+        assert_eq!(
+            parsed.evidence, original.evidence,
+            "the escaped `&` survived"
+        );
         assert_eq!(parsed.recommended_action, original.recommended_action);
         assert_eq!(parsed.category, original.category);
         assert_eq!(parsed.source, original.source);
@@ -1396,7 +1453,9 @@ mod tests {
     #[test]
     fn a_non_watchdog_body_does_not_parse() {
         assert!(parse_watchdog_warning_content("just some text").is_none());
-        assert!(parse_watchdog_warning_content("<subagent_watchdog severity=\"blocker\">").is_none());
+        assert!(
+            parse_watchdog_warning_content("<subagent_watchdog severity=\"blocker\">").is_none()
+        );
     }
 
     #[test]
@@ -1413,7 +1472,10 @@ mod tests {
         let text = rendered.as_str().expect("text");
         assert!(text.starts_with("Subagent watchdog Blocker"), "{text}");
         assert!(text.contains("the <migration> is not reversible"), "{text}");
-        assert!(!text.contains("<subagent_watchdog"), "the raw XML is not shown: {text}");
+        assert!(
+            !text.contains("<subagent_watchdog"),
+            "the raw XML is not shown: {text}"
+        );
     }
 
     #[test]
@@ -1442,7 +1504,9 @@ mod tests {
 
     #[test]
     fn a_message_with_no_body_at_all_renders_nothing() {
-        assert!(render_watchdog_warning_message(&serde_json::json!({ "role": "custom" })).is_none());
+        assert!(
+            render_watchdog_warning_message(&serde_json::json!({ "role": "custom" })).is_none()
+        );
     }
 
     // ---- registration ---------------------------------------------------------------------------

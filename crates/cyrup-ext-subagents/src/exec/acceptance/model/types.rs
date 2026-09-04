@@ -606,7 +606,11 @@ impl SerializableGate {
         Self {
             id: gate.id.clone(),
             must: gate.must.clone(),
-            evidence: gate.evidence.iter().map(|k| k.as_str().to_string()).collect(),
+            evidence: gate
+                .evidence
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect(),
             severity: match gate.severity {
                 GateSeverity::Required => "required".to_string(),
                 GateSeverity::Recommended => "recommended".to_string(),
@@ -677,7 +681,6 @@ mod tests {
     use crate::exec::acceptance::model::testsupport::temp_dir;
     use serde_json::json;
 
-
     #[test]
     fn explicit_acceptance_strengthens_inferred_policy() {
         let resolved = resolve(AcceptanceResolveInput {
@@ -701,7 +704,6 @@ mod tests {
         assert_eq!(resolved.verify.first().map(|v| v.id.as_str()), Some("ok"));
     }
 
-
     #[test]
     fn explicit_none_with_reason_disables_inferred_gates() {
         let resolved = resolve(AcceptanceResolveInput {
@@ -717,7 +719,6 @@ mod tests {
         assert_eq!(resolved.level, AcceptanceLevel::None);
         assert!(resolved.evidence.is_empty());
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn verified_mode_runs_real_verify_commands() {
@@ -751,7 +752,10 @@ mod tests {
         })
         .await;
         assert_eq!(pass_ledger.status, AcceptanceLedgerStatus::Verified);
-        assert_eq!(pass_ledger.verify_runs.first().map(|r| r.status), Some(VerifyRunStatus::Passed));
+        assert_eq!(
+            pass_ledger.verify_runs.first().map(|r| r.status),
+            Some(VerifyRunStatus::Passed)
+        );
 
         let failing = resolve(AcceptanceResolveInput {
             agent_name: "worker".into(),
@@ -785,12 +789,19 @@ mod tests {
         // The child's own commandsRun claim of "passed" is IRRELEVANT: the orchestrator observed
         // a real nonzero exit.
         assert_eq!(
-            fail_ledger.child_report.as_ref().and_then(|r| r.commands_run.as_ref()).and_then(|c| c.first()).map(|c| c.result.clone()),
+            fail_ledger
+                .child_report
+                .as_ref()
+                .and_then(|r| r.commands_run.as_ref())
+                .and_then(|c| c.first())
+                .map(|c| c.result.clone()),
             Some(CommandRunResult::Passed)
         );
-        assert_eq!(fail_ledger.verify_runs.first().map(|r| r.status), Some(VerifyRunStatus::Failed));
+        assert_eq!(
+            fail_ledger.verify_runs.first().map(|r| r.status),
+            Some(VerifyRunStatus::Failed)
+        );
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     /// G78 — the review gate hangs off `acceptance.review` (`acceptance.ts:1318-1336`
@@ -873,7 +884,10 @@ mod tests {
         // `review-required` is NOT `rejected` (`acceptance.ts:1334`): the run is waiting on a
         // reviewer, so it neither passes nor fails the acceptance gate on its own.
         assert_eq!(unavailable.status, AcceptanceLedgerStatus::ReviewRequired);
-        assert_eq!(unavailable.evidence_status, AcceptanceEvidenceStatus::Checked);
+        assert_eq!(
+            unavailable.evidence_status,
+            AcceptanceEvidenceStatus::Checked
+        );
         assert!(acceptance_failure_message(&unavailable).is_none());
         assert_eq!(
             unavailable.review_result.as_ref().map(|r| r.status),
@@ -888,7 +902,6 @@ mod tests {
             Some("Independent review has not been supplied.")
         );
     }
-
 
     // ---- G78: the checked rung's v0.43.0 rewrite (`acceptance.ts:1268-1278`) ----
 
@@ -980,7 +993,9 @@ mod tests {
             "checkCriteriaSatisfied's checks come first: {ids:?}"
         );
         assert!(
-            ids.iter().skip(1).all(|id| id.starts_with("evidence:") || *id == "no-staged-files"),
+            ids.iter()
+                .skip(1)
+                .all(|id| id.starts_with("evidence:") || *id == "no-staged-files"),
             "runStructuralChecks' checks follow them: {ids:?}"
         );
         assert!(
@@ -1003,5 +1018,4 @@ mod tests {
                 .contains("Required criterion 'regression' was reported as not-satisfied")
         );
     }
-
 }

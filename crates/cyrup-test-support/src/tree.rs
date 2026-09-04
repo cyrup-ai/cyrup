@@ -39,11 +39,19 @@ pub enum TreeRole {
 
 impl TreeMessage {
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: TreeRole::User, text: text.into(), branch_from: None }
+        Self {
+            role: TreeRole::User,
+            text: text.into(),
+            branch_from: None,
+        }
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
-        Self { role: TreeRole::Assistant, text: text.into(), branch_from: None }
+        Self {
+            role: TreeRole::Assistant,
+            text: text.into(),
+            branch_from: None,
+        }
     }
 
     /// Mark this message as branching from a previously-appended message (by its text).

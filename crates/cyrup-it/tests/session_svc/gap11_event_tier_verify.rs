@@ -18,15 +18,20 @@
 // always true here. Re-spelled in cyrup-it it would name THIS crate's `wasm-host`, which
 // `--features it` does not enable, and every test below would SILENTLY not compile in.
 // See the `[[test]]` note in crates/cyrup-it/Cargo.toml.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{ExtensionId, ModelThinkingLevel, StopReason};
 use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, FauxConfig, FauxModelDefinition, FauxProvider,
-    FauxResponseMeta,
+    FauxConfig, FauxModelDefinition, FauxProvider, FauxResponseMeta, faux_assistant_message,
+    faux_text,
 };
 use cyrup_provider::{Model, Provider};
 use cyrup_session_svc::{SessionBuilder, SessionConfig};
@@ -52,7 +57,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -76,7 +85,9 @@ fn recording_two_model_faux(recorded: Arc<Mutex<Vec<String>>>) -> Arc<FauxProvid
     let cfg = FauxConfig {
         models: vec![reasoning("faux-1"), reasoning("faux-2")],
         on_response: Some(Arc::new(move |_meta: &FauxResponseMeta, model: &Model| {
-            rec.lock().unwrap_or_else(|e| e.into_inner()).push(model.id.as_str().to_string());
+            rec.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(model.id.as_str().to_string());
         })),
         ..FauxConfig::default()
     };
@@ -103,7 +114,11 @@ async fn event_tier_set_model_and_thinking_take_effect_on_next_turn() {
     // BIND the session (`into_shared`) — production always does (runtime.rs:107). Only a bound
     // session spawns the post-run driver (`drive_run`) that hosts the GAP-11 event-tier turn-boundary
     // drain; an unbound by-value session runs the prompt without it.
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.unwrap().into_shared();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .unwrap()
+        .into_shared();
 
     // Load the REAL guest COMPONENT through the session's own host (arch-08 §5.6 seam).
     let ext = session
@@ -126,7 +141,15 @@ async fn event_tier_set_model_and_thinking_take_effect_on_next_turn() {
     // baseline — the file predates that commit and cyrup-it did not compile in between, so it was
     // never re-run. What the assertion is FOR is unchanged: pin a known starting level distinct
     // from the `high` the event handler sets below, so the switch is observable.
-    assert_eq!(session.model().expect("session must have a resolved model").model.as_str(), "faux-1", "starts on faux-1");
+    assert_eq!(
+        session
+            .model()
+            .expect("session must have a resolved model")
+            .model
+            .as_str(),
+        "faux-1",
+        "starts on faux-1"
+    );
     assert_eq!(
         session.thinking_level().await,
         ModelThinkingLevel::Medium,
@@ -143,11 +166,15 @@ async fn event_tier_set_model_and_thinking_take_effect_on_next_turn() {
     // and the guest observed Ok — pre-fix it returned an honest deadlock Err → notify "err".
     let notes = ext.guest().notifications();
     assert!(
-        notes.iter().any(|n| n.contains("gap11: set_model called from message_end")),
+        notes
+            .iter()
+            .any(|n| n.contains("gap11: set_model called from message_end")),
         "event-tier set_model must be reached across the wasm boundary; notes: {notes:?}"
     );
     assert!(
-        notes.iter().any(|n| n.contains("gap11: set_thinking_level ok from message_end")),
+        notes
+            .iter()
+            .any(|n| n.contains("gap11: set_thinking_level ok from message_end")),
         "event-tier set_thinking_level must surface Ok to the guest; notes: {notes:?}"
     );
     assert!(
@@ -157,7 +184,11 @@ async fn event_tier_set_model_and_thinking_take_effect_on_next_turn() {
 
     // (1)+(2) The event-tier ops TOOK EFFECT: session model switched, thinking level switched.
     assert_eq!(
-        session.model().expect("session must have a resolved model").model.as_str(),
+        session
+            .model()
+            .expect("session must have a resolved model")
+            .model
+            .as_str(),
         "faux-2",
         "event-tier set_model took effect on the session model"
     );
@@ -209,12 +240,19 @@ async fn event_tier_set_model_and_thinking_take_effect_on_next_turn() {
     let _ = session.prompt("/gap11setmodel faux/faux-1").await.unwrap();
     session.wait_for_idle().await;
     assert_eq!(
-        session.model().expect("session must have a resolved model").model.as_str(),
+        session
+            .model()
+            .expect("session must have a resolved model")
+            .model
+            .as_str(),
         "faux-1",
         "command-tier set_model still applies"
     );
 
     // The /commands short-circuited (no stream) — the recorded request models are unchanged.
     let models_after = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    assert_eq!(models_after, models, "slash commands did not issue provider requests");
+    assert_eq!(
+        models_after, models,
+        "slash commands did not issue provider requests"
+    );
 }

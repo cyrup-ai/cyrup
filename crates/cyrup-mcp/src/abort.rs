@@ -39,7 +39,7 @@ use std::future::Future;
 use cyrup_core::CancelToken;
 
 use crate::errors::{McpError, McpResult};
-use crate::owner::{McpRuntimeOwner, DEFAULT_STOP_REASON};
+use crate::owner::{DEFAULT_STOP_REASON, McpRuntimeOwner};
 
 /// `combineAbortSignals(owner.signal, other)`.
 ///
@@ -96,7 +96,9 @@ pub fn throw_if_aborted(token: &CancelToken, reason: Option<&str>) -> McpResult<
     if !token.is_cancelled() {
         return Ok(());
     }
-    Err(McpError::Aborted(reason.unwrap_or(ABORTED_FALLBACK_REASON).to_string()))
+    Err(McpError::Aborted(
+        reason.unwrap_or(ABORTED_FALLBACK_REASON).to_string(),
+    ))
 }
 
 /// `abort.ts`'s fallback when `signal.reason` is not an `Error`:
@@ -176,7 +178,11 @@ mod tests {
             let b = CancelToken::new();
             let combined = combine(&a, Some(&b));
             assert!(!combined.is_cancelled());
-            if cancel_first { a.cancel() } else { b.cancel() }
+            if cancel_first {
+                a.cancel()
+            } else {
+                b.cancel()
+            }
             combined.cancelled().await;
             assert!(combined.is_cancelled());
         }
@@ -207,7 +213,9 @@ mod tests {
     async fn abortable_owned_carries_the_stop_reason() {
         let owner = Arc::new(McpRuntimeOwner::new());
         let _ = owner.stop(Some("MCP extension session shutdown")).await;
-        let err = abortable_owned(async { 1_u8 }, &owner).await.expect_err("stopped");
+        let err = abortable_owned(async { 1_u8 }, &owner)
+            .await
+            .expect_err("stopped");
         assert_eq!(err.to_string(), "MCP extension session shutdown");
     }
 
@@ -221,10 +229,19 @@ mod tests {
     fn abort_classification_covers_both_arms() {
         let cancelled = CancelToken::new();
         cancelled.cancel();
-        let connect_failure = McpError::Server { server: "s".into(), message: "refused".into() };
+        let connect_failure = McpError::Server {
+            server: "s".into(),
+            message: "refused".into(),
+        };
         assert!(!is_abort_error(&connect_failure, None));
-        assert!(is_abort_error(&connect_failure, Some(&cancelled)), "signal?.aborted arm");
-        assert!(is_abort_error(&McpError::aborted_default(), None), "typed arm");
+        assert!(
+            is_abort_error(&connect_failure, Some(&cancelled)),
+            "signal?.aborted arm"
+        );
+        assert!(
+            is_abort_error(&McpError::aborted_default(), None),
+            "typed arm"
+        );
     }
 
     #[test]
@@ -236,6 +253,11 @@ mod tests {
             throw_if_aborted(&token, None).unwrap_err().to_string(),
             ABORTED_FALLBACK_REASON
         );
-        assert_eq!(throw_if_aborted(&token, Some("custom")).unwrap_err().to_string(), "custom");
+        assert_eq!(
+            throw_if_aborted(&token, Some("custom"))
+                .unwrap_err()
+                .to_string(),
+            "custom"
+        );
     }
 }

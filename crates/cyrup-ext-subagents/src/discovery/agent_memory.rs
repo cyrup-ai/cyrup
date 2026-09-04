@@ -191,7 +191,11 @@ pub fn resolve_memory_dir(root_dir: &Path, scoped_path: &str) -> Result<PathBuf,
     // pi's symlink audit: the root must not itself be a symlink, and every EXISTING prefix of the
     // resolved path must still land inside the root's real location.
     let verify = || -> std::io::Result<Result<(), String>> {
-        if root_dir.exists() && std::fs::symlink_metadata(root_dir)?.file_type().is_symlink() {
+        if root_dir.exists()
+            && std::fs::symlink_metadata(root_dir)?
+                .file_type()
+                .is_symlink()
+        {
             return Ok(Err("memory root must not be a symlink".to_string()));
         }
         let root_real = if root_dir.exists() {
@@ -276,7 +280,9 @@ pub fn read_memory_file(memory_dir: &Path) -> MemoryFileResult {
         return MemoryFileResult::Missing;
     };
     let over_byte_cap = bytes.len() > MAX_MEMORY_BYTES;
-    let capped = bytes.get(..bytes.len().min(MAX_MEMORY_BYTES)).unwrap_or(&[]);
+    let capped = bytes
+        .get(..bytes.len().min(MAX_MEMORY_BYTES))
+        .unwrap_or(&[]);
     let raw = String::from_utf8_lossy(capped);
     let (contents, truncated_capped) = truncate_memory(&raw);
     MemoryFileResult::Contents {
@@ -394,8 +400,10 @@ pub fn build_agent_memory_injection_with_root(
 pub fn memory_scope_root(scope: MemoryScope, cwd: &Path) -> Option<PathBuf> {
     match scope {
         MemoryScope::User => Some(crate::paths::agent_dir().join(AGENT_MEMORY_DIR_NAME)),
-        MemoryScope::Project => super::find_nearest_project_root(cwd)
-            .map(|root| root.join(super::PROJECT_CONFIG_DIR_SEGMENT).join(AGENT_MEMORY_DIR_NAME)),
+        MemoryScope::Project => super::find_nearest_project_root(cwd).map(|root| {
+            root.join(super::PROJECT_CONFIG_DIR_SEGMENT)
+                .join(AGENT_MEMORY_DIR_NAME)
+        }),
     }
 }
 
@@ -419,7 +427,12 @@ pub fn build_agent_memory_injection_for(agent: &AgentDefinition, cwd: &Path) -> 
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -447,7 +460,10 @@ mod tests {
 
     #[test]
     fn an_illegal_scope_or_a_missing_path_declines_the_config() {
-        assert_eq!(parse_memory_frontmatter(Some("scope: global\npath: x")), None);
+        assert_eq!(
+            parse_memory_frontmatter(Some("scope: global\npath: x")),
+            None
+        );
         assert_eq!(parse_memory_frontmatter(Some("scope: user")), None);
         assert_eq!(parse_memory_frontmatter(Some("scope: user\npath:")), None);
         assert_eq!(parse_memory_frontmatter(None), None);
@@ -457,7 +473,9 @@ mod tests {
     #[test]
     fn write_tools_are_inferred_from_the_allowlist_and_default_to_true() {
         assert!(agent_has_write_tools(None));
-        assert!(agent_has_write_tools(Some(&vec![ToolRef::Builtin("bash".into())])));
+        assert!(agent_has_write_tools(Some(&vec![ToolRef::Builtin(
+            "bash".into()
+        )])));
         assert!(!agent_has_write_tools(Some(&vec![
             ToolRef::Builtin("read".into()),
             ToolRef::Builtin("grep".into()),
@@ -533,13 +551,15 @@ mod tests {
         assert!(injection.contains(&format!(
             "No {AGENT_MEMORY_FILE} exists yet at the path above."
         )));
-        assert!(injection.contains(
-            &root
-                .join("reviewer")
-                .join(AGENT_MEMORY_FILE)
-                .display()
-                .to_string()
-        ));
+        assert!(
+            injection.contains(
+                &root
+                    .join("reviewer")
+                    .join(AGENT_MEMORY_FILE)
+                    .display()
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -562,8 +582,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let root = tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("reviewer")).expect("mkdir");
-        std::fs::write(root.join("reviewer").join(AGENT_MEMORY_FILE), "note one\n")
-            .expect("write");
+        std::fs::write(root.join("reviewer").join(AGENT_MEMORY_FILE), "note one\n").expect("write");
         let injection = build_agent_memory_injection_with_root(
             Some(&AgentMemoryConfig {
                 scope: MemoryScope::User,

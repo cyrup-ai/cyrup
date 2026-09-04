@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cyrup_tools::ops::shell_env;
-use cyrup_tools::truncate::{TruncOpts, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+use cyrup_tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncOpts};
 use cyrup_tools::{ExecSpec, ExitStatus, ProcOps, ShellConfig};
 
 /// The outcome of an immediate bash execution (Pi `BashResult`, bash-executor.ts:29-40).
@@ -108,7 +108,14 @@ impl std::fmt::Debug for BashOptions {
         f.debug_struct("BashOptions")
             .field("exclude_from_context", &self.exclude_from_context)
             .field("id", &self.id)
-            .field("operations", &if self.operations.is_some() { "Some(<override>)" } else { "None" })
+            .field(
+                "operations",
+                &if self.operations.is_some() {
+                    "Some(<override>)"
+                } else {
+                    "None"
+                },
+            )
             .finish()
     }
 }
@@ -241,15 +248,27 @@ pub(crate) async fn run_bash(
             truncated,
             full_output_path,
         }),
-        Ok(ExitStatus::Signaled) => {
-            Ok(BashResult { output, exit_code: None, cancelled: false, truncated, full_output_path })
-        }
-        Ok(ExitStatus::Killed) => {
-            Ok(BashResult { output, exit_code: None, cancelled: true, truncated, full_output_path })
-        }
-        Ok(ExitStatus::TimedOut) => {
-            Ok(BashResult { output, exit_code: None, cancelled: false, truncated, full_output_path })
-        }
+        Ok(ExitStatus::Signaled) => Ok(BashResult {
+            output,
+            exit_code: None,
+            cancelled: false,
+            truncated,
+            full_output_path,
+        }),
+        Ok(ExitStatus::Killed) => Ok(BashResult {
+            output,
+            exit_code: None,
+            cancelled: true,
+            truncated,
+            full_output_path,
+        }),
+        Ok(ExitStatus::TimedOut) => Ok(BashResult {
+            output,
+            exit_code: None,
+            cancelled: false,
+            truncated,
+            full_output_path,
+        }),
         Err(e) => Err(e),
     }
 }
@@ -264,19 +283,38 @@ pub(crate) async fn run_bash(
 /// value. This payload rides the same stdout stream as the `bash` response (it becomes a custom
 /// message inside `message_update`), so a `null` here is the same client-visible divergence the
 /// response's own keys had.
-pub(crate) fn bash_message_payload(command: &str, result: &BashResult, exclude_from_context: bool) -> serde_json::Value {
+pub(crate) fn bash_message_payload(
+    command: &str,
+    result: &BashResult,
+    exclude_from_context: bool,
+) -> serde_json::Value {
     let mut payload = serde_json::Map::new();
     payload.insert("command".into(), serde_json::Value::from(command));
-    payload.insert("output".into(), serde_json::Value::from(result.output.clone()));
+    payload.insert(
+        "output".into(),
+        serde_json::Value::from(result.output.clone()),
+    );
     if let Some(code) = result.exit_code {
         payload.insert("exitCode".into(), serde_json::Value::from(code));
     }
-    payload.insert("cancelled".into(), serde_json::Value::from(result.cancelled));
-    payload.insert("truncated".into(), serde_json::Value::from(result.truncated));
+    payload.insert(
+        "cancelled".into(),
+        serde_json::Value::from(result.cancelled),
+    );
+    payload.insert(
+        "truncated".into(),
+        serde_json::Value::from(result.truncated),
+    );
     if let Some(path) = &result.full_output_path {
-        payload.insert("fullOutputPath".into(), serde_json::Value::from(path.clone()));
+        payload.insert(
+            "fullOutputPath".into(),
+            serde_json::Value::from(path.clone()),
+        );
     }
-    payload.insert("excludeFromContext".into(), serde_json::Value::from(exclude_from_context));
+    payload.insert(
+        "excludeFromContext".into(),
+        serde_json::Value::from(exclude_from_context),
+    );
     serde_json::Value::Object(payload)
 }
 
@@ -409,15 +447,21 @@ impl BashOutputBuffer {
     /// regardless of the final `truncated` value.
     fn finish(mut self) -> (String, bool, Option<String>) {
         let full_output = self.chunks.concat();
-        let truncation =
-            cyrup_tools::truncate::truncate_tail(&full_output, TruncOpts::new(DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES));
+        let truncation = cyrup_tools::truncate::truncate_tail(
+            &full_output,
+            TruncOpts::new(DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES),
+        );
         if truncation.info.truncated {
             self.ensure_temp_file();
         }
         if let Some(f) = self.temp_file.as_mut() {
             let _ = f.flush();
         }
-        let output = if truncation.info.truncated { truncation.content } else { full_output };
+        let output = if truncation.info.truncated {
+            truncation.content
+        } else {
+            full_output
+        };
         let full_output_path = self.temp_path.map(|p| p.to_string_lossy().into_owned());
         (output, truncation.info.truncated, full_output_path)
     }
@@ -474,7 +518,9 @@ fn strip_ansi(input: &str) -> String {
                 rest = end;
                 continue;
             }
-        } else if c == '\u{9B}' && let Some(end) = try_csi(rest) {
+        } else if c == '\u{9B}'
+            && let Some(end) = try_csi(rest)
+        {
             rest = end;
             continue;
         }
@@ -727,7 +773,7 @@ mod sanitize_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod wire_shape_tests {
-    use super::{bash_message_payload, BashResult};
+    use super::{BashResult, bash_message_payload};
 
     /// SEAM-083 — RED before this pass on the FIRST assertion of each half.
     ///
@@ -811,7 +857,10 @@ mod wire_shape_tests {
         assert!(!obj.contains_key("fullOutputPath"), "got {payload}");
         assert_eq!(obj.get("command"), Some(&serde_json::json!("sleep 100")));
         assert_eq!(obj.get("cancelled"), Some(&serde_json::json!(true)));
-        assert_eq!(obj.get("excludeFromContext"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            obj.get("excludeFromContext"),
+            Some(&serde_json::json!(false))
+        );
 
         let ok = BashResult {
             output: "hi".into(),
@@ -822,7 +871,13 @@ mod wire_shape_tests {
         };
         let payload = bash_message_payload("echo hi", &ok, true);
         assert_eq!(payload.get("exitCode"), Some(&serde_json::json!(3)));
-        assert_eq!(payload.get("fullOutputPath"), Some(&serde_json::json!("/tmp/x.log")));
-        assert_eq!(payload.get("excludeFromContext"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            payload.get("fullOutputPath"),
+            Some(&serde_json::json!("/tmp/x.log"))
+        );
+        assert_eq!(
+            payload.get("excludeFromContext"),
+            Some(&serde_json::json!(true))
+        );
     }
 }

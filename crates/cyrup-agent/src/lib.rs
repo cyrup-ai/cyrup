@@ -23,16 +23,17 @@ pub mod subscriber;
 pub use agent::{Agent, AgentBuilder, HeaderFn, PromptInput, RunHandle, Subscription};
 pub use error::{AgentError, BusyEntry, ContinueSurface, HookError};
 pub use event::{AgentEvent, AgentMessage, AppRole, ToolResultMessage};
-pub use loop_fn::{
-    agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue, AgentContext,
-    AgentEventSink, AgentLoopConfig, AgentLoopStream,
-};
 pub use hooks::{
-    default_convert_to_llm, AfterOutcome, AfterOverride, AfterToolCall, AgentContextView, BeforeOutcome,
-    BeforeToolCall, DefaultHooks, Hooks, PostTurn, TurnUpdate,
+    AfterOutcome, AfterOverride, AfterToolCall, AgentContextView, BeforeOutcome, BeforeToolCall,
+    DefaultHooks, Hooks, PostTurn, TurnUpdate, default_convert_to_llm,
+};
+pub use loop_fn::{
+    AgentContext, AgentEventSink, AgentLoopConfig, AgentLoopStream, agent_loop,
+    agent_loop_continue, run_agent_loop, run_agent_loop_continue,
 };
 pub use proxy::{
-    stream_proxy, ProxyAssistantMessageEvent, ProxyMessageBuilder, ProxyStreamFn, ProxyStreamOptions,
+    ProxyAssistantMessageEvent, ProxyMessageBuilder, ProxyStreamFn, ProxyStreamOptions,
+    stream_proxy,
 };
 pub use queue::{PendingQueue, QueueMode, ToolExecution};
 pub use state::{AgentStateSnapshot, GenerationConfig};
@@ -45,13 +46,13 @@ pub use subscriber::EventSubscriber;
 // directly. A type that appears in no public signature does NOT belong in these lists. On a name
 // collision with a cyrup-agent item above, the cyrup-agent name wins and the third-party one is
 // dropped (none today).
-pub use cyrup_provider::{
-    CacheRetention, Context, HeaderMap, OnPayload, OnResponseHook, Provider, ProviderEnv,
-    StreamEvent, StreamOptions, ThinkingBudgets, Transport,
-};
 pub use cyrup_core::{
     AssistantMessage, CancelToken, Content, EventStream, ModelRef, ModelThinkingLevel, ProviderId,
     SessionId, StopReason, Tool, ToolCallId,
+};
+pub use cyrup_provider::{
+    CacheRetention, Context, HeaderMap, OnPayload, OnResponseHook, Provider, ProviderEnv,
+    StreamEvent, StreamOptions, ThinkingBudgets, Transport,
 };
 
 #[cfg(test)]

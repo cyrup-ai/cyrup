@@ -138,7 +138,12 @@ impl EscapeReassembler {
     /// A machine holding nothing.
     #[must_use]
     pub fn new() -> Self {
-        Self { state: State::Idle, held: Vec::new(), bytes: Vec::new(), paste: String::new() }
+        Self {
+            state: State::Idle,
+            held: Vec::new(),
+            bytes: Vec::new(),
+            paste: String::new(),
+        }
     }
 
     /// Whether events are currently being held. The reader thread uses this to shorten its poll
@@ -209,7 +214,11 @@ impl EscapeReassembler {
     fn step(&mut self, ev: Event) -> Step {
         let Event::Key(key) = ev else {
             // Resize / focus / an already-assembled paste can never be part of a split sequence.
-            return if self.state == State::Idle { Step::Forward(ev) } else { Step::Replay(ev) };
+            return if self.state == State::Idle {
+                Step::Forward(ev)
+            } else {
+                Step::Replay(ev)
+            };
         };
         // Release/Repeat reports cannot be part of a split sequence's tail either.
         if key.kind != KeyEventKind::Press {
@@ -368,12 +377,17 @@ enum Step {
 /// uppercase. Anything else (a control byte, a non-ASCII character, a modifier chord) cannot be
 /// sequence tail and aborts the reassembly.
 fn sequence_byte(key: KeyEvent) -> Option<u8> {
-    let KeyCode::Char(c) = key.code else { return None };
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
     if !c.is_ascii() {
         return None;
     }
-    let expected =
-        if c.is_uppercase() { KeyModifiers::SHIFT } else { KeyModifiers::NONE };
+    let expected = if c.is_uppercase() {
+        KeyModifiers::SHIFT
+    } else {
+        KeyModifiers::NONE
+    };
     if key.modifiers != expected {
         return None;
     }
@@ -419,7 +433,9 @@ fn is_complete_csi(buf: &[u8]) -> bool {
         return false;
     }
     let payload = &buf[2..];
-    let Some(&last) = payload.last() else { return false };
+    let Some(&last) = payload.last() else {
+        return false;
+    };
     if !(0x40..=0x7e).contains(&last) {
         return false;
     }
@@ -431,10 +447,14 @@ fn is_complete_csi(buf: &[u8]) -> bool {
             return false;
         }
         let inner = &payload[1..payload.len() - 1];
-        let Ok(inner) = std::str::from_utf8(inner) else { return false };
+        let Ok(inner) = std::str::from_utf8(inner) else {
+            return false;
+        };
         let parts: Vec<&str> = inner.split(';').collect();
         return parts.len() == 3
-            && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
     }
     true
 }
@@ -576,7 +596,10 @@ fn decode_csi_modifier_key_code(buf: &[u8]) -> Result<Option<Event>, ()> {
         (parse_modifiers(mask), parse_key_event_kind(kind_code))
     } else if buf.len() > 3 {
         let digit = char::from(buf[buf.len() - 2]).to_digit(10).ok_or(())?;
-        (parse_modifiers(u8::try_from(digit).map_err(|_| ())?), KeyEventKind::Press)
+        (
+            parse_modifiers(u8::try_from(digit).map_err(|_| ())?),
+            KeyEventKind::Press,
+        )
     } else {
         (KeyModifiers::NONE, KeyEventKind::Press)
     };
@@ -594,7 +617,9 @@ fn decode_csi_modifier_key_code(buf: &[u8]) -> Result<Option<Event>, ()> {
         b'S' => KeyCode::F(4),
         _ => return Err(()),
     };
-    Ok(Some(Event::Key(KeyEvent::new_with_kind(code, modifiers, kind))))
+    Ok(Some(Event::Key(KeyEvent::new_with_kind(
+        code, modifiers, kind,
+    ))))
 }
 
 /// `parse_csi_special_key_code` (`parse.rs:619-660`).
@@ -606,7 +631,11 @@ fn decode_csi_special_key_code(buf: &[u8]) -> Result<Option<Event>, ()> {
 
     let (modifiers, kind, state) =
         if let Some((mask, kind_code)) = modifier_and_kind_parsed(&mut split) {
-            (parse_modifiers(mask), parse_key_event_kind(kind_code), parse_modifiers_to_state(mask))
+            (
+                parse_modifiers(mask),
+                parse_key_event_kind(kind_code),
+                parse_modifiers_to_state(mask),
+            )
         } else {
             (KeyModifiers::NONE, KeyEventKind::Press, KeyEventState::NONE)
         };
@@ -625,7 +654,9 @@ fn decode_csi_special_key_code(buf: &[u8]) -> Result<Option<Event>, ()> {
         v @ 31..=34 => KeyCode::F(v - 17),
         _ => return Err(()),
     };
-    Ok(Some(Event::Key(KeyEvent::new_with_kind_and_state(code, modifiers, kind, state))))
+    Ok(Some(Event::Key(KeyEvent::new_with_kind_and_state(
+        code, modifiers, kind, state,
+    ))))
 }
 
 /// `translate_functional_key_code` (`parse.rs:396-495`).
@@ -708,11 +739,19 @@ fn decode_csi_u_encoded_key_code(buf: &[u8]) -> Result<Option<Event>, ()> {
     let s = std::str::from_utf8(&buf[2..buf.len() - 1]).map_err(|_| ())?;
     let mut split = s.split(';');
     let mut codepoints = split.next().ok_or(())?.split(':');
-    let codepoint = codepoints.next().ok_or(())?.parse::<u32>().map_err(|_| ())?;
+    let codepoint = codepoints
+        .next()
+        .ok_or(())?
+        .parse::<u32>()
+        .map_err(|_| ())?;
 
     let (mut modifiers, kind, state_from_modifiers) =
         if let Some((mask, kind_code)) = modifier_and_kind_parsed(&mut split) {
-            (parse_modifiers(mask), parse_key_event_kind(kind_code), parse_modifiers_to_state(mask))
+            (
+                parse_modifiers(mask),
+                parse_key_event_kind(kind_code),
+                parse_modifiers_to_state(mask),
+            )
         } else {
             (KeyModifiers::NONE, KeyEventKind::Press, KeyEventState::NONE)
         };
@@ -764,8 +803,10 @@ fn decode_csi_u_encoded_key_code(buf: &[u8]) -> Result<Option<Event>, ()> {
     }
 
     if modifiers.contains(KeyModifiers::SHIFT)
-        && let Some(shifted) =
-            codepoints.next().and_then(|c| c.parse::<u32>().ok()).and_then(char::from_u32)
+        && let Some(shifted) = codepoints
+            .next()
+            .and_then(|c| c.parse::<u32>().ok())
+            .and_then(char::from_u32)
     {
         code = KeyCode::Char(shifted);
         modifiers.set(KeyModifiers::SHIFT, false);
@@ -781,7 +822,12 @@ fn decode_csi_u_encoded_key_code(buf: &[u8]) -> Result<Option<Event>, ()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Event {
@@ -794,7 +840,11 @@ mod tests {
     /// (`parse.rs:129-135`) sets `SHIFT` iff the character is uppercase.
     fn byte(b: u8) -> Event {
         let c = char::from(b);
-        let mods = if c.is_uppercase() { KeyModifiers::SHIFT } else { KeyModifiers::NONE };
+        let mods = if c.is_uppercase() {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
         key(KeyCode::Char(c), mods)
     }
     /// The event stream crossterm produces for a sequence whose leading `ESC` arrived in the
@@ -820,7 +870,10 @@ mod tests {
     fn typed(out: &[Event]) -> String {
         out.iter()
             .filter_map(|e| match e {
-                Event::Key(KeyEvent { code: KeyCode::Char(c), .. }) => Some(*c),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(c),
+                    ..
+                }) => Some(*c),
                 _ => None,
             })
             .collect()
@@ -869,21 +922,45 @@ mod tests {
 
     #[test]
     fn split_special_and_modified_keys_reassemble() {
-        assert_eq!(run(split_at_esc("[3~")), vec![key(KeyCode::Delete, KeyModifiers::NONE)]);
-        assert_eq!(run(split_at_esc("[5~")), vec![key(KeyCode::PageUp, KeyModifiers::NONE)]);
-        assert_eq!(run(split_at_esc("[6~")), vec![key(KeyCode::PageDown, KeyModifiers::NONE)]);
-        assert_eq!(run(split_at_esc("[15~")), vec![key(KeyCode::F(5), KeyModifiers::NONE)]);
+        assert_eq!(
+            run(split_at_esc("[3~")),
+            vec![key(KeyCode::Delete, KeyModifiers::NONE)]
+        );
+        assert_eq!(
+            run(split_at_esc("[5~")),
+            vec![key(KeyCode::PageUp, KeyModifiers::NONE)]
+        );
+        assert_eq!(
+            run(split_at_esc("[6~")),
+            vec![key(KeyCode::PageDown, KeyModifiers::NONE)]
+        );
+        assert_eq!(
+            run(split_at_esc("[15~")),
+            vec![key(KeyCode::F(5), KeyModifiers::NONE)]
+        );
         // Ctrl+Left — the modifier form the editor's word-motion bindings use.
-        assert_eq!(run(split_at_esc("[1;5D")), vec![key(KeyCode::Left, KeyModifiers::CONTROL)]);
-        assert_eq!(run(split_at_esc("[1;3A")), vec![key(KeyCode::Up, KeyModifiers::ALT)]);
+        assert_eq!(
+            run(split_at_esc("[1;5D")),
+            vec![key(KeyCode::Left, KeyModifiers::CONTROL)]
+        );
+        assert_eq!(
+            run(split_at_esc("[1;3A")),
+            vec![key(KeyCode::Up, KeyModifiers::ALT)]
+        );
         // Shift+Tab.
-        assert_eq!(run(split_at_esc("[Z")), vec![key(KeyCode::BackTab, KeyModifiers::SHIFT)]);
+        assert_eq!(
+            run(split_at_esc("[Z")),
+            vec![key(KeyCode::BackTab, KeyModifiers::SHIFT)]
+        );
     }
 
     #[test]
     fn a_split_kitty_csi_u_sequence_reassembles() {
         // `CSI 27 u` — Escape under DISAMBIGUATE_ESCAPE_CODES, the flag cyrup pushes.
-        assert_eq!(run(split_at_esc("[27u")), vec![key(KeyCode::Esc, KeyModifiers::NONE)]);
+        assert_eq!(
+            run(split_at_esc("[27u")),
+            vec![key(KeyCode::Esc, KeyModifiers::NONE)]
+        );
         // `CSI 97 ; 5 u` — Ctrl+a.
         assert_eq!(
             run(split_at_esc("[97;5u")),
@@ -935,7 +1012,11 @@ mod tests {
 
     #[test]
     fn a_lone_escape_press_is_still_delivered() {
-        assert_eq!(run(vec![esc()]), vec![esc()], "a lone Escape must reach the app");
+        assert_eq!(
+            run(vec![esc()]),
+            vec![esc()],
+            "a lone Escape must reach the app"
+        );
     }
 
     #[test]
@@ -950,15 +1031,29 @@ mod tests {
         // NOT folded into an Alt chord, because a real Escape press followed by fast typing is
         // far more common than a split meta sequence.
         assert_eq!(run(vec![esc(), byte(b'x')]), vec![esc(), byte(b'x')]);
-        assert_eq!(run(vec![esc(), byte(b'a'), byte(b'b')]), vec![esc(), byte(b'a'), byte(b'b')]);
+        assert_eq!(
+            run(vec![esc(), byte(b'a'), byte(b'b')]),
+            vec![esc(), byte(b'a'), byte(b'b')]
+        );
     }
 
     #[test]
     fn escape_then_an_unterminated_csi_prefix_is_replayed_in_order() {
         let burst = vec![esc(), byte(b'['), byte(b'1'), byte(b';')];
-        assert_eq!(run(burst.clone()), burst, "an unterminated prefix must be replayed whole");
+        assert_eq!(
+            run(burst.clone()),
+            burst,
+            "an unterminated prefix must be replayed whole"
+        );
         // And a CSI whose final byte is not decodable is replayed rather than eaten.
-        let burst = vec![esc(), byte(b'['), byte(b'9'), byte(b'9'), byte(b'9'), byte(b'~')];
+        let burst = vec![
+            esc(),
+            byte(b'['),
+            byte(b'9'),
+            byte(b'9'),
+            byte(b'9'),
+            byte(b'~'),
+        ];
         assert_eq!(run(burst.clone()), burst);
         // SS3 with a final byte that is not a cursor key.
         let burst = vec![esc(), byte(b'O'), byte(b'x')];
@@ -971,14 +1066,21 @@ mod tests {
         // this module byte-for-byte, or that machine would never see them.
         for intro in *b"]P_" {
             let burst = vec![esc(), byte(intro), byte(b'1')];
-            assert_eq!(run(burst.clone()), burst, "introducer {} must pass through", intro as char);
+            assert_eq!(
+                run(burst.clone()),
+                burst,
+                "introducer {} must pass through",
+                intro as char
+            );
         }
     }
 
     #[test]
     fn ordinary_typing_is_untouched() {
-        let burst: Vec<Event> =
-            "the quick brown fox; jumps over 11 lazy dogs -- 1;2;3 [x] {y} ]z]".bytes().map(byte).collect();
+        let burst: Vec<Event> = "the quick brown fox; jumps over 11 lazy dogs -- 1;2;3 [x] {y} ]z]"
+            .bytes()
+            .map(byte)
+            .collect();
         assert_eq!(run(burst.clone()), burst);
     }
 
@@ -1019,7 +1121,11 @@ mod tests {
         let mut burst = vec![esc(), byte(b'[')];
         // Every one of these is a legal CSI parameter byte, so only the cap can stop it.
         burst.extend(std::iter::repeat_n(byte(b'1'), MAX_HELD * 3));
-        assert_eq!(run(burst.clone()), burst, "every held event must be replayed at the cap");
+        assert_eq!(
+            run(burst.clone()),
+            burst,
+            "every held event must be replayed at the cap"
+        );
 
         // And the machine recovers: a real split sequence right after is still reassembled.
         let mut r = EscapeReassembler::new();
@@ -1042,7 +1148,11 @@ mod tests {
         r.push(byte(b'['), &mut out);
         for _ in 0..1000 {
             r.push(byte(b'1'), &mut out);
-            assert!(r.held.len() <= MAX_HELD, "hold must stay bounded: {}", r.held.len());
+            assert!(
+                r.held.len() <= MAX_HELD,
+                "hold must stay bounded: {}",
+                r.held.len()
+            );
         }
     }
 
@@ -1060,14 +1170,28 @@ mod tests {
     #[test]
     fn every_event_of_a_non_matching_burst_is_accounted_for() {
         // Property-ish sweep: no 3-event burst that cannot complete a sequence may be altered.
-        let alphabet =
-            [esc(), byte(b'x'), byte(b'1'), byte(b';'), byte(b']'), byte(b'_'), byte(b'\\')];
+        let alphabet = [
+            esc(),
+            byte(b'x'),
+            byte(b'1'),
+            byte(b';'),
+            byte(b']'),
+            byte(b'_'),
+            byte(b'\\'),
+        ];
         for i in 0..alphabet.len() {
             for j in 0..alphabet.len() {
                 for k in 0..alphabet.len() {
-                    let burst =
-                        vec![alphabet[i].clone(), alphabet[j].clone(), alphabet[k].clone()];
-                    assert_eq!(run(burst.clone()), burst, "burst {burst:?} must be unaltered");
+                    let burst = vec![
+                        alphabet[i].clone(),
+                        alphabet[j].clone(),
+                        alphabet[k].clone(),
+                    ];
+                    assert_eq!(
+                        run(burst.clone()),
+                        burst,
+                        "burst {burst:?} must be unaltered"
+                    );
                 }
             }
         }

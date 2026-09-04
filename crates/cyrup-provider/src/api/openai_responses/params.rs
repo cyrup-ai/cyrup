@@ -82,18 +82,17 @@ pub(super) fn try_build_params(
         &|name: &str| name.to_string(),
     );
 
-    let messages =
-        convert_responses_messages(
-            model,
-            ctx,
-            OPENAI_TOOL_CALL_PROVIDERS,
-            &placement.deferred,
-            ConvertResponsesToolsOptions {
-                defer_loading: false,
-                supports_strict_mode: compat.supports_strict_mode,
-                default_strict: Some(false),
-            },
-        )?;
+    let messages = convert_responses_messages(
+        model,
+        ctx,
+        OPENAI_TOOL_CALL_PROVIDERS,
+        &placement.deferred,
+        ConvertResponsesToolsOptions {
+            defer_loading: false,
+            supports_strict_mode: compat.supports_strict_mode,
+            default_strict: Some(false),
+        },
+    )?;
     let cache = resolve_cache_retention(opts.cache_retention, env);
 
     let mut obj = Map::new();

@@ -43,18 +43,30 @@ fn tool_block_has_tinted_padding_rows_and_a_gutter_on_both_sides() {
 
     // Row 0 is the component's own untinted `Spacer(1)` (`tool-execution.ts:63`).
     assert_eq!(txt(&lines[0]), "", "leading Spacer(1)");
-    assert_eq!(lines[0].style.bg, None, "the Spacer is OUTSIDE the Box, so it is untinted");
+    assert_eq!(
+        lines[0].style.bg, None,
+        "the Spacer is OUTSIDE the Box, so it is untinted"
+    );
     // Rows 1 and N-1 are the Box's paddingY rows: blank, full width, tinted.
     let last = lines.len() - 1;
     for i in [1usize, last] {
-        assert_eq!(txt(&lines[i]).trim(), "", "row {i} is blank: {:?}", txt(&lines[i]));
+        assert_eq!(
+            txt(&lines[i]).trim(),
+            "",
+            "row {i} is blank: {:?}",
+            txt(&lines[i])
+        );
         assert_eq!(lines[i].width(), 30, "row {i} fills the width");
         assert_eq!(lines[i].style.bg, tint, "row {i} carries the tint");
     }
     // Content rows sit at column 1 and are padded to the full width, so the last column is a
     // tinted blank — the right gutter.
     let header = &lines[2];
-    assert!(txt(header).starts_with(" $ "), "1-column inset: {:?}", txt(header));
+    assert!(
+        txt(header).starts_with(" $ "),
+        "1-column inset: {:?}",
+        txt(header)
+    );
     assert_eq!(header.width(), 30, "content row fills the width");
 
     // MIRROR: an EMPTY block renders nothing at all — `box.ts:75-77` / `:91-93` return `[]`
@@ -85,14 +97,26 @@ fn tool_block_content_is_sized_to_width_minus_both_paddings() {
             t.contains("abcdefghijklmnopqr") || t.contains("stuvwxy")
         })
         .collect();
-    assert!(body.len() > 1, "the long line must wrap inside the Box: {:?}", texts(&lines));
+    assert!(
+        body.len() > 1,
+        "the long line must wrap inside the Box: {:?}",
+        texts(&lines)
+    );
     for row in &body {
         assert_eq!(row.width(), 20, "every row still fills the frame");
         // The INK — everything before the right pad — must stop at or before column
         // `paddingX + contentWidth` = 19, leaving column 19 (0-indexed) as the tinted gutter.
         let ink = Line::raw(txt(row).trim_end().to_string()).width();
-        assert!(ink <= 19, "row ran into the right gutter ({ink} cols): {:?}", txt(row));
-        assert!(txt(row).starts_with(' '), "row lost its left inset: {:?}", txt(row));
+        assert!(
+            ink <= 19,
+            "row ran into the right gutter ({ink} cols): {:?}",
+            txt(row)
+        );
+        assert!(
+            txt(row).starts_with(' '),
+            "row lost its left inset: {:?}",
+            txt(row)
+        );
     }
 
     // MIRROR: a SHORT line is not broken and is not indented twice.
@@ -115,10 +139,18 @@ fn tool_block_background_is_measured_in_columns_not_chars() {
     }));
     let lines = entry_lines(&wide, &theme, 30, 1, ImageOpts::default());
     for (i, line) in lines.iter().enumerate() {
-        assert!(line.width() <= 30, "row {i} overflows the frame: {} cols", line.width());
+        assert!(
+            line.width() <= 30,
+            "row {i} overflows the frame: {} cols",
+            line.width()
+        );
     }
     let body = lines.iter().find(|l| txt(l).contains('日')).unwrap();
-    assert_eq!(body.width(), 30, "the wide row is padded to exactly the width, not past it");
+    assert_eq!(
+        body.width(),
+        30,
+        "the wide row is padded to exactly the width, not past it"
+    );
 
     // MIRROR: the same number of NARROW characters still lands on exactly the width — the fix is
     // a change of measure, not a change of target.
@@ -136,11 +168,20 @@ fn tool_block_background_is_measured_in_columns_not_chars() {
 #[test]
 fn assistant_and_thinking_each_lead_with_the_spacer() {
     let theme = UiTheme::dark();
-    let a = entry_lines(&Entry::Assistant("hi".into()), &theme, 40, 1, ImageOpts::default());
+    let a = entry_lines(
+        &Entry::Assistant("hi".into()),
+        &theme,
+        40,
+        1,
+        ImageOpts::default(),
+    );
     assert_eq!(txt(&a[0]), "", "assistant leading Spacer(1)");
     assert_eq!(txt(&a[1]), " hi");
 
-    let t = Entry::Thinking { text: "musing".into(), hidden: true };
+    let t = Entry::Thinking {
+        text: "musing".into(),
+        hidden: true,
+    };
     let tl = entry_lines(&t, &theme, 40, 1, ImageOpts::default());
     assert_eq!(txt(&tl[0]), "", "thinking leading Spacer(1)");
     assert_eq!(txt(&tl[1]), format!(" {HIDDEN_THINKING_LABEL}"));
@@ -169,17 +210,26 @@ fn label_blocks_space_after_the_label_except_skill() {
         // `tools_expanded: true` — this test is about the EXPANDED body's spacer
         // (`branch-summary-message.ts:37` then `:39-45`); X14's collapsed arm is covered by
         // `x14_collapsed_branch_summary_is_one_hint_row`.
-        &Entry::BranchSummary { summary: "we merged".into() },
+        &Entry::BranchSummary {
+            summary: "we merged".into(),
+        },
         &theme,
         40,
         1,
-        ImageOpts { tools_expanded: true, ..ImageOpts::default() },
+        ImageOpts {
+            tools_expanded: true,
+            ..ImageOpts::default()
+        },
     );
     let b = texts(&branch);
     assert_eq!(b[0], "", "leading Spacer(1) (interactive-mode.ts:3491)");
     assert_eq!(b[1].trim(), "", "Box top paddingY");
     assert_eq!(b[2].trim_end(), " [branch]", "label, inset 1");
-    assert_eq!(b[3].trim(), "", "Spacer(1) after the label (branch-summary-message.ts:37)");
+    assert_eq!(
+        b[3].trim(),
+        "",
+        "Spacer(1) after the label (branch-summary-message.ts:37)"
+    );
     assert_eq!(b[b.len() - 1].trim(), "", "Box bottom paddingY");
 
     // MIRROR: `[skill]` has NO spacer after its label — the body follows immediately.
@@ -196,7 +246,11 @@ fn label_blocks_space_after_the_label_except_skill() {
     );
     let s = texts(&skill);
     assert_eq!(s[2].trim_end(), " [skill]", "label, inset 1");
-    assert_eq!(s[3].trim_end(), " deploy", "the body starts on the very next row");
+    assert_eq!(
+        s[3].trim_end(),
+        " deploy",
+        "the body starts on the very next row"
+    );
 
     // Every row of either block carries the `customMessageBg` band, padding rows included.
     let band = theme.custom_message_bg_style().bg;
@@ -214,23 +268,51 @@ fn label_blocks_space_after_the_label_except_skill() {
 #[test]
 fn thinking_body_is_markdown_not_flat_text() {
     let theme = UiTheme::dark();
-    let e = Entry::Thinking { text: "## Plan\n\nthen do it".into(), hidden: false };
+    let e = Entry::Thinking {
+        text: "## Plan\n\nthen do it".into(),
+        hidden: false,
+    };
     let lines = entry_lines(&e, &theme, 40, 0, ImageOpts::default());
     let heading = lines.iter().find(|l| txt(l).contains("Plan")).unwrap();
     // The literal `## ` is consumed by the renderer (level < 3 prints no prefix).
-    assert_eq!(txt(heading), "Plan", "markdown was not parsed: {:?}", txt(heading));
+    assert_eq!(
+        txt(heading),
+        "Plan",
+        "markdown was not parsed: {:?}",
+        txt(heading)
+    );
     let hs = heading.spans[0].style;
-    assert_eq!(hs.fg, theme.md_heading_style().fg, "heading kept its own colour");
+    assert_eq!(
+        hs.fg,
+        theme.md_heading_style().fg,
+        "heading kept its own colour"
+    );
 
-    let prose = lines.iter().find(|l| txt(l).contains("then do it")).unwrap();
+    let prose = lines
+        .iter()
+        .find(|l| txt(l).contains("then do it"))
+        .unwrap();
     let ps = prose.spans[0].style;
-    assert_eq!(ps.fg, theme.thinking_text_style().fg, "prose takes the thinkingText colour");
-    assert!(ps.add_modifier.contains(Modifier::ITALIC), "prose takes `italic: true`");
+    assert_eq!(
+        ps.fg,
+        theme.thinking_text_style().fg,
+        "prose takes the thinkingText colour"
+    );
+    assert!(
+        ps.add_modifier.contains(Modifier::ITALIC),
+        "prose takes `italic: true`"
+    );
 
     // MIRROR: the HIDDEN form is still one plain `Text` line (`:141-143`), not markdown.
-    let hidden = Entry::Thinking { text: "## Plan".into(), hidden: true };
+    let hidden = Entry::Thinking {
+        text: "## Plan".into(),
+        hidden: true,
+    };
     let hl = entry_lines(&hidden, &theme, 40, 0, ImageOpts::default());
-    assert_eq!(texts(&hl), vec!["".to_string(), HIDDEN_THINKING_LABEL.to_string()]);
+    assert_eq!(
+        texts(&hl),
+        vec!["".to_string(), HIDDEN_THINKING_LABEL.to_string()]
+    );
 }
 
 /// X10 — `bash.ts:311` and `:317` both build their row as `new Text(`\n${…}`, 0, 0)`. The

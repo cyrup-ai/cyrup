@@ -21,15 +21,20 @@
 // always true here. Re-spelled in cyrup-it it would name THIS crate's `wasm-host`, which
 // `--features it` does not enable, and every test below would SILENTLY not compile in.
 // See the `[[test]]` note in crates/cyrup-it/Cargo.toml.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cyrup_core::{ExtensionId, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 
@@ -43,7 +48,10 @@ use crate::support::bins;
 
 fn faux_with_ok() -> Arc<FauxProvider> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     faux
 }
 
@@ -64,7 +72,10 @@ async fn trusted_session() -> AgentSession {
     cfg.trust_override = Some(true); // TRUSTED project ⇒ the guest's proc grant is live.
     cfg.no_extensions = true; // only the explicitly-loaded guest is present.
 
-    SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, cfg).build().await.expect("build session")
+    SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, cfg)
+        .build()
+        .await
+        .expect("build session")
 }
 
 /// A fresh, process-unique marker so `pgrep -f <marker>` can find (and later confirm the
@@ -78,7 +89,11 @@ fn unique_marker(tag: &str) -> String {
 
 /// Real OS-level check: is a process whose command line contains `marker` currently running?
 fn marker_process_alive(marker: &str) -> bool {
-    Command::new("pgrep").args(["-f", marker]).status().map(|s| s.success()).unwrap_or(false)
+    Command::new("pgrep")
+        .args(["-f", marker])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Extract `handle:<N>` from a guest notification string produced by the demo commands.
@@ -87,9 +102,19 @@ fn parse_handle(notifications: &[String], prefix_contains: &str) -> u32 {
         .iter()
         .rev()
         .find(|n| n.contains(prefix_contains))
-        .unwrap_or_else(|| panic!("no notification containing {prefix_contains:?}: {notifications:?}"));
-    let after = line.split("handle:").nth(1).unwrap_or_else(|| panic!("no handle: in {line:?}"));
-    after.split_whitespace().next().unwrap_or_default().parse().unwrap_or_else(|_| panic!("bad handle in {line:?}"))
+        .unwrap_or_else(|| {
+            panic!("no notification containing {prefix_contains:?}: {notifications:?}")
+        });
+    let after = line
+        .split("handle:")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no handle: in {line:?}"));
+    after
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .parse()
+        .unwrap_or_else(|_| panic!("bad handle in {line:?}"))
 }
 
 /// THE headline proof (a): a TRUSTED live wasm guest spawns a REAL long-lived duplex-pipe child
@@ -115,42 +140,76 @@ async fn wasm_guest_proc_is_a_real_live_duplex_pipe_across_multiple_polls() {
     let marker = unique_marker("duplex");
 
     // 1) spawn the REAL long-lived child (a separate top-level prompt/round trip).
-    let _ = session.prompt(format!("/procspawn {marker}")).await.unwrap();
+    let _ = session
+        .prompt(format!("/procspawn {marker}"))
+        .await
+        .unwrap();
     session.wait_for_idle().await;
     let handle = parse_handle(&ext.guest().notifications(), "proc spawned handle:");
-    assert!(marker_process_alive(&marker), "the real marker-tagged child is running after spawn");
+    assert!(
+        marker_process_alive(&marker),
+        "the real marker-tagged child is running after spawn"
+    );
 
     // 2) write "first" to its REAL stdin (a separate round trip)...
-    let _ = session.prompt(format!("/procwrite {handle} first")).await.unwrap();
+    let _ = session
+        .prompt(format!("/procwrite {handle} first"))
+        .await
+        .unwrap();
     session.wait_for_idle().await;
 
     // ...then poll its REAL stdout (yet another separate round trip, itself polling
     // `read-stdout` MANY times internally) until the real echoed bytes appear.
-    let _ = session.prompt(format!("/procreadpoll {handle} echo:first")).await.unwrap();
+    let _ = session
+        .prompt(format!("/procreadpoll {handle} echo:first"))
+        .await
+        .unwrap();
     session.wait_for_idle().await;
     assert!(
-        ext.guest().notifications().iter().any(|n| n.starts_with("proc read") && n.contains("seen:true") && n.contains("echo:first")),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.starts_with("proc read")
+                && n.contains("seen:true")
+                && n.contains("echo:first")),
         "the REAL child echoed the first line back: {:?}",
         ext.guest().notifications()
     );
 
     // 3) the SAME handle stays live: write + poll a SECOND line, proving this is a genuine
     //    duplex pipe across time, not a one-shot capture.
-    let _ = session.prompt(format!("/procwrite {handle} second")).await.unwrap();
+    let _ = session
+        .prompt(format!("/procwrite {handle} second"))
+        .await
+        .unwrap();
     session.wait_for_idle().await;
-    let _ = session.prompt(format!("/procreadpoll {handle} echo:second")).await.unwrap();
+    let _ = session
+        .prompt(format!("/procreadpoll {handle} echo:second"))
+        .await
+        .unwrap();
     session.wait_for_idle().await;
     assert!(
-        ext.guest().notifications().iter().any(|n| n.starts_with("proc read") && n.contains("seen:true") && n.contains("echo:second")),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.starts_with("proc read")
+                && n.contains("seen:true")
+                && n.contains("echo:second")),
         "the SAME live child echoed the second line back too: {:?}",
         ext.guest().notifications()
     );
 
     // 4) `poll-exit` correctly reports STILL RUNNING (no `some` yet — nothing killed/exited it).
-    let _ = session.prompt(format!("/procpollexit {handle}")).await.unwrap();
+    let _ = session
+        .prompt(format!("/procpollexit {handle}"))
+        .await
+        .unwrap();
     session.wait_for_idle().await;
     assert!(
-        ext.guest().notifications().iter().any(|n| n.contains("proc pollexit") && n.contains("code:None")),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("proc pollexit") && n.contains("code:None")),
         "poll-exit reports still-running while the real child is alive: {:?}",
         ext.guest().notifications()
     );
@@ -186,9 +245,17 @@ async fn wasm_guest_proc_poll_exit_reports_the_real_natural_exit_code() {
     // REAL exit code (7, `sh -c "sleep 0.1; exit 7"`) shows up.
     let mut seen_code = None;
     for _ in 0..50 {
-        let _ = session.prompt(format!("/procpollexit {handle}")).await.unwrap();
+        let _ = session
+            .prompt(format!("/procpollexit {handle}"))
+            .await
+            .unwrap();
         session.wait_for_idle().await;
-        if let Some(n) = ext.guest().notifications().iter().rev().find(|n| n.contains("proc pollexit"))
+        if let Some(n) = ext
+            .guest()
+            .notifications()
+            .iter()
+            .rev()
+            .find(|n| n.contains("proc pollexit"))
             && let Some(code_str) = n.split("code:").nth(1)
             && code_str.contains("Some(7)")
         {
@@ -197,7 +264,11 @@ async fn wasm_guest_proc_poll_exit_reports_the_real_natural_exit_code() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(seen_code, Some(7), "the REAL natural exit code (7) round-trips end to end");
+    assert_eq!(
+        seen_code,
+        Some(7),
+        "the REAL natural exit code (7) round-trips end to end"
+    );
 }
 
 /// THE headline proof (c): `kill` actually terminates a REAL still-running child — verified at the
@@ -219,7 +290,10 @@ async fn wasm_guest_proc_kill_terminates_a_real_running_child_verified_at_the_os
         .expect("load + init the live wasm extension");
 
     let marker = unique_marker("kill");
-    let _ = session.prompt(format!("/procspawn {marker}")).await.unwrap();
+    let _ = session
+        .prompt(format!("/procspawn {marker}"))
+        .await
+        .unwrap();
     session.wait_for_idle().await;
     let handle = parse_handle(&ext.guest().notifications(), "proc spawned handle:");
 
@@ -231,14 +305,20 @@ async fn wasm_guest_proc_kill_terminates_a_real_running_child_verified_at_the_os
     let _ = session.prompt(format!("/prockill {handle}")).await.unwrap();
     session.wait_for_idle().await;
     assert!(
-        ext.guest().notifications().iter().any(|n| n.contains("proc kill") && n.contains("ok:true")),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("proc kill") && n.contains("ok:true")),
         "the guest observed a successful kill across the boundary: {:?}",
         ext.guest().notifications()
     );
     // `poll-exit` right after `kill` reflects the REAL termination (`ProcCaps::kill` only returns
     // `Ok` once the OS process is confirmed reaped — never a fire-and-forget signal send).
     assert!(
-        ext.guest().notifications().iter().any(|n| n.contains("proc kill") && !n.contains("code:None")),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("proc kill") && !n.contains("code:None")),
         "poll-exit right after kill shows a real exit code, not still-running: {:?}",
         ext.guest().notifications()
     );

@@ -33,7 +33,10 @@ fn blank_user_text_blocks_are_filtered_when_other_content_remains() {
         &StreamOptions::default(),
         &BedrockOptions::default(),
     );
-    assert_eq!(messages_of(&body)[0]["content"], json!([{ "text": "hello" }]));
+    assert_eq!(
+        messages_of(&body)[0]["content"],
+        json!([{ "text": "hello" }])
+    );
 }
 
 #[test]
@@ -355,7 +358,12 @@ fn tool_config_shape_and_choice_mapping() {
             tool_choice: Some(choice),
             ..Default::default()
         };
-        let body = payload(&sonnet_45(), &tool_ctx(), &StreamOptions::default(), &bedrock);
+        let body = payload(
+            &sonnet_45(),
+            &tool_ctx(),
+            &StreamOptions::default(),
+            &bedrock,
+        );
         assert_eq!(body["toolConfig"]["toolChoice"], wire);
     }
 
@@ -364,7 +372,12 @@ fn tool_config_shape_and_choice_mapping() {
         tool_choice: Some(BedrockToolChoice::None),
         ..Default::default()
     };
-    let body = payload(&sonnet_45(), &tool_ctx(), &StreamOptions::default(), &bedrock);
+    let body = payload(
+        &sonnet_45(),
+        &tool_ctx(),
+        &StreamOptions::default(),
+        &bedrock,
+    );
     assert!(body.get("toolConfig").is_none());
 
     // No tools ⇒ no toolConfig.

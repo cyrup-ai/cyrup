@@ -16,12 +16,18 @@
 //! `scheduleReconnect` :794-809, `ensureConnected` :810-861, the disconnect handler :779-789, the
 //! startup connect :952-965 and the teardown :1060-1064.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::common::{registration, spawn_broker, within};
 use cyrup_core::{CancelToken, Tool, ToolCallId, ToolUpdate, ToolUpdateSink};
 use cyrup_ext::{HostCtx, HostEvent, NativeExtension};
 use cyrup_intercom::config::load_config;
@@ -32,7 +38,6 @@ use cyrup_intercom::session_state::SharedIntercomState;
 use cyrup_intercom::tools::intercom::IntercomTool;
 use cyrup_intercom::transport::client::{IntercomClient, SendOptions};
 use cyrup_intercom::transport::spawn::wait_for_broker;
-use crate::common::{registration, spawn_broker, within};
 
 fn noop_sink() -> ToolUpdateSink {
     Box::new(|_u: ToolUpdate| {})
@@ -61,7 +66,11 @@ fn write_broker_command(intercom_dir: &Path, command: &Path) {
 
 fn state_for(agent_dir: &Path) -> Arc<SharedIntercomState> {
     let config = load_config(&intercom_dir_path(agent_dir)).expect("config loads");
-    Arc::new(SharedIntercomState::new(config, 600_000, PathBuf::from("/tmp/work")))
+    Arc::new(SharedIntercomState::new(
+        config,
+        600_000,
+        PathBuf::from("/tmp/work"),
+    ))
 }
 
 fn params_for(agent_dir: &Path) -> ConnectParams {
@@ -86,7 +95,9 @@ async fn a_broker_drop_reconnects_and_the_session_can_send_again() {
     let socket = broker_socket_path(&intercom_dir);
 
     let mut broker = spawn_broker(agent_dir.path());
-    wait_for_broker(&socket, Duration::from_secs(5)).await.expect("broker up");
+    wait_for_broker(&socket, Duration::from_secs(5))
+        .await
+        .expect("broker up");
 
     let state = state_for(agent_dir.path());
     connect::begin_runtime(&state, params_for(agent_dir.path()));
@@ -120,7 +131,10 @@ async fn a_broker_drop_reconnects_and_the_session_can_send_again() {
         reason.starts_with("Disconnected while waiting for reply:"),
         "pi's disconnect reason must survive to the caller, got: {reason}"
     );
-    assert!(state.connect.reconnect_armed(), "the disconnect edge armed a backoff rung");
+    assert!(
+        state.connect.reconnect_armed(),
+        "the disconnect edge armed a backoff rung"
+    );
 
     // --- RECOVERY: the ladder fires (rung 0 = 1000 ms), respawns the broker and re-registers. ---
     assert!(
@@ -136,19 +150,42 @@ async fn a_broker_drop_reconnects_and_the_session_can_send_again() {
         Some(id_before.clone()),
         "the reconnect re-registers under the SAME identity (broker takeover), not a second one"
     );
-    assert_eq!(state.connect.attempt(), 0, "a successful connect resets the backoff ladder");
+    assert_eq!(
+        state.connect.attempt(),
+        0,
+        "a successful connect resets the backoff ladder"
+    );
 
     // The recovered connection genuinely works end to end.
-    let peer = IntercomClient::connect(&socket, registration("peer"), Some("peer-session".to_string()))
+    let peer = IntercomClient::connect(
+        &socket,
+        registration("peer"),
+        Some("peer-session".to_string()),
+    )
+    .await
+    .expect("a peer registers on the respawned broker");
+    let sessions = recovered
+        .list_sessions()
         .await
-        .expect("a peer registers on the respawned broker");
-    let sessions = recovered.list_sessions().await.expect("list over the recovered connection");
-    assert!(sessions.iter().any(|s| s.id == id_before), "we are registered under our old id");
+        .expect("list over the recovered connection");
+    assert!(
+        sessions.iter().any(|s| s.id == id_before),
+        "we are registered under our old id"
+    );
     let sent = recovered
-        .send("peer-session", SendOptions { text: "after reconnect".to_string(), ..Default::default() })
+        .send(
+            "peer-session",
+            SendOptions {
+                text: "after reconnect".to_string(),
+                ..Default::default()
+            },
+        )
         .await
         .expect("send over the recovered connection");
-    assert!(sent.delivered, "the reconnected session can reach a peer again: {sent:?}");
+    assert!(
+        sent.delivered,
+        "the reconnected session can reach a peer again: {sent:?}"
+    );
 
     connect::shutdown(&state);
     if let Some(c) = state.client() {
@@ -214,7 +251,10 @@ async fn a_tool_call_after_a_refused_broker_retries_and_succeeds() {
             _ => String::new(),
         })
         .collect::<String>();
-    assert!(text.contains("Current session"), "the tool now sees a live broker: {text}");
+    assert!(
+        text.contains("Current session"),
+        "the tool now sees a live broker: {text}"
+    );
     assert!(state.client().is_some_and(|c| c.is_connected()));
 
     connect::shutdown(&state);
@@ -234,7 +274,9 @@ async fn a_deliberate_shutdown_never_reconnects() {
     let socket = broker_socket_path(&intercom_dir);
 
     let mut broker = spawn_broker(agent_dir.path());
-    wait_for_broker(&socket, Duration::from_secs(5)).await.expect("broker up");
+    wait_for_broker(&socket, Duration::from_secs(5))
+        .await
+        .expect("broker up");
 
     let ext = IntercomExtension::new(
         agent_dir.path().to_path_buf(),
@@ -243,25 +285,54 @@ async fn a_deliberate_shutdown_never_reconnects() {
         None,
     )
     .expect("build the extension");
-    let ctx = HostCtx::event(cyrup_ext::ExtMode::Print, false, agent_dir.path().to_path_buf());
+    let ctx = HostCtx::event(
+        cyrup_ext::ExtMode::Print,
+        false,
+        agent_dir.path().to_path_buf(),
+    );
 
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "test".to_string(), previous_session_file: None }, &ctx).await;
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "test".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     let state = ext.state().clone();
     assert!(
-        within(Duration::from_secs(20), || state.client().is_some_and(|c| c.is_connected())).await,
+        within(Duration::from_secs(20), || state
+            .client()
+            .is_some_and(|c| c.is_connected()))
+        .await,
         "the session connects on SessionStart"
     );
 
-    let _ = ext.on_event(&HostEvent::SessionShutdown { reason: "test".to_string(), target_session_file: None }, &ctx).await;
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionShutdown {
+                reason: "test".to_string(),
+                target_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     assert!(state.connect.is_shutting_down());
     assert!(state.client().is_none());
-    assert!(!state.connect.reconnect_armed(), "shutdown leaves no armed backoff rung");
+    assert!(
+        !state.connect.reconnect_armed(),
+        "shutdown leaves no armed backoff rung"
+    );
 
     // --- FAILURE AFTER SHUTDOWN: the broker dies. Nothing may reconnect. ---
     broker.kill().await.expect("kill the broker");
     // Well past rung 0's 1000 ms backoff.
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    assert!(!state.connect.reconnect_armed(), "a post-shutdown disconnect must not arm the ladder");
+    assert!(
+        !state.connect.reconnect_armed(),
+        "a post-shutdown disconnect must not arm the ladder"
+    );
     assert!(state.client().is_none(), "and must not resurrect a client");
 
     let err = connect::ensure_connected(&state, ConnectReason::Background)
@@ -270,5 +341,8 @@ async fn a_deliberate_shutdown_never_reconnects() {
         .map(|e| e.to_string())
         .expect("an explicit connect after shutdown is refused");
     assert!(err.contains("shutting down"), "{err}");
-    assert!(!state.connect.reconnect_armed(), "the refusal armed nothing either");
+    assert!(
+        !state.connect.reconnect_armed(),
+        "the refusal armed nothing either"
+    );
 }

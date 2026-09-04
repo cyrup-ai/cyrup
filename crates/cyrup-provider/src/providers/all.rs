@@ -85,19 +85,18 @@ use crate::auth::{CredentialStore, InMemoryCredentialStore};
 use crate::collection::{CreateModelsOptions, Models, create_models};
 use crate::images::{ImagesModels, ImagesProvider, create_images_models};
 use crate::provider::Provider;
-use crate::remote_catalog::CatalogOverlay;
-use crate::utils::http_date::parse_iso8601_utc_ms;
 use crate::providers::anthropic::anthropic_fleet_providers_with;
 use crate::providers::fleet::fleet_providers_with;
 use crate::providers::{
-    anthropic_provider_with, azure_openai_responses_provider_with,
+    amazon_bedrock_provider_with, anthropic_provider_with, azure_openai_responses_provider_with,
     cloudflare_ai_gateway_provider_with, cloudflare_workers_ai_provider_with,
     fireworks_provider_with, github_copilot_provider_with, google_provider_with,
-    google_vertex_provider_with, openai_codex_provider_with,
-    amazon_bedrock_provider_with, mistral_provider_with, openai_provider_with,
-    opencode_go_provider_with, opencode_provider_with, openrouter_images_provider,
-    together_provider_with,
+    google_vertex_provider_with, mistral_provider_with, openai_codex_provider_with,
+    openai_provider_with, opencode_go_provider_with, opencode_provider_with,
+    openrouter_images_provider, together_provider_with,
 };
+use crate::remote_catalog::CatalogOverlay;
+use crate::utils::http_date::parse_iso8601_utc_ms;
 use std::sync::Arc;
 
 /// The generation manifest for the compiled-in catalogs under `providers/catalog/` (Pi

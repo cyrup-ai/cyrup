@@ -1,8 +1,8 @@
 //! R-SA-033 post-hoc correction: the strictly-ordered exit-code and error rewrite applied when
 //! the gate rejects an otherwise-clean run.
 
-use super::{AcceptanceLedger, AcceptanceStatus};
 use super::gate::CleanCompletionGate;
+use super::{AcceptanceLedger, AcceptanceStatus};
 
 // ============================================================================================
 // R-SA-033: post-hoc exit-code correction, strictly ordered
@@ -62,9 +62,8 @@ pub fn apply_post_hoc_correction(
     gate: CleanCompletionGate,
     existing_error: Option<&str>,
 ) -> PostHocCorrection {
-    let should_correct = ledger.status == AcceptanceStatus::Rejected
-        && contract_was_explicit
-        && gate.is_clean();
+    let should_correct =
+        ledger.status == AcceptanceStatus::Rejected && contract_was_explicit && gate.is_clean();
 
     if !should_correct {
         return PostHocCorrection {
@@ -97,11 +96,10 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
+    use crate::exec::acceptance::lattice::gate::evaluate_acceptance;
     use crate::exec::acceptance::lattice::lowering::lower_acceptance_input;
     use crate::exec::acceptance::lattice::testsupport::clean_gate;
     use crate::exec::acceptance::lattice::testsupport::no_guard_trigger;
-    use crate::exec::acceptance::lattice::gate::evaluate_acceptance;
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_allow_failure_command_that_exits_nonzero_still_reaches_verified() {
@@ -138,7 +136,10 @@ mod tests {
              {ledger:?}"
         );
         assert_eq!(ledger.verify_results.len(), 2);
-        assert_eq!(ledger.verify_results[1].status, crate::exec::acceptance::model::VerifyRunStatus::AllowedFailure);
+        assert_eq!(
+            ledger.verify_results[1].status,
+            crate::exec::acceptance::model::VerifyRunStatus::AllowedFailure
+        );
         assert_eq!(
             apply_post_hoc_correction(&ledger, contract.explicit, clean_gate(), None).exit_code,
             0,
@@ -146,7 +147,6 @@ mod tests {
              ACCEPTANCE_REJECTED_EXIT_CODE"
         );
     }
-
 
     // ---------------------------------------------------------------------------------------
     // apply_post_hoc_correction (R-SA-033)
@@ -170,7 +170,6 @@ mod tests {
         assert!(error.contains("verify[] command failed"));
     }
 
-
     #[test]
     fn heuristic_inferred_rejected_contract_never_corrects_exit_code() {
         // R-SA-033: "AND the acceptance contract was explicit AND..." — a heuristic contract's
@@ -187,7 +186,6 @@ mod tests {
         assert!(correction.error.is_none());
     }
 
-
     #[test]
     fn a_non_rejected_ledger_never_triggers_a_correction() {
         let ledger = AcceptanceLedger {
@@ -200,7 +198,6 @@ mod tests {
         assert!(!correction.corrected);
         assert_eq!(correction.exit_code, 0);
     }
-
 
     #[test]
     fn a_dirty_gate_never_triggers_a_correction_even_if_the_ledger_says_rejected() {
@@ -227,7 +224,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn correction_with_no_prior_error_produces_a_clean_standalone_message() {
         let ledger = AcceptanceLedger {
@@ -240,9 +236,11 @@ mod tests {
         assert!(correction.corrected);
         let error = correction.error.expect("error set");
         assert!(error.starts_with("acceptance rejected:"));
-        assert!(!error.contains(';'), "no prior error to join with a separator");
+        assert!(
+            !error.contains(';'),
+            "no prior error to join with a separator"
+        );
     }
-
 
     #[test]
     fn correction_falls_back_to_a_generic_reason_when_ledger_has_no_detail() {
@@ -261,5 +259,4 @@ mod tests {
                 .contains("acceptance criteria were not met")
         );
     }
-
 }

@@ -242,7 +242,12 @@ pub async fn reconcile(
         // synthesized `Failed` (spawn presumed lost) otherwise — both cases still produce a
         // returnable RunStatus rather than an error, mirroring "reconciliation always yields a
         // status", never an I/O-not-found error for a legitimately-in-flight run.
-        return Ok(reconcile_missing_status(paths, spawn_confirmed_at, now, grace));
+        return Ok(reconcile_missing_status(
+            paths,
+            spawn_confirmed_at,
+            now,
+            grace,
+        ));
     };
 
     // SUBA-057 — pi `if (effectiveStatus.displayDismissedAt !== undefined) return { status: null,
@@ -252,13 +257,19 @@ pub async fn reconcile(
     // probed, never repaired and never advanced — dismissal is display-only and terminates
     // nothing).
     if status.display_dismissed_at.is_some() {
-        return Ok(ReconcileOutcome { status, action: ReconcileAction::DisplayDismissed });
+        return Ok(ReconcileOutcome {
+            status,
+            action: ReconcileAction::DisplayDismissed,
+        });
     }
 
     // Step 3: status.json exists but isn't claiming Running with a numeric pid — nothing to
     // reconcile (Queued/Paused/terminal all pass through unmodified).
     let (RunState::Running, Some(pid)) = (status.state, status.pid) else {
-        return Ok(ReconcileOutcome { status, action: ReconcileAction::NoneNeeded });
+        return Ok(ReconcileOutcome {
+            status,
+            action: ReconcileAction::NoneNeeded,
+        });
     };
 
     // Step 4: claims Running with a numeric pid — probe liveness.
@@ -271,7 +282,10 @@ pub async fn reconcile(
     };
 
     if !should_fail {
-        return Ok(ReconcileOutcome { status, action: ReconcileAction::NoneNeeded });
+        return Ok(ReconcileOutcome {
+            status,
+            action: ReconcileAction::NoneNeeded,
+        });
     }
 
     let reason = match liveness {
@@ -349,7 +363,8 @@ async fn repair_from_result(
         }
     }
 
-    let mut repaired = existing.unwrap_or_else(|| RunStatus::queued(result.run_id.clone(), result.mode, None));
+    let mut repaired =
+        existing.unwrap_or_else(|| RunStatus::queued(result.run_id.clone(), result.mode, None));
     repaired.pid = repaired.pid.or(None);
     for (index, step) in repaired.steps.iter_mut().enumerate() {
         if !step.status.is_terminal() {
@@ -382,12 +397,17 @@ async fn repair_from_result(
     // the run reappears with its genuine terminal outcome. Without this line a dismissed run whose
     // result landed a moment later would stay invisible forever.
     repaired.display_dismissed_at = None;
-    repaired.ended_at = repaired.ended_at.or_else(|| Some(crate::time::epoch_millis(SystemTime::now())));
+    repaired.ended_at = repaired
+        .ended_at
+        .or_else(|| Some(crate::time::epoch_millis(SystemTime::now())));
     repaired.last_update = crate::time::epoch_millis(SystemTime::now());
 
     crate::background::atomic::write_atomic_json(&paths.status, &repaired).await?;
 
-    Ok(ReconcileOutcome { status: repaired, action: ReconcileAction::RepairedFromResult })
+    Ok(ReconcileOutcome {
+        status: repaired,
+        action: ReconcileAction::RepairedFromResult,
+    })
 }
 
 /// Step 2's grace-window handling for a `status.json` that does not exist on disk at all.
@@ -427,7 +447,10 @@ fn reconcile_missing_status(
     let now_ms = crate::time::epoch_millis(now);
     status.last_update = now_ms;
     status.ended_at = Some(now_ms);
-    ReconcileOutcome { status, action: ReconcileAction::NoneNeeded }
+    ReconcileOutcome {
+        status,
+        action: ReconcileAction::NoneNeeded,
+    }
 }
 
 /// `true` once `last_update` has not advanced for longer than `stale_after` relative to `now`
@@ -516,7 +539,10 @@ async fn synthesize_failure(
 
     crate::background::atomic::write_atomic_json(&paths.result, &result).await?;
 
-    Ok(ReconcileOutcome { status: status.clone(), action: ReconcileAction::SynthesizedFailure })
+    Ok(ReconcileOutcome {
+        status: status.clone(),
+        action: ReconcileAction::SynthesizedFailure,
+    })
 }
 
 /// Builds one synthesized [`crate::exec::SingleResult`] per step (or, if there are no steps at all
@@ -751,7 +777,11 @@ mod tests {
         let (_dir, paths) = temp_paths();
         let run_id = run_id_from_paths(&paths);
 
-        let status = running_status(run_id.clone(), 999_999, crate::time::epoch_millis(SystemTime::now()));
+        let status = running_status(
+            run_id.clone(),
+            999_999,
+            crate::time::epoch_millis(SystemTime::now()),
+        );
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -787,7 +817,9 @@ mod tests {
 
         // The repair must actually have been persisted to disk, not just returned in-memory.
         let reread: RunStatus = serde_json::from_slice(
-            &tokio::fs::read(&paths.status).await.expect("status.json exists"),
+            &tokio::fs::read(&paths.status)
+                .await
+                .expect("status.json exists"),
         )
         .expect("valid JSON");
         assert_eq!(reread.state, RunState::Complete);
@@ -806,7 +838,11 @@ mod tests {
         let (_dir, paths) = temp_paths();
         let run_id = run_id_from_paths(&paths);
 
-        let status = running_status(run_id.clone(), 999_999, crate::time::epoch_millis(SystemTime::now()));
+        let status = running_status(
+            run_id.clone(),
+            999_999,
+            crate::time::epoch_millis(SystemTime::now()),
+        );
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -848,7 +884,9 @@ mod tests {
 
         // Persisted, not merely returned.
         let reread: RunStatus = serde_json::from_slice(
-            &tokio::fs::read(&paths.status).await.expect("status.json exists"),
+            &tokio::fs::read(&paths.status)
+                .await
+                .expect("status.json exists"),
         )
         .expect("valid JSON");
         assert_eq!(reread.state, RunState::Stopped);
@@ -860,7 +898,11 @@ mod tests {
         let (_dir, paths) = temp_paths();
         let run_id = run_id_from_paths(&paths);
 
-        let mut status = running_status(run_id.clone(), 1, crate::time::epoch_millis(SystemTime::now()));
+        let mut status = running_status(
+            run_id.clone(),
+            1,
+            crate::time::epoch_millis(SystemTime::now()),
+        );
         status.state = RunState::Failed;
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
@@ -1008,7 +1050,11 @@ mod tests {
         let run_id = run_id_from_paths(&paths);
         let dead_pid = spawn_and_reap_dead_pid();
 
-        let status = running_status(run_id, dead_pid, crate::time::epoch_millis(SystemTime::now()));
+        let status = running_status(
+            run_id,
+            dead_pid,
+            crate::time::epoch_millis(SystemTime::now()),
+        );
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -1027,20 +1073,31 @@ mod tests {
         assert_eq!(outcome.action, ReconcileAction::SynthesizedFailure);
         assert_eq!(outcome.status.state, RunState::Failed);
         assert!(
-            outcome.status.steps.iter().all(|s| s.status == crate::background::StepState::Failed),
+            outcome
+                .status
+                .steps
+                .iter()
+                .all(|s| s.status == crate::background::StepState::Failed),
             "every non-terminal step must be marked Failed"
         );
 
         // Both files must actually exist on disk with Failed/success:false content.
-        let status_bytes = tokio::fs::read(&paths.status).await.expect("status.json exists");
+        let status_bytes = tokio::fs::read(&paths.status)
+            .await
+            .expect("status.json exists");
         let reread_status: RunStatus = serde_json::from_slice(&status_bytes).expect("valid JSON");
         assert_eq!(reread_status.state, RunState::Failed);
 
-        let result_bytes = tokio::fs::read(&paths.result).await.expect("ResultFile exists");
+        let result_bytes = tokio::fs::read(&paths.result)
+            .await
+            .expect("ResultFile exists");
         let reread_result: ResultFile = serde_json::from_slice(&result_bytes).expect("valid JSON");
         assert_eq!(reread_result.state, RunState::Failed);
         assert!(!reread_result.success);
-        assert!(!reread_result.results.is_empty(), "a synthesized diagnostic result must be present");
+        assert!(
+            !reread_result.results.is_empty(),
+            "a synthesized diagnostic result must be present"
+        );
     }
 
     /// A genuinely-alive-but-stale-past-threshold pid (a REAL long-lived child, but with a fake
@@ -1090,11 +1147,17 @@ mod tests {
         let run_id = run_id_from_paths(&paths);
         let (mut child, alive_pid) = spawn_long_lived();
 
-        let status = running_status(run_id, alive_pid, crate::time::epoch_millis(SystemTime::now()));
+        let status = running_status(
+            run_id,
+            alive_pid,
+            crate::time::epoch_millis(SystemTime::now()),
+        );
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
-        let before_bytes = tokio::fs::read(&paths.status).await.expect("status.json exists");
+        let before_bytes = tokio::fs::read(&paths.status)
+            .await
+            .expect("status.json exists");
 
         let outcome = reconcile(
             &paths,
@@ -1116,7 +1179,9 @@ mod tests {
 
         // status.json on disk must be byte-identical to before reconcile ran — reconcile must not
         // have rewritten it just because it happened to inspect it.
-        let after_bytes = tokio::fs::read(&paths.status).await.expect("status.json still exists");
+        let after_bytes = tokio::fs::read(&paths.status)
+            .await
+            .expect("status.json still exists");
         assert_eq!(
             before_bytes, after_bytes,
             "reconcile must not touch status.json at all when the run is genuinely still active"
@@ -1134,7 +1199,11 @@ mod tests {
     async fn unknown_liveness_within_staleness_threshold_is_not_failed() {
         let (_dir, paths) = temp_paths();
         let run_id = run_id_from_paths(&paths);
-        let status = running_status(run_id, 123_456, crate::time::epoch_millis(SystemTime::now()));
+        let status = running_status(
+            run_id,
+            123_456,
+            crate::time::epoch_millis(SystemTime::now()),
+        );
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");

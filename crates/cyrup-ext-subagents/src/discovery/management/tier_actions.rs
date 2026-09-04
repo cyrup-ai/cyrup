@@ -23,7 +23,9 @@
 use std::path::PathBuf;
 
 use super::super::types::AgentSource;
-use super::super::{resolve_agent_name, AgentDiscoveryConfig, AgentDiscoveryResult, AgentNameResolution};
+use super::super::{
+    AgentDiscoveryConfig, AgentDiscoveryResult, AgentNameResolution, resolve_agent_name,
+};
 use super::agent_crud::agent_file_path;
 use super::helpers::{override_scope_str, pick_scope_dir, sanitize_name, source_str};
 use super::lookup::{available_agent_names, name_exists_in_scope};
@@ -164,7 +166,10 @@ fn with_settings_reread(cfg: &AgentDiscoveryConfig) -> Result<AgentDiscoveryConf
 /// original text (comments, field order, prose formatting and any frontmatter key this crate's
 /// parser ignores all survive), which round-tripping through
 /// [`crate::discovery::management::frontmatter_write::write_agent_file`] would not preserve.
-pub(crate) fn handle_eject(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
+pub(crate) fn handle_eject(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest,
+) -> Result<ManagementOutcome, SubagentError> {
     let Some(agent_param) = req.agent else {
         return Ok(ManagementOutcome::err("Specify 'agent' for eject."));
     };
@@ -183,12 +188,19 @@ pub(crate) fn handle_eject(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) 
             "Agent '{raw}' not found or is not a bundled/package agent. eject copies a builtin or \
              package agent to {} scope so it can be customized. Available: {}.",
             source_str(scope),
-            if avail.is_empty() { "none".to_string() } else { avail.join(", ") }
+            if avail.is_empty() {
+                "none".to_string()
+            } else {
+                avail.join(", ")
+            }
         )));
     };
     let runtime_name = source.name.clone();
 
-    if let Some(existing) = writable_tier(&tiers, scope).iter().find(|a| a.name == runtime_name) {
+    if let Some(existing) = writable_tier(&tiers, scope)
+        .iter()
+        .find(|a| a.name == runtime_name)
+    {
         return Ok(ManagementOutcome::err(format!(
             "Agent '{runtime_name}' is already a custom {} agent at {}. Edit it with {{ action: \"update\", agent: \"{runtime_name}\" }} or delete it first.",
             source_str(scope),
@@ -245,7 +257,10 @@ pub(crate) fn handle_eject(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) 
 /// `subagents.agentOverrides.<name>` at `scope`, then RE-DISCOVER and verify the agent actually
 /// became invisible — reporting an error (naming the winning scope) if a higher-precedence override
 /// overruled the write.
-pub(crate) async fn handle_disable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest<'_>) -> Result<ManagementOutcome, SubagentError> {
+pub(crate) async fn handle_disable(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest<'_>,
+) -> Result<ManagementOutcome, SubagentError> {
     let Some(agent_param) = req.agent else {
         return Ok(ManagementOutcome::err("Specify 'agent' for disable."));
     };
@@ -269,7 +284,11 @@ pub(crate) async fn handle_disable(cfg: &AgentDiscoveryConfig, req: &ManagementR
             let avail = available_agent_names(&d);
             return Ok(ManagementOutcome::err(format!(
                 "Agent '{raw}' not found. Available: {}.",
-                if avail.is_empty() { "none".to_string() } else { avail.join(", ") }
+                if avail.is_empty() {
+                    "none".to_string()
+                } else {
+                    avail.join(", ")
+                }
             )));
         }
     };
@@ -277,8 +296,12 @@ pub(crate) async fn handle_disable(cfg: &AgentDiscoveryConfig, req: &ManagementR
 
     let mut fields = serde_json::Map::new();
     fields.insert("disabled".to_string(), serde_json::Value::Bool(true));
-    crate::discovery::settings_write::merge_builtin_agent_override(&settings_path, &runtime_name, &fields)
-        .await?;
+    crate::discovery::settings_write::merge_builtin_agent_override(
+        &settings_path,
+        &runtime_name,
+        &fields,
+    )
+    .await?;
 
     // pi re-runs `discoverAgentsAll` and inspects the effective agent again: the write is only a
     // success if the agent is ACTUALLY disabled now. `discover_agents_all` is the management view,
@@ -314,7 +337,10 @@ pub(crate) async fn handle_disable(cfg: &AgentDiscoveryConfig, req: &ManagementR
 /// pi `handleEnable` (`agent-management.ts:1173-1199`): remove ONLY the `disabled` field from
 /// `subagents.agentOverrides.<name>` at `scope` (an agent's other overrides — its model, tools,
 /// thinking budget — survive being re-enabled), then re-discover and verify.
-pub(crate) async fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRequest<'_>) -> Result<ManagementOutcome, SubagentError> {
+pub(crate) async fn handle_enable(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest<'_>,
+) -> Result<ManagementOutcome, SubagentError> {
     let Some(agent_param) = req.agent else {
         return Ok(ManagementOutcome::err("Specify 'agent' for enable."));
     };
@@ -338,7 +364,11 @@ pub(crate) async fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRe
             let avail = available_agent_names(&d);
             return Ok(ManagementOutcome::err(format!(
                 "Agent '{raw}' not found. Available: {}.",
-                if avail.is_empty() { "none".to_string() } else { avail.join(", ") }
+                if avail.is_empty() {
+                    "none".to_string()
+                } else {
+                    avail.join(", ")
+                }
             )));
         }
     };
@@ -348,7 +378,8 @@ pub(crate) async fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRe
         &settings_path,
         &runtime_name,
         &["disabled"],
-    ).await?;
+    )
+    .await?;
     // Re-read from disk before verifying — see [`with_settings_reread`].
     let after = resolve_effective_agent(
         &crate::discovery::discover_agents_all(&with_settings_reread(cfg)?)?,
@@ -384,8 +415,18 @@ pub(crate) async fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRe
         .as_ref()
         .and_then(|a| a.override_info.as_ref())
         .map_or_else(
-            || (source_str(scope).to_string(), settings_path.display().to_string()),
-            |o| (override_scope_str(o.scope).to_string(), o.settings_path.display().to_string()),
+            || {
+                (
+                    source_str(scope).to_string(),
+                    settings_path.display().to_string(),
+                )
+            },
+            |o| {
+                (
+                    override_scope_str(o.scope).to_string(),
+                    o.settings_path.display().to_string(),
+                )
+            },
         );
     Ok(ManagementOutcome::err(format!(
         "Agent '{runtime_name}' is still disabled after removing the {} disabled override. It may \
@@ -401,7 +442,10 @@ pub(crate) async fn handle_enable(cfg: &AgentDiscoveryConfig, req: &ManagementRe
 /// Distinct from `delete` (which removes a custom agent that has no bundled default and leaves
 /// settings alone) and from `enable` (which removes only the `disabled` field). Reset with nothing
 /// to reset is a **success**, not an error, and says so.
-pub(crate) async fn handle_reset(cfg: &AgentDiscoveryConfig, req: &ManagementRequest<'_>) -> Result<ManagementOutcome, SubagentError> {
+pub(crate) async fn handle_reset(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest<'_>,
+) -> Result<ManagementOutcome, SubagentError> {
     let Some(agent_param) = req.agent else {
         return Ok(ManagementOutcome::err("Specify 'agent' for reset."));
     };
@@ -434,7 +478,11 @@ pub(crate) async fn handle_reset(cfg: &AgentDiscoveryConfig, req: &ManagementReq
         let avail = available_agent_names(&d);
         return Ok(ManagementOutcome::err(format!(
             "Agent '{raw}' not found. Available: {}.",
-            if avail.is_empty() { "none".to_string() } else { avail.join(", ") }
+            if avail.is_empty() {
+                "none".to_string()
+            } else {
+                avail.join(", ")
+            }
         )));
     };
     let runtime_name = bundled.name.clone();
@@ -452,7 +500,12 @@ pub(crate) async fn handle_reset(cfg: &AgentDiscoveryConfig, req: &ManagementReq
             custom.file_path.display()
         ));
     }
-    if crate::discovery::settings_write::remove_builtin_agent_override(&settings_path, &runtime_name).await? {
+    if crate::discovery::settings_write::remove_builtin_agent_override(
+        &settings_path,
+        &runtime_name,
+    )
+    .await?
+    {
         lines.push(format!(
             "Removed {} settings override at {}.",
             source_str(scope),

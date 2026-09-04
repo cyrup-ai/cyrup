@@ -27,7 +27,11 @@ impl SessionLayout {
     /// Encoded layout for `cwd` under an explicit sessions `root` (overridable — R-04-002): `dir()`
     /// yields `<root>/--<encoded-cwd>--`. This is Pi's *default* directory (`getDefaultSessionDir`).
     pub fn new(root: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), cwd: cwd.into(), encode: true }
+        Self {
+            root: root.into(),
+            cwd: cwd.into(),
+            encode: true,
+        }
     }
 
     /// Literal layout: `dir()` returns `root` verbatim, with **no** further per-cwd encoding. Use for
@@ -36,7 +40,11 @@ impl SessionLayout {
     /// fork/clone (Pi `createBranchedSession`'s `this.getSessionDir()` reuse). `cwd` is retained for
     /// the cross-project `continue_recent_filtered` guard but never re-encoded into the path.
     pub fn literal(root: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), cwd: cwd.into(), encode: false }
+        Self {
+            root: root.into(),
+            cwd: cwd.into(),
+            encode: false,
+        }
     }
 
     /// Layout for `cwd` under the default `~/.cyrup/agent/sessions` root (encoded).
@@ -64,7 +72,8 @@ impl SessionLayout {
 
     /// A fresh `<timestamp>_<uuid>.jsonl` path in this cwd's directory.
     pub fn new_file_path(&self, timestamp: &str, uuid: &str) -> PathBuf {
-        self.dir().join(format!("{}_{}.jsonl", sanitize_ts(timestamp), uuid))
+        self.dir()
+            .join(format!("{}_{}.jsonl", sanitize_ts(timestamp), uuid))
     }
 }
 
@@ -104,10 +113,19 @@ pub fn default_root() -> PathBuf {
 /// invisible for those cwds.
 pub fn encode_cwd(cwd: &Path) -> String {
     let raw = cwd.to_string_lossy();
-    let trimmed = raw.strip_prefix('/').or_else(|| raw.strip_prefix('\\')).unwrap_or(&raw);
+    let trimmed = raw
+        .strip_prefix('/')
+        .or_else(|| raw.strip_prefix('\\'))
+        .unwrap_or(&raw);
     let mapped: String = trimmed
         .chars()
-        .map(|c| if matches!(c, '/' | '\\' | ':') { '-' } else { c })
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':') {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
     format!("--{mapped}--")
 }

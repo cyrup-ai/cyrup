@@ -16,7 +16,10 @@ use anyhow::Context;
 /// render it to standalone HTML, write it, and exit. The optional second positional is the output
 /// path (else `<input-stem>.html`). On success prints `Exported to: {path}`; on failure prints
 /// `Error: {msg}` and exits 1 (Pi's exact messages).
-pub async fn export_session_html(input: &std::path::Path, output: Option<&str>) -> anyhow::Result<i32> {
+pub async fn export_session_html(
+    input: &std::path::Path,
+    output: Option<&str>,
+) -> anyhow::Result<i32> {
     let out_path = match output {
         Some(p) => std::path::PathBuf::from(p),
         None => input.with_extension("html"),
@@ -279,7 +282,8 @@ mod tests {
         // The retry ITSELF, isolated: `4o` cannot match `openai o4-mini` in order (the only `o`
         // after the `4` would have to come from `-mini`), so the score it does get can only be the
         // swapped query's score plus pi's flat +5 penalty (`fuzzy.ts:88`).
-        let swapped = cyrup_tui::fuzzy_score("openai o4-mini", "o4").expect("`o4` matches directly");
+        let swapped =
+            cyrup_tui::fuzzy_score("openai o4-mini", "o4").expect("`o4` matches directly");
         assert_eq!(
             cyrup_tui::fuzzy_score("openai o4-mini", "4o"),
             Some(swapped + 5.0),

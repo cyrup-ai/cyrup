@@ -7,8 +7,13 @@ impl<B: Backend> App<B> {
     pub fn open_selector(&mut self, kind: SelectorKind) {
         let saved_editor = self.state.editor.text();
         let (inner, restore_theme) = self.build_list_selector(kind);
-        self.state.selector =
-            Some(ActiveSelector { kind, inner, saved_editor, restore_theme, parent: None });
+        self.state.selector = Some(ActiveSelector {
+            kind,
+            inner,
+            saved_editor,
+            restore_theme,
+            parent: None,
+        });
     }
 
     /// Build (but do not mount) the dependency-free list selector for `kind`, plus the theme to
@@ -50,10 +55,10 @@ impl<B: Backend> App<B> {
                 None,
             ),
             SelectorKind::ShowImages => (
-                Box::new(ListSelector::show_images(self.state.show_images).with_upstream_chrome(
-                    kind,
-                    &self.state.select_keymap,
-                )),
+                Box::new(
+                    ListSelector::show_images(self.state.show_images)
+                        .with_upstream_chrome(kind, &self.state.select_keymap),
+                ),
                 None,
             ),
             SelectorKind::Theme => (
@@ -115,8 +120,13 @@ impl<B: Backend> App<B> {
     ) {
         let saved_editor = self.state.editor.text();
         let inner = self.build_data_selector(kind, rows, selected);
-        self.state.selector =
-            Some(ActiveSelector { kind, inner, saved_editor, restore_theme: None, parent: None });
+        self.state.selector = Some(ActiveSelector {
+            kind,
+            inner,
+            saved_editor,
+            restore_theme: None,
+            parent: None,
+        });
     }
 
     /// The `/settings`-submenu form of [`Self::open_data_selector`]: same picker, mounted as a
@@ -181,8 +191,11 @@ impl<B: Backend> App<B> {
             searchable,
             layout,
         ));
-        let saved_editor =
-            if parent.is_some() { String::new() } else { self.state.editor.text() };
+        let saved_editor = if parent.is_some() {
+            String::new()
+        } else {
+            self.state.editor.text()
+        };
         self.state.selector = Some(ActiveSelector {
             kind,
             inner,
@@ -269,7 +282,11 @@ impl<B: Backend> App<B> {
     /// `findExactModelReferenceMatch` → `session.setModel`), while a partial opens the picker
     /// pre-filtered to it. The catalog is the live available multi-provider catalog the picker itself
     /// sources (`model_entries`).
-    pub(crate) async fn handle_model_command(&mut self, session: &Arc<AgentSession>, search: Option<String>) {
+    pub(crate) async fn handle_model_command(
+        &mut self,
+        session: &Arc<AgentSession>,
+        search: Option<String>,
+    ) {
         // Seed the persisted default before opening: `open_model_selector` is also reachable from
         // session-less test paths, so the picker reads it off state rather than taking it as an
         // argument. `Some` even when both are unset — that is Pi's "callback wired, nothing
@@ -281,18 +298,24 @@ impl<B: Backend> App<B> {
         ));
         let models = model_entries(session);
         if models.is_empty() {
-            self.state.transcript.push_status("no models available (configure providers)");
+            self.state
+                .transcript
+                .push_status("no models available (configure providers)");
             return;
         }
         if let Some(term) = search.as_deref()
-            && let Some(model) = crate::model_selector::find_exact_model_reference_match(&models, term)
+            && let Some(model) =
+                crate::model_selector::find_exact_model_reference_match(&models, term)
         {
             // Exact match → set the fully-qualified `provider/id` directly (mirrors the confirm path),
             // no picker (`handleModelCommand` early-returns after `setModel`).
             let id = format!("{}/{}", model.provider, model.id);
             match session.set_model(&id).await {
                 Ok(_) => self.state.transcript.push_status(format!("model → {id}")),
-                Err(e) => self.state.transcript.push_status(format!("model error: {e}")),
+                Err(e) => self
+                    .state
+                    .transcript
+                    .push_status(format!("model error: {e}")),
             }
             return;
         }
@@ -305,8 +328,13 @@ impl<B: Backend> App<B> {
     /// the same editor-swap lifecycle as the data selectors). Snapshots the editor like the others.
     pub fn open_boxed_selector(&mut self, kind: SelectorKind, inner: Box<dyn Selector>) {
         let saved_editor = self.state.editor.text();
-        self.state.selector =
-            Some(ActiveSelector { kind, inner, saved_editor, restore_theme: None, parent: None });
+        self.state.selector = Some(ActiveSelector {
+            kind,
+            inner,
+            saved_editor,
+            restore_theme: None,
+            parent: None,
+        });
     }
 
     /// The kind of the currently-open selector, if any (test/inspection access).
@@ -322,8 +350,15 @@ impl<B: Backend> App<B> {
         // re-reads `getKeybindings()` on every keystroke (`input.ts:86`), so a rebound Ctrl+W or
         // Alt+B reaches a search box without the dialog being reopened. Destructured so the editor
         // borrow does not collide with the selector one.
-        let AppState { selector, select_keymap, editor, .. } = &mut self.state;
-        let Some(active) = selector.as_mut() else { return AppAction::None };
+        let AppState {
+            selector,
+            select_keymap,
+            editor,
+            ..
+        } = &mut self.state;
+        let Some(active) = selector.as_mut() else {
+            return AppAction::None;
+        };
         active.inner.set_editor_keymap(editor.keymap_ref());
         let outcome = active.inner.handle(key, select_keymap);
         let kind = active.kind;
@@ -334,7 +369,9 @@ impl<B: Backend> App<B> {
     /// `input.ts:362-372`). A selector that owns no input answers [`SelectorOutcome::Ignored`],
     /// which becomes [`AppAction::None`] — the preserved "the chrome drops the paste" fallback.
     pub(crate) fn handle_selector_paste(&mut self, text: &str) -> AppAction {
-        let Some(active) = self.state.selector.as_mut() else { return AppAction::None };
+        let Some(active) = self.state.selector.as_mut() else {
+            return AppAction::None;
+        };
         let outcome = active.inner.handle_paste(text);
         let kind = active.kind;
         self.apply_selector_outcome(kind, outcome)
@@ -342,7 +379,11 @@ impl<B: Backend> App<B> {
 
     /// Act on a [`SelectorOutcome`], whatever produced it — the key path and the paste path share
     /// this verbatim.
-    fn apply_selector_outcome(&mut self, kind: SelectorKind, outcome: SelectorOutcome) -> AppAction {
+    fn apply_selector_outcome(
+        &mut self,
+        kind: SelectorKind,
+        outcome: SelectorOutcome,
+    ) -> AppAction {
         match outcome {
             SelectorOutcome::Ignored => AppAction::None,
             SelectorOutcome::Redraw => AppAction::Redraw,
@@ -509,7 +550,8 @@ impl<B: Backend> App<B> {
                         // exist until the run loop has built its rows — so it rides
                         // `pending_selector_parent` across the command, and the `OpenSelector`
                         // arm re-parents the picker onto it (execute.rs).
-                        self.state.pending_selector_parent = self.state.selector.take().map(Box::new);
+                        self.state.pending_selector_parent =
+                            self.state.selector.take().map(Box::new);
                         return AppAction::Command(AppCommand::OpenSelector(
                             SelectorKind::ModelThinking,
                         ));
@@ -521,7 +563,8 @@ impl<B: Backend> App<B> {
                     // `Apply("id\u{1f}value")` → `AppCommand::ApplySetting` persist path the parent
                     // grid rides, so the nested row writes the global layer with no new plumbing.
                     "warnings" => {
-                        let rows = vec![SettingRow::toggle(
+                        let rows =
+                            vec![SettingRow::toggle(
                             "warnings.anthropicExtraUsage",
                             "Anthropic extra usage",
                             self.state.warn_anthropic_extra_usage,
@@ -638,22 +681,30 @@ impl<B: Backend> App<B> {
             }
             // GAP 3 step 2: apply. The pending model is consumed here, so an Escape at step 2
             // leaves it set but harmless — the next step-1 confirm overwrites it.
-            SelectorKind::ModelThinkingLevel => self
-                .state
-                .pending_model_thinking
-                .take()
-                .map(|model| AppCommand::SetModelThinkingLevel {
-                    model,
-                    level: value.to_string(),
-                }),
+            SelectorKind::ModelThinkingLevel => {
+                self.state.pending_model_thinking.take().map(|model| {
+                    AppCommand::SetModelThinkingLevel {
+                        model,
+                        level: value.to_string(),
+                    }
+                })
+            }
             SelectorKind::ShowImages => {
                 self.state.show_images = value == "yes";
                 // TUI-007: the toggle governs TOOL-RESULT images too (Pi passes `showImages` into
                 // every `ToolExecutionComponent`, interactive-mode.ts:3449), not just the editor's
                 // attachment strip. Off ⇒ Pi's `[Image: …]` text stand-in.
-                self.state.transcript.set_show_images(self.state.show_images);
-                let label = if self.state.show_images { "inline" } else { "placeholder" };
-                self.state.transcript.push_status(format!("images → {label}"));
+                self.state
+                    .transcript
+                    .set_show_images(self.state.show_images);
+                let label = if self.state.show_images {
+                    "inline"
+                } else {
+                    "placeholder"
+                };
+                self.state
+                    .transcript
+                    .push_status(format!("images → {label}"));
                 None
             }
             SelectorKind::ExtensionConfirm => {
@@ -679,7 +730,10 @@ impl<B: Backend> App<B> {
                 }
                 None
             }
-            other => Some(AppCommand::ConfirmSelection { kind: other, value: value.to_string() }),
+            other => Some(AppCommand::ConfirmSelection {
+                kind: other,
+                value: value.to_string(),
+            }),
         }
     }
 

@@ -1,7 +1,12 @@
 //! Slash-command registry + dispatch tests (spec/tui/04 §2; gaps 2/19/20).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use crate::{CommandRegistry, Dispatch, BUILTIN_SLASH_COMMANDS};
+use crate::{BUILTIN_SLASH_COMMANDS, CommandRegistry, Dispatch};
 
 #[test]
 fn builtin_table_is_23_commands_in_pi_order() {
@@ -17,9 +22,15 @@ fn builtin_table_is_23_commands_in_pi_order() {
     // (`slash-commands.ts:22-23`). Its absolute index differs because cyrup's table already places
     // `tree` later than pi does — a pre-existing divergence this task does not touch, since the
     // list is user-visible autocomplete order.
-    let tree_at = BUILTIN_SLASH_COMMANDS.iter().position(|c| c.name == "tree").unwrap();
+    let tree_at = BUILTIN_SLASH_COMMANDS
+        .iter()
+        .position(|c| c.name == "tree")
+        .unwrap();
     assert_eq!(BUILTIN_SLASH_COMMANDS[tree_at + 1].name, "thinking");
-    assert_eq!(BUILTIN_SLASH_COMMANDS[tree_at + 1].argument_hint.as_deref(), Some("<level>"));
+    assert_eq!(
+        BUILTIN_SLASH_COMMANDS[tree_at + 1].argument_hint.as_deref(),
+        Some("<level>")
+    );
     assert_eq!(BUILTIN_SLASH_COMMANDS.last().unwrap().name, "quit");
     // `/model`, `/thinking` and `/login` are the builtins that carry argument completion.
     // THREE at pi v0.84.3, not the two this used to assert: `createBaseAutocompleteProvider`
@@ -28,14 +39,20 @@ fn builtin_table_is_23_commands_in_pi_order() {
     // `autocomplete.ts` returns `null` for any command without one. Hints at
     // `slash-commands.ts:21`, `:23` and `:35`.
     assert!(BUILTIN_SLASH_COMMANDS[1].has_arg_completion());
-    assert_eq!(BUILTIN_SLASH_COMMANDS[1].argument_hint.as_deref(), Some("<provider/model>"));
+    assert_eq!(
+        BUILTIN_SLASH_COMMANDS[1].argument_hint.as_deref(),
+        Some("<provider/model>")
+    );
     let with_args: Vec<&str> = BUILTIN_SLASH_COMMANDS
         .iter()
         .filter(|c| c.has_arg_completion())
         .map(|c| c.name.as_ref())
         .collect();
     assert_eq!(with_args, vec!["model", "thinking", "login"]);
-    let login = BUILTIN_SLASH_COMMANDS.iter().find(|c| c.name == "login").unwrap();
+    let login = BUILTIN_SLASH_COMMANDS
+        .iter()
+        .find(|c| c.name == "login")
+        .unwrap();
     assert_eq!(login.argument_hint.as_deref(), Some("<provider>"));
 }
 
@@ -44,7 +61,10 @@ fn dispatch_exact_command() {
     let reg = CommandRegistry::new();
     assert_eq!(
         reg.dispatch("/tree"),
-        Dispatch::Command { name: "tree".to_string(), arg: None }
+        Dispatch::Command {
+            name: "tree".to_string(),
+            arg: None
+        }
     );
 }
 
@@ -53,12 +73,18 @@ fn dispatch_command_with_argument() {
     let reg = CommandRegistry::new();
     assert_eq!(
         reg.dispatch("/model claude-opus"),
-        Dispatch::Command { name: "model".to_string(), arg: Some("claude-opus".to_string()) }
+        Dispatch::Command {
+            name: "model".to_string(),
+            arg: Some("claude-opus".to_string())
+        }
     );
     // Trailing whitespace arg trims to None.
     assert_eq!(
         reg.dispatch("/compact   "),
-        Dispatch::Command { name: "compact".to_string(), arg: None }
+        Dispatch::Command {
+            name: "compact".to_string(),
+            arg: None
+        }
     );
 }
 
@@ -66,7 +92,10 @@ fn dispatch_command_with_argument() {
 fn modelx_is_not_model_command_falls_through_to_prompt() {
     // Edge 1 (interactive-mode.ts:2565): exact-or-`"name "`-prefix only.
     let reg = CommandRegistry::new();
-    assert_eq!(reg.dispatch("/modelfoo"), Dispatch::Prompt("/modelfoo".to_string()));
+    assert_eq!(
+        reg.dispatch("/modelfoo"),
+        Dispatch::Prompt("/modelfoo".to_string())
+    );
 }
 
 #[test]
@@ -85,12 +114,24 @@ fn theme_think_show_images_route_to_the_agent_like_pi() {
     // level via Shift+Tab (`app.thinking.cycle`, keybindings.ts). These must therefore dispatch as
     // prompts, never as in-crate commands (regression guard against the reverted 9a703f1 divergence).
     let reg = CommandRegistry::new();
-    assert_eq!(reg.dispatch("/theme"), Dispatch::Prompt("/theme".to_string()));
-    assert_eq!(reg.dispatch("/think"), Dispatch::Prompt("/think".to_string()));
-    assert_eq!(reg.dispatch("/show-images"), Dispatch::Prompt("/show-images".to_string()));
+    assert_eq!(
+        reg.dispatch("/theme"),
+        Dispatch::Prompt("/theme".to_string())
+    );
+    assert_eq!(
+        reg.dispatch("/think"),
+        Dispatch::Prompt("/think".to_string())
+    );
+    assert_eq!(
+        reg.dispatch("/show-images"),
+        Dispatch::Prompt("/show-images".to_string())
+    );
     // ...and none of the three appear in the autocomplete surface.
     for name in ["theme", "think", "show-images"] {
-        assert!(reg.commands().iter().all(|c| c.name != name), "/{name} leaked into autocomplete");
+        assert!(
+            reg.commands().iter().all(|c| c.name != name),
+            "/{name} leaked into autocomplete"
+        );
     }
 }
 
@@ -102,7 +143,14 @@ fn only_pis_six_argument_commands_accept_trailing_text() {
     // are strict equality, so trailing text makes the line a PROMPT upstream. cyrup's matcher was
     // uniform, so `/quit now` quit, `/copy that` copied and `/new session` started a new session.
     let reg = CommandRegistry::new();
-    for line in ["/quit now", "/copy that", "/new session", "/trust me", "/tree left", "/debug on"] {
+    for line in [
+        "/quit now",
+        "/copy that",
+        "/new session",
+        "/trust me",
+        "/tree left",
+        "/debug on",
+    ] {
         assert_eq!(
             reg.dispatch(line),
             Dispatch::Prompt(line.to_string()),
@@ -121,7 +169,10 @@ fn only_pis_six_argument_commands_accept_trailing_text() {
     ] {
         assert_eq!(
             reg.dispatch(line),
-            Dispatch::Command { name: name.to_string(), arg: arg.map(str::to_string) },
+            Dispatch::Command {
+                name: name.to_string(),
+                arg: arg.map(str::to_string)
+            },
             "{line}"
         );
     }
@@ -132,7 +183,10 @@ fn hidden_commands_dispatch_but_are_not_in_autocomplete() {
     let reg = CommandRegistry::new();
     assert_eq!(
         reg.dispatch("/debug"),
-        Dispatch::Command { name: "debug".to_string(), arg: None }
+        Dispatch::Command {
+            name: "debug".to_string(),
+            arg: None
+        }
     );
     // …but they are not listed in the autocomplete-visible commands.
     assert!(reg.commands().iter().all(|c| c.name != "debug"));
@@ -145,11 +199,17 @@ fn bash_precedence_after_slash_before_prompt() {
     let reg = CommandRegistry::new();
     assert_eq!(
         reg.dispatch("!cargo test"),
-        Dispatch::Bash { command: "cargo test".to_string(), excluded: false }
+        Dispatch::Bash {
+            command: "cargo test".to_string(),
+            excluded: false
+        }
     );
     assert_eq!(
         reg.dispatch("!!secret-cmd"),
-        Dispatch::Bash { command: "secret-cmd".to_string(), excluded: true }
+        Dispatch::Bash {
+            command: "secret-cmd".to_string(),
+            excluded: true
+        }
     );
     // Empty bash body falls through to normal text.
     assert_eq!(reg.dispatch("!  "), Dispatch::Prompt("!".to_string()));
@@ -164,7 +224,10 @@ fn whitespace_only_is_empty() {
 #[test]
 fn plain_text_is_a_prompt() {
     let reg = CommandRegistry::new();
-    assert_eq!(reg.dispatch("hello there"), Dispatch::Prompt("hello there".to_string()));
+    assert_eq!(
+        reg.dispatch("hello there"),
+        Dispatch::Prompt("hello there".to_string())
+    );
 }
 
 /// The gap this closes: `CommandSource::{Prompt, Extension, Skill}` were declared and NEVER
@@ -231,9 +294,7 @@ fn a_dynamic_command_is_visible_but_not_locally_dispatched() {
         "source": "extension",
         "sourceInfo": { "path": "", "source": "extension", "scope": "temporary", "origin": "top-level" },
     })];
-    let reg = crate::CommandRegistry::with_dynamic(
-        crate::dynamic_commands_from_catalog(&catalog),
-    );
+    let reg = crate::CommandRegistry::with_dynamic(crate::dynamic_commands_from_catalog(&catalog));
     assert!(reg.get("subagent-status").is_some(), "visible");
     assert!(
         matches!(reg.dispatch("/subagent-status"), crate::Dispatch::Prompt(_)),
@@ -250,12 +311,13 @@ fn a_builtin_wins_a_name_collision_with_a_dynamic_command() {
         "source": "extension",
         "sourceInfo": { "path": "", "source": "extension", "scope": "temporary", "origin": "top-level" },
     })];
-    let reg = crate::CommandRegistry::with_dynamic(
-        crate::dynamic_commands_from_catalog(&catalog),
-    );
+    let reg = crate::CommandRegistry::with_dynamic(crate::dynamic_commands_from_catalog(&catalog));
     let model = reg.get("model").expect("builtin /model survives");
     assert_eq!(model.source, crate::CommandSource::Builtin);
-    assert_eq!(reg.commands().iter().filter(|c| c.name == "model").count(), 1);
+    assert_eq!(
+        reg.commands().iter().filter(|c| c.name == "model").count(),
+        1
+    );
 }
 
 /// CMDHINT_01 — a prompt-template row's `argumentHint` key reaches `SlashCommand::argument_hint`,
@@ -317,21 +379,33 @@ fn dynamic_command_argument_hint_reaches_slash_command() {
 
     let dynamic = crate::dynamic_commands_from_catalog(&catalog);
     let by = |name: &str| dynamic.iter().find(|c| c.name == name).expect(name);
-    assert_eq!(by("deploy").argument_hint.as_deref(), Some("<env> [--dry-run]"));
+    assert_eq!(
+        by("deploy").argument_hint.as_deref(),
+        Some("<env> [--dry-run]")
+    );
     assert_eq!(by("greet").argument_hint, None);
     assert_eq!(
-        by("subagent-status").argument_hint, None,
+        by("subagent-status").argument_hint,
+        None,
         "a real catalog never sets argumentHint on an extension row"
     );
     assert_eq!(
-        by("skill:deploy").argument_hint, None,
+        by("skill:deploy").argument_hint,
+        None,
         "a real catalog never sets argumentHint on a skill row"
     );
-    assert_eq!(by("blank-hint").argument_hint, None, "an empty-string hint filters to None");
+    assert_eq!(
+        by("blank-hint").argument_hint,
+        None,
+        "an empty-string hint filters to None"
+    );
 
     // And it is genuinely usable end to end: the merged registry's `get()` returns the hint.
     let reg = crate::CommandRegistry::with_dynamic(dynamic);
-    assert_eq!(reg.get("deploy").unwrap().argument_hint.as_deref(), Some("<env> [--dry-run]"));
+    assert_eq!(
+        reg.get("deploy").unwrap().argument_hint.as_deref(),
+        Some("<env> [--dry-run]")
+    );
 }
 
 /// TUI-025 — the slash-command metadata was one baseline behind.
@@ -349,7 +423,10 @@ fn the_builtin_command_metadata_matches_pi() {
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("`/{name}` must exist"))
     };
-    assert_eq!(by("model").argument_hint.as_deref(), Some("<provider/model>"));
+    assert_eq!(
+        by("model").argument_hint.as_deref(),
+        Some("<provider/model>")
+    );
     assert_eq!(by("login").argument_hint.as_deref(), Some("<provider>"));
     assert_eq!(
         by("reload").description,
@@ -463,7 +540,10 @@ fn a_path_command_argument_is_one_quote_aware_token() {
     let arg = crate::commands::path_command_argument;
 
     // Quoted: the quotes are stripped and the inner spaces survive.
-    assert_eq!(arg("\"my session.html\"").as_deref(), Some("my session.html"));
+    assert_eq!(
+        arg("\"my session.html\"").as_deref(),
+        Some("my session.html")
+    );
     assert_eq!(arg("'my session.html'").as_deref(), Some("my session.html"));
     // Unquoted: the token ends at the first whitespace — a second word is NOT part of the path.
     assert_eq!(arg("a.html junk").as_deref(), Some("a.html"));

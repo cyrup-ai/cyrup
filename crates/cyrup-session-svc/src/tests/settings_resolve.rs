@@ -22,10 +22,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::{SessionBuilder, SessionConfig};
 use cyrup_config::FileSettingsStore;
 use cyrup_provider::Provider;
 use cyrup_provider::faux::FauxProvider;
-use crate::{SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 
 fn write(path: &Path, contents: &str) {
@@ -304,9 +304,14 @@ async fn models_json_overrides_reach_the_provider_the_session_is_running_on() {
         .iter()
         .filter(|m| m.provider.as_str() == "anthropic")
         .collect();
-    assert!(!entries.is_empty(), "anthropic models must be in the registry");
     assert!(
-        entries.iter().all(|m| m.base_url == "https://proxy.internal/v1"),
+        !entries.is_empty(),
+        "anthropic models must be in the registry"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|m| m.base_url == "https://proxy.internal/v1"),
         "the CURRENT provider's own entries must be composed, not shadowed by their uncomposed \
          originals: {:?}",
         entries
@@ -423,15 +428,17 @@ async fn cfg003_the_install_gate_reaches_discovery_in_both_directions() {
         &closed.agent_dir.join("settings.json"),
         "{\"packages\": [\"git:localhost/acme/pack\"]}",
     );
-    let closed_msgs = messages(&closed.session_with(|c| c.install_missing_packages = false).await);
+    let closed_msgs = messages(
+        &closed
+            .session_with(|c| c.install_missing_packages = false)
+            .await,
+    );
     // The remedy text names the source — "run `cyrup install <source>`" — so the match must not
     // expect a closing backtick straight after `install`.
     assert!(
-        closed_msgs
-            .iter()
-            .any(|m| m.contains("acme/pack")
-                && m.contains("run `cyrup install ")
-                && !m.contains("could not be installed")),
+        closed_msgs.iter().any(|m| m.contains("acme/pack")
+            && m.contains("run `cyrup install ")
+            && !m.contains("could not be installed")),
         "a closed gate installs nothing and says so: {closed_msgs:?}"
     );
 
@@ -440,7 +447,11 @@ async fn cfg003_the_install_gate_reaches_discovery_in_both_directions() {
         &open.agent_dir.join("settings.json"),
         "{\"packages\": [\"git:localhost/acme/pack\"]}",
     );
-    let open_msgs = messages(&open.session_with(|c| c.install_missing_packages = true).await);
+    let open_msgs = messages(
+        &open
+            .session_with(|c| c.install_missing_packages = true)
+            .await,
+    );
     assert!(
         open_msgs
             .iter()

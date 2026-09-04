@@ -403,9 +403,9 @@ impl PiAggregateProjection {
         }
         match (self.event_type.as_deref(), self.will_retry) {
             (Some("turn_end"), _) => Some("{\"type\":\"turn_end\"}".to_string()),
-            (Some("agent_end"), Some(will_retry)) => {
-                Some(format!("{{\"type\":\"agent_end\",\"willRetry\":{will_retry}}}"))
-            }
+            (Some("agent_end"), Some(will_retry)) => Some(format!(
+                "{{\"type\":\"agent_end\",\"willRetry\":{will_retry}}}"
+            )),
             _ => None,
         }
     }
@@ -978,7 +978,11 @@ impl BoundedLineReader {
     /// `finishLine` (`child-protocol.ts:295-313`).
     fn finish_line(&mut self) {
         if self.projecting {
-            match self.projection.take().and_then(PiAggregateProjection::finish) {
+            match self
+                .projection
+                .take()
+                .and_then(PiAggregateProjection::finish)
+            {
                 Some(projected) => self.lines.push_back(projected),
                 None => {
                     let observed = self.projected_bytes;
@@ -1028,7 +1032,8 @@ impl BoundedLineReader {
                 .to_vec();
             if prefix.len() < MAX_PROTOCOL_DIAGNOSTIC_BYTES {
                 let want = MAX_PROTOCOL_DIAGNOSTIC_BYTES - prefix.len();
-                prefix.extend_from_slice(segment.get(..want.min(segment.len())).unwrap_or_default());
+                prefix
+                    .extend_from_slice(segment.get(..want.min(segment.len())).unwrap_or_default());
             }
             let tail = Self::diagnostic_tail(&prior, segment);
             if self.projector_enabled
@@ -1195,7 +1200,10 @@ mod tests {
             ]
         );
         reader.end();
-        assert_eq!(drain(&mut reader), vec!["{\"type\":\"agent_end\"}".to_string()]);
+        assert_eq!(
+            drain(&mut reader),
+            vec!["{\"type\":\"agent_end\"}".to_string()]
+        );
         assert!(reader.take_limit().is_none());
     }
 
@@ -1205,7 +1213,10 @@ mod tests {
         for chunk in [&b"{\"type\":\"ag"[..], b"ent_start\"}", b"\n"] {
             reader.push(chunk);
         }
-        assert_eq!(drain(&mut reader), vec!["{\"type\":\"agent_start\"}".to_string()]);
+        assert_eq!(
+            drain(&mut reader),
+            vec!["{\"type\":\"agent_start\"}".to_string()]
+        );
     }
 
     /// THE cap. A single line one byte over the limit must produce a `protocol_output_limit`
@@ -1259,8 +1270,14 @@ mod tests {
         assert!(line.len() > 64);
         reader.push(line.as_bytes());
         reader.push(b"\n");
-        assert!(!reader.exceeded(), "a projectable aggregate must not fail the run");
-        assert_eq!(drain(&mut reader), vec!["{\"type\":\"turn_end\"}".to_string()]);
+        assert!(
+            !reader.exceeded(),
+            "a projectable aggregate must not fail the run"
+        );
+        assert_eq!(
+            drain(&mut reader),
+            vec!["{\"type\":\"turn_end\"}".to_string()]
+        );
     }
 
     #[test]
@@ -1275,7 +1292,9 @@ mod tests {
             reader.push(b"\n");
             assert_eq!(
                 drain(&mut reader),
-                vec![format!("{{\"type\":\"agent_end\",\"willRetry\":{will_retry}}}")]
+                vec![format!(
+                    "{{\"type\":\"agent_end\",\"willRetry\":{will_retry}}}"
+                )]
             );
         }
     }

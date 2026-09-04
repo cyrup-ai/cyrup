@@ -31,7 +31,11 @@ pub(crate) fn model_thinking_summary_for_count(count: usize) -> String {
 /// and visible" while the body is replaced by the static label. Shared with the submenu
 /// write-back in `app/selectors.rs` so a confirmed pick cannot silently drop the marker.
 pub(crate) fn thinking_row_value(level: &str, hidden: bool) -> String {
-    if hidden { format!("{level} (hidden)") } else { level.to_string() }
+    if hidden {
+        format!("{level} (hidden)")
+    } else {
+        level.to_string()
+    }
 }
 
 pub(crate) fn settings_rows(
@@ -85,8 +89,12 @@ pub(crate) fn settings_rows(
         // settings-selector.ts:603-610) — the one in-app path Pi reaches theme switching through.
         SettingRow::submenu("theme", "Theme", current_theme.to_string(), "theme")
             .with_description("Color theme for the interface"),
-        SettingRow::toggle("compaction.enabled", "Auto-compact", eff.compaction_enabled())
-            .with_description("Automatically compact context when it gets too large"),
+        SettingRow::toggle(
+            "compaction.enabled",
+            "Auto-compact",
+            eff.compaction_enabled(),
+        )
+        .with_description("Automatically compact context when it gets too large"),
     ];
     rows.extend(image_rows);
     rows.extend([
@@ -372,7 +380,11 @@ pub(crate) fn format_saved_trust(saved: &Option<cyrup_session_svc::TrustEntry>) 
     match saved {
         None => "none".to_string(),
         Some(entry) => {
-            let label = if entry.decision.is_trusted() { "trusted" } else { "untrusted" };
+            let label = if entry.decision.is_trusted() {
+                "trusted"
+            } else {
+                "untrusted"
+            };
             format!("{label} ({})", entry.path.display())
         }
     }
@@ -392,9 +404,9 @@ pub(crate) fn session_label(info: &cyrup_session_svc::SessionInfo) -> String {
 /// A monotonic recency key for a session's `modified` time (nanoseconds since the Unix epoch; `0`
 /// before the epoch / on a clock fault). Drives the `Relevance` sort tie-break (newest first).
 pub(crate) fn system_time_nanos(t: std::time::SystemTime) -> u128 {
-    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
-
 pub(crate) const PROJECT_UNTRUSTED_WARNING: &str = "This project is not trusted. Project .cyrup resources and packages are ignored. Use /trust to save a trust decision, then restart cyrup.";
-

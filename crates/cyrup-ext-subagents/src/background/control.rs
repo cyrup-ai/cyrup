@@ -184,9 +184,9 @@ pub fn resolve_run_paths(
 /// but cannot be read or parsed, and no [`ResultFile`] exists to fall back on.
 pub async fn reconcile_before_control_op(paths: &RunPaths) -> Result<RunStatus, SubagentError> {
     if let Some(result) = read_result_file(&paths.result).await? {
-        let mut status = read_status_file(&paths.status).await?.unwrap_or_else(|| {
-            RunStatus::queued(result.run_id.clone(), result.mode, None)
-        });
+        let mut status = read_status_file(&paths.status)
+            .await?
+            .unwrap_or_else(|| RunStatus::queued(result.run_id.clone(), result.mode, None));
         if !status.state.is_terminal() {
             // Repair status.json from the authoritative ResultFile (R-SA-077's "readers MUST
             // treat presence of the ResultFile as authoritative... repairing status.json from it
@@ -283,9 +283,9 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
 /// [`reconcile_before_control_op`] would let the liveness probe rewrite the record first.
 pub(crate) async fn read_status_file(path: &Path) -> Result<Option<RunStatus>, SubagentError> {
     match tokio::fs::read(path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|e| SubagentError::Spawn(std::io::Error::new(std::io::ErrorKind::InvalidData, e))),
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            SubagentError::Spawn(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(SubagentError::Spawn(e)),
     }
@@ -293,9 +293,9 @@ pub(crate) async fn read_status_file(path: &Path) -> Result<Option<RunStatus>, S
 
 async fn read_result_file(path: &Path) -> Result<Option<ResultFile>, SubagentError> {
     match tokio::fs::read(path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|e| SubagentError::Spawn(std::io::Error::new(std::io::ErrorKind::InvalidData, e))),
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            SubagentError::Spawn(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(SubagentError::Spawn(e)),
     }
@@ -882,7 +882,9 @@ pub fn steer_requests_dir(run_dir: &Path) -> PathBuf {
 /// running, and the child must not have to filter a queue that is not its own.
 #[must_use]
 pub fn step_steer_inbox_dir(run_dir: &Path, index: usize) -> PathBuf {
-    control_inbox_dir(run_dir).join("steer-targets").join(index.to_string())
+    control_inbox_dir(run_dir)
+        .join("steer-targets")
+        .join(index.to_string())
 }
 
 /// pi `steerRequestFileName` (`runs/background/control-channel.ts:181-183`): `<ts zero-padded to 13>-<base64url(id)>.json`.
@@ -972,7 +974,9 @@ pub async fn request_async_steer_with_mode(
 ) -> Result<(PathBuf, String), SubagentError> {
     let message = message.trim();
     if message.is_empty() {
-        return Err(SubagentError::Management("steer message must not be empty.".to_string()));
+        return Err(SubagentError::Management(
+            "steer message must not be empty.".to_string(),
+        ));
     }
     // pi additionally rejects a non-integer/negative `targetIndex`; both are unrepresentable in
     // `Option<usize>`, so that guard has no surviving branch here.
@@ -1036,7 +1040,9 @@ pub async fn consume_steer_requests_from_dir(dir: &Path) -> Vec<SteerRequest> {
             .await
             .ok()
             .and_then(|bytes| serde_json::from_slice::<SteerRequest>(&bytes).ok())
-            .filter(|r| r.kind == "steer" && !r.id.trim().is_empty() && !r.message.trim().is_empty());
+            .filter(|r| {
+                r.kind == "steer" && !r.id.trim().is_empty() && !r.message.trim().is_empty()
+            });
         // Removal is the consumption primitive and happens whether or not the parse succeeded —
         // a malformed request that stayed on disk would be re-read on every single tick forever.
         if tokio::fs::remove_file(&path).await.is_err() {
@@ -1238,7 +1244,9 @@ pub fn steer_capability_path(run_dir: &Path, index: usize) -> PathBuf {
 /// `<run_dir>/control/steer-acks/<index>/` (pi `steerAcksDir`, `control-channel.ts:163-166`).
 #[must_use]
 pub fn steer_acks_dir(run_dir: &Path, index: usize) -> PathBuf {
-    control_inbox_dir(run_dir).join("steer-acks").join(index.to_string())
+    control_inbox_dir(run_dir)
+        .join("steer-acks")
+        .join(index.to_string())
 }
 
 /// pi `steerAckFileName` (`control-channel.ts:168-170`): `base64url(requestId).json`.
@@ -1260,7 +1268,10 @@ fn steer_ack_file_name(request_id: &str) -> String {
 /// outcome even when two acks share a millisecond.
 async fn steer_ack_write_path(dir: &Path, ack: &SteerAck) -> Result<PathBuf, SubagentError> {
     let stem = steer_ack_file_name(&ack.request_id);
-    let stem = stem.strip_suffix(".json").unwrap_or(stem.as_str()).to_string();
+    let stem = stem
+        .strip_suffix(".json")
+        .unwrap_or(stem.as_str())
+        .to_string();
     let order = match ack.state {
         SteerAckState::Queued => '0',
         SteerAckState::Delivered => '1',
@@ -1269,13 +1280,19 @@ async fn steer_ack_write_path(dir: &Path, ack: &SteerAck) -> Result<PathBuf, Sub
     let ts = format!("{:013}", ack.ts.max(0));
     let state = ack.state.as_str();
     for suffix in 0..1_000u32 {
-        let tail = if suffix == 0 { String::new() } else { format!("-{suffix}") };
+        let tail = if suffix == 0 {
+            String::new()
+        } else {
+            format!("-{suffix}")
+        };
         let candidate = dir.join(format!("{stem}-{ts}-{order}-{state}{tail}.json"));
         if !tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
             return Ok(candidate);
         }
     }
-    Err(SubagentError::Management("steer acknowledgment queue is full.".to_string()))
+    Err(SubagentError::Management(
+        "steer acknowledgment queue is full.".to_string(),
+    ))
 }
 
 /// pi `writeSteerAckAt` (`control-channel.ts:240-249` @v0.43.0) — the CHILD side of the return path.
@@ -1290,10 +1307,7 @@ async fn steer_ack_write_path(dir: &Path, ack: &SteerAck) -> Result<PathBuf, Sub
 ///
 /// [`SubagentError::Management`] for an invalid request id or message, [`SubagentError::Spawn`] for
 /// an I/O failure.
-pub async fn write_steer_ack_at(
-    dir: &Path,
-    ack: &SteerAck,
-) -> Result<PathBuf, SubagentError> {
+pub async fn write_steer_ack_at(dir: &Path, ack: &SteerAck) -> Result<PathBuf, SubagentError> {
     if ack.request_id.is_empty()
         || ack.request_id.len() > 256
         || ack.request_id.chars().any(char::is_whitespace)
@@ -1365,7 +1379,9 @@ pub async fn write_steer_capability_at(
 /// its runtime yet, or when the file is unreadable/malformed — all three are the same actionable
 /// fact for the caller ("no capability has been published for this child").
 pub async fn read_steer_capability(run_dir: &Path, index: usize) -> Option<SteerCapability> {
-    let bytes = tokio::fs::read(steer_capability_path(run_dir, index)).await.ok()?;
+    let bytes = tokio::fs::read(steer_capability_path(run_dir, index))
+        .await
+        .ok()?;
     let parsed: SteerCapability = serde_json::from_slice(&bytes).ok()?;
     (parsed.kind == "steer-capability" && parsed.protocol_version == 1).then_some(parsed)
 }
@@ -1520,9 +1536,9 @@ async fn read_control_request<T: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<Option<T>, SubagentError> {
     match tokio::fs::read(path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|e| SubagentError::Spawn(std::io::Error::new(std::io::ErrorKind::InvalidData, e))),
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            SubagentError::Spawn(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(SubagentError::Spawn(e)),
     }
@@ -1552,9 +1568,9 @@ pub async fn check_control_inbox_now(
     paths: &RunPaths,
 ) -> Result<Option<InterruptRequest>, SubagentError> {
     match tokio::fs::read(&paths.control_inbox).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|e| SubagentError::Spawn(std::io::Error::new(std::io::ErrorKind::InvalidData, e))),
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            SubagentError::Spawn(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(SubagentError::Spawn(e)),
     }
@@ -1805,7 +1821,9 @@ fn resolve_running_selection(
         .collect();
 
     match running_indices.as_slice() {
-        [single] => Ok(ResumeOutcome::SteerRunning { step_index: *single }),
+        [single] => Ok(ResumeOutcome::SteerRunning {
+            step_index: *single,
+        }),
         [] => Err(SubagentError::AgentNotFound(
             "no running step to steer: the run reports Running overall but no individual step is \
              currently Running"
@@ -2105,7 +2123,10 @@ pub async fn append_step(
     }
 
     let reserved = reserved_output_names(&status, &paths.append_dir).await?;
-    let new_names: Vec<String> = new_steps.iter().flat_map(runner_step_output_names).collect();
+    let new_names: Vec<String> = new_steps
+        .iter()
+        .flat_map(runner_step_output_names)
+        .collect();
     for name in &new_names {
         if reserved.contains(name) {
             return Err(SubagentError::AcceptanceRejected(format!(
@@ -2428,7 +2449,12 @@ pub async fn wait_for_imported_async_root(
             poll_root_attachment(target_paths, terminal_first_observed_at).await?;
         match outcome {
             AttachmentPoll::Ready(result) => {
-                return Ok(build_imported_result(&result, run_id, index, fallback_agent));
+                return Ok(build_imported_result(
+                    &result,
+                    run_id,
+                    index,
+                    fallback_agent,
+                ));
             }
             AttachmentPoll::Failed => {
                 // The target's status.json went terminal but no ResultFile ever landed (past the
@@ -2449,7 +2475,10 @@ pub async fn wait_for_imported_async_root(
                 // pi's `!status && !fs.existsSync(root.asyncDir)` guard: a target that is not
                 // terminal AND whose run directory does not exist never started — surface that as a
                 // hard error rather than polling forever against a directory that will never appear.
-                if !tokio::fs::try_exists(&target_paths.run_dir).await.unwrap_or(false) {
+                if !tokio::fs::try_exists(&target_paths.run_dir)
+                    .await
+                    .unwrap_or(false)
+                {
                     return Err(SubagentError::Spawn(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         format!(
@@ -2499,7 +2528,11 @@ fn imported_state(result: &ResultFile, child: Option<&SingleResult>) -> RunState
         RunState::Paused => RunState::Paused,
         RunState::Stopped => RunState::Stopped,
         RunState::Queued | RunState::Running => {
-            if result.success { RunState::Complete } else { RunState::Failed }
+            if result.success {
+                RunState::Complete
+            } else {
+                RunState::Failed
+            }
         }
     }
 }
@@ -2522,7 +2555,9 @@ fn build_imported_result(
         .or_else(|| Some(result.agent.clone()).filter(|a| !a.is_empty()))
         .unwrap_or_else(|| fallback_agent.to_string());
 
-    let output_text = child.and_then(|c| c.final_output.clone()).unwrap_or_default();
+    let output_text = child
+        .and_then(|c| c.final_output.clone())
+        .unwrap_or_default();
     let error = child.and_then(|c| c.error.clone()).or_else(|| {
         if success {
             None
@@ -2552,7 +2587,9 @@ fn build_imported_result(
         // `child?.sessionFile ?? … ?? status?.sessionFile` chain collapsing to the run session).
         session_file: result.session_file.clone(),
         model: child.and_then(|c| c.model.clone()),
-        attempted_models: child.map(|c| c.attempted_models.clone()).unwrap_or_default(),
+        attempted_models: child
+            .map(|c| c.attempted_models.clone())
+            .unwrap_or_default(),
         structured_output: child.and_then(|c| c.structured_output.clone()),
     }
 }
@@ -2616,7 +2653,11 @@ mod tests {
     /// probe.
     fn spawn_and_reap_dead_pid() -> u32 {
         let mut child = std::process::Command::new(if cfg!(unix) { "true" } else { "cmd" })
-            .args(if cfg!(unix) { Vec::new() } else { vec!["/c", "exit"] })
+            .args(if cfg!(unix) {
+                Vec::new()
+            } else {
+                vec!["/c", "exit"]
+            })
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -2634,7 +2675,9 @@ mod tests {
         let child = if cfg!(unix) {
             std::process::Command::new("sleep").arg("30").spawn()
         } else {
-            std::process::Command::new("ping").args(["-n", "31", "127.0.0.1"]).spawn()
+            std::process::Command::new("ping")
+                .args(["-n", "31", "127.0.0.1"])
+                .spawn()
         }
         .expect("the long-lived child spawns");
         let pid = child.id();
@@ -2705,7 +2748,10 @@ mod tests {
     /// send's own `ESRCH`; where it does not, from the zero-signal probe.
     #[test]
     fn a_reaped_pid_is_reported_dead_by_the_wakeup_liveness_answer() {
-        assert_eq!(wakeup_addressee_liveness(spawn_and_reap_dead_pid()), Liveness::Dead);
+        assert_eq!(
+            wakeup_addressee_liveness(spawn_and_reap_dead_pid()),
+            Liveness::Dead
+        );
     }
 
     /// ...and a live one is not, so the cleanup never fires against it.
@@ -2796,7 +2842,10 @@ mod tests {
             .collect();
         assert_eq!(
             delivered,
-            vec!["older-ts-later-seq".to_string(), "newer-ts-earlier-seq".to_string()],
+            vec![
+                "older-ts-later-seq".to_string(),
+                "newer-ts-earlier-seq".to_string()
+            ],
             "`ts` is the primary key; the sequence only breaks ties within one millisecond"
         );
     }
@@ -2815,11 +2864,17 @@ mod tests {
         pid: Option<u32>,
         steps: Vec<super::super::StepStatus>,
     ) -> RunStatus {
-        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
         let mut status = RunStatus::queued(run_id.clone(), mode, pid);
-        status.advance_state(RunState::Running).expect("Queued -> Running");
+        status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
         status.steps = steps;
-        write_atomic_json(&paths.status, &status).await.expect("write status");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write status");
         status
     }
 
@@ -2860,9 +2915,15 @@ mod tests {
         write_running_status(&paths, &run_id, RunMode::Single, Some(4242), Vec::new()).await;
 
         assert_eq!(
-            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None)
-                .await
-                .expect("stop resolves"),
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None
+            )
+            .await
+            .expect("stop resolves"),
             StopOutcome::Requested
         );
 
@@ -2879,10 +2940,18 @@ mod tests {
         assert!(check_stop_inbox_now(&paths).await.expect("read").is_some());
         assert!(path.exists());
         // …consumption removes it and is idempotent thereafter.
-        let consumed = consume_stop_request(&paths).await.expect("consume").expect("was pending");
+        let consumed = consume_stop_request(&paths)
+            .await
+            .expect("consume")
+            .expect("was pending");
         assert_eq!(consumed.kind, "stop");
         assert!(!path.exists());
-        assert!(consume_stop_request(&paths).await.expect("second consume").is_none());
+        assert!(
+            consume_stop_request(&paths)
+                .await
+                .expect("second consume")
+                .is_none()
+        );
     }
 
     /// pi `stopAsyncRun`'s actionability guard (`async-stop-action.ts:41`): only `running` or
@@ -2895,7 +2964,9 @@ mod tests {
         // Queued IS stoppable.
         let queued_id = RunId::from_token("stopqueued01");
         let queued_paths = RunPaths::for_run(&async_root, &results_dir, &queued_id);
-        tokio::fs::create_dir_all(&queued_paths.run_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&queued_paths.run_dir)
+            .await
+            .expect("mkdir");
         write_atomic_json(
             &queued_paths.status,
             &RunStatus::queued(queued_id.clone(), RunMode::Single, None),
@@ -2903,9 +2974,15 @@ mod tests {
         .await
         .expect("write status");
         assert_eq!(
-            stop(&async_root, &results_dir, queued_id.as_str(), "stop-action", None)
-                .await
-                .expect("stop resolves"),
+            stop(
+                &async_root,
+                &results_dir,
+                queued_id.as_str(),
+                "stop-action",
+                None
+            )
+            .await
+            .expect("stop resolves"),
             StopOutcome::Requested
         );
 
@@ -2920,12 +2997,22 @@ mod tests {
             Vec::new(),
         )
         .await;
-        paused.advance_state(RunState::Paused).expect("Running -> Paused");
-        write_atomic_json(&paused_paths.status, &paused).await.expect("write");
+        paused
+            .advance_state(RunState::Paused)
+            .expect("Running -> Paused");
+        write_atomic_json(&paused_paths.status, &paused)
+            .await
+            .expect("write");
         assert_eq!(
-            stop(&async_root, &results_dir, paused_id.as_str(), "stop-action", None)
-                .await
-                .expect("stop resolves"),
+            stop(
+                &async_root,
+                &results_dir,
+                paused_id.as_str(),
+                "stop-action",
+                None
+            )
+            .await
+            .expect("stop resolves"),
             StopOutcome::NotStoppable
         );
         assert!(
@@ -2945,15 +3032,21 @@ mod tests {
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
 
         let transcript = dir.path().join("session.jsonl");
-        tokio::fs::write(&transcript, b"{}\n").await.expect("write transcript");
+        tokio::fs::write(&transcript, b"{}\n")
+            .await
+            .expect("write transcript");
 
         let mut step = super::super::StepStatus::pending("worker");
         step.status = StepState::Stopped;
         step.session_file = Some(transcript.clone());
         let mut status =
             write_running_status(&paths, &run_id, RunMode::Single, Some(9), vec![step]).await;
-        status.advance_state(RunState::Stopped).expect("Running -> Stopped");
-        write_atomic_json(&paths.status, &status).await.expect("write");
+        status
+            .advance_state(RunState::Stopped)
+            .expect("Running -> Stopped");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write");
 
         let err = resume(&async_root, &results_dir, run_id.as_str(), None)
             .await
@@ -3089,7 +3182,9 @@ mod tests {
 
         assert_eq!(outcome, InterruptOutcome::Delivered);
         assert!(
-            tokio::fs::try_exists(&paths.control_inbox).await.expect("check exists"),
+            tokio::fs::try_exists(&paths.control_inbox)
+                .await
+                .expect("check exists"),
             "control inbox file must exist after a delivered interrupt"
         );
     }
@@ -3136,8 +3231,12 @@ mod tests {
         let run_id = RunId::from_token("run00003");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         let mut status = write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
-        status.advance_state(RunState::Paused).expect("Running -> Paused");
-        write_atomic_json(&paths.status, &status).await.expect("write paused status");
+        status
+            .advance_state(RunState::Paused)
+            .expect("Running -> Paused");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write paused status");
 
         let outcome = interrupt(&async_root, &results_dir, "run00003", "user", None)
             .await
@@ -3149,7 +3248,9 @@ mod tests {
             "interrupting an already-Paused run must be a silent no-op (R-SA-083 idempotency)"
         );
         assert!(
-            !tokio::fs::try_exists(&paths.control_inbox).await.expect("check exists"),
+            !tokio::fs::try_exists(&paths.control_inbox)
+                .await
+                .expect("check exists"),
             "no control-inbox file should be written for a not-Running run"
         );
     }
@@ -3160,8 +3261,12 @@ mod tests {
         let run_id = RunId::from_token("run00004");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         let mut status = write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
-        status.advance_state(RunState::Complete).expect("Running -> Complete");
-        write_atomic_json(&paths.status, &status).await.expect("write complete status");
+        status
+            .advance_state(RunState::Complete)
+            .expect("Running -> Complete");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write complete status");
 
         let outcome = interrupt(&async_root, &results_dir, "run00004", "user", None)
             .await
@@ -3185,14 +3290,23 @@ mod tests {
             .await
             .expect("write interrupt request");
 
-        let first = consume_interrupt_request(&paths).await.expect("first consume");
-        assert!(first.is_some(), "first consumption must observe the request");
+        let first = consume_interrupt_request(&paths)
+            .await
+            .expect("first consume");
         assert!(
-            !tokio::fs::try_exists(&paths.control_inbox).await.expect("check exists"),
+            first.is_some(),
+            "first consumption must observe the request"
+        );
+        assert!(
+            !tokio::fs::try_exists(&paths.control_inbox)
+                .await
+                .expect("check exists"),
             "file must be deleted after consumption (delete-then-act)"
         );
 
-        let second = consume_interrupt_request(&paths).await.expect("second consume does not error");
+        let second = consume_interrupt_request(&paths)
+            .await
+            .expect("second consume does not error");
         assert!(
             second.is_none(),
             "a duplicate consumption after the file is gone must be silently absorbed, not \
@@ -3212,10 +3326,14 @@ mod tests {
             .await
             .expect("write interrupt request");
 
-        let checked = check_control_inbox_now(&paths).await.expect("check succeeds");
+        let checked = check_control_inbox_now(&paths)
+            .await
+            .expect("check succeeds");
         assert!(checked.is_some());
         assert!(
-            tokio::fs::try_exists(&paths.control_inbox).await.expect("check exists"),
+            tokio::fs::try_exists(&paths.control_inbox)
+                .await
+                .expect("check exists"),
             "a non-consuming check must leave the file in place"
         );
     }
@@ -3304,19 +3422,28 @@ mod tests {
         terminal_step.session_file = Some(transcript_path.clone());
         let mut status =
             write_running_status(&paths, &run_id, RunMode::Single, None, vec![terminal_step]).await;
-        status.advance_state(RunState::Complete).expect("Running -> Complete");
-        write_atomic_json(&paths.status, &status).await.expect("write complete status");
+        status
+            .advance_state(RunState::Complete)
+            .expect("Running -> Complete");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write complete status");
 
         let outcome = resume(&async_root, &results_dir, "run00010", None)
             .await
             .expect("resume on a terminal run with a real transcript succeeds");
 
         match outcome {
-            ResumeOutcome::RespawnFromTranscript { step_index, session_file } => {
+            ResumeOutcome::RespawnFromTranscript {
+                step_index,
+                session_file,
+            } => {
                 assert_eq!(step_index, 0);
                 assert_eq!(session_file, transcript_path);
                 assert!(
-                    tokio::fs::try_exists(&session_file).await.expect("check exists"),
+                    tokio::fs::try_exists(&session_file)
+                        .await
+                        .expect("check exists"),
                     "the resolved transcript path must point at a REAL file on disk"
                 );
             }
@@ -3335,8 +3462,12 @@ mod tests {
         terminal_step.session_file = None; // NO transcript persisted
         let mut status =
             write_running_status(&paths, &run_id, RunMode::Single, None, vec![terminal_step]).await;
-        status.advance_state(RunState::Failed).expect("Running -> Failed");
-        write_atomic_json(&paths.status, &status).await.expect("write failed status");
+        status
+            .advance_state(RunState::Failed)
+            .expect("Running -> Failed");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write failed status");
 
         let result = resume(&async_root, &results_dir, "run00011", None).await;
 
@@ -3353,15 +3484,21 @@ mod tests {
         let run_id = RunId::from_token("run00012");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         let transcript_path = dir.path().join("session-paused.jsonl");
-        tokio::fs::write(&transcript_path, b"{}\n").await.expect("write fixture");
+        tokio::fs::write(&transcript_path, b"{}\n")
+            .await
+            .expect("write fixture");
 
         let mut paused_step = super::super::StepStatus::pending("researcher");
         paused_step.status = StepState::Paused;
         paused_step.session_file = Some(transcript_path.clone());
         let mut status =
             write_running_status(&paths, &run_id, RunMode::Single, None, vec![paused_step]).await;
-        status.advance_state(RunState::Paused).expect("Running -> Paused");
-        write_atomic_json(&paths.status, &status).await.expect("write paused status");
+        status
+            .advance_state(RunState::Paused)
+            .expect("Running -> Paused");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write paused status");
 
         let outcome = resume(&async_root, &results_dir, "run00012", None)
             .await
@@ -3395,14 +3532,15 @@ mod tests {
 
         let AppendOutcome::Enqueued { file_name } = outcome;
         assert!(
-            tokio::fs::try_exists(paths.append_dir.join(&file_name)).await.expect("check exists"),
+            tokio::fs::try_exists(paths.append_dir.join(&file_name))
+                .await
+                .expect("check exists"),
             "the enqueued request file must exist on disk"
         );
 
-        let status: RunStatus = serde_json::from_slice(
-            &tokio::fs::read(&paths.status).await.expect("read status"),
-        )
-        .expect("parse status");
+        let status: RunStatus =
+            serde_json::from_slice(&tokio::fs::read(&paths.status).await.expect("read status"))
+                .expect("parse status");
         assert_eq!(
             status.pending_appends,
             Some(1),
@@ -3424,7 +3562,10 @@ mod tests {
             vec![RunnerStep::SingleStep(single_step("writer", None))],
         )
         .await;
-        assert!(result.is_err(), "append-step against a non-Chain run must be rejected");
+        assert!(
+            result.is_err(),
+            "append-step against a non-Chain run must be rejected"
+        );
     }
 
     #[tokio::test]
@@ -3447,7 +3588,10 @@ mod tests {
             &async_root,
             &results_dir,
             "run00015",
-            vec![RunnerStep::SingleStep(single_step("reviewer", Some("plan")))],
+            vec![RunnerStep::SingleStep(single_step(
+                "reviewer",
+                Some("plan"),
+            ))],
         )
         .await;
 
@@ -3500,7 +3644,10 @@ mod tests {
                     &async_root,
                     &results_dir,
                     "run00017",
-                    vec![RunnerStep::SingleStep(single_step(agent, Some("shared-name")))],
+                    vec![RunnerStep::SingleStep(single_step(
+                        agent,
+                        Some("shared-name"),
+                    ))],
                 )
                 .await
             }));
@@ -3523,12 +3670,17 @@ mod tests {
         assert_eq!(failures, 3);
 
         // Confirm exactly one request file landed on disk — never zero, never more than one.
-        let mut entries = tokio::fs::read_dir(&paths.append_dir).await.expect("list append_dir");
+        let mut entries = tokio::fs::read_dir(&paths.append_dir)
+            .await
+            .expect("list append_dir");
         let mut count = 0usize;
         while entries.next_entry().await.expect("readdir entry").is_some() {
             count += 1;
         }
-        assert_eq!(count, 1, "exactly one append-request file must exist on disk after the race");
+        assert_eq!(
+            count, 1,
+            "exactly one append-request file must exist on disk after the race"
+        );
     }
 
     #[tokio::test]
@@ -3542,19 +3694,28 @@ mod tests {
             &async_root,
             &results_dir,
             "run00018",
-            vec![RunnerStep::SingleStep(single_step("writer", Some("draft-a")))],
+            vec![RunnerStep::SingleStep(single_step(
+                "writer",
+                Some("draft-a"),
+            ))],
         )
         .await;
         let second = append_step(
             &async_root,
             &results_dir,
             "run00018",
-            vec![RunnerStep::SingleStep(single_step("reviewer", Some("draft-b")))],
+            vec![RunnerStep::SingleStep(single_step(
+                "reviewer",
+                Some("draft-b"),
+            ))],
         )
         .await;
 
         assert!(first.is_ok(), "distinct output names must both be accepted");
-        assert!(second.is_ok(), "distinct output names must both be accepted");
+        assert!(
+            second.is_ok(),
+            "distinct output names must both be accepted"
+        );
     }
 
     #[tokio::test]
@@ -3582,7 +3743,9 @@ mod tests {
         .await
         .expect("second append");
 
-        let listed = list_pending_appends(&paths.append_dir).await.expect("list succeeds");
+        let listed = list_pending_appends(&paths.append_dir)
+            .await
+            .expect("list succeeds");
         assert_eq!(listed.len(), 2);
         let names: Vec<String> = listed
             .iter()
@@ -3595,7 +3758,11 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert_eq!(names, vec!["a".to_string(), "b".to_string()], "must be in creation order");
+        assert_eq!(
+            names,
+            vec!["a".to_string(), "b".to_string()],
+            "must be in creation order"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -3610,7 +3777,9 @@ mod tests {
         // status.json still claims Running...
         write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
         // ...but an authoritative terminal ResultFile already exists.
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir results_dir");
         let result = ResultFile {
             id: run_id.clone(),
             run_id: run_id.clone(),
@@ -3622,9 +3791,13 @@ mod tests {
             session_file: None,
             results: Vec::new(),
         };
-        write_atomic_json(&paths.result, &result).await.expect("write result file");
+        write_atomic_json(&paths.result, &result)
+            .await
+            .expect("write result file");
 
-        let reconciled = reconcile_before_control_op(&paths).await.expect("reconcile succeeds");
+        let reconciled = reconcile_before_control_op(&paths)
+            .await
+            .expect("reconcile succeeds");
 
         assert_eq!(
             reconciled.state,
@@ -3634,7 +3807,9 @@ mod tests {
 
         // The repair must also have been persisted back to disk.
         let on_disk: RunStatus = serde_json::from_slice(
-            &tokio::fs::read(&paths.status).await.expect("read repaired status"),
+            &tokio::fs::read(&paths.status)
+                .await
+                .expect("read repaired status"),
         )
         .expect("parse repaired status");
         assert_eq!(on_disk.state, RunState::Complete);
@@ -3647,7 +3822,9 @@ mod tests {
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
 
-        let reconciled = reconcile_before_control_op(&paths).await.expect("reconcile succeeds");
+        let reconciled = reconcile_before_control_op(&paths)
+            .await
+            .expect("reconcile succeeds");
         assert_eq!(reconciled.state, RunState::Running);
     }
 
@@ -3670,7 +3847,9 @@ mod tests {
         let (_dir, async_root, results_dir) = temp_roots();
         let run_id = RunId::from_token("run00023");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir results_dir");
         let result = ResultFile {
             id: run_id.clone(),
             run_id: run_id.clone(),
@@ -3682,9 +3861,13 @@ mod tests {
             session_file: None,
             results: Vec::new(),
         };
-        write_atomic_json(&paths.result, &result).await.expect("write result");
+        write_atomic_json(&paths.result, &result)
+            .await
+            .expect("write result");
 
-        let (outcome, _) = poll_root_attachment(&paths, None).await.expect("poll succeeds");
+        let (outcome, _) = poll_root_attachment(&paths, None)
+            .await
+            .expect("poll succeeds");
         assert!(matches!(outcome, AttachmentPoll::Ready(_)));
     }
 
@@ -3695,7 +3878,9 @@ mod tests {
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
 
-        let (outcome, _) = poll_root_attachment(&paths, None).await.expect("poll succeeds");
+        let (outcome, _) = poll_root_attachment(&paths, None)
+            .await
+            .expect("poll succeeds");
         assert_eq!(outcome, AttachmentPoll::StillWaiting);
     }
 
@@ -3705,13 +3890,18 @@ mod tests {
         let run_id = RunId::from_token("run00025");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         let mut status = write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
-        status.advance_state(RunState::Complete).expect("Running -> Complete");
-        write_atomic_json(&paths.status, &status).await.expect("write terminal status");
+        status
+            .advance_state(RunState::Complete)
+            .expect("Running -> Complete");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write terminal status");
 
         // No ResultFile written yet — must be StillWaiting (within grace), not Failed, on the
         // very first observation.
-        let (outcome, first_observed) =
-            poll_root_attachment(&paths, None).await.expect("poll succeeds");
+        let (outcome, first_observed) = poll_root_attachment(&paths, None)
+            .await
+            .expect("poll succeeds");
         assert_eq!(outcome, AttachmentPoll::StillWaiting);
         assert!(first_observed.is_some());
     }
@@ -3722,8 +3912,12 @@ mod tests {
         let run_id = RunId::from_token("run00026");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         let mut status = write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
-        status.advance_state(RunState::Complete).expect("Running -> Complete");
-        write_atomic_json(&paths.status, &status).await.expect("write terminal status");
+        status
+            .advance_state(RunState::Complete)
+            .expect("Running -> Complete");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write terminal status");
 
         // Simulate the grace period having already elapsed by backdating
         // `terminal_first_observed_at` well beyond ROOT_ATTACHMENT_GRACE.
@@ -3743,7 +3937,12 @@ mod tests {
     // chain-root-attachment.test.ts)
     // ---------------------------------------------------------------------------------------
 
-    fn imported_child(agent: &str, output: Option<&str>, exit_code: i32, error: Option<&str>) -> SingleResult {
+    fn imported_child(
+        agent: &str,
+        output: Option<&str>,
+        exit_code: i32,
+        error: Option<&str>,
+    ) -> SingleResult {
         SingleResult {
             // SUBA-021: no usage budget on this path (see the field doc).
             usage_budget: None,
@@ -3797,15 +3996,23 @@ mod tests {
     #[tokio::test]
     async fn wait_for_imported_async_root_imports_a_completed_child_result() {
         let (_dir, async_root, results_dir) = temp_roots();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir results_dir");
         let run_id = RunId::from_token("root-run-a");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         let session_file = _dir.path().join("child.jsonl");
-        tokio::fs::write(&session_file, b"").await.expect("write session file");
+        tokio::fs::write(&session_file, b"")
+            .await
+            .expect("write session file");
 
         let mut status = write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
-        status.advance_state(RunState::Complete).expect("Running -> Complete");
-        write_atomic_json(&paths.status, &status).await.expect("write terminal status");
+        status
+            .advance_state(RunState::Complete)
+            .expect("Running -> Complete");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write terminal status");
         let result = imported_result_file(
             &run_id,
             RunState::Complete,
@@ -3813,7 +4020,9 @@ mod tests {
             Some(session_file.clone()),
             vec![imported_child("worker", Some("root output"), 0, None)],
         );
-        write_atomic_json(&paths.result, &result).await.expect("write result");
+        write_atomic_json(&paths.result, &result)
+            .await
+            .expect("write result");
 
         let imported = wait_for_imported_async_root(
             &paths,
@@ -3829,13 +4038,18 @@ mod tests {
         assert_eq!(imported.output, "root output");
         assert_eq!(imported.exit_code, 0);
         assert!(imported.success);
-        assert_eq!(imported.session_file.as_deref(), Some(session_file.as_path()));
+        assert_eq!(
+            imported.session_file.as_deref(),
+            Some(session_file.as_path())
+        );
     }
 
     #[tokio::test]
     async fn wait_for_imported_async_root_waits_for_a_running_child_to_finish() {
         let (dir, async_root, results_dir) = temp_roots();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir results_dir");
         let run_id = RunId::from_token("root-run-late");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
@@ -3853,7 +4067,9 @@ mod tests {
                 None,
                 vec![imported_child("worker", Some("late root output"), 0, None)],
             );
-            write_atomic_json(&result_path, &result).await.expect("write late result");
+            write_atomic_json(&result_path, &result)
+                .await
+                .expect("write late result");
         });
 
         let imported = wait_for_imported_async_root(
@@ -3876,20 +4092,33 @@ mod tests {
     #[tokio::test]
     async fn wait_for_imported_async_root_imports_a_failed_child_as_a_failure() {
         let (_dir, async_root, results_dir) = temp_roots();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir results_dir");
         let run_id = RunId::from_token("root-run-fail");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         let mut status = write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
-        status.advance_state(RunState::Failed).expect("Running -> Failed");
-        write_atomic_json(&paths.status, &status).await.expect("write terminal status");
+        status
+            .advance_state(RunState::Failed)
+            .expect("Running -> Failed");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write terminal status");
         let result = imported_result_file(
             &run_id,
             RunState::Failed,
             false,
             None,
-            vec![imported_child("worker", Some("root failed"), 1, Some("root failed"))],
+            vec![imported_child(
+                "worker",
+                Some("root failed"),
+                1,
+                Some("root failed"),
+            )],
         );
-        write_atomic_json(&paths.result, &result).await.expect("write result");
+        write_atomic_json(&paths.result, &result)
+            .await
+            .expect("write result");
 
         let imported = wait_for_imported_async_root(
             &paths,
@@ -3920,8 +4149,12 @@ mod tests {
             vec![super::super::StepStatus::pending("worker")],
         )
         .await;
-        status.advance_state(RunState::Complete).expect("Running -> Complete");
-        write_atomic_json(&paths.status, &status).await.expect("write terminal status");
+        status
+            .advance_state(RunState::Complete)
+            .expect("Running -> Complete");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write terminal status");
 
         // No ResultFile is ever written. The loop polls: on the first tick it observes terminal
         // status (StillWaiting, within grace); after the grace window elapses it reports Failed and
@@ -3941,7 +4174,11 @@ mod tests {
         assert_eq!(imported.exit_code, 1);
         assert!(!imported.success);
         assert!(
-            imported.error.as_deref().unwrap_or_default().contains("ended without a result file"),
+            imported
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ended without a result file"),
             "expected an `ended without a result file` diagnostic, got: {:?}",
             imported.error
         );
@@ -3983,11 +4220,16 @@ mod tests {
         tokio::fs::create_dir_all(paths.control_inbox.parent().expect("has parent"))
             .await
             .expect("mkdir control dir");
-        write_atomic_json(&paths.control_inbox, &InterruptRequest::new("race-writer", None))
-            .await
-            .expect("write request BEFORE any watcher exists");
+        write_atomic_json(
+            &paths.control_inbox,
+            &InterruptRequest::new("race-writer", None),
+        )
+        .await
+        .expect("write request BEFORE any watcher exists");
 
-        let found = check_control_inbox_now(&paths).await.expect("check succeeds");
+        let found = check_control_inbox_now(&paths)
+            .await
+            .expect("check succeeds");
         assert!(
             found.is_some(),
             "a request written before the watcher attaches must still be caught by the \

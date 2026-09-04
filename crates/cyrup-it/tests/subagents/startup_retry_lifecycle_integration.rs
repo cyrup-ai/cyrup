@@ -32,24 +32,21 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-
 use cyrup_core::{CancelToken, ModelId};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::child_protocol::MAX_CHILD_PENDING_LINE_BYTES;
 use cyrup_ext_subagents::exec::fallback::{
-    ModelOverride, SUBAGENT_STARTUP_RETRY_DELAYS_MS,
-    format_subagent_startup_retry_exhausted_error, format_subagent_startup_retry_note,
+    ModelOverride, SUBAGENT_STARTUP_RETRY_DELAYS_MS, format_subagent_startup_retry_exhausted_error,
+    format_subagent_startup_retry_note,
 };
 use cyrup_ext_subagents::exec::output::{INTERRUPTED_FINAL_OUTPUT, OutputCap};
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult};
 use cyrup_ext_subagents::fork_context::ForkContext;
-use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::SpawnCommand;
-
-
+use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -192,7 +189,10 @@ async fn run_fixture_with(
     // concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     let agent = base_agent_config("fixture-model");
     tokio::time::timeout(
@@ -287,7 +287,10 @@ async fn a_cancel_during_the_startup_backoff_abandons_the_run_before_relaunching
          ignored the signal: {:?}",
         result.model_attempts
     );
-    assert_ne!(result.exit_code, 0, "a cancelled run is not a success: {result:?}");
+    assert_ne!(
+        result.exit_code, 0,
+        "a cancelled run is not a success: {result:?}"
+    );
 }
 
 /// A SOFT INTERRUPT landing during a startup-retry backoff is pi's PAUSED SUCCESS: exit 0, a
@@ -365,7 +368,11 @@ async fn with_no_signal_the_backoff_ladder_runs_to_exhaustion_and_reports_it_as_
         "an undisturbed backoff spends the whole launch budget: {:?}",
         result.model_attempts
     );
-    assert_eq!(result.error.as_deref(), Some(exhausted.as_str()), "{result:?}");
+    assert_eq!(
+        result.error.as_deref(),
+        Some(exhausted.as_str()),
+        "{result:?}"
+    );
     assert_eq!(
         result.final_output.as_deref(),
         Some(exhausted.as_str()),
@@ -438,7 +445,10 @@ async fn the_startup_retry_note_reaches_the_live_progress_surface_of_the_relaunc
     let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
         spawn_command: Some(SpawnCommand {
             binary: fixture,
-            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            base_args: vec![
+                "--fixture-script".to_string(),
+                script_path.display().to_string(),
+            ],
         }),
         roots: Roots::sandboxed(home.path()),
         ..SubagentExtensionConfig::default()

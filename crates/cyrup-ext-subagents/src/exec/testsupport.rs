@@ -1,6 +1,11 @@
 //! Fixtures shared by more than one `exec` submodule's tests.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::discovery::types::{OutputMode, SystemPromptMode};
 use crate::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
@@ -75,7 +80,10 @@ pub(crate) fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions
         runtime_cwd: None,
         include_progress: None,
         agent_scope: None,
-        acceptance: Some(AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![])),
+        acceptance: Some(AcceptanceContract::explicit(
+            AcceptanceStatus::NotRequired,
+            vec![],
+        )),
         fork_context: ForkContext::fresh(),
         live_events: None,
         parent_session_id: None,
@@ -104,16 +112,19 @@ pub(crate) fn delivered_system_prompt(argv: &[String]) -> Option<String> {
         .iter()
         .position(|a| a == "--system-prompt" || a == "--append-system-prompt")?;
     assert!(
-        !argv.iter().any(|a| a.starts_with("--system-prompt=")
-            || a.starts_with("--append-system-prompt=")),
+        !argv
+            .iter()
+            .any(|a| a.starts_with("--system-prompt=") || a.starts_with("--append-system-prompt=")),
         "SUBA-030: the persona must NEVER ride on argv as `--flag=<body>`; argv was {argv:?}"
     );
     let path = argv
         .get(idx + 1)
         .unwrap_or_else(|| panic!("the flag must be followed by a spill path; argv {argv:?}"));
-    Some(std::fs::read_to_string(path).unwrap_or_else(|e| {
-        panic!("the spill file named on argv must be readable ({path}): {e}")
-    }))
+    Some(
+        std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!("the spill file named on argv must be readable ({path}): {e}")
+        }),
+    )
 }
 
 /// Read back the file `--system-prompt`/`--append-system-prompt` points at in a built plan.

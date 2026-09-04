@@ -44,9 +44,9 @@ use super::store::{
     update_mission, validate_mission_id_str,
 };
 use super::{
-    MissionArtifact, MissionArtifactKind, MissionCreateInput, MissionError, MissionRecord,
-    MissionResult, MissionRunLink, MissionRunMode, MissionStatus, MissionStoreConfig,
-    MissionStoreLocation, MissionTokenUsage, MissionUpdateInput, MISSION_SCHEMA_VERSION,
+    MISSION_SCHEMA_VERSION, MissionArtifact, MissionArtifactKind, MissionCreateInput, MissionError,
+    MissionRecord, MissionResult, MissionRunLink, MissionRunMode, MissionStatus,
+    MissionStoreConfig, MissionStoreLocation, MissionTokenUsage, MissionUpdateInput,
 };
 
 /// pi `MISSION_BINDING_FILE` (`lifecycle.ts:10`).
@@ -95,20 +95,25 @@ pub struct MissionLaunchBinding {
 /// `parallel` children.
 fn workflow_objective(params: &MissionLaunchParams) -> Option<String> {
     let non_blank = |value: Option<&str>| -> Option<String> {
-        value.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+        value
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     };
     if let Some(task) = non_blank(params.task.as_deref()) {
         return Some(task);
     }
     if let Some(tasks) = &params.tasks
-        && let Some(task) =
-            tasks.iter().find_map(|item| non_blank(item.get("task").and_then(Value::as_str)))
+        && let Some(task) = tasks
+            .iter()
+            .find_map(|item| non_blank(item.get("task").and_then(Value::as_str)))
     {
         return Some(task);
     }
     if let Some(chain) = &params.chain {
-        if let Some(task) =
-            chain.iter().find_map(|step| non_blank(step.get("task").and_then(Value::as_str)))
+        if let Some(task) = chain
+            .iter()
+            .find_map(|step| non_blank(step.get("task").and_then(Value::as_str)))
         {
             return Some(task);
         }
@@ -133,7 +138,11 @@ fn workflow_objective(params: &MissionLaunchParams) -> Option<String> {
 /// that first line is blank, ellipsized at 100 characters.
 fn concise_title(objective: &str) -> String {
     let first_line = objective.split(['\r', '\n']).next().unwrap_or("").trim();
-    let base = if first_line.is_empty() { objective.trim() } else { first_line };
+    let base = if first_line.is_empty() {
+        objective.trim()
+    } else {
+        first_line
+    };
     if base.chars().count() > 100 {
         let head: String = base.chars().take(97).collect();
         format!("{head}...")
@@ -169,8 +178,7 @@ pub fn prepare_mission_launch(
     let objective = workflow_objective(params);
     // pi: `input.config?.enabled !== false` — an ABSENT flag means enabled.
     let missions_enabled = config.and_then(|c| c.enabled) != Some(false);
-    let should_create =
-        params.mission.is_some() || (missions_enabled && objective.is_some());
+    let should_create = params.mission.is_some() || (missions_enabled && objective.is_some());
     if !has_mission_id && !should_create {
         return Ok(None);
     }
@@ -183,7 +191,10 @@ pub fn prepare_mission_launch(
         update_mission(
             &location,
             &mission_id,
-            &MissionUpdateInput { status: Some(MissionStatus::Active), ..Default::default() },
+            &MissionUpdateInput {
+                status: Some(MissionStatus::Active),
+                ..Default::default()
+            },
             crate::time::now_epoch_millis(),
             None,
         )?;
@@ -201,7 +212,11 @@ pub fn prepare_mission_launch(
     // `mission?.title || conciseTitle(objective!)`: upstream asserts `objective` is present here
     // via `!`, and it is — `shouldCreate` was true and `hasMissionId` false, so either `mission`
     // was supplied (giving a title) or an objective was found.
-    let title = match mission.as_ref().map(|m| m.title.clone()).filter(|t| !t.is_empty()) {
+    let title = match mission
+        .as_ref()
+        .map(|m| m.title.clone())
+        .filter(|t| !t.is_empty())
+    {
         Some(title) => title,
         None => concise_title(objective.as_deref().unwrap_or_default()),
     };
@@ -300,11 +315,7 @@ fn run_status_for_result(outcome: &LaunchOutcome) -> &'static str {
 /// pi `missionStatusForRun` (`lifecycle.ts:104-114`) — the mission status one run's status
 /// implies, in upstream's exact branch order. Note branch three: a GOAL mission stays `active`
 /// whatever the run did, so the turn-end driver keeps considering it.
-fn mission_status_for_run(
-    record: &MissionRecord,
-    run_id: &str,
-    run_status: &str,
-) -> MissionStatus {
+fn mission_status_for_run(record: &MissionRecord, run_id: &str, run_status: &str) -> MissionStatus {
     if record.status.is_terminal() {
         return record.status;
     }
@@ -319,7 +330,10 @@ fn mission_status_for_run(
     }
     let other_active = record.runs.iter().any(|run| {
         run.run_id != run_id
-            && run.status.as_deref().is_some_and(|s| matches!(s, "active" | "queued" | "running"))
+            && run
+                .status
+                .as_deref()
+                .is_some_and(|s| matches!(s, "active" | "queued" | "running"))
     });
     if other_active {
         return MissionStatus::Active;
@@ -339,7 +353,10 @@ fn usage_for_result(outcome: &LaunchOutcome) -> Option<MissionTokenUsage> {
         .map(|child| {
             let usage = child.get("usage");
             let read = |key: &str| {
-                usage.and_then(|u| u.get(key)).and_then(Value::as_u64).unwrap_or(0)
+                usage
+                    .and_then(|u| u.get(key))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
             };
             read("input") + read("output")
         })
@@ -353,7 +370,9 @@ fn usage_from_unknown(value: Option<&Value>) -> Option<MissionTokenUsage> {
     // `Number.isSafeInteger(total) && total >= 0` — the upper bound is JS's 2^53-1.
     (0..=9_007_199_254_740_991)
         .contains(&total)
-        .then_some(MissionTokenUsage { tokens: total.unsigned_abs() })
+        .then_some(MissionTokenUsage {
+            tokens: total.unsigned_abs(),
+        })
 }
 
 /// pi `artifactsForResult` (`lifecycle.ts:127-143`) — everything a settled run points at.
@@ -469,7 +488,11 @@ fn persisted_binding(binding: &MissionLaunchBinding) -> PersistedMissionBinding<
         mission_id: &binding.mission_id,
         project_root: binding.location.project_root.to_string_lossy().into_owned(),
         mission_dir: binding.location.mission_dir.to_string_lossy().into_owned(),
-        global_index_dir: binding.location.global_index_dir.to_string_lossy().into_owned(),
+        global_index_dir: binding
+            .location
+            .global_index_dir
+            .to_string_lossy()
+            .into_owned(),
         write_global_index: binding.location.write_global_index,
         retain_terminal: binding.location.retain_terminal,
     }
@@ -514,7 +537,9 @@ pub fn attach_mission_to_launch_result(
     let Some(run_id) = run_id else {
         let current = read_mission(&binding.location, &binding.mission_id)?;
         let active_run_exists = current.runs.iter().any(|run| {
-            run.status.as_deref().is_some_and(|s| matches!(s, "active" | "queued" | "running"))
+            run.status
+                .as_deref()
+                .is_some_and(|s| matches!(s, "active" | "queued" | "running"))
         });
         let mission = if outcome.is_error {
             update_mission(
@@ -569,7 +594,11 @@ pub fn attach_mission_to_launch_result(
             status: Some(mission_status_for_run(&current, &run_id, run_status)),
             add_runs: vec![run],
             add_artifacts: artifacts_for_result(&outcome),
-            summary: if run_status == "active" { None } else { summary_text.clone() },
+            summary: if run_status == "active" {
+                None
+            } else {
+                summary_text.clone()
+            },
             // pi guards this on TRUTHINESS (`results[0]?.acceptance ? … : {}`, `lifecycle.ts:210`),
             // so a `null`/`false` acceptance is NOT carried across — only a real ledger is.
             acceptance: single_child
@@ -589,9 +618,7 @@ pub fn attach_mission_to_launch_result(
         if status_path.exists() {
             let terminal_state = std::fs::read_to_string(&status_path)
                 .map_err(|e| e.to_string())
-                .and_then(|raw| {
-                    serde_json::from_str::<Value>(&raw).map_err(|e| e.to_string())
-                })
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).map_err(|e| e.to_string()))
                 .map_err(|e| {
                     MissionError::invalid(format!(
                         "Failed to reconcile mission from terminal async status '{}': {e}",
@@ -620,8 +647,8 @@ pub fn attach_mission_to_launch_result(
                 // (`lifecycle.ts:216-229`), so a failure INSIDE the reconciliation also surfaces
                 // under the `Failed to reconcile mission from terminal async status '<path>'`
                 // wrapper rather than bare.
-                let synced = sync_mission_from_async_completion(&Value::Object(event))
-                    .map_err(|e| {
+                let synced =
+                    sync_mission_from_async_completion(&Value::Object(event)).map_err(|e| {
                         MissionError::invalid(format!(
                             "Failed to reconcile mission from terminal async status '{}': {e}",
                             status_path.display()
@@ -666,9 +693,7 @@ pub fn attach_mission_to_launch_result(
         .is_some_and(|text| serde_json::from_str::<Value>(text).is_ok());
 
     let content = match last_text_index {
-        Some(index)
-            if binding.announce_in_content && !has_structured_output && !text_is_json =>
-        {
+        Some(index) if binding.announce_in_content && !has_structured_output && !text_is_json => {
             outcome
                 .content
                 .iter()
@@ -721,7 +746,9 @@ fn parse_persisted_binding(value: &Value, source: &str) -> MissionResult<Mission
         .ok_or_else(|| MissionError::invalid(format!("{source} must be an object")))?;
     if input.get("schemaVersion").and_then(Value::as_u64) != Some(u64::from(MISSION_SCHEMA_VERSION))
     {
-        return Err(MissionError::invalid(format!("{source}.schemaVersion must be 1")));
+        return Err(MissionError::invalid(format!(
+            "{source}.schemaVersion must be 1"
+        )));
     }
     let mut fields = Vec::with_capacity(3);
     for field in ["projectRoot", "missionDir", "globalIndexDir"] {
@@ -789,9 +816,8 @@ pub fn read_mission_binding(async_dir: &Path) -> MissionResult<Option<MissionLau
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(MissionError::io(&binding_path, err)),
     };
-    let value: Value = serde_json::from_str(&raw).map_err(|e| {
-        MissionError::invalid(format!("{}: {e}", binding_path.to_string_lossy()))
-    })?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|e| MissionError::invalid(format!("{}: {e}", binding_path.to_string_lossy())))?;
     parse_persisted_binding(&value, &binding_path.to_string_lossy()).map(Some)
 }
 
@@ -808,14 +834,20 @@ pub fn read_mission_binding(async_dir: &Path) -> MissionResult<Option<MissionLau
 /// [`MissionError::Invalid`] when the event carries no run id at all, or when the binding does not
 /// validate; [`MissionError::Io`]/[`MissionError::NotFound`] as [`update_mission`] raises them.
 pub fn sync_mission_from_async_completion(event: &Value) -> MissionResult<Option<MissionRecord>> {
-    let Some(map) = event.as_object() else { return Ok(None) };
-    let Some(async_dir) =
-        map.get("asyncDir").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+    let Some(map) = event.as_object() else {
+        return Ok(None);
+    };
+    let Some(async_dir) = map
+        .get("asyncDir")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
     else {
         return Ok(None);
     };
     let async_dir_path = Path::new(async_dir);
-    let Some(binding) = read_mission_binding(async_dir_path)? else { return Ok(None) };
+    let Some(binding) = read_mission_binding(async_dir_path)? else {
+        return Ok(None);
+    };
     let run_id = map
         .get("runId")
         .and_then(Value::as_str)
@@ -824,10 +856,12 @@ pub fn sync_mission_from_async_completion(event: &Value) -> MissionResult<Option
         .to_string();
     let run_status = match map.get("state").and_then(Value::as_str) {
         Some(state) => state.to_string(),
-        None => {
-            if map.get("success") == Some(&Value::Bool(true)) { "completed" } else { "failed" }
-                .to_string()
+        None => if map.get("success") == Some(&Value::Bool(true)) {
+            "completed"
+        } else {
+            "failed"
         }
+        .to_string(),
     };
     let current = match read_mission(&binding.location, &binding.mission_id) {
         Ok(record) => record,
@@ -841,12 +875,18 @@ pub fn sync_mission_from_async_completion(event: &Value) -> MissionResult<Option
     let mut artifacts = vec![
         MissionArtifact {
             kind: MissionArtifactKind::Status,
-            path: async_dir_path.join("status.json").to_string_lossy().into_owned(),
+            path: async_dir_path
+                .join("status.json")
+                .to_string_lossy()
+                .into_owned(),
             description: None,
         },
         MissionArtifact {
             kind: MissionArtifactKind::Other,
-            path: async_dir_path.join("events.jsonl").to_string_lossy().into_owned(),
+            path: async_dir_path
+                .join("events.jsonl")
+                .to_string_lossy()
+                .into_owned(),
             description: Some("Lifecycle events".to_string()),
         },
     ];
@@ -865,7 +905,9 @@ pub fn sync_mission_from_async_completion(event: &Value) -> MissionResult<Option
     let event_results = map.get("results").and_then(Value::as_array);
     if let Some(results) = event_results {
         for result in results {
-            let Some(child) = result.as_object() else { continue };
+            let Some(child) = result.as_object() else {
+                continue;
+            };
             if let Some(path) = child.get("artifactPath").and_then(Value::as_str) {
                 artifacts.push(MissionArtifact {
                     kind: MissionArtifactKind::Output,
@@ -943,11 +985,7 @@ pub fn sync_mission_from_async_completion(event: &Value) -> MissionResult<Option
 /// whose mission record has been deleted appends one line to its own `events.jsonl` and moves on.
 /// Entirely best-effort — "Mission bookkeeping is secondary to preserving the completed async
 /// result."
-fn append_sync_skipped_breadcrumb(
-    async_dir: &Path,
-    run_id: &str,
-    binding: &MissionLaunchBinding,
-) {
+fn append_sync_skipped_breadcrumb(async_dir: &Path, run_id: &str, binding: &MissionLaunchBinding) {
     use std::io::Write as _;
     let Ok(mission_path) = mission_record_path(&binding.location, &binding.mission_id) else {
         return;
@@ -960,8 +998,10 @@ fn append_sync_skipped_breadcrumb(
         "reason": "mission-record-missing",
         "missionPath": mission_path.to_string_lossy(),
     });
-    let Ok(mut file) =
-        std::fs::OpenOptions::new().create(true).append(true).open(async_dir.join("events.jsonl"))
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(async_dir.join("events.jsonl"))
     else {
         return;
     };
@@ -997,7 +1037,11 @@ mod tests {
     fn scoped(root: &Path) -> MissionStoreConfig {
         MissionStoreConfig {
             global_index_dir: Some(
-                root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+                root.join("agent")
+                    .join("missions")
+                    .join("index")
+                    .to_string_lossy()
+                    .into_owned(),
             ),
             ..Default::default()
         }
@@ -1031,22 +1075,26 @@ mod tests {
     #[test]
     fn mission_false_opts_out_entirely() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(prepared(
-            tmp.path(),
-            MissionLaunchParams {
-                task: Some("do it".to_string()),
-                mission: Some(Value::Bool(false)),
-                ..Default::default()
-            },
-        )
-        .is_none());
-        assert!(list_missions(&resolve_mission_store_location(
-            tmp.path(),
-            Some(&scoped(tmp.path())),
-            None
-        ))
-        .records
-        .is_empty());
+        assert!(
+            prepared(
+                tmp.path(),
+                MissionLaunchParams {
+                    task: Some("do it".to_string()),
+                    mission: Some(Value::Bool(false)),
+                    ..Default::default()
+                },
+            )
+            .is_none()
+        );
+        assert!(
+            list_missions(&resolve_mission_store_location(
+                tmp.path(),
+                Some(&scoped(tmp.path())),
+                None
+            ))
+            .records
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1058,10 +1106,18 @@ mod tests {
     #[test]
     fn missions_disabled_suppresses_the_automatic_create_but_not_an_explicit_one() {
         let tmp = tempfile::tempdir().unwrap();
-        let disabled = MissionStoreConfig { enabled: Some(false), ..scoped(tmp.path()) };
-        let params = MissionLaunchParams { task: Some("do it".to_string()), ..Default::default() };
+        let disabled = MissionStoreConfig {
+            enabled: Some(false),
+            ..scoped(tmp.path())
+        };
+        let params = MissionLaunchParams {
+            task: Some("do it".to_string()),
+            ..Default::default()
+        };
         assert!(
-            prepare_mission_launch(&params, tmp.path(), Some(&disabled), None).unwrap().is_none()
+            prepare_mission_launch(&params, tmp.path(), Some(&disabled), None)
+                .unwrap()
+                .is_none()
         );
         let explicit = MissionLaunchParams {
             mission: Some(serde_json::json!({"title": "Explicit"})),
@@ -1097,7 +1153,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let created = prepared(
             tmp.path(),
-            MissionLaunchParams { task: Some("first".to_string()), ..Default::default() },
+            MissionLaunchParams {
+                task: Some("first".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         let attached = prepared(
@@ -1113,7 +1172,10 @@ mod tests {
         assert_eq!(attached.mission_id, created.mission_id);
 
         let missing = prepare_mission_launch(
-            &MissionLaunchParams { mission_id: Some("nope".to_string()), ..Default::default() },
+            &MissionLaunchParams {
+                mission_id: Some("nope".to_string()),
+                ..Default::default()
+            },
             tmp.path(),
             Some(&scoped(tmp.path())),
             None,
@@ -1137,7 +1199,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_mission(&binding.location, &binding.mission_id).unwrap().objective,
+            read_mission(&binding.location, &binding.mission_id)
+                .unwrap()
+                .objective,
             "nested work"
         );
     }
@@ -1147,7 +1211,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let binding = prepared(
             tmp.path(),
-            MissionLaunchParams { task: Some("build".to_string()), ..Default::default() },
+            MissionLaunchParams {
+                task: Some("build".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         let attached = attach_mission_to_launch_result(
@@ -1185,9 +1252,18 @@ mod tests {
             cyrup_core::Content::Text { text, .. } => text.to_string(),
             other => panic!("expected text, got {other:?}"),
         };
-        assert_eq!(text, format!("all done\nMission: {} (completed)", record.id));
-        assert_eq!(attached.details.as_ref().unwrap()["missionId"], record.id.as_str());
-        assert_eq!(attached.details.as_ref().unwrap()["mission"]["id"], record.id.as_str());
+        assert_eq!(
+            text,
+            format!("all done\nMission: {} (completed)", record.id)
+        );
+        assert_eq!(
+            attached.details.as_ref().unwrap()["missionId"],
+            record.id.as_str()
+        );
+        assert_eq!(
+            attached.details.as_ref().unwrap()["mission"]["id"],
+            record.id.as_str()
+        );
     }
 
     #[test]
@@ -1195,7 +1271,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let binding = prepared(
             tmp.path(),
-            MissionLaunchParams { task: Some("build".to_string()), ..Default::default() },
+            MissionLaunchParams {
+                task: Some("build".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         attach_mission_to_launch_result(
@@ -1220,7 +1299,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let binding = prepared(
             tmp.path(),
-            MissionLaunchParams { task: Some("build".to_string()), ..Default::default() },
+            MissionLaunchParams {
+                task: Some("build".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         attach_mission_to_launch_result(
@@ -1248,7 +1330,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let binding = prepared(
             tmp.path(),
-            MissionLaunchParams { task: Some("build".to_string()), ..Default::default() },
+            MissionLaunchParams {
+                task: Some("build".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         let json_result = attach_mission_to_launch_result(
@@ -1266,7 +1351,10 @@ mod tests {
             cyrup_core::Content::Text { text, .. } => text.to_string(),
             other => panic!("{other:?}"),
         };
-        assert_eq!(text, r#"{"ok":true}"#, "a JSON payload must not be prose-appended to");
+        assert_eq!(
+            text, r#"{"ok":true}"#,
+            "a JSON payload must not be prose-appended to"
+        );
 
         let structured = attach_mission_to_launch_result(
             &binding,
@@ -1295,7 +1383,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let binding = prepared(
             tmp.path(),
-            MissionLaunchParams { task: Some("build".to_string()), ..Default::default() },
+            MissionLaunchParams {
+                task: Some("build".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         let structured = attach_mission_to_launch_result(
@@ -1346,7 +1437,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let binding = prepared(
             tmp.path(),
-            MissionLaunchParams { task: Some("background".to_string()), ..Default::default() },
+            MissionLaunchParams {
+                task: Some("background".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         let async_dir = tmp.path().join("async").join("run-bg");
@@ -1369,15 +1463,28 @@ mod tests {
         assert_eq!(read_back.mission_id, binding.mission_id);
         assert_eq!(read_back.location, binding.location);
         assert!(!read_back.auto_created);
-        assert!(!read_back.announce_in_content, "a persisted binding never re-announces");
+        assert!(
+            !read_back.announce_in_content,
+            "a persisted binding never re-announces"
+        );
 
         let record = read_mission(&binding.location, &binding.mission_id).unwrap();
         assert_eq!(record.status, MissionStatus::Active);
         assert_eq!(record.runs[0].status.as_deref(), Some("active"));
         assert!(record.runs[0].completed_at.is_none());
         assert_eq!(record.artifacts.len(), 2);
-        assert!(record.artifacts.iter().any(|a| a.path.ends_with("status.json")));
-        assert!(record.artifacts.iter().any(|a| a.path.ends_with("events.jsonl")));
+        assert!(
+            record
+                .artifacts
+                .iter()
+                .any(|a| a.path.ends_with("status.json"))
+        );
+        assert!(
+            record
+                .artifacts
+                .iter()
+                .any(|a| a.path.ends_with("events.jsonl"))
+        );
         // An active run contributes no summary.
         assert!(record.summary.is_none());
     }
@@ -1393,7 +1500,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let binding = prepared(
             tmp.path(),
-            MissionLaunchParams { task: Some("background".to_string()), ..Default::default() },
+            MissionLaunchParams {
+                task: Some("background".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         let async_dir = tmp.path().join("async").join("run-bg2");
@@ -1423,7 +1533,11 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(synced.status, MissionStatus::Completed);
-        assert_eq!(synced.runs.len(), 1, "the same runId is a MERGE, not a second link");
+        assert_eq!(
+            synced.runs.len(),
+            1,
+            "the same runId is a MERGE, not a second link"
+        );
         assert_eq!(synced.runs[0].status.as_deref(), Some("complete"));
         assert_eq!(synced.runs[0].usage.unwrap().tokens, 512);
         // The RECORD-level `usage` is written only for a GOAL mission
@@ -1436,8 +1550,16 @@ mod tests {
     #[test]
     fn sync_is_a_no_op_without_an_async_dir_or_a_binding() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(sync_mission_from_async_completion(&Value::Null).unwrap().is_none());
-        assert!(sync_mission_from_async_completion(&serde_json::json!({})).unwrap().is_none());
+        assert!(
+            sync_mission_from_async_completion(&Value::Null)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            sync_mission_from_async_completion(&serde_json::json!({}))
+                .unwrap()
+                .is_none()
+        );
         assert!(
             sync_mission_from_async_completion(&serde_json::json!({
                 "asyncDir": tmp.path().to_string_lossy(),
@@ -1454,7 +1576,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let binding = prepared(
             tmp.path(),
-            MissionLaunchParams { task: Some("bg".to_string()), ..Default::default() },
+            MissionLaunchParams {
+                task: Some("bg".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         let async_dir = tmp.path().join("async").join("run-noid");
@@ -1473,7 +1598,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let binding = prepared(
             tmp.path(),
-            MissionLaunchParams { task: Some("bg".to_string()), ..Default::default() },
+            MissionLaunchParams {
+                task: Some("bg".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         let async_dir = tmp.path().join("async").join("run-gone");
@@ -1499,7 +1627,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let binding = prepared(
             tmp.path(),
-            MissionLaunchParams { task: Some("bg".to_string()), ..Default::default() },
+            MissionLaunchParams {
+                task: Some("bg".to_string()),
+                ..Default::default()
+            },
         )
         .unwrap();
         let attached = attach_mission_to_launch_result(
@@ -1522,7 +1653,10 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(text, "refused before launch");
-        assert_eq!(attached.details.as_ref().unwrap()["missionId"], record.id.as_str());
+        assert_eq!(
+            attached.details.as_ref().unwrap()["missionId"],
+            record.id.as_str()
+        );
     }
 
     #[test]
@@ -1551,7 +1685,11 @@ mod tests {
         )
         .unwrap();
         let record = read_mission(&binding.location, &binding.mission_id).unwrap();
-        assert_eq!(record.status, MissionStatus::Active, "a goal mission does not self-close");
+        assert_eq!(
+            record.status,
+            MissionStatus::Active,
+            "a goal mission does not self-close"
+        );
         assert_eq!(record.usage.unwrap().tokens, 10);
     }
 
@@ -1562,6 +1700,9 @@ mod tests {
         let title = concise_title(&long);
         assert_eq!(title.chars().count(), 100);
         assert!(title.ends_with("..."));
-        assert_eq!(concise_title("\n\nsecond line wins when the first is blank"), "second line wins when the first is blank");
+        assert_eq!(
+            concise_title("\n\nsecond line wins when the first is blank"),
+            "second line wins when the first is blank"
+        );
     }
 }

@@ -28,12 +28,12 @@
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
-use crate::{reanchor_inline_region, App, RebuildBackend, UiTheme};
+use crate::{App, RebuildBackend, UiTheme, reanchor_inline_region};
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Size};
-use super::harness::*;
 
 const W: u16 = 80;
 const H: u16 = 24;
@@ -103,7 +103,10 @@ impl Backend for CaptureBackend {
         self.inner.show_cursor()
     }
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        Ok(Position { x: 0, y: self.cursor_y })
+        Ok(Position {
+            x: 0,
+            y: self.cursor_y,
+        })
     }
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
         let p = position.into();
@@ -117,10 +120,22 @@ impl Backend for CaptureBackend {
         self.inner.clear_region(clear_type)
     }
     fn size(&self) -> io::Result<Size> {
-        Ok(Size { width: W, height: H })
+        Ok(Size {
+            width: W,
+            height: H,
+        })
     }
     fn window_size(&mut self) -> io::Result<WindowSize> {
-        Ok(WindowSize { columns_rows: Size { width: W, height: H }, pixels: Size { width: 0, height: 0 } })
+        Ok(WindowSize {
+            columns_rows: Size {
+                width: W,
+                height: H,
+            },
+            pixels: Size {
+                width: 0,
+                height: 0,
+            },
+        })
     }
     fn flush(&mut self) -> io::Result<()> {
         Backend::flush(&mut self.inner)
@@ -148,7 +163,8 @@ impl RebuildBackend for CaptureBackend {
     fn reanchor_inline(&mut self, term_height: u16, old_height: u16, new_height: u16) {
         // Emit the SAME erase + re-anchor the production `CrosstermBackend<Stdout>` emits, into the
         // shared buffer, and track where the cursor is left so `rebuild` carries the anchor forward.
-        self.cursor_y = reanchor_inline_region(&mut self.inner, term_height, old_height, new_height);
+        self.cursor_y =
+            reanchor_inline_region(&mut self.inner, term_height, old_height, new_height);
     }
 }
 
@@ -168,7 +184,14 @@ struct Screen {
 
 impl Screen {
     fn new(w: usize, h: usize) -> Self {
-        Screen { w, h, grid: vec![vec![' '; w]; h], scrollback: Vec::new(), cx: 0, cy: 0 }
+        Screen {
+            w,
+            h,
+            grid: vec![vec![' '; w]; h],
+            scrollback: Vec::new(),
+            cx: 0,
+            cy: 0,
+        }
     }
 
     fn scroll_up(&mut self, n: usize) {
@@ -296,8 +319,10 @@ impl Screen {
         if params.starts_with('?') {
             return; // private modes (?25h/l cursor, ?2026h/l sync, ?7h/l wrap) — no screen effect here
         }
-        let nums: Vec<usize> =
-            params.split(';').map(|p| p.parse::<usize>().unwrap_or(0)).collect();
+        let nums: Vec<usize> = params
+            .split(';')
+            .map(|p| p.parse::<usize>().unwrap_or(0))
+            .collect();
         let p0 = nums.first().copied().unwrap_or(0);
         match final_c {
             'H' | 'f' => {
@@ -356,7 +381,9 @@ fn rows_containing(rows: &[String], needle: &str) -> usize {
 /// Count the editor's horizontal rule rows (a full-width `─` run; the editor draws exactly one top +
 /// one bottom rule, so a single un-stacked editor yields 2).
 fn rule_rows(rows: &[String]) -> usize {
-    rows.iter().filter(|r| r.chars().filter(|&c| c == '─').count() >= 10).count()
+    rows.iter()
+        .filter(|r| r.chars().filter(|&c| c == '─').count() >= 10)
+        .count()
 }
 
 /// Count non-overlapping-ish occurrences of a byte subsequence (used to sanity-check that an erase
@@ -390,8 +417,10 @@ fn hint_bar_and_editor_rules_do_not_stack_as_the_live_region_grows() {
 
     // Grow the editor 2..=8 logical lines → viewport 7..=13 → 7 reconstructions, hints stay visible.
     for n in 2..=8u16 {
-        let text: String =
-            (1..=n).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let text: String = (1..=n)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         app.editor_mut().set_text(&text);
         app.draw().unwrap();
     }
@@ -401,18 +430,23 @@ fn hint_bar_and_editor_rules_do_not_stack_as_the_live_region_grows() {
     let rules = rule_rows(&rows);
 
     assert_eq!(
-        interrupts, 1,
+        interrupts,
+        1,
         "keybinding-hints bar STACKED: the user sees {interrupts} `interrupt` hint bars, expected 1.\n{}",
         rows.join("\n")
     );
     assert_eq!(
-        rules, 2,
+        rules,
+        2,
         "editor rules STACKED: {rules} rule rows on screen, expected 2 (one editor's top+bottom).\n{}",
         rows.join("\n")
     );
     // Sanity: the growth really did drive several reconstructions (each one erases-then-reserves).
     let erases = count_subseq(&app.terminal().backend().bytes(), b"\x1b[J");
-    assert!(erases >= 6, "expected an erase per reconstruction, saw {erases}");
+    assert!(
+        erases >= 6,
+        "expected an erase per reconstruction, saw {erases}"
+    );
 }
 
 /// GROWTH then SHRINK with a streaming assistant turn (the task's push_user → stream → commit flow).
@@ -432,12 +466,14 @@ fn streaming_turn_grows_and_commits_without_stacking_chrome() {
     // Stream a growing multi-line answer; each newline grows the wrapped height → reconstruction.
     let mut peak_bytes = Vec::new();
     for i in 1..=8u16 {
-        app.transcript_mut().push_assistant_delta(&format!("answer line {i}\n"));
+        app.transcript_mut()
+            .push_assistant_delta(&format!("answer line {i}\n"));
         app.draw().unwrap();
         peak_bytes = app.terminal().backend().bytes();
     }
     // The last streamed delta carries a sentinel that word-wrap cannot split.
-    app.transcript_mut().push_assistant_delta("final tail SENTINELZZ");
+    app.transcript_mut()
+        .push_assistant_delta("final tail SENTINELZZ");
     app.draw().unwrap();
     let at_peak = replay(&app.terminal().backend().bytes());
     let _ = peak_bytes;
@@ -486,7 +522,10 @@ fn streaming_turn_grows_and_commits_without_stacking_chrome() {
         after.join("\n")
     );
     // The in-memory flush accumulator agrees (test-visible mirror of the `insert_before` payload).
-    assert!(app.scrollback_text().contains("SENTINELZZ"), "flush accumulator missing the answer");
+    assert!(
+        app.scrollback_text().contains("SENTINELZZ"),
+        "flush accumulator missing the answer"
+    );
 }
 
 // -------------------------------------------------------- the replay itself catches stacking ----

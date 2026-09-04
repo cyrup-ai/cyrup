@@ -78,7 +78,11 @@ impl CheckboxSelector {
     ) -> Self {
         let rows: Vec<ModelRow> = catalog
             .into_iter()
-            .map(|(id, label, provider, _desc)| ModelRow { id, label, provider })
+            .map(|(id, label, provider, _desc)| ModelRow {
+                id,
+                label,
+                provider,
+            })
             .collect();
         CheckboxSelector {
             rows,
@@ -118,14 +122,23 @@ impl CheckboxSelector {
     /// `setRefreshStatus`, `:178-180`). An empty message clears it.
     pub fn set_refresh_status(&mut self, message: impl Into<String>) {
         let message = message.into();
-        self.refresh_status = if message.is_empty() { None } else { Some(message) };
+        self.refresh_status = if message.is_empty() {
+            None
+        } else {
+            Some(message)
+        };
     }
 
     /// The fuzzy search text for one catalog row — `getModelSearchText({id, provider, name})`
     /// (`model-search.ts:16-19`), the same provider-first shape [`crate::model_selector`] uses so a
     /// `provider/id` query ranks the way it does in `/model`.
     fn search_text(row: &ModelRow) -> String {
-        format!("{p} {p}/{id} {p} {id} {name}", p = row.provider, id = row.id, name = row.label)
+        format!(
+            "{p} {p}/{id} {p} {id} {name}",
+            p = row.provider,
+            id = row.id,
+            name = row.label
+        )
     }
 
     /// `true` when model `id` is in the scoped set (`isEnabled`, `scoped-models-selector.ts:21`).
@@ -231,7 +244,9 @@ impl CheckboxSelector {
     /// a real catalog model is still disabled.
     fn enable_all(&mut self, targets: Option<&[String]>) {
         // `if (enabledIds === null) return null` (`:33`) — already all-enabled, nothing to do.
-        let Some(list) = self.enabled.as_ref() else { return };
+        let Some(list) = self.enabled.as_ref() else {
+            return;
+        };
         let all_ids = self.all_ids();
         let mut result = list.clone();
         for id in targets.unwrap_or(&all_ids) {
@@ -283,7 +298,10 @@ impl CheckboxSelector {
 
     /// The highlighted model id, if any.
     fn current_id(&self) -> Option<String> {
-        self.items().into_iter().nth(self.selected).map(|it| it.full_id)
+        self.items()
+            .into_iter()
+            .nth(self.selected)
+            .map(|it| it.full_id)
     }
 
     /// Toggle membership of `id` (`toggle`, `:25-31`): from "all" the first toggle starts a set with
@@ -307,8 +325,12 @@ impl CheckboxSelector {
     /// three cases upstream's `:302-318` also treats as "nothing happened", so neither `isDirty` nor
     /// `selectedIndex` moves.
     fn reorder(&mut self, id: &str, delta: isize) -> bool {
-        let Some(list) = self.enabled.as_mut() else { return false };
-        let Some(idx) = list.iter().position(|e| e == id) else { return false };
+        let Some(list) = self.enabled.as_mut() else {
+            return false;
+        };
+        let Some(idx) = list.iter().position(|e| e == id) else {
+            return false;
+        };
         let new = idx as isize + delta;
         if new < 0 || new as usize >= list.len() {
             return false;
@@ -320,11 +342,20 @@ impl CheckboxSelector {
     /// Enable/clear every model of `id`'s provider (`toggleProvider`, `:354-368`): clear them if all
     /// are already enabled, else enable them all.
     fn toggle_provider(&mut self, id: &str) {
-        let Some(provider) = self.rows.iter().find(|r| r.id == id).map(|r| r.provider.clone()) else {
+        let Some(provider) = self
+            .rows
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.provider.clone())
+        else {
             return;
         };
-        let provider_ids: Vec<String> =
-            self.rows.iter().filter(|r| r.provider == provider).map(|r| r.id.clone()).collect();
+        let provider_ids: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| r.provider == provider)
+            .map(|r| r.id.clone())
+            .collect();
         let all_on = provider_ids.iter().all(|pid| self.is_enabled(pid));
         // `:356-362` — upstream routes the provider toggle through the very same two bulk helpers,
         // with the provider's ids as the target set.
@@ -350,14 +381,19 @@ impl CheckboxSelector {
     fn title_line(theme: &UiTheme) -> Line<'static> {
         Line::from(Span::styled(
             "Model Configuration",
-            theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD),
+            theme
+                .accent_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
         ))
     }
 
     /// The subtitle row (`:133-135`): `muted` `Session-only. {keyText("app.models.save")} to save to
     /// settings.` — the guidance that explains why Enter does not close the dialog.
     fn subtitle_line(&self, theme: &UiTheme) -> Line<'static> {
-        let save = self.models_keymap.keys_label(ModelsAction::Save).unwrap_or_default();
+        let save = self
+            .models_keymap
+            .keys_label(ModelsAction::Save)
+            .unwrap_or_default();
         Line::from(Span::styled(
             format!("Session-only. {save} to save to settings."),
             theme.muted_style(),
@@ -371,14 +407,19 @@ impl CheckboxSelector {
     /// the `N/M enabled` count were both missing entirely, and the indent was one column.
     fn footer_spans(&self, theme: &UiTheme) -> Vec<Span<'static>> {
         let k = |a: ModelsAction| self.models_keymap.keys_label(a).unwrap_or_default();
-        let confirm = self.select_keymap.keys_label(SelectAction::Confirm).unwrap_or_default();
+        let confirm = self
+            .select_keymap
+            .keys_label(SelectAction::Confirm)
+            .unwrap_or_default();
         // `countText` (`:191-196`): `enabledCount` counts only ids still in the catalog, and the
         // rest are reported as `N unavailable`.
         let count_text = match &self.enabled {
             None => "all enabled".to_string(),
             Some(en) => {
-                let enabled_count =
-                    en.iter().filter(|id| self.rows.iter().any(|r| &&r.id == id)).count();
+                let enabled_count = en
+                    .iter()
+                    .filter(|id| self.rows.iter().any(|r| &&r.id == id))
+                    .count();
                 let unavailable = en.len().saturating_sub(enabled_count);
                 let total = self.rows.len();
                 if unavailable > 0 {
@@ -393,7 +434,11 @@ impl CheckboxSelector {
             format!("{} all", k(ModelsAction::EnableAll)),
             format!("{} clear", k(ModelsAction::ClearAll)),
             format!("{} provider", k(ModelsAction::ToggleProvider)),
-            format!("{}/{} reorder", k(ModelsAction::ReorderUp), k(ModelsAction::ReorderDown)),
+            format!(
+                "{}/{} reorder",
+                k(ModelsAction::ReorderUp),
+                k(ModelsAction::ReorderDown)
+            ),
             format!("{} save", k(ModelsAction::Save)),
             count_text,
         ];
@@ -423,7 +468,10 @@ impl CheckboxSelector {
         let mut lines: Vec<Line<'static>> = Vec::new();
         // `:233-236` — the empty case RETURNS, so no `Model Name:` row follows it.
         if items.is_empty() {
-            lines.push(Line::from(Span::styled("  No matching models", theme.muted_style())));
+            lines.push(Line::from(Span::styled(
+                "  No matching models",
+                theme.muted_style(),
+            )));
             return lines;
         }
         let len = items.len();
@@ -455,7 +503,11 @@ impl CheckboxSelector {
                 (Some(_), false, true) => spans.push(Span::styled(" ✓", theme.success_style())),
                 (Some(_), false, false) => spans.push(Span::styled(" ✗", theme.dim_style())),
             }
-            lines.extend(crate::transcript::text_lines_of(&Line::from(spans), width, 0));
+            lines.extend(crate::transcript::text_lines_of(
+                &Line::from(spans),
+                width,
+                0,
+            ));
         }
         // Scroll indicator (`:263-267`).
         if start > 0 || end < len {
@@ -496,7 +548,11 @@ impl CheckboxSelector {
         lines.push(border_rule_line(width, theme));
         lines.push(Line::from(""));
         lines.push(Self::title_line(theme));
-        lines.extend(crate::transcript::text_lines_of(&self.subtitle_line(theme), w, 0));
+        lines.extend(crate::transcript::text_lines_of(
+            &self.subtitle_line(theme),
+            w,
+            0,
+        ));
         lines.push(Line::from(""));
         // The `Input` is a bare container child (`:140`), so it renders at column 0 behind the
         // shared unstyled `"> "` prompt (S31, `input.ts:380`).
@@ -528,7 +584,9 @@ impl CheckboxSelector {
 
 impl Selector for CheckboxSelector {
     fn desired_height(&self, width: u16) -> u16 {
-        self.all_lines(width, UiTheme::default_ref()).len().min(usize::from(u16::MAX)) as u16
+        self.all_lines(width, UiTheme::default_ref())
+            .len()
+            .min(usize::from(u16::MAX)) as u16
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
@@ -547,14 +605,18 @@ impl Selector for CheckboxSelector {
                 // `:300-319` — a successful move also advances the highlight so it tracks the model
                 // that moved, and only a successful move sets `isDirty`.
                 ModelsAction::ReorderUp => {
-                    let Some(id) = self.current_id() else { return SelectorOutcome::Redraw };
+                    let Some(id) = self.current_id() else {
+                        return SelectorOutcome::Redraw;
+                    };
                     if self.reorder(&id, -1) {
                         self.selected = self.selected.saturating_sub(1);
                         self.dirty = true;
                     }
                 }
                 ModelsAction::ReorderDown => {
-                    let Some(id) = self.current_id() else { return SelectorOutcome::Redraw };
+                    let Some(id) = self.current_id() else {
+                        return SelectorOutcome::Redraw;
+                    };
                     if self.reorder(&id, 1) {
                         self.selected = self.selected.saturating_add(1);
                         self.dirty = true;
@@ -579,7 +641,9 @@ impl Selector for CheckboxSelector {
                     // `:353-355` — upstream requires `item?.model`, i.e. an *available* model; an
                     // `[unavailable]` row has no provider to toggle. [`Self::toggle_provider`]
                     // returns early for an id that is not in the catalog.
-                    let Some(id) = self.current_id() else { return SelectorOutcome::Redraw };
+                    let Some(id) = self.current_id() else {
+                        return SelectorOutcome::Redraw;
+                    };
                     self.toggle_provider(&id);
                     self.dirty = true;
                 }
@@ -610,16 +674,22 @@ impl Selector for CheckboxSelector {
             Some(SelectAction::Up) | Some(SelectAction::PageUp) => {
                 let len = self.visible_len();
                 if len > 0 {
-                    self.selected =
-                        if self.selected == 0 { len.saturating_sub(1) } else { self.selected - 1 };
+                    self.selected = if self.selected == 0 {
+                        len.saturating_sub(1)
+                    } else {
+                        self.selected - 1
+                    };
                 }
                 SelectorOutcome::Redraw
             }
             Some(SelectAction::Down) | Some(SelectAction::PageDown) => {
                 let len = self.visible_len();
                 if len > 0 {
-                    self.selected =
-                        if self.selected.saturating_add(1) >= len { 0 } else { self.selected + 1 };
+                    self.selected = if self.selected.saturating_add(1) >= len {
+                        0
+                    } else {
+                        self.selected + 1
+                    };
                 }
                 SelectorOutcome::Redraw
             }

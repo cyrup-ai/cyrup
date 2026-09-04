@@ -36,11 +36,11 @@ use clap::Parser;
 use cyrup::predispatch::Internal;
 use cyrup::session_launch::PostBuild;
 use cyrup::{
-    AppMode, Cli, Diagnostic, DiagnosticLevel, actions, apply_arg_leniency, bootstrap, build_inputs,
-    diagnostics, interactive, migrations, normalize_short_aliases, partition_extension_flags,
-    predispatch, prelaunch, render_help, resolve_app_mode, run_json_dispatch, run_print_dispatch,
-    run_rpc_dispatch, select_provider, session_launch, should_take_over_stdout,
-    spawn_abort_on_signal, timings,
+    AppMode, Cli, Diagnostic, DiagnosticLevel, actions, apply_arg_leniency, bootstrap,
+    build_inputs, diagnostics, interactive, migrations, normalize_short_aliases,
+    partition_extension_flags, predispatch, prelaunch, render_help, resolve_app_mode,
+    run_json_dispatch, run_print_dispatch, run_rpc_dispatch, select_provider, session_launch,
+    should_take_over_stdout, spawn_abort_on_signal, timings,
 };
 use cyrup_config::{AuthStore, EnvVars};
 use cyrup_sdk::core::CancelToken;
@@ -410,7 +410,8 @@ async fn run() -> anyhow::Result<i32> {
     // `startupSettingsManager` (`:610`) and the `sessionDir` tier chain (`:625-630`), for pi's stated
     // reason at `:613-614` — "Runs before any runtime services are created so the chosen settings
     // apply everywhere". Wired per ADR-0011.
-    if bootstrap::maybe_run_first_time_setup(mode, &cli, &dirs, &env, &mut startup_settings).await? {
+    if bootstrap::maybe_run_first_time_setup(mode, &cli, &dirs, &env, &mut startup_settings).await?
+    {
         timings::time("firstTimeSetup", timings::TimingLabel::Main);
     }
 
@@ -540,13 +541,9 @@ async fn run() -> anyhow::Result<i32> {
     // matching `model_pattern` so the builder launches on that exact model. A no-op when nothing is
     // configured — the empty catalog then stands and `resolve_model` yields `model: None` +
     // `modelFallbackMessage` (SEAM-075).
-    if let Some((launch_provider, launch_pattern)) = bootstrap::resolve_default_launch_model(
-        &cli,
-        &dirs,
-        &config,
-        &models_json,
-        &settings_store,
-    ) {
+    if let Some((launch_provider, launch_pattern)) =
+        bootstrap::resolve_default_launch_model(&cli, &dirs, &config, &models_json, &settings_store)
+    {
         provider = select_provider(Some(&launch_provider), None, None, &models_json)?;
         config.model_pattern = Some(launch_pattern);
     }

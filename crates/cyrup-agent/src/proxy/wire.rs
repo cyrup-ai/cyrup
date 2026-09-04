@@ -33,7 +33,11 @@ pub enum ProxyAssistantMessageEvent {
         content_signature: Option<String>,
     },
     #[serde(rename = "toolcall_start")]
-    ToolCallStart { content_index: usize, id: String, tool_name: String },
+    ToolCallStart {
+        content_index: usize,
+        id: String,
+        tool_name: String,
+    },
     #[serde(rename = "toolcall_delta")]
     ToolCallDelta { content_index: usize, delta: String },
     #[serde(rename = "toolcall_end")]
@@ -53,20 +57,33 @@ pub enum ProxyAssistantMessageEvent {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::proxy::{ev, usage_json};
 
     #[test]
     fn wire_enum_deserializes_pi_camelcase_tags() {
-        assert_eq!(ev(serde_json::json!({"type": "start"})), ProxyAssistantMessageEvent::Start);
         assert_eq!(
-            ev(serde_json::json!({"type": "text_delta", "contentIndex": 2, "delta": "hi"})),
-            ProxyAssistantMessageEvent::TextDelta { content_index: 2, delta: "hi".into() }
+            ev(serde_json::json!({"type": "start"})),
+            ProxyAssistantMessageEvent::Start
         );
         assert_eq!(
-            ev(serde_json::json!({"type": "toolcall_start", "contentIndex": 0, "id": "t1", "toolName": "read"})),
+            ev(serde_json::json!({"type": "text_delta", "contentIndex": 2, "delta": "hi"})),
+            ProxyAssistantMessageEvent::TextDelta {
+                content_index: 2,
+                delta: "hi".into()
+            }
+        );
+        assert_eq!(
+            ev(
+                serde_json::json!({"type": "toolcall_start", "contentIndex": 0, "id": "t1", "toolName": "read"})
+            ),
             ProxyAssistantMessageEvent::ToolCallStart {
                 content_index: 0,
                 id: "t1".into(),
@@ -76,11 +93,24 @@ mod tests {
         // `done.reason` is the narrowed DoneReason ("toolUse"); `error.reason` the ErrorReason.
         assert_eq!(
             ev(serde_json::json!({"type": "done", "reason": "toolUse", "usage": usage_json()})),
-            ProxyAssistantMessageEvent::Done { reason: DoneReason::ToolUse, usage: Usage { input: 10, output: 20, total_tokens: 30, ..Usage::default() } }
+            ProxyAssistantMessageEvent::Done {
+                reason: DoneReason::ToolUse,
+                usage: Usage {
+                    input: 10,
+                    output: 20,
+                    total_tokens: 30,
+                    ..Usage::default()
+                }
+            }
         );
         assert!(matches!(
-            ev(serde_json::json!({"type": "error", "reason": "aborted", "errorMessage": "x", "usage": usage_json()})),
-            ProxyAssistantMessageEvent::Error { reason: ErrorReason::Aborted, .. }
+            ev(
+                serde_json::json!({"type": "error", "reason": "aborted", "errorMessage": "x", "usage": usage_json()})
+            ),
+            ProxyAssistantMessageEvent::Error {
+                reason: ErrorReason::Aborted,
+                ..
+            }
         ));
     }
 }

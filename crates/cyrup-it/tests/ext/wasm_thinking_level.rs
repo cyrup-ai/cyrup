@@ -17,7 +17,12 @@
 //! (a recorded control op) and the guest surfaces the `Ok` success via `notify`, never a deadlock
 //! error and never a silent nothing. (The full assembled-session drive that observes the level
 //! change TAKE EFFECT on the next turn is the session-svc E2E; here the backend only records.)
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use cyrup_core::CancelToken;
 use cyrup_ext::host::{CannedResponses, ControlOp, RecordingServices};
@@ -34,7 +39,11 @@ fn fixture_component() -> PathBuf {
 }
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: PathBuf::from("."),
+    }
 }
 
 /// Count `SetThinkingLevel(level)` control ops the host actually applied.
@@ -62,7 +71,9 @@ async fn set_thinking_level_is_queued_from_both_tiers_across_the_wasm_boundary()
     let cancel = CancelToken::new();
 
     // --- EVENT tier: agent_start -> the guest calls ctx.models().set_thinking_level("minimal") ---
-    host.dispatcher().dispatch_notify(&HostEvent::AgentStart, &cancel).await;
+    host.dispatcher()
+        .dispatch_notify(&HostEvent::AgentStart, &cancel)
+        .await;
 
     // GAP-11: the host must QUEUE the op from an event handler (Pi allows it from any handler), NOT
     // reject it. The `SetThinkingLevel("minimal")` control op reached the RecordingServices backend.
@@ -78,7 +89,9 @@ async fn set_thinking_level_is_queued_from_both_tiers_across_the_wasm_boundary()
     // returned an honest deadlock `Err` and the guest notified "thinking level rejected".)
     let notes = ext.guest().notifications();
     assert!(
-        notes.iter().any(|n| n.contains("thinking level set from agent_start")),
+        notes
+            .iter()
+            .any(|n| n.contains("thinking level set from agent_start")),
         "event-tier set_thinking_level must surface Ok to the guest, not a deadlock error; \
          notifications: {notes:?}"
     );
@@ -89,7 +102,10 @@ async fn set_thinking_level_is_queued_from_both_tiers_across_the_wasm_boundary()
     );
 
     // --- COMMAND tier: /thinkdemo high -> the guest calls set_thinking_level at command tier ---
-    let out = ext.execute_command("thinkdemo", "high", &cancel).await.expect("thinkdemo runs");
+    let out = ext
+        .execute_command("thinkdemo", "high", &cancel)
+        .await
+        .expect("thinkdemo runs");
     assert_eq!(out.as_deref(), Some("thinking level set: high"));
 
     // Both tiers queued their op, in order: the event-tier "minimal" then the command-tier "high".
@@ -101,7 +117,10 @@ async fn set_thinking_level_is_queued_from_both_tiers_across_the_wasm_boundary()
     );
     // ...and the command observed Ok (took effect), surfaced via notify.
     assert!(
-        ext.guest().notifications().iter().any(|n| n.contains("thinking level set: high")),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("thinking level set: high")),
         "command-tier set_thinking_level success must be observable; notifications: {:?}",
         ext.guest().notifications()
     );

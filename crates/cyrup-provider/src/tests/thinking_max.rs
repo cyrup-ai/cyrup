@@ -14,12 +14,12 @@
     clippy::indexing_slicing
 )]
 
-use cyrup_core::{ModelThinkingLevel, ThinkingLevel};
 use crate::Model;
 use crate::api::compat::thinking_level_key;
 use crate::collection::{
     EXTENDED_THINKING_LEVELS, clamp_thinking_level, get_supported_thinking_levels,
 };
+use cyrup_core::{ModelThinkingLevel, ThinkingLevel};
 fn model(provider: &str, id: &str) -> Model {
     crate::all_providers()
         .into_iter()

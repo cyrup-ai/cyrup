@@ -66,9 +66,21 @@ use std::process::Command;
 /// `cargo build -p cyrup --features faux --bin cyrup`, not a bare `--workspace --bins`.
 const BINS: &[(&str, &str, &[&str])] = &[
     ("cyrup", "cyrup", &["faux"]),
-    ("cyrup-intercom-broker", "cyrup-intercom", &["test-fixtures"]),
-    ("cyrup-intercom-child-fixture", "cyrup-intercom", &["test-fixtures"]),
-    ("cyrup-subagent-fixture", "cyrup-ext-subagents", &["test-fixtures"]),
+    (
+        "cyrup-intercom-broker",
+        "cyrup-intercom",
+        &["test-fixtures"],
+    ),
+    (
+        "cyrup-intercom-child-fixture",
+        "cyrup-intercom",
+        &["test-fixtures"],
+    ),
+    (
+        "cyrup-subagent-fixture",
+        "cyrup-ext-subagents",
+        &["test-fixtures"],
+    ),
     (
         "cyrup-subagent-orchestrator-sim",
         "cyrup-ext-subagents",
@@ -102,7 +114,10 @@ fn main() {
     // spurious rerun costs an up-to-date check, while a MISSED rerun costs a false green.
     let ws = workspace_root();
     println!("cargo::rerun-if-changed={}", ws.join("crates").display());
-    println!("cargo::rerun-if-changed={}", ws.join("Cargo.lock").display());
+    println!(
+        "cargo::rerun-if-changed={}",
+        ws.join("Cargo.lock").display()
+    );
 
     // ---------------------------------------------------------------------------------------
     // 1. Binaries.
@@ -265,7 +280,9 @@ fn cargo_build_component(pkg: &str, target: &str, target_dir: &Path) -> PathBuf 
         // fall through to the panic below, whose message blames a missing `wasm32-wasip2`
         // toolchain — the target was installed and the `.wasm` had just been built. Normalize.
         // (The BIN loop above is unaffected: bin target names keep their hyphens.)
-        if v.pointer("/target/name").and_then(|n| n.as_str()) != Some(pkg.replace('-', "_").as_str()) {
+        if v.pointer("/target/name").and_then(|n| n.as_str())
+            != Some(pkg.replace('-', "_").as_str())
+        {
             continue;
         }
         if let Some(files) = v.get("filenames").and_then(|f| f.as_array()) {
@@ -326,7 +343,8 @@ fn out_dir() -> PathBuf {
 /// regardless of where the outer cargo was invoked from.
 fn workspace_root() -> PathBuf {
     let manifest = PathBuf::from(
-        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set for build scripts"),
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is set for build scripts"),
     );
     manifest
         .parent()

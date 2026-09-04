@@ -453,7 +453,12 @@ fn highlight_uncached(
 /// Pi, reached only when the language is unknown or the highlighter throws (`theme.ts:1275`,
 /// `:1284`); that path is [`highlight_lines`]'s `flat()`, not this one. Defaulting each unclassified
 /// run to `mdCodeBlock` painted roughly half of every code block `#b5bd68` green.
-fn push_code_span(spans: &mut Vec<Span<'static>>, piece: &str, stack: &ScopeStack, theme: &UiTheme) {
+fn push_code_span(
+    spans: &mut Vec<Span<'static>>,
+    piece: &str,
+    stack: &ScopeStack,
+    theme: &UiTheme,
+) {
     let text = piece.trim_end_matches('\n');
     if text.is_empty() {
         return;

@@ -57,20 +57,20 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::change_signature::{
-    event_indicates_repo_edit, GitRepoChangeSource, WatchdogRepoChangeSignature,
+    GitRepoChangeSource, WatchdogRepoChangeSignature, event_indicates_repo_edit,
 };
 use super::emission_guard::{WatchdogEmissionGuard, WatchdogEmissionGuardOptions};
 use super::lsp_diagnostics::{TypeScriptLspDiagnostics, WatchdogLspRequest};
 use super::scope::{WatchdogAutoFollowPromptLedger, WatchdogScopeArtifact};
 use super::settings::resolve_watchdog_config;
-use super::turn_delta::{format_watchdog_turn_delta, WatchdogTurnDeltaInput};
+use super::turn_delta::{WatchdogTurnDeltaInput, format_watchdog_turn_delta};
 use super::types::{
     ResolvedWatchdogConfig, ThinkingSetting, WatchdogLspResult, WatchdogLspRuntimeSnapshot,
     WatchdogLspStatus, WatchdogRuntimeStatus, WatchdogSettingsError, WatchdogSettingsResult,
     WatchdogSettingsSource, WatchdogSeverity, WatchdogWarning, WatchdogWarningDetails,
     WatchdogWarningSource, WatchdogWarningState,
 };
-use super::warning_format::{normalize_watchdog_warning_details, WatchdogWarningDetailsPatch};
+use super::warning_format::{WatchdogWarningDetailsPatch, normalize_watchdog_warning_details};
 
 /// `MAX_REVIEW_INPUT_CHARS` (`runtime.ts:94`).
 const MAX_REVIEW_INPUT_CHARS: usize = 24_000;
@@ -1033,7 +1033,13 @@ impl MainWatchdogRuntime {
         previous_displayed_sequence: u64,
     ) {
         let lsp_block = self
-            .collect_lsp_diagnostics(cwd, change_signature.as_ref(), agent_end_epoch, agent_end_id, cancel)
+            .collect_lsp_diagnostics(
+                cwd,
+                change_signature.as_ref(),
+                agent_end_epoch,
+                agent_end_id,
+                cancel,
+            )
             .await;
         {
             let mut inner = self.lock();
@@ -1106,7 +1112,8 @@ impl MainWatchdogRuntime {
             if let Some(sig) = &change_signature {
                 inner.last_reviewed_change_signature = Some(sig.key.clone());
             }
-            inner.current_changed_paths = change_signature.as_ref().map(|s| s.changed_paths.clone());
+            inner.current_changed_paths =
+                change_signature.as_ref().map(|s| s.changed_paths.clone());
             inner.status = WatchdogRuntimeStatus::Idle;
         }
         let displayed = if inner.displayed_warning_sequence != previous_displayed_sequence {
@@ -1257,7 +1264,12 @@ impl MainWatchdogRuntime {
     }
 
     /// `reviewDelta(delta, timeoutMs, options)` (`runtime.ts:573-629`).
-    async fn review_delta(&self, delta: String, timeout_ms: u64, correction: bool) -> ReviewDeltaOutcome {
+    async fn review_delta(
+        &self,
+        delta: String,
+        timeout_ms: u64,
+        correction: bool,
+    ) -> ReviewDeltaOutcome {
         let (review_epoch, review_id, cancel, request) = {
             let mut inner = self.lock();
             if inner.reviewing || inner.disposed {
@@ -1465,12 +1477,14 @@ impl MainWatchdogRuntime {
                 return;
             }
             let identity = warning.identity.clone().unwrap_or_else(|| {
-                review_input_signature(&[
-                    warning.severity.as_str(),
-                    warning.summary.as_str(),
-                    warning.evidence.as_str(),
-                ]
-                .join("\n"))
+                review_input_signature(
+                    &[
+                        warning.severity.as_str(),
+                        warning.summary.as_str(),
+                        warning.evidence.as_str(),
+                    ]
+                    .join("\n"),
+                )
             });
             if inner.consecutive_auto_follow_identity.as_deref() == Some(identity.as_str()) {
                 inner.consecutive_auto_follow_repeats += 1;
@@ -2051,8 +2065,8 @@ fn tail_chars(value: &str, n: usize) -> String {
     clippy::panic
 )]
 mod tests {
-    use super::*;
     use super::super::settings::default_watchdog_config;
+    use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2124,12 +2138,14 @@ mod tests {
     }
 
     fn fixed_resolver(config: ResolvedWatchdogConfig) -> WatchdogConfigResolver {
-        Arc::new(move |_cwd: &Path, _session: Option<&Value>| WatchdogSettingsResult {
-            ok: true,
-            config: config.clone(),
-            errors: Vec::new(),
-            sources: Vec::new(),
-        })
+        Arc::new(
+            move |_cwd: &Path, _session: Option<&Value>| WatchdogSettingsResult {
+                ok: true,
+                config: config.clone(),
+                errors: Vec::new(),
+                sources: Vec::new(),
+            },
+        )
     }
 
     fn options_with(config: ResolvedWatchdogConfig, sinks: &Sinks) -> MainWatchdogRuntimeOptions {
@@ -2194,8 +2210,7 @@ mod tests {
     #[tokio::test]
     async fn a_default_config_leaves_the_runtime_off_and_it_buffers_nothing() {
         let sinks = Sinks::default();
-        let runtime =
-            MainWatchdogRuntime::new(options_with(default_watchdog_config(), &sinks));
+        let runtime = MainWatchdogRuntime::new(options_with(default_watchdog_config(), &sinks));
         runtime.handle_turn_end(&turn_end_event("hello"), &cwd());
         let snapshot = runtime.get_snapshot(None);
         assert!(!snapshot.enabled);
@@ -2322,7 +2337,11 @@ mod tests {
             runtime.handle_turn_end(&turn_end_event("identical work"), &cwd());
             runtime.handle_agent_end(&cwd()).await;
         }
-        assert_eq!(calls.lock().unwrap().len(), 1, "the second delta was a repeat");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the second delta was a repeat"
+        );
     }
 
     #[tokio::test]
@@ -2446,7 +2465,10 @@ mod tests {
 
         let messages = sinks.user_messages.lock().unwrap();
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].starts_with("Watchdog auto-follow: address this blocker before continuing.\n"));
+        assert!(
+            messages[0]
+                .starts_with("Watchdog auto-follow: address this blocker before continuing.\n")
+        );
         assert!(messages[0].contains("Summary: the migration is unreversible"));
         assert!(messages[0].contains("Evidence: the evidence for it"));
         assert!(messages[0].contains("Recommended action: fix it before continuing"));
@@ -2854,7 +2876,8 @@ mod tests {
         let mut options = options_with(enabled_config(), &sinks);
         options.review = Some(Arc::new(review));
         options.review_changes_only = true;
-        options.repo_change_signature = Some(Arc::clone(&source) as Arc<dyn WatchdogRepoChangeSource>);
+        options.repo_change_signature =
+            Some(Arc::clone(&source) as Arc<dyn WatchdogRepoChangeSource>);
         let runtime = MainWatchdogRuntime::new(options);
 
         *source.signature.lock().unwrap() = Some(WatchdogRepoChangeSignature {
@@ -2866,7 +2889,9 @@ mod tests {
         runtime.handle_agent_end(&cwd()).await;
         assert_eq!(calls.lock().unwrap().len(), 1);
         assert!(
-            calls.lock().unwrap()[0].delta.contains("Changed repo paths:\n- src/lib.rs"),
+            calls.lock().unwrap()[0]
+                .delta
+                .contains("Changed repo paths:\n- src/lib.rs"),
             "{}",
             calls.lock().unwrap()[0].delta
         );
@@ -3134,25 +3159,24 @@ mod tests {
         let mut options = options_with(enabled_config(), &sinks);
         options.review = Some(Arc::new(review));
         options.review_changes_only = true;
-        options.repo_change_signature = Some(Arc::clone(&source) as Arc<dyn WatchdogRepoChangeSource>);
-        options.lsp_diagnostics = Some(Arc::new(ScriptedLsp::new(
-            WatchdogLspResult {
-                status: WatchdogLspStatus::Ok,
-                provider: Some("typescript-language-server".into()),
-                checked_paths: vec!["src/lib.rs".into()],
-                skipped_paths: Vec::new(),
-                diagnostics: vec![WatchdogLspDiagnostic {
-                    path: "src/lib.rs".into(),
-                    line: 12,
-                    column: 3,
-                    severity: WatchdogLspDiagnosticSeverity::Error,
-                    source: "ts".into(),
-                    code: Some("2322".into()),
-                    message: "Type 'string' is not assignable to type 'number'.".into(),
-                }],
-                message: None,
-            },
-        )));
+        options.repo_change_signature =
+            Some(Arc::clone(&source) as Arc<dyn WatchdogRepoChangeSource>);
+        options.lsp_diagnostics = Some(Arc::new(ScriptedLsp::new(WatchdogLspResult {
+            status: WatchdogLspStatus::Ok,
+            provider: Some("typescript-language-server".into()),
+            checked_paths: vec!["src/lib.rs".into()],
+            skipped_paths: Vec::new(),
+            diagnostics: vec![WatchdogLspDiagnostic {
+                path: "src/lib.rs".into(),
+                line: 12,
+                column: 3,
+                severity: WatchdogLspDiagnosticSeverity::Error,
+                source: "ts".into(),
+                code: Some("2322".into()),
+                message: "Type 'string' is not assignable to type 'number'.".into(),
+            }],
+            message: None,
+        })));
         let runtime = MainWatchdogRuntime::new(options);
         *source.signature.lock().unwrap() = Some(WatchdogRepoChangeSignature {
             root: "/repo".into(),
@@ -3197,7 +3221,8 @@ mod tests {
         let mut options = options_with(enabled_config(), &sinks);
         options.review = Some(Arc::new(review));
         options.review_changes_only = true;
-        options.repo_change_signature = Some(Arc::clone(&source) as Arc<dyn WatchdogRepoChangeSource>);
+        options.repo_change_signature =
+            Some(Arc::clone(&source) as Arc<dyn WatchdogRepoChangeSource>);
         options.lsp_diagnostics = Some(Arc::new(FailingLsp));
         let runtime = MainWatchdogRuntime::new(options);
         *source.signature.lock().unwrap() = Some(WatchdogRepoChangeSignature {

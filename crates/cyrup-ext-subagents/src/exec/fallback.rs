@@ -340,9 +340,7 @@ pub fn resolve_model_inheritance(
     // resolved to NOTHING (a `"inherit"`/blank `model` with no live parent session) must not
     // shadow the agent's own configured model. Re-resolve against the persona model alone, at
     // `"inherited"` source so an out-of-scope agent default warns rather than refusing the run.
-    if explicit_present
-        && let Some(persona) = real_requested_model(persona_model)
-    {
+    if explicit_present && let Some(persona) = real_requested_model(persona_model) {
         if let Some(violation) =
             check_model_scope(Some(persona.as_str()), scope, ModelSource::Inherited)
         {
@@ -422,7 +420,7 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     RetryPattern::Contains("quota"),
     RetryPattern::Contains("billing"),
     RetryPattern::Contains("credit"),
-    RetryPattern::Contains("auth"), // /auth(?:entication)?/i
+    RetryPattern::Contains("auth"),         // /auth(?:entication)?/i
     RetryPattern::Contains("unauthorized"), // /unauthori[sz]ed/i, US spelling
     RetryPattern::Contains("unauthorised"), // /unauthori[sz]ed/i, UK spelling
     RetryPattern::Contains("forbidden"),
@@ -447,9 +445,9 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     RetryPattern::Contains("upstream"),
     RetryPattern::OptionalWordBetween("time", "d", " out"), // /timed? out/i
     RetryPattern::Contains("timeout"),
-    RetryPattern::WordNumber("502"), // /\b502\b/
-    RetryPattern::WordNumber("503"), // /\b503\b/
-    RetryPattern::WordNumber("504"), // /\b504\b/
+    RetryPattern::WordNumber("502"),                    // /\b502\b/
+    RetryPattern::WordNumber("503"),                    // /\b503\b/
+    RetryPattern::WordNumber("504"),                    // /\b504\b/
     RetryPattern::OptionalCharBetween("cold", "start"), // /cold.?start/i
     RetryPattern::Contains("empty response"),
     RetryPattern::Contains("no output"),
@@ -503,9 +501,9 @@ fn line_matches(line: &str, pattern: &RetryPattern) -> bool {
             None => false,
         },
         RetryPattern::ThenAny(first, seconds) => match line.find(first) {
-            Some(pos) => line.get(pos + first.len()..).is_some_and(|rest| {
-                seconds.iter().any(|second| rest.contains(second))
-            }),
+            Some(pos) => line
+                .get(pos + first.len()..)
+                .is_some_and(|rest| seconds.iter().any(|second| rest.contains(second))),
             None => false,
         },
         RetryPattern::OptionalCharBetween(first, second) => {
@@ -583,7 +581,10 @@ fn is_tool_failure_prefix(error: &str) -> bool {
     if name_len == 0 {
         return false;
     }
-    let Some(rest) = trimmed.get(name_len..).and_then(|r| strip_prefix_ci(r, " failed ")) else {
+    let Some(rest) = trimmed
+        .get(name_len..)
+        .and_then(|r| strip_prefix_ci(r, " failed "))
+    else {
         return false;
     };
     let tail = if let Some(after) = strip_prefix_ci(rest, "(exit ") {
@@ -654,9 +655,11 @@ pub fn is_retryable_model_failure(error: Option<&str>) -> bool {
     // Per-line so the `.*`/`\s*`/`.?` constructs never cross a newline (JS `.`-no-newline). A
     // `Contains`/`WordNumber` needle can never straddle a `\n` either, so per-line evaluation is
     // equivalent to whole-string for those and correct for the sequence patterns.
-    haystack
-        .split('\n')
-        .any(|line| RETRYABLE_MODEL_FAILURE_PATTERNS.iter().any(|p| line_matches(line, p)))
+    haystack.split('\n').any(|line| {
+        RETRYABLE_MODEL_FAILURE_PATTERNS
+            .iter()
+            .any(|p| line_matches(line, p))
+    })
 }
 
 /// Format the "prior attempt failed" note appended into the next attempt's initial
@@ -1433,10 +1436,19 @@ mod tests {
         let persona_fallbacks: Vec<ModelId> = Vec::new();
 
         // available_models is built the way both call sites build it: fallbacks + persona model.
-        let mut available_models: Vec<ModelId> =
-            persona_fallbacks.iter().cloned().chain(persona_model.cloned()).collect();
-        let ov = resolve_model_inheritance(None, persona_model, Some(&inherited), &mut available_models, None)
-            .expect("no scope configured, so resolution cannot be refused");
+        let mut available_models: Vec<ModelId> = persona_fallbacks
+            .iter()
+            .cloned()
+            .chain(persona_model.cloned())
+            .collect();
+        let ov = resolve_model_inheritance(
+            None,
+            persona_model,
+            Some(&inherited),
+            &mut available_models,
+            None,
+        )
+        .expect("no scope configured, so resolution cannot be refused");
 
         assert_eq!(ov, ModelOverride::Explicit(inherited.clone()));
         assert!(
@@ -1459,8 +1471,9 @@ mod tests {
         // threaded through resolve_model_inheritance, the same persona now resolves a candidate.
         let inherited = model("anthropic/claude-opus-4-8");
         let mut available_models: Vec<ModelId> = Vec::new();
-        let ov = resolve_model_inheritance(None, None, Some(&inherited), &mut available_models, None)
-            .expect("no scope configured");
+        let ov =
+            resolve_model_inheritance(None, None, Some(&inherited), &mut available_models, None)
+                .expect("no scope configured");
         let candidates = build_model_candidates(&ov, None, &[], &available_models);
         assert!(!candidates.is_empty());
         assert_eq!(candidates, vec![inherited]);
@@ -1472,12 +1485,21 @@ mod tests {
         let inherited = model("together/zai-org/GLM-5.2");
         let per_call = model("z");
         let mut available_models: Vec<ModelId> = vec![per_call.clone()];
-        let ov =
-            resolve_model_inheritance(Some(&per_call), None, Some(&inherited), &mut available_models, None)
-                .expect("no scope configured");
+        let ov = resolve_model_inheritance(
+            Some(&per_call),
+            None,
+            Some(&inherited),
+            &mut available_models,
+            None,
+        )
+        .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Explicit(per_call.clone()));
         let candidates = build_model_candidates(&ov, None, &[], &available_models);
-        assert_eq!(candidates.first(), Some(&per_call), "per-call override is candidate #0");
+        assert_eq!(
+            candidates.first(),
+            Some(&per_call),
+            "per-call override is candidate #0"
+        );
         assert!(
             !candidates.contains(&inherited),
             "inheritance must NOT be added when a per-call override is present"
@@ -1491,12 +1513,21 @@ mod tests {
         let inherited = model("together/zai-org/GLM-5.2");
         let persona = model("x");
         let mut available_models: Vec<ModelId> = vec![persona.clone()];
-        let ov =
-            resolve_model_inheritance(None, Some(&persona), Some(&inherited), &mut available_models, None)
-                .expect("no scope configured");
+        let ov = resolve_model_inheritance(
+            None,
+            Some(&persona),
+            Some(&inherited),
+            &mut available_models,
+            None,
+        )
+        .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Inherit);
         let candidates = build_model_candidates(&ov, Some(&persona), &[], &available_models);
-        assert_eq!(candidates.first(), Some(&persona), "persona model is candidate #0");
+        assert_eq!(
+            candidates.first(),
+            Some(&persona),
+            "persona model is candidate #0"
+        );
         assert!(
             !candidates.contains(&inherited),
             "inheritance must NOT be added when the persona declares its own model"
@@ -1512,9 +1543,15 @@ mod tests {
         let ov = resolve_model_inheritance(None, None, None, &mut available_models, None)
             .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Inherit);
-        assert_eq!(available_models, fallbacks, "no inherited model may be added when there is no host");
+        assert_eq!(
+            available_models, fallbacks,
+            "no inherited model may be added when there is no host"
+        );
         let candidates = build_model_candidates(&ov, None, &fallbacks, &available_models);
-        assert_eq!(candidates, fallbacks, "the ladder is exactly the persona fallback list");
+        assert_eq!(
+            candidates, fallbacks,
+            "the ladder is exactly the persona fallback list"
+        );
 
         // ...and with neither a persona model nor fallbacks nor a host, the ladder stays empty (the
         // caller's genuine hard pre-spawn error) — never a spuriously-invented candidate.
@@ -1543,13 +1580,21 @@ mod tests {
     #[test]
     fn out_of_scope_fallback_candidates_warn_without_changing_the_ladder() {
         let primary = model("anthropic/claude-opus-4");
-        let fallbacks = vec![model("openai/gpt-5-nano"), model("anthropic/claude-haiku-4")];
-        let available: Vec<ModelId> =
-            std::iter::once(primary.clone()).chain(fallbacks.iter().cloned()).collect();
+        let fallbacks = vec![
+            model("openai/gpt-5-nano"),
+            model("anthropic/claude-haiku-4"),
+        ];
+        let available: Vec<ModelId> = std::iter::once(primary.clone())
+            .chain(fallbacks.iter().cloned())
+            .collect();
         let scope = armed_scope(&["anthropic/*"]);
 
-        let unpoliced =
-            build_model_candidates(&ModelOverride::Inherit, Some(&primary), &fallbacks, &available);
+        let unpoliced = build_model_candidates(
+            &ModelOverride::Inherit,
+            Some(&primary),
+            &fallbacks,
+            &available,
+        );
         let (policed, violations) = build_model_candidates_scoped(
             &ModelOverride::Inherit,
             Some(&primary),
@@ -1558,8 +1603,15 @@ mod tests {
             Some(&scope),
         );
 
-        assert_eq!(policed, unpoliced, "enforcement must never rewrite or shorten the ladder");
-        assert_eq!(violations.len(), 1, "exactly the one out-of-scope fallback: {violations:?}");
+        assert_eq!(
+            policed, unpoliced,
+            "enforcement must never rewrite or shorten the ladder"
+        );
+        assert_eq!(
+            violations.len(),
+            1,
+            "exactly the one out-of-scope fallback: {violations:?}"
+        );
         assert_eq!(violations[0].model, "openai/gpt-5-nano");
         assert_eq!(
             violations[0].severity,
@@ -1582,7 +1634,10 @@ mod tests {
             Some(&armed_scope(&["anthropic/*"])),
         );
         assert_eq!(candidates, vec![primary]);
-        assert!(violations.is_empty(), "index 0 is the other seam's business: {violations:?}");
+        assert!(
+            violations.is_empty(),
+            "index 0 is the other seam's business: {violations:?}"
+        );
     }
 
     /// The fail-closed half, at the decision boundary: an EXPLICIT out-of-scope model resolves to
@@ -1593,10 +1648,12 @@ mod tests {
         let out = model("openai/gpt-5-nano");
 
         let mut avail = vec![out.clone()];
-        let refused =
-            resolve_model_inheritance(Some(&out), None, None, &mut avail, Some(&scope));
+        let refused = resolve_model_inheritance(Some(&out), None, None, &mut avail, Some(&scope));
         let violation = refused.expect_err("an explicit out-of-scope model must be refused");
-        assert_eq!(violation.severity, crate::exec::model_scope::ModelScopeSeverity::Error);
+        assert_eq!(
+            violation.severity,
+            crate::exec::model_scope::ModelScopeSeverity::Error
+        );
         assert_eq!(
             violation.message,
             "Model 'openai/gpt-5-nano' is outside the configured subagent model scope. Allowed \
@@ -1707,7 +1764,8 @@ mod tests {
     }
 
     #[test]
-    fn bare_http_status_codes_require_a_word_boundary_and_do_not_false_positive_on_larger_numbers() {
+    fn bare_http_status_codes_require_a_word_boundary_and_do_not_false_positive_on_larger_numbers()
+    {
         // pi `/\b429\b/` etc. — a status code embedded in a LARGER number is NOT a rate-limit/5xx
         // signal. The prior bare-substring port wrongly fired on all of these.
         for msg in [
@@ -1723,7 +1781,13 @@ mod tests {
             );
         }
         // ...but a genuine, word-bounded status code still is.
-        for msg in ["HTTP 429", "(429) Too Many", "got 502 from upstream", "-> 503", "504."] {
+        for msg in [
+            "HTTP 429",
+            "(429) Too Many",
+            "got 502 from upstream",
+            "-> 503",
+            "504.",
+        ] {
             assert!(
                 is_retryable_model_failure(Some(msg)),
                 "a word-bounded status code MUST be retryable: {msg}"
@@ -1775,7 +1839,10 @@ mod tests {
             "request timed out",
             "temporarily unavailable",
         ] {
-            assert!(is_retryable_model_failure(Some(msg)), "expected retryable: {msg}");
+            assert!(
+                is_retryable_model_failure(Some(msg)),
+                "expected retryable: {msg}"
+            );
         }
         // `temporar(?:ily)? unavailable` matches "temporarily"/"temporar unavailable" but NOT the
         // "temporary unavailable" spelling (faithful to pi's regex, which has no `y` branch).
@@ -2485,7 +2552,9 @@ mod tests {
 
     #[test]
     fn a_bare_zero_activity_non_zero_exit_is_a_startup_failure() {
-        assert!(is_retryable_subagent_startup_failure(&startup_failure_signal()));
+        assert!(is_retryable_subagent_startup_failure(
+            &startup_failure_signal()
+        ));
     }
 
     /// Every field is a REASON NOT TO RETRY: each of these mutations alone must disqualify it.
@@ -2495,8 +2564,14 @@ mod tests {
     fn any_single_piece_of_evidence_disqualifies_the_startup_retry() {
         type Mutate = Box<dyn Fn(&mut AttemptSignal)>;
         let cases: Vec<(&str, Mutate)> = vec![
-            ("a clean exit", Box::new(|s: &mut AttemptSignal| s.exit_code = Some(0))),
-            ("no exit code at all", Box::new(|s: &mut AttemptSignal| s.exit_code = None)),
+            (
+                "a clean exit",
+                Box::new(|s: &mut AttemptSignal| s.exit_code = Some(0)),
+            ),
+            (
+                "no exit code at all",
+                Box::new(|s: &mut AttemptSignal| s.exit_code = None),
+            ),
             (
                 "a real diagnostic",
                 Box::new(|s: &mut AttemptSignal| {
@@ -2504,9 +2579,18 @@ mod tests {
                     s.startup.error_is_placeholder = false;
                 }),
             ),
-            ("produced output", Box::new(|s: &mut AttemptSignal| s.startup.final_output_present = true)),
-            ("emitted a message", Box::new(|s: &mut AttemptSignal| s.startup.message_count = 1)),
-            ("ran a tool", Box::new(|s: &mut AttemptSignal| s.startup.tool_count = 1)),
+            (
+                "produced output",
+                Box::new(|s: &mut AttemptSignal| s.startup.final_output_present = true),
+            ),
+            (
+                "emitted a message",
+                Box::new(|s: &mut AttemptSignal| s.startup.message_count = 1),
+            ),
+            (
+                "ran a tool",
+                Box::new(|s: &mut AttemptSignal| s.startup.tool_count = 1),
+            ),
             (
                 "burned tokens",
                 Box::new(|s: &mut AttemptSignal| s.usage.input = 1),
@@ -2521,18 +2605,32 @@ mod tests {
                     s.startup.duration_ms = Some(MAX_SUBAGENT_STARTUP_FAILURE_DURATION_MS + 1);
                 }),
             ),
-            ("a protocol violation", Box::new(|s: &mut AttemptSignal| s.startup.protocol_error = true)),
+            (
+                "a protocol violation",
+                Box::new(|s: &mut AttemptSignal| s.startup.protocol_error = true),
+            ),
             (
                 "a signal other than SIGKILL",
-                Box::new(|s: &mut AttemptSignal| s.startup.process_signal = Some("SIGSEGV".to_string())),
+                Box::new(|s: &mut AttemptSignal| {
+                    s.startup.process_signal = Some("SIGSEGV".to_string())
+                }),
             ),
             (
                 "a mutation attempt",
                 Box::new(|s: &mut AttemptSignal| s.startup.observed_mutation_attempt = true),
             ),
-            ("a detach", Box::new(|s: &mut AttemptSignal| s.detached = true)),
-            ("a timeout", Box::new(|s: &mut AttemptSignal| s.timed_out = true)),
-            ("an explicit stop", Box::new(|s: &mut AttemptSignal| s.startup.stopped = true)),
+            (
+                "a detach",
+                Box::new(|s: &mut AttemptSignal| s.detached = true),
+            ),
+            (
+                "a timeout",
+                Box::new(|s: &mut AttemptSignal| s.timed_out = true),
+            ),
+            (
+                "an explicit stop",
+                Box::new(|s: &mut AttemptSignal| s.startup.stopped = true),
+            ),
             (
                 "an exhausted turn budget",
                 Box::new(|s: &mut AttemptSignal| s.startup.turn_budget_exceeded = true),

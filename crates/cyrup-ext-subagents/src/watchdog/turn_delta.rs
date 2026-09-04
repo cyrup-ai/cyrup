@@ -57,7 +57,10 @@ fn nullish(value: Option<&Value>) -> Option<&Value> {
 }
 
 /// `input.foo ?? input.bar` over an object, returning the first non-nullish of `keys`.
-fn first_present<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
+fn first_present<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a Value> {
     keys.iter().find_map(|key| nullish(object.get(*key)))
 }
 
@@ -107,7 +110,9 @@ pub fn format_value(value: &Value, indent: &str) -> String {
             let mut lines: Vec<String> = Vec::with_capacity(map.len());
             for (key, item) in map {
                 match item {
-                    Value::String(s) if s.contains('\n') => lines.push(format!("{indent}{key}:\n{s}")),
+                    Value::String(s) if s.contains('\n') => {
+                        lines.push(format!("{indent}{key}:\n{s}"))
+                    }
                     _ => lines.push(format!(
                         "{indent}{key}: {}",
                         format_value(item, &child_indent)
@@ -204,7 +209,10 @@ pub fn format_tool_result(
     let diff = if failed {
         None
     } else {
-        details.and_then(Value::as_object).and_then(|d| d.get("diff")).and_then(Value::as_str)
+        details
+            .and_then(Value::as_object)
+            .and_then(|d| d.get("diff"))
+            .and_then(Value::as_str)
     };
     if let Some(diff) = diff {
         lines.push("Diff:".to_string());
@@ -212,7 +220,11 @@ pub fn format_tool_result(
     } else {
         let body = text_from_content(content);
         if !body.is_empty() {
-            lines.push(if failed { "Output:".to_string() } else { "Result:".to_string() });
+            lines.push(if failed {
+                "Output:".to_string()
+            } else {
+                "Result:".to_string()
+            });
             lines.push(body);
         }
     }
@@ -311,11 +323,15 @@ pub fn messages_from_event(event: &Value) -> Vec<Value> {
             ("role", Value::String("toolCall".into())),
             (
                 "name",
-                first_present(input, &["toolName", "name"]).cloned().unwrap_or(Value::Null),
+                first_present(input, &["toolName", "name"])
+                    .cloned()
+                    .unwrap_or(Value::Null),
             ),
             (
                 "input",
-                first_present(input, &["args", "input"]).cloned().unwrap_or(Value::Null),
+                first_present(input, &["args", "input"])
+                    .cloned()
+                    .unwrap_or(Value::Null),
             ),
         ])];
     }
@@ -340,12 +356,17 @@ pub fn messages_from_event(event: &Value) -> Vec<Value> {
             ("role", Value::String("toolResult".into())),
             (
                 "toolName",
-                first_present(input, &["toolName", "name"]).cloned().unwrap_or(Value::Null),
+                first_present(input, &["toolName", "name"])
+                    .cloned()
+                    .unwrap_or(Value::Null),
             ),
             ("content", content),
             ("details", details),
             ("error", input.get("error").cloned().unwrap_or(Value::Null)),
-            ("isError", input.get("isError").cloned().unwrap_or(Value::Null)),
+            (
+                "isError",
+                input.get("isError").cloned().unwrap_or(Value::Null),
+            ),
         ])];
     }
     if is_event(input, "tool_result") {
@@ -353,12 +374,23 @@ pub fn messages_from_event(event: &Value) -> Vec<Value> {
             ("role", Value::String("toolResult".into())),
             (
                 "toolName",
-                first_present(input, &["toolName", "name"]).cloned().unwrap_or(Value::Null),
+                first_present(input, &["toolName", "name"])
+                    .cloned()
+                    .unwrap_or(Value::Null),
             ),
-            ("content", input.get("content").cloned().unwrap_or(Value::Null)),
-            ("details", input.get("details").cloned().unwrap_or(Value::Null)),
+            (
+                "content",
+                input.get("content").cloned().unwrap_or(Value::Null),
+            ),
+            (
+                "details",
+                input.get("details").cloned().unwrap_or(Value::Null),
+            ),
             ("error", input.get("error").cloned().unwrap_or(Value::Null)),
-            ("isError", input.get("isError").cloned().unwrap_or(Value::Null)),
+            (
+                "isError",
+                input.get("isError").cloned().unwrap_or(Value::Null),
+            ),
         ])];
     }
     Vec::new()
@@ -492,7 +524,12 @@ pub fn format_watchdog_turn_delta(input: &WatchdogTurnDeltaInput<'_>) -> String 
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -708,7 +745,11 @@ mod tests {
         );
         // A tool that is not edit/write keeps its text.
         let read = json!({ "role": "toolCall", "name": "read", "input": { "content": "kept" } });
-        assert!(format_watchdog_review_message(&read).unwrap().contains("kept"));
+        assert!(
+            format_watchdog_review_message(&read)
+                .unwrap()
+                .contains("kept")
+        );
     }
 
     #[test]
@@ -744,7 +785,10 @@ mod tests {
 
     #[test]
     fn an_unnamed_tool_call_with_no_input_renders_the_bare_header() {
-        assert_eq!(format_tool_call(None, None), "Tool call: tool\nArguments:\n");
+        assert_eq!(
+            format_tool_call(None, None),
+            "Tool call: tool\nArguments:\n"
+        );
         assert_eq!(
             format_tool_call(Some(&json!("")), Some(&Value::Null)),
             "Tool call: tool\nArguments:\n"
@@ -805,7 +849,10 @@ mod tests {
         );
         assert_eq!(
             format_tool_result("bash", None, None, Some(&json!({ "code": 2 })), None),
-            format!("Tool result: bash\nError: {}", format_value(&json!({ "code": 2 }), ""))
+            format!(
+                "Tool result: bash\nError: {}",
+                format_value(&json!({ "code": 2 }), "")
+            )
         );
     }
 }

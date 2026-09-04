@@ -127,11 +127,11 @@ pub async fn run_json<W: Write>(
 /// Pi's `rebindSession` body (print-mode.ts:71-112): `bindExtensions({..., onError})` then a fresh
 /// session-wide `session.subscribe(...)`. Returns the new stream; the caller drops the old one,
 /// which is cyrup's `unsubscribe?.()` (`:106`).
-async fn bind_and_subscribe(
-    session: &Arc<AgentSession>,
-) -> EventStream<AgentSessionEvent> {
+async fn bind_and_subscribe(session: &Arc<AgentSession>) -> EventStream<AgentSessionEvent> {
     session
-        .bind_extensions_with(BindOptions { on_error: Some(crate::print::extension_error_sink()) })
+        .bind_extensions_with(BindOptions {
+            on_error: Some(crate::print::extension_error_sink()),
+        })
         .await;
     session.subscribe()
 }
@@ -198,7 +198,9 @@ mod tests {
                 reason: "startup".into(),
                 previous_session_file: None,
             },
-            AgentSessionEvent::SessionShutdown { reason: "quit".into() },
+            AgentSessionEvent::SessionShutdown {
+                reason: "quit".into(),
+            },
             AgentSessionEvent::SessionReplaced { generation: 2 },
         ];
         for ev in &invented {
@@ -217,8 +219,12 @@ mod tests {
     #[test]
     fn genuine_upstream_events_still_reach_the_json_stdout_stream() {
         let kept = [
-            AgentSessionEvent::ThinkingLevelChanged { level: "high".into() },
-            AgentSessionEvent::SessionInfoChanged { name: Some("work".into()) },
+            AgentSessionEvent::ThinkingLevelChanged {
+                level: "high".into(),
+            },
+            AgentSessionEvent::SessionInfoChanged {
+                name: Some("work".into()),
+            },
             AgentSessionEvent::AgentSettled,
         ];
         for ev in &kept {

@@ -34,15 +34,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::SystemPromptMode;
-use cyrup_ext_subagents::registration::SubagentExtensionConfig;
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::ResolvedAgentPersona;
 use cyrup_ext_subagents::extension::SubagentExecutor;
+use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec, StepResult};
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -95,7 +93,7 @@ fn reporter_persona() -> ResolvedAgentPersona {
         default_context: None,
         memory: None,
         tool_budget: None,
-        runner: None, // SUBA-074: the native child, as before
+        runner: None,          // SUBA-074: the native child, as before
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
     }
@@ -125,14 +123,21 @@ fn step(output_path: Option<&str>) -> SingleStepSpec {
 }
 
 /// Run one chain step against the real fixture child and return its `StepResult`.
-async fn run_one_step(dir: &Path, script: &serde_json::Value, output_path: Option<&str>) -> StepResult {
+async fn run_one_step(
+    dir: &Path,
+    script: &serde_json::Value,
+    output_path: Option<&str>,
+) -> StepResult {
     let script_path = write_script(dir, "script.json", script);
     // The fixture named for THIS executor rather than moved into the process environment every
     // concurrently-running test in this binary shares.
     let config = SubagentExtensionConfig {
         spawn_command: Some(SpawnCommand {
             binary: fixture_binary_path(),
-            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            base_args: vec![
+                "--fixture-script".to_string(),
+                script_path.display().to_string(),
+            ],
         }),
         ..SubagentExtensionConfig::default()
     };
@@ -151,7 +156,6 @@ async fn run_one_step(dir: &Path, script: &serde_json::Value, output_path: Optio
             None,
         )
         .await;
-
 
     let (results, _groups) = outcome.expect("the foreground chain walk completes");
     assert_eq!(results.len(), 1, "one step, one result");
@@ -204,7 +208,11 @@ async fn a_saved_output_path_reaches_the_step_result_as_a_bare_path() {
     let result = run_one_step(dir.path(), &script, Some("report.md")).await;
 
     assert!(result.success, "the step must succeed: {:?}", result.error);
-    assert_eq!(result.exit_code, Some(0), "a clean child reports 0: {result:?}");
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "a clean child reports 0: {result:?}"
+    );
 
     let expected = dir.path().join("report.md");
     // The handoff really happened: the file is on disk with the child's output in it.

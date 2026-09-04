@@ -68,8 +68,12 @@ pub(super) async fn dispatch_frame(
                 })
                 .await)
         }
-        "contentBlockStart" => Ok(handle_content_block_start(&payload, dec, model, api, sink).await),
-        "contentBlockDelta" => Ok(handle_content_block_delta(&payload, dec, model, api, sink).await),
+        "contentBlockStart" => {
+            Ok(handle_content_block_start(&payload, dec, model, api, sink).await)
+        }
+        "contentBlockDelta" => {
+            Ok(handle_content_block_delta(&payload, dec, model, api, sink).await)
+        }
         "contentBlockStop" => Ok(handle_content_block_stop(&payload, dec, model, api, sink).await),
         "messageStop" => {
             let raw = payload.get("stopReason").and_then(Value::as_str);

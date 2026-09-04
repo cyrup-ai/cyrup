@@ -26,11 +26,19 @@ impl AutocompleteItem {
     /// user should see.
     pub fn new(value: impl Into<String>) -> Self {
         let value = value.into();
-        Self { label: value.clone(), value, description: None }
+        Self {
+            label: value.clone(),
+            value,
+            description: None,
+        }
     }
     /// An item displayed as `label` but completing to `value`.
     pub fn labelled(value: impl Into<String>, label: impl Into<String>) -> Self {
-        Self { value: value.into(), label: label.into(), description: None }
+        Self {
+            value: value.into(),
+            label: label.into(),
+            description: None,
+        }
     }
 }
 
@@ -66,7 +74,10 @@ pub struct AutocompleteQuery {
 impl AutocompleteQuery {
     /// The text of the line the cursor is on (empty if out of range — never panics).
     pub fn current_line(&self) -> &str {
-        self.lines.get(self.cursor_line as usize).map(String::as_str).unwrap_or("")
+        self.lines
+            .get(self.cursor_line as usize)
+            .map(String::as_str)
+            .unwrap_or("")
     }
 }
 

@@ -82,4 +82,3 @@ fn session_headers_are_omitted_without_a_session() {
     assert!(!h.contains_key("session-id"));
     assert!(!h.contains_key("x-client-request-id"));
 }
-

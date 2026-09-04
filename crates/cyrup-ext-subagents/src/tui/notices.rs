@@ -450,7 +450,7 @@ impl ControlNoticeState {
             ev.step_index.is_none() || ev.step_index == live.current_step_index;
         agent_still_matches            // check 2
             && step_still_matches      // check 3
-            && live.needs_attention    // check 4: still in the needs-attention activity state
+            && live.needs_attention // check 4: still in the needs-attention activity state
     }
 
     /// The single delivery choke point every dispatch path (async-immediate, foreground-debounced-
@@ -480,8 +480,8 @@ mod tests {
         clippy::indexing_slicing
     )]
 
-    use super::*;
     use super::super::ControlNoticeKind;
+    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -495,7 +495,10 @@ mod tests {
 
     impl RecordingSink {
         fn count(&self) -> usize {
-            self.deliveries.lock().unwrap_or_else(|e| e.into_inner()).len()
+            self.deliveries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
         }
 
         fn last(&self) -> Option<(ControlNotice, bool)> {
@@ -563,9 +566,16 @@ mod tests {
         let ev = needs_attention_notice(&run_id, Some("scout"), Some(0), RunSource::Async);
         ControlNoticeState::handle(&state, ev, Arc::clone(&sink)).await;
 
-        assert_eq!(sink.count(), 1, "async notice must deliver without any wait");
+        assert_eq!(
+            sink.count(),
+            1,
+            "async notice must deliver without any wait"
+        );
         let (_, trigger_turn) = sink.last().expect("one delivery recorded");
-        assert!(trigger_turn, "R-SA-118: async delivery must trigger a new turn");
+        assert!(
+            trigger_turn,
+            "R-SA-118: async delivery must trigger a new turn"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -617,7 +627,11 @@ mod tests {
         // "Hot-reload" happens here in spirit: nothing about this call changes because a reload
         // occurred, since `ControlNoticeState` itself holds no reload-scoped reference.
         ControlNoticeState::handle(&state, ev, Arc::clone(&sink)).await;
-        assert_eq!(sink.count(), 1, "dedup must survive across the simulated reload");
+        assert_eq!(
+            sink.count(),
+            1,
+            "dedup must survive across the simulated reload"
+        );
     }
 
     #[tokio::test]
@@ -806,7 +820,10 @@ mod tests {
         );
         let (delivered, trigger_turn) = sink.last().expect("delivered");
         assert_eq!(delivered.key.run_id, run_id);
-        assert!(!trigger_turn, "R-SA-118: foreground delivery never triggers a new turn");
+        assert!(
+            !trigger_turn,
+            "R-SA-118: foreground delivery never triggers a new turn"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -970,7 +987,11 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(sink.count(), 1, "the re-armed (coalesced) timer must still eventually fire");
+        assert_eq!(
+            sink.count(),
+            1,
+            "the re-armed (coalesced) timer must still eventually fire"
+        );
     }
 
     #[tokio::test]

@@ -40,7 +40,8 @@ impl PermissionSystemExtension {
         // Called from all four of pi's `startForwardedPermissionPolling` hooks
         // (`session_start`/`before_agent_start`/`input`/`tool_call`), which is every event arm that
         // carries a ctx, so this is the exact set of moments upstream reassigns `runtimeContext`.
-        self.has_ui.store(ctx.has_ui, std::sync::atomic::Ordering::Relaxed);
+        self.has_ui
+            .store(ctx.has_ui, std::sync::atomic::Ordering::Relaxed);
         if !self.install_watcher || !ctx.has_ui {
             // pi `:1985`: a non-parent / headless context tears the watcher DOWN, it does not merely
             // decline to start one.
@@ -78,7 +79,9 @@ impl PermissionSystemExtension {
     /// yield exactly one watcher.
     #[cfg(test)]
     pub(super) fn has_live_forwarding_watcher(&self) -> bool {
-        guard(&self.watcher).as_ref().is_some_and(|h| !h.is_finished())
+        guard(&self.watcher)
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
     }
 
     /// Test seam (PERM-005): how many watcher TASKS currently exist, counted independently of the

@@ -12,27 +12,30 @@
 //! functions: they open no socket, resolve no host and carry no real token (`"tok-"` +
 //! whatever the test typed). Nothing here reaches a provider endpoint even by accident, because
 //! nothing here has an endpoint.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use cyrup_config::login::AuthType;
-use cyrup_core::{ProviderId, StopReason};
-use cyrup_provider::auth::oauth::{AuthEvent, AuthInteraction, AuthPrompt, OAuthError};
-use cyrup_provider::auth::{
-    ApiKeyAuth, ModelAuth, OAuthAuth, ProviderAuth,
-};
-use cyrup_provider::AuthError as ProviderAuthError;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
-use cyrup_core::EventStream;
-use cyrup_provider::{Context, Credential, Model, Provider, StreamEvent, StreamOptions};
-use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig};
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
 use crate::{App, AppCommand, Entry, LoginProviderSource, LoginUiMsg, SelectorKind, UiTheme};
+use cyrup_config::login::AuthType;
+use cyrup_core::EventStream;
+use cyrup_core::{ProviderId, StopReason};
+use cyrup_provider::AuthError as ProviderAuthError;
+use cyrup_provider::auth::oauth::{AuthEvent, AuthInteraction, AuthPrompt, OAuthError};
+use cyrup_provider::auth::{ApiKeyAuth, ModelAuth, OAuthAuth, ProviderAuth};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
+use cyrup_provider::{Context, Credential, Model, Provider, StreamEvent, StreamOptions};
+use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
-use super::harness::*;
 
 // ---------------------------------------------------------------- stub provider
 
@@ -240,7 +243,10 @@ async fn login_confirm_runs_the_flow_and_writes_a_credential() {
 
     // `notify({type:"auth_url"})` → `dialog.showAuth(url, instructions)` (`:5352`).
     let msg = next_msg(&mut rx).await;
-    assert!(matches!(msg, LoginUiMsg::Notify(_)), "expected the auth url");
+    assert!(
+        matches!(msg, LoginUiMsg::Notify(_)),
+        "expected the auth url"
+    );
     app.apply_login_msg(msg);
     let body = app.login_dialog_body().expect("dialog is open");
     assert!(body.contains("https://stub.invalid/authorize"), "{body}");
@@ -248,7 +254,10 @@ async fn login_confirm_runs_the_flow_and_writes_a_credential() {
 
     // `prompt(...)` → `dialog.showPrompt(message)` (`:5331`), which BLOCKS the flow.
     let msg = next_msg(&mut rx).await;
-    assert!(matches!(msg, LoginUiMsg::Prompt { .. }), "expected a prompt");
+    assert!(
+        matches!(msg, LoginUiMsg::Prompt { .. }),
+        "expected a prompt"
+    );
     app.apply_login_msg(msg);
     let body = app.login_dialog_body().expect("dialog is open");
     assert!(body.contains("Paste the authorization code"), "{body}");
@@ -286,8 +295,13 @@ async fn login_confirm_runs_the_flow_and_writes_a_credential() {
         .unwrap()
         .expect("a credential must be persisted for `stub`");
     match stored {
-        cyrup_config::auth::Credential::Oauth { access, refresh, .. } => {
-            assert_eq!(access, "at-CODE42", "the typed answer shaped the credential");
+        cyrup_config::auth::Credential::Oauth {
+            access, refresh, ..
+        } => {
+            assert_eq!(
+                access, "at-CODE42",
+                "the typed answer shaped the credential"
+            );
             assert_eq!(refresh, "rt-CODE42");
         }
         other => panic!("expected an oauth credential, got {other:?}"),
@@ -323,7 +337,10 @@ async fn picker_confirm_arm_opens_the_dialog_and_starts_the_flow() {
     // Bare `/login` with two methods ⇒ `showLoginAuthTypeSelector()` (`:4997`).
     app.execute_command(AppCommand::LoginCommand(None), &fx.session, None)
         .await;
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::LoginAuthType));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::LoginAuthType)
+    );
 
     // Choosing "subscription" with NO pinned provider opens the provider picker filtered to oauth
     // (`:5071`).
@@ -521,14 +538,15 @@ async fn logout_removes_the_stored_credential() {
     type_text(&mut app, "CODE7");
     app.handle_input(&key(KeyCode::Enter));
     app.apply_login_msg(next_msg(&mut rx).await); // finished
-    assert!(fx
-        .session
-        .services()
-        .auth
-        .read(&ProviderId::from("stub"))
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        fx.session
+            .services()
+            .auth
+            .read(&ProviderId::from("stub"))
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     app.execute_command(
         AppCommand::OpenSelector(SelectorKind::Logout),
@@ -601,9 +619,10 @@ async fn login_with_an_argument_skips_the_picker() {
     )
     .await;
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::LoginDialog));
-    assert!(app
-        .login_dialog_title()
-        .is_some_and(|t| t == "Login to Stub"));
+    assert!(
+        app.login_dialog_title()
+            .is_some_and(|t| t == "Login to Stub")
+    );
 }
 
 /// An unmatched `/login <ref>` falls through to the full picker (`:5013`), it does not error out.

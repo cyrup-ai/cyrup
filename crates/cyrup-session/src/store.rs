@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::entry::Entry;
@@ -212,7 +212,12 @@ impl DiskStore {
         if let Some(f) = &self.file {
             return Ok(Arc::clone(f));
         }
-        let f = Arc::new(OpenOptions::new().create(true).append(true).open(&self.path)?);
+        let f = Arc::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?,
+        );
         self.file = Some(Arc::clone(&f));
         Ok(f)
     }
@@ -333,7 +338,11 @@ impl SessionStore for DiskStore {
         // already exists it errors (`AlreadyExists`/EEXIST) instead of overwriting, guarding the
         // duplicate-header bug (`session-manager.ts:927,1489`). Written directly (no temp+rename)
         // to mirror Pi, which writes header+entries straight to the freshly-created fd.
-        let mut f = match OpenOptions::new().write(true).create_new(true).open(&self.path) {
+        let mut f = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.path)
+        {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(SessionError::AlreadyExists(self.path.clone()));
@@ -370,11 +379,7 @@ impl SessionStore for MemStore {
         Ok(())
     }
 
-    fn rewrite(
-        &mut self,
-        _header: &SessionHeader,
-        _entries: &[Entry],
-    ) -> Result<(), SessionError> {
+    fn rewrite(&mut self, _header: &SessionHeader, _entries: &[Entry]) -> Result<(), SessionError> {
         Ok(())
     }
 

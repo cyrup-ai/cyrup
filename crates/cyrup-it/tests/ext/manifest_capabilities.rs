@@ -17,12 +17,17 @@
 //! Before the fix every one of the `*_denied_*` tests below FAILS: `load_discovered` called
 //! `self.load_wasm(id, &bytes, services)`, a signature with no manifest parameter, so
 //! `disc.manifest.capabilities` was parsed and dropped on the floor.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use cyrup_core::CancelToken;
 use cyrup_ext::loader::DiscoveryRoots;
 use cyrup_ext::{
-    CannedResponses, ExtMode, ExtensionHost, HostConfig, RecordingServices, DENIED_EXEC, DENIED_NET,
+    CannedResponses, DENIED_EXEC, DENIED_NET, ExtMode, ExtensionHost, HostConfig, RecordingServices,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -95,12 +100,21 @@ async fn load(cwd: &Path) -> (ExtensionHost, Arc<RecordingServices>) {
         configured: vec![],
         disabled: Vec::new(),
     };
-    let cfg = HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: cwd.to_path_buf() };
+    let cfg = HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: cwd.to_path_buf(),
+    };
     let host = ExtensionHost::with_wasm(cfg).expect("host with wasm");
     // A fully capable, non-deny backend: if anything still gets through, it is the HOST that let it.
     let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
     let res = host.discover_and_load(&roots, true, rec.clone()).await;
-    assert_eq!(res.loaded.len(), 1, "fixture loaded, errors={:?}", res.errors);
+    assert_eq!(
+        res.loaded.len(),
+        1,
+        "fixture loaded, errors={:?}",
+        res.errors
+    );
     (host, rec)
 }
 
@@ -111,13 +125,25 @@ async fn load(cwd: &Path) -> (ExtensionHost, Arc<RecordingServices>) {
 /// The reproduction, inverted. `{"exec": false}` and the host never reaches its exec backend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_is_refused_when_the_manifest_denies_it() {
-    let cwd = project_with_caps("exec-deny", r#"{ "fs": [], "exec": false, "net": false, "ui": false }"#);
+    let cwd = project_with_caps(
+        "exec-deny",
+        r#"{ "fs": [], "exec": false, "net": false, "ui": false }"#,
+    );
     let (host, rec) = load(&cwd).await;
 
-    let out = host.run_command("execdemo", "", &CancelToken::new()).await.expect("command runs");
+    let out = host
+        .run_command("execdemo", "", &CancelToken::new())
+        .await
+        .expect("command runs");
     let out = out.unwrap_or_default();
-    assert!(out.contains("exec denied"), "guest saw a denial, got: {out}");
-    assert!(out.contains(DENIED_EXEC), "denial names the manifest key, got: {out}");
+    assert!(
+        out.contains("exec denied"),
+        "guest saw a denial, got: {out}"
+    );
+    assert!(
+        out.contains(DENIED_EXEC),
+        "denial names the manifest key, got: {out}"
+    );
     assert!(
         rec.exec_calls().is_empty(),
         "the host refused BEFORE the exec backend: {:?}",
@@ -134,9 +160,15 @@ async fn exec_runs_when_the_manifest_grants_it() {
     let cwd = project_with_caps("exec-grant", r#"{ "exec": true, "ui": true }"#);
     let (host, rec) = load(&cwd).await;
 
-    let out = host.run_command("execdemo", "", &CancelToken::new()).await.expect("command runs");
+    let out = host
+        .run_command("execdemo", "", &CancelToken::new())
+        .await
+        .expect("command runs");
     let out = out.unwrap_or_default();
-    assert!(!out.contains("denied"), "granted exec is not denied, got: {out}");
+    assert!(
+        !out.contains("denied"),
+        "granted exec is not denied, got: {out}"
+    );
     assert_eq!(
         rec.exec_calls(),
         vec![("echo".to_string(), vec!["hi".to_string()])],
@@ -154,7 +186,10 @@ async fn exec_runs_when_the_manifest_grants_it() {
 /// reaches the http backend at all — asserted at the backend, so no network is touched either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn net_is_refused_when_the_manifest_denies_it() {
-    let cwd = project_with_caps("net-deny", r#"{ "fs": [], "exec": false, "net": false, "ui": true }"#);
+    let cwd = project_with_caps(
+        "net-deny",
+        r#"{ "fs": [], "exec": false, "net": false, "ui": true }"#,
+    );
     let (host, rec) = load(&cwd).await;
 
     let out = host
@@ -162,8 +197,14 @@ async fn net_is_refused_when_the_manifest_denies_it() {
         .await
         .expect("command runs");
     let out = out.unwrap_or_default();
-    assert!(out.contains("http denied"), "guest saw a denial, got: {out}");
-    assert!(out.contains(DENIED_NET), "denial names the manifest key, got: {out}");
+    assert!(
+        out.contains("http denied"),
+        "guest saw a denial, got: {out}"
+    );
+    assert!(
+        out.contains(DENIED_NET),
+        "denial names the manifest key, got: {out}"
+    );
     assert!(
         rec.http_requests().is_empty(),
         "the host refused BEFORE the http backend: {:?}",
@@ -174,7 +215,11 @@ async fn net_is_refused_when_the_manifest_denies_it() {
     // was per-INTERFACE, not per-function, and a fix that only covered `request` would leave
     // `request-stream` as an open second door to the same network.
     let out = host
-        .run_command("httpstreamdemo", "https://example.invalid/", &CancelToken::new())
+        .run_command(
+            "httpstreamdemo",
+            "https://example.invalid/",
+            &CancelToken::new(),
+        )
         .await
         .expect("command runs");
     assert!(
@@ -197,8 +242,15 @@ async fn net_runs_when_the_manifest_grants_it() {
         .await
         .expect("command runs");
     let out = out.unwrap_or_default();
-    assert!(!out.contains("denied"), "granted net is not denied, got: {out}");
-    assert_eq!(rec.http_requests().len(), 1, "the request reached the backend");
+    assert!(
+        !out.contains("denied"),
+        "granted net is not denied, got: {out}"
+    );
+    assert_eq!(
+        rec.http_requests().len(),
+        1,
+        "the request reached the backend"
+    );
 
     let _ = std::fs::remove_dir_all(&cwd);
 }
@@ -224,8 +276,14 @@ async fn net_runs_when_the_manifest_grants_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_guest_declaring_zero_capabilities_is_refused_exec_and_net() {
     for (label, cwd) in [
-        ("empty capabilities object", project_with_caps("caps-empty", "{}")),
-        ("no capabilities key", project_without_caps_key("caps-absent")),
+        (
+            "empty capabilities object",
+            project_with_caps("caps-empty", "{}"),
+        ),
+        (
+            "no capabilities key",
+            project_without_caps_key("caps-absent"),
+        ),
     ] {
         let (host, rec) = load(&cwd).await;
 
@@ -235,8 +293,14 @@ async fn a_guest_declaring_zero_capabilities_is_refused_exec_and_net() {
             .await
             .expect("command runs")
             .unwrap_or_default();
-        assert!(out.contains("exec denied"), "{label}: guest saw an exec denial, got: {out}");
-        assert!(out.contains(DENIED_EXEC), "{label}: denial names the manifest key, got: {out}");
+        assert!(
+            out.contains("exec denied"),
+            "{label}: guest saw an exec denial, got: {out}"
+        );
+        assert!(
+            out.contains(DENIED_EXEC),
+            "{label}: denial names the manifest key, got: {out}"
+        );
         assert!(
             rec.exec_calls().is_empty(),
             "{label}: the host refused BEFORE the exec backend: {:?}",
@@ -249,8 +313,14 @@ async fn a_guest_declaring_zero_capabilities_is_refused_exec_and_net() {
             .await
             .expect("command runs")
             .unwrap_or_default();
-        assert!(out.contains("http denied"), "{label}: guest saw a net denial, got: {out}");
-        assert!(out.contains(DENIED_NET), "{label}: denial names the manifest key, got: {out}");
+        assert!(
+            out.contains("http denied"),
+            "{label}: guest saw a net denial, got: {out}"
+        );
+        assert!(
+            out.contains(DENIED_NET),
+            "{label}: denial names the manifest key, got: {out}"
+        );
         assert!(
             rec.http_requests().is_empty(),
             "{label}: the host refused BEFORE the http backend: {:?}",
@@ -258,7 +328,11 @@ async fn a_guest_declaring_zero_capabilities_is_refused_exec_and_net() {
         );
 
         let out = host
-            .run_command("httpstreamdemo", "https://example.invalid/", &CancelToken::new())
+            .run_command(
+                "httpstreamdemo",
+                "https://example.invalid/",
+                &CancelToken::new(),
+            )
             .await
             .expect("command runs");
         assert!(
@@ -286,7 +360,10 @@ async fn the_zero_capability_refusal_is_a_refusal_and_not_an_absence_of_activity
         .await
         .expect("command runs")
         .unwrap_or_default();
-    assert!(!out.contains("denied"), "control: granted exec is not denied, got: {out}");
+    assert!(
+        !out.contains("denied"),
+        "control: granted exec is not denied, got: {out}"
+    );
     assert_eq!(
         rec.exec_calls(),
         vec![("echo".to_string(), vec!["hi".to_string()])],
@@ -298,7 +375,10 @@ async fn the_zero_capability_refusal_is_a_refusal_and_not_an_absence_of_activity
         .await
         .expect("command runs")
         .unwrap_or_default();
-    assert!(!out.contains("denied"), "control: granted net is not denied, got: {out}");
+    assert!(
+        !out.contains("denied"),
+        "control: granted net is not denied, got: {out}"
+    );
     assert_eq!(
         rec.http_requests().len(),
         1,
@@ -318,9 +398,15 @@ async fn the_zero_capability_refusal_is_a_refusal_and_not_an_absence_of_activity
 /// backend, while the identical run with `"ui": true` produces one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ui_effects_are_dropped_when_the_manifest_denies_ui() {
-    let denied = project_with_caps("ui-deny", r#"{ "fs": [], "exec": false, "net": false, "ui": false }"#);
+    let denied = project_with_caps(
+        "ui-deny",
+        r#"{ "fs": [], "exec": false, "net": false, "ui": false }"#,
+    );
     let (host, rec) = load(&denied).await;
-    let _ = host.run_command("execdemo", "", &CancelToken::new()).await.expect("command runs");
+    let _ = host
+        .run_command("execdemo", "", &CancelToken::new())
+        .await
+        .expect("command runs");
     assert!(
         rec.notify_calls().is_empty(),
         "ui.notify never reached the backend: {:?}",
@@ -331,7 +417,10 @@ async fn ui_effects_are_dropped_when_the_manifest_denies_ui() {
 
     let granted = project_with_caps("ui-grant", r#"{ "ui": true }"#);
     let (host, rec) = load(&granted).await;
-    let _ = host.run_command("execdemo", "", &CancelToken::new()).await.expect("command runs");
+    let _ = host
+        .run_command("execdemo", "", &CancelToken::new())
+        .await
+        .expect("command runs");
     assert!(
         !rec.notify_calls().is_empty(),
         "the same run WITH the ui grant does notify — so the denial above is the grant, not a \
@@ -355,11 +444,16 @@ async fn ui_effects_are_dropped_when_the_manifest_denies_ui() {
 /// above is the grant and not a missing registration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_autocomplete_provider_is_refused_when_the_manifest_denies_ui() {
-    let denied =
-        project_with_caps("acp-deny", r#"{ "fs": [], "exec": false, "net": false, "ui": false }"#);
+    let denied = project_with_caps(
+        "acp-deny",
+        r#"{ "fs": [], "exec": false, "net": false, "ui": false }"#,
+    );
     let (host, _rec) = load(&denied).await;
     assert!(
-        host.registry().autocomplete_providers().expect("registry readable").is_empty(),
+        host.registry()
+            .autocomplete_providers()
+            .expect("registry readable")
+            .is_empty(),
         "a guest with no `ui` grant stacked an autocomplete provider onto the core input editor \
          (EXT-065)"
     );
@@ -369,7 +463,10 @@ async fn an_autocomplete_provider_is_refused_when_the_manifest_denies_ui() {
     let granted = project_with_caps("acp-grant", r#"{ "ui": true }"#);
     let (host, _rec) = load(&granted).await;
     assert_eq!(
-        host.registry().autocomplete_providers().expect("registry readable").len(),
+        host.registry()
+            .autocomplete_providers()
+            .expect("registry readable")
+            .len(),
         1,
         "the same fixture WITH the ui grant registers its one provider — so the refusal above is \
          the grant, not an absent registration"
@@ -395,7 +492,10 @@ async fn fs_is_refused_when_no_grant_is_declared() {
         .expect("command runs")
         .unwrap_or_default();
     assert!(out.contains("denied"), "write refused, got: {out}");
-    assert!(out.contains("capabilities.fs"), "refusal names the manifest key, got: {out}");
+    assert!(
+        out.contains("capabilities.fs"),
+        "refusal names the manifest key, got: {out}"
+    );
     assert!(!cwd.join("note.txt").exists(), "nothing was written");
 
     let _ = std::fs::remove_dir_all(&cwd);
@@ -405,7 +505,10 @@ async fn fs_is_refused_when_no_grant_is_declared() {
 /// write — the two modes the manifest syntax has always had and nothing ever read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fs_grants_are_scoped_by_mode_and_by_subtree() {
-    let cwd = project_with_caps("fs-scoped", r#"{ "fs": ["read:.", "write:.cyrup/todo"], "ui": true }"#);
+    let cwd = project_with_caps(
+        "fs-scoped",
+        r#"{ "fs": ["read:.", "write:.cyrup/todo"], "ui": true }"#,
+    );
     std::fs::create_dir_all(cwd.join(".cyrup").join("todo")).unwrap();
     std::fs::write(cwd.join("readable.txt"), b"visible").unwrap();
     let (host, _rec) = load(&cwd).await;
@@ -425,7 +528,10 @@ async fn fs_grants_are_scoped_by_mode_and_by_subtree() {
         .await
         .expect("command runs")
         .unwrap_or_default();
-    assert!(!out.contains("denied"), "the write: grant writes, got: {out}");
+    assert!(
+        !out.contains("denied"),
+        "the write: grant writes, got: {out}"
+    );
     assert_eq!(
         std::fs::read_to_string(cwd.join(".cyrup").join("todo").join("item.md")).unwrap(),
         "hello"
@@ -437,8 +543,14 @@ async fn fs_grants_are_scoped_by_mode_and_by_subtree() {
         .await
         .expect("command runs")
         .unwrap_or_default();
-    assert!(out.contains("denied"), "a read:-only path is not writable, got: {out}");
-    assert!(!cwd.join("escaped.txt").exists(), "nothing was written outside the write: grant");
+    assert!(
+        out.contains("denied"),
+        "a read:-only path is not writable, got: {out}"
+    );
+    assert!(
+        !cwd.join("escaped.txt").exists(),
+        "nothing was written outside the write: grant"
+    );
 
     // A `..` escape is refused by the resolver regardless of grants.
     let out = host
@@ -446,7 +558,10 @@ async fn fs_grants_are_scoped_by_mode_and_by_subtree() {
         .await
         .expect("command runs")
         .unwrap_or_default();
-    assert!(out.contains("escapes the granted capability root"), "got: {out}");
+    assert!(
+        out.contains("escapes the granted capability root"),
+        "got: {out}"
+    );
 
     let _ = std::fs::remove_dir_all(&cwd);
 }
@@ -462,19 +577,32 @@ async fn a_malformed_fs_grant_fails_the_load() {
         configured: vec![],
         disabled: Vec::new(),
     };
-    let cfg = HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: cwd.clone() };
+    let cfg = HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: cwd.clone(),
+    };
     let host = ExtensionHost::with_wasm(cfg).expect("host with wasm");
     let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
 
     let res = host.discover_and_load(&roots, true, rec).await;
-    assert!(res.loaded.is_empty(), "the extension did not load: {:?}", res.loaded);
+    assert!(
+        res.loaded.is_empty(),
+        "the extension did not load: {:?}",
+        res.loaded
+    );
     assert_eq!(res.errors.len(), 1, "one recorded error: {:?}", res.errors);
     assert!(
-        res.errors[0].error.contains("invalid capability declaration"),
+        res.errors[0]
+            .error
+            .contains("invalid capability declaration"),
         "typed capability error, got: {}",
         res.errors[0].error
     );
-    assert!(res.errors[0].fatal, "a malformed sandbox declaration is a fatal load fault");
+    assert!(
+        res.errors[0].fatal,
+        "a malformed sandbox declaration is a fatal load fault"
+    );
 
     let _ = std::fs::remove_dir_all(&cwd);
 }
@@ -490,23 +618,41 @@ async fn a_malformed_fs_grant_fails_the_load() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_manifest_less_load_keeps_the_host_grant() {
     let caps = cyrup_ext::Capabilities::host_granted();
-    assert!(caps.exec && caps.net && caps.ui, "interactive capabilities stay on");
-    assert!(caps.fs.is_empty(), "but `ext-fs` still has no root without a declared grant");
-    assert_eq!(cyrup_ext::Capabilities::none(), cyrup_ext::Capabilities::default());
+    assert!(
+        caps.exec && caps.net && caps.ui,
+        "interactive capabilities stay on"
+    );
+    assert!(
+        caps.fs.is_empty(),
+        "but `ext-fs` still has no root without a declared grant"
+    );
+    assert_eq!(
+        cyrup_ext::Capabilities::none(),
+        cyrup_ext::Capabilities::default()
+    );
 
     let bytes = std::fs::read(fixture_component()).expect("read fixture component");
     let cwd = temp_project("hostgrant");
-    let cfg = HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: cwd.clone() };
+    let cfg = HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: cwd.clone(),
+    };
     let host = ExtensionHost::with_wasm(cfg).expect("host with wasm");
     let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
-    host.load_wasm("demo".into(), &bytes, rec.clone()).await.expect("load + init");
+    host.load_wasm("demo".into(), &bytes, rec.clone())
+        .await
+        .expect("load + init");
 
     let out = host
         .run_command("execdemo", "", &CancelToken::new())
         .await
         .expect("command runs")
         .unwrap_or_default();
-    assert!(!out.contains("denied"), "the host-internal load still grants exec, got: {out}");
+    assert!(
+        !out.contains("denied"),
+        "the host-internal load still grants exec, got: {out}"
+    );
     assert_eq!(rec.exec_calls().len(), 1);
 
     let _ = std::fs::remove_dir_all(&cwd);
@@ -530,13 +676,22 @@ async fn the_manifest_less_load_keeps_the_host_grant() {
 async fn the_explicit_grant_entry_point_caps_a_manifest_less_component() {
     let bytes = std::fs::read(fixture_component()).expect("read fixture component");
     let cwd = temp_project("explicitcaps");
-    let cfg = HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: cwd.clone() };
+    let cfg = HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: cwd.clone(),
+    };
     let host = ExtensionHost::with_wasm(cfg).expect("host with wasm");
     // Fully capable backend: anything that gets through got through the HOST, not the stub.
     let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
 
     // `ui` on so the guest can still report; `exec` off is the restriction under test.
-    let caps = cyrup_ext::Capabilities { fs: Vec::new(), exec: false, net: false, ui: true };
+    let caps = cyrup_ext::Capabilities {
+        fs: Vec::new(),
+        exec: false,
+        net: false,
+        ui: true,
+    };
     host.load_wasm_with_caps("demo".into(), &bytes, rec.clone(), &caps)
         .await
         .expect("load + init");
@@ -546,8 +701,14 @@ async fn the_explicit_grant_entry_point_caps_a_manifest_less_component() {
         .await
         .expect("command runs")
         .unwrap_or_default();
-    assert!(out.contains("exec denied"), "the explicit grant restricts the guest, got: {out}");
-    assert!(out.contains(DENIED_EXEC), "denial names the capability key, got: {out}");
+    assert!(
+        out.contains("exec denied"),
+        "the explicit grant restricts the guest, got: {out}"
+    );
+    assert!(
+        out.contains(DENIED_EXEC),
+        "denial names the capability key, got: {out}"
+    );
     assert!(
         rec.exec_calls().is_empty(),
         "the host refused BEFORE the exec backend: {:?}",

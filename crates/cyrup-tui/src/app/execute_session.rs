@@ -36,9 +36,18 @@ impl<B: Backend> App<B> {
             C::RenameSession { path, name } => {
                 // `/resume` in-list rename (`onRenameSession`): persist a `session_info` name on the
                 // target file via the additive `rename_session_file` seam.
-                match session.rename_session_file(std::path::Path::new(&path), &name).await {
-                    Ok(()) => self.state.transcript.push_status(format!("renamed session → {name}")),
-                    Err(e) => self.state.transcript.push_status(format!("rename error: {e}")),
+                match session
+                    .rename_session_file(std::path::Path::new(&path), &name)
+                    .await
+                {
+                    Ok(()) => self
+                        .state
+                        .transcript
+                        .push_status(format!("renamed session → {name}")),
+                    Err(e) => self
+                        .state
+                        .transcript
+                        .push_status(format!("rename error: {e}")),
                 }
             }
 
@@ -57,8 +66,14 @@ impl<B: Backend> App<B> {
             },
 
             C::Clone => match session.clone_at(None).await {
-                Ok(id) => self.state.transcript.push_status(format!("cloned session → {id}")),
-                Err(e) => self.state.transcript.push_status(format!("clone error: {e}")),
+                Ok(id) => self
+                    .state
+                    .transcript
+                    .push_status(format!("cloned session → {id}")),
+                Err(e) => self
+                    .state
+                    .transcript
+                    .push_status(format!("clone error: {e}")),
             },
 
             C::Export(arg) => {
@@ -67,8 +82,9 @@ impl<B: Backend> App<B> {
                 // every other target (including no path) writes a styled HTML document — HTML is the
                 // default. cyrup renders the HTML body in-crate (`export::session_jsonl_to_html`) over
                 // the session's own JSONL; the rich tool-card renderer is the L5 residual.
-                let is_jsonl =
-                    arg.as_deref().is_some_and(|p| p.trim_end().to_ascii_lowercase().ends_with(".jsonl"));
+                let is_jsonl = arg
+                    .as_deref()
+                    .is_some_and(|p| p.trim_end().to_ascii_lowercase().ends_with(".jsonl"));
                 if is_jsonl {
                     let path = arg.as_deref().map(std::path::Path::new);
                     match session.export_to_jsonl(path).await {
@@ -82,7 +98,10 @@ impl<B: Backend> App<B> {
                                 .transcript
                                 .push_status(format!("Session exported to: {label}"));
                         }
-                        Err(e) => self.state.transcript.push_status(format!("export error: {e}")),
+                        Err(e) => self
+                            .state
+                            .transcript
+                            .push_status(format!("export error: {e}")),
                     }
                 } else {
                     // Pull the transcript as JSONL (no path ⇒ returned as text), render to HTML, write.
@@ -134,7 +153,10 @@ impl<B: Backend> App<B> {
                             }
                         }
                         Ok(None) => self.state.transcript.push_status("exported session"),
-                        Err(e) => self.state.transcript.push_status(format!("export error: {e}")),
+                        Err(e) => self
+                            .state
+                            .transcript
+                            .push_status(format!("export error: {e}")),
                     }
                 }
             }
@@ -143,7 +165,6 @@ impl<B: Backend> App<B> {
             // store normalizes, and echoing the input told the user a name was set that `/resume`
             // would not show. When the two differ upstream warns first (`:5648-5650`), verbatim
             // including the JSON quoting of both values.
-
             C::SessionInfo => {
                 // Pi's `/session` renderer (`handleSessionCommand`, interactive-mode.ts:5656-5717
                 // @v0.83.0) reads exactly these fields off `getSessionStats()`; cyrup renders them
@@ -215,7 +236,6 @@ impl<B: Backend> App<B> {
             // the active session + bumps the generation, and the run loop's generation-watch arm
             // re-binds the UI (re-subscribe + reset transcript) → `pending_swap_status`. Without a
             // runtime (SDK/embedder), surface the request so the path is real (no silent drop).
-
             C::NewSession => match runtime {
                 // `/new` (handleClearCommand): start a fresh session in the same cwd (Pi `newSession`).
                 //
@@ -298,9 +318,10 @@ impl<B: Backend> App<B> {
                 // `showError` (`interactive-mode.ts:5482` @v0.83.0). cyrup dropped the `.jsonl`
                 // constraint, lowercased the word, and routed a real error to the neutral status
                 // line, where it is neither coloured nor prefixed as a problem.
-                (Some(_), None) => {
-                    self.state.transcript.push_error("Usage: /import <path.jsonl>")
-                }
+                (Some(_), None) => self
+                    .state
+                    .transcript
+                    .push_error("Usage: /import <path.jsonl>"),
                 (None, p) => self
                     .state
                     .transcript
@@ -311,7 +332,10 @@ impl<B: Backend> App<B> {
             // lifecycle bucket; a variant it names there with no arm above lands here. Report it
             // rather than swallowing it — cc19b87 was exactly this, in `execute_misc_command`.
             other => {
-                debug_assert!(false, "unrouted command in execute_session_command: {other:?}");
+                debug_assert!(
+                    false,
+                    "unrouted command in execute_session_command: {other:?}"
+                );
                 self.state
                     .transcript
                     .push_error(format!("internal: unrouted command {other:?}"));
@@ -330,7 +354,10 @@ impl<B: Backend> App<B> {
     ) {
         use AppCommand as C;
         match cmd {
-            C::ConfirmSelection { kind: SelectorKind::UserMessage, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::UserMessage,
+                value,
+            } => {
                 // `/fork` (user-message-selector.ts): fork at the chosen entry. With the runtime
                 // threaded in, drive `AgentSessionRuntime::fork` so the runtime swaps to the new
                 // branched session and the UI re-binds on the generation bump (Pi `fork`,
@@ -360,12 +387,18 @@ impl<B: Backend> App<B> {
                     }
                     None => match session.fork_at_entry(&entry, ForkPosition::Before).await {
                         Ok(_) => self.state.transcript.push_status("forked from message"),
-                        Err(e) => self.state.transcript.push_status(format!("fork error: {e}")),
+                        Err(e) => self
+                            .state
+                            .transcript
+                            .push_status(format!("fork error: {e}")),
                     },
                 }
             }
 
-            C::ConfirmSelection { kind: SelectorKind::Session, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::Session,
+                value,
+            } => {
                 // `/resume` swap (handleResumeSession, interactive-mode.ts): switch the runtime to the
                 // chosen session file (Pi `switchSession`, agent-session-runtime.ts:193). The runtime
                 // asserts the resumed cwd still exists, rebuilds cwd-bound services, and bumps the
@@ -400,7 +433,10 @@ impl<B: Backend> App<B> {
             // that arm without adding an arm here and the command vanishes silently — cc19b87's
             // shape, one level deeper. Report it instead.
             other => {
-                debug_assert!(false, "unrouted command in execute_session_switch: {other:?}");
+                debug_assert!(
+                    false,
+                    "unrouted command in execute_session_switch: {other:?}"
+                );
                 self.state
                     .transcript
                     .push_error(format!("internal: unrouted command {other:?}"));
@@ -418,7 +454,9 @@ impl<B: Backend> App<B> {
         // (`switch_session`) once the runtime is threaded into the run loop (residual gap #3).
         let sessions = session.list_sessions();
         if sessions.is_empty() {
-            self.state.transcript.push_status("no saved sessions to resume");
+            self.state
+                .transcript
+                .push_status("no saved sessions to resume");
         } else {
             let current = session.session_id().to_string();
             let rows: Vec<SessionRow> = sessions
@@ -483,5 +521,4 @@ impl<B: Backend> App<B> {
             self.open_boxed_selector(SelectorKind::Session, inner);
         }
     }
-
 }

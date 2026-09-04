@@ -20,20 +20,25 @@
 //! real `NativeExtension::execute_command` command-tier dispatch, and a `HostServices` sink
 //! late-bound exactly as the builder binds the live session backend.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::common::{registration, spawn_broker, within, write_broker_command};
 use cyrup_ext::{ExtMode, HostCtx, HostEvent, HostServices, NativeExtension};
 use cyrup_intercom::config::load_config;
 use cyrup_intercom::extension::{INTERCOM_COMMAND, IntercomExtension};
 use cyrup_intercom::paths::{broker_socket_path, intercom_dir_path};
-use cyrup_intercom::transport::client::{IntercomClient, InboundEvent};
+use cyrup_intercom::transport::client::{InboundEvent, IntercomClient};
 use cyrup_intercom::transport::spawn::wait_for_broker;
 use serde_json::Value;
-use crate::common::{registration, spawn_broker, within, write_broker_command};
 
 const MY_SESSION_ID: &str = "session-aaaabbbbccccdddd";
 const PEER_SESSION_ID: &str = "session-1111222233334444";
@@ -47,7 +52,9 @@ struct RecordingSink {
 
 impl RecordingSink {
     fn new() -> Arc<Self> {
-        Arc::new(Self { appended: Mutex::new(Vec::new()) })
+        Arc::new(Self {
+            appended: Mutex::new(Vec::new()),
+        })
     }
 
     fn entries(&self) -> Vec<(String, Value)> {
@@ -102,14 +109,20 @@ async fn slash_intercom_send_appends_an_intercom_sent_entry() {
     let socket = broker_socket_path(&intercom_dir);
 
     let mut broker = spawn_broker(agent_dir.path());
-    wait_for_broker(&socket, Duration::from_secs(20)).await.expect("broker up");
+    wait_for_broker(&socket, Duration::from_secs(20))
+        .await
+        .expect("broker up");
 
     // The peer this session will address by NAME. Its receiver is subscribed BEFORE the send and
     // held open for the whole test, so the delivery cannot be missed by a subscribe/send race.
     let peer = Arc::new(
-        IntercomClient::connect(&socket, registration(PEER_NAME), Some(PEER_SESSION_ID.to_string()))
-            .await
-            .expect("the peer registers"),
+        IntercomClient::connect(
+            &socket,
+            registration(PEER_NAME),
+            Some(PEER_SESSION_ID.to_string()),
+        )
+        .await
+        .expect("the peer registers"),
     );
     let mut peer_events = peer.subscribe();
 
@@ -124,10 +137,21 @@ async fn slash_intercom_send_appends_an_intercom_sent_entry() {
     .expect("build the extension");
     ext.set_host_services(sink.clone());
     let ctx = HostCtx::command(ExtMode::Print, false, agent_dir.path().to_path_buf());
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "test".to_string(), previous_session_file: None }, &ctx).await;
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "test".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     let state = ext.state().clone();
     assert!(
-        within(Duration::from_secs(30), || state.client().is_some_and(|c| c.is_connected())).await,
+        within(Duration::from_secs(30), || state
+            .client()
+            .is_some_and(|c| c.is_connected()))
+        .await,
         "the session connects on SessionStart"
     );
 
@@ -140,8 +164,7 @@ async fn slash_intercom_send_appends_an_intercom_sent_entry() {
 
     // MIRROR 1 (green pre- AND post-fix): the command reports the send to the model/user.
     assert_eq!(
-        reply,
-        "Message sent to reviewer",
+        reply, "Message sent to reviewer",
         "ICOM-013: v0.10.1 index.ts:2429 interpolates targetLabel with NO trailing period, \
 and the label is `formatSessionLabel` over the RESOLVED peer — which is the peer's own name \
 here because it is unique in the roster"
@@ -157,8 +180,15 @@ here because it is unique in the roster"
 
     // THE FIX: the transcript now carries pi's `intercom_sent` entry.
     let entries = sink.entries();
-    let sent: Vec<&(String, Value)> = entries.iter().filter(|(t, _)| t == "intercom_sent").collect();
-    assert_eq!(sent.len(), 1, "exactly one intercom_sent entry, got: {entries:?}");
+    let sent: Vec<&(String, Value)> = entries
+        .iter()
+        .filter(|(t, _)| t == "intercom_sent")
+        .collect();
+    assert_eq!(
+        sent.len(),
+        1,
+        "exactly one intercom_sent entry, got: {entries:?}"
+    );
     let data = &sent[0].1;
     assert_eq!(
         data.get("to").and_then(Value::as_str),
@@ -166,16 +196,22 @@ here because it is unique in the roster"
         "pi `to: selectedSession.name || selectedSession.id` — the RESOLVED peer's label: {data}"
     );
     assert_eq!(
-        data.get("message").and_then(|m| m.get("text")).and_then(Value::as_str),
+        data.get("message")
+            .and_then(|m| m.get("text"))
+            .and_then(Value::as_str),
         Some("please review the diff"),
         "pi `message: {{ text: result.text }}`: {data}"
     );
     assert!(
-        data.get("messageId").and_then(Value::as_str).is_some_and(|id| !id.is_empty()),
+        data.get("messageId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty()),
         "pi `messageId: result.messageId` — the broker-assigned id, so the entry is correlatable: {data}"
     );
     assert!(
-        data.get("timestamp").and_then(Value::as_u64).is_some_and(|t| t > 0),
+        data.get("timestamp")
+            .and_then(Value::as_u64)
+            .is_some_and(|t| t > 0),
         "pi `timestamp: Date.now()`: {data}"
     );
 
@@ -198,12 +234,18 @@ async fn slash_intercom_picker_appends_nothing() {
     let socket = broker_socket_path(&intercom_dir);
 
     let mut broker = spawn_broker(agent_dir.path());
-    wait_for_broker(&socket, Duration::from_secs(20)).await.expect("broker up");
+    wait_for_broker(&socket, Duration::from_secs(20))
+        .await
+        .expect("broker up");
 
     let peer = Arc::new(
-        IntercomClient::connect(&socket, registration(PEER_NAME), Some(PEER_SESSION_ID.to_string()))
-            .await
-            .expect("the peer registers"),
+        IntercomClient::connect(
+            &socket,
+            registration(PEER_NAME),
+            Some(PEER_SESSION_ID.to_string()),
+        )
+        .await
+        .expect("the peer registers"),
     );
 
     let sink = RecordingSink::new();
@@ -216,10 +258,21 @@ async fn slash_intercom_picker_appends_nothing() {
     .expect("build the extension");
     ext.set_host_services(sink.clone());
     let ctx = HostCtx::command(ExtMode::Print, false, agent_dir.path().to_path_buf());
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "test".to_string(), previous_session_file: None }, &ctx).await;
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "test".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     let state = ext.state().clone();
     assert!(
-        within(Duration::from_secs(30), || state.client().is_some_and(|c| c.is_connected())).await,
+        within(Duration::from_secs(30), || state
+            .client()
+            .is_some_and(|c| c.is_connected()))
+        .await,
         "the session connects on SessionStart"
     );
 
@@ -228,7 +281,10 @@ async fn slash_intercom_picker_appends_nothing() {
         .await
         .expect("the command dispatches")
         .expect("the command produces output");
-    assert!(rendered.contains(PEER_NAME), "the picker lists the peer: {rendered}");
+    assert!(
+        rendered.contains(PEER_NAME),
+        "the picker lists the peer: {rendered}"
+    );
     assert!(
         sink.entries().is_empty(),
         "opening the picker sends nothing, so it appends nothing: {:?}",

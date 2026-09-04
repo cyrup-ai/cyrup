@@ -54,9 +54,7 @@
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::oauth::now_ms;
 use crate::auth::types::{AuthContext, EnvAuthContext, ModelAuth};
-use crate::auth::{
-    Credential, CredentialStore, InMemoryCredentialStore, OAuthAuth, ProviderAuth,
-};
+use crate::auth::{Credential, CredentialStore, InMemoryCredentialStore, OAuthAuth, ProviderAuth};
 use crate::error::AuthError;
 use crate::model::Model;
 use crate::wire::WireProvider;
@@ -496,9 +494,7 @@ impl OAuthAuth for OpenAiCodexOAuth {
             Credential::ApiKey { .. } => {
                 return Err(AuthError::oauth(
                     provider,
-                    OpenAiCodexAuthError::new(
-                        "OpenAI Codex refresh requires an OAuth credential",
-                    ),
+                    OpenAiCodexAuthError::new("OpenAI Codex refresh requires an OAuth credential"),
                 ));
             }
         };
@@ -508,8 +504,7 @@ impl OAuthAuth for OpenAiCodexOAuth {
             .await
             .map_err(|e| AuthError::oauth(provider.clone(), e))?;
 
-        credentials_from_token(access, refresh, expires)
-            .map_err(|e| AuthError::oauth(provider, e))
+        credentials_from_token(access, refresh, expires).map_err(|e| AuthError::oauth(provider, e))
     }
 
     /// pi `toAuth` (`auth/oauth/openai-codex.ts:458-460`): `{ apiKey: credential.access }` — the
@@ -670,7 +665,10 @@ mod tests {
         );
         let t = &luna.cost.tiers.as_ref().expect("luna tiers")[0];
         assert_eq!(t.input_tokens_above, 272_000);
-        assert_eq!((t.input, t.output, t.cache_read, t.cache_write), (0.4, 1.8, 0.04, 0.5));
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_write),
+            (0.4, 1.8, 0.04, 0.5)
+        );
 
         let terra = find("gpt-5.6-terra");
         assert_eq!(
@@ -683,7 +681,10 @@ mod tests {
             (2.0, 12.0, 0.2, 2.5)
         );
         let t = &terra.cost.tiers.as_ref().expect("terra tiers")[0];
-        assert_eq!((t.input, t.output, t.cache_read, t.cache_write), (4.0, 18.0, 0.4, 5.0));
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_write),
+            (4.0, 18.0, 0.4, 5.0)
+        );
 
         // MIRROR: Sol has no entry in `OPENAI_GPT_56_STANDARD_COSTS`; its literal is the unchanged
         // inline `{5, 30, 0.5, 6.25}` (v0.84.1 `…:2609`), so only its contextWindow moved.
@@ -720,7 +721,11 @@ mod tests {
         assert_eq!(m.cost.cache_read, 0.25);
         assert_eq!(m.cost.cache_write, 0.0);
 
-        let tiers = m.cost.tiers.as_ref().expect("gpt-5.4 has a long-context tier");
+        let tiers = m
+            .cost
+            .tiers
+            .as_ref()
+            .expect("gpt-5.4 has a long-context tier");
         assert_eq!(tiers.len(), 1);
         let tier = &tiers[0];
         assert_eq!(tier.input_tokens_above, 272_000);
@@ -756,7 +761,10 @@ mod tests {
         assert_eq!(spark.context_window, 128_000);
 
         // Every other row opts into tool search.
-        for m in models.iter().filter(|m| m.id.as_str() != "gpt-5.3-codex-spark") {
+        for m in models
+            .iter()
+            .filter(|m| m.id.as_str() != "gpt-5.3-codex-spark")
+        {
             assert_eq!(
                 m.compat.as_ref().and_then(|c| c.supports_tool_search),
                 Some(true),
@@ -912,10 +920,7 @@ mod tests {
         assert_eq!(openai_codex_account_id("a.b.c.d"), None);
         // Not base64, and not JSON.
         assert_eq!(openai_codex_account_id("aaa.!!!!.ccc"), None);
-        assert_eq!(
-            openai_codex_account_id(&jwt("not json at all")),
-            None
-        );
+        assert_eq!(openai_codex_account_id(&jwt("not json at all")), None);
     }
 
     /// A base64**url** payload — one character outside the STANDARD alphabet — makes upstream's
@@ -1002,9 +1007,10 @@ mod tests {
                                         .split("content-length:")
                                         .nth(1)
                                         .and_then(|rest| {
-                                            rest.split("\r\n").next().map(str::trim).and_then(|v| {
-                                                v.parse::<usize>().ok()
-                                            })
+                                            rest.split("\r\n")
+                                                .next()
+                                                .map(str::trim)
+                                                .and_then(|v| v.parse::<usize>().ok())
                                         })
                                         .unwrap_or(0);
                                     if raw.len() >= head_end + 4 + want {
@@ -1107,12 +1113,8 @@ mod tests {
     /// verbatim — the `refresh` operation word, the numeric status, and the raw body.
     #[tokio::test]
     async fn a_non_2xx_token_response_is_the_upstream_error_string() {
-        let (origin, _) = spawn_token_endpoint(
-            401,
-            "Unauthorized",
-            r#"{"error":"invalid_grant"}"#,
-        )
-        .await;
+        let (origin, _) =
+            spawn_token_endpoint(401, "Unauthorized", r#"{"error":"invalid_grant"}"#).await;
         let oauth = OpenAiCodexOAuth::new()
             .with_auth_context(empty_env())
             .with_token_url(&format!("{origin}/oauth/token"));

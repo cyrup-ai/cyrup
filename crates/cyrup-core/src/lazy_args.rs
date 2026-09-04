@@ -30,7 +30,10 @@ impl LazyArgs {
     /// Arguments deferred behind the raw streaming buffer they are recovered from.
     #[must_use]
     pub fn streaming(raw: SharedStr) -> Self {
-        Self { raw: Some(raw), parsed: OnceLock::new() }
+        Self {
+            raw: Some(raw),
+            parsed: OnceLock::new(),
+        }
     }
 
     /// The materialised map, parsing on first call.
@@ -63,7 +66,10 @@ impl Clone for LazyArgs {
         if let Some(m) = self.parsed.get() {
             let _ = parsed.set(Arc::clone(m));
         }
-        Self { raw: self.raw.clone(), parsed }
+        Self {
+            raw: self.raw.clone(),
+            parsed,
+        }
     }
 }
 
@@ -162,7 +168,11 @@ mod tests {
                     inc.feed(&buf[at..end]);
                     at = end;
                 }
-                assert_eq!(&*lazy, &inc.object(buf), "buffer {buf:?}, {chunk}-byte chunks");
+                assert_eq!(
+                    &*lazy,
+                    &inc.object(buf),
+                    "buffer {buf:?}, {chunk}-byte chunks"
+                );
             }
         }
     }
@@ -176,8 +186,8 @@ mod tests {
             serde_json::to_string(&m).expect("map"),
             serde_json::to_string(&LazyArgs::from(m.clone())).expect("lazy")
         );
-        let back: LazyArgs = serde_json::from_str(&serde_json::to_string(&m).expect("map"))
-            .expect("deserialize");
+        let back: LazyArgs =
+            serde_json::from_str(&serde_json::to_string(&m).expect("map")).expect("deserialize");
         assert_eq!(&*back, &m);
         assert!(serde_json::from_str::<LazyArgs>("[1,2]").is_err());
         assert!(serde_json::from_str::<LazyArgs>("\"s\"").is_err());
@@ -239,10 +249,16 @@ mod tests {
         let snap = LazyArgs::streaming(w.clone());
         assert!(!snap.is_materialised());
         let other = snap.clone();
-        assert!(!other.is_materialised(), "a clone of an unparsed handle carries nothing");
+        assert!(
+            !other.is_materialised(),
+            "a clone of an unparsed handle carries nothing"
+        );
         assert_eq!(other.len(), 1);
         assert!(other.is_materialised());
-        assert!(!snap.is_materialised(), "reading one handle does not parse its siblings");
+        assert!(
+            !snap.is_materialised(),
+            "reading one handle does not parse its siblings"
+        );
         // A clone taken AFTER the parse inherits it — the O(1) path — and must still read the same.
         let inheriting = other.clone();
         assert!(inheriting.is_materialised());

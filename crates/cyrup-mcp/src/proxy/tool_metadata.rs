@@ -18,7 +18,6 @@
 //!
 //! See [`crate::proxy`] for the module overview.
 
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -54,7 +53,11 @@ pub struct ToolMetadata {
 impl ToolMetadata {
     /// A plain tool, for tests and for callers that only need the three required fields.
     #[must_use]
-    pub fn new(name: impl Into<String>, original_name: impl Into<String>, description: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        original_name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             original_name: original_name.into(),
@@ -98,14 +101,18 @@ pub use crate::registration::{
     sanitize_server_prefix, server_prefix, tool_name_candidates, truncate_at_word,
 };
 
-
 /// `tool-metadata.ts:154` `findToolByName(metadata, toolName)` — exact `name` match first,
 /// otherwise compare with `-` globally replaced by `_` on **both** sides.
 #[must_use]
-pub fn find_tool_by_name<'a>(metadata: &'a [ToolMetadata], tool_name: &str) -> Option<&'a ToolMetadata> {
+pub fn find_tool_by_name<'a>(
+    metadata: &'a [ToolMetadata],
+    tool_name: &str,
+) -> Option<&'a ToolMetadata> {
     if let Some(exact) = metadata.iter().find(|tool| tool.name == tool_name) {
         return Some(exact);
     }
     let normalized = tool_name.replace('-', "_");
-    metadata.iter().find(|tool| tool.name.replace('-', "_") == normalized)
+    metadata
+        .iter()
+        .find(|tool| tool.name.replace('-', "_") == normalized)
 }

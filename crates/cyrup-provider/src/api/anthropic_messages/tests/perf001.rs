@@ -108,7 +108,9 @@ fn text_frames(payload: &str, delta_bytes: usize) -> Vec<SseFrame> {
 
 /// The number of `content_block_delta` frames in `f` (the delta count under measurement).
 fn delta_count(f: &[SseFrame]) -> usize {
-    f.iter().filter(|x| x.event == "content_block_delta").count()
+    f.iter()
+        .filter(|x| x.event == "content_block_delta")
+        .count()
 }
 
 /// Drive the decoder over `frames`, keeping every event and reading no `partial`'s payload.
@@ -175,7 +177,11 @@ async fn content_cost(
     let n = delta_count(&heavy);
     let light_payload: String = std::iter::repeat_n('x', n).collect();
     let light = build(&light_payload, 1);
-    assert_eq!(n, delta_count(&light), "both runs must emit the same number of deltas");
+    assert_eq!(
+        n,
+        delta_count(&light),
+        "both runs must emit the same number of deltas"
+    );
 
     let mut best = Duration::MAX;
     for _ in 0..3 {
@@ -202,9 +208,13 @@ const NOISE: Duration = Duration::from_millis(1);
 /// bar, which is stable and is the figure DoD 1 actually names.
 fn scaling_report(small: Duration, big: Duration) -> String {
     if small < NOISE || big < NOISE {
-        return "n/a — a point is below the 1 ms noise floor, which is better than linear".to_string();
+        return "n/a — a point is below the 1 ms noise floor, which is better than linear"
+            .to_string();
     }
-    format!("{:.2}x   (linear = 4, quadratic = 16)", big.as_secs_f64() / small.as_secs_f64())
+    format!(
+        "{:.2}x   (linear = 4, quadratic = 16)",
+        big.as_secs_f64() / small.as_secs_f64()
+    )
 }
 
 fn payload(kib: usize) -> String {
@@ -355,9 +365,16 @@ async fn every_partial_freezes_the_prefix_it_was_taken_at() {
         let Some(Content::Text { text, .. }) = partial.content.first() else {
             panic!("a text delta's partial must carry a text block");
         };
-        assert_eq!(text.as_str(), acc.as_str(), "partial {seen} must show deltas 0..={seen}");
+        assert_eq!(
+            text.as_str(),
+            acc.as_str(),
+            "partial {seen} must show deltas 0..={seen}"
+        );
     }
-    assert!(seen > 100, "the stream must actually have been chunked, got {seen} deltas");
+    assert!(
+        seen > 100,
+        "the stream must actually have been chunked, got {seen} deltas"
+    );
     assert_eq!(acc, prose, "the deltas must reconstruct the payload");
 
     // The same for tool arguments, which are recovered through `LazyArgs` rather than read directly.
@@ -380,7 +397,10 @@ async fn every_partial_freezes_the_prefix_it_was_taken_at() {
             "partial {seen} must recover deltas 0..={seen}"
         );
     }
-    assert!(seen > 100, "the stream must actually have been chunked, got {seen} deltas");
+    assert!(
+        seen > 100,
+        "the stream must actually have been chunked, got {seen} deltas"
+    );
     assert_eq!(acc, args, "the deltas must reconstruct the payload");
 }
 
@@ -398,7 +418,9 @@ async fn no_snapshot_materialises_a_payload_nobody_read() {
 
     let mut checked = 0usize;
     for ev in &events {
-        let Some(partial) = ev.partial() else { continue };
+        let Some(partial) = ev.partial() else {
+            continue;
+        };
         for block in &partial.content {
             match block {
                 Content::ToolCall(tc) => {
@@ -410,7 +432,10 @@ async fn no_snapshot_materialises_a_payload_nobody_read() {
                 }
                 Content::Text { text, .. } => {
                     checked += 1;
-                    assert!(!text.is_materialised(), "a `partial` nobody read flattened its text");
+                    assert!(
+                        !text.is_materialised(),
+                        "a `partial` nobody read flattened its text"
+                    );
                 }
                 Content::Thinking { thinking, .. } => {
                     checked += 1;
@@ -420,7 +445,10 @@ async fn no_snapshot_materialises_a_payload_nobody_read() {
             }
         }
     }
-    assert!(checked > n, "the snapshots must actually have carried blocks to check");
+    assert!(
+        checked > n,
+        "the snapshots must actually have carried blocks to check"
+    );
 
     // ...and reading ONE of them materialises exactly that one. (The FIRST partial belongs to the
     // `Start` event, which precedes any block, so take the last.)
@@ -447,7 +475,11 @@ async fn partial_is_unchanged() {
     let partials: Vec<_> = events.iter().filter_map(|e| e.partial()).collect();
     assert!(partials.len() >= 4);
     for p in &partials {
-        assert_eq!(p.stop_reason, StopReason::Pending, "in-flight partials stay Pending");
+        assert_eq!(
+            p.stop_reason,
+            StopReason::Pending,
+            "in-flight partials stay Pending"
+        );
         assert_eq!(p.api.as_str(), API_ID);
     }
     // Every partial after the leading `Start` — emitted before `message_start` is read — carries
@@ -457,7 +489,10 @@ async fn partial_is_unchanged() {
     }
     // `usage` is cost-adjusted on every partial, not only on the terminal.
     let last_partial = partials.last().expect("a partial");
-    assert!(last_partial.usage.cost.total > 0.0, "apply_cost still runs per snapshot");
+    assert!(
+        last_partial.usage.cost.total > 0.0,
+        "apply_cost still runs per snapshot"
+    );
     // Timestamps advance: they are recomputed per event, never frozen by the memo.
     let first_ts = partials.first().expect("a partial").timestamp;
     assert!(partials.iter().all(|p| p.timestamp >= first_ts));
@@ -490,7 +525,11 @@ async fn truncated_salvage_survives_a_split_escape() {
     // `\u00e9` at bytes 30..36, and the 33-byte delta boundary falls INSIDE it: the first delta
     // ends `...caf\u0`, the second starts `0e9...`. The scanner therefore sees half an escape.
     let truncated = r#"{"path":"a.txt","content":"caf\u00e9 and more"#;
-    assert_eq!(&truncated[30..36], r"\u00e9", "the escape must sit at 30..36");
+    assert_eq!(
+        &truncated[30..36],
+        r"\u00e9",
+        "the escape must sit at 30..36"
+    );
     let mut frames = tool_frames(truncated, 33);
     // Cut the stream off: no `content_block_stop`, no `message_delta`, no `message_stop`.
     frames.truncate(frames.len() - 3);

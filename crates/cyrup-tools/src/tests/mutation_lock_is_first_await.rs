@@ -39,8 +39,8 @@ use cyrup_core::{
     CancelToken, EventStream, Tool, ToolCallId, ToolError, ToolUpdate, ToolUpdateSink,
 };
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Poll `f` exactly once with a no-op waker.
 fn poll_once<F: std::future::Future>(f: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
@@ -159,7 +159,10 @@ fn write_takes_the_mutation_lock_before_any_other_await() {
     assert_first_await_is_the_mutation_lock(
         |fs, locks, cwd| {
             let tool: Arc<dyn Tool> = Arc::new(WriteTool::new(fs, locks, cwd, WriteOpts));
-            (tool, serde_json::json!({ "path": "f.txt", "content": "hello" }))
+            (
+                tool,
+                serde_json::json!({ "path": "f.txt", "content": "hello" }),
+            )
         },
         |_dir| {},
     );

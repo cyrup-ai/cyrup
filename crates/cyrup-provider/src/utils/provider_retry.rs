@@ -64,7 +64,8 @@ impl ProviderRetry {
 
     /// The effective server-delay ceiling in ms (`0` = no ceiling).
     fn delay_ceiling_ms(&self) -> u64 {
-        self.max_retry_delay_ms.unwrap_or(DEFAULT_MAX_RETRY_DELAY_MS)
+        self.max_retry_delay_ms
+            .unwrap_or(DEFAULT_MAX_RETRY_DELAY_MS)
     }
 }
 
@@ -326,7 +327,10 @@ mod tests {
         assert_eq!(apply_jitter(8_000, 1.0), 6_000);
         for _ in 0..256 {
             let d = retry_delay_ms(None, "boom", 3, ProviderRetry::NONE).unwrap();
-            assert!((3_000..=4_000).contains(&d), "jittered 4s backoff was {d}ms");
+            assert!(
+                (3_000..=4_000).contains(&d),
+                "jittered 4s backoff was {d}ms"
+            );
         }
     }
 

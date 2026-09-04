@@ -43,10 +43,10 @@
 //! `addMessageToChat(event.message)` followed by `updatePendingMessagesDisplay()`). Adding the rows
 //! without removing the echo would render every queued message twice.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::text_width::truncate_to_width;
 use crate::theme::UiTheme;
@@ -113,7 +113,11 @@ impl PendingMessages {
             out.push(row(&format!("Follow-up: {message}"), width, theme));
         }
         let key = dequeue_key.unwrap_or_default();
-        out.push(row(&format!("↳ {key} to edit all queued messages"), width, theme));
+        out.push(row(
+            &format!("↳ {key} to edit all queued messages"),
+            width,
+            theme,
+        ));
         out
     }
 
@@ -143,12 +147,20 @@ fn row(text: &str, width: u16, theme: &UiTheme) -> Line<'static> {
     // `truncateToWidth(singleLineText, availableWidth)` (`truncated-text.ts:44`) — the shared port,
     // with upstream's default `"..."` ellipsis (`utils.ts:939`).
     let clipped = truncate_to_width(single, available, "...");
-    Line::from(vec![Span::raw(" "), Span::styled(clipped, theme.dim_style())])
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(clipped, theme.dim_style()),
+    ])
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     fn text_of(line: &Line<'_>) -> String {
@@ -157,7 +169,10 @@ mod tests {
 
     fn rendered(p: &PendingMessages, width: u16) -> Vec<String> {
         let theme = UiTheme::default();
-        p.lines(width, &theme, Some("Alt+Up")).iter().map(text_of).collect()
+        p.lines(width, &theme, Some("Alt+Up"))
+            .iter()
+            .map(text_of)
+            .collect()
     }
 
     #[test]
@@ -192,8 +207,15 @@ mod tests {
 
         p.set(vec!["x".repeat(200)], Vec::new());
         let row = rendered(&p, 30).remove(1);
-        assert_eq!(row.chars().count(), 29, "one space of padding + 28 columns of text");
-        assert!(row.ends_with("..."), "truncateToWidth's default ellipsis: {row:?}");
+        assert_eq!(
+            row.chars().count(),
+            29,
+            "one space of padding + 28 columns of text"
+        );
+        assert!(
+            row.ends_with("..."),
+            "truncateToWidth's default ellipsis: {row:?}"
+        );
     }
 
     #[test]
@@ -202,7 +224,10 @@ mod tests {
         p.set(vec!["q".into()], Vec::new());
         let theme = UiTheme::default();
         let lines = p.lines(80, &theme, Some("Ctrl+K"));
-        assert_eq!(text_of(lines.last().unwrap()), " ↳ Ctrl+K to edit all queued messages");
+        assert_eq!(
+            text_of(lines.last().unwrap()),
+            " ↳ Ctrl+K to edit all queued messages"
+        );
     }
 
     #[test]

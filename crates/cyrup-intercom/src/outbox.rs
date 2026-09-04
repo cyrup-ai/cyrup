@@ -137,7 +137,11 @@ pub struct OutboxTarget {
 /// (`v0.12.0 index.ts:487-499`), which `serde` alone would not reject.
 fn non_blank(value: &serde_json::Value, key: &str) -> Option<String> {
     let s = value.get(key)?.as_str()?;
-    if s.trim().is_empty() { None } else { Some(s.to_string()) }
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 /// `parseOutboxRequestPayload` (`v0.12.0 index.ts:471-507`), statement for statement.
@@ -156,13 +160,25 @@ pub fn parse_outbox_request(payload: &serde_json::Value) -> ParsedOutboxRequest 
     };
     // The trace is recovered FIRST and independently of validity, so a rejection can still be
     // correlated by the extension that sent it (`index.ts:475-477`).
-    let request_id = obj.get("requestId").and_then(|v| v.as_str()).map(str::to_string);
+    let request_id = obj
+        .get("requestId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let trace = request_id.as_ref().map(|id| OutboxRequestTrace {
         request_id: id.clone(),
-        extension_id: obj.get("extensionId").and_then(|v| v.as_str()).map(str::to_string),
-        extension_name: obj.get("extensionName").and_then(|v| v.as_str()).map(str::to_string),
+        extension_id: obj
+            .get("extensionId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        extension_name: obj
+            .get("extensionName")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         to: obj.get("to").and_then(|v| v.as_str()).map(str::to_string),
-        message: obj.get("message").and_then(|v| v.as_str()).map(str::to_string),
+        message: obj
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     });
     let invalid = |detail: &str| ParsedOutboxRequest::Invalid {
         trace: trace.clone(),
@@ -213,8 +229,10 @@ pub fn resolve_outbox_target(
     sessions: &[SessionInfo],
     to: &str,
 ) -> Result<OutboxTarget, (OutboxResultCode, String)> {
-    let entries: Vec<(String, Option<String>)> =
-        sessions.iter().map(|s| (s.id.clone(), s.name.clone())).collect();
+    let entries: Vec<(String, Option<String>)> = sessions
+        .iter()
+        .map(|s| (s.id.clone(), s.name.clone()))
+        .collect();
     let matches = crate::broker::routing::find_session_ids(&entries, to);
     if matches.is_empty() {
         return Err((
@@ -291,7 +309,9 @@ fn emit_outbox_result(
     result: &serde_json::Value,
     trace: Option<&OutboxRequestTrace>,
 ) {
-    let Some(services) = state.host_services() else { return };
+    let Some(services) = state.host_services() else {
+        return;
+    };
     let mut entry = result.clone();
     if let Some(obj) = entry.as_object_mut() {
         if let Some(to) = trace.and_then(|t| t.to.as_deref()) {
@@ -420,7 +440,10 @@ pub fn handle_outbox_request(state: Arc<SharedIntercomState>, payload: serde_jso
     let generation = state.connect.generation();
     state.track_pending_outbox(
         request.request_id.clone(),
-        PendingOutboxRequest { generation, request: trace },
+        PendingOutboxRequest {
+            generation,
+            request: trace,
+        },
     );
 
     tokio::spawn(async move {
@@ -466,7 +489,8 @@ async fn deliver_outbox_request(
 
     // 3. Connect. `Background` is the reason that re-arms the reconnect ladder on failure, which is
     //    what upstream's outbox uses (`ensureConnected("background")`, `:1088`).
-    let Ok(client) = crate::connect::ensure_connected(&state, crate::connect::ConnectReason::Background).await
+    let Ok(client) =
+        crate::connect::ensure_connected(&state, crate::connect::ConnectReason::Background).await
     else {
         settle(
             OutboxResultStatus::Failed,
@@ -532,7 +556,11 @@ async fn deliver_outbox_request(
         && let Some(services) = services.as_ref()
     {
         let prompt = format!("Send message to {}?", target.label);
-        if !services.confirm("Send Message", &prompt, &cyrup_ext::DialogOptions::default()) {
+        if !services.confirm(
+            "Send Message",
+            &prompt,
+            &cyrup_ext::DialogOptions::default(),
+        ) {
             settle(
                 OutboxResultStatus::Rejected,
                 OutboxResultCode::UserCancelled,
@@ -590,14 +618,21 @@ async fn deliver_outbox_request(
     };
 
     if !result.delivered {
-        let detail = result.reason.clone().unwrap_or_else(|| "Delivery failed".to_string());
+        let detail = result
+            .reason
+            .clone()
+            .unwrap_or_else(|| "Delivery failed".to_string());
         // `SendResult.id` carries the broker's own id when a `DeliveryFailed` frame answered the
         // send (`transport/client.rs:871-878`), but it is EMPTY when the client tore down with the
         // send still in flight (`:189`, `:697`) — that teardown has no message id in scope and
         // synthesizes one. Emitting `"messageId": ""` would put a meaningless value on the field an
         // extension correlates results on, so fall back to the id we actually attempted: the
         // requestId, which `handle_outbox_request` passed as `message_id`.
-        let attempted = if result.id.is_empty() { rid } else { result.id.as_str() };
+        let attempted = if result.id.is_empty() {
+            rid
+        } else {
+            result.id.as_str()
+        };
         settle(
             OutboxResultStatus::Failed,
             OutboxResultCode::DeliveryFailed,
@@ -651,12 +686,13 @@ pub fn handle_extension_register(state: &SharedIntercomState, payload: &serde_js
     };
     // `^[a-z0-9][a-z0-9._/-]{0,63}$` (`v0.12.0 index.ts:863-868`), spelled without a regex crate.
     let mut chars = namespace.chars();
-    let head_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    let head_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
     let tail_ok = namespace.len() <= 64
-        && namespace
-            .chars()
-            .skip(1)
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '/' | '-'));
+        && namespace.chars().skip(1).all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '/' | '-')
+        });
     if !head_ok || !tail_ok {
         return;
     }

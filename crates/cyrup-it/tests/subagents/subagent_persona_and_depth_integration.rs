@@ -24,10 +24,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::background::runner_main::{RunnerConfig, RunnerOverrides, run_with};
 use cyrup_ext_subagents::background::{
     ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus, run_artifact_roots,
@@ -39,11 +37,12 @@ use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, ResolvedAgentPersona, RunOptions};
 use cyrup_ext_subagents::extension::{BackgroundStepsSpec, SubagentExecutor, SubagentsExtension};
 use cyrup_ext_subagents::fork_context::ForkContext;
-use cyrup_ext_subagents::registration::{DynamicFanoutConfig, ExtensionChainConfig, SubagentExtensionConfig};
+use cyrup_ext_subagents::registration::{
+    DynamicFanoutConfig, ExtensionChainConfig, SubagentExtensionConfig,
+};
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
-
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -113,7 +112,8 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
 // =============================================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_its_prompt_and_tools() {
+async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_its_prompt_and_tools()
+{
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // The fixture echoes its own argv back as NDJSON so this test can read exactly what the child
@@ -166,10 +166,16 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     let run_id = RunId::from_token("t01reviewr");
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
-    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async_root");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     let config = RunnerConfig {
         turn_budget: None,
@@ -186,7 +192,10 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Chain,
-        steps: vec![RunnerStep::SingleStep(single_step("reviewer", "Review the diff"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "reviewer",
+            "Review the diff",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -200,16 +209,18 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write runner config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write runner config");
 
     let outcome = run_with(
         &cfg_path,
@@ -218,7 +229,10 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         RunnerOverrides {
             spawn_command: Some(SpawnCommand {
                 binary: fixture_binary_path(),
-                base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
             }),
             ..Default::default()
         },
@@ -253,7 +267,8 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     // red asserting the very disclosure SUBA-030 removed. The child READS the file, so that is
     // where the body is now observed — the fixture echoes the contents it read.
     assert!(
-        tee.lines().any(|l| l.contains("\"arg\":\"--append-system-prompt\"")),
+        tee.lines()
+            .any(|l| l.contains("\"arg\":\"--append-system-prompt\"")),
         "the composed prompt must be passed by FILE, not inline (SUBA-030). tee:\n{tee}"
     );
     let prompt_line = tee
@@ -280,14 +295,27 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
 
     // The terminal records must exist and be internally consistent (the run reached a terminal
     // state; the persona-driven step actually ran).
-    let status: RunStatus =
-        serde_json::from_slice(&tokio::fs::read(&run_paths.status).await.expect("status.json"))
-            .expect("parse status.json");
-    let result_file: ResultFile =
-        serde_json::from_slice(&tokio::fs::read(&run_paths.result).await.expect("ResultFile"))
-            .expect("parse ResultFile");
-    assert!(status.state.is_terminal(), "run must reach a terminal state: {status:?}");
-    assert_eq!(result_file.results.len(), 1, "the one reviewer step must have produced one result");
+    let status: RunStatus = serde_json::from_slice(
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json"),
+    )
+    .expect("parse status.json");
+    let result_file: ResultFile = serde_json::from_slice(
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile"),
+    )
+    .expect("parse ResultFile");
+    assert!(
+        status.state.is_terminal(),
+        "run must reach a terminal state: {status:?}"
+    );
+    assert_eq!(
+        result_file.results.len(),
+        1,
+        "the one reviewer step must have produced one result"
+    );
     assert_eq!(
         result_file.results[0].agent, "reviewer",
         "the recorded result must attribute the run to the real reviewer agent"
@@ -350,10 +378,16 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
     let run_id = RunId::from_token("taskresolv1");
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
-    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async_root");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     let config = RunnerConfig {
         turn_budget: None,
@@ -371,7 +405,10 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         run_id: run_id.clone(),
         mode: RunMode::Chain,
         // The step template references `{task}` — it must be substituted with `original_task`.
-        steps: vec![RunnerStep::SingleStep(single_step("worker", "Handle {task} now"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "Handle {task} now",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -385,16 +422,18 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write runner config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write runner config");
 
     let outcome = run_with(
         &cfg_path,
@@ -403,15 +442,22 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         RunnerOverrides {
             spawn_command: Some(SpawnCommand {
                 binary: fixture_binary_path(),
-                base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
             }),
             ..Default::default()
         },
     )
-    .await;    outcome.expect("run() itself never returns Err");
+    .await;
+    outcome.expect("run() itself never returns Err");
 
     let tee = read_attempt_tee(dir.path());
-    assert!(!tee.is_empty(), "a tee must exist — the child actually spawned");
+    assert!(
+        !tee.is_empty(),
+        "a tee must exist — the child actually spawned"
+    );
     assert!(
         tee.contains("Handle ORIGINAL_TASK_MARKER now"),
         "the step's `{{task}}` must resolve to the config's original_task in the dispatched task \
@@ -461,7 +507,10 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         runtime_cwd: None,
         include_progress: None,
         agent_scope: None,
-        acceptance: Some(AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![])),
+        acceptance: Some(AcceptanceContract::explicit(
+            AcceptanceStatus::NotRequired,
+            vec![],
+        )),
         fork_context: ForkContext::fresh(),
         live_events: None,
         parent_session_id: None,
@@ -484,7 +533,11 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     }
 }
 
-fn depth_echo_agent(model: &str, depth: DepthEnvelope, max_subagent_depth: Option<u32>) -> AgentConfig {
+fn depth_echo_agent(
+    model: &str,
+    depth: DepthEnvelope,
+    max_subagent_depth: Option<u32>,
+) -> AgentConfig {
     AgentConfig {
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
@@ -527,7 +580,10 @@ async fn run_depth_echo_child(dir: &Path, agent: &AgentConfig) -> String {
     let mut opts = base_run_options(dir, "fixture-model");
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -535,7 +591,10 @@ async fn run_depth_echo_child(dir: &Path, agent: &AgentConfig) -> String {
     )
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
-    assert_eq!(result.exit_code, 0, "the depth-echo child must exit cleanly: {result:?}");
+    assert_eq!(
+        result.exit_code, 0,
+        "the depth-echo child must exit cleanly: {result:?}"
+    );
 
     read_attempt_tee(dir)
 }
@@ -651,10 +710,16 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     let run_id = RunId::from_token("t03deep001");
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
-    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async_root");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     // A ceiling of 0 with the process's own (absent) depth env resolving to 0 means this run is
     // already blocked — the same terminal state a genuinely deep chain reaches once the T0.3
@@ -674,7 +739,10 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Chain,
-        steps: vec![RunnerStep::SingleStep(single_step("reviewer", "review at the ceiling"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "reviewer",
+            "review at the ceiling",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -688,16 +756,18 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write runner config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write runner config");
 
     let outcome = run_with(
         &cfg_path,
@@ -706,7 +776,10 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
         RunnerOverrides {
             spawn_command: Some(SpawnCommand {
                 binary: fixture_binary_path(),
-                base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
             }),
             ..Default::default()
         },
@@ -714,12 +787,18 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     .await;
     outcome.expect("run() itself never returns Err, even on a depth rejection");
 
-    let status: RunStatus =
-        serde_json::from_slice(&tokio::fs::read(&run_paths.status).await.expect("status.json"))
-            .expect("parse status.json");
-    let result_file: ResultFile =
-        serde_json::from_slice(&tokio::fs::read(&run_paths.result).await.expect("ResultFile"))
-            .expect("parse ResultFile");
+    let status: RunStatus = serde_json::from_slice(
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json"),
+    )
+    .expect("parse status.json");
+    let result_file: ResultFile = serde_json::from_slice(
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile"),
+    )
+    .expect("parse ResultFile");
 
     assert_eq!(
         status.state,
@@ -820,7 +899,10 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
     let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
         spawn_command: Some(SpawnCommand {
             binary: fixture_binary_path(),
-            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            base_args: vec![
+                "--fixture-script".to_string(),
+                script_path.display().to_string(),
+            ],
         }),
         ..SubagentExtensionConfig::default()
     });
@@ -838,11 +920,16 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
 
     let (results, _groups) = outcome.expect("the foreground chain walk completes");
     assert_eq!(results.len(), 1, "one step, one result");
-    assert!(results[0].success, "the step must succeed: {:?}", results[0].error);
+    assert!(
+        results[0].success,
+        "the step must succeed: {:?}",
+        results[0].error
+    );
 
     // (1) The file was actually written on disk with the child's output.
     let expected_path = dir.path().join("report.md");
-    let written = std::fs::read_to_string(&expected_path).expect("report.md must be written on disk");
+    let written =
+        std::fs::read_to_string(&expected_path).expect("report.md must be written on disk");
     assert_eq!(
         written.trim(),
         REPORT_BODY,
@@ -949,7 +1036,10 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
     let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
         spawn_command: Some(SpawnCommand {
             binary: fixture_binary_path(),
-            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            base_args: vec![
+                "--fixture-script".to_string(),
+                script_path.display().to_string(),
+            ],
         }),
         ..SubagentExtensionConfig::default()
     });
@@ -1176,20 +1266,23 @@ async fn run_chain_step_with_acceptance(
     let outcome = SubagentExecutor::with_config(SubagentExtensionConfig {
         spawn_command: Some(SpawnCommand {
             binary: fixture_binary_path(),
-            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            base_args: vec![
+                "--fixture-script".to_string(),
+                script_path.display().to_string(),
+            ],
         }),
         ..SubagentExtensionConfig::default()
     })
-        .run_chain_foreground(
-            dir,
-            vec![RunnerStep::SingleStep(step)],
-            resolved_agents,
-            String::new(),
-            None,
-            CancelToken::new(),
-            None,
-        )
-        .await;
+    .run_chain_foreground(
+        dir,
+        vec![RunnerStep::SingleStep(step)],
+        resolved_agents,
+        String::new(),
+        None,
+        CancelToken::new(),
+        None,
+    )
+    .await;
 
     let (results, _groups) = outcome.expect("the foreground chain walk completes");
     assert_eq!(results.len(), 1, "one step, one result");
@@ -1252,7 +1345,8 @@ async fn a_chain_step_acceptance_contract_with_a_passing_verify_command_still_su
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_chain_step_with_an_invalid_acceptance_policy_fails_the_step_rather_than_running_ungated() {
+async fn a_chain_step_with_an_invalid_acceptance_policy_fails_the_step_rather_than_running_ungated()
+{
     let dir = tempfile::tempdir().expect("real tempdir");
 
     // A policy that reaches the runner already malformed (the tool boundary refuses these up front,
@@ -1262,7 +1356,10 @@ async fn a_chain_step_with_an_invalid_acceptance_policy_fails_the_step_rather_th
     let (success, error) =
         run_chain_step_with_acceptance(dir.path(), serde_json::json!("nonsense")).await;
 
-    assert!(!success, "an invalid acceptance policy must not run ungated and report success");
+    assert!(
+        !success,
+        "an invalid acceptance policy must not run ungated and report success"
+    );
     let error = error.expect("an invalid acceptance policy must carry a reason");
     assert!(
         error.contains("acceptance has invalid level 'nonsense'."),

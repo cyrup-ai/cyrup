@@ -20,19 +20,26 @@
 //!
 //! These tests assert the OBSERVABLE contract, from the provider request the agent actually built:
 //! not before the anchor, yes from the anchor onward, actually executed, still permission-gated.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use crate::{AgentSession, SessionBuilder, SessionConfig};
 use cyrup_core::{
-    TerminateHint,CancelToken, Content, StopReason, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
+    CancelToken, Content, StopReason, TerminateHint, Tool, ToolCallId, ToolError, ToolResult,
+    ToolUpdateSink,
 };
 use cyrup_provider::Provider;
-use crate::{AgentSession, SessionBuilder, SessionConfig};
+use cyrup_provider::faux::{
+    FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
+};
 use cyrup_tools::{PermissionPolicy, Rule};
 use tempfile::TempDir;
 
@@ -50,7 +57,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -90,7 +101,11 @@ impl Tool for LoaderTool {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        let session = self.slot.get().and_then(Weak::upgrade).ok_or_else(|| ToolError::new("no session"))?;
+        let session = self
+            .slot
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| ToolError::new("no session"))?;
         // Pi's `pi.setActiveTools([...getActiveTools(), "late"])` — a purely ADDITIVE change, which
         // is the only kind `wrapRegisteredTool` records (a removal wipes the cache instead).
         let mut names = session.active_tool_names();
@@ -101,7 +116,10 @@ impl Tool for LoaderTool {
         // NOTE: the tool does NOT stamp `added_tool_names` itself — upstream no tool ever does.
         // The host's registered-tool wrapper (Pi `wrapRegisteredTool`) derives it from the
         // active-set diff around this very `execute`.
-        Ok(ToolResult { content: vec![Content::text("loaded")], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("loaded")],
+            ..Default::default()
+        })
     }
 }
 
@@ -133,7 +151,10 @@ impl Tool for LateTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.ran.store(true, Ordering::SeqCst);
-        Ok(ToolResult { content: vec![Content::text("late-ran")], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("late-ran")],
+            ..Default::default()
+        })
     }
 }
 
@@ -146,7 +167,9 @@ fn faux_three_turns(offered: &OfferedTools) -> Arc<FauxProvider> {
     let mk = |offered: &OfferedTools, reply: AssistantReply| {
         let cap = offered.clone();
         FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-            cap.lock().unwrap().push(ctx.tools.iter().map(|t| t.name.clone()).collect());
+            cap.lock()
+                .unwrap()
+                .push(ctx.tools.iter().map(|t| t.name.clone()).collect());
             match &reply {
                 AssistantReply::Call(name) => faux_assistant_message(
                     vec![faux_tool_call(name.clone(), serde_json::json!({}))],
@@ -184,8 +207,14 @@ async fn session_with_loader(
     let mut cfg = base_config(fx);
     cfg.permission_policy = policy;
     cfg.custom_tools = vec![
-        Arc::new(LoaderTool { slot: slot.clone(), params: empty_schema() }) as Arc<dyn Tool>,
-        Arc::new(LateTool { ran: late_ran.clone(), params: empty_schema() }) as Arc<dyn Tool>,
+        Arc::new(LoaderTool {
+            slot: slot.clone(),
+            params: empty_schema(),
+        }) as Arc<dyn Tool>,
+        Arc::new(LateTool {
+            ran: late_ran.clone(),
+            params: empty_schema(),
+        }) as Arc<dyn Tool>,
     ];
     let session = SessionBuilder::new(faux as Arc<dyn Provider>, cfg)
         .build()
@@ -195,7 +224,9 @@ async fn session_with_loader(
     let _ = slot.set(Arc::downgrade(&session));
     // Start from a known active set: `loader` only. `late` is registered-but-inactive, exactly the
     // state Pi's `dynamic-tools.ts` example leaves a not-yet-loaded tool in.
-    session.set_active_tools_by_name(&["loader".to_string()]).await;
+    session
+        .set_active_tools_by_name(&["loader".to_string()])
+        .await;
     (session, late_ran)
 }
 
@@ -214,7 +245,10 @@ async fn a_tool_added_mid_run_is_callable_from_that_turn_onward_and_not_before()
     session.wait_for_idle().await;
 
     let turns = offered.lock().unwrap().clone();
-    assert!(turns.len() >= 2, "the run drove at least two turns against the provider: {turns:?}");
+    assert!(
+        turns.len() >= 2,
+        "the run drove at least two turns against the provider: {turns:?}"
+    );
 
     // NOT BEFORE — the turn that produced the anchoring tool call could not see `late`.
     assert!(
@@ -222,7 +256,11 @@ async fn a_tool_added_mid_run_is_callable_from_that_turn_onward_and_not_before()
         "turn 1 must NOT offer the not-yet-added tool: {:?}",
         turns[0]
     );
-    assert!(turns[0].iter().any(|t| t == "loader"), "turn 1 offers the loader: {:?}", turns[0]);
+    assert!(
+        turns[0].iter().any(|t| t == "loader"),
+        "turn 1 offers the loader: {:?}",
+        turns[0]
+    );
 
     // FROM THIS POINT ONWARD — the very next turn of the SAME run offers it.
     assert!(
@@ -231,7 +269,11 @@ async fn a_tool_added_mid_run_is_callable_from_that_turn_onward_and_not_before()
         turns[1]
     );
     // Additive, not a replacement: Pi's refresh keeps the previously active names.
-    assert!(turns[1].iter().any(|t| t == "loader"), "turn 2 kept the loader: {:?}", turns[1]);
+    assert!(
+        turns[1].iter().any(|t| t == "loader"),
+        "turn 2 kept the loader: {:?}",
+        turns[1]
+    );
 
     // CALLABLE, not merely advertised: the model's call actually reached the tool.
     assert!(
@@ -268,7 +310,9 @@ fn faux_three_turns_capturing_prompts(prompts: &OfferedPrompts) -> Arc<FauxProvi
     let mk = |prompts: &OfferedPrompts, reply: AssistantReply| {
         let cap = prompts.clone();
         FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-            cap.lock().unwrap().push(ctx.system_prompt.clone().unwrap_or_default());
+            cap.lock()
+                .unwrap()
+                .push(ctx.system_prompt.clone().unwrap_or_default());
             match &reply {
                 AssistantReply::Call(name) => faux_assistant_message(
                     vec![faux_tool_call(name.clone(), serde_json::json!({}))],
@@ -313,7 +357,11 @@ async fn drift033_a_mid_run_tool_addition_reaches_the_system_prompt() {
     session.wait_for_idle().await;
 
     let seen = prompts.lock().unwrap().clone();
-    assert!(seen.len() >= 2, "the run drove at least two turns: {}", seen.len());
+    assert!(
+        seen.len() >= 2,
+        "the run drove at least two turns: {}",
+        seen.len()
+    );
     assert!(
         !seen[0].contains("LATE_TOOL_SNIPPET"),
         "turn 1 must not describe the not-yet-added tool"
@@ -338,7 +386,11 @@ async fn drift033_a_start_hook_override_outranks_a_mid_run_rebuild_and_dies_with
     let (session, _late_ran) = session_with_loader(&fx, faux, PermissionPolicy::new()).await;
 
     // No handler ran, so nothing may be held in the override slot at any point of a plain run.
-    assert_eq!(session.system_prompt_override(), None, "nothing overrides before a run");
+    assert_eq!(
+        session.system_prompt_override(),
+        None,
+        "nothing overrides before a run"
+    );
     let base_before = session.base_system_prompt();
     assert_eq!(
         session.effective_system_prompt(),
@@ -357,7 +409,10 @@ async fn drift033_a_start_hook_override_outranks_a_mid_run_rebuild_and_dies_with
     // The mid-run `set_active_tools_by_name` rebuilt the base, and with no override in force the
     // effective prompt follows it — the `late` snippet is now permanent for the session.
     let base_after = session.base_system_prompt();
-    assert!(base_after.contains("LATE_TOOL_SNIPPET"), "the rebuild became the new base");
+    assert!(
+        base_after.contains("LATE_TOOL_SNIPPET"),
+        "the rebuild became the new base"
+    );
     assert_eq!(session.effective_system_prompt(), base_after);
 }
 
@@ -371,7 +426,10 @@ async fn the_anchor_survives_the_transcript_and_the_session_file() {
     let faux = faux_three_turns(&offered);
     let (session, _late_ran) = session_with_loader(&fx, faux, PermissionPolicy::new()).await;
 
-    let session_file = session.session_file().await.expect("the session persists to a file");
+    let session_file = session
+        .session_file()
+        .await
+        .expect("the session persists to a file");
     let _ = session.prompt("go").await.unwrap();
     session.wait_for_idle().await;
 
@@ -385,7 +443,11 @@ async fn the_anchor_survives_the_transcript_and_the_session_file() {
             _ => None,
         })
         .collect();
-    assert_eq!(anchored.len(), 1, "exactly one tool result anchors a tool load");
+    assert_eq!(
+        anchored.len(),
+        1,
+        "exactly one tool result anchors a tool load"
+    );
     assert_eq!(anchored[0].tool_name, "loader");
     assert_eq!(anchored[0].added_tool_names, vec!["late".to_string()]);
 
@@ -403,11 +465,13 @@ async fn the_anchor_survives_the_transcript_and_the_session_file() {
     // (3) And it comes back through the RESUME direction (`core_message_to_agent`).
     let mut resume_cfg = base_config(&fx);
     resume_cfg.target = crate::SessionTarget::Resume(session_file);
-    let resumed =
-        SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, resume_cfg)
-            .build()
-            .await
-            .unwrap();
+    let resumed = SessionBuilder::new(
+        Arc::new(FauxProvider::new()) as Arc<dyn Provider>,
+        resume_cfg,
+    )
+    .build()
+    .await
+    .unwrap();
     let recovered: Vec<Vec<String>> = resumed
         .agent_messages()
         .await
@@ -419,7 +483,11 @@ async fn the_anchor_survives_the_transcript_and_the_session_file() {
             _ => None,
         })
         .collect();
-    assert_eq!(recovered, vec![vec!["late".to_string()]], "the anchor survived resume");
+    assert_eq!(
+        recovered,
+        vec![vec!["late".to_string()]],
+        "the anchor survived resume"
+    );
 }
 
 /// PRIVILEGE ESCALATION GUARD. A tool that can add tools must not be able to add an UNGATED tool.
@@ -441,7 +509,11 @@ async fn a_mid_run_added_tool_is_still_permission_gated() {
     // It became visible (the refresh still ran) …
     let turns = offered.lock().unwrap().clone();
     assert!(turns.len() >= 2, "{turns:?}");
-    assert!(turns[1].iter().any(|t| t == "late"), "the added tool is offered: {:?}", turns[1]);
+    assert!(
+        turns[1].iter().any(|t| t == "late"),
+        "the added tool is offered: {:?}",
+        turns[1]
+    );
 
     // … and was BLOCKED when called, with the policy's reason as the tool result.
     assert!(
@@ -457,7 +529,11 @@ async fn a_mid_run_added_tool_is_still_permission_gated() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(blocked.len(), 1, "the blocked call still produced a tool result");
+    assert_eq!(
+        blocked.len(),
+        1,
+        "the blocked call still produced a tool result"
+    );
     assert!(blocked[0].is_error, "a blocked call is an error result");
     let text: String = blocked[0]
         .content
@@ -467,10 +543,16 @@ async fn a_mid_run_added_tool_is_still_permission_gated() {
             _ => None,
         })
         .collect();
-    assert!(text.contains("late is denied by policy"), "the policy reason reached the model: {text}");
+    assert!(
+        text.contains("late is denied by policy"),
+        "the policy reason reached the model: {text}"
+    );
     // A blocked call never ran, so it can never anchor a tool load (Pi's `createErrorToolResult`
     // carries no `addedToolNames`).
-    assert!(blocked[0].added_tool_names.is_empty(), "an error result carries no anchor");
+    assert!(
+        blocked[0].added_tool_names.is_empty(),
+        "an error result carries no anchor"
+    );
 }
 
 // ------------------------------------------------------- the gate the permission system uses ----
@@ -497,7 +579,10 @@ impl cyrup_ext::NativeExtension for DenyByName {
     ) -> cyrup_ext::HookOutcome {
         match ev {
             cyrup_ext::HostEvent::ToolCall { name, .. } if name == self.0 => {
-                cyrup_ext::HookOutcome::Block { reason: Some(format!("{name} denied by extension")), terminate: TerminateHint::Unspecified }
+                cyrup_ext::HookOutcome::Block {
+                    reason: Some(format!("{name} denied by extension")),
+                    terminate: TerminateHint::Unspecified,
+                }
             }
             _ => cyrup_ext::HookOutcome::Noop,
         }
@@ -521,8 +606,14 @@ async fn a_mid_run_added_tool_is_gated_by_the_extension_tool_call_seam() {
     // A native extension needs the extension host live.
     cfg.no_extensions = false;
     cfg.custom_tools = vec![
-        Arc::new(LoaderTool { slot: slot.clone(), params: empty_schema() }) as Arc<dyn Tool>,
-        Arc::new(LateTool { ran: late_ran.clone(), params: empty_schema() }) as Arc<dyn Tool>,
+        Arc::new(LoaderTool {
+            slot: slot.clone(),
+            params: empty_schema(),
+        }) as Arc<dyn Tool>,
+        Arc::new(LateTool {
+            ran: late_ran.clone(),
+            params: empty_schema(),
+        }) as Arc<dyn Tool>,
     ];
     let session = SessionBuilder::new(faux as Arc<dyn Provider>, cfg)
         .with_native_extension(Arc::new(DenyByName("late")))
@@ -531,15 +622,24 @@ async fn a_mid_run_added_tool_is_gated_by_the_extension_tool_call_seam() {
         .unwrap()
         .into_shared();
     let _ = slot.set(Arc::downgrade(&session));
-    session.set_active_tools_by_name(&["loader".to_string()]).await;
+    session
+        .set_active_tools_by_name(&["loader".to_string()])
+        .await;
 
     let _ = session.prompt("go").await.unwrap();
     session.wait_for_idle().await;
 
     let turns = offered.lock().unwrap().clone();
     assert!(turns.len() >= 2, "{turns:?}");
-    assert!(turns[1].iter().any(|t| t == "late"), "the added tool is offered: {:?}", turns[1]);
-    assert!(!late_ran.load(Ordering::SeqCst), "the extension gate blocked the added tool");
+    assert!(
+        turns[1].iter().any(|t| t == "late"),
+        "the added tool is offered: {:?}",
+        turns[1]
+    );
+    assert!(
+        !late_ran.load(Ordering::SeqCst),
+        "the extension gate blocked the added tool"
+    );
 
     let blocked = session
         .agent_messages()
@@ -560,5 +660,8 @@ async fn a_mid_run_added_tool_is_gated_by_the_extension_tool_call_seam() {
             _ => None,
         })
         .collect();
-    assert!(text.contains("late denied by extension"), "the extension's reason reached the model: {text}");
+    assert!(
+        text.contains("late denied by extension"),
+        "the extension's reason reached the model: {text}"
+    );
 }

@@ -8,8 +8,8 @@ pub mod abi;
 pub mod cache;
 pub mod toolchain;
 
-pub use cache::{cache_key, ArtifactCache, CacheKey};
-pub use toolchain::{detect_toolchain, Toolchain, ToolchainStatus};
+pub use cache::{ArtifactCache, CacheKey, cache_key};
+pub use toolchain::{Toolchain, ToolchainStatus, detect_toolchain};
 
 use crate::error::ExtError;
 use crate::manifest::HOST_WORLD;
@@ -133,7 +133,11 @@ pub fn build_component_in(crate_dir: &Path, cache: &ArtifactCache) -> Result<Vec
 }
 
 /// Locate the `.wasm` artifact a build produced under `<target-dir>/<triple>/debug/<crate>.wasm`.
-fn locate_artifact(target_dir: &Path, manifest_path: &Path, triple: &str) -> Result<PathBuf, ExtError> {
+fn locate_artifact(
+    target_dir: &Path,
+    manifest_path: &Path,
+    triple: &str,
+) -> Result<PathBuf, ExtError> {
     let out_dir = target_dir.join(triple).join("debug");
 
     // Prefer the crate-named artifact; else fall back to any single `.wasm` in the dir.
@@ -149,9 +153,10 @@ fn locate_artifact(target_dir: &Path, manifest_path: &Path, triple: &str) -> Res
         .filter(|p| p.extension().map(|x| x == "wasm").unwrap_or(false))
         .collect();
     wasms.sort();
-    wasms.into_iter().next().ok_or_else(|| {
-        ExtError::Build(format!("no .wasm artifact found in {}", out_dir.display()))
-    })
+    wasms
+        .into_iter()
+        .next()
+        .ok_or_else(|| ExtError::Build(format!("no .wasm artifact found in {}", out_dir.display())))
 }
 
 /// Minimal `[package] name = "..."` extraction (no `toml` dep, consistent with the JSON-only host).
@@ -164,9 +169,7 @@ fn package_name(manifest_path: &Path) -> Option<String> {
             in_package = t == "[package]";
             continue;
         }
-        if in_package
-            && let Some(rest) = t.strip_prefix("name")
-        {
+        if in_package && let Some(rest) = t.strip_prefix("name") {
             let rest = rest.trim_start().strip_prefix('=')?.trim();
             return Some(rest.trim_matches(|c| c == '"' || c == '\'').to_string());
         }

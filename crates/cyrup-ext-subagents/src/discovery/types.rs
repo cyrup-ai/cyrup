@@ -848,7 +848,10 @@ impl LayeredOverrideSettings {
     /// else the user scope applies, else there is no policy and enforcement is off.
     #[must_use]
     pub fn model_scope(&self) -> Option<crate::exec::model_scope::ModelScopeConfig> {
-        self.project.model_scope.clone().or_else(|| self.user.model_scope.clone())
+        self.project
+            .model_scope
+            .clone()
+            .or_else(|| self.user.model_scope.clone())
     }
 
     /// SUBA-078 — the effective `subagents.maxThinking` ceiling for this cwd, pi
@@ -857,7 +860,10 @@ impl LayeredOverrideSettings {
     /// [`Self::model_scope`].
     #[must_use]
     pub fn max_thinking(&self) -> Option<String> {
-        self.project.max_thinking.clone().or_else(|| self.user.max_thinking.clone())
+        self.project
+            .max_thinking
+            .clone()
+            .or_else(|| self.user.max_thinking.clone())
     }
 }
 
@@ -1539,7 +1545,8 @@ mod tests {
         // pi settings `tools`/override lists are plain strings: `"bash"` / `"mcp:x"`.
         let builtin: ToolRef = serde_json::from_str("\"bash\"").expect("string builtin");
         assert_eq!(builtin, ToolRef::Builtin("bash".to_string()));
-        let mcp: ToolRef = serde_json::from_str("\"mcp:xcodebuild_list_sims\"").expect("string mcp");
+        let mcp: ToolRef =
+            serde_json::from_str("\"mcp:xcodebuild_list_sims\"").expect("string mcp");
         assert_eq!(mcp, ToolRef::Mcp("xcodebuild_list_sims".to_string()));
     }
 
@@ -1597,12 +1604,21 @@ mod tests {
         assert_eq!(settings.default_model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(settings.disable_builtins, Some(true));
 
-        let reviewer = settings.overrides.get("reviewer").expect("reviewer override");
-        assert_eq!(reviewer.model, OverrideField::Value("openai/gpt-5.4".to_string()));
+        let reviewer = settings
+            .overrides
+            .get("reviewer")
+            .expect("reviewer override");
+        assert_eq!(
+            reviewer.model,
+            OverrideField::Value("openai/gpt-5.4".to_string())
+        );
         assert_eq!(reviewer.thinking, OverrideField::Value("xhigh".to_string()));
         assert_eq!(reviewer.completion_guard, OverrideField::Value(false));
 
-        let implementer = settings.overrides.get("implementer").expect("implementer override");
+        let implementer = settings
+            .overrides
+            .get("implementer")
+            .expect("implementer override");
         assert_eq!(
             implementer.tools,
             ToolsOverrideField::Value(vec![
@@ -1629,8 +1645,14 @@ mod tests {
         .expect("six-field override deserializes");
         assert_eq!(full.inherit_project_context, OverrideField::Value(true));
         assert_eq!(full.inherit_skills, OverrideField::Value(false));
-        assert_eq!(full.default_context, OverrideField::Value(ContextMode::Fork));
-        assert_eq!(full.system_prompt, OverrideField::Value("Base prompt".to_string()));
+        assert_eq!(
+            full.default_context,
+            OverrideField::Value(ContextMode::Fork)
+        );
+        assert_eq!(
+            full.system_prompt,
+            OverrideField::Value("Base prompt".to_string())
+        );
         assert_eq!(
             full.skills,
             OverrideField::Value(vec!["tdd".to_string(), "safe-bash".to_string()])
@@ -1649,7 +1671,10 @@ mod tests {
         .expect("cleared override deserializes");
         assert_eq!(cleared.default_context, OverrideField::ExplicitClear);
         assert_eq!(cleared.skills, OverrideField::ExplicitClear);
-        assert_eq!(cleared.subagent_only_extensions, OverrideField::ExplicitClear);
+        assert_eq!(
+            cleared.subagent_only_extensions,
+            OverrideField::ExplicitClear
+        );
     }
 
     #[test]
@@ -1664,7 +1689,8 @@ mod tests {
                 "c": { "thinking": false }
             }
         });
-        let settings: SubagentSettings = serde_json::from_value(raw).expect("open thinking settings");
+        let settings: SubagentSettings =
+            serde_json::from_value(raw).expect("open thinking settings");
         assert_eq!(
             settings.overrides.get("a").expect("a").thinking,
             OverrideField::Value("off".to_string()),

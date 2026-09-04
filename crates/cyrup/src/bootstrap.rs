@@ -106,19 +106,19 @@ pub fn load_startup_settings(dirs: &ConfigDirs) -> (SettingsManager, Vec<Diagnos
 /// for `sessionDir` (main.ts:610-611, 629) — draining a second, independent manager's errors would
 /// leave the live one still holding them.
 fn collect_settings_diagnostics(
-mgr: &mut cyrup_config::SettingsManager,
-context: &str,
+    mgr: &mut cyrup_config::SettingsManager,
+    context: &str,
 ) -> Vec<Diagnostic> {
-mgr.drain_load_errors()
-    .into_iter()
-    .map(|e| {
-        let scope = match e.scope {
-            SettingsScope::Global => "global",
-            SettingsScope::Project => "project",
-        };
-        Diagnostic::warning(format!("({context}, {scope} settings) {}", e.message))
-    })
-    .collect()
+    mgr.drain_load_errors()
+        .into_iter()
+        .map(|e| {
+            let scope = match e.scope {
+                SettingsScope::Global => "global",
+                SettingsScope::Project => "project",
+            };
+            Diagnostic::warning(format!("({context}, {scope} settings) {}", e.message))
+        })
+        .collect()
 }
 
 /// Experimental first-time setup — Pi main.ts:615-617 (`:663-664` @v0.84.1).
@@ -146,7 +146,10 @@ pub async fn maybe_run_first_time_setup(
 ) -> anyhow::Result<bool> {
     if mode != AppMode::Interactive
         || cli.list_models.is_some()
-        || !crate::startup::should_run_first_time_setup(&dirs.settings_path(), env.agent_dir.is_some())
+        || !crate::startup::should_run_first_time_setup(
+            &dirs.settings_path(),
+            env.agent_dir.is_some(),
+        )
     {
         return Ok(false);
     }
@@ -279,11 +282,11 @@ pub fn resolve_default_launch_model(
 /// Initialise `tracing` to **stderr**, honouring `RUST_LOG`. Off by default; `--verbose` raises the
 /// floor to `debug`. Idempotent and never fatal.
 pub fn init_tracing(verbose: bool) {
-use tracing_subscriber::{EnvFilter, fmt};
-let default = if verbose { "debug" } else { "warn" };
-let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
-let _ = fmt()
-    .with_env_filter(filter)
-    .with_writer(std::io::stderr)
-    .try_init();
+    use tracing_subscriber::{EnvFilter, fmt};
+    let default = if verbose { "debug" } else { "warn" };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }

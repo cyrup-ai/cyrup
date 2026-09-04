@@ -1,9 +1,14 @@
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod live_floor_tests {
+    use crate::UiTheme;
     use crate::app::*;
     use ratatui::backend::TestBackend;
-    use crate::UiTheme;
 
     /// The FLICKER fix's height logic (a unit guard — the definitive check is the pty drive): while a
     /// turn is active the live-region height uses a grow-only floor so it does NOT track per-tool
@@ -22,8 +27,10 @@ mod live_floor_tests {
         app.status_mut().set_streaming(true);
         for i in 0..8u32 {
             let name = format!("read_{i}");
-            app.transcript_mut()
-                .push_tool_start(name.clone(), serde_json::json!({ "path": format!("file_{i}.md") }));
+            app.transcript_mut().push_tool_start(
+                name.clone(),
+                serde_json::json!({ "path": format!("file_{i}.md") }),
+            );
             app.transcript_mut().push_tool_end(
                 name,
                 false,
@@ -32,7 +39,10 @@ mod live_floor_tests {
         }
         app.draw().unwrap();
         let grown = app.viewport_height();
-        assert!(grown > idle, "viewport should grow for the live tool tail ({grown} vs idle {idle})");
+        assert!(
+            grown > idle,
+            "viewport should grow for the live tool tail ({grown} vs idle {idle})"
+        );
 
         // The finished tools commit to native scrollback mid-turn (SCREEN-FILL fix): the live content
         // collapses — and with a commit PENDING FLUSH the floor RELEASES to the remaining content
@@ -40,7 +50,11 @@ mod live_floor_tests {
         // invisibly in scrollback. The grow-only hold now applies only BETWEEN commits (nothing
         // pending flush); this is the one frame per commit where a shrink is visually required.
         app.transcript_mut().commit_finished_leading_tools();
-        assert_eq!(app.state().transcript.active_tools().len(), 0, "finished tools left the tail");
+        assert_eq!(
+            app.state().transcript.active_tools().len(),
+            0,
+            "finished tools left the tail"
+        );
         app.draw().unwrap();
         assert_eq!(
             app.viewport_height(),
@@ -72,12 +86,15 @@ mod live_floor_tests {
 
         // A multi-line editor makes the live region taller without any transcript content; a live
         // tool tail pins the floor above that.
-        app.editor_mut().set_text("line 1\nline 2\nline 3\nline 4\nline 5");
+        app.editor_mut()
+            .set_text("line 1\nline 2\nline 3\nline 4\nline 5");
         app.status_mut().set_streaming(true);
         for i in 0..8u32 {
             let name = format!("read_{i}");
-            app.transcript_mut()
-                .push_tool_start(name.clone(), serde_json::json!({ "path": format!("file_{i}.md") }));
+            app.transcript_mut().push_tool_start(
+                name.clone(),
+                serde_json::json!({ "path": format!("file_{i}.md") }),
+            );
             app.transcript_mut().push_tool_end(
                 name,
                 false,
@@ -117,8 +134,10 @@ mod live_floor_tests {
         app.status_mut().set_streaming(true);
         for i in 0..2u32 {
             let name = format!("read_{i}");
-            app.transcript_mut()
-                .push_tool_start(name.clone(), serde_json::json!({ "path": format!("file_{i}.md") }));
+            app.transcript_mut().push_tool_start(
+                name.clone(),
+                serde_json::json!({ "path": format!("file_{i}.md") }),
+            );
             app.transcript_mut().push_tool_end(
                 name,
                 false,
@@ -148,4 +167,3 @@ mod live_floor_tests {
         );
     }
 }
-

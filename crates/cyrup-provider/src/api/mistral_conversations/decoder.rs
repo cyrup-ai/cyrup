@@ -1,15 +1,15 @@
 //! Response decoding — the accumulator the SSE loop threads through (Pi's `currentBlock` +
 //! `output` pair, mistral-conversations.ts:295-310).
 
+use crate::api::content_cache::ContentCache;
 use crate::model::Model;
 use crate::usage::compute_cost;
-use crate::api::content_cache::ContentCache;
 use crate::utils::provider_plumbing::now_millis;
-use std::sync::Arc;
 use cyrup_core::{
     ApiId, AssistantMessage, Content, LazyArgs, SharedStr, StopReason, ToolCall, Usage,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// The in-progress text/thinking block being accumulated (Pi `currentBlock`,
 /// mistral-conversations.ts:301).

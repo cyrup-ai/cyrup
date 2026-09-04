@@ -56,14 +56,22 @@ impl InlineMessage {
     /// (matching pi's optional constructor args).
     #[must_use]
     pub fn new(from: SessionInfo, message: Message) -> Self {
-        Self { from, message, reply_command: None, body_text: None, collapsed: false }
+        Self {
+            from,
+            message,
+            reply_command: None,
+            body_text: None,
+            collapsed: false,
+        }
     }
 
     /// The pre-formatted body, or `message.content.text` when unset (pi `bodyText ||
     /// message.content.text`).
     #[must_use]
     pub fn body(&self) -> &str {
-        self.body_text.as_deref().unwrap_or(&self.message.content.text)
+        self.body_text
+            .as_deref()
+            .unwrap_or(&self.message.content.text)
     }
 
     /// The sender display label (pi `from.name || from.id.slice(0, 8)`).
@@ -136,7 +144,11 @@ impl InlineMessage {
         // Header: ╭ From: sender (cwd) ───╮ (`v0.10.1 ui/inline-message.ts:45`; the `📨` was removed
         // by the v0.10.0 deslop, `633e782`).
         let header = format!(" From: {sender_name} ({}) ", self.from.cwd);
-        let header_src = if collapsed { format!("{header} Ctrl+O expands ") } else { header };
+        let header_src = if collapsed {
+            format!("{header} Ctrl+O expands ")
+        } else {
+            header
+        };
         let header_text = truncate_to_width(&header_src, body_width);
         let header_pad = body_width.saturating_sub(visible_width(&header_text));
         // Two-tone, as upstream: `muted` borders around a `toolTitle` header. Colouring the whole
@@ -185,8 +197,14 @@ impl InlineMessage {
         // Reply-to breadcrumb (only when this is NOT itself an ask).
         if self.message.reply_to.is_some() && self.message.expects_reply != Some(true) {
             lines.push(card_row(theme, body_width, ""));
-            let short: String =
-                self.message.reply_to.as_deref().unwrap_or_default().chars().take(8).collect();
+            let short: String = self
+                .message
+                .reply_to
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .take(8)
+                .collect();
             let reply = theme.fg("dim", &format!(" Reply to {short}"));
             lines.push(card_row(theme, body_width, &reply));
         }
@@ -196,8 +214,10 @@ impl InlineMessage {
         // body — note this is NOT the same position it takes in the collapsed meta line.
         if let Some(provenance) = &self.message.provenance {
             lines.push(card_row(theme, body_width, ""));
-            let via =
-                theme.fg("dim", &format!(" Via extension: {}", provenance.extension_name));
+            let via = theme.fg(
+                "dim",
+                &format!(" Via extension: {}", provenance.extension_name),
+            );
             lines.push(card_row(theme, body_width, &via));
         }
 
@@ -239,8 +259,14 @@ impl InlineMessage {
             meta.push(format!("Via {}", provenance.extension_name));
         }
         if self.message.reply_to.is_some() && self.message.expects_reply != Some(true) {
-            let short: String =
-                self.message.reply_to.as_deref().unwrap_or_default().chars().take(8).collect();
+            let short: String = self
+                .message
+                .reply_to
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .take(8)
+                .collect();
             meta.push(format!("Reply to {short}"));
         }
         meta.push("Ctrl+O to expand".to_string());
@@ -357,8 +383,14 @@ impl InlineMessage {
         Some(Self {
             from: serde_json::from_value(details.get("from")?.clone()).ok()?,
             message: serde_json::from_value(details.get("message")?.clone()).ok()?,
-            reply_command: details.get("replyCommand").and_then(|v| v.as_str()).map(str::to_string),
-            body_text: details.get("bodyText").and_then(|v| v.as_str()).map(str::to_string),
+            reply_command: details
+                .get("replyCommand")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            body_text: details
+                .get("bodyText")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             // Resolved per render from `RenderCtx::expanded`, never stored.
             collapsed: false,
         })
@@ -398,7 +430,10 @@ impl InlineMessageComponent {
         if guard.as_ref().is_none_or(|(w, _)| *w != body_width) {
             *guard = Some((body_width, wrap_text(self.card.body(), body_width)));
         }
-        guard.as_ref().map(|(_, lines)| lines.clone()).unwrap_or_default()
+        guard
+            .as_ref()
+            .map(|(_, lines)| lines.clone())
+            .unwrap_or_default()
     }
 
     /// pi `collapsedPreview` — computed once, independent of width and theme.
@@ -413,7 +448,12 @@ impl cyrup_ext::RenderedComponent for InlineMessageComponent {
     /// pi `render(width)`. `collapsed = !options.expanded` — the flag comes from the LIVE context on
     /// every frame, never from the struct.
     fn render(&self, ctx: &cyrup_ext::RenderCtx<'_>) -> Vec<String> {
-        self.card.render_with(&RenderThemeAdapter(ctx.theme), ctx.width, !ctx.expanded, Some(self))
+        self.card.render_with(
+            &RenderThemeAdapter(ctx.theme),
+            ctx.width,
+            !ctx.expanded,
+            Some(self),
+        )
     }
 }
 
@@ -476,7 +516,11 @@ mod tests {
             timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: None,
-            content: MessageContent { text: text.to_string(), attachments: None, ..Default::default() },
+            content: MessageContent {
+                text: text.to_string(),
+                attachments: None,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -581,7 +625,10 @@ mod tests {
             InlineMessage::from_details(&details).expect("details deserialize as the inline card");
 
         // `bodyText` is the string the markdown's body was rendered from — not a re-derived twin.
-        let body = round_tripped.body_text.as_deref().expect("the card carries bodyText");
+        let body = round_tripped
+            .body_text
+            .as_deref()
+            .expect("the card carries bodyText");
         assert!(
             content.ends_with(body),
             "the content's body IS the card's bodyText: content={content:?} bodyText={body:?}"
@@ -606,7 +653,10 @@ mod tests {
     fn delivery_metadata_always_carries_the_message_id() {
         let mut msg = message("hi");
         msg.timestamp = 0u64.into();
-        assert_eq!(format_inbound_delivery_metadata(&msg), "id message-1 · sent 1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_inbound_delivery_metadata(&msg),
+            "id message-1 · sent 1970-01-01T00:00:00.000Z"
+        );
     }
 
     /// `v0.10.1 index.ts:471-485` in declaration order, joined by ` · `.
@@ -632,8 +682,14 @@ mod tests {
     #[test]
     fn iso8601_matches_javascript_date_to_iso_string() {
         assert_eq!(format_iso8601_millis(0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(format_iso8601_millis(1_609_459_200_000), "2021-01-01T00:00:00.000Z");
-        assert_eq!(format_iso8601_millis(1_609_459_245_296), "2021-01-01T00:00:45.296Z");
+        assert_eq!(
+            format_iso8601_millis(1_609_459_200_000),
+            "2021-01-01T00:00:00.000Z"
+        );
+        assert_eq!(
+            format_iso8601_millis(1_609_459_245_296),
+            "2021-01-01T00:00:45.296Z"
+        );
         // Pre-epoch: JS renders a negative offset as a real civil date, not a wrapped one.
         assert_eq!(format_iso8601_millis(-1), "1969-12-31T23:59:59.999Z");
     }
@@ -660,7 +716,10 @@ mod tests {
             };
             let rendered = card.render(&PlainTheme, 120).join("\n");
             for slop in ["📨", "📎", "↩", "↳"] {
-                assert!(!rendered.contains(slop), "v0.10.0 removed {slop:?}:\n{rendered}");
+                assert!(
+                    !rendered.contains(slop),
+                    "v0.10.0 removed {slop:?}:\n{rendered}"
+                );
             }
             assert!(rendered.contains("From: sender"));
             assert!(rendered.contains("To reply: intercom"));
@@ -673,7 +732,11 @@ mod tests {
             body_text: None,
             collapsed: false,
         };
-        assert!(card.render(&PlainTheme, 120).join("\n").contains("Attachment: note.txt"));
+        assert!(
+            card.render(&PlainTheme, 120)
+                .join("\n")
+                .contains("Attachment: note.txt")
+        );
     }
 
     #[test]

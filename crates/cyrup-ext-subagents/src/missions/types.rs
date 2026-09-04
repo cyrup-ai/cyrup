@@ -45,8 +45,11 @@ pub const MISSION_STATUSES: [MissionStatus; 7] = [
 
 /// The three statuses `store.ts:38`'s `TERMINAL_MISSION_STATUSES` treats as terminal — a mission in
 /// one of these is eligible for retention pruning and is never advanced by a later run's status.
-pub const TERMINAL_MISSION_STATUSES: [MissionStatus; 3] =
-    [MissionStatus::Completed, MissionStatus::Failed, MissionStatus::Cancelled];
+pub const TERMINAL_MISSION_STATUSES: [MissionStatus; 3] = [
+    MissionStatus::Completed,
+    MissionStatus::Failed,
+    MissionStatus::Cancelled,
+];
 
 /// pi `MissionStatus` (`missions/types.ts:11`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -787,8 +790,10 @@ mod tests {
 
     #[test]
     fn goal_status_serializes_budget_exhausted_with_a_hyphen() {
-        let json = serde_json::to_string(&MissionGoal { status: MissionGoalStatus::BudgetExhausted })
-            .unwrap();
+        let json = serde_json::to_string(&MissionGoal {
+            status: MissionGoalStatus::BudgetExhausted,
+        })
+        .unwrap();
         assert_eq!(json, r#"{"status":"budget-exhausted"}"#);
     }
 
@@ -839,14 +844,21 @@ mod tests {
         assert!(!json.contains("null"), "{json}");
         assert!(!json.contains("goal"), "{json}");
         // Field ORDER is load-bearing (see module docs): schemaVersion first, then id/title.
-        assert!(json.starts_with(r#"{"schemaVersion":1,"id":"m1","title":"t","objective":"o","status":"planned""#), "{json}");
+        assert!(
+            json.starts_with(
+                r#"{"schemaVersion":1,"id":"m1","title":"t","objective":"o","status":"planned""#
+            ),
+            "{json}"
+        );
     }
 
     #[test]
     fn update_input_is_empty_only_when_nothing_was_set() {
         assert!(MissionUpdateInput::default().is_empty());
-        let with_status =
-            MissionUpdateInput { status: Some(MissionStatus::Active), ..Default::default() };
+        let with_status = MissionUpdateInput {
+            status: Some(MissionStatus::Active),
+            ..Default::default()
+        };
         assert!(!with_status.is_empty());
         let with_receipt = MissionUpdateInput {
             add_receipts: vec![MissionReceiptInput {

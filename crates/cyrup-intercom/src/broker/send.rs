@@ -43,10 +43,13 @@ impl BrokerState {
         let (to, message) = match (to, parsed_message) {
             (Some(to), Some(msg)) => (to.to_string(), msg),
             _ => {
-                send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                    message_id,
-                    reason: "Invalid message format".to_string(),
-                });
+                send_msg(
+                    self_tx,
+                    &BrokerMessage::DeliveryFailed {
+                        message_id,
+                        reason: "Invalid message format".to_string(),
+                    },
+                );
                 return FrameResult::cont();
             }
         };
@@ -54,7 +57,10 @@ impl BrokerState {
         self.prune_ask_edges(now);
         // `this.pruneMessageReceiptRoutes(brokerReceivedAt)` (`v0.10.1 broker/broker.ts:502`).
         self.prune_message_receipt_routes(now);
-        let reply_edge = message.reply_to.as_ref().and_then(|rt| self.ask_edges.get(rt).cloned());
+        let reply_edge = message
+            .reply_to
+            .as_ref()
+            .and_then(|rt| self.ask_edges.get(rt).cloned());
 
         // Join-ordered, matching `findSessions`' `Array.from(this.sessions.values()/.entries())`
         // (`broker.ts:586-594`).
@@ -65,12 +71,15 @@ impl BrokerState {
         let targets = find_session_ids(&entries, &to);
 
         if targets.len() > 1 {
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id: message.id.clone(),
-                reason: format!(
-                    "Multiple sessions named \"{to}\" are connected. Use the session ID instead."
-                ),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: format!(
+                        "Multiple sessions named \"{to}\" are connected. Use the session ID instead."
+                    ),
+                },
+            );
             return FrameResult::cont();
         }
         let Some(target_id) = targets.first().cloned() else {
@@ -89,10 +98,13 @@ impl BrokerState {
 
         // A reply must match a pending edge (broker.ts:434-441).
         if message.reply_to.is_some() && reply_edge.is_none() {
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id: message.id.clone(),
-                reason: "Reply target does not match a pending ask".to_string(),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: "Reply target does not match a pending ask".to_string(),
+                },
+            );
             return FrameResult::cont();
         }
         // The sender's own session must still own this socket (broker.ts:442-450).
@@ -102,10 +114,13 @@ impl BrokerState {
             .filter(|s| s.conn_id == conn_id)
             .map(|s| s.info.clone())
         else {
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id: message.id.clone(),
-                reason: "Sender session not found".to_string(),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: "Sender session not found".to_string(),
+                },
+            );
             return FrameResult::cont();
         };
         // `if (message.supersedes)` (`v0.10.1 broker/broker.ts:522-533`): a supersede is only legal
@@ -132,10 +147,13 @@ impl BrokerState {
         if let Some(edge) = &reply_edge
             && (edge.to != current_id || edge.from != target_id)
         {
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id: message.id.clone(),
-                reason: "Reply target does not match the pending ask".to_string(),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: "Reply target does not match the pending ask".to_string(),
+                },
+            );
             return FrameResult::cont();
         }
 
@@ -153,11 +171,14 @@ impl BrokerState {
                 });
                 return FrameResult::cont();
             }
-            self.ask_edges.insert(message.id.clone(), AskEdge {
-                from: current_id.clone(),
-                to: target_id.clone(),
-                created_at: now,
-            });
+            self.ask_edges.insert(
+                message.id.clone(),
+                AskEdge {
+                    from: current_id.clone(),
+                    to: target_id.clone(),
+                    created_at: now,
+                },
+            );
         }
 
         // Deliver to the target, then (on a reply) delete the satisfied edge, then ack the sender.
@@ -175,19 +196,28 @@ impl BrokerState {
             // (`v0.10.1 broker/broker.ts:558-571`), so a receiver that has not yet surfaced the
             // superseded message can drop it before the new one lands.
             if let Some(superseded) = &message.supersedes {
-                send_msg(&target.tx, &BrokerMessage::MessageControl {
-                    from: from_info.clone(),
-                    control: MessageControl {
-                        message_id: superseded.clone(),
-                        action: MessageControlAction::Supersede,
-                        timestamp: now_ms().into(),
-                        superseded_by: Some(message.id.clone()),
-                        detail: None,
-                        extra: Default::default(),
+                send_msg(
+                    &target.tx,
+                    &BrokerMessage::MessageControl {
+                        from: from_info.clone(),
+                        control: MessageControl {
+                            message_id: superseded.clone(),
+                            action: MessageControlAction::Supersede,
+                            timestamp: now_ms().into(),
+                            superseded_by: Some(message.id.clone()),
+                            detail: None,
+                            extra: Default::default(),
+                        },
                     },
-                });
+                );
             }
-            send_msg(&target.tx, &BrokerMessage::Message { from: from_info, message: delivered });
+            send_msg(
+                &target.tx,
+                &BrokerMessage::Message {
+                    from: from_info,
+                    message: delivered,
+                },
+            );
         }
         if let Some(rt) = &message.reply_to {
             self.ask_edges.remove(rt);
@@ -195,12 +225,20 @@ impl BrokerState {
         // `this.messageReceiptRoutes.set(...)` (`v0.10.1 broker/broker.ts:580`), dated from
         // `brokerReceivedAt` — NOT from the delivery — so the 1 h retention measures how long ago
         // the broker accepted the message.
-        self.message_receipt_routes.insert(message.id.clone(), MessageReceiptRoute {
-            from: current_id.clone(),
-            to: target_id.clone(),
-            created_at: now,
-        });
-        send_msg(self_tx, &BrokerMessage::Delivered { message_id: message.id.clone() });
+        self.message_receipt_routes.insert(
+            message.id.clone(),
+            MessageReceiptRoute {
+                from: current_id.clone(),
+                to: target_id.clone(),
+                created_at: now,
+            },
+        );
+        send_msg(
+            self_tx,
+            &BrokerMessage::Delivered {
+                message_id: message.id.clone(),
+            },
+        );
         FrameResult::cont()
     }
 
@@ -227,36 +265,48 @@ impl BrokerState {
         let target_info = match disconnected.as_slice() {
             [only] => self.disconnected_sessions.get(only).map(|s| s.info.clone()),
             [] => {
-                send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                    message_id: message.id.clone(),
-                    reason: "Session not found".to_string(),
-                });
+                send_msg(
+                    self_tx,
+                    &BrokerMessage::DeliveryFailed {
+                        message_id: message.id.clone(),
+                        reason: "Session not found".to_string(),
+                    },
+                );
                 return FrameResult::cont();
             }
             _ => {
-                send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                    message_id: message.id.clone(),
-                    reason: format!(
-                        "Multiple disconnected sessions named \"{to}\" can receive queued mail. Use the session ID instead."
-                    ),
-                });
+                send_msg(
+                    self_tx,
+                    &BrokerMessage::DeliveryFailed {
+                        message_id: message.id.clone(),
+                        reason: format!(
+                            "Multiple disconnected sessions named \"{to}\" can receive queued mail. Use the session ID instead."
+                        ),
+                    },
+                );
                 return FrameResult::cont();
             }
         };
         let Some(target) = target_info else {
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id: message.id.clone(),
-                reason: "Session not found".to_string(),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: "Session not found".to_string(),
+                },
+            );
             return FrameResult::cont();
         };
 
         // `:598-604`
         if message.reply_to.is_some() && reply_edge.is_none() {
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id: message.id.clone(),
-                reason: "Reply target does not match a pending ask".to_string(),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: "Reply target does not match a pending ask".to_string(),
+                },
+            );
             return FrameResult::cont();
         }
         // `:605-613`
@@ -266,38 +316,51 @@ impl BrokerState {
             .filter(|s| s.conn_id == conn_id)
             .map(|s| s.info.clone())
         else {
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id: message.id.clone(),
-                reason: "Sender session not found".to_string(),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: "Sender session not found".to_string(),
+                },
+            );
             return FrameResult::cont();
         };
         // `:615-622`
         if message.supersedes.is_some() {
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id: message.id.clone(),
-                reason: "Supersede target is not connected".to_string(),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: "Supersede target is not connected".to_string(),
+                },
+            );
             return FrameResult::cont();
         }
         // `:623-630`
         if let Some(edge) = reply_edge
             && (edge.to != current_id || edge.from != target.id)
         {
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id: message.id.clone(),
-                reason: "Reply target does not match the pending ask".to_string(),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: "Reply target does not match the pending ask".to_string(),
+                },
+            );
             return FrameResult::cont();
         }
         // `:631-638` — ICOM-045's reason, in pi's own position: it belongs to a target the broker
         // KNOWS but cannot reach, not to a name it has never seen (that is `Session not found`).
         if message.expects_reply == Some(true) {
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id: message.id.clone(),
-                reason: "Target session is not currently connected; blocking asks are not queued"
-                    .to_string(),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason:
+                        "Target session is not currently connected; blocking asks are not queued"
+                            .to_string(),
+                },
+            );
             return FrameResult::cont();
         }
 
@@ -308,16 +371,22 @@ impl BrokerState {
                 delivered.broker_received_at = Some(now.into());
                 delivered.broker_delivered_at = Some(now_ms().into());
                 if let Some(live) = self.sessions.get(&live_id) {
-                    send_msg(&live.tx, &BrokerMessage::Message {
-                        from: from_info,
-                        message: delivered,
-                    });
+                    send_msg(
+                        &live.tx,
+                        &BrokerMessage::Message {
+                            from: from_info,
+                            message: delivered,
+                        },
+                    );
                 }
-                self.message_receipt_routes.insert(message.id.clone(), MessageReceiptRoute {
-                    from: current_id.to_string(),
-                    to: live_id,
-                    created_at: now,
-                });
+                self.message_receipt_routes.insert(
+                    message.id.clone(),
+                    MessageReceiptRoute {
+                        from: current_id.to_string(),
+                        to: live_id,
+                        created_at: now,
+                    },
+                );
             }
             None => self.queue_mailbox_message(from_info, target, message, now),
         }
@@ -325,7 +394,12 @@ impl BrokerState {
         if let Some(rt) = &message.reply_to {
             self.ask_edges.remove(rt);
         }
-        send_msg(self_tx, &BrokerMessage::Delivered { message_id: message.id.clone() });
+        send_msg(
+            self_tx,
+            &BrokerMessage::Delivered {
+                message_id: message.id.clone(),
+            },
+        );
         FrameResult::cont()
     }
 
@@ -342,20 +416,20 @@ impl BrokerState {
             return FrameResult::protocol_error();
         };
         let owns_socket = self.sessions.get(&current_id).map(|s| s.conn_id) == Some(conn_id);
-        let owns_edge = self.ask_edges.get(message_id).map(|e| e.from.as_str()) == Some(current_id.as_str());
+        let owns_edge =
+            self.ask_edges.get(message_id).map(|e| e.from.as_str()) == Some(current_id.as_str());
         if owns_socket && owns_edge {
             self.ask_edges.remove(message_id);
         }
         FrameResult::cont()
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-    use serde_json::json;
     use super::super::test_support::{make_state, payloads, register, register_named, send_frame};
+    use serde_json::json;
 
     /// ICOM-045's broker half (`v0.10.1 broker/broker.ts:631-638`, v0.10.0): a blocking ask against
     /// a target the broker KNOWS but cannot reach gets a reason that says blocking asks are not
@@ -460,10 +534,16 @@ mod tests {
             json!({ "id": "ask1", "timestamp": 1, "expectsReply": true, "content": { "text": "?" } }),
             1_100,
         );
-        assert!(state.ask_edges.contains_key("ask1"), "the ask edge exists before the drop");
+        assert!(
+            state.ask_edges.contains_key("ask1"),
+            "the ask edge exists before the drop"
+        );
 
         state.on_connection_closed(2, &b_sid, 1_500);
-        assert!(state.ask_edges.contains_key("ask1"), "a disconnect must not drop it");
+        assert!(
+            state.ask_edges.contains_key("ask1"),
+            "a disconnect must not drop it"
+        );
 
         let (b2_tx, _b2_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut b2_sid = None;
@@ -480,9 +560,13 @@ mod tests {
         );
         let got = payloads(&mut a_rx);
         assert!(
-            got.iter().any(|p| p["type"] == "message" && p["message"]["id"] == "r1"),
+            got.iter()
+                .any(|p| p["type"] == "message" && p["message"]["id"] == "r1"),
             "the reply reaches the asker after the reconnect: {got:?}"
         );
-        assert!(!state.ask_edges.contains_key("ask1"), "and the satisfied edge is dropped");
+        assert!(
+            !state.ask_edges.contains_key("ask1"),
+            "and the satisfied edge is dropped"
+        );
     }
 }

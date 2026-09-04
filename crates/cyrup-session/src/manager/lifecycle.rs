@@ -12,8 +12,8 @@ use crate::ids::{gen_session_id, now_ts, validate_session_id};
 use crate::layout::SessionLayout;
 use crate::store::{DiskStore, MemStore, SessionStore};
 
-use super::load::load;
 use super::SessionManager;
+use super::load::load;
 
 /// Options for a new session.
 #[derive(Clone, Debug, Default)]
@@ -41,7 +41,13 @@ impl SessionManager {
         header.parent_session = opts.parent_session;
         let path = layout.new_file_path(&ts, id.as_str());
         let store: Box<dyn SessionStore> = Box::new(DiskStore::new(path));
-        Ok(Self::assemble(header, cwd.to_path_buf(), store, Vec::new(), false))
+        Ok(Self::assemble(
+            header,
+            cwd.to_path_buf(),
+            store,
+            Vec::new(),
+            false,
+        ))
     }
 
     /// Open an existing session by path, migrating to the current version on load (R-04-004).
@@ -108,9 +114,7 @@ impl SessionManager {
         let cwd = cwd_override
             .map(Path::to_path_buf)
             .filter(|p| !p.as_os_str().is_empty())
-            .or_else(|| {
-                Some(PathBuf::from(&header.cwd)).filter(|p| !p.as_os_str().is_empty())
-            })
+            .or_else(|| Some(PathBuf::from(&header.cwd)).filter(|p| !p.as_os_str().is_empty()))
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
         let mut store: Box<dyn SessionStore> = Box::new(DiskStore::new(path));
@@ -127,10 +131,7 @@ impl SessionManager {
     }
 
     /// Continue the most recent session for `cwd`, or create a new one if none exist (R-04-017).
-    pub fn continue_recent(
-        cwd: &Path,
-        layout: &SessionLayout,
-    ) -> Result<Self, SessionError> {
+    pub fn continue_recent(cwd: &Path, layout: &SessionLayout) -> Result<Self, SessionError> {
         Self::continue_recent_filtered(cwd, layout, false)
     }
 
@@ -167,7 +168,13 @@ impl SessionManager {
         };
         let mut header = SessionHeader::new(id, cwd.to_string_lossy(), now_ts());
         header.parent_session = opts.parent_session;
-        Ok(Self::assemble(header, cwd.to_path_buf(), Box::new(MemStore), Vec::new(), false))
+        Ok(Self::assemble(
+            header,
+            cwd.to_path_buf(),
+            Box::new(MemStore),
+            Vec::new(),
+            false,
+        ))
     }
 
     /// Fork a source session into a new file under `target_cwd`, copying all source history
@@ -191,13 +198,21 @@ impl SessionManager {
         };
         let ts = now_ts();
         let mut header = SessionHeader::new(id.clone(), target_cwd.to_string_lossy(), ts.clone());
-        header.parent_session =
-            Some(opts.parent_session.unwrap_or_else(|| src.to_string_lossy().into_owned()));
+        header.parent_session = Some(
+            opts.parent_session
+                .unwrap_or_else(|| src.to_string_lossy().into_owned()),
+        );
         let path = layout.new_file_path(&ts, id.as_str());
         let mut store: Box<dyn SessionStore> = Box::new(DiskStore::new(path));
         // Pi `forkFrom` writes the header with `{flag:"wx"}` (`session-manager.ts:1489`) — exclusive
         // create that refuses to clobber an existing file.
         store.create_exclusive(&header, &entries)?;
-        Ok(Self::assemble(header, target_cwd.to_path_buf(), store, entries, true))
+        Ok(Self::assemble(
+            header,
+            target_cwd.to_path_buf(),
+            store,
+            entries,
+            true,
+        ))
     }
 }

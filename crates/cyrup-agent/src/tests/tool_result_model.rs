@@ -14,16 +14,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    AfterOutcome, AfterOverride, AfterToolCall, Agent, AgentEvent, AgentMessage, HookError,
-    Hooks, ToolResultMessage,
+    AfterOutcome, AfterOverride, AfterToolCall, Agent, AgentEvent, AgentMessage, HookError, Hooks,
+    ToolResultMessage,
 };
 use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, Cost, Message, StopReason, Tool, ToolCallId,
-    ToolError, ToolResult, ToolUpdateSink, Usage,
+    CancelToken, Content, Cost, Message, StopReason, TerminateHint, Tool, ToolCallId, ToolError,
+    ToolResult, ToolUpdateSink, Usage,
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::support::*;
 
@@ -41,7 +40,13 @@ fn usage(input: u64, output: u64) -> Usage {
         cache_write_1h: Some(5),
         reasoning: Some(6),
         total_tokens: input + output,
-        cost: Cost { input: 0.5, output: 1.5, cache_read: 0.0, cache_write: 0.0, total: 2.0 },
+        cost: Cost {
+            input: 0.5,
+            output: 1.5,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            total: 2.0,
+        },
     }
 }
 
@@ -50,7 +55,9 @@ fn message_end_results(events: &[AgentEvent]) -> Vec<ToolResultMessage> {
     events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::MessageEnd { message: AgentMessage::ToolResult(t) } => Some(t.clone()),
+            AgentEvent::MessageEnd {
+                message: AgentMessage::ToolResult(t),
+            } => Some(t.clone()),
             _ => None,
         })
         .collect()
@@ -71,9 +78,12 @@ fn execution_end_results(events: &[AgentEvent]) -> Vec<Value> {
 fn payload_tool_results(msgs: &[Message]) -> Vec<(String, Option<Usage>, Vec<String>)> {
     msgs.iter()
         .filter_map(|m| match m {
-            Message::ToolResult { tool_name, usage, added_tool_names, .. } => {
-                Some((tool_name.clone(), usage.clone(), added_tool_names.clone()))
-            }
+            Message::ToolResult {
+                tool_name,
+                usage,
+                added_tool_names,
+                ..
+            } => Some((tool_name.clone(), usage.clone(), added_tool_names.clone())),
             _ => None,
         })
         .collect()
@@ -144,7 +154,10 @@ async fn tool_reported_usage_surfaces_on_events_and_next_turn_payload() {
     let u = usage(11, 22);
     let (tool, _calls) = ReportingTool::new("meter", Some(u.clone()), &[]);
     let (sf, payloads) = payload_recording(vec![
-        faux_assistant_message(vec![faux_tool_call("meter", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("meter", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let rec = Arc::new(EventRecorder::default());
@@ -166,16 +179,28 @@ async fn tool_reported_usage_surfaces_on_events_and_next_turn_payload() {
     // 2. The transcript message carries it, on both message_end and turn_end.toolResults.
     let me = message_end_results(&events);
     assert_eq!(me.len(), 1);
-    assert_eq!(me[0].usage.as_ref(), Some(&u), "message_end tool result carries usage");
+    assert_eq!(
+        me[0].usage.as_ref(),
+        Some(&u),
+        "message_end tool result carries usage"
+    );
     let te = first_turn_results(&events);
-    assert_eq!(te[0].usage.as_ref(), Some(&u), "turn_end.toolResults carries usage");
+    assert_eq!(
+        te[0].usage.as_ref(),
+        Some(&u),
+        "turn_end.toolResults carries usage"
+    );
 
     // 3. It survives `convert_to_llm` and reaches the provider on the following turn.
     let p = payloads.lock().unwrap().clone();
     assert_eq!(p.len(), 2, "two provider requests");
     let results = payload_tool_results(&p[1]);
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].1.as_ref(), Some(&u), "LLM payload tool result carries usage");
+    assert_eq!(
+        results[0].1.as_ref(),
+        Some(&u),
+        "LLM payload tool result carries usage"
+    );
 }
 
 /// A tool that reports nothing leaves `usage` absent — and absent means NO KEY on the wire, not a
@@ -184,7 +209,10 @@ async fn tool_reported_usage_surfaces_on_events_and_next_turn_payload() {
 async fn absent_usage_emits_no_key() {
     let (tool, _calls) = ReportingTool::new("plain", None, &[]);
     let (sf, _payloads) = payload_recording(vec![
-        faux_assistant_message(vec![faux_tool_call("plain", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("plain", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let rec = Arc::new(EventRecorder::default());
@@ -195,14 +223,28 @@ async fn absent_usage_emits_no_key() {
 
     let events = rec.snapshot();
     let ends = execution_end_results(&events);
-    assert!(ends[0].get("usage").is_none(), "no `usage` key at all: {}", ends[0]);
-    assert!(ends[0].get("addedToolNames").is_none(), "no `addedToolNames` key: {}", ends[0]);
+    assert!(
+        ends[0].get("usage").is_none(),
+        "no `usage` key at all: {}",
+        ends[0]
+    );
+    assert!(
+        ends[0].get("addedToolNames").is_none(),
+        "no `addedToolNames` key: {}",
+        ends[0]
+    );
 
     let te = first_turn_results(&events);
     assert_eq!(te[0].usage, None);
     let json = serde_json::to_value(&te[0]).unwrap();
-    assert!(json.get("usage").is_none(), "ToolResultMessage omits `usage`: {json}");
-    assert!(json.get("addedToolNames").is_none(), "omits `addedToolNames`: {json}");
+    assert!(
+        json.get("usage").is_none(),
+        "ToolResultMessage omits `usage`: {json}"
+    );
+    assert!(
+        json.get("addedToolNames").is_none(),
+        "omits `addedToolNames`: {json}"
+    );
 }
 
 /// `after_tool_call` OBSERVES the tool's usage and REPLACES it wholesale (no deep merge).
@@ -214,11 +256,7 @@ struct UsagePatchHook {
 
 #[async_trait::async_trait]
 impl Hooks for UsagePatchHook {
-    async fn after_tool_call(
-        &self,
-        ctx: AfterToolCall<'_>,
-        _cancel: CancelToken,
-    ) -> AfterOutcome {
+    async fn after_tool_call(&self, ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
         self.observed.lock().unwrap().push(ctx.usage.cloned());
         AfterOutcome::Override(AfterOverride {
             usage: Some(self.replacement.clone()),
@@ -234,7 +272,10 @@ async fn after_tool_call_observes_then_replaces_usage() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let (tool, _calls) = ReportingTool::new("meter", Some(from_tool.clone()), &[]);
     let (sf, payloads) = payload_recording(vec![
-        faux_assistant_message(vec![faux_tool_call("meter", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("meter", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let rec = Arc::new(EventRecorder::default());
@@ -250,12 +291,19 @@ async fn after_tool_call_observes_then_replaces_usage() {
     agent.wait_for_idle().await;
 
     // READ side: the hook saw what the tool reported, not `None`.
-    assert_eq!(observed.lock().unwrap().clone(), vec![Some(from_tool.clone())]);
+    assert_eq!(
+        observed.lock().unwrap().clone(),
+        vec![Some(from_tool.clone())]
+    );
 
     // WRITE side: the hook's value replaces it end to end.
     let events = rec.snapshot();
     let te = first_turn_results(&events);
-    assert_eq!(te[0].usage.as_ref(), Some(&from_hook), "hook usage replaces the tool's");
+    assert_eq!(
+        te[0].usage.as_ref(),
+        Some(&from_hook),
+        "hook usage replaces the tool's"
+    );
     assert_ne!(te[0].usage.as_ref(), Some(&from_tool));
     let ends = execution_end_results(&events);
     assert_eq!(ends[0]["usage"]["input"], json!(700));
@@ -268,11 +316,7 @@ struct ContentOnlyHook;
 
 #[async_trait::async_trait]
 impl Hooks for ContentOnlyHook {
-    async fn after_tool_call(
-        &self,
-        _ctx: AfterToolCall<'_>,
-        _cancel: CancelToken,
-    ) -> AfterOutcome {
+    async fn after_tool_call(&self, _ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
         AfterOutcome::Override(AfterOverride {
             content: Some(vec![Content::text("patched")]),
             ..AfterOverride::default()
@@ -285,7 +329,10 @@ async fn override_without_usage_keeps_the_tools_usage_and_anchor() {
     let u = usage(11, 22);
     let (tool, _calls) = ReportingTool::new("meter", Some(u.clone()), &["late"]);
     let (sf, _payloads) = payload_recording(vec![
-        faux_assistant_message(vec![faux_tool_call("meter", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("meter", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let rec = Arc::new(EventRecorder::default());
@@ -302,10 +349,18 @@ async fn override_without_usage_keeps_the_tools_usage_and_anchor() {
         Content::Text { text, .. } => assert_eq!(text, "patched"),
         other => panic!("expected patched text, got {other:?}"),
     }
-    assert_eq!(te[0].usage.as_ref(), Some(&u), "an omitted override field keeps the original");
+    assert_eq!(
+        te[0].usage.as_ref(),
+        Some(&u),
+        "an omitted override field keeps the original"
+    );
     // Pi's `AfterToolCallResult` has no `addedToolNames`; the tool's value rides the
     // `{...result}` spread untouched (agent-loop.ts:736-742).
-    assert_eq!(te[0].added_tool_names, vec!["late".to_string()], "hook cannot clear the anchor");
+    assert_eq!(
+        te[0].added_tool_names,
+        vec!["late".to_string()],
+        "hook cannot clear the anchor"
+    );
 }
 
 /// A THROWING `after_tool_call` discards the whole result — Pi replaces it with
@@ -314,11 +369,7 @@ struct ThrowingHook;
 
 #[async_trait::async_trait]
 impl Hooks for ThrowingHook {
-    async fn after_tool_call(
-        &self,
-        _ctx: AfterToolCall<'_>,
-        _cancel: CancelToken,
-    ) -> AfterOutcome {
+    async fn after_tool_call(&self, _ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
         AfterOutcome::Failed(HookError::new("boom"))
     }
 }
@@ -327,12 +378,17 @@ impl Hooks for ThrowingHook {
 async fn throwing_after_tool_call_clears_usage_and_anchor() {
     let (tool, _calls) = ReportingTool::new("meter", Some(usage(11, 22)), &["late"]);
     let (sf, _payloads) = payload_recording(vec![
-        faux_assistant_message(vec![faux_tool_call("meter", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("meter", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let rec = Arc::new(EventRecorder::default());
-    let agent =
-        Agent::builder(model_ref(), sf).tools(vec![tool]).hooks(Arc::new(ThrowingHook)).build();
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![tool])
+        .hooks(Arc::new(ThrowingHook))
+        .build();
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -340,7 +396,10 @@ async fn throwing_after_tool_call_clears_usage_and_anchor() {
     let te = first_turn_results(&rec.snapshot());
     assert!(te[0].is_error);
     assert_eq!(te[0].usage, None, "the error result carries no usage");
-    assert!(te[0].added_tool_names.is_empty(), "the error result anchors nothing");
+    assert!(
+        te[0].added_tool_names.is_empty(),
+        "the error result anchors nothing"
+    );
 }
 
 /// A result that never ran (unknown tool ⇒ `immediate_error`, Pi `createErrorToolResult`) carries
@@ -383,24 +442,36 @@ async fn added_tool_names_anchor_lands_on_the_introducing_result_and_nowhere_ear
     let (loader, loader_calls) = ReportingTool::new("loader", None, &["late"]);
     let (late, late_calls) = ReportingTool::new("late", None, &[]);
     let (sf, payloads) = payload_recording(vec![
-        faux_assistant_message(vec![faux_tool_call("loader", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("loader", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_tool_call("late", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let rec = Arc::new(EventRecorder::default());
-    let agent = Agent::builder(model_ref(), sf).tools(vec![loader, late]).build();
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![loader, late])
+        .build();
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
 
     assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(late_calls.load(Ordering::SeqCst), 1, "`late` was actually invoked");
+    assert_eq!(
+        late_calls.load(Ordering::SeqCst),
+        1,
+        "`late` was actually invoked"
+    );
 
     let p = payloads.lock().unwrap().clone();
     assert_eq!(p.len(), 3, "three provider requests");
 
     // --- Turn 1's payload predates the anchor entirely: no tool result at all.
-    assert!(payload_tool_results(&p[0]).is_empty(), "nothing anchored before the tool ran");
+    assert!(
+        payload_tool_results(&p[0]).is_empty(),
+        "nothing anchored before the tool ran"
+    );
 
     // --- Turn 2's payload: exactly one anchor, on `loader`, at the transcript index of its result.
     let anchored: Vec<usize> = p[1]
@@ -414,7 +485,11 @@ async fn added_tool_names_anchor_lands_on_the_introducing_result_and_nowhere_ear
     assert_eq!(anchored.len(), 1, "exactly one anchoring message");
     let anchor_idx = anchored[0];
     match &p[1][anchor_idx] {
-        Message::ToolResult { tool_name, added_tool_names, .. } => {
+        Message::ToolResult {
+            tool_name,
+            added_tool_names,
+            ..
+        } => {
             assert_eq!(tool_name, "loader");
             assert_eq!(added_tool_names, &vec!["late".to_string()]);
         }
@@ -423,7 +498,10 @@ async fn added_tool_names_anchor_lands_on_the_introducing_result_and_nowhere_ear
     // Every message BEFORE the anchor is anchor-free, and serializes without the key at all.
     for (i, m) in p[1].iter().enumerate().take(anchor_idx) {
         let v = serde_json::to_value(m).unwrap();
-        assert!(v.get("addedToolNames").is_none(), "message {i} must not carry an anchor: {v}");
+        assert!(
+            v.get("addedToolNames").is_none(),
+            "message {i} must not carry an anchor: {v}"
+        );
     }
 
     // --- Turn 3's payload: the anchor stays put; `late`'s own result introduces nothing new.
@@ -438,7 +516,11 @@ async fn added_tool_names_anchor_lands_on_the_introducing_result_and_nowhere_ear
     );
     // And it is still at the SAME transcript index it was assigned on turn 2.
     match &p[2][anchor_idx] {
-        Message::ToolResult { tool_name, added_tool_names, .. } => {
+        Message::ToolResult {
+            tool_name,
+            added_tool_names,
+            ..
+        } => {
             assert_eq!(tool_name, "loader");
             assert_eq!(added_tool_names, &vec!["late".to_string()]);
         }
@@ -454,7 +536,10 @@ async fn parallel_batch_preserves_per_result_anchors_in_source_order() {
     let (b, _) = ReportingTool::new("b", Some(usage(3, 4)), &["y", "z"]);
     let (sf, payloads) = payload_recording(vec![
         faux_assistant_message(
-            vec![faux_tool_call("a", json!({})), faux_tool_call("b", json!({}))],
+            vec![
+                faux_tool_call("a", json!({})),
+                faux_tool_call("b", json!({})),
+            ],
             StopReason::ToolUse,
         ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
@@ -471,7 +556,10 @@ async fn parallel_batch_preserves_per_result_anchors_in_source_order() {
     assert_eq!(te[0].added_tool_names, vec!["x".to_string()]);
     assert_eq!(te[0].usage, Some(usage(1, 2)));
     assert_eq!(te[1].tool_name, "b");
-    assert_eq!(te[1].added_tool_names, vec!["y".to_string(), "z".to_string()]);
+    assert_eq!(
+        te[1].added_tool_names,
+        vec!["y".to_string(), "z".to_string()]
+    );
     assert_eq!(te[1].usage, Some(usage(3, 4)));
 
     let p = payloads.lock().unwrap().clone();
@@ -479,7 +567,11 @@ async fn parallel_batch_preserves_per_result_anchors_in_source_order() {
         payload_tool_results(&p[1]),
         vec![
             ("a".to_string(), Some(usage(1, 2)), vec!["x".to_string()]),
-            ("b".to_string(), Some(usage(3, 4)), vec!["y".to_string(), "z".to_string()]),
+            (
+                "b".to_string(),
+                Some(usage(3, 4)),
+                vec!["y".to_string(), "z".to_string()]
+            ),
         ]
     );
 }
@@ -515,7 +607,10 @@ async fn sequential_batch_preserves_per_result_anchors() {
     let (b, _) = ReportingTool::new("b", None, &["y"]);
     let (sf, _payloads) = payload_recording(vec![
         faux_assistant_message(
-            vec![faux_tool_call("a", json!({})), faux_tool_call("b", json!({}))],
+            vec![
+                faux_tool_call("a", json!({})),
+                faux_tool_call("b", json!({})),
+            ],
             StopReason::ToolUse,
         ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
@@ -563,7 +658,9 @@ async fn failing_tool_anchors_nothing() {
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let rec = Arc::new(EventRecorder::default());
-    let agent = Agent::builder(model_ref(), sf).tools(vec![Arc::new(Boom(obj_schema()))]).build();
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![Arc::new(Boom(obj_schema()))])
+        .build();
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -592,7 +689,10 @@ impl Hooks for GateLateToolHook {
         _cancel: CancelToken,
     ) -> crate::BeforeOutcome {
         if ctx.tool_name == "late" {
-            crate::BeforeOutcome::Block { reason: Some("denied by policy".into()), terminate: TerminateHint::Unspecified }
+            crate::BeforeOutcome::Block {
+                reason: Some("denied by policy".into()),
+                terminate: TerminateHint::Unspecified,
+            }
         } else {
             crate::BeforeOutcome::Proceed
         }
@@ -604,7 +704,10 @@ async fn an_announced_tool_is_still_subject_to_the_permission_gate() {
     let (loader, loader_calls) = ReportingTool::new("loader", None, &["late"]);
     let (late, late_calls) = ReportingTool::new("late", None, &[]);
     let (sf, _payloads) = payload_recording(vec![
-        faux_assistant_message(vec![faux_tool_call("loader", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("loader", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_tool_call("late", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
@@ -619,10 +722,17 @@ async fn an_announced_tool_is_still_subject_to_the_permission_gate() {
 
     // The announcing tool ran; the announced one was gated BEFORE execution.
     assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(late_calls.load(Ordering::SeqCst), 0, "the gate ran before `late` could execute");
+    assert_eq!(
+        late_calls.load(Ordering::SeqCst),
+        0,
+        "the gate ran before `late` could execute"
+    );
 
     let results = message_end_results(&rec.snapshot());
-    let blocked = results.iter().find(|r| r.tool_name == "late").expect("a result for `late`");
+    let blocked = results
+        .iter()
+        .find(|r| r.tool_name == "late")
+        .expect("a result for `late`");
     assert!(blocked.is_error, "the gated call produces an error result");
     match &blocked.content[0] {
         Content::Text { text, .. } => assert_eq!(text, "denied by policy"),

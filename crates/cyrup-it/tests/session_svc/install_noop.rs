@@ -28,7 +28,12 @@
 //! true. Re-spelled in cyrup-it it would name THIS crate's `wasm-host`, which `--features it` does
 //! not enable — and every test here would SILENTLY not compile in. See the `[[test]]` note in
 //! crates/cyrup-it/Cargo.toml.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,7 +77,12 @@ fn fixture() -> Fx {
     let package_dir = agent_dir.join("packages");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fx { _tmp: tmp, cwd, agent_dir, package_dir }
+    Fx {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+        package_dir,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -84,9 +94,14 @@ async fn package_declared_extension_loads_into_assembled_session() {
     // (same technique as cyrup-resources' a09_5_update_skips_pinned): write the registry record
     // via `lock::save` and materialize the working tree at the exact store path.
     let store = PackageStore::new(fx.package_dir.clone(), Some(fx.cwd.clone()));
-    let source = PackageSource::Git { url: "file:///fake/deploypkg".into(), reff: PinRef::Default };
+    let source = PackageSource::Git {
+        url: "file:///fake/deploypkg".into(),
+        reff: PinRef::Default,
+    };
     let id = source.package_id();
-    let pkg_dir = store.package_dir(InstallScope::Global, &id).expect("global package dir");
+    let pkg_dir = store
+        .package_dir(InstallScope::Global, &id)
+        .expect("global package dir");
     // A package whose manifest declares one extension = the demo component (registers `/greet`).
     std::fs::create_dir_all(pkg_dir.join("extensions/demo")).unwrap();
     std::fs::write(pkg_dir.join("extensions/demo/demo.wasm"), &bytes).unwrap();
@@ -115,13 +130,22 @@ async fn package_declared_extension_loads_into_assembled_session() {
     // The declared extension actually LOADED: its guest `init` registered `/greet` in the live
     // host command registry (pre-fix, `ext_crate_paths` was collected but never handed to the
     // loader, so `greet` was absent).
-    let commands = session.services().ext_host.registry().command_names().unwrap();
+    let commands = session
+        .services()
+        .ext_host
+        .registry()
+        .command_names()
+        .unwrap();
     assert!(
         commands.iter().any(|n| n == "greet"),
         "installed package's declared extension must load + register /greet: {commands:?}"
     );
     assert!(
-        session.resources().ext_crate_paths.iter().any(|p| p.ends_with("demo")),
+        session
+            .resources()
+            .ext_crate_paths
+            .iter()
+            .any(|p| p.ends_with("demo")),
         "the package's extension dir is collected in the resource registry"
     );
 }

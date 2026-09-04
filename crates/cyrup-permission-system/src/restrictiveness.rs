@@ -20,6 +20,10 @@ fn rank(state: PermissionState) -> u8 {
 pub fn pick_most_restrictive(results: Vec<PermissionCheckResult>) -> Option<PermissionCheckResult> {
     results.into_iter().reduce(|worst, next| {
         // Strictly greater, so the FIRST of equal-restrictiveness candidates is retained.
-        if rank(next.state) > rank(worst.state) { next } else { worst }
+        if rank(next.state) > rank(worst.state) {
+            next
+        } else {
+            worst
+        }
     })
 }

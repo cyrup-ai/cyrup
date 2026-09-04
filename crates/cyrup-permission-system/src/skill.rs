@@ -102,7 +102,10 @@ fn extract_skill_name_under_root(
         .strip_prefix(normalized_skills_root)
         .unwrap_or(normalized_read_path)
         .trim_start_matches(['/', '\\']);
-    relative.split(['/', '\\']).find(|part| !part.is_empty()).map(str::to_string)
+    relative
+        .split(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .map(str::to_string)
 }
 
 /// pi `inferSkillEntryFromReadPath` (`index.ts:614-647`): when a read path is NOT one of the parsed
@@ -121,9 +124,9 @@ pub fn infer_skill_entry_from_read_path(
         return None;
     }
     let agent_skills_root = common::join_paths(agent_dir, "skills");
-    let project_skills_root = SKILLS_DIR_PARTS.iter().fold(cwd.to_string(), |acc, seg| {
-        common::join_paths(&acc, seg)
-    });
+    let project_skills_root = SKILLS_DIR_PARTS
+        .iter()
+        .fold(cwd.to_string(), |acc, seg| common::join_paths(&acc, seg));
     for skill_root in [agent_skills_root, project_skills_root] {
         let normalized_skill_root = normalize_path_for_comparison(&skill_root, cwd);
         if let Some(skill_name) =
@@ -156,7 +159,11 @@ pub fn extract_skill_name_from_input(text: &str) -> Option<String> {
         None => after,
     }
     .trim();
-    if name.is_empty() { None } else { Some(name.to_string()) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// pi `formatSkillPathAskPrompt` (`index.ts:594-597`).
@@ -170,12 +177,18 @@ pub fn format_skill_path_ask_prompt(
         Some(a) => format!("Agent '{a}'"),
         None => "Current agent".to_string(),
     };
-    format!("{subject} requested access to skill '{}' via '{read_path}'. Allow this read?", skill.name)
+    format!(
+        "{subject} requested access to skill '{}' via '{read_path}'. Allow this read?",
+        skill.name
+    )
 }
 
 /// pi `formatSkillPathDenyReason` (`index.ts:599-602`).
 #[must_use]
-pub fn format_skill_path_deny_reason(_skill: &SkillPromptEntry, agent_name: Option<&str>) -> String {
+pub fn format_skill_path_deny_reason(
+    _skill: &SkillPromptEntry,
+    agent_name: Option<&str>,
+) -> String {
     let subject = match agent_name {
         Some(a) => format!("Agent '{a}'"),
         None => "Current agent".to_string(),
@@ -192,7 +205,9 @@ pub fn skill_ask_unavailable_reason() -> String {
 /// pi skill-read user-denied reason (`index.ts:2294-2295`).
 #[must_use]
 pub fn format_skill_user_denied_reason(denial_reason: Option<&str>) -> String {
-    let suffix = denial_reason.map(|r| format!(" Reason: {r}.")).unwrap_or_default();
+    let suffix = denial_reason
+        .map(|r| format!(" Reason: {r}."))
+        .unwrap_or_default();
     format!("User denied access to this skill.{suffix}")
 }
 
@@ -216,7 +231,10 @@ mod tests {
 
     #[test]
     fn extract_slash_skill_name() {
-        assert_eq!(extract_skill_name_from_input("/skill:deploy do it"), Some("deploy".into()));
+        assert_eq!(
+            extract_skill_name_from_input("/skill:deploy do it"),
+            Some("deploy".into())
+        );
         assert_eq!(extract_skill_name_from_input("/skill:"), None);
         assert_eq!(extract_skill_name_from_input("hello"), None);
     }

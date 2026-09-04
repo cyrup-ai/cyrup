@@ -306,8 +306,13 @@ pub fn parse_refinement_file(markdown: &str, label: &str) -> Result<ParsedRefine
         let after = item.get("after").and_then(Value::as_str);
         let at = text(item.get("at"));
         let revision = integer_number(item.get("revision"));
-        let (Some(revision), Some(at), Some(action @ ("refine" | "rollback")), Some(before), Some(after)) =
-            (revision, at, action, before, after)
+        let (
+            Some(revision),
+            Some(at),
+            Some(action @ ("refine" | "rollback")),
+            Some(before),
+            Some(after),
+        ) = (revision, at, action, before, after)
         else {
             return Err(format!("{label} snapshot {index} is invalid."));
         };
@@ -356,7 +361,11 @@ pub fn parse_refinement_file(markdown: &str, label: &str) -> Result<ParsedRefine
 /// (`.cyrup-subagents/refinements/<agent>.md`) without needing a resolver; a path that somehow does
 /// not sit under `cwd` falls back to its own display form rather than failing the overlay.
 #[must_use]
-pub fn append_agent_refinement_overlay(system_prompt: &str, cwd: &Path, agent_name: &str) -> String {
+pub fn append_agent_refinement_overlay(
+    system_prompt: &str,
+    cwd: &Path,
+    agent_name: &str,
+) -> String {
     let Ok(file_path) = get_agent_refinement_path(cwd, agent_name) else {
         return system_prompt.to_string();
     };
@@ -383,7 +392,8 @@ pub fn append_agent_refinement_overlay(system_prompt: &str, cwd: &Path, agent_na
     // fail for a string, and the fallback keeps this function infallible without a panic.
     let agent_attr =
         serde_json::to_string(agent_name).unwrap_or_else(|_| format!("\"{agent_name}\""));
-    let source_attr = serde_json::to_string(&relative).unwrap_or_else(|_| format!("\"{relative}\""));
+    let source_attr =
+        serde_json::to_string(&relative).unwrap_or_else(|_| format!("\"{relative}\""));
     let overlay = format!(
         "<pi-subagents-refinement agent={agent_attr} source={source_attr}>\n\
          Project-local refinement guidance generated from recent bounded evidence.\n\
@@ -400,7 +410,12 @@ pub fn append_agent_refinement_overlay(system_prompt: &str, cwd: &Path, agent_na
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -641,10 +656,13 @@ mod tests {
         let good = refinement_file("r", "Be terse.", "[]");
         assert!(parse_refinement_file(&good, "f").is_ok());
         assert!(parse_refinement_file(&format!("\n{good}"), "f").is_err());
-        assert!(parse_refinement_file(&format!("{METADATA_PREFIX}{METADATA_SUFFIX}"), "f").is_err());
+        assert!(
+            parse_refinement_file(&format!("{METADATA_PREFIX}{METADATA_SUFFIX}"), "f").is_err()
+        );
         // A non-integer revision fails (pi `Number.isInteger`), while `2.0` does not.
         assert!(
-            parse_refinement_file(&good.replace("\"revision\":2", "\"revision\":2.5"), "f").is_err()
+            parse_refinement_file(&good.replace("\"revision\":2", "\"revision\":2.5"), "f")
+                .is_err()
         );
         assert!(
             parse_refinement_file(&good.replace("\"revision\":2", "\"revision\":2.0"), "f").is_ok()

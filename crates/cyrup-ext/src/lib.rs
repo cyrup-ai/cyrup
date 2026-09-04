@@ -153,7 +153,7 @@ pub mod host_runtime;
 
 // --- Re-exports: the load-bearing surface (arch-08 §3). ---
 pub use aggregate::{
-    fold_project_trust, fold_resources, AttributedPath, ProjectTrustDecision, ResourcesAggregate,
+    AttributedPath, ProjectTrustDecision, ResourcesAggregate, fold_project_trust, fold_resources,
 };
 // The inter-extension bus is NOT `wasm-host`-gated (EXT-018): pi hangs `events` on the one base
 // `ExtensionAPI` every extension receives (extensions/loader.ts:389 @v0.83.0), so which tier an
@@ -168,6 +168,7 @@ pub use dispatch::{Dispatcher, ErrorListener, ExtensionError};
 /// argument: the consumer rebuilds from `slash_command_catalog()`, which is already live, so the
 /// signal carries no payload worth threading. Sibling of [`ErrorListener`].
 pub type CommandsListener = std::sync::Arc<dyn Fn() + Send + Sync>;
+pub use build::build_component;
 pub use error::ExtError;
 pub use event::{EventKind, HostEvent, InputEventSource, InputStreamingBehavior, Subscriptions};
 pub use extension::{ExtKind, Extension};
@@ -175,41 +176,39 @@ pub use facade::{
     BeforeAgentStartReduction, CompactionReduction, ExtensionFlagOverride, ExtensionHost,
     HostConfig, InputReduction, RenderOutcome, TreeReduction, UserBashReduction,
 };
-pub use build::build_component;
 pub use hooks::ExtHooks;
 pub use loader::{
-    discover, discover_with_diagnostics, resolve_component_bytes, DiscoveredExtension,
-    DiscoveryRoots, ExtOrigin, LoadError, LoadExtensionsResult, EXTENSIONS_SUBDIR,
+    DiscoveredExtension, DiscoveryRoots, EXTENSIONS_SUBDIR, ExtOrigin, LoadError,
+    LoadExtensionsResult, discover, discover_with_diagnostics, resolve_component_bytes,
 };
 pub use manifest::{Capabilities, ExtensionManifest, FsGrant, HOST_WORLD, MANIFEST_FILE};
-pub use native::{
-    CtxTier, ExtMode, HostCtx, HostCtxRich, HostCtxSource, HumanWaitGate, HumanWaitGuard, InitApi,
-    LateRegistrar, NativeExtension, NativeHandle, RenderCtx, RenderTheme, RenderedComponent,
-};
 /// EXT-060: the `HostServices` -> [`native::HostCtxSource`] adapter is only meaningful when the
 /// capability backend exists, but the TRAIT it feeds is unconditional.
 #[cfg(feature = "wasm-host")]
 pub use native::ServicesCtxSource;
+pub use native::{
+    CtxTier, ExtMode, HostCtx, HostCtxRich, HostCtxSource, HumanWaitGate, HumanWaitGuard, InitApi,
+    LateRegistrar, NativeExtension, NativeHandle, RenderCtx, RenderTheme, RenderedComponent,
+};
 pub use provider::{
-    resolve_api_key, ModelCost, ModelCostTier, ModelRegistrySink, ProviderConfig, ProviderHub,
-    ProviderModelConfig, ProviderRegistration,
+    ModelCost, ModelCostTier, ModelRegistrySink, ProviderConfig, ProviderHub, ProviderModelConfig,
+    ProviderRegistration, resolve_api_key,
 };
 pub use registry::{
     CommandDescriptor, ExecModeWire, ExtensionConflict, ExtensionProvenance, ExtensionRegistry,
     ResolvedCommand, ToolDescriptor,
 };
 pub use subscriber::ExtSubscriber;
-pub use wrapper::{wrap_registered_tool, ActiveToolNames, RegisteredTool};
+pub use wrapper::{ActiveToolNames, RegisteredTool, wrap_registered_tool};
 
 #[cfg(feature = "wasm-host")]
 pub use host::{
-    CannedResponses, ControlOp, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
-    DENIED_EXEC, DENIED_NET, DENIED_UI,
-    GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
-    CustomOption, CustomSpec, SpecOverlay,
-    HumanInteractionLock, InteractiveOverlay, OverlayOptions, LiveExtension, NotifyKind, OAuthEvent,
-    OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOutcome, OverlaySpan,
-    ProcSpawnSpec, RecordingServices, StoreLimits, UiChrome, WasmTool,
+    CannedResponses, ControlOp, CustomOption, CustomSpec, DENIED_EXEC, DENIED_NET, DENIED_UI,
+    DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps, GuestState, HostServices,
+    HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard, HumanInteractionLock,
+    InteractiveOverlay, LiveExtension, NotifyKind, OAuthEvent, OverlayColor, OverlayKey,
+    OverlayKeyCode, OverlayLine, OverlayOptions, OverlayOutcome, OverlaySpan, ProcSpawnSpec,
+    RecordingServices, SpecOverlay, StoreLimits, UiChrome, WasmTool,
 };
 #[cfg(feature = "wasm-host")]
 pub use host_runtime::WasmRuntime;

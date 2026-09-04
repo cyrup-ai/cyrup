@@ -47,7 +47,9 @@ pub fn reanchor_inline_region<W: io::Write>(
 ) -> u16 {
     let term_h = term_height.max(1);
     let last_row = term_h.saturating_sub(1);
-    let anchor_y = term_h.saturating_sub(old_height.min(new_height)).min(last_row);
+    let anchor_y = term_h
+        .saturating_sub(old_height.min(new_height))
+        .min(last_row);
     if old_height > 0 {
         // Erase the whole current inline region (its top row down to the bottom of the screen).
         let erase_top = term_h.saturating_sub(old_height).min(last_row);
@@ -66,7 +68,10 @@ impl RebuildBackend for ratatui::backend::TestBackend {
         // at launch (the cursor sits after the shell prompt). This makes `insert_before` scroll
         // committed history up off the top into native scrollback (out of the visible buffer) instead
         // of leaving it on-screen above a top-anchored viewport (ADR-0001; audit #1).
-        let bottom = ratatui::layout::Position { x: 0, y: area.height.saturating_sub(1) };
+        let bottom = ratatui::layout::Position {
+            x: 0,
+            y: area.height.saturating_sub(1),
+        };
         let _ = Backend::set_cursor_position(&mut next, bottom);
         next
     }
@@ -99,7 +104,10 @@ impl<W: io::Write> InlineBackend<W> {
     /// Wrap `writer`, seeding the anchor with the row the caller has established (see
     /// `App::into_stdout`'s one bounded probe).
     pub fn with_anchor(writer: W, anchor: ratatui::layout::Position) -> Self {
-        Self { inner: CrosstermBackend::new(writer), anchor }
+        Self {
+            inner: CrosstermBackend::new(writer),
+            anchor,
+        }
     }
 
     /// The tracked anchor (inspection / re-seed after a probe).
@@ -133,8 +141,9 @@ impl<W: io::Write> Backend for InlineBackend<W> {
     /// the row saturates at the last line (`compute_inline_size`'s own `missing_lines` math,
     /// `inline.rs:405-410`, and `CaptureBackend::append_lines`).
     fn append_lines(&mut self, n: u16) -> io::Result<()> {
-        let last =
-            Backend::size(&self.inner).map(|s| s.height.saturating_sub(1)).unwrap_or(u16::MAX);
+        let last = Backend::size(&self.inner)
+            .map(|s| s.height.saturating_sub(1))
+            .unwrap_or(u16::MAX);
         self.anchor.y = self.anchor.y.saturating_add(n).min(last);
         self.inner.append_lines(n)
     }
@@ -206,7 +215,10 @@ impl RebuildBackend for InlineBackend<Stdout> {
     /// makes the rebuilt `Terminal::with_options` reserve rows from the row `reanchor_inline` just
     /// moved to (`CaptureBackend::rebuild` does the same, `inline_stacking.rs:131-138`).
     fn rebuild(&self) -> Self {
-        Self { inner: CrosstermBackend::new(io::stdout()), anchor: self.anchor }
+        Self {
+            inner: CrosstermBackend::new(io::stdout()),
+            anchor: self.anchor,
+        }
     }
 
     fn reanchor_inline(&mut self, term_height: u16, old_height: u16, new_height: u16) {
@@ -220,7 +232,12 @@ impl RebuildBackend for InlineBackend<Stdout> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use std::sync::{Arc, Mutex};
 
     use ratatui::layout::Position;
@@ -378,7 +395,10 @@ mod tests {
         let mut backend = InlineBackend::with_anchor(buf.clone(), Position::ORIGIN);
         backend.set_anchor(Position::new(1, 5));
         assert_eq!(backend.anchor(), Position::new(1, 5));
-        assert!(buf.bytes().is_empty(), "re-seeding the anchor (the boot probe) writes nothing");
+        assert!(
+            buf.bytes().is_empty(),
+            "re-seeding the anchor (the boot probe) writes nothing"
+        );
     }
 
     #[test]
@@ -393,7 +413,11 @@ mod tests {
         backend.append_lines(3).unwrap();
         assert_eq!(backend.anchor().y, 3);
         backend.append_lines(4).unwrap();
-        assert_eq!(backend.anchor().y, 7, "append_lines accumulates across calls");
+        assert_eq!(
+            backend.anchor().y,
+            7,
+            "append_lines accumulates across calls"
+        );
     }
 
     #[test]
@@ -428,4 +452,3 @@ mod tests {
         );
     }
 }
-

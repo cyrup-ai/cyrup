@@ -1,14 +1,14 @@
 //! Request encoding — the `Content[]` encoder: tool-call-id normalization and the user /
 //! assistant part builders (Pi `convertMessages`, google-shared.ts:100-270).
 
+use super::capabilities::{requires_tool_call_id, supports_multimodal_function_response};
+use super::signatures::resolve_thought_signature;
 use crate::api::compat::sanitize_surrogates;
 use crate::api::openai_completions::transform_messages_with;
 use crate::context::Context;
 use crate::model::{Modality, Model};
 use cyrup_core::{AssistantMessage, Content, Message};
 use serde_json::{Map, Value, json};
-use super::capabilities::{requires_tool_call_id, supports_multimodal_function_response};
-use super::signatures::resolve_thought_signature;
 
 /// The Gemini tool-call-id normalizer (Pi `convertMessages` `normalizeToolCallId`,
 /// v0.84.1 `ai/src/api/google-shared.ts:100-103`; v0.83.0 `:94-97` — same body, shifted).

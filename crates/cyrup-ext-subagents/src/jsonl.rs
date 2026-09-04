@@ -187,12 +187,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let path = dir.path().join("under-cap.jsonl");
 
-        let mut writer = BoundedJsonlWriter::create_with_cap(&path, 1024).await.expect("opens");
+        let mut writer = BoundedJsonlWriter::create_with_cap(&path, 1024)
+            .await
+            .expect("opens");
         for i in 0..10 {
             let line = format!(r#"{{"type":"unknown","n":{i}}}"#);
-            writer.write_line(&line).await.expect("write under cap succeeds");
+            writer
+                .write_line(&line)
+                .await
+                .expect("write under cap succeeds");
         }
-        assert!(!writer.is_capped(), "10 short lines must not exceed a 1KB cap");
+        assert!(
+            !writer.is_capped(),
+            "10 short lines must not exceed a 1KB cap"
+        );
 
         let contents = tokio::fs::read_to_string(&path).await.expect("readable");
         let lines: Vec<&str> = contents.lines().collect();
@@ -200,7 +208,10 @@ mod tests {
         for (i, line) in lines.iter().enumerate() {
             let parsed: serde_json::Value = serde_json::from_str(line)
                 .unwrap_or_else(|e| panic!("line {i} must be valid JSON: {e}: {line}"));
-            assert_eq!(parsed["n"], i, "lines must land in write order, uncorrupted");
+            assert_eq!(
+                parsed["n"], i,
+                "lines must land in write order, uncorrupted"
+            );
         }
     }
 
@@ -219,15 +230,27 @@ mod tests {
         // not enough for a 5th 21-byte line, so the 5th (and every subsequent) line must be
         // dropped whole, never split.
         let cap = 100u64;
-        let mut writer = BoundedJsonlWriter::create_with_cap(&path, cap).await.expect("opens");
+        let mut writer = BoundedJsonlWriter::create_with_cap(&path, cap)
+            .await
+            .expect("opens");
 
         for i in 0..50 {
             let line = format!(r#"{{"n":"{i:02}","pad":"x"}}"#); // fixed 20-byte body
-            assert_eq!(line.len(), 20, "test fixture line must be exactly 20 bytes: {line:?}");
-            writer.write_line(&line).await.expect("write_line never errors, even over cap");
+            assert_eq!(
+                line.len(),
+                20,
+                "test fixture line must be exactly 20 bytes: {line:?}"
+            );
+            writer
+                .write_line(&line)
+                .await
+                .expect("write_line never errors, even over cap");
         }
 
-        assert!(writer.is_capped(), "50 lines against a 100-byte cap must have triggered the cap");
+        assert!(
+            writer.is_capped(),
+            "50 lines against a 100-byte cap must have triggered the cap"
+        );
         assert!(
             writer.bytes_written() <= cap,
             "writer must never report more bytes written than the configured cap: {} > {cap}",
@@ -275,7 +298,9 @@ mod tests {
         let path = dir.path().join("post-cap.jsonl");
 
         let cap = 32u64;
-        let mut writer = BoundedJsonlWriter::create_with_cap(&path, cap).await.expect("opens");
+        let mut writer = BoundedJsonlWriter::create_with_cap(&path, cap)
+            .await
+            .expect("opens");
 
         // Push well past the cap with many further calls; every single one must return Ok(()).
         for i in 0..500u32 {
@@ -291,7 +316,9 @@ mod tests {
         assert!(writer.bytes_written() <= cap);
 
         // The file itself must still be intact and fully parseable up to whatever prefix landed.
-        let contents = tokio::fs::read_to_string(&path).await.expect("readable, not corrupted");
+        let contents = tokio::fs::read_to_string(&path)
+            .await
+            .expect("readable, not corrupted");
         for line in contents.lines() {
             let _: serde_json::Value =
                 serde_json::from_str(line).expect("every persisted line remains valid JSON");
@@ -307,15 +334,30 @@ mod tests {
 
         // `{"n":0}` is 7 bytes; +1 newline = 8 bytes total. Cap the budget at exactly 8.
         let cap = 8u64;
-        let mut writer = BoundedJsonlWriter::create_with_cap(&path, cap).await.expect("opens");
+        let mut writer = BoundedJsonlWriter::create_with_cap(&path, cap)
+            .await
+            .expect("opens");
 
-        writer.write_line(r#"{"n":0}"#).await.expect("first line fits exactly at the cap");
+        writer
+            .write_line(r#"{"n":0}"#)
+            .await
+            .expect("first line fits exactly at the cap");
         assert_eq!(writer.bytes_written(), cap);
-        assert!(writer.is_capped(), "reaching the cap exactly still marks the writer as capped");
+        assert!(
+            writer.is_capped(),
+            "reaching the cap exactly still marks the writer as capped"
+        );
 
         // A second line must now be dropped entirely, not partially written.
-        writer.write_line(r#"{"n":1}"#).await.expect("post-cap call is a clean no-op");
-        assert_eq!(writer.bytes_written(), cap, "no further bytes accepted once at the cap");
+        writer
+            .write_line(r#"{"n":1}"#)
+            .await
+            .expect("post-cap call is a clean no-op");
+        assert_eq!(
+            writer.bytes_written(),
+            cap,
+            "no further bytes accepted once at the cap"
+        );
 
         let contents = tokio::fs::read_to_string(&path).await.expect("readable");
         assert_eq!(contents, "{\"n\":0}\n");
@@ -330,15 +372,26 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let path = dir.path().join("resumed.jsonl");
 
-        tokio::fs::write(&path, b"0123456789\n").await.expect("seed existing content");
+        tokio::fs::write(&path, b"0123456789\n")
+            .await
+            .expect("seed existing content");
 
         let cap = 15u64;
-        let mut writer = BoundedJsonlWriter::create_with_cap(&path, cap).await.expect("reopens");
-        assert_eq!(writer.bytes_written(), 11, "must start from the file's existing size");
+        let mut writer = BoundedJsonlWriter::create_with_cap(&path, cap)
+            .await
+            .expect("reopens");
+        assert_eq!(
+            writer.bytes_written(),
+            11,
+            "must start from the file's existing size"
+        );
 
         // Only 4 bytes of budget remain (15 - 11); a 3-byte line + 1 newline = 4 bytes fits
         // exactly.
-        writer.write_line("abc").await.expect("fits in the remaining 4 bytes");
+        writer
+            .write_line("abc")
+            .await
+            .expect("fits in the remaining 4 bytes");
         assert_eq!(writer.bytes_written(), 15);
         assert!(writer.is_capped());
 

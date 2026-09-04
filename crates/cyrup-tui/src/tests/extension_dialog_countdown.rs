@@ -6,23 +6,34 @@
 //! `ExtensionInputComponent`): the title shows `(Ns)` from the instant the dialog opens, ticks down
 //! once per second, and auto-resolves to the per-kind deny default (closing the widget) on expiry.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::*;
+use crate::{App, SelectorKind, UiTheme};
 use cyrup_ext::host::DialogOptions;
 use cyrup_session_svc::{UiKind, UiReply, UiRequest};
-use crate::{App, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
 use std::time::Duration;
-use super::harness::*;
 
-fn confirm_request(reply: tokio::sync::oneshot::Sender<UiReply>, timeout_ms: Option<u64>) -> UiRequest {
+fn confirm_request(
+    reply: tokio::sync::oneshot::Sender<UiReply>,
+    timeout_ms: Option<u64>,
+) -> UiRequest {
     UiRequest {
         kind: UiKind::Confirm,
         prompt: "Proceed?".to_string(),
         options: serde_json::Value::Null,
         message: String::new(),
         placeholder: None,
-        opts: DialogOptions { timeout_ms, signal_id: None },
+        opts: DialogOptions {
+            timeout_ms,
+            signal_id: None,
+        },
         reply,
     }
 }
@@ -35,10 +46,16 @@ fn extension_dialog_with_timeout_shows_the_countdown_immediately() {
     let mut app = App::new(TestBackend::new(60, 16), UiTheme::dark()).unwrap();
     let (tx, _rx) = tokio::sync::oneshot::channel();
     app.open_extension_dialog(confirm_request(tx, Some(5_000)));
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionConfirm));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionConfirm)
+    );
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("Proceed? (5s)"), "missing initial countdown in title:\n{text}");
+    assert!(
+        text.contains("Proceed? (5s)"),
+        "missing initial countdown in title:\n{text}"
+    );
 }
 
 /// A dialog with NO timeout renders its plain title, no countdown suffix — matching Pi's own
@@ -52,11 +69,17 @@ fn extension_dialog_without_timeout_shows_no_countdown() {
     app.draw().unwrap();
     let text = buf_text(&app);
     assert!(text.contains("Proceed?"), "missing plain title:\n{text}");
-    assert!(!text.contains("Proceed? ("), "must not show a countdown with no timeout set:\n{text}");
+    assert!(
+        !text.contains("Proceed? ("),
+        "must not show a countdown with no timeout set:\n{text}"
+    );
 
     // A tick with no deadline armed is a documented no-op: the dialog stays open indefinitely.
     app.tick_extension_dialog_countdown();
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionConfirm));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionConfirm)
+    );
 }
 
 /// Ticking the countdown after real time passes (but before the deadline) live-updates the title
@@ -80,15 +103,24 @@ async fn extension_dialog_countdown_ticks_down_with_elapsed_time() {
     app.tick_extension_dialog_countdown_at(opened + Duration::from_millis(1_100));
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("Proceed? (2s)"), "expected the countdown to have ticked to 2s:\n{text}");
+    assert!(
+        text.contains("Proceed? (2s)"),
+        "expected the countdown to have ticked to 2s:\n{text}"
+    );
     // The dialog is still open — 1.1s elapsed of a 3s budget.
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionConfirm));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionConfirm)
+    );
 
     // …and one second further on it reads `(1s)`, with no wall-clock dependence either way.
     app.tick_extension_dialog_countdown_at(opened + Duration::from_millis(2_100));
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("Proceed? (1s)"), "expected the countdown to have ticked to 1s:\n{text}");
+    assert!(
+        text.contains("Proceed? (1s)"),
+        "expected the countdown to have ticked to 1s:\n{text}"
+    );
 }
 
 /// THE headline fix: once the deadline passes, ticking the countdown auto-resolves the dialog to
@@ -101,19 +133,30 @@ async fn extension_dialog_auto_dismisses_and_replies_the_deny_default_on_expiry(
     let mut app = App::new(TestBackend::new(60, 16), UiTheme::dark()).unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.open_extension_dialog(confirm_request(tx, Some(50)));
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionConfirm));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionConfirm)
+    );
 
     // TUI-N09 — injected, not slept: an expiry test does not need real time to pass.
     app.tick_extension_dialog_countdown_at(
         tokio::time::Instant::now() + Duration::from_millis(120),
     );
 
-    assert_eq!(app.active_selector_kind(), None, "the stale dialog must auto-close on expiry");
+    assert_eq!(
+        app.active_selector_kind(),
+        None,
+        "the stale dialog must auto-close on expiry"
+    );
     let reply = tokio::time::timeout(Duration::from_secs(1), rx)
         .await
         .expect("the reply resolves promptly, not left hanging")
         .expect("the reply channel is fulfilled, not dropped");
-    assert_eq!(reply, UiReply::Confirm(false), "Confirm's deny default is `false`");
+    assert_eq!(
+        reply,
+        UiReply::Confirm(false),
+        "Confirm's deny default is `false`"
+    );
 }
 
 /// The `Select`/`Input` kinds' deny default is `UiReply::Text(None)`, not `Confirm`'s — the auto-
@@ -128,17 +171,26 @@ async fn extension_input_dialog_auto_dismisses_with_its_own_text_none_default() 
         options: serde_json::Value::Null,
         message: String::new(),
         placeholder: None,
-        opts: DialogOptions { timeout_ms: Some(50), signal_id: None },
+        opts: DialogOptions {
+            timeout_ms: Some(50),
+            signal_id: None,
+        },
         reply: tx,
     };
     app.open_extension_dialog(req);
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionInput));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionInput)
+    );
 
     app.tick_extension_dialog_countdown_at(
         tokio::time::Instant::now() + Duration::from_millis(120),
     );
 
     assert_eq!(app.active_selector_kind(), None);
-    let reply = tokio::time::timeout(Duration::from_secs(1), rx).await.unwrap().unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(1), rx)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(reply, UiReply::Text(None));
 }

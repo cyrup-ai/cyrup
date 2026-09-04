@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use cyrup_intercom::transport::client::IntercomClient;
 use cyrup_intercom::transport::protocol::{SessionInfo, SessionRegistration};
-use cyrup_intercom::ui::compose::ComposeOverlay;
 use cyrup_intercom::ui::DefaultKeybindings;
+use cyrup_intercom::ui::compose::ComposeOverlay;
 
 use super::common::Broker;
 
@@ -73,14 +73,22 @@ fn registration(cwd: &str) -> SessionRegistration {
 async fn send_message_delivers_and_returns_the_compose_result() {
     let broker = Broker::start().await;
     let me = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("/me"), Some("me-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("/me"),
+            Some("me-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
     let target_client = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("/target"), Some("target-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("/target"),
+            Some("target-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
 
     let mut target = session();
@@ -88,11 +96,20 @@ async fn send_message_delivers_and_returns_the_compose_result() {
     let mut overlay = ComposeOverlay::new(target, "target-session".to_string());
     overlay.handle_input(&DefaultKeybindings, "hello there");
 
-    let result = overlay.send_message(&me).await.expect("a delivered send must return Some(ComposeResult)");
+    let result = overlay
+        .send_message(&me)
+        .await
+        .expect("a delivered send must return Some(ComposeResult)");
     assert!(result.sent);
     assert_eq!(result.text.as_deref(), Some("hello there"));
-    assert!(result.message_id.is_some(), "must carry the broker-assigned message id");
-    assert!(overlay.error().is_none(), "a successful send must not record an error");
+    assert!(
+        result.message_id.is_some(),
+        "must carry the broker-assigned message id"
+    );
+    assert!(
+        overlay.error().is_none(),
+        "a successful send must not record an error"
+    );
     assert!(
         overlay.is_sending(),
         "pi never clears `sending` on the success path (the overlay is torn down instead)"
@@ -111,9 +128,13 @@ async fn send_message_delivers_and_returns_the_compose_result() {
 async fn send_message_records_the_error_and_clears_sending_when_undelivered() {
     let broker = Broker::start().await;
     let me = Arc::new(
-        IntercomClient::connect(&broker.socket, registration("/me"), Some("me-session".to_string()))
-            .await
-            .expect("connects"),
+        IntercomClient::connect(
+            &broker.socket,
+            registration("/me"),
+            Some("me-session".to_string()),
+        )
+        .await
+        .expect("connects"),
     );
 
     let mut target = session();
@@ -122,10 +143,20 @@ async fn send_message_records_the_error_and_clears_sending_when_undelivered() {
     overlay.handle_input(&DefaultKeybindings, "hi");
 
     let result = overlay.send_message(&me).await;
-    assert!(result.is_none(), "an undelivered send must not yield a ComposeResult");
-    assert!(!overlay.is_sending(), "a failed send must clear `sending` so the user can retry");
+    assert!(
+        result.is_none(),
+        "an undelivered send must not yield a ComposeResult"
+    );
+    assert!(
+        !overlay.is_sending(),
+        "a failed send must clear `sending` so the user can retry"
+    );
     assert_eq!(overlay.error(), Some("Session not found"));
-    assert_eq!(overlay.input(), "hi", "the typed text must survive the failure for the retry prompt");
+    assert_eq!(
+        overlay.input(),
+        "hi",
+        "the typed text must survive the failure for the retry prompt"
+    );
 
     me.disconnect();
 }

@@ -33,8 +33,8 @@ use crate::model::{Modality, Model, ModelCost};
 use crate::stream::sse::decode_sse_bytes;
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use cyrup_core::{
-    ApiId, AssistantMessage, Content, Message, ModelThinkingLevel, ProviderId, StopReason, ToolCall,
-    ToolCallId, Usage,
+    ApiId, AssistantMessage, Content, Message, ModelThinkingLevel, ProviderId, StopReason,
+    ToolCall, ToolCallId, Usage,
 };
 use serde_json::{Map, Value, json};
 

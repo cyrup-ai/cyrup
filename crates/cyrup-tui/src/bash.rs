@@ -118,7 +118,11 @@ impl BashExecution {
 
     /// The raw accumulated output (`getOutput`), `\n`-joined.
     pub fn output(&self) -> String {
-        self.output_lines.iter().map(String::as_str).collect::<Vec<_>>().join("\n")
+        self.output_lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Set the expansion state (`Ctrl+O`, `setExpanded`).
@@ -135,13 +139,17 @@ impl BashExecution {
     /// normalize CRLF/CR to LF, then merge the first new line onto the last existing line (an
     /// incomplete-line continuation) and push the rest as new lines.
     pub fn append_output(&mut self, chunk: &str) {
-        let clean = crate::ansi::strip_ansi(chunk).replace("\r\n", "\n").replace('\r', "\n");
+        let clean = crate::ansi::strip_ansi(chunk)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
         let new_lines: Vec<&str> = clean.split('\n').collect();
         if let (Some(last), Some(first)) = (self.output_lines.back_mut(), new_lines.first()) {
             last.push_str(first);
-            self.output_lines.extend(new_lines.iter().skip(1).map(|s| (*s).to_string()));
+            self.output_lines
+                .extend(new_lines.iter().skip(1).map(|s| (*s).to_string()));
         } else {
-            self.output_lines.extend(new_lines.iter().map(|s| (*s).to_string()));
+            self.output_lines
+                .extend(new_lines.iter().map(|s| (*s).to_string()));
         }
         // TUI-092 F6 — evict after EVERY chunk, so memory is bounded continuously through a
         // long-running command rather than only at completion. `drain` in one batch rather than a
@@ -230,7 +238,13 @@ impl BashExecution {
         cancel_hint: Option<&str>,
         expand_hint: Option<&str>,
     ) -> Vec<Line<'static>> {
-        self.render_lines_at(self.started.elapsed(), width, theme, cancel_hint, expand_hint)
+        self.render_lines_at(
+            self.started.elapsed(),
+            width,
+            theme,
+            cancel_hint,
+            expand_hint,
+        )
     }
 
     /// [`render_lines`](Self::render_lines) with the spinner phase supplied, so the animated frame
@@ -247,8 +261,11 @@ impl BashExecution {
         // once at construction and sticky (Pi bash-execution.ts:37-44,64). The `$ command` HEADER,
         // however, is **always** bash-green (Pi's `updateDisplay` header, bash-execution.ts:138, uses
         // `theme.fg("bashMode", …)` regardless of `excludeFromContext`) — item #5 "!! header green".
-        let border_style =
-            if self.excluded { theme.dim_style() } else { theme.bash_mode_style() };
+        let border_style = if self.excluded {
+            theme.dim_style()
+        } else {
+            theme.bash_mode_style()
+        };
         let header_style = theme.bash_mode_style().add_modifier(Modifier::BOLD);
         let rule = "─".repeat(width.max(1));
         let mut out: Vec<Line<'static>> = Vec::new();
@@ -283,7 +300,12 @@ impl BashExecution {
         // lines the collapsed form would have hidden. cyrup zeroed it when expanded, so the collapse
         // hint was dead code that could never render.
         let body_width = width.saturating_sub(2).max(1);
-        let joined = self.output_lines.iter().map(String::as_str).collect::<Vec<_>>().join("\n");
+        let joined = self
+            .output_lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
         let vt = crate::chrome::truncate_to_visual_lines(&joined, PREVIEW_LINES, body_width);
         let hidden = vt.skipped;
         // `visible` must stay `Vec<String>`: the other arm is `vt.lines: Vec<String>`, so a
@@ -401,10 +423,7 @@ impl BashExecution {
                         // upstream interpolates `this.exitCode` directly (`:192`) and has no `?`
                         // fallback, because a `null`/`undefined` code never classifies as `error`.
                         if let Some(code) = self.exit_code {
-                            parts.push(Line::styled(
-                                format!("(exit {code})"),
-                                theme.error_style(),
-                            ));
+                            parts.push(Line::styled(format!("(exit {code})"), theme.error_style()));
                         }
                     }
                     _ => {}
@@ -454,7 +473,6 @@ impl BashExecution {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
@@ -496,8 +514,15 @@ mod tests {
         let b = BashExecution::new("ls -la", false);
         let lines = b.render_lines(40, &theme, Some("Esc"), Some("Ctrl+O"));
         let text: Vec<String> = lines.iter().map(plain).collect();
-        assert!(text.iter().any(|l| l.contains("$ ls -la")), "header: {text:?}");
-        assert!(text.iter().any(|l| l.contains("Running...") && l.contains("Esc")), "{text:?}");
+        assert!(
+            text.iter().any(|l| l.contains("$ ls -la")),
+            "header: {text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l.contains("Running...") && l.contains("Esc")),
+            "{text:?}"
+        );
     }
 
     /// X17 — `bash-execution.ts:105-109` classifies as `"error"` only when
@@ -510,18 +535,31 @@ mod tests {
         let mut sig = BashExecution::new("sleep 10", false);
         sig.append_output("partial");
         sig.set_complete(None, false, false, None);
-        assert_eq!(sig.status(), BashStatus::Complete, "a missing exit code is not an error");
-        let text: Vec<String> =
-            sig.render_lines(40, &theme, None, None).iter().map(plain).collect();
-        assert!(!text.iter().any(|l| l.contains("exit")), "invented exit badge: {text:?}");
+        assert_eq!(
+            sig.status(),
+            BashStatus::Complete,
+            "a missing exit code is not an error"
+        );
+        let text: Vec<String> = sig
+            .render_lines(40, &theme, None, None)
+            .iter()
+            .map(plain)
+            .collect();
+        assert!(
+            !text.iter().any(|l| l.contains("exit")),
+            "invented exit badge: {text:?}"
+        );
 
         // MIRROR: a real non-zero code still classifies as an error and still renders `(exit N)`
         // with the number, inset one column like every other row of the block.
         let mut err = BashExecution::new("false", false);
         err.set_complete(Some(3), false, false, None);
         assert_eq!(err.status(), BashStatus::Error);
-        let etext: Vec<String> =
-            err.render_lines(40, &theme, None, None).iter().map(plain).collect();
+        let etext: Vec<String> = err
+            .render_lines(40, &theme, None, None)
+            .iter()
+            .map(plain)
+            .collect();
         assert!(etext.iter().any(|l| l == " (exit 3)"), "{etext:?}");
     }
 
@@ -538,8 +576,11 @@ mod tests {
         let mut b = BashExecution::new("ls", false);
         b.append_output("alpha\nbeta");
         b.set_complete(Some(7), false, false, None);
-        let text: Vec<String> =
-            b.render_lines(40, &theme, None, Some("Ctrl+O")).iter().map(plain).collect();
+        let text: Vec<String> = b
+            .render_lines(40, &theme, None, Some("Ctrl+O"))
+            .iter()
+            .map(plain)
+            .collect();
         // [spacer, rule, header, blank, out, out, blank, (exit 7), rule]
         assert_eq!(
             text,
@@ -560,9 +601,20 @@ mod tests {
         // output `Text` on `availableLines.length > 0`.
         let mut empty = BashExecution::new("true", false);
         empty.set_complete(Some(0), false, false, None);
-        let etext: Vec<String> =
-            empty.render_lines(40, &theme, None, None).iter().map(plain).collect();
-        assert_eq!(etext, vec!["".to_string(), "─".repeat(40), " $ true".to_string(), "─".repeat(40)]);
+        let etext: Vec<String> = empty
+            .render_lines(40, &theme, None, None)
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(
+            etext,
+            vec![
+                "".to_string(),
+                "─".repeat(40),
+                " $ true".to_string(),
+                "─".repeat(40)
+            ]
+        );
     }
 
     /// X4 — the running row is a `Loader` (`bash-execution.ts:55-61`), not a static string.
@@ -577,18 +629,33 @@ mod tests {
         let b = BashExecution::new("sleep 1", false);
         let lines = b.render_lines_at(Duration::from_millis(0), 40, &theme, Some("escape"), None);
         let text: Vec<String> = lines.iter().map(plain).collect();
-        assert_eq!(text[3], "", "the Loader's own leading blank row (loader.ts:44)");
+        assert_eq!(
+            text[3], "",
+            "the Loader's own leading blank row (loader.ts:44)"
+        );
         assert_eq!(text[4], " ⠋ Running... (escape to cancel)");
         let row = &lines[4];
         // `Text.render` builds the row as `leftMargin + line + rightMargin` (`text.ts:70`, `:76`) —
         // the inset is a SEPARATE unstyled string concatenated ahead of the styled content, not part
         // of the spinner's own span. So span 0 is the margin and the `Loader`'s two-tone
         // `${spinnerColorFn(frame)} ${messageColorFn(message)}` (`loader.ts:86`) starts at span 1.
-        assert_eq!(row.spans[0].content.as_ref(), " ", "text.ts:70 leftMargin, unstyled");
+        assert_eq!(
+            row.spans[0].content.as_ref(),
+            " ",
+            "text.ts:70 leftMargin, unstyled"
+        );
         assert_eq!(row.spans[0].style, Style::default());
         assert_eq!(row.spans[1].content.as_ref(), "⠋ ");
-        assert_eq!(row.spans[1].style, theme.bash_mode_style(), "spinner takes `colorKey`");
-        assert_eq!(row.spans[2].style, theme.muted_style(), "message is `muted`");
+        assert_eq!(
+            row.spans[1].style,
+            theme.bash_mode_style(),
+            "spinner takes `colorKey`"
+        );
+        assert_eq!(
+            row.spans[2].style,
+            theme.muted_style(),
+            "message is `muted`"
+        );
 
         // The glyph advances with elapsed time (`loader.ts:77-80`'s setInterval, re-derived here).
         let later = b.render_lines_at(Duration::from_millis(240), 40, &theme, Some("escape"), None);
@@ -617,7 +684,10 @@ mod tests {
         b.set_complete(Some(0), false, false, None);
 
         let lines = b.render_lines(40, &theme, None, Some("ctrl+o"));
-        let hint = lines.iter().find(|l| plain(l).contains("more lines")).unwrap();
+        let hint = lines
+            .iter()
+            .find(|l| plain(l).contains("more lines"))
+            .unwrap();
         assert_eq!(plain(hint), " ... 11 more lines (ctrl+o to expand)");
         // Span 0 is `Text.render`'s `leftMargin` (`text.ts:70`), unstyled; the three `keyHint` /
         // `fg("muted", …)` pieces of `bash-execution.ts:178-186` follow it at 1/2/3.
@@ -625,8 +695,16 @@ mod tests {
         assert_eq!(hint.spans[0].style, Style::default());
         assert_eq!(hint.spans[1].style, theme.muted_style());
         assert_eq!(hint.spans[2].content.as_ref(), "ctrl+o");
-        assert_eq!(hint.spans[2].style, theme.dim_style(), "keyHint's key half is `dim`");
-        assert_eq!(hint.spans[3].style, theme.muted_style(), "keyHint's description half is `muted`");
+        assert_eq!(
+            hint.spans[2].style,
+            theme.dim_style(),
+            "keyHint's key half is `dim`"
+        );
+        assert_eq!(
+            hint.spans[3].style,
+            theme.muted_style(),
+            "keyHint's description half is `muted`"
+        );
 
         // MIRROR: the expanded form keeps its parentheses and drops the count.
         let mut e = b.clone();
@@ -647,19 +725,32 @@ mod tests {
         let lines = b.render_lines(40, &theme, None, Some("Ctrl+O"));
         let text: Vec<String> = lines.iter().map(plain).collect();
         // 30 output lines + a trailing empty (from the final "\n") → preview keeps the last 20.
-        assert!(text.iter().any(|l| l.contains("line30")), "tail shown: {text:?}");
-        assert!(!text.iter().any(|l| l.trim() == "line1"), "first line hidden: {text:?}");
         assert!(
-            text.iter().any(|l| l.contains("11 more lines") && l.contains("Ctrl+O")),
+            text.iter().any(|l| l.contains("line30")),
+            "tail shown: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|l| l.trim() == "line1"),
+            "first line hidden: {text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l.contains("11 more lines") && l.contains("Ctrl+O")),
             "hidden count + expand hint: {text:?}"
         );
 
         // Expanded shows everything.
         let mut e = b.clone();
         e.set_expanded(true);
-        let etext: Vec<String> =
-            e.render_lines(40, &theme, None, None).iter().map(plain).collect();
-        assert!(etext.iter().any(|l| l.contains("line1")), "expanded shows first line: {etext:?}");
+        let etext: Vec<String> = e
+            .render_lines(40, &theme, None, None)
+            .iter()
+            .map(plain)
+            .collect();
+        assert!(
+            etext.iter().any(|l| l.contains("line1")),
+            "expanded shows first line: {etext:?}"
+        );
     }
 
     /// X3's right-margin half — every child of `contentContainer` is a `new Text(…, 1, 0)`
@@ -675,17 +766,30 @@ mod tests {
         let theme = UiTheme::dark();
         let long_cmd = "grep --recursive --line-number --binary-files=without-match needle ./src";
         let mut b = BashExecution::new(long_cmd, false);
-        b.append_output("a very long line of program output that certainly does not fit in thirty\n");
+        b.append_output(
+            "a very long line of program output that certainly does not fit in thirty\n",
+        );
         b.set_complete(Some(0), false, false, None);
         let lines = b.render_lines(30, &theme, None, None);
         let text: Vec<String> = lines.iter().map(plain).collect();
 
         // The header wrapped: more than one row mentions the command.
-        let header_rows: Vec<&String> = text.iter().filter(|r| r.contains("grep") || r.contains("without-match")).collect();
+        let header_rows: Vec<&String> = text
+            .iter()
+            .filter(|r| r.contains("grep") || r.contains("without-match"))
+            .collect();
         assert!(header_rows.len() > 1, "header did not wrap: {text:?}");
         // The output wrapped too.
-        assert!(text.iter().any(|r| r.contains("thirty")), "output missing: {text:?}");
-        assert!(text.iter().filter(|r| r.contains("long line") || r.contains("certainly")).count() >= 1);
+        assert!(
+            text.iter().any(|r| r.contains("thirty")),
+            "output missing: {text:?}"
+        );
+        assert!(
+            text.iter()
+                .filter(|r| r.contains("long line") || r.contains("certainly"))
+                .count()
+                >= 1
+        );
 
         for (i, row) in lines.iter().enumerate() {
             let t = &text[i];
@@ -696,13 +800,21 @@ mod tests {
             }
             assert!(t.starts_with(' '), "row {i} lost its leftMargin: {t:?}");
             assert!(!t.starts_with("  "), "row {i} over-indented: {t:?}");
-            assert!(row.width() <= 29, "row {i} has no right gutter: {t:?} ({})", row.width());
+            assert!(
+                row.width() <= 29,
+                "row {i} has no right gutter: {t:?} ({})",
+                row.width()
+            );
         }
 
         // MIRROR: a short command still renders as exactly one inset header row.
         let mut short = BashExecution::new("true", false);
         short.set_complete(Some(0), false, false, None);
-        let stext: Vec<String> = short.render_lines(40, &theme, None, None).iter().map(plain).collect();
+        let stext: Vec<String> = short
+            .render_lines(40, &theme, None, None)
+            .iter()
+            .map(plain)
+            .collect();
         assert_eq!(stext[2], " $ true", "{stext:?}");
     }
 
@@ -737,10 +849,26 @@ mod tests {
             .enumerate()
             .filter(|(_, r)| r.contains("more lines") || r.contains("to expand"))
             .collect();
-        assert_eq!(hint.len(), 2, "the status part did not WRAP, only got a margin: {text:?}");
-        assert_eq!(hint[0].0 + 1, hint[1].0, "the two halves are not adjacent rows: {text:?}");
-        assert_eq!(hint[0].1.as_str(), " ... 21 more lines", "first half: {text:?}");
-        assert_eq!(hint[1].1.as_str(), " (ctrl+shift+o to expand)", "second half: {text:?}");
+        assert_eq!(
+            hint.len(),
+            2,
+            "the status part did not WRAP, only got a margin: {text:?}"
+        );
+        assert_eq!(
+            hint[0].0 + 1,
+            hint[1].0,
+            "the two halves are not adjacent rows: {text:?}"
+        );
+        assert_eq!(
+            hint[0].1.as_str(),
+            " ... 21 more lines",
+            "first half: {text:?}"
+        );
+        assert_eq!(
+            hint[1].1.as_str(),
+            " (ctrl+shift+o to expand)",
+            "second half: {text:?}"
+        );
         for (i, row) in lines.iter().enumerate() {
             let t = &text[i];
             if t.trim().is_empty() || t.starts_with('\u{2500}') {
@@ -748,14 +876,20 @@ mod tests {
             }
             assert!(t.starts_with(' '), "row {i} lost its leftMargin: {t:?}");
             assert!(!t.starts_with("  "), "row {i} over-indented: {t:?}");
-            assert!(row.width() <= 29, "row {i} has no right gutter: {t:?} ({})", row.width());
+            assert!(
+                row.width() <= 29,
+                "row {i} has no right gutter: {t:?} ({})",
+                row.width()
+            );
         }
         // The two-tone `keyHint` split survives the wrap: the key half stays `dim`, the rest `muted`
         // (`keybinding-hints.ts:42-44`), which a re-styling wrap would flatten.
         let key_row = &lines[hint[1].0];
         assert!(
-            key_row.spans.iter().any(|s| s.content.contains("ctrl+shift+o")
-                && s.style.fg == theme.dim_style().fg),
+            key_row
+                .spans
+                .iter()
+                .any(|s| s.content.contains("ctrl+shift+o") && s.style.fg == theme.dim_style().fg),
             "the key half lost `dim` across the wrap: {:?}",
             text
         );
@@ -763,7 +897,11 @@ mod tests {
         // MIRROR — a status part that FITS is still exactly one inset row, unwrapped.
         let mut short = BashExecution::new("false", false);
         short.set_complete(Some(1), false, false, None);
-        let stext: Vec<String> = short.render_lines(40, &theme, None, None).iter().map(plain).collect();
+        let stext: Vec<String> = short
+            .render_lines(40, &theme, None, None)
+            .iter()
+            .map(plain)
+            .collect();
         assert_eq!(
             stext.iter().filter(|r| r.contains("exit 1")).count(),
             1,
@@ -787,7 +925,10 @@ mod tests {
         let header_style = theme.bash_mode_style().add_modifier(Modifier::BOLD);
         assert_eq!(lines[2].spans[0].content.as_ref(), " ");
         assert_eq!(lines[2].spans[0].style, Style::default());
-        assert_eq!(lines[2].spans[1].style, header_style, "!! header must stay bash-green, not dim");
+        assert_eq!(
+            lines[2].spans[1].style, header_style,
+            "!! header must stay bash-green, not dim"
+        );
         assert!(plain(&lines[2]).contains("$ secret"));
         // And a `!` (included) run's border matches the same green header.
         let inc = BashExecution::new("secret", false);
@@ -813,9 +954,18 @@ mod tests {
         let row = lines
             .iter()
             .find(|l| plain(l).contains("Output truncated"))
-            .unwrap_or_else(|| panic!("no warning row in {:?}", lines.iter().map(plain).collect::<Vec<_>>()));
+            .unwrap_or_else(|| {
+                panic!(
+                    "no warning row in {:?}",
+                    lines.iter().map(plain).collect::<Vec<_>>()
+                )
+            });
         assert!(plain(row).contains("Output truncated. Full output: /tmp/pi-bash-1.log"));
-        assert_eq!(row.spans[1].style, theme.warning_style(), "`theme.fg(\"warning\", …)`");
+        assert_eq!(
+            row.spans[1].style,
+            theme.warning_style(),
+            "`theme.fg(\"warning\", …)`"
+        );
 
         // MIRROR 1: truncated but with NO spool path renders nothing — upstream's `&& this.fullOutputPath`
         // guard, because there would be nowhere to point the user.
@@ -823,7 +973,10 @@ mod tests {
         no_path.append_output("a\nb\n");
         no_path.set_complete(Some(0), false, true, None);
         assert!(
-            !no_path.render_lines(80, &theme, None, None).iter().any(|l| plain(l).contains("truncated")),
+            !no_path
+                .render_lines(80, &theme, None, None)
+                .iter()
+                .any(|l| plain(l).contains("truncated")),
             "no path ⇒ no row"
         );
 
@@ -845,7 +998,9 @@ mod tests {
         ctx.append_output(&"x\n".repeat(2001));
         ctx.set_complete(Some(0), false, false, Some("/tmp/x.log".to_string()));
         assert!(
-            ctx.render_lines(80, &theme, None, None).iter().any(|l| plain(l).contains("Output truncated")),
+            ctx.render_lines(80, &theme, None, None)
+                .iter()
+                .any(|l| plain(l).contains("Output truncated")),
             "contextTruncation.truncated is the second leg of `wasTruncated`"
         );
 
@@ -853,9 +1008,19 @@ mod tests {
         let mut failed = BashExecution::new("gen", false);
         failed.append_output("a\n");
         failed.set_complete(Some(2), false, true, Some("/tmp/x.log".to_string()));
-        let rows: Vec<String> = failed.render_lines(80, &theme, None, None).iter().map(plain).collect();
+        let rows: Vec<String> = failed
+            .render_lines(80, &theme, None, None)
+            .iter()
+            .map(plain)
+            .collect();
         let exit = rows.iter().position(|r| r.contains("(exit 2)")).unwrap();
-        let warn = rows.iter().position(|r| r.contains("Output truncated")).unwrap();
-        assert!(exit < warn, "exit code first, truncation warning last: {rows:?}");
+        let warn = rows
+            .iter()
+            .position(|r| r.contains("Output truncated"))
+            .unwrap();
+        assert!(
+            exit < warn,
+            "exit code first, truncation warning last: {rows:?}"
+        );
     }
 }

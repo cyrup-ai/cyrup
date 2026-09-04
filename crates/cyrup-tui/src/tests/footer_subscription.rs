@@ -30,27 +30,30 @@
 //! **No network.** Same stub-provider construction as `tests/login_flow.rs`: the OAuth strategy is
 //! a pure in-process function with no endpoint, so nothing here can reach a provider even by
 //! accident.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::harness::*;
+use crate::crossterm::event::KeyCode;
+use crate::{App, AppCommand, LoginProviderSource, LoginUiMsg, SelectorKind, UiTheme};
 use cyrup_config::login::AuthType;
 use cyrup_core::EventStream;
 use cyrup_core::{ProviderId, StopReason};
-use cyrup_provider::auth::oauth::{AuthInteraction, AuthPrompt, OAuthError};
-use cyrup_provider::auth::{
-    ApiKeyAuth, ModelAuth, OAuthAuth, ProviderAuth,
-};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::AuthError as ProviderAuthError;
+use cyrup_provider::auth::oauth::{AuthInteraction, AuthPrompt, OAuthError};
+use cyrup_provider::auth::{ApiKeyAuth, ModelAuth, OAuthAuth, ProviderAuth};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_provider::{Context, Credential, Model, Provider, StreamEvent, StreamOptions};
 use cyrup_session_svc::{AgentSession, AgentSessionEvent, SessionBuilder, SessionConfig};
-use crate::crossterm::event::KeyCode;
-use crate::{App, AppCommand, LoginProviderSource, LoginUiMsg, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
-use super::harness::*;
 
 // ---------------------------------------------------------------- stub provider
 
@@ -185,8 +188,12 @@ async fn next_msg(rx: &mut tokio::sync::mpsc::UnboundedReceiver<LoginUiMsg>) -> 
 /// hangs off.
 async fn run_login(app: &mut App<TestBackend>, session: &Arc<AgentSession>, id: &str) {
     let mut rx = app.install_login_channel();
-    app.execute_command(AppCommand::LoginCommand(Some(id.to_string())), session, None)
-        .await;
+    app.execute_command(
+        AppCommand::LoginCommand(Some(id.to_string())),
+        session,
+        None,
+    )
+    .await;
     assert_eq!(
         app.active_selector_kind(),
         Some(SelectorKind::LoginDialog),
@@ -350,7 +357,10 @@ async fn logout_clears_the_footer_marker() {
     select_model(&mut app, "stub", "stub-model");
     run_login(&mut app, &fx.session, "stub").await;
     app.draw().unwrap();
-    assert!(buf_text(&app).contains("(sub)"), "precondition: marker is up");
+    assert!(
+        buf_text(&app).contains("(sub)"),
+        "precondition: marker is up"
+    );
 
     // `/logout` → the stored-credential picker (`interactive-mode.ts:5354-5379`) → confirm row 0.
     app.execute_command(
@@ -408,7 +418,10 @@ async fn switching_to_a_non_subscription_provider_clears_the_marker() {
     ));
     select_model(&mut app, "kimi-coding", "kimi-k2-turbo-preview");
     app.draw().unwrap();
-    assert!(buf_text(&app).contains("(sub)"), "precondition: marker is up");
+    assert!(
+        buf_text(&app).contains("(sub)"),
+        "precondition: marker is up"
+    );
 
     select_model(&mut app, "stub", "stub-model");
     app.draw().unwrap();

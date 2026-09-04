@@ -9,21 +9,20 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use crate::agent::HeaderFn;
-use crate::loop_fn::{run_agent_loop, AgentContext, AgentEventSink, AgentLoopConfig};
-use crate::state::{reduce, GenerationConfig, StateInner};
+use crate::loop_fn::{AgentContext, AgentEventSink, AgentLoopConfig, run_agent_loop};
+use crate::state::{GenerationConfig, StateInner, reduce};
 use crate::{
     Agent, AgentError, AgentEvent, AgentMessage, ApiKeyResolver, BeforeOutcome, BeforeToolCall,
     HookError, Hooks, StreamFn, ToolExecution,
 };
 use crate::{EventSubscriber, PendingQueue};
 use cyrup_core::{
-    TerminateHint,
     AssistantMessage, CancelToken, Content, ModelRef, ModelThinkingLevel, ProviderId, RunCancel,
-    StopReason, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
+    StopReason, TerminateHint, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
 use cyrup_provider::ProviderError;
-use serde_json::{json, Value};
+use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
+use serde_json::{Value, json};
 
 use super::support::{self, *};
 
@@ -73,7 +72,11 @@ impl EventSubscriber for AbortOn {
 }
 
 fn abort_on(agent: &Arc<Agent>, pred: fn(&AgentEvent) -> bool) -> Arc<AbortOn> {
-    Arc::new(AbortOn { agent: Arc::downgrade(agent), pred, fired: Mutex::new(false) })
+    Arc::new(AbortOn {
+        agent: Arc::downgrade(agent),
+        pred,
+        fired: Mutex::new(false),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +91,11 @@ struct OkTool {
 
 impl OkTool {
     fn new(name: &str, terminate: bool) -> Arc<Self> {
-        Arc::new(Self { name: name.into(), params: obj_schema(), terminate })
+        Arc::new(Self {
+            name: name.into(),
+            params: obj_schema(),
+            terminate,
+        })
     }
 }
 
@@ -145,7 +152,10 @@ impl Tool for BurstTool {
                 terminate: TerminateHint::Unspecified,
             });
         }
-        Ok(ToolResult { content: vec![Content::text("done")], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("done")],
+            ..Default::default()
+        })
     }
 }
 
@@ -177,7 +187,10 @@ impl Tool for ParkingTool {
         if let Some(rx) = rx {
             let _ = rx.await;
         }
-        Ok(ToolResult { content: vec![Content::text("released")], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("released")],
+            ..Default::default()
+        })
     }
 }
 
@@ -193,9 +206,13 @@ impl Tool for ParkingTool {
 #[tokio::test]
 async fn agent009_error_result_has_empty_details_object_and_no_terminate_key() {
     let sf = faux_stream_fn(vec![
-        faux_assistant_message(vec![faux_tool_call("ghost", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("ghost", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let agent = Agent::builder(model_ref(), sf).build();
     let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
@@ -204,7 +221,11 @@ async fn agent009_error_result_has_empty_details_object_and_no_terminate_key() {
 
     let ends = rec.end_results();
     assert_eq!(ends.len(), 1);
-    assert_eq!(ends[0]["details"], json!({}), "pi writes the empty object literal, not null");
+    assert_eq!(
+        ends[0]["details"],
+        json!({}),
+        "pi writes the empty object literal, not null"
+    );
     assert!(
         ends[0].get("terminate").is_none(),
         "`createErrorToolResult` sets no `terminate`, so `JSON.stringify` emits no key: {}",
@@ -216,7 +237,11 @@ async fn agent009_error_result_has_empty_details_object_and_no_terminate_key() {
     let msgs = rec.tool_result_messages();
     assert_eq!(msgs.len(), 1);
     let wire = serde_json::to_value(&msgs[0]).unwrap();
-    assert_eq!(wire["details"], json!({}), "the transcript entry must carry `\"details\":{{}}`");
+    assert_eq!(
+        wire["details"],
+        json!({}),
+        "the transcript entry must carry `\"details\":{{}}`"
+    );
 }
 
 /// A SUCCESSFUL result whose tool set neither `details` nor `terminate` must emit neither key —
@@ -227,8 +252,11 @@ async fn agent009_plain_success_result_omits_details_and_terminate() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
-    let agent = Agent::builder(model_ref(), sf).tools(vec![OkTool::new("t", false)]).build();
+    ])
+    .1;
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![OkTool::new("t", false)])
+        .build();
     let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
@@ -236,8 +264,16 @@ async fn agent009_plain_success_result_omits_details_and_terminate() {
 
     let ends = rec.end_results();
     assert_eq!(ends.len(), 1);
-    assert!(ends[0].get("details").is_none(), "absent details ⇒ no key: {}", ends[0]);
-    assert!(ends[0].get("terminate").is_none(), "absent terminate ⇒ no key: {}", ends[0]);
+    assert!(
+        ends[0].get("details").is_none(),
+        "absent details ⇒ no key: {}",
+        ends[0]
+    );
+    assert!(
+        ends[0].get("terminate").is_none(),
+        "absent terminate ⇒ no key: {}",
+        ends[0]
+    );
 }
 
 // ===========================================================================
@@ -249,9 +285,13 @@ async fn agent009_plain_success_result_omits_details_and_terminate() {
 #[tokio::test]
 async fn agent010_tool_not_found_string_is_pis() {
     let sf = faux_stream_fn(vec![
-        faux_assistant_message(vec![faux_tool_call("ghost", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("ghost", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let agent = Agent::builder(model_ref(), sf).build();
     let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
@@ -286,7 +326,10 @@ impl Hooks for BlockWith {
         _cancel: CancelToken,
     ) -> BeforeOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        BeforeOutcome::Block { reason: self.reason.clone(), terminate: TerminateHint::from_guest_bool(self.terminate) }
+        BeforeOutcome::Block {
+            reason: self.reason.clone(),
+            terminate: TerminateHint::from_guest_bool(self.terminate),
+        }
     }
 }
 
@@ -301,7 +344,8 @@ async fn agent010_032_blocked_reason_falls_back_on_none_and_on_empty_string() {
         let sf = faux_stream_fn(vec![
             faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
             faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-        ]).1;
+        ])
+        .1;
         let agent = Agent::builder(model_ref(), sf)
             .tools(vec![OkTool::new("t", false)])
             .hooks(Arc::new(BlockWith {
@@ -338,7 +382,8 @@ async fn agent012_before_tool_call_still_runs_on_a_cancelled_run_and_abort_beats
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let calls = Arc::new(AtomicUsize::new(0));
     let agent = Arc::new(
         Agent::builder(model_ref(), sf)
@@ -353,7 +398,9 @@ async fn agent012_before_tool_call_still_runs_on_a_cancelled_run_and_abort_beats
     let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     // Cancel while the batch is being prepared: the abort lands before `prepare` is entered.
-    agent.subscribe(abort_on(&agent, |e| matches!(e, AgentEvent::ToolExecutionStart { .. })));
+    agent.subscribe(abort_on(&agent, |e| {
+        matches!(e, AgentEvent::ToolExecutionStart { .. })
+    }));
 
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -389,12 +436,16 @@ async fn agent012_before_tool_call_still_runs_on_a_cancelled_run_and_abort_beats
 async fn agent015_022_blocked_terminate_survives_an_abort_that_leaves_a_slot_unprepared() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(
-            vec![faux_tool_call("a", json!({})), faux_tool_call("b", json!({}))],
+            vec![
+                faux_tool_call("a", json!({})),
+                faux_tool_call("b", json!({})),
+            ],
             StopReason::ToolUse,
         ),
         // Only consumed if the batch WRONGLY fails to terminate.
         faux_assistant_message(vec![faux_text("second turn")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let agent = Arc::new(
         Agent::builder(model_ref(), sf)
             .tools(vec![OkTool::new("a", false), OkTool::new("b", false)])
@@ -408,7 +459,9 @@ async fn agent015_022_blocked_terminate_survives_an_abort_that_leaves_a_slot_unp
     );
     let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
-    agent.subscribe(abort_on(&agent, |e| matches!(e, AgentEvent::ToolExecutionEnd { .. })));
+    agent.subscribe(abort_on(&agent, |e| {
+        matches!(e, AgentEvent::ToolExecutionEnd { .. })
+    }));
 
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -416,8 +469,16 @@ async fn agent015_022_blocked_terminate_survives_an_abort_that_leaves_a_slot_unp
     // Call `a` was blocked WITH `terminate`; call `b` was never prepared, so pi's array never
     // received an entry for it and cannot be vetoed by it.
     let ends = rec.end_results();
-    assert_eq!(ends.len(), 1, "only the prepared call reported an end: {ends:?}");
-    assert_eq!(ends[0]["terminate"], json!(true), "AGENT-022: the block carried the hint");
+    assert_eq!(
+        ends.len(),
+        1,
+        "only the prepared call reported an end: {ends:?}"
+    );
+    assert_eq!(
+        ends[0]["terminate"],
+        json!(true),
+        "AGENT-022: the block carried the hint"
+    );
     assert_eq!(
         rec.turn_starts(),
         1,
@@ -465,9 +526,15 @@ fn agent011_turn_end_error_message_is_presence_gated_with_no_fallback() {
     let mut st = empty_state();
     reduce(
         &mut st,
-        &AgentEvent::TurnEnd { message: errored(StopReason::Aborted, None), tool_results: vec![] },
+        &AgentEvent::TurnEnd {
+            message: errored(StopReason::Aborted, None),
+            tool_results: vec![],
+        },
     );
-    assert_eq!(st.error_message, None, "no message ⇒ no state write, and never a synthetic one");
+    assert_eq!(
+        st.error_message, None,
+        "no message ⇒ no state write, and never a synthetic one"
+    );
 
     // (b) an errorMessage on a NON-error stop reason still updates state — cyrup's stop-reason gate
     // dropped this recoverable-error annotation.
@@ -479,7 +546,10 @@ fn agent011_turn_end_error_message_is_presence_gated_with_no_fallback() {
             tool_results: vec![],
         },
     );
-    assert_eq!(st.error_message.as_deref(), Some("recovered after 2 retries"));
+    assert_eq!(
+        st.error_message.as_deref(),
+        Some("recovered after 2 retries")
+    );
 }
 
 /// `case "message_start": this._state.streamingMessage = event.message; break;` —
@@ -487,7 +557,12 @@ fn agent011_turn_end_error_message_is_presence_gated_with_no_fallback() {
 #[test]
 fn agent018_message_start_reduces_for_non_assistant_messages() {
     let mut st = empty_state();
-    reduce(&mut st, &AgentEvent::MessageStart { message: AgentMessage::user_text("hi") });
+    reduce(
+        &mut st,
+        &AgentEvent::MessageStart {
+            message: AgentMessage::user_text("hi"),
+        },
+    );
     assert!(
         st.streaming_message.is_some(),
         "pi publishes the user message as `streamingMessage`; the assistant-only guard showed the \
@@ -511,7 +586,10 @@ fn agent018_agent_end_does_not_clear_pending_tool_calls() {
         },
     );
     reduce(&mut st, &AgentEvent::AgentEnd { messages: vec![] });
-    assert!(st.streaming_message.is_none(), "agent_end still clears streamingMessage");
+    assert!(
+        st.streaming_message.is_none(),
+        "agent_end still clears streamingMessage"
+    );
     assert_eq!(
         st.pending_tool_calls.len(),
         1,
@@ -526,8 +604,11 @@ async fn agent018_settlement_clears_pending_tool_calls() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
-    let agent = Agent::builder(model_ref(), sf).tools(vec![OkTool::new("t", false)]).build();
+    ])
+    .1;
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![OkTool::new("t", false)])
+        .build();
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
     assert!(agent.snapshot().await.pending_tool_calls.is_empty());
@@ -551,13 +632,18 @@ impl AgentEventSink for NullSink {
 
 #[tokio::test]
 async fn agent021_low_level_loop_forwards_configured_headers() {
-    let (sf, captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let (sf, captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let mut headers = cyrup_provider::HeaderMap::new();
     headers.insert("x-probe".to_string(), Some("42".to_string()));
 
     let mut config = AgentLoopConfig::new(model_ref());
-    config.gen_config = GenerationConfig { headers: Some(headers), ..GenerationConfig::default() };
+    config.gen_config = GenerationConfig {
+        headers: Some(headers),
+        ..GenerationConfig::default()
+    };
     // The queues are per-run handles; the default config already supplies empty ones.
     assert!(config.steering.lock().unwrap().is_empty());
     assert!(config.follow_up.lock().unwrap().is_empty());
@@ -587,8 +673,10 @@ async fn agent021_low_level_loop_forwards_configured_headers() {
 
 #[tokio::test]
 async fn agent_s03_031_metadata_and_ws_connect_timeout_reach_stream_options() {
-    let (sf, captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let (sf, captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let mut meta = serde_json::Map::new();
     meta.insert("user_id".to_string(), json!("u-7"));
 
@@ -600,7 +688,10 @@ async fn agent_s03_031_metadata_and_ws_connect_timeout_reach_stream_options() {
     agent.wait_for_idle().await;
 
     let seen = captured.lock().unwrap();
-    assert_eq!(seen[0].metadata.as_ref().and_then(|m| m.get("user_id")), Some(&json!("u-7")));
+    assert_eq!(
+        seen[0].metadata.as_ref().and_then(|m| m.get("user_id")),
+        Some(&json!("u-7"))
+    );
     assert_eq!(seen[0].websocket_connect_timeout_ms, Some(2_500));
 }
 
@@ -622,8 +713,10 @@ impl ApiKeyResolver for EmptyKeyResolver {
 
 #[tokio::test]
 async fn agent032_empty_resolved_api_key_falls_back_to_the_static_key() {
-    let (sf, captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let (sf, captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let agent = Agent::builder(model_ref(), sf)
         .api_key("static-key")
         .key_resolver(Arc::new(EmptyKeyResolver))
@@ -647,7 +740,8 @@ async fn agent023_reset_is_refused_while_a_run_is_in_flight() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("park", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let entered = Arc::new(tokio::sync::Notify::new());
     let tool = Arc::new(ParkingTool {
@@ -660,18 +754,26 @@ async fn agent023_reset_is_refused_while_a_run_is_in_flight() {
 
     let waiter = entered.notified();
     let handle = agent.prompt("go").await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("tool body entered");
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("tool body entered");
 
     let before = agent.snapshot().await.messages.len();
     let refused_reset = agent.reset().await;
     assert!(
-        matches!(refused_reset, Err(AgentError::RunActive(crate::BusyEntry::Reset))),
+        matches!(
+            refused_reset,
+            Err(AgentError::RunActive(crate::BusyEntry::Reset))
+        ),
         "upstream throws \"Agent is already processing. Wait for completion before resetting.\""
     );
     // AGENT-034 — and it must be `reset()`'s own text, not the latch's or `continue()`'s. pi keys
     // four distinct messages off the same `this.activeRun` condition (agent.ts:335 @v0.84.1).
     assert_eq!(
-        refused_reset.err().map(|e| e.to_string()).unwrap_or_default(),
+        refused_reset
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default(),
         "Agent is already processing. Wait for completion before resetting."
     );
     assert_eq!(
@@ -710,7 +812,8 @@ async fn agent034_busy_entry_points_carry_pis_per_entry_point_message() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("park", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let entered = Arc::new(tokio::sync::Notify::new());
     let tool = Arc::new(ParkingTool {
@@ -725,13 +828,22 @@ async fn agent034_busy_entry_points_carry_pis_per_entry_point_message() {
     let handle = agent.prompt("go").await.unwrap();
     // Park inside the tool body: the run holds the latch for the whole of the assertions below,
     // with no wall-clock sleep anywhere.
-    tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("tool body entered");
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("tool body entered");
     assert!(agent.is_running());
 
     // (1) `prompt` — pi agent.ts:341-343 @v0.83.0. RED before: cyrup had no guard here, so this
     // fell through to the latch and reported "Agent is already processing." instead.
-    let busy_prompt = agent.prompt("second").await.err().expect("a second prompt is refused");
-    assert!(matches!(busy_prompt, AgentError::RunActive(crate::BusyEntry::Prompt)));
+    let busy_prompt = agent
+        .prompt("second")
+        .await
+        .err()
+        .expect("a second prompt is refused");
+    assert!(matches!(
+        busy_prompt,
+        AgentError::RunActive(crate::BusyEntry::Prompt)
+    ));
     assert_eq!(
         busy_prompt.to_string(),
         "Agent is already processing a prompt. Use steer() or followUp() to queue messages, \
@@ -744,11 +856,21 @@ async fn agent034_busy_entry_points_carry_pis_per_entry_point_message() {
         .await
         .err()
         .expect("the image overload is refused identically");
-    assert!(matches!(busy_images, AgentError::RunActive(crate::BusyEntry::Prompt)));
+    assert!(matches!(
+        busy_images,
+        AgentError::RunActive(crate::BusyEntry::Prompt)
+    ));
 
     // (2) `continue` — pi agent.ts:352 @v0.83.0. Different sentence from (1) and (3).
-    let busy_continue = agent.continue_run().await.err().expect("a continuation is refused");
-    assert!(matches!(busy_continue, AgentError::RunActive(crate::BusyEntry::Continue)));
+    let busy_continue = agent
+        .continue_run()
+        .await
+        .err()
+        .expect("a continuation is refused");
+    assert!(matches!(
+        busy_continue,
+        AgentError::RunActive(crate::BusyEntry::Continue)
+    ));
     assert_eq!(
         busy_continue.to_string(),
         "Agent is already processing. Wait for completion before continuing."
@@ -756,7 +878,10 @@ async fn agent034_busy_entry_points_carry_pis_per_entry_point_message() {
 
     // (3) `reset` — pi agent.ts:335 @v0.84.1 (the AGENT-023 drift).
     let busy_reset = agent.reset().await.expect_err("a reset is refused");
-    assert!(matches!(busy_reset, AgentError::RunActive(crate::BusyEntry::Reset)));
+    assert!(matches!(
+        busy_reset,
+        AgentError::RunActive(crate::BusyEntry::Reset)
+    ));
     assert_eq!(
         busy_reset.to_string(),
         "Agent is already processing. Wait for completion before resetting."
@@ -811,9 +936,15 @@ fn agent034_continue_validation_messages_are_surface_specific() {
 
 #[tokio::test]
 async fn agent025_transform_failure_agent_end_carries_only_the_failure_message() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("x")], StopReason::Stop)]).1;
+    let sf = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("x")],
+        StopReason::Stop,
+    )])
+    .1;
     let agent = Agent::builder(model_ref(), sf)
-        .hooks(Arc::new(FailingTransform::new("compaction budget exceeded")))
+        .hooks(Arc::new(FailingTransform::new(
+            "compaction budget exceeded",
+        )))
         .build();
     let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
@@ -838,11 +969,18 @@ async fn agent025_transform_failure_agent_end_carries_only_the_failure_message()
     match end[0].as_ref() {
         AgentMessage::Assistant(a) => {
             assert_eq!(a.stop_reason, StopReason::Error);
-            assert_eq!(a.error_message.as_deref(), Some("compaction budget exceeded"));
+            assert_eq!(
+                a.error_message.as_deref(),
+                Some("compaction budget exceeded")
+            );
         }
         other => panic!("expected the synthetic assistant failure, got {other:?}"),
     }
-    assert_eq!(returned.len(), 1, "`RunHandle::finished()` returns the same vector as `agent_end`");
+    assert_eq!(
+        returned.len(),
+        1,
+        "`RunHandle::finished()` returns the same vector as `agent_end`"
+    );
 }
 
 /// A hook that fails only after the run has been cancelled — the compaction / context-budget hook
@@ -864,14 +1002,26 @@ impl Hooks for CancelAwareTransform {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent025_transform_failure_after_abort_reports_aborted() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("x")], StopReason::Stop)]).1;
-    let agent =
-        Arc::new(Agent::builder(model_ref(), sf).hooks(Arc::new(CancelAwareTransform)).build());
+    let sf = faux_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("x")],
+        StopReason::Stop,
+    )])
+    .1;
+    let agent = Arc::new(
+        Agent::builder(model_ref(), sf)
+            .hooks(Arc::new(CancelAwareTransform))
+            .build(),
+    );
     let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     // `transform_context` runs after the prompt's `message_end`, so aborting there parks the hook.
     agent.subscribe(abort_on(&agent, |e| {
-        matches!(e, AgentEvent::MessageEnd { message: AgentMessage::User { .. } })
+        matches!(
+            e,
+            AgentEvent::MessageEnd {
+                message: AgentMessage::User { .. }
+            }
+        )
     }));
 
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -909,12 +1059,22 @@ async fn agent025_transform_failure_after_abort_reports_aborted() {
 async fn burst_delivers_all(execution: ToolExecution) {
     const N: usize = 500;
     let sf = faux_stream_fn(vec![
-        faux_assistant_message(vec![faux_tool_call("burst", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("burst", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
-    let tool = Arc::new(BurstTool { name: "burst".into(), params: obj_schema(), n: N });
-    let agent =
-        Agent::builder(model_ref(), sf).tools(vec![tool]).tool_execution(execution).build();
+    ])
+    .1;
+    let tool = Arc::new(BurstTool {
+        name: "burst".into(),
+        params: obj_schema(),
+        n: N,
+    });
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![tool])
+        .tool_execution(execution)
+        .build();
     let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
@@ -951,7 +1111,8 @@ async fn agent_s02_subscribe_returns_a_working_detach_handle() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_text("one")], StopReason::Stop),
         faux_assistant_message(vec![faux_text("two")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let agent = Agent::builder(model_ref(), sf).build();
     let rec = Arc::new(EventRecorder::default());
     let sub = agent.subscribe(rec.clone());
@@ -959,7 +1120,10 @@ async fn agent_s02_subscribe_returns_a_working_detach_handle() {
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
     let after_first = rec.snapshot().len();
-    assert!(after_first > 0, "the subscriber received the first run's events");
+    assert!(
+        after_first > 0,
+        "the subscriber received the first run's events"
+    );
 
     sub.unsubscribe();
     agent.prompt("again").await.unwrap().finished().await;
@@ -984,7 +1148,10 @@ struct SignalWatchingSubscriber {
 #[async_trait::async_trait]
 impl EventSubscriber for SignalWatchingSubscriber {
     async fn on_event(&self, _event: &AgentEvent, cancel: CancelToken) {
-        self.saw_cancelled.lock().unwrap().push(cancel.is_cancelled());
+        self.saw_cancelled
+            .lock()
+            .unwrap()
+            .push(cancel.is_cancelled());
     }
 }
 
@@ -993,19 +1160,27 @@ async fn agent_s02_on_event_receives_the_runs_abort_signal() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let agent = Arc::new(
-        Agent::builder(model_ref(), sf).tools(vec![OkTool::new("t", false)]).build(),
+        Agent::builder(model_ref(), sf)
+            .tools(vec![OkTool::new("t", false)])
+            .build(),
     );
     let watcher = Arc::new(SignalWatchingSubscriber::default());
     agent.subscribe(watcher.clone());
-    agent.subscribe(abort_on(&agent, |e| matches!(e, AgentEvent::ToolExecutionStart { .. })));
+    agent.subscribe(abort_on(&agent, |e| {
+        matches!(e, AgentEvent::ToolExecutionStart { .. })
+    }));
 
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
 
     let seen = watcher.saw_cancelled.lock().unwrap();
-    assert!(seen.iter().any(|c| !*c), "early events are delivered with a live token");
+    assert!(
+        seen.iter().any(|c| !*c),
+        "early events are delivered with a live token"
+    );
     assert!(
         seen.iter().any(|c| *c),
         "every event after the abort carries a cancelled token: {seen:?}"
@@ -1033,7 +1208,10 @@ impl Hooks for SignalWatchingPostTurn {
         _ctx: crate::PostTurn<'_>,
         cancel: CancelToken,
     ) -> Result<Option<crate::TurnUpdate>, HookError> {
-        self.saw_cancelled.lock().unwrap().push(cancel.is_cancelled());
+        self.saw_cancelled
+            .lock()
+            .unwrap()
+            .push(cancel.is_cancelled());
         Ok(None)
     }
     async fn should_stop_after_turn(
@@ -1041,7 +1219,10 @@ impl Hooks for SignalWatchingPostTurn {
         _ctx: crate::PostTurn<'_>,
         cancel: CancelToken,
     ) -> Result<bool, HookError> {
-        self.saw_cancelled.lock().unwrap().push(cancel.is_cancelled());
+        self.saw_cancelled
+            .lock()
+            .unwrap()
+            .push(cancel.is_cancelled());
         Ok(false)
     }
 }
@@ -1051,16 +1232,21 @@ async fn agent024_post_turn_hooks_observe_the_runs_abort_signal() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let seen = Arc::new(Mutex::new(Vec::new()));
     let agent = Arc::new(
         Agent::builder(model_ref(), sf)
             .tools(vec![OkTool::new("t", false)])
-            .hooks(Arc::new(SignalWatchingPostTurn { saw_cancelled: seen.clone() }))
+            .hooks(Arc::new(SignalWatchingPostTurn {
+                saw_cancelled: seen.clone(),
+            }))
             .build(),
     );
     // Abort once the first turn's tool has finished, i.e. before the post-turn hooks run.
-    agent.subscribe(abort_on(&agent, |e| matches!(e, AgentEvent::ToolExecutionEnd { .. })));
+    agent.subscribe(abort_on(&agent, |e| {
+        matches!(e, AgentEvent::ToolExecutionEnd { .. })
+    }));
 
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -1143,8 +1329,10 @@ fn agent035_proxy_abort_carries_pis_request_aborted_by_user() {
 
 #[tokio::test]
 async fn agent029_header_fn_is_keyed_on_the_dispatched_model() {
-    let (sf, captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let (sf, captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let agent = Agent::builder(model_ref(), sf).build();
     let f: Arc<HeaderFn> = Arc::new(|m: &ModelRef| {
         let mut h = cyrup_provider::HeaderMap::new();
@@ -1157,7 +1345,10 @@ async fn agent029_header_fn_is_keyed_on_the_dispatched_model() {
     agent.wait_for_idle().await;
 
     assert_eq!(
-        captured.lock().unwrap()[0].headers.as_ref().and_then(|h| h.get("x-for-model")),
+        captured.lock().unwrap()[0]
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("x-for-model")),
         Some(&Some("faux-1".to_string()))
     );
 }

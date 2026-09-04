@@ -12,12 +12,12 @@
 //! on a `std::net` OS thread (the workspace `tokio` has no `net` feature, so std net is used).
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{Agent, AgentMessage, ProviderStreamFn, ProxyStreamFn, StreamFn};
 use cyrup_core::{Content, EventStream, ModelRef, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_provider::{Context, Provider, StreamEvent, StreamOptions};
 
 use super::support::anthropic_model_ref;
@@ -78,7 +78,11 @@ async fn injected_stream_fn_serves_a_live_agent_turn() {
 
     assert_eq!(new.len(), 2, "user + assistant");
     assert_eq!(assistant_text(&new[1]), "reply from the injected transport");
-    assert_eq!(hits.load(Ordering::SeqCst), 1, "the injected transport ran exactly once");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the injected transport ran exactly once"
+    );
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -240,9 +244,8 @@ async fn agent035_aborted_proxy_stream_reports_pis_request_aborted_by_user() {
     // A generous ceiling used as a HANG detector, not a latency assertion: a regression that stops
     // turning a cancel into a terminal event leaves the server parked and this loop awaiting
     // forever, which must surface as a failure rather than a stuck suite.
-    let terminal: Option<StreamEvent> = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        async {
+    let terminal: Option<StreamEvent> =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let mut terminal = None;
             while let Some(ev) = stream.next().await {
                 match ev {
@@ -258,11 +261,13 @@ async fn agent035_aborted_proxy_stream_reports_pis_request_aborted_by_user() {
                 }
             }
             terminal
-        },
-    )
-    .await
-    .expect("a cancelled proxy stream must push its terminal error event, not hang");
-    assert!(saw_delta, "the stalling server delivered its text_delta frame before the abort");
+        })
+        .await
+        .expect("a cancelled proxy stream must push its terminal error event, not hang");
+    assert!(
+        saw_delta,
+        "the stalling server delivered its text_delta frame before the abort"
+    );
 
     let Some(StreamEvent::Error { reason, error }) = terminal else {
         panic!("an aborted proxy stream must still push a terminal error event (proxy.ts:219-223)");
@@ -309,9 +314,7 @@ impl Drop for ClearHttpProxyOnDrop {
 /// proxy SSE frames. For a plain-`http` target, reqwest sends the ABSOLUTE-form request line
 /// (`POST http://host:port/api/stream HTTP/1.1`) to the proxy, which is what makes the recorded line
 /// proof that the request was proxied rather than sent direct.
-fn spawn_recording_http_proxy(
-    frames: Vec<String>,
-) -> (String, std::sync::mpsc::Receiver<String>) {
+fn spawn_recording_http_proxy(frames: Vec<String>) -> (String, std::sync::mpsc::Receiver<String>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().expect("addr");
     let url = format!("http://{addr}");

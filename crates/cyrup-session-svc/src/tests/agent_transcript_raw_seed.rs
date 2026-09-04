@@ -19,7 +19,12 @@
 //! `compactionSummary` arms at all. The transcript therefore had a different LENGTH and different
 //! roles from pi's: an `excludeFromContext` (`!!`) bash message is DROPPED by the flattening and a
 //! summary is REWRITTEN into `COMPACTION_SUMMARY_PREFIX … SUFFIX` wrapper prose.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use cyrup_agent::AppRole;
 use std::path::PathBuf;
@@ -36,8 +41,8 @@ fn arcs<I: IntoIterator<Item = cyrup_agent::AgentMessage>>(
 }
 use crate::{SessionBuilder, SessionConfig};
 use cyrup_core::{Content, Message, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session::agent_message::AgentMessage as Raw;
 use tempfile::TempDir;
 
@@ -53,7 +58,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -132,7 +141,9 @@ async fn compaction_reseeds_the_transcript_from_pi_s_raw_context() {
     let summaries: Vec<_> = transcript
         .iter()
         .filter_map(|m| match m {
-            cyrup_agent::AgentMessage::App { role, payload } if *role == AppRole::CompactionSummary => {
+            cyrup_agent::AgentMessage::App { role, payload }
+                if *role == AppRole::CompactionSummary =>
+            {
                 Some(payload.clone())
             }
             _ => None,
@@ -144,7 +155,9 @@ async fn compaction_reseeds_the_transcript_from_pi_s_raw_context() {
         "pi's transcript holds the compactionSummary AS a compactionSummary; got {transcript:?}"
     );
     // (2) …carrying pi's raw `summary` field, NOT the wrapper prose the LLM projection adds.
-    let summary = summaries[0]["summary"].as_str().expect("pi's `summary` field");
+    let summary = summaries[0]["summary"]
+        .as_str()
+        .expect("pi's `summary` field");
     assert!(
         !summary.starts_with("The conversation history before this point was compacted"),
         "the raw projection stores the bare summary; the wrapper belongs to convertToLlm only \
@@ -215,7 +228,10 @@ async fn resuming_a_session_seeds_the_transcript_from_pi_s_raw_context() {
         .build()
         .await
         .expect("build");
-    let file = session.session_file().await.expect("a persisted session to resume from");
+    let file = session
+        .session_file()
+        .await
+        .expect("a persisted session to resume from");
 
     let _ = session.prompt("tell me one").await.expect("prompt 1");
     session.wait_for_idle().await;
@@ -226,7 +242,11 @@ async fn resuming_a_session_seeds_the_transcript_from_pi_s_raw_context() {
     let _ = session
         .execute_bash(
             "echo excluded-from-context",
-            crate::BashOptions { exclude_from_context: true, id: None, operations: None },
+            crate::BashOptions {
+                exclude_from_context: true,
+                id: None,
+                operations: None,
+            },
             None,
         )
         .await
@@ -265,7 +285,10 @@ async fn resuming_a_session_seeds_the_transcript_from_pi_s_raw_context() {
     assert!(
         transcript.iter().any(|m| matches!(
             m,
-            cyrup_agent::AgentMessage::App { role: AppRole::BashExecution, .. }
+            cyrup_agent::AgentMessage::App {
+                role: AppRole::BashExecution,
+                ..
+            }
         )),
         "a resumed transcript holds the excluded bash execution as a bashExecution, exactly as \
          `sessionEntryToContextMessages` returns it (sdk.ts:190,374); got {transcript:?}"
@@ -275,14 +298,22 @@ async fn resuming_a_session_seeds_the_transcript_from_pi_s_raw_context() {
     let summaries: Vec<_> = transcript
         .iter()
         .filter_map(|m| match m {
-            cyrup_agent::AgentMessage::App { role, payload } if *role == AppRole::CompactionSummary => {
+            cyrup_agent::AgentMessage::App { role, payload }
+                if *role == AppRole::CompactionSummary =>
+            {
                 Some(payload.clone())
             }
             _ => None,
         })
         .collect();
-    assert_eq!(summaries.len(), 1, "one retained compactionSummary; got {transcript:?}");
-    let summary = summaries[0]["summary"].as_str().expect("pi's `summary` field");
+    assert_eq!(
+        summaries.len(),
+        1,
+        "one retained compactionSummary; got {transcript:?}"
+    );
+    let summary = summaries[0]["summary"]
+        .as_str()
+        .expect("pi's `summary` field");
     assert!(
         !summary.starts_with("The conversation history before this point was compacted"),
         "the raw projection stores the bare summary; the wrapper belongs to convertToLlm only \
@@ -345,18 +376,30 @@ fn the_llm_boundary_renders_pi_s_declaration_merged_roles() {
         "fromId": "e1",
         "timestamp": 12,
     });
-    let serde_json::Value::Object(branch_payload) = branch_summary else { unreachable!() };
+    let serde_json::Value::Object(branch_payload) = branch_summary else {
+        unreachable!()
+    };
     let app = cyrup_agent::AgentMessage::App {
         role: AppRole::BranchSummary,
         payload: branch_payload,
     };
 
     let out = coding_agent_convert_to_llm(&arcs([custom, app]));
-    assert_eq!(out.len(), 2, "both roles render to exactly one user message each: {out:?}");
-    assert_eq!(text_of(&out[0]), "remember the deploy freeze", "pi's `case \"custom\"` (:162-168)");
+    assert_eq!(
+        out.len(),
+        2,
+        "both roles render to exactly one user message each: {out:?}"
+    );
+    assert_eq!(
+        text_of(&out[0]),
+        "remember the deploy freeze",
+        "pi's `case \"custom\"` (:162-168)"
+    );
     let branch = text_of(&out[1]);
     assert!(
-        branch.starts_with("The following is a summary of a branch that this conversation came back from:"),
+        branch.starts_with(
+            "The following is a summary of a branch that this conversation came back from:"
+        ),
         "pi's BRANCH_SUMMARY_PREFIX (messages.ts:20-24) is applied here, not at seeding: {branch:?}"
     );
     assert!(branch.contains("explored the retry path"));
@@ -398,10 +441,15 @@ fn a_live_bash_execution_renders_like_a_reseeded_one_and_honours_exclude_from_co
     // A live execution as `record_bash_result` now records it: the pi wire object with `role`
     // and `timestamp`, in the same `App` variant a compaction re-seed produces.
     let live_app = |exclude: bool| {
-        let serde_json::Value::Object(mut payload) = body(exclude) else { unreachable!() };
+        let serde_json::Value::Object(mut payload) = body(exclude) else {
+            unreachable!()
+        };
         payload.insert("role".into(), "bashExecution".into());
         payload.insert("timestamp".into(), 7.into());
-        Agent::App { role: AppRole::BashExecution, payload }
+        Agent::App {
+            role: AppRole::BashExecution,
+            payload,
+        }
     };
     let reseeded = |exclude: bool| {
         crate::event::raw_message_to_agent(&Raw::BashExecution(BashExecutionMessage {
@@ -419,7 +467,11 @@ fn a_live_bash_execution_renders_like_a_reseeded_one_and_honours_exclude_from_co
     // (a) `!` — rendered as pi's `bashExecutionToText`, byte-identical on both paths.
     let live = live_app(false);
     let live_out = coding_agent_convert_to_llm(&arcs([live.clone()]));
-    assert_eq!(live_out.len(), 1, "one user turn, as pi's `case \"bashExecution\"` returns");
+    assert_eq!(
+        live_out.len(),
+        1,
+        "one user turn, as pi's `case \"bashExecution\"` returns"
+    );
     assert_eq!(
         text_of(&live_out[0]),
         text_of(&coding_agent_convert_to_llm(&arcs([reseeded(false)]))[0]),
@@ -497,7 +549,12 @@ fn raw_message_to_agent_preserves_every_pi_role() {
         timestamp: 2,
     });
     match crate::event::raw_message_to_agent(&custom) {
-        Agent::Custom { kind, payload, timestamp, .. } => {
+        Agent::Custom {
+            kind,
+            payload,
+            timestamp,
+            ..
+        } => {
             assert_eq!(kind, "ext.note");
             assert_eq!(payload, serde_json::Value::String("hi".into()));
             assert_eq!(timestamp, Some(2));
@@ -525,7 +582,10 @@ fn raw_message_to_agent_preserves_every_pi_role() {
         Agent::App { ref role, .. } if *role == AppRole::CompactionSummary
     ));
 
-    let core = Raw::Core(Message::User { content: vec![Content::text("hello")], timestamp: 5 });
+    let core = Raw::Core(Message::User {
+        content: vec![Content::text("hello")],
+        timestamp: 5,
+    });
     assert!(matches!(
         crate::event::raw_message_to_agent(&core),
         Agent::User { ref timestamp, .. } if *timestamp == Some(5)

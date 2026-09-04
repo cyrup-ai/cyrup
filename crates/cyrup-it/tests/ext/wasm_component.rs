@@ -9,7 +9,12 @@
 //! emits a component directly — no cargo-component/wasm-tools needed), run ONCE for the whole
 //! suite by `crates/cyrup-it/build.rs` rather than by this file. Set
 //! `CYRUP_EXT_FIXTURE_COMPONENT` to a prebuilt component to skip that build.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use cyrup_core::{CancelToken, Content};
 use cyrup_ext::{
@@ -29,7 +34,11 @@ fn fixture_component() -> PathBuf {
 }
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: PathBuf::from("."),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -43,8 +52,14 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
         .expect("load + init the live wasm extension");
 
     // init declared subscriptions: the gate (tool_call) + the notify hook (agent_start).
-    assert!(ext.subscriptions().contains(EventKind::ToolCall), "guest subscribed to tool_call");
-    assert!(ext.subscriptions().contains(EventKind::AgentStart), "guest subscribed to agent_start");
+    assert!(
+        ext.subscriptions().contains(EventKind::ToolCall),
+        "guest subscribed to tool_call"
+    );
+    assert!(
+        ext.subscriptions().contains(EventKind::AgentStart),
+        "guest subscribed to agent_start"
+    );
 
     let cancel = CancelToken::new();
 
@@ -73,7 +88,10 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
 
     // The guest's `ctx.ui().notify(...)` ran inside the gate — observable host-side.
     assert!(
-        ext.guest().notifications().iter().any(|n| n.contains("blocked a bash call")),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("blocked a bash call")),
         "guest UI notification recorded: {:?}",
         ext.guest().notifications()
     );
@@ -100,26 +118,42 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
             &cancel,
         )
         .await;
-    assert!(matches!(reduced, Reduced::Pass(_)), "non-bash tool passes the guest gate");
+    assert!(
+        matches!(reduced, Reduced::Pass(_)),
+        "non-bash tool passes the guest gate"
+    );
 
     // 3) notify-only: agent_start -> the guest records another notification.
-    host.dispatcher().dispatch_notify(&HostEvent::AgentStart, &cancel).await;
+    host.dispatcher()
+        .dispatch_notify(&HostEvent::AgentStart, &cancel)
+        .await;
     assert!(
-        ext.guest().notifications().iter().any(|n| n.contains("demo extension active")),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("demo extension active")),
         "guest agent_start notification recorded"
     );
 
     // 4) the guest-registered `demo_echo` tool is in the active set and EXECUTES across the boundary,
     //    streaming an onUpdate chunk (R-08-013/015).
     let active = host.active_tools(&[]).expect("active tools");
-    let echo = active.iter().find(|t| t.name() == "demo_echo").expect("guest tool surfaced");
+    let echo = active
+        .iter()
+        .find(|t| t.name() == "demo_echo")
+        .expect("guest tool surfaced");
 
     let updates: Arc<Mutex<Vec<cyrup_core::ToolUpdate>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_updates = updates.clone();
     let sink: cyrup_core::ToolUpdateSink = Box::new(move |u| sink_updates.lock().unwrap().push(u));
 
     let result = echo
-        .execute("tc3".into(), json!({ "text": "hello" }), cancel.clone(), sink)
+        .execute(
+            "tc3".into(),
+            json!({ "text": "hello" }),
+            cancel.clone(),
+            sink,
+        )
         .await
         .expect("guest tool executes");
     match result.content.first() {
@@ -133,17 +167,25 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
 
     // 5) a guest slash command EXECUTES across the boundary at command tier and returns text
     //    (R-08-016), and its dynamic argument completer answers a prefix query.
-    let out = ext.execute_command("greet", "world", &cancel).await.expect("guest command runs");
+    let out = ext
+        .execute_command("greet", "world", &cancel)
+        .await
+        .expect("guest command runs");
     assert_eq!(out.as_deref(), Some("hello, world!"));
     assert!(
-        ext.guest().notifications().iter().any(|n| n.contains("greet command ran")),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("greet command ran")),
         "command handler's ctx.ui().notify ran"
     );
     // The command addressed a KEYED status segment then cleared it (Pi `setStatus(key, text)` /
     // `setStatus(key, undefined)`, types.ts:141) — both calls recorded with their key across the WIT.
     let statuses = ext.guest().statuses();
     assert!(
-        statuses.iter().any(|(k, t)| k == "greet" && t.as_deref() == Some("greeting…")),
+        statuses
+            .iter()
+            .any(|(k, t)| k == "greet" && t.as_deref() == Some("greeting…")),
         "keyed status set recorded: {statuses:?}"
     );
     assert!(
@@ -151,9 +193,20 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
         "keyed status clear (text=None) recorded: {statuses:?}"
     );
     // Replaying the keyed segment resolves to cleared (the clear was last).
-    assert_eq!(ext.guest().status_for("greet"), None, "greet status segment resolves cleared");
-    let comps = ext.argument_completions("greet", "te").await.expect("completions");
-    assert_eq!(comps, vec!["team".to_string()], "dynamic getArgumentCompletions filtered by prefix");
+    assert_eq!(
+        ext.guest().status_for("greet"),
+        None,
+        "greet status segment resolves cleared"
+    );
+    let comps = ext
+        .argument_completions("greet", "te")
+        .await
+        .expect("completions");
+    assert_eq!(
+        comps,
+        vec!["team".to_string()],
+        "dynamic getArgumentCompletions filtered by prefix"
+    );
 
     // 6) a guest message renderer renders a call across the boundary (R-08-020).
     let widget = ext
@@ -168,7 +221,10 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
     //    guest's `/execdemo` calls `pi.exec("echo",["hi"])` across the WIT boundary, the host router
     //    routes it to `DenyServices::exec` which returns "exec capability not granted", and the guest
     //    surfaces that denial (Pi's ambient exec is unavailable to an ungranted extension).
-    let out = ext.execute_command("execdemo", "", &cancel).await.expect("execdemo runs");
+    let out = ext
+        .execute_command("execdemo", "", &cancel)
+        .await
+        .expect("execdemo runs");
     assert_eq!(
         out.as_deref(),
         Some("exec denied: exec capability not granted"),
@@ -188,7 +244,10 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
     //    calls `ctx.http_request(...)` across the WIT boundary, the host router routes it to
     //    `DenyServices::http_request` which returns "http-client capability not granted", and the
     //    guest surfaces that denial — the SAME trust gate as `exec`, no separate allowlist.
-    let out = ext.execute_command("httpdemo", "http://127.0.0.1:1/unused", &cancel).await.expect("httpdemo runs");
+    let out = ext
+        .execute_command("httpdemo", "http://127.0.0.1:1/unused", &cancel)
+        .await
+        .expect("httpdemo runs");
     assert_eq!(
         out.as_deref(),
         Some("http denied: http-client capability not granted"),
@@ -205,8 +264,10 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
 
     // The streaming half is denied the same way (denial happens at `request-stream`, before any
     // poll — never a hang/panic on the ungranted path).
-    let out =
-        ext.execute_command("httpstreamdemo", "http://127.0.0.1:1/unused", &cancel).await.expect("httpstreamdemo runs");
+    let out = ext
+        .execute_command("httpstreamdemo", "http://127.0.0.1:1/unused", &cancel)
+        .await
+        .expect("httpstreamdemo runs");
     assert_eq!(
         out.as_deref(),
         Some("http stream denied: http-client capability not granted"),
@@ -220,21 +281,30 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
     //    surfaces that denial — the SAME trust gate as `exec`/`http-client`. Denied STRUCTURALLY: an
     //    untrusted guest never reaches a real `ProcCaps` at all (`DenyServices` holds none), so there
     //    is no path to ever spawn a real process.
-    let out = ext.execute_command("procspawn", "denial-marker", &cancel).await.expect("procspawn runs");
+    let out = ext
+        .execute_command("procspawn", "denial-marker", &cancel)
+        .await
+        .expect("procspawn runs");
     assert_eq!(
         out.as_deref(),
         Some("proc denied: proc capability not granted"),
         "the deny-all backend refuses the guest's proc_spawn"
     );
     assert!(
-        ext.guest().notifications().iter().any(|n| n.contains("proc denied: proc capability not granted")),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("proc denied: proc capability not granted")),
         "the guest observed the proc denial across the boundary: {:?}",
         ext.guest().notifications()
     );
 
     // an unknown command surfaces an error (never a host crash).
     let err = ext.execute_command("nope", "", &cancel).await.unwrap_err();
-    assert!(err.to_string().contains("no such command"), "unknown command surfaced: {err}");
+    assert!(
+        err.to_string().contains("no such command"),
+        "unknown command surfaced: {err}"
+    );
 }
 
 /// The fire-and-forget `ui.notify`/`ui.set-status` imports must ALSO reach the injected
@@ -260,14 +330,20 @@ async fn live_guest_component_fire_and_forget_ui_effects_reach_host_services() {
         .expect("load + init the live wasm extension");
 
     let cancel = CancelToken::new();
-    let out = ext.execute_command("greet", "world", &cancel).await.expect("guest command runs");
+    let out = ext
+        .execute_command("greet", "world", &cancel)
+        .await
+        .expect("guest command runs");
     assert_eq!(out.as_deref(), Some("hello, world!"));
 
     // `ctx.ui().notify("greet command ran")` (example/commands_session.rs:32) reached
     // `HostServices::notify` — the WIT `ui.notify` import now forwards to `guest.services` in
     // ADDITION to `GuestState`'s own log.
     assert!(
-        recording.notify_calls().iter().any(|(m, _)| m.contains("greet command ran")),
+        recording
+            .notify_calls()
+            .iter()
+            .any(|(m, _)| m.contains("greet command ran")),
         "the injected HostServices backend observed the guest's notify call: {:?}",
         recording.notify_calls()
     );
@@ -284,7 +360,10 @@ async fn live_guest_component_fire_and_forget_ui_effects_reach_host_services() {
     );
     // ...and its later clear (`set_status("greet", None)`, example/commands_session.rs:36) too.
     assert!(
-        recording.set_status_calls().iter().any(|(k, t)| k == "greet" && t.is_none()),
+        recording
+            .set_status_calls()
+            .iter()
+            .any(|(k, t)| k == "greet" && t.is_none()),
         "the injected HostServices backend observed the guest's set_status CLEAR call: {:?}",
         recording.set_status_calls()
     );

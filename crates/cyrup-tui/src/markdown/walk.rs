@@ -54,7 +54,11 @@ impl<'t> MdRenderer<'t> {
             // (`markdown.ts:377-404` `applyDefaultStyle`, reached through the inline style context).
             // `{ italic }` is the next line of the same function (`:393-395`) and rides along.
             let base = Style::default().fg(c);
-            if self.default_italic { base.add_modifier(Modifier::ITALIC) } else { base }
+            if self.default_italic {
+                base.add_modifier(Modifier::ITALIC)
+            } else {
+                base
+            }
         } else {
             self.theme.assistant_style()
         };
@@ -141,7 +145,10 @@ impl<'t> MdRenderer<'t> {
     fn continuation_prefix(&self) -> Vec<Span<'static>> {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for _ in 0..self.quote {
-            spans.push(Span::styled("│ ".to_string(), self.theme.md_quote_border_style()));
+            spans.push(Span::styled(
+                "│ ".to_string(),
+                self.theme.md_quote_border_style(),
+            ));
         }
         let depth = self.lists.len().saturating_sub(1);
         if depth > 0 {
@@ -166,7 +173,9 @@ impl<'t> MdRenderer<'t> {
     /// from `firstPrefix` before rendering any of the item's children (`:774-776`, `:786`), so the
     /// item's first block is sized past the bullet even though the bullet has not been emitted yet.
     pub(super) fn content_width(&self) -> usize {
-        let mut used: usize = usize::try_from(self.quote).unwrap_or(usize::MAX).saturating_mul(2);
+        let mut used: usize = usize::try_from(self.quote)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(2);
         used = used.saturating_add(self.lists.len().saturating_sub(1).saturating_mul(4));
         let marker_w = match (self.pending_marker.as_ref(), self.items.last()) {
             (Some((m, _)), _) => display_width(m),
@@ -214,8 +223,11 @@ impl<'t> MdRenderer<'t> {
         let cont = self.continuation_prefix();
         for (i, row) in rows.into_iter().enumerate() {
             // `const linePrefix = renderedAnyLine ? continuationPrefix : firstPrefix;` (`:789`).
-            let mut out_spans: Vec<Span<'static>> =
-                if i == 0 { prefix.to_vec() } else { cont.clone() };
+            let mut out_spans: Vec<Span<'static>> = if i == 0 {
+                prefix.to_vec()
+            } else {
+                cont.clone()
+            };
             out_spans.extend(row.spans);
             self.out.push(Line::from(out_spans));
         }
@@ -260,14 +272,26 @@ impl<'t> MdRenderer<'t> {
     ///   i.e. a run of trailing SPACES. Both paint an empty terminal row, so only the quote border —
     ///   the one prefix with a glyph in it — is materialised here.
     pub(super) fn blank(&mut self) {
-        if self.out.last().map(|l| row_is_blank(l, self.quote)).unwrap_or(true) {
+        if self
+            .out
+            .last()
+            .map(|l| row_is_blank(l, self.quote))
+            .unwrap_or(true)
+        {
             return;
         }
         let mut spans: Vec<Span<'static>> = Vec::new();
         for _ in 0..self.quote {
-            spans.push(Span::styled("│ ".to_string(), self.theme.md_quote_border_style()));
+            spans.push(Span::styled(
+                "│ ".to_string(),
+                self.theme.md_quote_border_style(),
+            ));
         }
-        self.out.push(if spans.is_empty() { Line::default() } else { Line::from(spans) });
+        self.out.push(if spans.is_empty() {
+            Line::default()
+        } else {
+            Line::from(spans)
+        });
     }
 
     /// Emit literal source text through the same three-way sink as [`Event::Text`] (table cell /
@@ -310,7 +334,11 @@ impl<'t> MdRenderer<'t> {
             if chars.peek() == Some(&MATH_END) {
                 chars.next();
             }
-            let rows = digits.parse::<usize>().ok().and_then(|i| self.math.get(i)).cloned();
+            let rows = digits
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| self.math.get(i))
+                .cloned();
             let Some(rows) = rows else { continue };
             for (i, row) in rows.iter().enumerate() {
                 if i > 0 {
@@ -527,7 +555,10 @@ impl<'t> MdRenderer<'t> {
                 // `token.raw` — the fallback body when the pane is too narrow for the grid
                 // (`markdown.ts:854-861`). The offset iterator's `Start(Table)` range is the whole
                 // table source (header + delimiter row + body).
-                self.table = Some(TableCapture { raw: raw.to_string(), ..TableCapture::default() });
+                self.table = Some(TableCapture {
+                    raw: raw.to_string(),
+                    ..TableCapture::default()
+                });
             }
             Tag::TableHead => {
                 if let Some(t) = self.table.as_mut() {
@@ -595,7 +626,11 @@ impl<'t> MdRenderer<'t> {
                 // reaches `:592-598`, so the block cannot end on a dangling `│ `; the single blank
                 // that follows a blockquote is `:599-601`'s BARE `""`, which `blank()` supplies once
                 // the depth is back to zero.
-                while self.out.last().is_some_and(|l| is_quote_only_row(l, self.quote)) {
+                while self
+                    .out
+                    .last()
+                    .is_some_and(|l| is_quote_only_row(l, self.quote))
+                {
                     self.out.pop();
                 }
                 self.quote = self.quote.saturating_sub(1);
@@ -848,7 +883,11 @@ impl<'t> MdRenderer<'t> {
             .flat_map(|line| crate::transcript::wrap_line(&line, width))
             .collect();
         // Drop a single trailing blank line for tight scrollback packing.
-        if self.out.last().map(|l| l.spans.iter().all(|s| s.content.trim().is_empty())).unwrap_or(false)
+        if self
+            .out
+            .last()
+            .map(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+            .unwrap_or(false)
         {
             self.out.pop();
         }
@@ -878,7 +917,12 @@ fn strip_indent(raw: &str) -> &str {
 fn source_ordered_marker(raw: &str) -> Option<String> {
     let s = strip_indent(raw);
     // `\d{1,9}` — a tenth digit leaves a digit where `[.)]` must be, so the whole pattern fails.
-    let digits: String = s.bytes().take(9).take_while(u8::is_ascii_digit).map(char::from).collect();
+    let digits: String = s
+        .bytes()
+        .take(9)
+        .take_while(u8::is_ascii_digit)
+        .map(char::from)
+        .collect();
     if digits.is_empty() {
         return None;
     }
@@ -900,7 +944,9 @@ fn source_ordered_marker(raw: &str) -> Option<String> {
 /// line), which carries no space to consume.
 fn source_unordered_marker(raw: &str) -> Option<String> {
     let s = strip_indent(raw);
-    let (bullet, rest) = ['-', '+', '*'].into_iter().find_map(|b| Some((b, s.strip_prefix(b)?)))?;
+    let (bullet, rest) = ['-', '+', '*']
+        .into_iter()
+        .find_map(|b| Some((b, s.strip_prefix(b)?)))?;
     let ends_line = rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n");
     if rest.starts_with([' ', '\t']) || ends_line {
         Some(format!("{bullet} "))

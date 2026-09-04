@@ -199,7 +199,11 @@ pub async fn expand_home(path: &str, ctx: &dyn AuthContext) -> String {
 
 /// pi `getProviderEnvValue(name, env)` (`provider-env.ts:44-52`): the provider-scoped overlay wins
 /// over the ambient environment, and an empty string counts as absent (JS `||`).
-fn provider_env_value(name: &str, env: Option<&ProviderEnv>, ambient: Option<String>) -> Option<String> {
+fn provider_env_value(
+    name: &str,
+    env: Option<&ProviderEnv>,
+    ambient: Option<String>,
+) -> Option<String> {
     if let Some(map) = env
         && let Some(v) = map.get(name).filter(|v| !v.is_empty())
     {
@@ -308,7 +312,11 @@ fn require_str(doc: &Value, field: &str, kind: &str) -> Result<String, ProviderE
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| adc_error(format!("Google `{kind}` credentials file is missing `{field}`")))
+        .ok_or_else(|| {
+            adc_error(format!(
+                "Google `{kind}` credentials file is missing `{field}`"
+            ))
+        })
 }
 
 fn adc_error(message: impl Into<String>) -> ProviderError {
@@ -332,18 +340,23 @@ fn b64url(bytes: &[u8]) -> String {
 pub fn pkcs8_der_from_pem(pem: &str) -> Result<Vec<u8>, ProviderError> {
     const BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
     const END: &str = "-----END PRIVATE KEY-----";
-    let start = pem
-        .find(BEGIN)
-        .ok_or_else(|| adc_error("Google service-account `private_key` is not a PKCS#8 PEM block"))?
-        + BEGIN.len();
-    let end = pem[start..]
-        .find(END)
-        .ok_or_else(|| adc_error("Google service-account `private_key` PEM block is unterminated"))?
-        + start;
-    let body: String = pem[start..end].chars().filter(|c| !c.is_whitespace()).collect();
+    let start = pem.find(BEGIN).ok_or_else(|| {
+        adc_error("Google service-account `private_key` is not a PKCS#8 PEM block")
+    })? + BEGIN.len();
+    let end = pem[start..].find(END).ok_or_else(|| {
+        adc_error("Google service-account `private_key` PEM block is unterminated")
+    })? + start;
+    let body: String = pem[start..end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     base64::engine::general_purpose::STANDARD
         .decode(body.as_bytes())
-        .map_err(|e| adc_error(format!("Google service-account `private_key` is not valid base64: {e}")))
+        .map_err(|e| {
+            adc_error(format!(
+                "Google service-account `private_key` is not valid base64: {e}"
+            ))
+        })
 }
 
 /// Build the signed-but-not-yet-exchanged JWT assertion for a service account.
@@ -375,8 +388,11 @@ pub fn sign_service_account_assertion(
     );
 
     let der = pkcs8_der_from_pem(private_key_pem)?;
-    let key_pair = ring::signature::RsaKeyPair::from_pkcs8(&der)
-        .map_err(|e| adc_error(format!("Google service-account `private_key` was rejected: {e}")))?;
+    let key_pair = ring::signature::RsaKeyPair::from_pkcs8(&der).map_err(|e| {
+        adc_error(format!(
+            "Google service-account `private_key` was rejected: {e}"
+        ))
+    })?;
     let mut signature = vec![0u8; key_pair.public().modulus_len()];
     key_pair
         .sign(
@@ -442,7 +458,9 @@ fn into_token(body: &str, now_ms: i64) -> Result<AdcToken, ProviderError> {
     let parsed: TokenResponse = serde_json::from_str(body)
         .map_err(|e| adc_error(format!("Google token response was not valid JSON: {e}")))?;
     if parsed.access_token.is_empty() {
-        return Err(adc_error("Google token response carried an empty access_token"));
+        return Err(adc_error(
+            "Google token response carried an empty access_token",
+        ));
     }
     let ttl = parsed.expires_in.unwrap_or(ASSERTION_LIFETIME_SECS).max(0);
     Ok(AdcToken {
@@ -544,7 +562,9 @@ pub async fn resolve_access_token(
         AdcSource::Metadata => None,
         AdcSource::File(path) => {
             let raw = tokio::fs::read_to_string(path).await.map_err(|e| {
-                adc_error(format!("Failed to read Google credentials file {path}: {e}"))
+                adc_error(format!(
+                    "Failed to read Google credentials file {path}: {e}"
+                ))
             })?;
             let doc: Value = serde_json::from_str(&raw).map_err(|e| {
                 adc_error(format!(
@@ -564,9 +584,7 @@ pub async fn resolve_access_token(
     };
 
     let client = crate::stream::sse::build_client_for_target(
-        token_uri,
-        ctx,
-        env,
+        token_uri, ctx, env,
         // The token round trip takes the process-global idle timeout, as every non-streaming
         // request does; a per-request stream timeout must not truncate it.
         None,

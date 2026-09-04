@@ -58,7 +58,10 @@ impl AgentSession {
         let drained = {
             let mut steering = Self::lock(&self.steering_messages);
             let mut follow_up = Self::lock(&self.follow_up_messages);
-            (std::mem::take(&mut *steering), std::mem::take(&mut *follow_up))
+            (
+                std::mem::take(&mut *steering),
+                std::mem::take(&mut *follow_up),
+            )
         };
         // Discarded: the agent's queued copies duplicate the mirror text taken just above.
         let _ = self.agent.drain_queues_for_restore();
@@ -71,7 +74,11 @@ impl AgentSession {
     pub(super) async fn emit_queue_update(&self) {
         let steering = Self::lock(&self.steering_messages).clone();
         let follow_up = Self::lock(&self.follow_up_messages).clone();
-        self.fanout_emit(AgentSessionEvent::QueueUpdate { steering, follow_up }).await;
+        self.fanout_emit(AgentSessionEvent::QueueUpdate {
+            steering,
+            follow_up,
+        })
+        .await;
     }
 
     /// Interrupt the active run (idempotent, R-11-018 / func-02 R-02-045).

@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 //! `js_number` is `String(n)` for a `Number` out of `JSON.parse` — the fold every numeric header
 //! suffix applies (read's `:<start>-<end>`, bash's `(timeout Ns)`, grep/find/ls's `limit`).
 
@@ -43,7 +48,11 @@ fn js_number_breaks_shortest_form_ties_toward_the_even_digit() {
     // 5 requires the EVEN one, and V8 prints `-1149636667324797.2`. Rust's `Display` picks `…97.3`,
     // so `format!("{n}")` alone is not `String(n)` even inside the fixed band.
     let x = f64::from_bits(0xc310_565a_94b4_e5f5);
-    assert_eq!(format!("{x}"), "-1149636667324797.3", "Rust `Display` ties away from the even digit");
+    assert_eq!(
+        format!("{x}"),
+        "-1149636667324797.3",
+        "Rust `Display` ties away from the even digit"
+    );
     assert_eq!(js_number(x), "-1149636667324797.2");
     assert_eq!(js_number(-x), "1149636667324797.2");
 }

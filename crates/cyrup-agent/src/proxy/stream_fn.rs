@@ -27,7 +27,11 @@ pub struct ProxyStreamFn {
 
 impl ProxyStreamFn {
     pub fn new(proxy_url: impl Into<String>, auth_token: impl Into<String>) -> Self {
-        Self { proxy_url: proxy_url.into(), auth_token: auth_token.into(), env: None }
+        Self {
+            proxy_url: proxy_url.into(),
+            auth_token: auth_token.into(),
+            env: None,
+        }
     }
 
     /// Attach a provider-scoped environment overlay (Pi `options.env`) used when deciding whether
@@ -102,7 +106,12 @@ fn model_thinking_to_unified(level: ModelThinkingLevel) -> Option<ThinkingLevel>
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::proxy::options::build_proxy_request_options;
@@ -112,8 +121,14 @@ mod tests {
     #[test]
     fn model_thinking_lowers_to_unified() {
         assert_eq!(model_thinking_to_unified(ModelThinkingLevel::Off), None);
-        assert_eq!(model_thinking_to_unified(ModelThinkingLevel::High), Some(ThinkingLevel::High));
-        assert_eq!(model_thinking_to_unified(ModelThinkingLevel::Xhigh), Some(ThinkingLevel::Xhigh));
+        assert_eq!(
+            model_thinking_to_unified(ModelThinkingLevel::High),
+            Some(ThinkingLevel::High)
+        );
+        assert_eq!(
+            model_thinking_to_unified(ModelThinkingLevel::Xhigh),
+            Some(ThinkingLevel::Xhigh)
+        );
     }
 
     // --- StreamFn adapter threads thinking_budgets end-to-end -----------------
@@ -125,10 +140,15 @@ mod tests {
     // drop it. (Before the fix this dropped it — `options_from` hardcoded `thinking_budgets: None`.)
     #[test]
     fn proxy_stream_fn_threads_thinking_budgets_into_wire_body() {
-        let budgets =
-            ThinkingBudgets { medium: Some(4096), high: Some(8192), ..ThinkingBudgets::default() };
-        let stream_opts =
-            StreamOptions { thinking_budgets: Some(budgets), ..StreamOptions::default() };
+        let budgets = ThinkingBudgets {
+            medium: Some(4096),
+            high: Some(8192),
+            ..ThinkingBudgets::default()
+        };
+        let stream_opts = StreamOptions {
+            thinking_budgets: Some(budgets),
+            ..StreamOptions::default()
+        };
 
         let proxy_fn = ProxyStreamFn::new("https://proxy.example", "secret");
         // The transform output carries the budgets (Pi `{...options}` spread, proxy.ts:93-97).
@@ -166,8 +186,10 @@ mod tests {
         let mut params = Map::new();
         params.insert("top_p".to_string(), Value::from(0.9));
         params.insert("repetition_penalty".to_string(), Value::from(1.05));
-        let stream_opts =
-            StreamOptions { sampling_params: Some(params.clone()), ..StreamOptions::default() };
+        let stream_opts = StreamOptions {
+            sampling_params: Some(params.clone()),
+            ..StreamOptions::default()
+        };
 
         let proxy_fn = ProxyStreamFn::new("https://proxy.example", "secret");
         let proxy_opts = proxy_fn.options_from(&stream_opts);
@@ -179,7 +201,10 @@ mod tests {
 
         let body = serde_json::to_value(build_proxy_request_options(&proxy_opts)).unwrap();
         assert_eq!(body["samplingParams"]["top_p"], serde_json::json!(0.9));
-        assert_eq!(body["samplingParams"]["repetition_penalty"], serde_json::json!(1.05));
+        assert_eq!(
+            body["samplingParams"]["repetition_penalty"],
+            serde_json::json!(1.05)
+        );
 
         // Unset stays absent on the wire (Pi's `JSON.stringify` drops undefined).
         let none_body = serde_json::to_value(build_proxy_request_options(

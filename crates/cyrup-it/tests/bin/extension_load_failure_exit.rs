@@ -18,7 +18,12 @@
 //! Only the real binary can show the exit code and the stderr text together, so that is what this
 //! drives. Fully offline (`--offline`, faux model, tempdir HOME + agent dir, proxies stripped): no
 //! network, no credentials.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -99,12 +104,17 @@ fn a_failed_extension_load_reports_and_exits_1_in_print_mode() {
     );
     // Pi prints its hint alongside (main.ts:844-846, EXTENSION_LOAD_FAILURE_HINT at :61).
     assert!(
-        r.stderr.contains("Hint: Start without extensions using \"cyrup -ne\"."),
+        r.stderr
+            .contains("Hint: Start without extensions using \"cyrup -ne\"."),
         "stderr was: {}",
         r.stderr
     );
     // The diagnostic belongs on stderr; stdout stays clean for the protocol/answer stream.
-    assert!(!r.stdout.contains("Failed to load extension"), "stdout was: {}", r.stdout);
+    assert!(
+        !r.stdout.contains("Failed to load extension"),
+        "stdout was: {}",
+        r.stdout
+    );
 }
 
 /// The same failure in `--mode json`: the machine-readable surface must not swallow it either.
@@ -112,7 +122,11 @@ fn a_failed_extension_load_reports_and_exits_1_in_print_mode() {
 fn a_failed_extension_load_reports_and_exits_1_in_json_mode() {
     let (r, _tmp) = run(true, &["--mode", "json", "-p", "hi"]);
     assert_eq!(r.code, 1, "stderr was: {}", r.stderr);
-    assert!(r.stderr.contains("Failed to load extension"), "stderr was: {}", r.stderr);
+    assert!(
+        r.stderr.contains("Failed to load extension"),
+        "stderr was: {}",
+        r.stderr
+    );
 }
 
 /// …and in rpc mode, which never renders a startup panel at all.
@@ -120,7 +134,11 @@ fn a_failed_extension_load_reports_and_exits_1_in_json_mode() {
 fn a_failed_extension_load_reports_and_exits_1_in_rpc_mode() {
     let (r, _tmp) = run(true, &["--rpc"]);
     assert_eq!(r.code, 1, "stderr was: {}", r.stderr);
-    assert!(r.stderr.contains("Failed to load extension"), "stderr was: {}", r.stderr);
+    assert!(
+        r.stderr.contains("Failed to load extension"),
+        "stderr was: {}",
+        r.stderr
+    );
 }
 
 /// The CONTROL that stops this from degrading into "every startup exits 1": the identical

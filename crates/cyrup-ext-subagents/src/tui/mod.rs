@@ -46,15 +46,15 @@ use std::time::Instant;
 use crate::background::{self, RunMode, RunStatus};
 use crate::fork_context::ContextMode;
 
-pub mod render;
 pub mod events;
-pub mod notices;
-pub mod fleet_theme;
-pub mod fleet_transcript;
-pub mod fleet_state;
-pub mod fleet_status;
 pub mod fleet;
 pub mod fleet_overlay;
+pub mod fleet_state;
+pub mod fleet_status;
+pub mod fleet_theme;
+pub mod fleet_transcript;
+pub mod notices;
+pub mod render;
 
 // =================================================================================================
 // RunSource (func-SA §4.6's `SubagentRunHandle.source`; shared by every type below)

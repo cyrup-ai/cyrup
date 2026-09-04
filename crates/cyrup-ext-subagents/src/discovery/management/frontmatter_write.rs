@@ -38,7 +38,10 @@ pub(crate) fn write_agent_file(
     Ok(())
 }
 
-pub(crate) fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&HashSet<String>>) -> String {
+pub(crate) fn serialize_agent(
+    def: &AgentDefinition,
+    preserve_fields: Option<&HashSet<String>>,
+) -> String {
     // `preserve(&[..])` mirrors pi's `preserve(...fields)` (true iff any listed key is in the set);
     // `preserving_existing` mirrors `preservingExistingFrontmatter` (`Some` == an UPDATE that must
     // round-trip the file's existing field set; `None` == a CREATE emitting the default field set).
@@ -60,10 +63,16 @@ pub(crate) fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&Ha
     // silently DELETING an author's `alias:`/`aliases:` (the extra-fields loop skips known keys);
     // an author who wrote the singular `alias:` gets the plural back, exactly as upstream does.
     {
-        let aliases_value =
-            if def.aliases.is_empty() { None } else { Some(def.aliases.join(", ")) };
+        let aliases_value = if def.aliases.is_empty() {
+            None
+        } else {
+            Some(def.aliases.join(", "))
+        };
         if aliases_value.is_some() || preserve(&["alias", "aliases"]) {
-            lines.push(format!("aliases: {}", aliases_value.as_deref().unwrap_or("")));
+            lines.push(format!(
+                "aliases: {}",
+                aliases_value.as_deref().unwrap_or("")
+            ));
         }
     }
 
@@ -95,7 +104,10 @@ pub(crate) fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&Ha
         .filter(|list| !list.is_empty())
         .map(|list| list.join(", "));
     if exclude_tools_value.is_some() || preserve(&["excludeTools"]) {
-        lines.push(format!("excludeTools: {}", exclude_tools_value.as_deref().unwrap_or("")));
+        lines.push(format!(
+            "excludeTools: {}",
+            exclude_tools_value.as_deref().unwrap_or("")
+        ));
     }
     // SUBA-092 allowNestedSubagents (`agent-serializer.ts:76-78` @v0.64.0): emitted only when
     // `=== true` or under preserve, and under preserve an unset value is written as an EMPTY value
@@ -110,7 +122,11 @@ pub(crate) fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&Ha
     }
 
     if def.model.is_some() || preserve(&["model"]) {
-        let model_str = def.model.as_ref().map(ToString::to_string).unwrap_or_default();
+        let model_str = def
+            .model
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
         lines.push(format!("model: {model_str}"));
     }
 
@@ -426,7 +442,10 @@ pub(crate) fn preserved_frontmatter_fields(
     }
     if fields.thinking.is_some() {
         set.remove("thinking");
-        if matches!(fields.thinking.as_ref().and_then(|o| o.as_deref()), Some("off")) {
+        if matches!(
+            fields.thinking.as_ref().and_then(|o| o.as_deref()),
+            Some("off")
+        ) {
             set.insert("thinking".to_string());
         }
     }
@@ -480,8 +499,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use super::*;
     use super::super::test_support::sample_agent;
+    use super::*;
     use crate::discovery::types::AgentSource;
 
     /// A `memory:`/`toolBudget:` agent must survive a serialize -> re-parse round-trip. This is
@@ -633,11 +652,20 @@ mod tests {
         def.default_acceptance = Some(serde_json::json!("checked"));
         def.acceptance_role = Some(AcceptanceRole::ReadOnly);
         let serialized = serialize_agent(&def, None);
-        assert!(serialized.contains("\nacceptance: checked\n"), "{serialized}");
-        assert!(serialized.contains("\nacceptanceRole: read-only\n"), "{serialized}");
+        assert!(
+            serialized.contains("\nacceptance: checked\n"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\nacceptanceRole: read-only\n"),
+            "{serialized}"
+        );
         let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
             .expect("round-trips");
-        assert_eq!(reparsed.default_acceptance, Some(serde_json::json!("checked")));
+        assert_eq!(
+            reparsed.default_acceptance,
+            Some(serde_json::json!("checked"))
+        );
         assert_eq!(reparsed.acceptance_role, Some(AcceptanceRole::ReadOnly));
 
         // Neither set: nothing emitted on CREATE; on UPDATE with the keys preserved, both are
@@ -646,8 +674,10 @@ mod tests {
         def.acceptance_role = None;
         let created = serialize_agent(&def, None);
         assert!(!created.contains("acceptance"), "{created}");
-        let preserve: HashSet<String> =
-            ["acceptance", "acceptanceRole"].iter().map(|k| k.to_string()).collect();
+        let preserve: HashSet<String> = ["acceptance", "acceptanceRole"]
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
         let preserved = serialize_agent(&def, Some(&preserve));
         assert!(preserved.contains("\nacceptance: \n"), "{preserved}");
         assert!(preserved.contains("\nacceptanceRole: \n"), "{preserved}");
@@ -727,8 +757,9 @@ mod tests {
 
         let serialized = serialize_agent(&def, None);
         assert!(
-            serialized
-                .contains(r#"runner: {"type":"external-cli","adapter":"claude-code","command":"claude"}"#),
+            serialized.contains(
+                r#"runner: {"type":"external-cli","adapter":"claude-code","command":"claude"}"#
+            ),
             "the runner must be emitted as compact JSON in upstream's key order:\n{serialized}"
         );
 
@@ -828,7 +859,10 @@ mod tests {
             ),
             "block-valued extra field must round-trip as an indented block:\n{serialized}"
         );
-        assert!(serialized.contains("customVendorField: some-value"), "{serialized}");
+        assert!(
+            serialized.contains("customVendorField: some-value"),
+            "{serialized}"
+        );
         assert!(
             serialized.contains("disabled: true"),
             "disabled must round-trip as an extra field, not vanish:\n{serialized}"
@@ -841,16 +875,28 @@ mod tests {
         let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
             .expect("re-parses");
         assert_eq!(
-            reparsed.extra_fields.get("customVendorField").map(String::as_str),
+            reparsed
+                .extra_fields
+                .get("customVendorField")
+                .map(String::as_str),
             Some("some-value")
         );
         assert_eq!(
-            reparsed.extra_fields.get("vendorPolicy").map(String::as_str),
+            reparsed
+                .extra_fields
+                .get("vendorPolicy")
+                .map(String::as_str),
             Some("\"*\": ask\nread: allow\nbash:\n  \"*\": ask\n  \"git *\": allow"),
             "the block value must round-trip byte-for-byte"
         );
-        assert_eq!(reparsed.extra_fields.get("disabled").map(String::as_str), Some("true"));
-        assert_eq!(reparsed.disabled, None, "disabled: in a file is never an honored flag");
+        assert_eq!(
+            reparsed.extra_fields.get("disabled").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            reparsed.disabled, None,
+            "disabled: in a file is never an honored flag"
+        );
         assert_eq!(reparsed.thinking, Some("off".to_string()));
     }
 
@@ -882,7 +928,6 @@ mod tests {
         assert!(!serialize_agent(&def, None).contains("aliases:"));
     }
 
-
     /// SUBA-092 — the same silent-deletion trap as `toolBudget`/`turnBudget` above, for the two keys
     /// `b26da18e` added to `KNOWN_FIELDS` (`agent-serializer.ts:12-13,74-78` @v0.64.0). Both halves
     /// are asserted: the emit arms, and the round-trip back through the parser.
@@ -910,8 +955,15 @@ mod tests {
 
         let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
             .expect("round-trips back through the parser");
-        assert_eq!(reparsed.exclude_tools, def.exclude_tools, "excludeTools lost on round trip");
-        assert_eq!(reparsed.allow_nested_subagents, Some(true), "allowNestedSubagents lost on round trip");
+        assert_eq!(
+            reparsed.exclude_tools, def.exclude_tools,
+            "excludeTools lost on round trip"
+        );
+        assert_eq!(
+            reparsed.allow_nested_subagents,
+            Some(true),
+            "allowNestedSubagents lost on round trip"
+        );
         assert!(!reparsed.extra_fields.contains_key("excludeTools"));
         assert!(!reparsed.extra_fields.contains_key("allowNestedSubagents"));
     }
@@ -935,7 +987,10 @@ mod tests {
             .map(str::to_string)
             .collect();
         let preserved = serialize_agent(&def, Some(&preserve));
-        assert!(preserved.contains("\nexcludeTools: \n"), "empty value under preserve:\n{preserved}");
+        assert!(
+            preserved.contains("\nexcludeTools: \n"),
+            "empty value under preserve:\n{preserved}"
+        );
         assert!(
             preserved.contains("\nallowNestedSubagents: false\n"),
             "an explicit false is written back as false under preserve:\n{preserved}"

@@ -35,16 +35,23 @@ async fn rpc_model_commands_span_the_full_auth_filtered_registry() {
 
     // Phase 1 — `get_available_models` must list the OTHER configured provider's models.
     let reader = Cursor::new(
-        concat!(r#"{"type":"get_available_models","id":"a"}"#, "\n").as_bytes().to_vec(),
+        concat!(r#"{"type":"get_available_models","id":"a"}"#, "\n")
+            .as_bytes()
+            .to_vec(),
     );
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
     let lines = parse_lines(&out);
     let listed = lines
         .iter()
         .find(|l| l["command"] == "get_available_models")
         .expect("get_available_models response");
-    let models = listed["data"]["models"].as_array().expect("models array").clone();
+    let models = listed["data"]["models"]
+        .as_array()
+        .expect("models array")
+        .clone();
     let anthropic = models
         .iter()
         .find(|m| m["provider"] == "anthropic")
@@ -55,8 +62,10 @@ async fn rpc_model_commands_span_the_full_auth_filtered_registry() {
             )
         })
         .clone();
-    let anthropic_id =
-        anthropic["id"].as_str().expect("catalog model carries an id").to_string();
+    let anthropic_id = anthropic["id"]
+        .as_str()
+        .expect("catalog model carries an id")
+        .to_string();
 
     // Phase 2 — `set_model` onto that non-active provider must succeed, and `get_state` must then
     // report the FULL model record for it (not the two-field degraded stub).
@@ -66,19 +75,37 @@ async fn rpc_model_commands_span_the_full_auth_filtered_registry() {
     );
     let reader = Cursor::new(script.into_bytes());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
     let lines = parse_lines(&out);
-    let set = lines.iter().find(|l| l["command"] == "set_model").expect("set_model response");
+    let set = lines
+        .iter()
+        .find(|l| l["command"] == "set_model")
+        .expect("set_model response");
     assert_eq!(
         set["success"], true,
         "set_model onto a different CONFIGURED provider must succeed (Pi rpc-mode.ts:468-475): {set}"
     );
-    let state = lines.iter().find(|l| l["command"] == "get_state").expect("get_state response");
-    assert_eq!(state["data"]["model"]["provider"], "anthropic", "get_state model: {state}");
-    assert_eq!(state["data"]["model"]["id"].as_str(), Some(anthropic_id.as_str()));
+    let state = lines
+        .iter()
+        .find(|l| l["command"] == "get_state")
+        .expect("get_state response");
+    assert_eq!(
+        state["data"]["model"]["provider"], "anthropic",
+        "get_state model: {state}"
+    );
+    assert_eq!(
+        state["data"]["model"]["id"].as_str(),
+        Some(anthropic_id.as_str())
+    );
     assert!(
         state["data"]["model"].get("contextWindow").is_some()
-            || state["data"]["model"].as_object().map(|o| o.len()).unwrap_or(0) > 2,
+            || state["data"]["model"]
+                .as_object()
+                .map(|o| o.len())
+                .unwrap_or(0)
+                > 2,
         "get_state.model must be the FULL catalog record, not the degraded {{provider,id}} stub: {state}"
     );
 }
@@ -107,15 +134,25 @@ async fn rpc_cycle_model_spans_the_full_auth_filtered_registry() {
     let runtime = build_runtime_hermetic_auth(&fx, Arc::new(FauxProvider::new())).await;
 
     let reader = Cursor::new(
-        concat!(r#"{"type":"cycle_model","id":"c"}"#, "\n", r#"{"type":"get_state","id":"s"}"#, "\n")
-            .as_bytes()
-            .to_vec(),
+        concat!(
+            r#"{"type":"cycle_model","id":"c"}"#,
+            "\n",
+            r#"{"type":"get_state","id":"s"}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec(),
     );
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
     let lines = parse_lines(&out);
 
-    let cycled = lines.iter().find(|l| l["command"] == "cycle_model").expect("cycle_model response");
+    let cycled = lines
+        .iter()
+        .find(|l| l["command"] == "cycle_model")
+        .expect("cycle_model response");
     assert_eq!(cycled["success"], true, "cycle_model response: {cycled}");
     assert!(
         !cycled["data"].is_null(),
@@ -128,10 +165,19 @@ async fn rpc_cycle_model_spans_the_full_auth_filtered_registry() {
         "cycle_model must step onto the OTHER configured provider (Pi \
          `_modelRuntime.getAvailable()`, agent-session.ts:1644): {cycled}"
     );
-    assert_eq!(cycled["data"]["isScoped"], false, "no scoped set → the available arm: {cycled}");
+    assert_eq!(
+        cycled["data"]["isScoped"], false,
+        "no scoped set → the available arm: {cycled}"
+    );
 
     // ...and the switch is real: the session's live model — what the next turn streams with —
     // reports the new provider, which also proves the owning provider was installed.
-    let state = lines.iter().find(|l| l["command"] == "get_state").expect("get_state response");
-    assert_eq!(state["data"]["model"]["provider"], "anthropic", "get_state after cycle: {state}");
+    let state = lines
+        .iter()
+        .find(|l| l["command"] == "get_state")
+        .expect("get_state response");
+    assert_eq!(
+        state["data"]["model"]["provider"], "anthropic",
+        "get_state after cycle: {state}"
+    );
 }

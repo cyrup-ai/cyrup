@@ -34,9 +34,9 @@ pub use options::{OpenAiResponsesOptions, ReasoningSummary};
 
 pub(crate) use convert::convert_responses_messages;
 pub(crate) use decoder::decode_stream;
-pub(crate) use tools::{ConvertResponsesToolsOptions, convert_responses_tools};
 #[cfg(test)]
 pub(crate) use params::build_params;
+pub(crate) use tools::{ConvertResponsesToolsOptions, convert_responses_tools};
 
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::AuthResult;

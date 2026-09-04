@@ -19,15 +19,15 @@
 //! The cursor is `theme.fg("accent", "› ")` (U+203A, `:57`) — not the `"→ "` every other picker
 //! uses — and the selected message is `theme.bold(...)` on top of it.
 
+use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap};
-use crate::selector::{border_rule_line, centered_window, Selector, SelectorOutcome};
+use crate::selector::{Selector, SelectorOutcome, border_rule_line, centered_window};
 use crate::text_width::truncate_line_to_width;
 use crate::theme::UiTheme;
 
@@ -92,7 +92,9 @@ impl UserMessageSelector {
         let (start, end) = centered_window(self.selected, len, MAX_VISIBLE);
         let mut lines = Vec::with_capacity((end - start) * 3 + 1);
         for i in start..end {
-            let Some(message) = self.messages.get(i) else { continue };
+            let Some(message) = self.messages.get(i) else {
+                continue;
+            };
             let is_selected = i == self.selected;
             // First line: `cursor + (isSelected ? bold(msg) : msg)`, the message hard-truncated to
             // `width - 2` to leave room for the two-column cursor (`:58-60`).
@@ -181,15 +183,21 @@ impl Selector for UserMessageSelector {
             // Up/Down WRAP (`:84-90`).
             Some(SelectAction::Up) | Some(SelectAction::PageUp) => {
                 if len > 0 {
-                    self.selected =
-                        if self.selected == 0 { len - 1 } else { self.selected.saturating_sub(1) };
+                    self.selected = if self.selected == 0 {
+                        len - 1
+                    } else {
+                        self.selected.saturating_sub(1)
+                    };
                 }
                 SelectorOutcome::Redraw
             }
             Some(SelectAction::Down) | Some(SelectAction::PageDown) => {
                 if len > 0 {
-                    self.selected =
-                        if self.selected.saturating_add(1) >= len { 0 } else { self.selected + 1 };
+                    self.selected = if self.selected.saturating_add(1) >= len {
+                        0
+                    } else {
+                        self.selected + 1
+                    };
                 }
                 SelectorOutcome::Redraw
             }

@@ -53,7 +53,10 @@ impl PermissionSystemExtension {
         // legitimately exposes nothing, and would replay the wrong prompt if the backend attached
         // between turns.
         let allowed: Option<Vec<String>> = services.and_then(|s| s.all_tool_names()).map(|tools| {
-            tools.into_iter().filter(|name| self.should_expose_tool(name, agent)).collect()
+            tools
+                .into_iter()
+                .filter(|name| self.should_expose_tool(name, agent))
+                .collect()
         });
 
         let Some(allowed) = allowed else {

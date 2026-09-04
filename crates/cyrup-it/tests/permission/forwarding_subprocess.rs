@@ -18,7 +18,12 @@
 //! Each assertion proves the decision genuinely traversed the process boundary: the watcher's
 //! select-count > 0 means THIS process saw a request written by the OTHER process, and the child's exit
 //! code reflects the decision THIS process wrote back.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::Path;
 use std::process::Command;
@@ -30,13 +35,15 @@ use cyrup_core::ToolCallId;
 use cyrup_ext::{
     ExtMode, HookOutcome, HostCtx, HostEvent, HostServices, HumanInteractionLock, InitApi,
 };
-use cyrup_permission_system::{permission_extension_for_env, spawn_forwarding_watcher, ExtensionConfig};
+use cyrup_permission_system::{
+    ExtensionConfig, permission_extension_for_env, spawn_forwarding_watcher,
+};
 
 // The scripted parent-side host, the ASK policy and the child reaper are shared with
 // `forwarding_spawn_env.rs` — see `forwarding_common.rs` for why the 40ms/25ms poll split collapsed
 // to one value and why `spawn_child` deliberately did NOT.
 use crate::forwarding_common::{
-    wait_child, write_policy, ScriptedHost, EXIT_ALLOWED, EXIT_BLOCKED, EXIT_UNEXPECTED,
+    EXIT_ALLOWED, EXIT_BLOCKED, EXIT_UNEXPECTED, ScriptedHost, wait_child, write_policy,
 };
 
 /// A scripted [`HostServices`] whose ONLY override is [`HostServices::all_tool_names`] — the full
@@ -113,7 +120,9 @@ fn forwarding_child_role_entry() {
         // any event reaches it — for every role, including this re-exec'd subagent child. Without
         // this the registry gate treats "bash" as unregistered and blocks it immediately, before the
         // ask-forwarding logic under test ever runs.
-        ext.set_host_services(Arc::new(ChildRegistryServices { names: vec!["bash".to_string()] }));
+        ext.set_host_services(Arc::new(ChildRegistryServices {
+            names: vec!["bash".to_string()],
+        }));
         // A headless child ctx (has_ui=false) — the exact shape a re-exec'd subagent runs under.
         let ctx = HostCtx::event(ExtMode::Print, false, agent_dir.clone());
         let event = HostEvent::ToolCall {
@@ -151,7 +160,12 @@ fn spawn_child(
 ) -> std::process::Child {
     let exe = std::env::current_exe().expect("current test exe");
     let mut cmd = Command::new(exe);
-    cmd.args(["--exact", CHILD_TEST_NAME, "--nocapture", "--test-threads=1"]);
+    cmd.args([
+        "--exact",
+        CHILD_TEST_NAME,
+        "--nocapture",
+        "--test-threads=1",
+    ]);
     cmd.env(CHILD_ROLE_ENV, "1");
     cmd.env(CHILD_AGENT_DIR_ENV, agent_dir);
     cmd.env(CHILD_COMMAND_ENV, command);
@@ -162,7 +176,10 @@ fn spawn_child(
     cmd.env("CYRUP_SUBAGENT_PARENT_SESSION", parent_id);
     // Bound the child's blocking wait so a wiring bug fails fast instead of hanging on the 10-min
     // production default (and so the timeout case is a fast, genuine fail-closed proof).
-    cmd.env("CYRUP_PERMISSION_FORWARDING_TIMEOUT_MS", child_wait_ms.to_string());
+    cmd.env(
+        "CYRUP_PERMISSION_FORWARDING_TIMEOUT_MS",
+        child_wait_ms.to_string(),
+    );
     cmd.spawn().expect("spawn child role subprocess")
 }
 
@@ -205,8 +222,15 @@ async fn forwarded_allow_crosses_process_and_lets_child_proceed() {
     let code = wait_child(child, Duration::from_secs(30)).await;
     watcher.abort();
 
-    assert_eq!(code, Some(EXIT_ALLOWED), "the forwarded ALLOW must let the child's tool proceed (exit 0)");
-    assert!(sentinel.exists(), "the child's tool must have run (sentinel written) after the cross-process allow");
+    assert_eq!(
+        code,
+        Some(EXIT_ALLOWED),
+        "the forwarded ALLOW must let the child's tool proceed (exit 0)"
+    );
+    assert!(
+        sentinel.exists(),
+        "the child's tool must have run (sentinel written) after the cross-process allow"
+    );
     assert!(
         selects.load(Ordering::SeqCst) >= 1,
         "the PARENT watcher must have surfaced ≥1 forwarded prompt written by the CHILD process (boundary crossed)"
@@ -241,8 +265,15 @@ async fn forwarded_deny_crosses_process_and_blocks_child() {
     let code = wait_child(child, Duration::from_secs(30)).await;
     watcher.abort();
 
-    assert_eq!(code, Some(EXIT_BLOCKED), "the forwarded DENY must block the child's tool (exit 3)");
-    assert!(!sentinel.exists(), "a denied tool must NOT run (no sentinel)");
+    assert_eq!(
+        code,
+        Some(EXIT_BLOCKED),
+        "the forwarded DENY must block the child's tool (exit 3)"
+    );
+    assert!(
+        !sentinel.exists(),
+        "a denied tool must NOT run (no sentinel)"
+    );
     assert!(
         selects.load(Ordering::SeqCst) >= 1,
         "the PARENT watcher must have surfaced the forwarded prompt it then rejected"
@@ -258,12 +289,25 @@ async fn forwarded_timeout_fail_closes_the_child() {
 
     // NO watcher/responder at all: the child writes its request and no one ever answers. It must
     // fail-CLOSE (deny) after its shortened wait bound (1.2s here), never hang, never allow.
-    let child = spawn_child(agent_dir.path(), &parent_id, "curl http://evil", &sentinel, 1_200);
+    let child = spawn_child(
+        agent_dir.path(),
+        &parent_id,
+        "curl http://evil",
+        &sentinel,
+        1_200,
+    );
     let started = Instant::now();
     let code = wait_child(child, Duration::from_secs(30)).await;
 
-    assert_eq!(code, Some(EXIT_BLOCKED), "an unanswered forward must fail-CLOSE the child (exit 3)");
-    assert!(!sentinel.exists(), "a timed-out forward must NOT let the tool run");
+    assert_eq!(
+        code,
+        Some(EXIT_BLOCKED),
+        "an unanswered forward must fail-CLOSE the child (exit 3)"
+    );
+    assert!(
+        !sentinel.exists(),
+        "a timed-out forward must NOT let the tool run"
+    );
     assert!(
         started.elapsed() >= Duration::from_millis(1_000),
         "the child must have actually WAITED on its bound before denying (not denied instantly)"

@@ -1,17 +1,22 @@
 //! `/tree` session-navigator layout tests (spec/tui/05 §5.1; Pi `tree-selector.ts`). Exercises the
 //! bespoke layout: connectors, fold markers/behavior, filter modes, glyphs, and navigation — both
 //! through the public API and via TestBackend buffer assertions.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::key_event as key;
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{
-    FilterMode, SelectKeymap, Selector, SelectorOutcome, TreeKind, TreeNode, TreeSelector, UiTheme,
-    FIELD_SEP,
+    FIELD_SEP, FilterMode, SelectKeymap, Selector, SelectorOutcome, TreeKind, TreeNode,
+    TreeSelector, UiTheme,
 };
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
-use ratatui::Terminal;
-use super::harness::key_event as key;
 
 fn node(id: &str, depth: usize, label: &str, kind: TreeKind) -> TreeNode {
     let mut n = TreeNode::message(id, depth, label);
@@ -75,23 +80,34 @@ fn renders_connectors_glyphs_and_fold_markers() {
     let theme = UiTheme::dark();
     let mut sel = TreeSelector::new(sample());
     let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-    terminal.draw(|f| sel.render(f, Rect::new(0, 0, 80, 12), &theme)).unwrap();
+    terminal
+        .draw(|f| sel.render(f, Rect::new(0, 0, 80, 12), &theme))
+        .unwrap();
     let text = buf_string(&terminal);
     assert!(text.contains("Session Tree"), "header: {text}");
     assert!(text.contains("Filter: default"));
     assert!(text.contains('●'), "message glyph");
     assert!(text.contains('◆'), "model-change glyph");
     assert!(text.contains('⚙'), "tool-group glyph");
-    assert!(text.contains("├─") || text.contains("└─"), "connectors: {text}");
+    assert!(
+        text.contains("├─") || text.contains("└─"),
+        "connectors: {text}"
+    );
     // S24 (corrected): pi draws the fold state INSIDE the connector — `tree-selector.ts:722`
     //   `prefixChars.push(isFolded ? "⊞" : foldable ? "⊟" : "─");`
     // at `posInLevel === 1`, i.e. in place of the `─` of the node's own `├─ `. `model -> opus` is
     // depth-1, foldable and expanded, and is not the last child, so its connector is exactly `├⊟ `.
     // The separate `foldMarker` at `:734` is the connector-LESS fallback (`!showsFoldInConnector`),
     // not evidence that pi never emits `⊟`.
-    assert!(text.contains("├⊟ "), "expanded foldable node must render `├⊟ `: {text}");
+    assert!(
+        text.contains("├⊟ "),
+        "expanded foldable node must render `├⊟ `: {text}"
+    );
     // Nothing is folded, so neither fold glyph may appear as `⊞`.
-    assert!(!text.contains('\u{229e}'), "folded marker `⊞` present with nothing folded: {text}");
+    assert!(
+        !text.contains('\u{229e}'),
+        "folded marker `⊞` present with nothing folded: {text}"
+    );
     assert!(text.contains("☆labeled"), "label star on the labeled node");
 }
 
@@ -140,7 +156,11 @@ fn filter_modes_change_visible_set() {
     sel.handle(&ctrl('d'), &SelectKeymap::default());
     assert_eq!(sel.filter(), FilterMode::Default);
     sel.handle(&ctrl('d'), &SelectKeymap::default());
-    assert_eq!(sel.filter(), FilterMode::Default, "`filter.default` is not a toggle");
+    assert_eq!(
+        sel.filter(),
+        FilterMode::Default,
+        "`filter.default` is not a toggle"
+    );
 }
 
 /// `app.tree.filter.cycleForward` / `cycleBackward` walk pi's ordered mode list and wrap
@@ -161,7 +181,10 @@ fn filter_cycle_walks_pis_mode_order_and_wraps() {
     }
     // Backward from `default` wraps to the end of the list.
     sel.handle(
-        &KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        &KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
         &SelectKeymap::default(),
     );
     assert_eq!(sel.filter(), FilterMode::All, "cycleBackward wraps");
@@ -186,11 +209,19 @@ fn typing_a_word_searches_and_fires_no_tree_action() {
     // No tree action fired: the filter is untouched, nothing folded, no label editor opened.
     assert_eq!(sel.filter(), FilterMode::Default);
     // And the search really filters: no sample row contains "text".
-    assert!(sel.visible_ids().is_empty(), "no row matches `text`: {:?}", sel.visible_ids());
+    assert!(
+        sel.visible_ids().is_empty(),
+        "no row matches `text`: {:?}",
+        sel.visible_ids()
+    );
     // Enter on an empty result set must NOT produce an `Apply` — the payload `app.rs` persists via
     // `host_services.set_label`.
     let out = sel.handle(&key(KeyCode::Enter), &SelectKeymap::default());
-    assert_eq!(out, SelectorOutcome::Redraw, "no Apply, so no label is written: {out:?}");
+    assert_eq!(
+        out,
+        SelectorOutcome::Redraw,
+        "no Apply, so no label is written: {out:?}"
+    );
 }
 
 /// The search is whitespace-tokenised, lowercased, and every token must be a substring of the row
@@ -201,7 +232,11 @@ fn search_matches_all_tokens_case_insensitively() {
     for c in "FIX Foot".chars() {
         sel.handle(&ch(c), &SelectKeymap::default());
     }
-    assert_eq!(sel.visible_ids(), vec!["f".to_string()], "both tokens must match one row");
+    assert_eq!(
+        sel.visible_ids(),
+        vec!["f".to_string()],
+        "both tokens must match one row"
+    );
     // Backspace pops one character (`:1078-1084`).
     sel.handle(&key(KeyCode::Backspace), &SelectKeymap::default());
     assert_eq!(sel.search_query(), "FIX Foo");
@@ -229,11 +264,18 @@ fn escape_clears_the_search_before_it_cancels() {
 fn a_rebound_tree_filter_id_takes_effect() {
     use crate::{TreeAction, TreeKeymap};
     let mut km = TreeKeymap::default();
-    km.merge_json(r#"{"app.tree.filter.noTools": "ctrl+n"}"#).unwrap();
-    assert_eq!(TreeAction::from_id("app.tree.filter.noTools"), Some(TreeAction::FilterNoTools));
+    km.merge_json(r#"{"app.tree.filter.noTools": "ctrl+n"}"#)
+        .unwrap();
+    assert_eq!(
+        TreeAction::from_id("app.tree.filter.noTools"),
+        Some(TreeAction::FilterNoTools)
+    );
     let mut sel = TreeSelector::new(sample());
     sel.set_keymap(km);
-    sel.handle(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL), &SelectKeymap::default());
+    sel.handle(
+        &KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        &SelectKeymap::default(),
+    );
     assert_eq!(sel.filter(), FilterMode::NoTools);
 }
 
@@ -246,12 +288,26 @@ fn help_row_and_search_prompt_come_from_the_live_keymap() {
     let theme = UiTheme::dark();
     let mut sel = TreeSelector::new(sample());
     let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
-    terminal.draw(|f| sel.render(f, Rect::new(0, 0, 120, 14), &theme)).unwrap();
+    terminal
+        .draw(|f| sel.render(f, Rect::new(0, 0, 120, 14), &theme))
+        .unwrap();
     let text = buf_string(&terminal);
-    assert!(text.contains("Type to search:"), "standing search prompt: {text}");
-    assert!(text.contains("alt+←/alt+→ branch"), "branch cell from the live keymap: {text}");
-    assert!(text.contains("shift+l label"), "label cell from the live keymap: {text}");
-    assert!(!text.contains("z/x branch"), "the invented `z`/`x` cell is gone: {text}");
+    assert!(
+        text.contains("Type to search:"),
+        "standing search prompt: {text}"
+    );
+    assert!(
+        text.contains("alt+←/alt+→ branch"),
+        "branch cell from the live keymap: {text}"
+    );
+    assert!(
+        text.contains("shift+l label"),
+        "label cell from the live keymap: {text}"
+    );
+    assert!(
+        !text.contains("z/x branch"),
+        "the invented `z`/`x` cell is gone: {text}"
+    );
 }
 
 #[test]
@@ -281,12 +337,24 @@ fn shift_l_opens_the_label_editor_overlay() {
     let theme = UiTheme::dark();
     let mut sel = TreeSelector::new(sample());
     let out = sel.handle(&shift('l'), &SelectKeymap::default());
-    assert_eq!(out, SelectorOutcome::Redraw, "`shift+l` opens the editor and redraws");
+    assert_eq!(
+        out,
+        SelectorOutcome::Redraw,
+        "`shift+l` opens the editor and redraws"
+    );
     let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-    terminal.draw(|f| sel.render(f, Rect::new(0, 0, 80, 12), &theme)).unwrap();
+    terminal
+        .draw(|f| sel.render(f, Rect::new(0, 0, 80, 12), &theme))
+        .unwrap();
     let text = buf_string(&terminal);
-    assert!(text.contains("Label (empty to remove):"), "label prompt shown: {text}");
-    assert!(text.contains("enter save"), "save/cancel hint shown: {text}");
+    assert!(
+        text.contains("Label (empty to remove):"),
+        "label prompt shown: {text}"
+    );
+    assert!(
+        text.contains("enter save"),
+        "save/cancel hint shown: {text}"
+    );
 }
 
 /// While the editor is open it captures ALL keys as literal text — `z` types a `z` instead of folding,
@@ -301,10 +369,21 @@ fn label_editor_captures_keys_and_confirms_with_apply_payload() {
     sel.handle(&shift('l'), &SelectKeymap::default());
     // Type "z1x" — every char is literal; the filter stays default and nothing folds.
     for c in ['z', '1', 'x'] {
-        assert_eq!(sel.handle(&ch(c), &SelectKeymap::default()), SelectorOutcome::Redraw);
+        assert_eq!(
+            sel.handle(&ch(c), &SelectKeymap::default()),
+            SelectorOutcome::Redraw
+        );
     }
-    assert_eq!(sel.filter(), FilterMode::Default, "digits typed literally, no filter change");
-    assert_eq!(sel.visible_indices().len(), 6, "`z`/`x` typed literally, no fold/unfold");
+    assert_eq!(
+        sel.filter(),
+        FilterMode::Default,
+        "digits typed literally, no filter change"
+    );
+    assert_eq!(
+        sel.visible_indices().len(),
+        6,
+        "`z`/`x` typed literally, no fold/unfold"
+    );
     // Confirm → the persist payload carries the entry id + the typed label; the slot stays open.
     let out = sel.handle(&key(KeyCode::Enter), &SelectKeymap::default());
     assert_eq!(out, SelectorOutcome::Apply(format!("root{FIELD_SEP}z1x")));
@@ -312,8 +391,14 @@ fn label_editor_captures_keys_and_confirms_with_apply_payload() {
     // `sample()`, but labeled-only now includes it alongside the pre-labeled `f`.
     sel.set_filter(FilterMode::LabeledOnly);
     let labeled = sel.visible_ids();
-    assert!(labeled.contains(&"root".to_string()), "root gained a label star: {labeled:?}");
-    assert!(labeled.contains(&"f".to_string()), "pre-labeled node still present: {labeled:?}");
+    assert!(
+        labeled.contains(&"root".to_string()),
+        "root gained a label star: {labeled:?}"
+    );
+    assert!(
+        labeled.contains(&"f".to_string()),
+        "pre-labeled node still present: {labeled:?}"
+    );
 }
 
 /// Confirming an EMPTY buffer clears the label (Pi `value || undefined` → remove; the payload's label
@@ -331,7 +416,10 @@ fn label_editor_empty_confirm_removes_label() {
     assert_eq!(out, SelectorOutcome::Apply(format!("f{FIELD_SEP}")));
     // The star is cleared locally: labeled-only now excludes `f`.
     sel.set_filter(FilterMode::LabeledOnly);
-    assert!(!sel.visible_ids().contains(&"f".to_string()), "label star cleared after empty confirm");
+    assert!(
+        !sel.visible_ids().contains(&"f".to_string()),
+        "label star cleared after empty confirm"
+    );
 }
 
 /// Esc inside the editor discards the edit (no `Apply`, no label change) and returns to the tree.
@@ -342,9 +430,17 @@ fn label_editor_esc_discards() {
     sel.handle(&shift('l'), &SelectKeymap::default());
     sel.handle(&ch('x'), &SelectKeymap::default());
     let out = sel.handle(&key(KeyCode::Esc), &SelectKeymap::default());
-    assert_eq!(out, SelectorOutcome::Redraw, "esc discards without an Apply");
+    assert_eq!(
+        out,
+        SelectorOutcome::Redraw,
+        "esc discards without an Apply"
+    );
     // The editor closed: a subsequent `alt+left` folds again (tree keys are live once more).
     sel.handle(&key(KeyCode::Down), &SelectKeymap::default()); // row 1 (foldable model)
     sel.handle(&alt(KeyCode::Left), &SelectKeymap::default());
-    assert_eq!(sel.visible_indices().len(), 5, "tree keys live again after cancel");
+    assert_eq!(
+        sel.visible_indices().len(),
+        5,
+        "tree keys live again after cancel"
+    );
 }

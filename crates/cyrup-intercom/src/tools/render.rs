@@ -42,7 +42,10 @@ fn preview_text(value: Option<&Value>, max_length: usize) -> Option<String> {
         return None;
     }
     if normalized.chars().count() > max_length {
-        let head: String = normalized.chars().take(max_length.saturating_sub(1)).collect();
+        let head: String = normalized
+            .chars()
+            .take(max_length.saturating_sub(1))
+            .collect();
         Some(format!("{head}…"))
     } else {
         Some(normalized)
@@ -85,10 +88,14 @@ pub(crate) fn render_intercom_call(args: &Value) -> String {
     // `typeof args.action === "string" ? args.action : "intercom"`.
     let action = string_field(args, "action").unwrap_or("intercom");
     // `typeof args.to === "string" && args.to.trim() ? args.to.trim() : undefined`.
-    let target = string_field(args, "to").map(str::trim).filter(|t| !t.is_empty());
+    let target = string_field(args, "to")
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
     let message_preview = preview_text(args.get("message"), 96);
-    let attachment_count =
-        args.get("attachments").and_then(Value::as_array).map_or(0, Vec::len);
+    let attachment_count = args
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
 
     let mut text = format!("intercom {action}");
     if let Some(target) = target {
@@ -114,9 +121,14 @@ pub(crate) fn render_intercom_result(result: &Value) -> String {
     // `if (details?.messageId && !context.expanded)` — a truthiness test, so an empty id is skipped.
     // `context.expanded` is not observable here (see the module doc), so this draws the collapsed
     // tier a transcript row shows by default.
-    if let Some(message_id) = details.and_then(|d| string_field(d, "messageId")).filter(|id| !id.is_empty())
+    if let Some(message_id) = details
+        .and_then(|d| string_field(d, "messageId"))
+        .filter(|id| !id.is_empty())
     {
-        text.push_str(&format!(" ({})", crate::identity::short_session_id(message_id)));
+        text.push_str(&format!(
+            " ({})",
+            crate::identity::short_session_id(message_id)
+        ));
     }
     text
 }
@@ -151,8 +163,9 @@ pub(crate) fn render_contact_supervisor_result(result: &Value) -> String {
     let failed = failed(details);
     // `typeof details?.structuredReplyParseError === "string"` — presence of the KEY as a string,
     // not its truthiness, so an empty-string parse error still warns.
-    let parse_warning =
-        details.and_then(|d| d.get("structuredReplyParseError")).and_then(Value::as_str);
+    let parse_warning = details
+        .and_then(|d| d.get("structuredReplyParseError"))
+        .and_then(Value::as_str);
 
     let mut text = String::from(match (failed, parse_warning.is_some()) {
         (true, _) => "✗ ",
@@ -179,7 +192,10 @@ mod tests {
         assert_eq!(preview_text(Some(&json!("   \n\t ")), 96), None);
         assert_eq!(preview_text(None, 96), None);
         // `\s+` → one space, then trim.
-        assert_eq!(preview_text(Some(&json!("  a \n\t b  ")), 96).unwrap(), "a b");
+        assert_eq!(
+            preview_text(Some(&json!("  a \n\t b  ")), 96).unwrap(),
+            "a b"
+        );
         // The ellipsis branch is `slice(0, maxLength - 1)` + `…`, so the RESULT is `maxLength`
         // chars — an off-by-one that a `take(max)` + `…` port would get wrong.
         let long = "x".repeat(100);
@@ -201,7 +217,10 @@ mod tests {
                 { "type": "text", "text": "second" },
             ]
         });
-        assert_eq!(first_text_content(&result), "Reply from reviewer:\nlooks good");
+        assert_eq!(
+            first_text_content(&result),
+            "Reply from reviewer:\nlooks good"
+        );
         // No text content at all is upstream's `?? ""`.
         assert_eq!(first_text_content(&json!({ "content": [] })), "");
         assert_eq!(first_text_content(&json!({})), "");
@@ -232,7 +251,10 @@ mod tests {
         // attachment draws the segment too — singular, with no `s`. This assertion originally
         // omitted it while still passing an `attachments` array, contradicting both the test's own
         // name and the plural case two lines below.
-        assert_eq!(text, "intercom ask → reviewer (1 attachment)\n  please review this");
+        assert_eq!(
+            text,
+            "intercom ask → reviewer (1 attachment)\n  please review this"
+        );
         // Zero attachments is the only count that draws nothing.
         assert_eq!(
             render_intercom_call(&json!({ "action": "ask", "to": "reviewer", "attachments": [] })),
@@ -246,7 +268,10 @@ mod tests {
         }));
         assert_eq!(two, "intercom send (2 attachments)\n  hi");
         // A blank `to` is dropped (`args.to.trim()` truthiness), and a missing action is "intercom".
-        assert_eq!(render_intercom_call(&json!({ "to": "   " })), "intercom intercom");
+        assert_eq!(
+            render_intercom_call(&json!({ "to": "   " })),
+            "intercom intercom"
+        );
     }
 
     #[test]
@@ -277,9 +302,15 @@ mod tests {
             "interview": { "title": "  Pick a plan  " },
             "message": "which one?",
         }));
-        assert_eq!(call, "contact_supervisor interview_request Pick a plan\n  which one?");
+        assert_eq!(
+            call,
+            "contact_supervisor interview_request Pick a plan\n  which one?"
+        );
         // Missing reason is upstream's "contact".
-        assert_eq!(render_contact_supervisor_call(&json!({})), "contact_supervisor contact");
+        assert_eq!(
+            render_contact_supervisor_call(&json!({})),
+            "contact_supervisor contact"
+        );
 
         let warn = render_contact_supervisor_result(&json!({
             "content": [{ "type": "text", "text": "**Reply from supervisor:**\nok" }],

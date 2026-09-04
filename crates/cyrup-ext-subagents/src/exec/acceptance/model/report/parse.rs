@@ -3,9 +3,13 @@
 
 use serde_json::Value;
 
-use super::super::report::fences::{extract_balanced_json, fenced_block_bodies, fenced_matches, parse_report_json};
+use super::super::report::fences::{
+    extract_balanced_json, fenced_block_bodies, fenced_matches, parse_report_json,
+};
 use super::super::report::normalize::normalize_acceptance_report_value;
-use super::super::report::validate::{has_generic_acceptance_report_signal, validate_acceptance_report};
+use super::super::report::validate::{
+    has_generic_acceptance_report_signal, validate_acceptance_report,
+};
 use super::super::types::AcceptanceReport;
 
 // --------------------------------------------------------------------------------------------
@@ -30,7 +34,9 @@ pub const ACCEPTANCE_REPORT_NOT_FOUND: &str = "Structured acceptance report not 
 const ACCEPTANCE_REPORT_FENCE_TAGS: &[&str] = &["acceptance-report", "acceptance_report"];
 
 /// `parseAcceptanceReportBody` (acceptance.ts:666-668).
-fn parse_acceptance_report_body(body: &str) -> Result<(Option<AcceptanceReport>, Vec<String>), String> {
+fn parse_acceptance_report_body(
+    body: &str,
+) -> Result<(Option<AcceptanceReport>, Vec<String>), String> {
     let parsed = parse_report_json(body)?;
     Ok(validate_acceptance_report(&parsed, ""))
 }
@@ -48,7 +54,10 @@ fn parse_unterminated_acceptance_report_fence(
     let Some((body_start, _)) = find_acceptance_report_fence_opener(output) else {
         return (Option::None, Option::None);
     };
-    if output.get(body_start..).is_some_and(|rest| rest.contains("```")) {
+    if output
+        .get(body_start..)
+        .is_some_and(|rest| rest.contains("```"))
+    {
         return (Option::None, Option::None);
     }
     let body = output.get(body_start..).unwrap_or("").trim();
@@ -132,8 +141,7 @@ fn find_acceptance_report_fence_opener(output: &str) -> Option<(usize, usize)> {
                 .get(after_tag..)
                 .and_then(|s| s.chars().next())
                 .is_none_or(|c| !c.is_alphanumeric() && c != '_');
-            if boundary_ok
-                && let Some(nl_rel) = lowered.get(after_tag..).and_then(|s| s.find('\n'))
+            if boundary_ok && let Some(nl_rel) = lowered.get(after_tag..).and_then(|s| s.find('\n'))
             {
                 return Some((after_tag + nl_rel + 1, fence_at));
             }
@@ -330,11 +338,19 @@ pub fn parse_acceptance_report_sources(
         }
     };
     let authoritative = file_output.is_some_and(|file| file.authoritative);
-    let first = if authoritative { from_file() } else { from_text() };
+    let first = if authoritative {
+        from_file()
+    } else {
+        from_text()
+    };
     if first.report.is_some() || first.error.as_deref() != Some(ACCEPTANCE_REPORT_NOT_FOUND) {
         return first;
     }
-    if authoritative { from_text() } else { from_file() }
+    if authoritative {
+        from_text()
+    } else {
+        from_file()
+    }
 }
 
 /// Case-insensitive `/ACCEPTANCE_REPORT\s*:/i` locator (acceptance.ts:473).
@@ -377,13 +393,21 @@ pub fn strip_acceptance_report(output: &str) -> String {
     });
     if let Some(fence) = trailing {
         if ACCEPTANCE_REPORT_FENCE_TAGS.contains(&fence.tag.as_str()) {
-            return output.get(..fence.index).unwrap_or("").trim_end().to_string();
+            return output
+                .get(..fence.index)
+                .unwrap_or("")
+                .trim_end()
+                .to_string();
         }
         if matches!(
             parse_generic_json_acceptance_report_body(&fence.body),
             Ok((Some(_), _))
         ) {
-            return output.get(..fence.index).unwrap_or("").trim_end().to_string();
+            return output
+                .get(..fence.index)
+                .unwrap_or("")
+                .trim_end()
+                .to_string();
         }
     }
     // Fallbacks (acceptance.ts:511-514): a trailing acceptance-report fence, then a trailing
@@ -416,7 +440,9 @@ fn strip_trailing_acceptance_marker(output: &str) -> String {
         return output.to_string();
     };
     // Between the marker and the `{`, only `\s*:\s*` is allowed.
-    let between = output.get(marker_index + "ACCEPTANCE_REPORT".len()..marker_index + brace_rel).unwrap_or("");
+    let between = output
+        .get(marker_index + "ACCEPTANCE_REPORT".len()..marker_index + brace_rel)
+        .unwrap_or("");
     let between_ok = {
         let t = between.trim();
         t == ":"
@@ -428,7 +454,11 @@ fn strip_trailing_acceptance_marker(output: &str) -> String {
     let Some(last_close) = output.rfind('}') else {
         return output.to_string();
     };
-    if output.get(last_close + 1..).is_none_or(|tail| tail.trim().is_empty()) && last_close > marker_index {
+    if output
+        .get(last_close + 1..)
+        .is_none_or(|tail| tail.trim().is_empty())
+        && last_close > marker_index
+    {
         let start = if marker_index > 0 && output.as_bytes().get(marker_index - 1) == Some(&b'\n') {
             marker_index - 1
         } else {
@@ -452,17 +482,12 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
-    use crate::exec::acceptance::model::testsupport::report_value;
     use crate::exec::acceptance::model::testsupport::report_text;
+    use crate::exec::acceptance::model::testsupport::report_value;
     use crate::exec::acceptance::model::types::CommandRunResult;
     use crate::exec::acceptance::model::types::CriterionStatus;
 
-
-
     use serde_json::json;
-
-
-
 
     // ---- parseAcceptanceReport / stripAcceptanceReport ----
 
@@ -470,12 +495,22 @@ mod tests {
     fn parses_acceptance_report_fences_and_ignores_unrelated_json() {
         let parsed = parse_acceptance_report(&report_text(json!({}), "acceptance-report"));
         let report = parsed.report.expect("report");
-        assert_eq!(report.changed_files.as_deref(), Some(&["src/file.ts".to_string()][..]));
+        assert_eq!(
+            report.changed_files.as_deref(),
+            Some(&["src/file.ts".to_string()][..])
+        );
         assert!(parsed.error.is_none());
 
-        let generic = parse_acceptance_report("done\n```json\n{\"notes\":\"not an acceptance report\"}\n```");
+        let generic =
+            parse_acceptance_report("done\n```json\n{\"notes\":\"not an acceptance report\"}\n```");
         assert!(generic.report.is_none());
-        assert!(generic.error.as_deref().unwrap().contains("Structured acceptance report not found"));
+        assert!(
+            generic
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Structured acceptance report not found")
+        );
 
         let criteria_only = parse_acceptance_report(
             "done\n```json\n{\"criteriaSatisfied\":[{\"id\":\"criterion-1\",\"status\":\"satisfied\",\"evidence\":\"example\"}]}\n```",
@@ -484,9 +519,14 @@ mod tests {
 
         let malformed = parse_acceptance_report("```acceptance-report\n{bad-json\n```");
         assert!(malformed.report.is_none());
-        assert!(malformed.error.as_deref().unwrap().contains("Failed to parse acceptance-report"));
+        assert!(
+            malformed
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Failed to parse acceptance-report")
+        );
     }
-
 
     #[test]
     fn parses_reports_from_json_family_fences_and_strips_them() {
@@ -497,7 +537,6 @@ mod tests {
             assert_eq!(strip_acceptance_report(&output), "done");
         }
     }
-
 
     #[test]
     fn strips_trailing_json_report_after_earlier_unrelated_json_fence() {
@@ -516,10 +555,10 @@ mod tests {
         assert_eq!(strip_acceptance_report(&output), expected);
     }
 
-
     #[test]
     fn unwraps_acceptance_report_wrapper_objects() {
-        let wrapped = serde_json::to_string(&json!({"acceptance-report": report_value(json!({}))})).unwrap();
+        let wrapped =
+            serde_json::to_string(&json!({"acceptance-report": report_value(json!({}))})).unwrap();
         let output = format!("done\n```json\n{wrapped}\n```");
         let parsed = parse_acceptance_report(&output);
         let report = parsed.report.expect("report");
@@ -530,14 +569,12 @@ mod tests {
         assert_eq!(strip_acceptance_report(&output), "done");
     }
 
-
     #[test]
     fn report_shaped_generic_json_without_criteria_is_not_stripped() {
         let output = "done\n```json\n{\"changedFiles\":[\"src/file.ts\"]}\n```".to_string();
         assert!(parse_acceptance_report(&output).report.is_none());
         assert_eq!(strip_acceptance_report(&output), output);
     }
-
 
     #[test]
     fn reports_field_level_validation_errors() {
@@ -547,7 +584,13 @@ mod tests {
         ));
         assert!(bad_review.report.is_none());
         // G79 — `validateStringArrayField` now demands a NON-EMPTY string (`acceptance.ts:827`).
-        assert!(bad_review.error.as_deref().unwrap().contains("reviewFindings[0]: expected non-empty string; got object"));
+        assert!(
+            bad_review
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("reviewFindings[0]: expected non-empty string; got object")
+        );
 
         let bad_command = parse_acceptance_report(&report_text(
             json!({"commandsRun": [{"command": "npm test", "exitCode": 0}]}),
@@ -570,7 +613,6 @@ mod tests {
         assert!(err.contains("criteriaSatisfied[0].status: expected one of \"satisfied\", \"not-satisfied\", \"not-applicable\"; got \"maybe\""));
         assert!(err.contains("criteriaSatisfied[0].evidence: expected non-empty string; got \"\""));
     }
-
 
     // ---- G79: report normalization, recovery and sources (acceptance.ts:484-772) ----
 
@@ -614,7 +656,6 @@ mod tests {
         assert_eq!(report.manual_notes.as_deref(), Some("nothing else"));
     }
 
-
     #[test]
     fn rejects_duplicate_normalized_criterion_ids_and_unsupported_fields() {
         let parsed = parse_acceptance_report(&report_text(
@@ -636,7 +677,10 @@ mod tests {
             ]}),
             "acceptance-report",
         ));
-        let err = unsupported.error.as_deref().expect("unknown fields are an error");
+        let err = unsupported
+            .error
+            .as_deref()
+            .expect("unknown fields are an error");
         assert!(
             err.contains("criteriaSatisfied[0].confidence: unsupported acceptance criterion field"),
             "{err}"
@@ -646,17 +690,24 @@ mod tests {
             json!({"totallyUnknown": 1}),
             "acceptance-report",
         ));
-        let err = stray.error.as_deref().expect("unknown report fields are an error");
+        let err = stray
+            .error
+            .as_deref()
+            .expect("unknown report fields are an error");
         assert!(
             err.contains("totallyUnknown: unsupported acceptance report field"),
             "{err}"
         );
     }
 
-
     #[test]
     fn unwraps_every_wrapper_spelling_and_flags_siblings() {
-        for wrapper in ["acceptance", "acceptance-report", "acceptance_report", "acceptanceReport"] {
+        for wrapper in [
+            "acceptance",
+            "acceptance-report",
+            "acceptance_report",
+            "acceptanceReport",
+        ] {
             let mut map = serde_json::Map::new();
             map.insert(wrapper.to_string(), report_value(json!({})));
             let body = Value::Object(map);
@@ -695,7 +746,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn recovers_an_unterminated_acceptance_report_fence() {
         let body = serde_json::to_string(&report_value(json!({}))).unwrap();
@@ -705,7 +755,8 @@ mod tests {
 
         // The underscore spelling is accepted everywhere the hyphenated one is
         // (`acceptance.ts:702-703`).
-        let underscored = parse_acceptance_report(&format!("done\n```acceptance_report\n{body}\n```"));
+        let underscored =
+            parse_acceptance_report(&format!("done\n```acceptance_report\n{body}\n```"));
         assert_eq!(underscored.error, None);
         assert!(underscored.report.is_some());
 
@@ -726,10 +777,11 @@ mod tests {
         let empty = parse_acceptance_report("done\n```acceptance-report\n\n```");
         assert_eq!(
             empty.error.as_deref(),
-            Some("Failed to parse acceptance-report: Empty or unterminated acceptance-report fence.")
+            Some(
+                "Failed to parse acceptance-report: Empty or unterminated acceptance-report fence."
+            )
         );
     }
-
 
     /// A model cut off mid-opener — `"…\n```acceptance-report"` with no newline after the tag —
     /// must still be reported as a FENCE DEFECT, not as "no report at all".
@@ -763,7 +815,10 @@ mod tests {
         // `\b` still bites: a tag that runs straight into another word character is NOT an
         // acceptance-report fence, so this one genuinely IS absent.
         let unrelated = parse_acceptance_report("done\n```acceptance-reporting");
-        assert_eq!(unrelated.error.as_deref(), Some(ACCEPTANCE_REPORT_NOT_FOUND));
+        assert_eq!(
+            unrelated.error.as_deref(),
+            Some(ACCEPTANCE_REPORT_NOT_FOUND)
+        );
 
         // And the load-bearing consequence: an absent report falls through to the other
         // source, but this defect must NOT — it is surfaced verbatim.
@@ -772,8 +827,7 @@ mod tests {
             path: std::path::Path::new("out.md"),
             authoritative: false,
         };
-        let sources =
-            parse_acceptance_report_sources("done\n```acceptance-report", Some(&file));
+        let sources = parse_acceptance_report_sources("done\n```acceptance-report", Some(&file));
         assert!(sources.report.is_none());
         assert_eq!(
             sources.error.as_deref(),
@@ -782,7 +836,6 @@ mod tests {
             )
         );
     }
-
 
     #[test]
     fn report_shaped_generic_json_surfaces_its_validation_errors() {
@@ -798,29 +851,42 @@ mod tests {
         );
         let parsed = parse_acceptance_report(&text);
         assert!(parsed.report.is_none());
-        let err = parsed.error.as_deref().expect("a report-shaped json fence reports errors");
-        assert!(err.starts_with("Failed to parse acceptance-report: Invalid acceptance-report:"), "{err}");
+        let err = parsed
+            .error
+            .as_deref()
+            .expect("a report-shaped json fence reports errors");
+        assert!(
+            err.starts_with("Failed to parse acceptance-report: Invalid acceptance-report:"),
+            "{err}"
+        );
 
         // Genuinely unrelated JSON stays quiet.
         let unrelated = parse_acceptance_report("prose\n```json\n{\"hello\": \"world\"}\n```");
-        assert_eq!(unrelated.error.as_deref(), Some(ACCEPTANCE_REPORT_NOT_FOUND));
+        assert_eq!(
+            unrelated.error.as_deref(),
+            Some(ACCEPTANCE_REPORT_NOT_FOUND)
+        );
     }
-
 
     #[test]
     fn marker_path_distinguishes_missing_from_unterminated_objects() {
         assert_eq!(
-            parse_acceptance_report("ACCEPTANCE_REPORT: nope").error.as_deref(),
-            Some("Failed to parse acceptance-report: Expected a JSON object after ACCEPTANCE_REPORT:.")
+            parse_acceptance_report("ACCEPTANCE_REPORT: nope")
+                .error
+                .as_deref(),
+            Some(
+                "Failed to parse acceptance-report: Expected a JSON object after ACCEPTANCE_REPORT:."
+            )
         );
         assert_eq!(
             parse_acceptance_report("ACCEPTANCE_REPORT: {\"changedFiles\": [")
                 .error
                 .as_deref(),
-            Some("Failed to parse acceptance-report: Unterminated JSON object after ACCEPTANCE_REPORT:.")
+            Some(
+                "Failed to parse acceptance-report: Unterminated JSON object after ACCEPTANCE_REPORT:."
+            )
         );
     }
-
 
     #[test]
     fn report_sources_prefer_the_file_when_authoritative_and_never_paper_over_a_defect() {
@@ -871,7 +937,8 @@ mod tests {
 
         // A MALFORMED report in the primary source is surfaced, never papered over with the
         // secondary (`acceptance.ts:767-771`) — and the file's parse errors carry the path.
-        let malformed = "done\n```acceptance-report\n{\"criteriaSatisfied\": [{\"id\": \"c1\"}]}\n```";
+        let malformed =
+            "done\n```acceptance-report\n{\"criteriaSatisfied\": [{\"id\": \"c1\"}]}\n```";
         let primary_defect = parse_acceptance_report_sources(
             malformed,
             Some(&crate::exec::acceptance::AcceptanceFileOutput {
@@ -882,7 +949,11 @@ mod tests {
         );
         assert!(primary_defect.report.is_none());
         assert!(
-            primary_defect.error.as_deref().unwrap().contains("Invalid acceptance-report"),
+            primary_defect
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Invalid acceptance-report"),
             "{:?}",
             primary_defect.error
         );
@@ -905,7 +976,6 @@ mod tests {
             file_defect.error
         );
     }
-
 
     // ---- G79: normalizedToken's second pass + the two `skip|skipped` alias groups ----
 
@@ -953,7 +1023,6 @@ mod tests {
         );
     }
 
-
     /// G79 — the two alias groups the existing normalization test never touches:
     /// `normalizeCommandResult`'s `not-run|not-executed|skip|skipped` (`acceptance.ts:531`) and
     /// `normalizeCriterionStatus`'s `not-applicable|n-a|na|skip|skipped` (`:522`).
@@ -969,7 +1038,10 @@ mod tests {
                 ]}),
                 "acceptance-report",
             ));
-            assert_eq!(parsed.error, None, "`{alias}` must be a recognized commandsRun result");
+            assert_eq!(
+                parsed.error, None,
+                "`{alias}` must be a recognized commandsRun result"
+            );
             let report = parsed.report.expect("the report parses");
             assert_eq!(
                 report.commands_run.as_ref().unwrap()[0].result,
@@ -987,7 +1059,10 @@ mod tests {
                 ]}),
                 "acceptance-report",
             ));
-            assert_eq!(parsed.error, None, "`{alias}` must be a recognized criterion status");
+            assert_eq!(
+                parsed.error, None,
+                "`{alias}` must be a recognized criterion status"
+            );
             let report = parsed.report.expect("the report parses");
             assert_eq!(
                 report.criteria_satisfied.as_ref().unwrap()[0].status,
@@ -1013,5 +1088,4 @@ mod tests {
             "{unknown:?}"
         );
     }
-
 }

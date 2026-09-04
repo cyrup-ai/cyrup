@@ -41,8 +41,8 @@ use crate::proxy::{
     UrlElicitationAction,
 };
 use crate::state::{
-    McpServerRuntimeStatus, McpServerStatusSnapshot, McpState, McpStatusSnapshot,
-    MCP_STATUS_SNAPSHOT_VERSION, ServerFailure,
+    MCP_STATUS_SNAPSHOT_VERSION, McpServerRuntimeStatus, McpServerStatusSnapshot, McpState,
+    McpStatusSnapshot, ServerFailure,
 };
 
 /// `init.ts:40` `FAILURE_BACKOFF_MS = 60 * 1000` (13a §13).
@@ -88,7 +88,10 @@ where
     use futures::StreamExt as _;
     // A `limit` of 0 would stall the stream; upstream's callers only ever pass 10.
     let limit = limit.max(1);
-    futures::stream::iter(items.into_iter().map(f)).buffered(limit).collect::<Vec<R>>().await
+    futures::stream::iter(items.into_iter().map(f))
+        .buffered(limit)
+        .collect::<Vec<R>>()
+        .await
 }
 
 // =================================================================================================
@@ -130,7 +133,10 @@ pub fn record_failure(state: &Arc<McpState>, server: &str, message: &str) {
     if let Ok(mut tracker) = state.failure_tracker.lock() {
         tracker.insert(
             server.to_string(),
-            ServerFailure { last_failure: failed_at, count: previous.saturating_add(1) },
+            ServerFailure {
+                last_failure: failed_at,
+                count: previous.saturating_add(1),
+            },
         );
     }
     if let Ok(mut messages) = state.failure_messages.lock() {
@@ -213,7 +219,11 @@ pub fn failure_age_seconds(state: &McpState, server: &str) -> Option<u64> {
 #[must_use]
 pub fn failure_message(state: &McpState, server: &str) -> Option<String> {
     failure_age_seconds(state, server)?;
-    state.failure_messages.lock().ok().and_then(|messages| messages.get(server).cloned())
+    state
+        .failure_messages
+        .lock()
+        .ok()
+        .and_then(|messages| messages.get(server).cloned())
 }
 
 // =================================================================================================
@@ -235,20 +245,26 @@ pub fn create_mcp_status_snapshot(state: &McpState) -> McpStatusSnapshot {
     for (name, definition) in &state.config.mcp_servers {
         // `definition?.disabled === true` — only the literal boolean.
         let disabled = definition.is_disabled();
-        let connection = if disabled { None } else { state.manager.get_connection(name) };
+        let connection = if disabled {
+            None
+        } else {
+            state.manager.get_connection(name)
+        };
         let status_of = connection.as_ref().map(|c| c.status());
         let metadata_len = if disabled {
             None
         } else {
-            state.tool_metadata.lock().ok().and_then(|map| map.get(name).map(Vec::len))
+            state
+                .tool_metadata
+                .lock()
+                .ok()
+                .and_then(|map| map.get(name).map(Vec::len))
         };
 
         // `metadata?.length ?? (connection?.status === "connected" ? connection.tools.length : 0)`
-        let tool_count = metadata_len.unwrap_or_else(|| {
-            match (status_of, connection.as_ref()) {
-                (Some(LinkStatus::Connected), Some(c)) => c.tools().len(),
-                _ => 0,
-            }
+        let tool_count = metadata_len.unwrap_or_else(|| match (status_of, connection.as_ref()) {
+            (Some(LinkStatus::Connected), Some(c)) => c.tools().len(),
+            _ => 0,
         });
         // `resourceCounts?.get(name) ?? (connected ? connection.resources.length : undefined)`
         let resource_count = if disabled {
@@ -264,7 +280,11 @@ pub fn create_mcp_status_snapshot(state: &McpState) -> McpStatusSnapshot {
                     _ => None,
                 })
         };
-        let failed_ago = if disabled { None } else { failure_age_seconds(state, name) };
+        let failed_ago = if disabled {
+            None
+        } else {
+            failure_age_seconds(state, name)
+        };
 
         // `mcp-status.ts:42-55` — first match wins, and the two counters increment INSIDE the
         // ladder.
@@ -343,11 +363,15 @@ pub fn update_status_bar(state: &McpState) {
 
 /// `init.ts:471-500` `updateServerMetadata(state, serverName)` (13a §17).
 pub fn update_server_metadata(state: &McpState, server: &str) {
-    let Some(connection) = state.manager.get_connection(server) else { return };
+    let Some(connection) = state.manager.get_connection(server) else {
+        return;
+    };
     if connection.status() != LinkStatus::Connected {
         return;
     }
-    let Some(definition) = state.config.mcp_servers.get(server) else { return };
+    let Some(definition) = state.config.mcp_servers.get(server) else {
+        return;
+    };
 
     // `init.ts:477-484` — a server disabled WHILE connected disappears from the surface on the next
     // refresh instead of lingering. All five maps, then return.
@@ -359,7 +383,11 @@ pub fn update_server_metadata(state: &McpState, server: &str) {
     // The collision universe here is `state.toolMetadata` — every server's CURRENT names — not the
     // startup snapshot (`init.ts:488` passes `state.toolMetadata`; `init.ts:340` passes
     // `startupKnownMetadata`). Getting this wrong makes prefixed names order-dependent.
-    let universe = state.tool_metadata.lock().map(|guard| guard.clone()).unwrap_or_default();
+    let universe = state
+        .tool_metadata
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
     let built = crate::registration::build_tool_metadata(
         &connection.tools(),
         &connection.resources(),
@@ -400,11 +428,15 @@ pub fn update_server_metadata(state: &McpState, server: &str) {
 /// A cache-rehydrated prompt list is deliberately **not** routed through here — see
 /// [`rehydrate_from_cache`] for why `promptMetadataLive` is the flag that separates the two.
 pub fn commit_prompt_metadata(state: &McpState, server: &str) {
-    let Some(connection) = state.manager.get_connection(server) else { return };
+    let Some(connection) = state.manager.get_connection(server) else {
+        return;
+    };
     if connection.status() != LinkStatus::Connected || connection.prompt_discovery_failed() {
         return;
     }
-    let Some(definition) = state.config.mcp_servers.get(server) else { return };
+    let Some(definition) = state.config.mcp_servers.get(server) else {
+        return;
+    };
     let prompts = crate::registration::reconstruct_prompt_metadata(
         server,
         &connection.prompts(),
@@ -451,7 +483,9 @@ impl MetadataCacheOptions {
     /// constructor rather than a `Default` impl so no call site can silently mean the other thing.
     #[must_use]
     pub fn preserving() -> Self {
-        Self { preserve_empty_resources: true }
+        Self {
+            preserve_empty_resources: true,
+        }
     }
 }
 
@@ -489,11 +523,15 @@ pub fn update_metadata_cache(
     server: &str,
     options: MetadataCacheOptions,
 ) {
-    let Some(connection) = state.manager.get_connection(server) else { return };
+    let Some(connection) = state.manager.get_connection(server) else {
+        return;
+    };
     if connection.status() != LinkStatus::Connected {
         return;
     }
-    let Some(definition) = state.config.mcp_servers.get(server) else { return };
+    let Some(definition) = state.config.mcp_servers.get(server) else {
+        return;
+    };
     if definition.is_disabled() {
         return;
     }
@@ -507,7 +545,9 @@ pub fn update_metadata_cache(
 
     let path = dirs.metadata_cache();
     let existing = crate::dirs::load_metadata_cache(&path);
-    let existing_entry = existing.as_ref().and_then(|cache| cache.servers.get(server));
+    let existing_entry = existing
+        .as_ref()
+        .and_then(|cache| cache.servers.get(server));
     let hash_matches =
         existing_entry.is_some_and(|entry| entry.config_hash.as_str() == config_hash.as_str());
 
@@ -522,7 +562,11 @@ pub fn update_metadata_cache(
     // that entry describes the same server definition. Otherwise the key is omitted entirely, which
     // is not the same as writing `[]`: an absent `prompts` means "never discovered".
     let prompts = if connection.prompt_discovery_failed() {
-        if hash_matches { existing_entry.and_then(|entry| entry.prompts.clone()) } else { None }
+        if hash_matches {
+            existing_entry.and_then(|entry| entry.prompts.clone())
+        } else {
+            None
+        }
     } else {
         Some(crate::dirs::serialize_prompts(&connection.prompts()))
     };
@@ -619,7 +663,9 @@ pub async fn lazy_connect(
         return false;
     }
     // 5
-    let Some(definition) = state.config.mcp_servers.get(server) else { return false };
+    let Some(definition) = state.config.mcp_servers.get(server) else {
+        return false;
+    };
     if definition.is_disabled() {
         return false;
     }
@@ -630,7 +676,11 @@ pub async fn lazy_connect(
         cyrup_ext::HostServices::set_status(ui.as_ref(), "mcp", text.as_deref());
     }
     // 7-8
-    match state.manager.connect(server, definition, Some(&owned)).await {
+    match state
+        .manager
+        .connect(server, definition, Some(&owned))
+        .await
+    {
         Ok(connection) if connection.status() == LinkStatus::NeedsAuth => false,
         Ok(_) => {
             clear_failure(state, server);
@@ -723,7 +773,10 @@ pub fn rehydrate_from_cache(
         );
     }
     // `if (cachedEntry.instructions)` — truthy, so an empty string writes nothing.
-    if let Some(text) = entry.instructions.as_deref().filter(|text| !text.is_empty())
+    if let Some(text) = entry
+        .instructions
+        .as_deref()
+        .filter(|text| !text.is_empty())
         && let Ok(mut map) = state.server_instructions.lock()
     {
         map.insert(server.to_string(), text.to_string());
@@ -766,7 +819,11 @@ impl RuntimeEnv {
         dirs: McpDirs,
         extension: std::sync::Weak<crate::extension::McpExtension>,
     ) -> Self {
-        Self { state, dirs, extension }
+        Self {
+            state,
+            dirs,
+            extension,
+        }
     }
 
     /// `state.config.mcpServers[serverName]`, or the byte-exact upstream "not configured" error
@@ -792,7 +849,12 @@ impl RuntimeEnv {
         server: &str,
         connection: &crate::server_manager::ServerConnection,
     ) -> ConnectOutcome {
-        let known = self.state.tool_metadata.lock().map(|guard| guard.clone()).unwrap_or_default();
+        let known = self
+            .state
+            .tool_metadata
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         let definition = self.state.config.mcp_servers.get(server);
         let metadata = match definition {
             Some(definition) => {
@@ -945,8 +1007,8 @@ impl RequestFailure {
             // `ServiceError::Cancelled` is the peer telling us the request was cancelled; upstream's
             // `isAbortError` arm would classify the SDK's equivalent the same way.
             ServiceError::Cancelled { reason } => {
-                let reason = reason
-                    .unwrap_or_else(|| crate::abort::ABORTED_FALLBACK_REASON.to_string());
+                let reason =
+                    reason.unwrap_or_else(|| crate::abort::ABORTED_FALLBACK_REASON.to_string());
                 Self {
                     error: McpError::Aborted(reason.clone()),
                     http_status: None,
@@ -1087,8 +1149,9 @@ async fn request_on_peer(
             ))))
         }
         Settled::Cancelled => {
-            if let Err(error) =
-                handle.cancel(Some(crate::abort::ABORTED_FALLBACK_REASON.to_string())).await
+            if let Err(error) = handle
+                .cancel(Some(crate::abort::ABORTED_FALLBACK_REASON.to_string()))
+                .await
             {
                 tracing::debug!("MCP: cancelling an aborted request failed: {error}");
             }
@@ -1146,13 +1209,19 @@ fn call_tool_outcome(
     // `result.isError` is optional on the wire and absent means "not an error".
     let is_error = result.is_error.unwrap_or(false);
     let blocks = if is_error {
-        let content = raw.get("content").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+        let content = raw
+            .get("content")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
         crate::renderers::transform_mcp_content(content, None)
     } else {
         crate::renderers::resolve_mcp_result_content(&raw, None)
     };
     Ok(CallToolOutcome {
-        content: blocks.into_iter().map(crate::renderers::McpContentBlock::into_core).collect(),
+        content: blocks
+            .into_iter()
+            .map(crate::renderers::McpContentBlock::into_core)
+            .collect(),
         is_error,
         raw: Some(raw),
     })
@@ -1173,11 +1242,16 @@ fn resource_contents(
             message: format!("the `resources/read` result could not be read: {error}"),
         })
     })?;
-    let contents = raw.get("contents").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-    Ok(crate::renderers::transform_mcp_resource_contents(contents, None)
-        .into_iter()
-        .map(crate::renderers::McpContentBlock::into_core)
-        .collect())
+    let contents = raw
+        .get("contents")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    Ok(
+        crate::renderers::transform_mcp_resource_contents(contents, None)
+            .into_iter()
+            .map(crate::renderers::McpContentBlock::into_core)
+            .collect(),
+    )
 }
 
 impl RuntimeEnv {
@@ -1214,7 +1288,13 @@ impl RuntimeEnv {
         // `if (isServerDisabled(deps.config.mcpServers[serverName])) throw …`. An absent entry is
         // NOT disabled — upstream's `isServerDisabled(undefined)` is false, and the "not connected"
         // error below is the one such a server gets.
-        if self.state.config.mcp_servers.get(server).is_some_and(ServerEntry::is_disabled) {
+        if self
+            .state
+            .config
+            .mcp_servers
+            .get(server)
+            .is_some_and(ServerEntry::is_disabled)
+        {
             return Err(ProxyCallError::Other(McpError::other(format!(
                 "MCP server \"{server}\" is disabled"
             ))));
@@ -1277,9 +1357,13 @@ impl RuntimeEnv {
         // fail the call. Here it cannot throw and the `false` return means "a newer connection
         // replaced this one", which is not this caller's business either.
         let _published =
-            self.state.manager.publish_metadata_changed(server, &fresh, "session-reconnect");
+            self.state
+                .manager
+                .publish_metadata_changed(server, &fresh, "session-reconnect");
         crate::abort::throw_if_aborted(cancel, None).map_err(ProxyCallError::Other)?;
-        run(peer_of(&fresh, server)?).await.map_err(|failure| ProxyCallError::Other(failure.error))
+        run(peer_of(&fresh, server)?)
+            .await
+            .map_err(|failure| ProxyCallError::Other(failure.error))
     }
 
     /// `getRequestOptions(serverName, ownedSignal)`, with the signal half living in
@@ -1315,7 +1399,11 @@ impl ProxyEnv for RuntimeEnv {
 
     async fn connect(&self, server: &str, cancel: &CancelToken) -> McpResult<ConnectOutcome> {
         let definition = self.definition(server)?;
-        let connection = self.state.manager.connect(server, &definition, Some(cancel)).await?;
+        let connection = self
+            .state
+            .manager
+            .connect(server, &definition, Some(cancel))
+            .await?;
         Ok(self.outcome_of(server, &connection))
     }
 
@@ -1326,12 +1414,19 @@ impl ProxyEnv for RuntimeEnv {
         // "connected"` fork). With none there is nothing stale to tear down, and a plain connect is
         // what `reconnect` would degrade to anyway.
         let Some(current) = self.state.manager.get_connection(server) else {
-            let connection = self.state.manager.connect(server, &definition, Some(cancel)).await?;
+            let connection = self
+                .state
+                .manager
+                .connect(server, &definition, Some(cancel))
+                .await?;
             return Ok(self.outcome_of(server, &connection));
         };
         let stale: crate::lifecycle::ConnectionHandle = current;
-        let connection =
-            self.state.manager.reconnect(server, &definition, &stale, Some(cancel)).await?;
+        let connection = self
+            .state
+            .manager
+            .reconnect(server, &definition, &stale, Some(cancel))
+            .await?;
         Ok(self.outcome_of(server, &connection))
     }
 
@@ -1551,9 +1646,14 @@ impl ProxyEnv for RuntimeEnv {
     ) -> McpResult<()> {
         // Upstream never inspects the resolved status — `await authenticate(...)` and a throw is the
         // only failure channel (`proxy-modes.ts:165-177`).
-        crate::oauth::authenticate(server, server_url, Some(definition), &self.auth_options(cancel))
-            .await
-            .map(|_status| ())
+        crate::oauth::authenticate(
+            server,
+            server_url,
+            Some(definition),
+            &self.auth_options(cancel),
+        )
+        .await
+        .map(|_status| ())
     }
 
     async fn start_auth(
@@ -1565,9 +1665,14 @@ impl ProxyEnv for RuntimeEnv {
     ) -> McpResult<Option<String>> {
         // `Ok(None)` is the client-credentials short-circuit, which completes synchronously and has
         // no authorization URL to hand back — `start_auth` spells that as an empty string.
-        crate::oauth::start_auth(server, server_url, Some(definition), &self.auth_options(cancel))
-            .await
-            .map(|url| (!url.is_empty()).then_some(url))
+        crate::oauth::start_auth(
+            server,
+            server_url,
+            Some(definition),
+            &self.auth_options(cancel),
+        )
+        .await
+        .map(|url| (!url.is_empty()).then_some(url))
     }
 
     async fn complete_auth_from_input(
@@ -1611,12 +1716,9 @@ impl ProxyEnv for RuntimeEnv {
             ),
             // A poisoned lock reaches the `tool_metadata == None` asymmetry `proxy/approval.rs`
             // documents honestly, rather than by guessing a map.
-            Err(_) => crate::proxy::is_tool_call_approval_required(
-                &self.state.config,
-                server,
-                tool,
-                None,
-            ),
+            Err(_) => {
+                crate::proxy::is_tool_call_approval_required(&self.state.config, server, tool, None)
+            }
         }
     }
 
@@ -1630,8 +1732,12 @@ impl ProxyEnv for RuntimeEnv {
         origin: ApprovalOrigin,
         cancel: &CancelToken,
     ) -> ApprovalOutcome {
-        let metadata =
-            self.state.tool_metadata.lock().map(|guard| guard.clone()).unwrap_or_default();
+        let metadata = self
+            .state
+            .tool_metadata
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         crate::proxy::ensure_tool_call_approved(
             &self.state,
             server,
@@ -1679,12 +1785,20 @@ impl ProxyEnv for RuntimeEnv {
     /// `getPiTools?.()`. `None` is upstream's optional-parameter branch, NOT a defect: never
     /// synthesise a built-in name list as a floor.
     fn all_tool_names(&self) -> Option<Vec<String>> {
-        self.state.ui.as_ref().and_then(|ui| cyrup_ext::HostServices::all_tool_names(ui.as_ref()))
+        self.state
+            .ui
+            .as_ref()
+            .and_then(|ui| cyrup_ext::HostServices::all_tool_names(ui.as_ref()))
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1693,9 +1807,15 @@ mod tests {
     /// bridge. A fourth state on either side has to fail here rather than mistranslate.
     #[test]
     fn the_two_connection_status_enums_map_across() {
-        assert_eq!(proxy_status(LinkStatus::Connected), ConnectionStatus::Connected);
+        assert_eq!(
+            proxy_status(LinkStatus::Connected),
+            ConnectionStatus::Connected
+        );
         assert_eq!(proxy_status(LinkStatus::Closed), ConnectionStatus::Closed);
-        assert_eq!(proxy_status(LinkStatus::NeedsAuth), ConnectionStatus::NeedsAuth);
+        assert_eq!(
+            proxy_status(LinkStatus::NeedsAuth),
+            ConnectionStatus::NeedsAuth
+        );
     }
 
     /// `message.slice(0, MAX_FAILURE_MESSAGE_CHARS)` (`init.ts:66`) — upstream slices UTF-16 code
@@ -1710,7 +1830,10 @@ mod tests {
         message.push('\u{1f600}');
         let cut = truncate_failure_message(&message);
         assert_eq!(cut.len(), MAX_FAILURE_MESSAGE_CHARS - 1);
-        assert!(cut.chars().all(|c| c == 'a'), "the split character is dropped whole");
+        assert!(
+            cut.chars().all(|c| c == 'a'),
+            "the split character is dropped whole"
+        );
     }
 
     /// `parallelLimit`'s first property: results come back **by original index**, whatever order
@@ -1747,7 +1870,10 @@ mod tests {
         })
         .await;
         assert_eq!(out.len(), 20);
-        assert!(peak.load(Ordering::Acquire) <= 3, "at most `limit` futures may be in flight");
+        assert!(
+            peak.load(Ordering::Acquire) <= 3,
+            "at most `limit` futures may be in flight"
+        );
     }
 
     /// A `limit` of 0 would stall `buffered` outright; upstream's callers only ever pass 10, but
@@ -1826,7 +1952,11 @@ done
     fn live_entry() -> ServerEntry {
         ServerEntry {
             command: Some("sh".to_string()),
-            args: Some(vec!["-c".to_string(), LIVE_ECHO.to_string(), "sh".to_string()]),
+            args: Some(vec![
+                "-c".to_string(),
+                LIVE_ECHO.to_string(),
+                "sh".to_string(),
+            ]),
             ..ServerEntry::default()
         }
     }
@@ -1842,8 +1972,11 @@ done
     /// The attempt token and the resource are both returned rather than dropped: the token is
     /// rmcp's service-loop cancellation token, and the resource owns the `RunningService` — dropping
     /// either takes the child with it.
-    async fn live_peer() -> (CancelToken, Arc<dyn crate::server_manager::ConnectionResource>, Peer<RoleClient>)
-    {
+    async fn live_peer() -> (
+        CancelToken,
+        Arc<dyn crate::server_manager::ConnectionResource>,
+        Peer<RoleClient>,
+    ) {
         use crate::server_manager::ConnectionFactory as _;
         let attempt = CancelToken::new();
         let made = crate::runtime::ConnectionBuilder::new(None)
@@ -1932,7 +2065,11 @@ done
         let outcome = call_tool_outcome("fixture", &result).expect("the result reads");
 
         assert!(outcome.is_error, "the discriminator survives");
-        assert_eq!(text_of(&outcome.content), "it went wrong", "the server's own text");
+        assert_eq!(
+            text_of(&outcome.content),
+            "it went wrong",
+            "the server's own text"
+        );
     }
 
     /// An empty `content` with a `structuredContent` object is `resolveMcpResultContent`'s fallback,
@@ -1947,8 +2084,14 @@ done
         let outcome = call_tool_outcome("fixture", &result).expect("the result reads");
 
         let text = text_of(&outcome.content);
-        assert!(text.contains("\"ok\""), "the structured payload, got {text:?}");
-        assert!(text.contains("true"), "the structured payload, got {text:?}");
+        assert!(
+            text.contains("\"ok\""),
+            "the structured payload, got {text:?}"
+        );
+        assert!(
+            text.contains("true"),
+            "the structured payload, got {text:?}"
+        );
     }
 
     /// The error path takes the OTHER transform: `transformMcpContent` never consults
@@ -1966,7 +2109,11 @@ done
         let outcome = call_tool_outcome("fixture", &result).expect("the result reads");
 
         assert!(outcome.is_error);
-        assert!(outcome.content.is_empty(), "no fallback on the error path: {:?}", outcome.content);
+        assert!(
+            outcome.content.is_empty(),
+            "no fallback on the error path: {:?}",
+            outcome.content
+        );
     }
 
     /// `resources/read` on the live peer, through the same handle-and-cancel path `tools/call` uses,
@@ -2013,10 +2160,17 @@ done
         .await
         .expect_err("a cancelled token never returns a result");
 
-        assert!(matches!(failure.error, McpError::Aborted(_)), "got {:?}", failure.error);
+        assert!(
+            matches!(failure.error, McpError::Aborted(_)),
+            "got {:?}",
+            failure.error
+        );
         // Evidence-free: an abort is never a terminated session, so it can never trigger a retry —
         // which would double-execute a tool the user just stopped.
-        assert!(!crate::server_manager::is_terminated_session(&failure.evidence(), true));
+        assert!(!crate::server_manager::is_terminated_session(
+            &failure.evidence(),
+            true
+        ));
     }
 
     /// A JSON-RPC error keeps the server's message **bare** and carries the code out beside it.
@@ -2053,15 +2207,24 @@ done
             None,
         )));
 
-        assert!(crate::server_manager::is_terminated_session(&failure.evidence(), true));
-        assert!(!crate::server_manager::is_terminated_session(&failure.evidence(), false));
+        assert!(crate::server_manager::is_terminated_session(
+            &failure.evidence(),
+            true
+        ));
+        assert!(!crate::server_manager::is_terminated_session(
+            &failure.evidence(),
+            false
+        ));
     }
 
     /// rmcp's `Display` for `StreamableHttpError::SessionExpired` is read off the type, not copied,
     /// so a change to that text cannot silently stop [`session_expired_status`] from matching.
     #[test]
     fn the_session_expired_marker_is_taken_from_rmcp() {
-        assert_eq!(SESSION_EXPIRED_DISPLAY.as_str(), "Session expired (HTTP 404)");
+        assert_eq!(
+            SESSION_EXPIRED_DISPLAY.as_str(),
+            "Session expired (HTTP 404)"
+        );
     }
 
     /// **The whole chain, in one test: a model-issued tool call gets a real server's real answer.**
@@ -2117,20 +2280,33 @@ done
             open_browser: Arc::new(|_| Box::pin(async { Ok(()) })),
             send_message: Arc::new(|_| {}),
         }));
-        let connection =
-            state.manager.connect("fixture", &entry, None).await.expect("the fixture connects");
-        assert_eq!(connection.status(), LinkStatus::Connected, "a live child, past the handshake");
-        assert!(connection.resource().peer().is_some(), "and a peer to talk to it with");
+        let connection = state
+            .manager
+            .connect("fixture", &entry, None)
+            .await
+            .expect("the fixture connects");
+        assert_eq!(
+            connection.status(),
+            LinkStatus::Connected,
+            "a live child, past the handshake"
+        );
+        assert!(
+            connection.resource().peer().is_some(),
+            "and a peer to talk to it with"
+        );
 
-        state
-            .tool_metadata
-            .lock()
-            .unwrap()
-            .insert("fixture".to_string(), vec![ToolMetadata::new("fixture_echo", "echo", "echo")]);
+        state.tool_metadata.lock().unwrap().insert(
+            "fixture".to_string(),
+            vec![ToolMetadata::new("fixture_echo", "echo", "echo")],
+        );
         let dirs = McpDirs::new(temp.path().to_path_buf(), temp.path().to_path_buf());
         let ctx = crate::proxy::ProxyCtx::new(
             Arc::clone(&state),
-            Arc::new(RuntimeEnv::new(Arc::clone(&state), dirs, std::sync::Weak::new())),
+            Arc::new(RuntimeEnv::new(
+                Arc::clone(&state),
+                dirs,
+                std::sync::Weak::new(),
+            )),
         );
 
         let result = crate::proxy::execute_call(
@@ -2145,10 +2321,22 @@ done
         .expect("the call completes");
 
         let details = result.details.clone().expect("details");
-        assert_eq!(details.get("error"), None, "a real result, not a failure: {details}");
+        assert_eq!(
+            details.get("error"),
+            None,
+            "a real result, not a failure: {details}"
+        );
         assert_eq!(details["server"], serde_json::json!("fixture"));
-        assert_eq!(details["tool"], serde_json::json!("echo"), "the ORIGINAL name went on the wire");
-        assert_eq!(text_of(&result.content), "echoed:pong", "the server's own answer");
+        assert_eq!(
+            details["tool"],
+            serde_json::json!("echo"),
+            "the ORIGINAL name went on the wire"
+        );
+        assert_eq!(
+            text_of(&result.content),
+            "echoed:pong",
+            "the server's own answer"
+        );
         assert_eq!(
             details["mcpResult"]["content"][0]["text"],
             serde_json::json!("echoed:pong"),

@@ -74,8 +74,7 @@ pub const MAX_DETAILED_RUNS: usize = 4;
 /// `crates/cyrup-tui/src/status_indicator.rs:28`) because this crate has zero dependency on
 /// `cyrup-tui` (arch-SA §1.1/§6.1): duplicating this small, stable, purely-cosmetic constant is
 /// the correct trade against introducing a crate dependency solely for ten characters.
-pub const ACTIVITY_GLYPH_FRAMES: [&str; 10] =
-    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub const ACTIVITY_GLYPH_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The static glyph shown for a non-running (terminal or paused) entry in place of the animated
 /// spinner (R-SA-109: the glyph MUST stop animating, not merely freeze on an arbitrary frame).
@@ -111,7 +110,10 @@ pub fn is_actively_running(state: RunState) -> bool {
 pub fn activity_glyph(state: RunState, tick: usize) -> &'static str {
     if is_actively_running(state) {
         let idx = tick % ACTIVITY_GLYPH_FRAMES.len();
-        ACTIVITY_GLYPH_FRAMES.get(idx).copied().unwrap_or(IDLE_GLYPH)
+        ACTIVITY_GLYPH_FRAMES
+            .get(idx)
+            .copied()
+            .unwrap_or(IDLE_GLYPH)
     } else {
         IDLE_GLYPH
     }
@@ -123,7 +125,9 @@ pub fn activity_glyph(state: RunState, tick: usize) -> &'static str {
 #[must_use]
 pub fn activity_glyph_style(state: RunState) -> Style {
     if is_actively_running(state) {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::DIM)
     }
@@ -148,7 +152,9 @@ pub fn fork_badge_span(context: ContextMode) -> Option<Span<'static>> {
         ContextMode::Fresh => None,
         ContextMode::Fork => Some(Span::styled(
             format!(" {FORK_BADGE_TEXT}"),
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
         )),
     }
 }
@@ -251,7 +257,8 @@ fn fold_nested_into(
     let (visible, overflow) = split_at_budget(summaries, MAX_CHILDREN_PER_LEVEL);
 
     for child in visible {
-        let mut header = render_run_header_line(&child.agent, child.status.state, child_context(child), tick);
+        let mut header =
+            render_run_header_line(&child.agent, child.status.state, child_context(child), tick);
         prepend_indent(&mut header, &indent);
         out.push(header);
 
@@ -346,9 +353,20 @@ fn child_context(_child: &NestedRunSummary) -> ContextMode {
 /// difference between those two call sites is which region of the terminal the caller places the
 /// returned lines into, not anything about how the lines themselves are built.
 #[must_use]
-pub fn render_progress_header(snapshot: &SubagentProgressSnapshot, tick: usize) -> Vec<Line<'static>> {
-    let label = snapshot.current_agent.as_deref().unwrap_or(snapshot.run_id.as_ref());
-    let mut lines = vec![render_run_header_line(label, snapshot.status.state, snapshot.context, tick)];
+pub fn render_progress_header(
+    snapshot: &SubagentProgressSnapshot,
+    tick: usize,
+) -> Vec<Line<'static>> {
+    let label = snapshot
+        .current_agent
+        .as_deref()
+        .unwrap_or(snapshot.run_id.as_ref());
+    let mut lines = vec![render_run_header_line(
+        label,
+        snapshot.status.state,
+        snapshot.context,
+        tick,
+    )];
     lines.extend(render_nested_children(&snapshot.children, 0, tick));
     lines
 }
@@ -365,7 +383,10 @@ pub fn render_progress_header(snapshot: &SubagentProgressSnapshot, tick: usize) 
 /// (R-SA-144's "no more than one extra render pass per NDJSON event" cadence discipline lives in
 /// that caller, not here).
 #[must_use]
-pub fn render_background_region(snapshots: &[SubagentProgressSnapshot], tick: usize) -> Vec<Line<'static>> {
+pub fn render_background_region(
+    snapshots: &[SubagentProgressSnapshot],
+    tick: usize,
+) -> Vec<Line<'static>> {
     if snapshots.is_empty() {
         return Vec::new();
     }
@@ -376,10 +397,16 @@ pub fn render_background_region(snapshots: &[SubagentProgressSnapshot], tick: us
         out.extend(render_progress_header(snapshot, tick));
     }
     if !overflow.is_empty() {
-        let running = overflow.iter().filter(|s| is_actively_running(s.status.state)).count();
+        let running = overflow
+            .iter()
+            .filter(|s| is_actively_running(s.status.state))
+            .count();
         let noun = if overflow.len() == 1 { "run" } else { "runs" };
         out.push(Line::from(vec![Span::styled(
-            format!("… +{} more {noun} tracked ({running} running)", overflow.len()),
+            format!(
+                "… +{} more {noun} tracked ({running} running)",
+                overflow.len()
+            ),
             Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
         )]));
     }
@@ -396,12 +423,22 @@ pub fn render_background_region(snapshots: &[SubagentProgressSnapshot], tick: us
 pub fn lines_to_plain_text(lines: &[Line<'static>]) -> Vec<String> {
     lines
         .iter()
-        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
         .collect()
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use std::time::Instant;
 
@@ -431,7 +468,12 @@ mod tests {
     }
 
     fn nested(agent: &str, state: RunState, children: Vec<NestedRunSummary>) -> NestedRunSummary {
-        NestedRunSummary { run_id: RunId::new(), agent: agent.to_string(), status: status(state), children }
+        NestedRunSummary {
+            run_id: RunId::new(),
+            agent: agent.to_string(),
+            status: status(state),
+            children,
+        }
     }
 
     fn snapshot(
@@ -464,14 +506,22 @@ mod tests {
     fn activity_glyph_animates_only_while_running() {
         let running_frame_0 = activity_glyph(RunState::Running, 0);
         let running_frame_1 = activity_glyph(RunState::Running, 1);
-        assert_ne!(running_frame_0, running_frame_1, "running glyph must advance across ticks");
+        assert_ne!(
+            running_frame_0, running_frame_1,
+            "running glyph must advance across ticks"
+        );
         assert_eq!(running_frame_0, ACTIVITY_GLYPH_FRAMES[0]);
         assert_eq!(running_frame_1, ACTIVITY_GLYPH_FRAMES[1]);
     }
 
     #[test]
     fn activity_glyph_is_static_idle_for_every_non_running_state() {
-        for state in [RunState::Queued, RunState::Paused, RunState::Complete, RunState::Failed] {
+        for state in [
+            RunState::Queued,
+            RunState::Paused,
+            RunState::Complete,
+            RunState::Failed,
+        ] {
             let g0 = activity_glyph(state, 0);
             let g7 = activity_glyph(state, 7);
             assert_eq!(g0, IDLE_GLYPH, "state {state:?} must render the idle glyph");
@@ -507,7 +557,12 @@ mod tests {
     fn fork_badge_reflects_resolved_context_regardless_of_agent_or_state() {
         // R-SA-111: the badge is driven purely by the resolved `ContextMode` passed in, never by
         // any other field — verify it is insensitive to run state/agent identity.
-        for state in [RunState::Queued, RunState::Running, RunState::Complete, RunState::Failed] {
+        for state in [
+            RunState::Queued,
+            RunState::Running,
+            RunState::Complete,
+            RunState::Failed,
+        ] {
             let snap = snapshot("scout", state, ContextMode::Fork, vec![]);
             let header = render_run_header_line(
                 snap.current_agent.as_deref().unwrap_or("?"),
@@ -516,24 +571,37 @@ mod tests {
                 0,
             );
             let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
-            assert!(text.contains(FORK_BADGE_TEXT), "state {state:?} must still show fork badge");
+            assert!(
+                text.contains(FORK_BADGE_TEXT),
+                "state {state:?} must still show fork badge"
+            );
         }
         let fresh_snap = snapshot("scout", RunState::Running, ContextMode::Fresh, vec![]);
-        let header = render_run_header_line("scout", fresh_snap.status.state, fresh_snap.context, 0);
+        let header =
+            render_run_header_line("scout", fresh_snap.status.state, fresh_snap.context, 0);
         let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!text.contains(FORK_BADGE_TEXT), "fresh context must never show fork badge");
+        assert!(
+            !text.contains(FORK_BADGE_TEXT),
+            "fresh context must never show fork badge"
+        );
     }
 
     // ---- R-SA-112/113: nested fold, depth cap, overflow aggregation ----
 
     #[test]
     fn nested_children_render_indented_under_parent() {
-        let children = vec![nested("worker-a", RunState::Running, vec![]), nested("worker-b", RunState::Complete, vec![])];
+        let children = vec![
+            nested("worker-a", RunState::Running, vec![]),
+            nested("worker-b", RunState::Complete, vec![]),
+        ];
         let lines = render_nested_children(&children, 0, 0);
         assert_eq!(lines.len(), 2);
         for line in &lines {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            assert!(text.starts_with("  "), "child line must be indented: {text:?}");
+            assert!(
+                text.starts_with("  "),
+                "child line must be indented: {text:?}"
+            );
         }
     }
 
@@ -547,22 +615,33 @@ mod tests {
         let top = vec![child];
 
         let lines = render_nested_children(&top, 0, 0);
-        let texts: Vec<String> =
-            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
 
         // Expect: "c" header line, then "g" header line (depth 1 -> within cap), then an
         // aggregate line collapsing everything at/under "g"'s children (the grandchild "gg"
         // subtree), since depth+1 (2) >= MAX_NESTED_DEPTH (2) once we'd otherwise recurse into
         // "g"'s children.
-        assert!(texts.iter().any(|t| t.contains('c')), "expected child 'c' rendered: {texts:?}");
-        assert!(texts.iter().any(|t| t.contains('g') && !t.contains("gg")), "expected grandchild 'g' rendered: {texts:?}");
+        assert!(
+            texts.iter().any(|t| t.contains('c')),
+            "expected child 'c' rendered: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains('g') && !t.contains("gg")),
+            "expected grandchild 'g' rendered: {texts:?}"
+        );
         assert!(
             texts.iter().any(|t| t.contains("more")),
             "expected an aggregate overflow/collapse line beyond the depth cap: {texts:?}"
         );
         // The deepest literal agent name ("gg") must never appear as its own rendered header —
         // it must have been folded into the aggregate line instead.
-        assert!(!texts.iter().any(|t| t.trim_start().starts_with("gg")), "grandchild-of-grandchild must not get its own line: {texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.trim_start().starts_with("gg")),
+            "grandchild-of-grandchild must not get its own line: {texts:?}"
+        );
     }
 
     #[test]
@@ -574,9 +653,17 @@ mod tests {
         let lines = render_nested_children(&children, 0, 0);
         // MAX_CHILDREN_PER_LEVEL full lines + exactly one aggregate suffix line.
         assert_eq!(lines.len(), MAX_CHILDREN_PER_LEVEL + 1);
-        let last_text: String =
-            lines.last().expect("non-empty").spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(last_text.contains("+3 more"), "expected '+3 more' aggregate line, got {last_text:?}");
+        let last_text: String = lines
+            .last()
+            .expect("non-empty")
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            last_text.contains("+3 more"),
+            "expected '+3 more' aggregate line, got {last_text:?}"
+        );
     }
 
     #[test]
@@ -589,7 +676,9 @@ mod tests {
     fn nested_render_never_grows_unbounded_for_large_flat_fanout() {
         // A pathologically large flat fan-out (R-SA-113: "never allowed to grow the rendered
         // region unbounded") must still collapse to bounded output.
-        let children: Vec<_> = (0..500).map(|i| nested(&format!("w{i}"), RunState::Complete, vec![])).collect();
+        let children: Vec<_> = (0..500)
+            .map(|i| nested(&format!("w{i}"), RunState::Complete, vec![]))
+            .collect();
         let lines = render_nested_children(&children, 0, 0);
         assert_eq!(lines.len(), MAX_CHILDREN_PER_LEVEL + 1);
     }
@@ -600,14 +689,27 @@ mod tests {
     fn background_region_details_up_to_cap_then_folds_overflow() {
         let mut snapshots = Vec::new();
         for i in 0..(MAX_DETAILED_RUNS + 2) {
-            snapshots.push(snapshot(&format!("agent-{i}"), RunState::Running, ContextMode::Fresh, vec![]));
+            snapshots.push(snapshot(
+                &format!("agent-{i}"),
+                RunState::Running,
+                ContextMode::Fresh,
+                vec![],
+            ));
         }
         let lines = render_background_region(&snapshots, 0);
         // MAX_DETAILED_RUNS header lines + 1 aggregate line (no nested children in this fixture).
         assert_eq!(lines.len(), MAX_DETAILED_RUNS + 1);
-        let last_text: String =
-            lines.last().expect("non-empty").spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(last_text.contains("+2 more"), "expected overflow aggregate, got {last_text:?}");
+        let last_text: String = lines
+            .last()
+            .expect("non-empty")
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            last_text.contains("+2 more"),
+            "expected overflow aggregate, got {last_text:?}"
+        );
     }
 
     #[test]
@@ -623,8 +725,10 @@ mod tests {
         ];
         let lines = render_background_region(&snapshots, 0);
         assert_eq!(lines.len(), 2);
-        let texts: Vec<String> =
-            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
         assert!(!texts.iter().any(|t| t.contains("more")));
     }
 
@@ -639,12 +743,19 @@ mod tests {
             vec![nested("child-1", RunState::Running, vec![])],
         );
         let lines = render_progress_header(&snap, 0);
-        assert_eq!(lines.len(), 2, "expected parent header + one nested child line");
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected parent header + one nested child line"
+        );
         let plain = lines_to_plain_text(&lines);
         assert!(plain[0].contains("orchestrated-worker"));
         assert!(plain[0].contains(FORK_BADGE_TEXT));
         assert!(plain[1].contains("child-1"));
-        assert!(plain[1].starts_with("  "), "nested child must be indented under parent");
+        assert!(
+            plain[1].starts_with("  "),
+            "nested child must be indented under parent"
+        );
     }
 
     // ---- Determinism: same input -> byte-identical output across repeated calls ----
@@ -655,11 +766,18 @@ mod tests {
             "det",
             RunState::Running,
             ContextMode::Fork,
-            vec![nested("c1", RunState::Complete, vec![nested("c2", RunState::Running, vec![])])],
+            vec![nested(
+                "c1",
+                RunState::Complete,
+                vec![nested("c2", RunState::Running, vec![])],
+            )],
         );
         let a = lines_to_plain_text(&render_progress_header(&snap, 5));
         let b = lines_to_plain_text(&render_progress_header(&snap, 5));
-        assert_eq!(a, b, "identical input at the same tick must render byte-identical output");
+        assert_eq!(
+            a, b,
+            "identical input at the same tick must render byte-identical output"
+        );
     }
 
     // ---- Grid-painted assertions via cyrup-test-support's TestBackend wrapper ----
@@ -670,7 +788,11 @@ mod tests {
     fn nested_tree_paints_into_a_real_test_backend_grid() {
         let children = vec![
             nested("alpha", RunState::Running, vec![]),
-            nested("beta", RunState::Complete, vec![nested("beta-child", RunState::Complete, vec![])]),
+            nested(
+                "beta",
+                RunState::Complete,
+                vec![nested("beta-child", RunState::Complete, vec![])],
+            ),
         ];
         let top = snapshot("root", RunState::Running, ContextMode::Fork, children);
         let lines = render_progress_header(&top, 0);
@@ -684,9 +806,18 @@ mod tests {
 
         let grid = term.snapshot();
         assert!(grid.contains("root"), "grid missing root label:\n{grid}");
-        assert!(grid.contains(FORK_BADGE_TEXT), "grid missing fork badge:\n{grid}");
-        assert!(grid.contains("alpha"), "grid missing nested child 'alpha':\n{grid}");
-        assert!(grid.contains("beta"), "grid missing nested child 'beta':\n{grid}");
+        assert!(
+            grid.contains(FORK_BADGE_TEXT),
+            "grid missing fork badge:\n{grid}"
+        );
+        assert!(
+            grid.contains("alpha"),
+            "grid missing nested child 'alpha':\n{grid}"
+        );
+        assert!(
+            grid.contains("beta"),
+            "grid missing nested child 'beta':\n{grid}"
+        );
     }
 
     #[test]
@@ -702,6 +833,9 @@ mod tests {
 
         let grid = term.snapshot();
         assert!(grid.contains("plain-run"), "grid missing label:\n{grid}");
-        assert!(!grid.contains("fork"), "fresh context must never paint a fork badge:\n{grid}");
+        assert!(
+            !grid.contains("fork"),
+            "fresh context must never paint a fork badge:\n{grid}"
+        );
     }
 }

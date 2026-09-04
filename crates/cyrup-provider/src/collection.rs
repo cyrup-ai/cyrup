@@ -822,10 +822,7 @@ pub fn get_supported_thinking_levels(model: &Model) -> Vec<ModelThinkingLevel> {
                 Some(None) => false, // explicit null → unsupported
                 Some(Some(_)) => true,
                 // undefined: `xhigh`/`max` require an entry, every other rung is implicit.
-                None => !matches!(
-                    *level,
-                    ModelThinkingLevel::Xhigh | ModelThinkingLevel::Max
-                ),
+                None => !matches!(*level, ModelThinkingLevel::Xhigh | ModelThinkingLevel::Max),
             }
         })
         .collect()
@@ -1451,7 +1448,9 @@ mod tests {
         // shape below deliberately produces). Asserting the rendered string instead would have been
         // asserting `ProviderError::Transport`'s own `Display` prefix, which is not what upstream
         // is saying anything about.
-        let recorded = result.error_for("dyn-bad").expect("the failing provider is named");
+        let recorded = result
+            .error_for("dyn-bad")
+            .expect("the failing provider is named");
         assert!(
             matches!(recorded, ProviderError::Transport(_)),
             "the provider's own error variant must survive the fan-out unwrapped, got {recorded:?}"
@@ -1603,7 +1602,10 @@ mod tests {
             .await
             .expect("cancel must cut the in-flight refresh off, not merely be recorded");
 
-        assert!(result.aborted, "models.ts:327 — `aborted: signal?.aborted ?? false`");
+        assert!(
+            result.aborted,
+            "models.ts:327 — `aborted: signal?.aborted ?? false`"
+        );
         assert!(
             result.errors.is_empty(),
             "models.ts:305 — an aborted provider records no error, even though its fetch returned Err"

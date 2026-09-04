@@ -63,19 +63,28 @@ impl YoloModeControlOptions {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map_or_else(|| DEFAULT_YOLO_CONTROL_SOURCE.to_string(), ToString::to_string)
+            .map_or_else(
+                || DEFAULT_YOLO_CONTROL_SOURCE.to_string(),
+                ToString::to_string,
+            )
     }
 
     /// The in-memory-only variant (pi `{ persist: false }`).
     #[must_use]
     pub fn transient(source: impl Into<String>) -> Self {
-        Self { persist: Some(false), source: Some(source.into()) }
+        Self {
+            persist: Some(false),
+            source: Some(source.into()),
+        }
     }
 
     /// The persisting variant with an explicit caller label (pi `{ source }`).
     #[must_use]
     pub fn from_source(source: impl Into<String>) -> Self {
-        Self { persist: None, source: Some(source.into()) }
+        Self {
+            persist: None,
+            source: Some(source.into()),
+        }
     }
 }
 
@@ -108,8 +117,20 @@ mod tests {
     #[test]
     fn only_an_explicit_false_suppresses_the_write() {
         assert!(YoloModeControlOptions::default().persists());
-        assert!(YoloModeControlOptions { persist: Some(true), source: None }.persists());
-        assert!(!YoloModeControlOptions { persist: Some(false), source: None }.persists());
+        assert!(
+            YoloModeControlOptions {
+                persist: Some(true),
+                source: None
+            }
+            .persists()
+        );
+        assert!(
+            !YoloModeControlOptions {
+                persist: Some(false),
+                source: None
+            }
+            .persists()
+        );
         assert!(!YoloModeControlOptions::transient("t").persists());
         assert!(YoloModeControlOptions::from_source("s").persists());
     }
@@ -117,9 +138,21 @@ mod tests {
     /// pi `getNonEmptyString(options.source) ?? "runtime-api"` (`index.ts:1443,1460`).
     #[test]
     fn source_falls_back_to_runtime_api_for_absent_empty_and_blank() {
-        assert_eq!(YoloModeControlOptions::default().source_or_default(), "runtime-api");
-        assert_eq!(YoloModeControlOptions::from_source("").source_or_default(), "runtime-api");
-        assert_eq!(YoloModeControlOptions::from_source("   ").source_or_default(), "runtime-api");
-        assert_eq!(YoloModeControlOptions::from_source("  cli  ").source_or_default(), "cli");
+        assert_eq!(
+            YoloModeControlOptions::default().source_or_default(),
+            "runtime-api"
+        );
+        assert_eq!(
+            YoloModeControlOptions::from_source("").source_or_default(),
+            "runtime-api"
+        );
+        assert_eq!(
+            YoloModeControlOptions::from_source("   ").source_or_default(),
+            "runtime-api"
+        );
+        assert_eq!(
+            YoloModeControlOptions::from_source("  cli  ").source_or_default(),
+            "cli"
+        );
     }
 }

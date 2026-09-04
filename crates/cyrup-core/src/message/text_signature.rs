@@ -27,7 +27,11 @@ pub struct TextSignatureV1 {
 impl TextSignatureV1 {
     /// Build a V1 signature (`v` fixed to 1).
     pub fn new(id: impl Into<String>, phase: Option<TextPhase>) -> Self {
-        Self { v: 1, id: id.into(), phase }
+        Self {
+            v: 1,
+            id: id.into(),
+            phase,
+        }
     }
 
     /// Parse a structured V1 signature from a `text_signature` string, or `None` for a legacy id

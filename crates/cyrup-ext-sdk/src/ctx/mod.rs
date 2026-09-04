@@ -91,7 +91,7 @@ pub use session::Session;
 pub use tool_call::{Signal, ToolCall};
 pub use ui::{NotifyKind, Ui};
 pub use with_session::{
-    register_with_session, run_with_session, ReplacedSessionContext, WithSessionFn,
+    ReplacedSessionContext, WithSessionFn, register_with_session, run_with_session,
 };
 
 /// Parse a host JSON string; `Value::Null` on failure. Private to `ctx` — a child module reaches it

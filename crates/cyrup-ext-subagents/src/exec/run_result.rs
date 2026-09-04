@@ -2,13 +2,11 @@
 //! Split out of `exec/mod.rs`'s own "AgentConfig / RunOptions / SingleResult" section;
 //! [`crate::exec::agent_config`] is that section's input-contract half.
 
-
 use cyrup_core::{ModelId, Usage};
 
 use crate::exec::acceptance::AcceptanceLedger;
 use crate::exec::fallback::ModelAttempt;
 use crate::exec::tool_call_summary::ToolCallSummary;
-
 
 /// The full, terminal outcome of one `run_sync` call (arch-SA §3.4). This is always the
 /// **compacted** (R-SA-043) shape: no raw per-turn messages — only the summarized fields below.

@@ -13,7 +13,11 @@ pub(super) fn install(api: &mut ExtensionApi) {
         CommandDescriptor::new("Dismiss a dialog via a named signal, then confirm (demo)."),
         |_args: &str, ctx: &crate::CommandCtx| {
             ctx.ui().abort_signal("demo-dialog");
-            let ok = ctx.ui().confirm_with("proceed?", "unreachable body", &DialogOptions::signal("demo-dialog"));
+            let ok = ctx.ui().confirm_with(
+                "proceed?",
+                "unreachable body",
+                &DialogOptions::signal("demo-dialog"),
+            );
             Ok(Some(format!("confirmed: {ok}")))
         },
     );
@@ -47,8 +51,11 @@ pub(super) fn install(api: &mut ExtensionApi) {
         "inputdemo",
         CommandDescriptor::new("Open an input dialog with a placeholder (demo)."),
         |_args: &str, ctx: &crate::CommandCtx| {
-            let answer =
-                ctx.ui().input_with("name?", Some("e.g. Ada Lovelace"), &DialogOptions::default());
+            let answer = ctx.ui().input_with(
+                "name?",
+                Some("e.g. Ada Lovelace"),
+                &DialogOptions::default(),
+            );
             ctx.ui().notify(&format!("input: {answer:?}"));
             // Visible LIVE proof (see `confirmdemo`'s comment): echo the received text in a follow-up
             // dialog's prompt.
@@ -69,7 +76,10 @@ pub(super) fn install(api: &mut ExtensionApi) {
             ctx.ui().notify(&text);
             // Visible LIVE proof (see `confirmdemo`'s comment): echo the received choice in a follow-up
             // dialog's prompt.
-            let _ = ctx.ui().confirm(&format!("you picked: {}", chosen.as_deref().unwrap_or("none")));
+            let _ = ctx.ui().confirm(&format!(
+                "you picked: {}",
+                chosen.as_deref().unwrap_or("none")
+            ));
             Ok(Some(text))
         },
     );
@@ -94,13 +104,17 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // review §2.1): proves the run loop's `AppAction::ExtensionShortcut` no longer self-deadlocks now
     // that it is spawned rather than awaited inline (a shortcut handler blocking on `ui_roundtrip`
     // while the SAME task also owns `ui_rx` would otherwise hang forever).
-    api.register_shortcut("ctrl+t", "Open a confirm dialog from a shortcut (demo)", |ctx: &crate::Ctx| {
-        let ok = ctx.ui().confirm("shortcut confirm — proceed?");
-        let text = format!("shortcut confirmed: {ok}");
-        ctx.ui().notify(&text);
-        // Visible LIVE proof (see `confirmdemo`'s comment) — also proves TWO SEQUENTIAL synchronous
-        // `ui.*` round trips from the SAME spawned shortcut task both reach the run loop correctly.
-        let _ = ctx.ui().confirm(&text);
-        Ok(())
-    });
+    api.register_shortcut(
+        "ctrl+t",
+        "Open a confirm dialog from a shortcut (demo)",
+        |ctx: &crate::Ctx| {
+            let ok = ctx.ui().confirm("shortcut confirm — proceed?");
+            let text = format!("shortcut confirmed: {ok}");
+            ctx.ui().notify(&text);
+            // Visible LIVE proof (see `confirmdemo`'s comment) — also proves TWO SEQUENTIAL synchronous
+            // `ui.*` round trips from the SAME spawned shortcut task both reach the run loop correctly.
+            let _ = ctx.ui().confirm(&text);
+            Ok(())
+        },
+    );
 }

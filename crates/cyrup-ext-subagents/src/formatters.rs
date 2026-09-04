@@ -52,7 +52,11 @@ pub fn format_model_thinking(model: Option<&str>, thinking: Option<&str>) -> Str
 #[must_use]
 pub fn format_model_thinking_opt(model: Option<&str>, thinking: Option<&str>) -> Option<String> {
     let joined = format_model_thinking(model, thinking);
-    if joined.is_empty() { None } else { Some(joined) }
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
 }
 
 /// The lowercase mode string pi renders (`SubagentRunMode`): `single`/`parallel`/`chain`.

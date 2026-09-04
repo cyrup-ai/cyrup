@@ -38,7 +38,12 @@
 //! control additionally asserts the *relayed* envelope is byte-identical to what was sent (modulo
 //! the two broker-owned stamps), which is what the lossless-relay claim actually means.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -47,10 +52,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use cyrup_intercom::transport::client::{IntercomClient, InboundEvent};
+use crate::common::Broker;
+use cyrup_intercom::transport::client::{InboundEvent, IntercomClient};
 use cyrup_intercom::transport::framing::{FrameReader, encode_json};
 use cyrup_intercom::transport::protocol::{SessionRegistration, now_ms};
-use crate::common::Broker;
 
 // ---------------------------------------------------------------------------------------------
 // Side A — the real broker subprocess, driven by raw framed clients.
@@ -68,7 +73,9 @@ struct RawClient {
 impl RawClient {
     async fn connect(socket: &Path) -> Self {
         Self {
-            stream: UnixStream::connect(socket).await.expect("connect to the broker socket"),
+            stream: UnixStream::connect(socket)
+                .await
+                .expect("connect to the broker socket"),
             reader: FrameReader::new(),
             queued: VecDeque::new(),
             buf: vec![0u8; 16 * 1024],
@@ -92,9 +99,13 @@ impl RawClient {
                 Ok(Ok(0) | Err(_)) => return None,
                 Ok(Ok(n)) => n,
             };
-            let frames = self.reader.push(&self.buf[..n]).expect("broker frames are well-formed");
+            let frames = self
+                .reader
+                .push(&self.buf[..n])
+                .expect("broker frames are well-formed");
             for payload in frames {
-                self.queued.push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
+                self.queued
+                    .push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
             }
         }
     }
@@ -124,7 +135,10 @@ impl RawClient {
             },
         }))
         .await;
-        assert_eq!(self.expect_frame("registered").await["sessionId"], session_id);
+        assert_eq!(
+            self.expect_frame("registered").await["sessionId"],
+            session_id
+        );
     }
 
     /// Assert the broker destroyed this connection. A `list` is queued first so a broker that
@@ -151,16 +165,23 @@ impl RawClient {
     /// Assert the broker did NOT destroy this connection — the other half of matching pi, and the
     /// half a blanket "reject everything" fix would fail.
     async fn assert_alive(&mut self, what: &str) {
-        self.send(&serde_json::json!({ "type": "list", "requestId": "alive" })).await;
+        self.send(&serde_json::json!({ "type": "list", "requestId": "alive" }))
+            .await;
         let frame = self.expect_frame("sessions").await;
-        assert_eq!(frame["requestId"], "alive", "the broker must keep serving after {what}");
+        assert_eq!(
+            frame["requestId"], "alive",
+            "the broker must keep serving after {what}"
+        );
     }
 
     /// Assert nothing at all arrives for a beat — used to prove a rejected `send` was not silently
     /// relayed to the peer with the offending keys stripped, which is what happened before the fix.
     async fn assert_quiet(&mut self, what: &str) {
         let frame = self.next_frame_within(Duration::from_millis(750)).await;
-        assert!(frame.is_none(), "{what}: the peer must receive nothing, but got {frame:?}");
+        assert!(
+            frame.is_none(),
+            "{what}: the peer must receive nothing, but got {frame:?}"
+        );
     }
 }
 
@@ -221,7 +242,9 @@ async fn send_with_a_null_optional_field_is_delivery_failed_and_never_relayed() 
             failed["messageId"], "unknown",
             "pi reports `unknown` because isMessage() failed (`v0.9.2 broker/broker.ts:605`), for {patch}"
         );
-        alpha.assert_alive(&format!("a rejected send carrying {patch}")).await;
+        alpha
+            .assert_alive(&format!("a rejected send carrying {patch}"))
+            .await;
         beta.assert_quiet(&format!("send carrying {patch}")).await;
     }
 }
@@ -238,8 +261,10 @@ async fn register_with_a_null_optional_field_is_fatal() {
         });
         session[key] = serde_json::Value::Null;
         let mut c = RawClient::connect(&broker.socket).await;
-        c.send(&serde_json::json!({ "type": "register", "sessionId": "s1", "session": session })).await;
-        c.assert_destroyed(&format!("`register.session.{key}` = null")).await;
+        c.send(&serde_json::json!({ "type": "register", "sessionId": "s1", "session": session }))
+            .await;
+        c.assert_destroyed(&format!("`register.session.{key}` = null"))
+            .await;
     }
 }
 
@@ -255,7 +280,8 @@ async fn message_receipt_with_a_null_detail_is_fatal() {
         "receipt": { "messageId": "m1", "status": "queued", "timestamp": 1, "detail": null },
     }))
     .await;
-    c.assert_destroyed("`message_receipt.receipt.detail` = null").await;
+    c.assert_destroyed("`message_receipt.receipt.detail` = null")
+        .await;
 }
 
 /// **Positive control for side A.** `undefined` is what pi's guards permit, so the same frames with
@@ -281,14 +307,19 @@ async fn absent_optional_fields_are_served_and_relayed_verbatim() {
             "session": { "cwd": "/tmp/work", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
         }))
         .await;
-    assert_eq!(plain.expect_frame("registered").await["sessionId"], "plain-session");
+    assert_eq!(
+        plain.expect_frame("registered").await["sessionId"],
+        "plain-session"
+    );
     plain
         .send(&serde_json::json!({
             "type": "message_receipt",
             "receipt": { "messageId": "m1", "status": "queued", "timestamp": 1 },
         }))
         .await;
-    plain.assert_alive("a `message_receipt` with `detail` absent").await;
+    plain
+        .assert_alive("a `message_receipt` with `detail` absent")
+        .await;
 
     // The relay half: every optional field set to a well-typed value, plus an unmodelled key.
     //
@@ -306,7 +337,9 @@ async fn absent_optional_fields_are_served_and_relayed_verbatim() {
         "timestamp": 1_699_999_999_000_u64,
         "content": { "text": "first" },
     });
-    alpha.send(&serde_json::json!({ "type": "send", "to": "beta-session", "message": earlier })).await;
+    alpha
+        .send(&serde_json::json!({ "type": "send", "to": "beta-session", "message": earlier }))
+        .await;
     assert_eq!(alpha.expect_frame("delivered").await["messageId"], "m0");
     assert_eq!(beta.expect_frame("message").await["message"]["id"], "m0");
 
@@ -323,16 +356,27 @@ async fn absent_optional_fields_are_served_and_relayed_verbatim() {
             { "type": "snippet", "name": "n", "content": "c", "language": "rust" },
         ] },
     });
-    alpha.send(&serde_json::json!({ "type": "send", "to": "beta-session", "message": sent })).await;
+    alpha
+        .send(&serde_json::json!({ "type": "send", "to": "beta-session", "message": sent }))
+        .await;
     assert_eq!(alpha.expect_frame("delivered").await["messageId"], "m-good");
 
     let relayed = beta.expect_frame("message").await;
     let mut got = relayed["message"].clone();
     // The two stamps pi's broker adds on top of the spread (`v0.9.2 broker/broker.ts:674-675`).
     let obj = got.as_object_mut().expect("the relayed message is a map");
-    assert!(obj.remove("brokerReceivedAt").is_some(), "the broker must stamp `brokerReceivedAt`");
-    assert!(obj.remove("brokerDeliveredAt").is_some(), "the broker must stamp `brokerDeliveredAt`");
-    assert_eq!(got, sent, "the relayed envelope must be byte-equal to what was sent");
+    assert!(
+        obj.remove("brokerReceivedAt").is_some(),
+        "the broker must stamp `brokerReceivedAt`"
+    );
+    assert!(
+        obj.remove("brokerDeliveredAt").is_some(),
+        "the broker must stamp `brokerDeliveredAt`"
+    );
+    assert_eq!(
+        got, sent,
+        "the relayed envelope must be byte-equal to what was sent"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -370,11 +414,15 @@ impl HostileBroker {
             let mut reader = FrameReader::new();
             let mut buf = vec![0u8; 16 * 1024];
             loop {
-                let Ok(n) = stream.read(&mut buf).await else { return };
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
                 if n == 0 {
                     return;
                 }
-                let Ok(got) = reader.push(&buf[..n]) else { return };
+                let Ok(got) = reader.push(&buf[..n]) else {
+                    return;
+                };
                 if !got.is_empty() {
                     break;
                 }
@@ -394,7 +442,11 @@ impl HostileBroker {
             // Hold the socket open so a client disconnect can only come from the client itself.
             std::future::pending::<()>().await;
         });
-        Self { _dir: dir, socket, release }
+        Self {
+            _dir: dir,
+            socket,
+            release,
+        }
     }
 }
 
@@ -453,8 +505,7 @@ fn with_null(base: &serde_json::Value, key: &str) -> serde_json::Value {
 /// each rejection is a `throw` in the client's switch, i.e. `socket.destroy`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_client_destroys_the_connection_on_null_optional_fields() {
-    let good_msg =
-        serde_json::json!({ "id": "m1", "timestamp": 1, "content": { "text": "hi" } });
+    let good_msg = serde_json::json!({ "id": "m1", "timestamp": 1, "content": { "text": "hi" } });
     let good_receipt = serde_json::json!({ "messageId": "m1", "status": "queued", "timestamp": 1 });
     let good_control = serde_json::json!({ "messageId": "m1", "action": "cancel", "timestamp": 1 });
 
@@ -535,24 +586,36 @@ async fn the_client_survives_absent_optional_fields() {
         "contextPct": 42, "contextTokens": 100, "contextWindow": 200,
     });
     for (what, frame) in [
-        ("session_joined", serde_json::json!({ "type": "session_joined", "session": from.clone() })),
-        ("message_control", serde_json::json!({
-            "type": "message_control", "from": from.clone(),
-            "control": { "messageId": "m1", "action": "cancel", "timestamp": 1 },
-        })),
-        ("message_receipt", serde_json::json!({
-            "type": "message_receipt", "from": from.clone(),
-            "receipt": { "messageId": "m1", "status": "queued", "timestamp": 1 },
-        })),
-        ("message", serde_json::json!({
-            "type": "message", "from": from.clone(),
-            "message": {
-                "id": "m1", "timestamp": 1, "senderSequence": 7, "expectsReply": false,
-                "content": { "text": "hi", "attachments": [
-                    { "type": "snippet", "name": "n", "content": "c" },
-                ] },
-            },
-        })),
+        (
+            "session_joined",
+            serde_json::json!({ "type": "session_joined", "session": from.clone() }),
+        ),
+        (
+            "message_control",
+            serde_json::json!({
+                "type": "message_control", "from": from.clone(),
+                "control": { "messageId": "m1", "action": "cancel", "timestamp": 1 },
+            }),
+        ),
+        (
+            "message_receipt",
+            serde_json::json!({
+                "type": "message_receipt", "from": from.clone(),
+                "receipt": { "messageId": "m1", "status": "queued", "timestamp": 1 },
+            }),
+        ),
+        (
+            "message",
+            serde_json::json!({
+                "type": "message", "from": from.clone(),
+                "message": {
+                    "id": "m1", "timestamp": 1, "senderSequence": 7, "expectsReply": false,
+                    "content": { "text": "hi", "attachments": [
+                        { "type": "snippet", "name": "n", "content": "c" },
+                    ] },
+                },
+            }),
+        ),
     ] {
         assert!(
             !client_disconnects_on(frame).await,
@@ -560,4 +623,3 @@ async fn the_client_survives_absent_optional_fields() {
         );
     }
 }
-

@@ -12,11 +12,11 @@ use crate::extension::{CHILD_ENV_VAR, SUBAGENT_ENV_HINT_KEYS};
 #[test]
 fn subagent_env_hint_ors_any_non_empty_value_across_all_three_keys() {
     let hint = |pairs: &[(&str, &str)]| {
-        let owned: Vec<(String, String)> =
-            pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
-        has_subagent_env_hint(|key| {
-            owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-        })
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        has_subagent_env_hint(|key| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
     };
 
     // The one case the old strict `== Some("1")` predicate already got right.
@@ -53,7 +53,11 @@ fn subagent_env_hint_ors_any_non_empty_value_across_all_three_keys() {
 fn subagent_env_hint_keys_match_the_spawn_overlay_contract() {
     assert_eq!(
         SUBAGENT_ENV_HINT_KEYS,
-        ["CYRUP_SUBAGENT_CHILD", "CYRUP_SUBAGENT_RUN_ID", "CYRUP_SUBAGENT_AGENT_NAME"]
+        [
+            "CYRUP_SUBAGENT_CHILD",
+            "CYRUP_SUBAGENT_RUN_ID",
+            "CYRUP_SUBAGENT_AGENT_NAME"
+        ]
     );
     assert_eq!(CHILD_ENV_VAR, SUBAGENT_ENV_HINT_KEYS[0]);
 }

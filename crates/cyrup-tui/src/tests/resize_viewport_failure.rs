@@ -11,7 +11,12 @@
 //! the exact seam the DSR used to fail at: `Backend::get_cursor_position`, called from
 //! `compute_inline_size` inside `Terminal::with_options` (`ratatui-core/src/terminal/inline.rs:396`,
 //! `init.rs:122-130`).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::cell::Cell;
 use std::convert::Infallible;
@@ -43,7 +48,10 @@ struct FlakyBackend {
 
 impl FlakyBackend {
     fn new(inner: TestBackend) -> Self {
-        Self { inner, fail_next_cursor_query: Cell::new(false) }
+        Self {
+            inner,
+            fail_next_cursor_query: Cell::new(false),
+        }
     }
 }
 
@@ -81,7 +89,9 @@ impl Backend for FlakyBackend {
     /// backend.
     fn get_cursor_position(&mut self) -> io::Result<Position> {
         if self.fail_next_cursor_query.replace(false) {
-            return Err(io::Error::other("simulated resize-time cursor query failure"));
+            return Err(io::Error::other(
+                "simulated resize-time cursor query failure",
+            ));
         }
         self.inner.get_cursor_position().map_err(infallible)
     }
@@ -112,12 +122,16 @@ impl Backend for FlakyBackend {
 
     #[cfg(feature = "scrolling-regions")]
     fn scroll_region_up(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
-        self.inner.scroll_region_up(region, amount).map_err(infallible)
+        self.inner
+            .scroll_region_up(region, amount)
+            .map_err(infallible)
     }
 
     #[cfg(feature = "scrolling-regions")]
     fn scroll_region_down(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
-        self.inner.scroll_region_down(region, amount).map_err(infallible)
+        self.inner
+            .scroll_region_down(region, amount)
+            .map_err(infallible)
     }
 }
 
@@ -126,7 +140,10 @@ impl RebuildBackend for FlakyBackend {
         // See the struct doc: consuming here (not copying) is what makes the injected failure
         // one-shot across a failed-then-retried `resize_viewport`.
         let armed = self.fail_next_cursor_query.replace(false);
-        Self { inner: self.inner.rebuild(), fail_next_cursor_query: Cell::new(armed) }
+        Self {
+            inner: self.inner.rebuild(),
+            fail_next_cursor_query: Cell::new(armed),
+        }
     }
 }
 
@@ -141,8 +158,11 @@ const GROW_A_LOT: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n";
 /// specifically so the FIRST `draw()` always reconstructs the viewport; drawing once here gives
 /// every test a real, non-zero baseline to compare against instead of that seed value).
 fn booted_app(width: u16, height: u16) -> App<FlakyBackend> {
-    let mut app = App::new(FlakyBackend::new(TestBackend::new(width, height)), UiTheme::dark())
-        .expect("constructing over a plain TestBackend-backed FlakyBackend cannot fail");
+    let mut app = App::new(
+        FlakyBackend::new(TestBackend::new(width, height)),
+        UiTheme::dark(),
+    )
+    .expect("constructing over a plain TestBackend-backed FlakyBackend cannot fail");
     app.draw().expect("the first draw, unarmed, must succeed");
     app
 }
@@ -178,7 +198,8 @@ fn a_viewport_resize_failure_does_not_end_the_session() {
     // The call that, before TUI-093's non-fatal handling, would have propagated
     // `Err(TuiError::Backend("... could not be read within a normal duration"))` all the way out
     // of `App::run`.
-    app.draw().expect("a resize failure must not propagate out of draw()");
+    app.draw()
+        .expect("a resize failure must not propagate out of draw()");
 
     assert_eq!(
         app.viewport_height(),
@@ -205,7 +226,11 @@ fn the_frame_after_a_failed_resize_retries_and_succeeds() {
     app.editor_mut().insert_str(GROW_A_LOT);
     app.terminal().backend().fail_next_cursor_query.set(true);
     app.draw().unwrap();
-    assert_eq!(app.viewport_height(), start, "the failed attempt (re-asserted from the test above)");
+    assert_eq!(
+        app.viewport_height(),
+        start,
+        "the failed attempt (re-asserted from the test above)"
+    );
 
     app.draw().unwrap();
     assert_ne!(

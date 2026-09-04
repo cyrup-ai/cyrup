@@ -50,7 +50,7 @@
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::types::{AuthContext, EnvAuthContext, ModelAuth};
 use crate::auth::{
-    CredentialStore, Credential, InMemoryCredentialStore, OAuthAuth, ProviderAuth, env_key,
+    Credential, CredentialStore, InMemoryCredentialStore, OAuthAuth, ProviderAuth, env_key,
 };
 use crate::error::AuthError;
 use crate::model::Model;
@@ -375,7 +375,10 @@ pub fn parse_available_copilot_model_ids(raw: &Value) -> Result<Vec<String>, Cop
 /// `createProvider({ filterModels })` transport (`models.ts:545`/`:618`) — and applied by
 /// [`crate::collection::Models::get_available`] at pi's exact position, `models.ts:407`
 /// (PROV-032). `models()` still returns the complete 28-row catalog, as pi's `getModels()` does.
-pub fn filter_github_copilot_models(models: &[Model], credential: Option<&Credential>) -> Vec<Model> {
+pub fn filter_github_copilot_models(
+    models: &[Model],
+    credential: Option<&Credential>,
+) -> Vec<Model> {
     let ext = match credential {
         Some(Credential::Oauth { ext, .. }) => ext,
         // `credential?.type !== "oauth"` — undefined or api_key: unfiltered (`:22`).
@@ -596,10 +599,7 @@ impl GitHubCopilotOAuth {
             ("Authorization", format!("Bearer {copilot_token}")),
         ];
         headers.extend(COPILOT_HEADERS.iter().map(|(k, v)| (*k, (*v).to_string())));
-        headers.push((
-            "X-GitHub-Api-Version",
-            COPILOT_API_VERSION.to_string(),
-        ));
+        headers.push(("X-GitHub-Api-Version", COPILOT_API_VERSION.to_string()));
 
         let raw = self
             .fetch_json(&url, &headers, Some(MODELS_REQUEST_TIMEOUT))
@@ -859,7 +859,9 @@ mod tests {
     #[test]
     fn base_url_from_token_rewrites_the_proxy_prefix() {
         assert_eq!(
-            base_url_from_token("tid=abc;exp=123;proxy-ep=proxy.individual.githubcopilot.com;st=dotcom"),
+            base_url_from_token(
+                "tid=abc;exp=123;proxy-ep=proxy.individual.githubcopilot.com;st=dotcom"
+            ),
             Some("https://api.individual.githubcopilot.com".to_string())
         );
         // A host without the `proxy.` prefix is used verbatim (`:71-72` only strips `^proxy\.`).
@@ -881,7 +883,10 @@ mod tests {
     #[test]
     fn base_url_precedence_matches_upstream() {
         assert_eq!(
-            github_copilot_base_url(Some("proxy-ep=proxy.acme.githubcopilot.com;"), Some("acme.com")),
+            github_copilot_base_url(
+                Some("proxy-ep=proxy.acme.githubcopilot.com;"),
+                Some("acme.com")
+            ),
             "https://api.acme.githubcopilot.com",
             "the token claim outranks the enterprise domain"
         );
@@ -889,25 +894,37 @@ mod tests {
             github_copilot_base_url(Some("tid=no-claim"), Some("company.ghe.com")),
             "https://copilot-api.company.ghe.com"
         );
+        assert_eq!(github_copilot_base_url(None, None), GITHUB_COPILOT_BASE_URL);
+        // JS truthiness: an empty token/domain is "absent" (`:77`, `:82`).
         assert_eq!(
-            github_copilot_base_url(None, None),
+            github_copilot_base_url(Some(""), Some("")),
             GITHUB_COPILOT_BASE_URL
         );
-        // JS truthiness: an empty token/domain is "absent" (`:77`, `:82`).
-        assert_eq!(github_copilot_base_url(Some(""), Some("")), GITHUB_COPILOT_BASE_URL);
     }
 
     /// Pi `normalizeDomain` (`:39-49`): trim → prepend `https://` when schemeless → `URL.hostname`.
     #[test]
     fn normalize_domain_extracts_the_host() {
-        assert_eq!(normalize_domain("  company.ghe.com "), Some("company.ghe.com".to_string()));
+        assert_eq!(
+            normalize_domain("  company.ghe.com "),
+            Some("company.ghe.com".to_string())
+        );
         assert_eq!(
             normalize_domain("https://company.ghe.com/enterprises/x?q=1"),
             Some("company.ghe.com".to_string())
         );
-        assert_eq!(normalize_domain("https://COMPANY.GHE.com"), Some("company.ghe.com".to_string()));
-        assert_eq!(normalize_domain("https://user:pw@company.ghe.com:8443/"), Some("company.ghe.com".to_string()));
-        assert_eq!(normalize_domain("https://[::1]:8443/x"), Some("[::1]".to_string()));
+        assert_eq!(
+            normalize_domain("https://COMPANY.GHE.com"),
+            Some("company.ghe.com".to_string())
+        );
+        assert_eq!(
+            normalize_domain("https://user:pw@company.ghe.com:8443/"),
+            Some("company.ghe.com".to_string())
+        );
+        assert_eq!(
+            normalize_domain("https://[::1]:8443/x"),
+            Some("[::1]".to_string())
+        );
         // Empty / unparseable → null (`:41`, `:47`).
         assert_eq!(normalize_domain("   "), None);
         assert_eq!(normalize_domain("://nope"), None);
@@ -1028,7 +1045,10 @@ mod tests {
         // `.every(id => typeof id === "string")` — ONE non-string voids the whole filter rather than
         // dropping just that entry.
         let mixed = oauth_cred(ext_with(EXT_AVAILABLE_MODEL_IDS, json!(["gpt-5.4", 7])));
-        assert_eq!(filter_github_copilot_models(&models, Some(&mixed)).len(), full);
+        assert_eq!(
+            filter_github_copilot_models(&models, Some(&mixed)).len(),
+            full
+        );
         // An empty list is a valid all-strings array, so it filters to nothing.
         let empty = oauth_cred(ext_with(EXT_AVAILABLE_MODEL_IDS, json!([])));
         assert!(filter_github_copilot_models(&models, Some(&empty)).is_empty());
@@ -1069,7 +1089,10 @@ mod tests {
             expires: 0,
             ext,
         };
-        let auth = GitHubCopilotOAuth::new().to_auth(&cred).await.expect("to_auth");
+        let auth = GitHubCopilotOAuth::new()
+            .to_auth(&cred)
+            .await
+            .expect("to_auth");
         assert_eq!(
             auth.base_url.as_deref(),
             Some("https://copilot-api.company.ghe.com")
@@ -1155,7 +1178,10 @@ mod tests {
             .with_auth_context(empty_env())
             .with_origin_override(&origin, &origin);
 
-        let refreshed = oauth.refresh(&stored_github_token()).await.expect("refresh");
+        let refreshed = oauth
+            .refresh(&stored_github_token())
+            .await
+            .expect("refresh");
         let Credential::Oauth {
             refresh,
             access,
@@ -1168,19 +1194,23 @@ mod tests {
 
         // The GitHub token is carried forward unchanged; the Copilot token replaces `access`.
         assert_eq!(refresh, "gho_stored_github_token");
-        assert_eq!(access, "tid=t1;exp=99;proxy-ep=proxy.individual.githubcopilot.com;");
+        assert_eq!(
+            access,
+            "tid=t1;exp=99;proxy-ep=proxy.individual.githubcopilot.com;"
+        );
         // `expiresAt * 1000 - 5 * 60 * 1000` (`:260`).
         assert_eq!(expires, 1_800_000_000_i64 * 1000 - 5 * 60 * 1000);
         // Only the selectable model is listed.
-        assert_eq!(
-            ext.get(EXT_AVAILABLE_MODEL_IDS),
-            Some(&json!(["gpt-5.4"]))
-        );
+        assert_eq!(ext.get(EXT_AVAILABLE_MODEL_IDS), Some(&json!(["gpt-5.4"])));
         // No enterprise domain was configured, so the key is absent (JS drops `undefined`, `:262`).
         assert!(!ext.contains_key(EXT_ENTERPRISE_URL));
 
         let heads = seen.lock().unwrap().clone();
-        assert_eq!(heads.len(), 2, "expected the token call then the models call");
+        assert_eq!(
+            heads.len(),
+            2,
+            "expected the token call then the models call"
+        );
         let token_head = heads
             .iter()
             .find(|h| h.contains("/copilot_internal/v2/token"))
@@ -1195,11 +1225,18 @@ mod tests {
         for (name, value) in COPILOT_HEADERS {
             let expected = format!("{}: {value}", name.to_ascii_lowercase());
             assert!(token_head.contains(&expected), "token call missing {name}");
-            assert!(models_head.contains(&expected), "models call missing {name}");
+            assert!(
+                models_head.contains(&expected),
+                "models call missing {name}"
+            );
         }
         // `X-GitHub-Api-Version` is on the listing only (`:122`); the token call never sends it.
         assert!(models_head.contains(&format!("x-github-api-version: {COPILOT_API_VERSION}")));
-        assert!(!token_head.to_ascii_lowercase().contains("x-github-api-version"));
+        assert!(
+            !token_head
+                .to_ascii_lowercase()
+                .contains("x-github-api-version")
+        );
     }
 
     /// Pi `:254`: a token response missing `token`/`expires_at` (or with the wrong types) fails with
@@ -1270,13 +1307,16 @@ mod tests {
         assert_eq!(p.id().as_str(), GITHUB_COPILOT_PROVIDER_ID);
         assert!(p.get_model("claude-sonnet-4.5").is_some());
         assert!(p.get_model("gpt-5.4").is_some());
-        let vars = crate::env_api_keys::api_key_env_vars(GITHUB_COPILOT_PROVIDER_ID)
-            .expect("env mapping");
+        let vars =
+            crate::env_api_keys::api_key_env_vars(GITHUB_COPILOT_PROVIDER_ID).expect("env mapping");
         assert!(vars.contains(&COPILOT_GITHUB_TOKEN_ENV));
         // Pi gives Copilot BOTH strategies (`github-copilot.ts:16-19`).
         let auth = p.provider_auth().expect("provider auth");
         assert!(auth.api_key.is_some());
-        assert_eq!(auth.oauth.as_ref().map(|o| o.name()), Some("GitHub Copilot"));
+        assert_eq!(
+            auth.oauth.as_ref().map(|o| o.name()),
+            Some("GitHub Copilot")
+        );
     }
 
     /// With no stored credential and no `COPILOT_GITHUB_TOKEN`, a request is "not configured" —
@@ -1322,8 +1362,14 @@ mod tests {
         .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "auth should have resolved, got: {err}");
-        assert!(err.contains("transport"), "expected transport error, got: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "auth should have resolved, got: {err}"
+        );
+        assert!(
+            err.contains("transport"),
+            "expected transport error, got: {err}"
+        );
     }
 
     /// A loopback listener that records the first bytes of every connection it accepts and answers
@@ -1381,9 +1427,8 @@ mod tests {
             },
         );
 
-        let provider =
-            github_copilot_provider_with(Arc::new(store), Arc::new(builtin_registry()))
-                .with_auth_context(empty_env());
+        let provider = github_copilot_provider_with(Arc::new(store), Arc::new(builtin_registry()))
+            .with_auth_context(empty_env());
         let mut model = provider.get_model("claude-sonnet-4.5").unwrap().clone();
         model.base_url = format!("http://{catalog}");
         let msg = collect_message(provider.stream(
@@ -1393,13 +1438,21 @@ mod tests {
         ))
         .await;
 
-        assert_eq!(edge_hits.lock().unwrap().len(), 1, "the credential's endpoint was not used");
+        assert_eq!(
+            edge_hits.lock().unwrap().len(),
+            1,
+            "the credential's endpoint was not used"
+        );
         assert!(
             catalog_hits.lock().unwrap().is_empty(),
             "model.base_url was used despite the credential's endpoint override"
         );
         assert_eq!(msg.stop_reason, StopReason::Error); // TLS against a plain recorder
-        assert!(!msg.error_message.unwrap_or_default().contains("not configured"));
+        assert!(
+            !msg.error_message
+                .unwrap_or_default()
+                .contains("not configured")
+        );
     }
 
     /// MIRROR of the above: an env API key resolves through `envApiKeyAuth`, which supplies NO
@@ -1428,7 +1481,10 @@ mod tests {
         ))
         .await;
 
-        assert!(edge_hits.lock().unwrap().is_empty(), "nothing should reach the unused edge");
+        assert!(
+            edge_hits.lock().unwrap().is_empty(),
+            "nothing should reach the unused edge"
+        );
         let hits = catalog_hits.lock().unwrap().clone();
         assert_eq!(hits.len(), 1, "model.base_url was not used");
         let head = String::from_utf8_lossy(hits.first().map(Vec::as_slice).unwrap_or(&[]))
@@ -1437,7 +1493,11 @@ mod tests {
         // The catalog's editor headers ride along on every request (`model.headers`).
         for (name, value) in COPILOT_HEADERS {
             assert!(
-                head.contains(&format!("{}: {}", name.to_ascii_lowercase(), value.to_ascii_lowercase())),
+                head.contains(&format!(
+                    "{}: {}",
+                    name.to_ascii_lowercase(),
+                    value.to_ascii_lowercase()
+                )),
                 "request is missing {name}; head: {head}"
             );
         }
@@ -1465,12 +1525,10 @@ mod tests {
             .map(|m| json!(m.id.as_str()))
             .collect();
 
-        let store = Arc::new(
-            InMemoryCredentialStore::new().with_credential(
-                GITHUB_COPILOT_PROVIDER_ID.into(),
-                oauth_cred(ext_with(EXT_AVAILABLE_MODEL_IDS, Value::Array(three))),
-            ),
-        );
+        let store = Arc::new(InMemoryCredentialStore::new().with_credential(
+            GITHUB_COPILOT_PROVIDER_ID.into(),
+            oauth_cred(ext_with(EXT_AVAILABLE_MODEL_IDS, Value::Array(three))),
+        ));
         let mut models = create_models(CreateModelsOptions {
             credentials: Some(store.clone()),
             ..Default::default()
@@ -1514,7 +1572,12 @@ mod tests {
             store,
             Arc::new(builtin_registry()),
         )));
-        assert!(models.check_auth(GITHUB_COPILOT_PROVIDER_ID).await.is_none());
+        assert!(
+            models
+                .check_auth(GITHUB_COPILOT_PROVIDER_ID)
+                .await
+                .is_none()
+        );
         assert!(models.get_available(None).await.is_empty());
         assert!(!models.get_models(None).is_empty());
     }

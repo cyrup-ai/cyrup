@@ -32,19 +32,24 @@
 //! (`:187`). This is the same check, applied to the other untrusted token that reaches a
 //! `Path::join`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::Path;
 use std::sync::Arc;
 
-use cyrup_ext::HostServices;
 use crate::{
-    forwarding::{
-        forwarding_location, process_forwarded_requests, ProcessForwardedOptions,
-        FORWARDING_AGENT_DIR_ENV,
-    },
     ExtensionConfig, ForwardedPermissionRequest,
+    forwarding::{
+        FORWARDING_AGENT_DIR_ENV, ProcessForwardedOptions, forwarding_location,
+        process_forwarded_requests,
+    },
 };
+use cyrup_ext::HostServices;
 
 struct SessionIdServices(String);
 

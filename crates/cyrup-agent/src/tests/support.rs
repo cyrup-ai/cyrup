@@ -16,13 +16,12 @@ use crate::{
     StreamFn, ToolResultMessage, TurnUpdate,
 };
 use cyrup_core::{
-    TerminateHint,
-    AssistantMessage, CancelToken, Content, EventStream, Message, ModelRef, Tool, ToolCallId,
-    ToolError, ToolResult, ToolUpdateSink,
+    AssistantMessage, CancelToken, Content, EventStream, Message, ModelRef, TerminateHint, Tool,
+    ToolCallId, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::{Context, Provider, StreamEvent, StreamOptions};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Model refs
@@ -30,7 +29,11 @@ use serde_json::{json, Value};
 
 /// The offline model every faux-provider-driven test runs against.
 pub(super) fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
+    ModelRef {
+        provider: "faux".into(),
+        api: Some("faux".into()),
+        model: "faux-1".into(),
+    }
 }
 
 /// A real-looking anthropic model ref, for the tests that assert on what a transport does with the
@@ -86,7 +89,10 @@ where
         ctx: &Context,
         opts: &StreamOptions,
     ) -> EventStream<StreamEvent> {
-        self.captured.lock().unwrap().push((self.capture)(model, ctx, opts));
+        self.captured
+            .lock()
+            .unwrap()
+            .push((self.capture)(model, ctx, opts));
         self.inner.stream(model, ctx, opts)
     }
 }
@@ -170,7 +176,12 @@ impl EventRecorder {
     }
 
     pub(super) fn turn_starts(&self) -> usize {
-        self.events.lock().unwrap().iter().filter(|e| matches!(e, AgentEvent::TurnStart)).count()
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnStart))
+            .count()
     }
 
     /// The `tool_execution_end.result` payloads, in order.
@@ -189,7 +200,9 @@ impl EventRecorder {
         self.snapshot()
             .into_iter()
             .filter_map(|e| match e {
-                AgentEvent::MessageEnd { message: AgentMessage::ToolResult(t) } => Some(t),
+                AgentEvent::MessageEnd {
+                    message: AgentMessage::ToolResult(t),
+                } => Some(t),
                 _ => None,
             })
             .collect()
@@ -255,7 +268,9 @@ pub(super) fn last_assistant(events: &[AgentEvent]) -> AssistantMessage {
         .iter()
         .rev()
         .find_map(|e| match e {
-            AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) } => Some((**a).clone()),
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(a),
+            } => Some((**a).clone()),
             _ => None,
         })
         .expect("an assistant message_end")
@@ -276,7 +291,14 @@ impl EchoTool {
     /// The tool AND its execution counter, for callers that assert on how often it ran.
     pub(super) fn new(name: &str) -> (Arc<Self>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
-        (Arc::new(Self { name: name.into(), params: obj_schema(), calls: calls.clone() }), calls)
+        (
+            Arc::new(Self {
+                name: name.into(),
+                params: obj_schema(),
+                calls: calls.clone(),
+            }),
+            calls,
+        )
     }
 
     /// Just the tool, for callers that only need something to dispatch to.

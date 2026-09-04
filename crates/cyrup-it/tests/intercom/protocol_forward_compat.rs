@@ -17,7 +17,12 @@
 //!   (`v0.9.2 broker/broker.ts:672-676`), so a cyrup broker sitting between two pi sessions must
 //!   not delete the half of their envelope it does not model.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -26,8 +31,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use cyrup_intercom::transport::framing::{FrameReader, encode_json};
 use crate::common::Broker;
+use cyrup_intercom::transport::framing::{FrameReader, encode_json};
 
 /// A raw length-prefixed-JSON client: it can put ANY frame on the wire, including tags cyrup's
 /// `ClientMessage` does not model.
@@ -41,7 +46,9 @@ struct RawClient {
 impl RawClient {
     async fn connect(socket: &Path) -> Self {
         Self {
-            stream: UnixStream::connect(socket).await.expect("connect to the broker socket"),
+            stream: UnixStream::connect(socket)
+                .await
+                .expect("connect to the broker socket"),
             reader: FrameReader::new(),
             queued: VecDeque::new(),
             buf: vec![0u8; 16 * 1024],
@@ -59,16 +66,21 @@ impl RawClient {
             if let Some(v) = self.queued.pop_front() {
                 return Some(v);
             }
-            let n = match tokio::time::timeout(Duration::from_secs(5), self.stream.read(&mut self.buf))
-                .await
-                .expect("broker responds or closes within 5s")
-            {
-                Ok(0) | Err(_) => return None,
-                Ok(n) => n,
-            };
-            let frames = self.reader.push(&self.buf[..n]).expect("broker frames are well-formed");
+            let n =
+                match tokio::time::timeout(Duration::from_secs(5), self.stream.read(&mut self.buf))
+                    .await
+                    .expect("broker responds or closes within 5s")
+                {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => n,
+                };
+            let frames = self
+                .reader
+                .push(&self.buf[..n])
+                .expect("broker frames are well-formed");
             for payload in frames {
-                self.queued.push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
+                self.queued
+                    .push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
             }
         }
     }
@@ -146,7 +158,9 @@ async fn broker_survives_the_v0_9_2_client_tags_a_pi_peer_actually_sends() {
         .await;
 
     // The connection must still be serving: a `list` round-trips.
-    alpha.send(&serde_json::json!({ "type": "list", "requestId": "r1" })).await;
+    alpha
+        .send(&serde_json::json!({ "type": "list", "requestId": "r1" }))
+        .await;
     let sessions = alpha.expect_frame("sessions").await;
     assert_eq!(sessions["requestId"], "r1");
     assert_eq!(sessions["sessions"][0]["id"], "alpha-session");
@@ -163,10 +177,15 @@ async fn cancel_message_is_answered_with_pis_delivery_failed_reason() {
     let mut alpha = RawClient::connect(&broker.socket).await;
     alpha.register("alpha", "alpha-session").await;
 
-    alpha.send(&serde_json::json!({ "type": "cancel_message", "messageId": "m-nope" })).await;
+    alpha
+        .send(&serde_json::json!({ "type": "cancel_message", "messageId": "m-nope" }))
+        .await;
     let failed = alpha.expect_frame("delivery_failed").await;
     assert_eq!(failed["messageId"], "m-nope");
-    assert_eq!(failed["reason"], "Message cannot be cancelled by this session");
+    assert_eq!(
+        failed["reason"],
+        "Message cannot be cancelled by this session"
+    );
 }
 
 // MIRROR for the two tests above. Accepting the v0.9.2 tag set must not make the broker credulous.
@@ -195,7 +214,8 @@ async fn broker_still_destroys_the_connection_on_unknown_tags_and_malformed_payl
         serde_json::json!({ "nope": true }),
     ] {
         let mut c = RawClient::connect(&broker.socket).await;
-        c.register("probe", &format!("probe-{}", uuid::Uuid::new_v4())).await;
+        c.register("probe", &format!("probe-{}", uuid::Uuid::new_v4()))
+            .await;
         c.send(&bad).await;
         // Give the broker a chance to answer before it closes; a `list` that never gets its reply
         // is exactly the "socket destroyed" observation. The probe write is fallible on purpose —
@@ -249,16 +269,31 @@ async fn relayed_message_keeps_every_field_a_pi_sender_set_and_gains_the_broker_
     assert_eq!(m["id"], "m1");
     assert_eq!(m["content"]["text"], "hello");
     // The v0.9.x fields the sender set.
-    assert_eq!(m["senderSequence"], 7, "senderSequence must survive the hop: {m}");
+    assert_eq!(
+        m["senderSequence"], 7,
+        "senderSequence must survive the hop: {m}"
+    );
     assert_eq!(m["retryOf"], "m0", "retryOf must survive the hop: {m}");
     assert_eq!(m["receiverReceivedAt"], 1_700_000_000_005_u64);
     assert_eq!(m["injectedAt"], 1_700_000_000_006_u64);
     // The keys cyrup models nowhere — pi's object spread carries these, so the flatten capture must.
-    assert_eq!(m["piFutureField"]["nested"][2], 3, "unmodelled top-level key must survive: {m}");
-    assert_eq!(m["content"]["piFutureContentKey"], "kept", "unmodelled content key must survive: {m}");
+    assert_eq!(
+        m["piFutureField"]["nested"][2], 3,
+        "unmodelled top-level key must survive: {m}"
+    );
+    assert_eq!(
+        m["content"]["piFutureContentKey"], "kept",
+        "unmodelled content key must survive: {m}"
+    );
     // And the two timestamps the broker itself owns (`v0.9.2 broker/broker.ts:674-675`).
-    assert!(m["brokerReceivedAt"].is_u64(), "broker must stamp brokerReceivedAt: {m}");
-    assert!(m["brokerDeliveredAt"].is_u64(), "broker must stamp brokerDeliveredAt: {m}");
+    assert!(
+        m["brokerReceivedAt"].is_u64(),
+        "broker must stamp brokerReceivedAt: {m}"
+    );
+    assert!(
+        m["brokerDeliveredAt"].is_u64(),
+        "broker must stamp brokerDeliveredAt: {m}"
+    );
     assert!(m["brokerDeliveredAt"].as_u64() >= m["brokerReceivedAt"].as_u64());
 
     // The sender still gets its ack, i.e. the relay path is otherwise unchanged.
@@ -297,6 +332,8 @@ async fn a_wrong_typed_v0_9_x_field_still_fails_delivery_like_pi() {
     assert_eq!(failed["messageId"], "unknown");
 
     // And the connection survives — an invalid message is a delivery failure, not a protocol error.
-    alpha.send(&serde_json::json!({ "type": "list", "requestId": "r1" })).await;
+    alpha
+        .send(&serde_json::json!({ "type": "list", "requestId": "r1" }))
+        .await;
     assert_eq!(alpha.expect_frame("sessions").await["requestId"], "r1");
 }

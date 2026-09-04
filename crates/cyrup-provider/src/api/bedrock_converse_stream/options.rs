@@ -4,7 +4,6 @@ use crate::stream::StreamOptions;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-
 /// How Claude's thinking content is returned (pi `BedrockThinkingDisplay`,
 /// `bedrock-converse-stream.ts:66`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

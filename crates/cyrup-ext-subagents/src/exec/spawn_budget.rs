@@ -295,7 +295,12 @@ pub fn grant_spawn_budget(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -428,7 +433,15 @@ mod tests {
     #[test]
     fn the_snapshot_serializes_with_pis_camel_case_keys() {
         let value = serde_json::to_value(snapshot(&capped(2, 1))).expect("serializes");
-        for key in ["used", "configuredLimit", "granted", "limit", "remaining", "grantRemaining", "grantHistory"] {
+        for key in [
+            "used",
+            "configuredLimit",
+            "granted",
+            "limit",
+            "remaining",
+            "grantRemaining",
+            "grantHistory",
+        ] {
             assert!(value.get(key).is_some(), "missing '{key}' in {value}");
         }
     }

@@ -32,11 +32,19 @@ impl InputEditor {
         let mut map = Vec::with_capacity(self.lines.len());
         for (logical, line) in self.lines.iter().enumerate() {
             for (start, len) in word_wrap_line(line, width) {
-                map.push(VisualLine { logical, start, len });
+                map.push(VisualLine {
+                    logical,
+                    start,
+                    len,
+                });
             }
         }
         if map.is_empty() {
-            map.push(VisualLine { logical: 0, start: 0, len: 0 });
+            map.push(VisualLine {
+                logical: 0,
+                start: 0,
+                len: 0,
+            });
         }
         map
     }
@@ -49,7 +57,11 @@ impl InputEditor {
     /// measurement and render agree when passed the same width. Always `>= 1`.
     pub fn visual_line_count(&self, width: usize) -> usize {
         let width = width.max(1);
-        let count: usize = self.lines.iter().map(|line| word_wrap_line(line, width).len()).sum();
+        let count: usize = self
+            .lines
+            .iter()
+            .map(|line| word_wrap_line(line, width).len())
+            .sum();
         count.max(1)
     }
 
@@ -316,7 +328,11 @@ impl InputEditor {
         let map = self.visual_line_map();
         let cur = self.current_visual_line(&map);
         let last = map.len().saturating_sub(1);
-        let target = if direction < 0 { cur.saturating_sub(page) } else { (cur + page).min(last) };
+        let target = if direction < 0 {
+            cur.saturating_sub(page)
+        } else {
+            (cur + page).min(last)
+        };
         self.move_to_visual_line(&map, cur, target);
     }
 
@@ -384,7 +400,11 @@ fn is_last_segment(map: &[VisualLine], i: usize) -> bool {
 /// with a bare `goal.min(vl.len)` and so could park the caret on a column that renders one row down.
 fn segment_max_visual_col(map: &[VisualLine], i: usize) -> usize {
     let len = map.get(i).map_or(0, |vl| vl.len);
-    if is_last_segment(map, i) { len } else { len.saturating_sub(1) }
+    if is_last_segment(map, i) {
+        len
+    } else {
+        len.saturating_sub(1)
+    }
 }
 
 /// The **display width** of `s` in terminal cells — Pi's `visibleWidth` (`utils.ts:240-...`), which
@@ -519,7 +539,9 @@ pub(super) fn word_wrap_line(line: &[char], width: usize) -> Vec<(usize, usize)>
     let mut wrap_opp: Option<(usize, usize)> = None;
 
     for i in 0..segs.len() {
-        let Some(&(char_index, grapheme)) = segs.get(i) else { continue };
+        let Some(&(char_index, grapheme)) = segs.get(i) else {
+            continue;
+        };
         let g_width = display_width(grapheme);
         let is_ws = is_whitespace_seg(grapheme);
 

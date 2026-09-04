@@ -5,10 +5,12 @@ use std::path::Path;
 
 use crate::exec::completion_guard::CompletionMutationGuardResult;
 
-use super::{AcceptanceLedger, AcceptanceStatus};
 use super::contract::{AcceptanceContract, ReviewerResult};
-use super::report_source::{select_acceptance_report_source, self_report_floor, AcceptanceFileOutput};
+use super::report_source::{
+    AcceptanceFileOutput, select_acceptance_report_source, self_report_floor,
+};
 use super::verify::run_verify_commands_memoized_with_cancel;
+use super::{AcceptanceLedger, AcceptanceStatus};
 
 // ============================================================================================
 // R-SA-032: acceptance-gate evaluation
@@ -266,9 +268,7 @@ pub async fn evaluate_acceptance_with_cancel(
                 achieved = achieved.max(AcceptanceStatus::Reviewed);
             }
             None => {
-                detail.push(
-                    "reviewed: no independent reviewer result was supplied".to_string(),
-                );
+                detail.push("reviewed: no independent reviewer result was supplied".to_string());
             }
         }
     }
@@ -336,8 +336,12 @@ async fn declared_structural_failures(
         .map(crate::exec::acceptance::model::parse_acceptance_report)
         .and_then(|parsed| parsed.report)
         .unwrap_or_default();
-    let mut checks = crate::exec::acceptance::model::check_criteria_satisfied(&contract.criteria, &report);
-    checks.extend(crate::exec::acceptance::model::run_structural_checks(&contract.evidence, &report, cwd).await);
+    let mut checks =
+        crate::exec::acceptance::model::check_criteria_satisfied(&contract.criteria, &report);
+    checks.extend(
+        crate::exec::acceptance::model::run_structural_checks(&contract.evidence, &report, cwd)
+            .await,
+    );
     checks
         .into_iter()
         .filter(|check| check.status == crate::exec::acceptance::model::RuntimeCheckStatus::Failed)
@@ -355,12 +359,10 @@ mod tests {
     use crate::exec::acceptance::lattice::testsupport::passed;
     use crate::exec::acceptance::lattice::testsupport::vc;
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_real_executed_passing_verify_command_reaches_verified() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let contract =
-            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 0")]);
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 0")]);
 
         let ledger = evaluate_acceptance(
             &contract,
@@ -381,7 +383,6 @@ mod tests {
         assert_eq!(ledger.verify_results.len(), 1);
         assert!(passed(&ledger.verify_results[0]));
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_childs_prose_claim_of_success_alone_never_reaches_verified() {
@@ -416,19 +417,15 @@ mod tests {
         assert!(ledger.verify_results.is_empty());
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_real_executed_failing_verify_command_is_rejected_regardless_of_prose_claim() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let contract =
-            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 1")]);
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 1")]);
 
         let ledger = evaluate_acceptance(
             &contract,
             clean_gate(),
-            Some(
-                "Everything passed!\n```acceptance-report\n{\"criteriaSatisfied\": true}\n```",
-            ),
+            Some("Everything passed!\n```acceptance-report\n{\"criteriaSatisfied\": true}\n```"),
             no_guard_trigger(),
             dir.path(),
             None,
@@ -441,7 +438,6 @@ mod tests {
         assert!(!passed(&ledger.verify_results[0]));
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_failing_command_among_several_caps_below_verified_even_if_others_pass() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -449,42 +445,63 @@ mod tests {
             AcceptanceStatus::Verified,
             vec![vc("exit 0"), vc("exit 1"), vc("exit 0")],
         );
-        let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path(), None, None)
-                .await;
+        let ledger = evaluate_acceptance(
+            &contract,
+            clean_gate(),
+            None,
+            no_guard_trigger(),
+            dir.path(),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(ledger.status, AcceptanceStatus::Rejected);
         assert_eq!(ledger.verify_results.len(), 3);
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn not_clean_gate_short_circuits_to_not_required_regardless_of_contract() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let contract =
-            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 0")]);
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 0")]);
         let dirty_gate = CleanCompletionGate {
             exit_code: 1,
             detached: false,
             interrupted: false,
             timed_out: false,
         };
-        let ledger =
-            evaluate_acceptance(&contract, dirty_gate, None, no_guard_trigger(), dir.path(), None, None).await;
+        let ledger = evaluate_acceptance(
+            &contract,
+            dirty_gate,
+            None,
+            no_guard_trigger(),
+            dir.path(),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(ledger.status, AcceptanceStatus::NotRequired);
-        assert!(ledger.verify_results.is_empty(), "must not even run verify[] on a non-clean gate");
+        assert!(
+            ledger.verify_results.is_empty(),
+            "must not even run verify[] on a non-clean gate"
+        );
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn checked_level_is_satisfied_by_a_non_triggered_completion_guard() {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]);
-        let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path(), None, None)
-                .await;
+        let ledger = evaluate_acceptance(
+            &contract,
+            clean_gate(),
+            None,
+            no_guard_trigger(),
+            dir.path(),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(ledger.status, AcceptanceStatus::Checked);
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn checked_level_is_rejected_when_completion_guard_triggered() {
@@ -495,11 +512,18 @@ mod tests {
             attempted_mutation: false,
             triggered: true,
         };
-        let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, triggered, dir.path(), None, None).await;
+        let ledger = evaluate_acceptance(
+            &contract,
+            clean_gate(),
+            None,
+            triggered,
+            dir.path(),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(ledger.status, AcceptanceStatus::Rejected);
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reviewed_level_requires_an_approved_externally_supplied_reviewer_result() {
@@ -510,24 +534,36 @@ mod tests {
                 detail: Some("looks good".to_string()),
             });
         assert_eq!(contract.required_level, AcceptanceStatus::Reviewed);
-        let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path(), None, None)
-                .await;
+        let ledger = evaluate_acceptance(
+            &contract,
+            clean_gate(),
+            None,
+            no_guard_trigger(),
+            dir.path(),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(ledger.status, AcceptanceStatus::Reviewed);
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reviewed_level_rejected_when_reviewer_result_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]);
         contract.required_level = AcceptanceStatus::Reviewed; // demand Reviewed but attach no result
-        let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path(), None, None)
-                .await;
+        let ledger = evaluate_acceptance(
+            &contract,
+            clean_gate(),
+            None,
+            no_guard_trigger(),
+            dir.path(),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(ledger.status, AcceptanceStatus::Rejected);
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reviewed_level_rejected_when_reviewer_disapproved() {
@@ -537,13 +573,19 @@ mod tests {
                 approved: false,
                 detail: Some("needs more work".to_string()),
             });
-        let ledger =
-            evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path(), None, None)
-                .await;
+        let ledger = evaluate_acceptance(
+            &contract,
+            clean_gate(),
+            None,
+            no_guard_trigger(),
+            dir.path(),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(ledger.status, AcceptanceStatus::Rejected);
         assert!(ledger.detail.expect("detail").contains("needs more work"));
     }
-
 
     /// G79 on the LIVE gate: `run_sync` calls THIS `evaluate_acceptance`, whose `Checked` rung
     /// parses the child's report through `crate::exec::acceptance::model::parse_acceptance_report`. A child that answered in
@@ -556,12 +598,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]).with_policy(
             crate::exec::acceptance::model::normalize_criteria(
-                &[crate::exec::acceptance::model::CriterionInput::Gate(crate::exec::acceptance::model::AcceptanceGate {
-                    id: Some("C 1".to_string()),
-                    must: Some("add a regression test".to_string()),
-                    evidence: None,
-                    severity: None,
-                })],
+                &[crate::exec::acceptance::model::CriterionInput::Gate(
+                    crate::exec::acceptance::model::AcceptanceGate {
+                        id: Some("C 1".to_string()),
+                        must: Some("add a regression test".to_string()),
+                        evidence: None,
+                        severity: None,
+                    },
+                )],
                 &[],
             ),
             vec![
@@ -601,5 +645,4 @@ mod tests {
         );
         assert_eq!(ledger.detail, None);
     }
-
 }

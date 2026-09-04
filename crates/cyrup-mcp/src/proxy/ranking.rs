@@ -3,16 +3,16 @@
 //!
 //! See [`crate::proxy`] for the module overview.
 
-
 use indexmap::{IndexMap, IndexSet};
 
-
-use crate::config::{
-    locale_compare, McpConfig, ServerEntry,
-    ToolPrefix,
+use crate::config::{McpConfig, ServerEntry, ToolPrefix, locale_compare};
+use crate::proxy::constants::{
+    MIN_STEM_LENGTH, WEIGHT_DESCRIPTION, WEIGHT_KEYWORDS, WEIGHT_NAME, WEIGHT_ORIGINAL_NAME,
+    WEIGHT_SERVER,
 };
-use crate::proxy::constants::{MIN_STEM_LENGTH, WEIGHT_DESCRIPTION, WEIGHT_KEYWORDS, WEIGHT_NAME, WEIGHT_ORIGINAL_NAME, WEIGHT_SERVER};
-use crate::proxy::tool_metadata::{ToolMetadata, matches_tool_pattern, resolve_tool_prefix, server_prefix, tool_name_candidates};
+use crate::proxy::tool_metadata::{
+    ToolMetadata, matches_tool_pattern, resolve_tool_prefix, server_prefix, tool_name_candidates,
+};
 
 // ==================================================================================================
 // 3 · `search-ranking.ts` — 206 lines of allocation-free integer scoring, no I/O
@@ -118,13 +118,19 @@ pub struct RankedToolMatch {
 /// **The stem rule is deliberately asymmetric.** `field.starts_with(token)` matches at any length,
 /// but `token.starts_with(field)` only when the field token is ≥ 4 characters, because real
 /// descriptions tokenize possessives into single letters.
-fn token_bonus(weight: i64, field_tokens: &[String], raw_contains: bool, token: &str) -> Option<i64> {
+fn token_bonus(
+    weight: i64,
+    field_tokens: &[String],
+    raw_contains: bool,
+    token: &str,
+) -> Option<i64> {
     if field_tokens.iter().any(|field_token| field_token == token) {
         return Some(weight * 4);
     }
     let stemmed = field_tokens.iter().any(|field_token| {
         field_token.starts_with(token)
-            || (field_token.chars().count() >= MIN_STEM_LENGTH && token.starts_with(field_token.as_str()))
+            || (field_token.chars().count() >= MIN_STEM_LENGTH
+                && token.starts_with(field_token.as_str()))
     });
     if stemmed {
         return Some(weight * 2);
@@ -182,7 +188,10 @@ pub fn score_tool_match(
     // the first phrase hit per field is the only one that scores.
     let fields: [(i64, String); 4] = [
         (WEIGHT_NAME, normalize_search_text(&tool.name)),
-        (WEIGHT_ORIGINAL_NAME, normalize_search_text(&tool.original_name)),
+        (
+            WEIGHT_ORIGINAL_NAME,
+            normalize_search_text(&tool.original_name),
+        ),
         (WEIGHT_SERVER, normalize_search_text(server)),
         (WEIGHT_DESCRIPTION, normalize_search_text(&tool.description)),
     ];
@@ -200,7 +209,12 @@ pub fn score_tool_match(
             whole_field_exact |= exact;
         }
         for token in &query_tokens {
-            if let Some(bonus) = token_bonus(*weight, &field_tokens, value.contains(token.as_str()), token) {
+            if let Some(bonus) = token_bonus(
+                *weight,
+                &field_tokens,
+                value.contains(token.as_str()),
+                token,
+            ) {
                 score += bonus;
                 matched_tokens.insert(token.clone());
             }
@@ -228,7 +242,8 @@ pub fn score_tool_match(
         }
         score += phrase_score;
 
-        let keyword_tokens: Vec<String> = phrases.iter().flat_map(|phrase| tokenize(phrase)).collect();
+        let keyword_tokens: Vec<String> =
+            phrases.iter().flat_map(|phrase| tokenize(phrase)).collect();
         for token in &query_tokens {
             let raw_contains = phrases.iter().any(|phrase| phrase.contains(token.as_str()));
             if let Some(bonus) = token_bonus(weight, &keyword_tokens, raw_contains, token) {
@@ -244,16 +259,31 @@ pub fn score_tool_match(
     let total = query_tokens.len();
     let full_coverage = matched == total; // integer comparison, never a float equality
     let coverage = matched as f64 / total as f64;
-    if !phrase_matched && (if total <= 2 { !full_coverage } else { coverage < 0.6 }) {
+    if !phrase_matched
+        && (if total <= 2 {
+            !full_coverage
+        } else {
+            coverage < 0.6
+        })
+    {
         return None;
     }
 
     // Step 7 — the final bonuses. `Math.round` on a positive value is Rust's `f64::round`.
-    score += if full_coverage { 25 } else { (coverage * 10.0).round() as i64 };
+    score += if full_coverage {
+        25
+    } else {
+        (coverage * 10.0).round() as i64
+    };
     if let Some(first) = query_tokens.first()
-        && tokenize(&fields.first().map(|(_, value)| value.clone()).unwrap_or_default())
-            .iter()
-            .any(|token| token == first)
+        && tokenize(
+            &fields
+                .first()
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default(),
+        )
+        .iter()
+        .any(|token| token == first)
     {
         score += 8;
     }
@@ -360,13 +390,16 @@ pub fn rank_tool_matches(
             include_keywords && definition.is_some_and(|entry| entry.search_keywords.is_some());
         for tool in metadata {
             let keywords = if has_keywords {
-                Some(resolve_search_keywords(definition, &tool.original_name, server_name, global_prefix))
+                Some(resolve_search_keywords(
+                    definition,
+                    &tool.original_name,
+                    server_name,
+                    global_prefix,
+                ))
             } else {
                 None
             };
-            if let Some(score) =
-                score_tool_match(tool, server_name, query, keywords.as_deref())
-            {
+            if let Some(score) = score_tool_match(tool, server_name, query, keywords.as_deref()) {
                 matches.push(RankedToolMatch {
                     server: server_name.clone(),
                     tool: tool.clone(),
@@ -375,7 +408,11 @@ pub fn rank_tool_matches(
             }
         }
     }
-    matches.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| rank_collate(&a.tool.name, &b.tool.name)));
+    matches.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| rank_collate(&a.tool.name, &b.tool.name))
+    });
     matches
 }
 
@@ -399,10 +436,22 @@ pub struct Page<T> {
 /// `safeLimit = Number.isFinite(limit) ? Math.max(1, Math.trunc(limit)) : 1`.
 /// JS `slice` clamps both ends and never throws — Rust must clamp explicitly.
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 pub fn paginate<T: Clone>(items: &[T], offset: f64, limit: f64) -> Page<T> {
-    let safe_offset: usize = if offset.is_finite() { offset.trunc().max(0.0) as usize } else { 0 };
-    let safe_limit: usize = if limit.is_finite() { limit.trunc().max(1.0) as usize } else { 1 };
+    let safe_offset: usize = if offset.is_finite() {
+        offset.trunc().max(0.0) as usize
+    } else {
+        0
+    };
+    let safe_limit: usize = if limit.is_finite() {
+        limit.trunc().max(1.0) as usize
+    } else {
+        1
+    };
     let total = items.len();
     let start = safe_offset.min(total);
     let end = start.saturating_add(safe_limit).min(total);
@@ -415,7 +464,11 @@ pub fn paginate<T: Clone>(items: &[T], offset: f64, limit: f64) -> Page<T> {
         items: page,
         total,
         has_more,
-        next_offset: if has_more { Some(next_offset_raw) } else { None },
+        next_offset: if has_more {
+            Some(next_offset_raw)
+        } else {
+            None
+        },
     }
 }
 
@@ -457,7 +510,12 @@ pub fn rank_suggestions(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::proxy::testsupport::{config_with, definition_with_keywords, metadata_with, tool};
@@ -467,7 +525,10 @@ mod tests {
     #[test]
     fn normalize_splits_camel_case_before_lowercasing() {
         // `ID` does not split: the pattern needs a lowercase or digit BEFORE the uppercase.
-        assert_eq!(normalize_search_text("getUserID_v2/foo"), "get user id v2 foo");
+        assert_eq!(
+            normalize_search_text("getUserID_v2/foo"),
+            "get user id v2 foo"
+        );
         // The separator class is exactly `_ . / : -`, runs collapsed to one space.
         assert_eq!(normalize_search_text("a__b..c//d::e--f"), "a b c d e f");
         // The global replace is non-overlapping: it consumes both characters of a match.
@@ -487,19 +548,36 @@ mod tests {
     /// `search ranking` › "ranks an exact name above a description match".
     #[test]
     fn ranks_an_exact_name_above_a_description_match() {
-        let exact = score_tool_match(&tool("search_records", "Find records"), "demo", "search", None)
-            .expect("exact name matches");
-        let description =
-            score_tool_match(&tool("find_records", "Search records"), "demo", "search", None)
-                .expect("description matches");
-        assert!(exact > description, "exact {exact} should beat description {description}");
+        let exact = score_tool_match(
+            &tool("search_records", "Find records"),
+            "demo",
+            "search",
+            None,
+        )
+        .expect("exact name matches");
+        let description = score_tool_match(
+            &tool("find_records", "Search records"),
+            "demo",
+            "search",
+            None,
+        )
+        .expect("description matches");
+        assert!(
+            exact > description,
+            "exact {exact} should beat description {description}"
+        );
     }
 
     /// `search ranking` › "drops partial two-token matches".
     #[test]
     fn drops_partial_two_token_matches() {
         assert_eq!(
-            score_tool_match(&tool("search_records", "Find records"), "demo", "search missing", None),
+            score_tool_match(
+                &tool("search_records", "Find records"),
+                "demo",
+                "search missing",
+                None
+            ),
             None
         );
     }
@@ -518,18 +596,31 @@ mod tests {
             None
         );
         // Real stems still match: "sync" (4+ chars) may prefix-match "synchronize".
-        assert!(score_tool_match(&tool("sync_icon", "Sync an icon."), "better-icons", "synchronize", None)
-            .is_some());
+        assert!(
+            score_tool_match(
+                &tool("sync_icon", "Sync an icon."),
+                "better-icons",
+                "synchronize",
+                None
+            )
+            .is_some()
+        );
     }
 
     /// `search ranking` › "matches through configured keywords where the query would otherwise miss".
     #[test]
     fn matches_through_configured_keywords() {
-        let advanced = tool("search_records_advanced", "Advanced record search with filters");
+        let advanced = tool(
+            "search_records_advanced",
+            "Advanced record search with filters",
+        );
         let both = ["fuzzy lookup".to_string(), "legacy".to_string()];
         let one = ["fuzzy lookup".to_string()];
 
-        assert_eq!(score_tool_match(&advanced, "demo", "fuzzy lookup", None), None);
+        assert_eq!(
+            score_tool_match(&advanced, "demo", "fuzzy lookup", None),
+            None
+        );
         assert!(score_tool_match(&advanced, "demo", "fuzzy lookup", Some(&both)).is_some());
         // Single-token queries pass the coverage gate through keyword tokens too.
         assert_eq!(score_tool_match(&advanced, "demo", "fuzzy", None), None);
@@ -541,16 +632,26 @@ mod tests {
     fn ranks_an_exact_keyword_alias_above_a_description_phrase_match() {
         let keywords = ["fuzzy lookup".to_string()];
         let aliased = score_tool_match(
-            &tool("search_records_advanced", "Advanced record search with filters"),
+            &tool(
+                "search_records_advanced",
+                "Advanced record search with filters",
+            ),
             "demo",
             "fuzzy lookup",
             Some(&keywords),
         )
         .expect("alias matches");
-        let description =
-            score_tool_match(&tool("record_search", "Fuzzy lookup across records"), "demo", "fuzzy lookup", None)
-                .expect("description matches");
-        assert!(aliased > description, "alias {aliased} should beat description {description}");
+        let description = score_tool_match(
+            &tool("record_search", "Fuzzy lookup across records"),
+            "demo",
+            "fuzzy lookup",
+            None,
+        )
+        .expect("description matches");
+        assert!(
+            aliased > description,
+            "alias {aliased} should beat description {description}"
+        );
     }
 
     /// `search ranking` › "scores an exact alias above incidental cross-phrase token matches".
@@ -559,13 +660,19 @@ mod tests {
     /// two unrelated keywords — may token-match but must not collect a phrase bonus.
     #[test]
     fn scores_an_exact_alias_above_incidental_cross_phrase_token_matches() {
-        let advanced = tool("search_records_advanced", "Advanced record search with filters");
+        let advanced = tool(
+            "search_records_advanced",
+            "Advanced record search with filters",
+        );
         let keywords = ["fuzzy lookup".to_string(), "legacy".to_string()];
         let exact = score_tool_match(&advanced, "demo", "fuzzy lookup", Some(&keywords))
             .expect("exact alias matches");
         let cross = score_tool_match(&advanced, "demo", "lookup legacy", Some(&keywords))
             .expect("cross-phrase matches");
-        assert!(exact > cross, "exact {exact} should beat cross-phrase {cross}");
+        assert!(
+            exact > cross,
+            "exact {exact} should beat cross-phrase {cross}"
+        );
     }
 
     /// `search ranking` › "does not change scoring when the keyword list is empty".
@@ -587,11 +694,21 @@ mod tests {
         let items = vec!["a", "b", "c"];
         assert_eq!(
             paginate(&items, 1.0, 1.0),
-            Page { items: vec!["b"], total: 3, has_more: true, next_offset: Some(2) }
+            Page {
+                items: vec!["b"],
+                total: 3,
+                has_more: true,
+                next_offset: Some(2)
+            }
         );
         assert_eq!(
             paginate(&items, 5.0, 1.0),
-            Page { items: Vec::new(), total: 3, has_more: false, next_offset: None }
+            Page {
+                items: Vec::new(),
+                total: 3,
+                has_more: false,
+                next_offset: None
+            }
         );
     }
 
@@ -605,7 +722,12 @@ mod tests {
             ("*", &["records"]),
         ];
         let expected = ["fuzzy lookup", "fuzzy lookup", "records", "records"];
-        let names = ["search_records_advanced", "search_records_advanced", "search_records_advanced", "anything"];
+        let names = [
+            "search_records_advanced",
+            "search_records_advanced",
+            "search_records_advanced",
+            "anything",
+        ];
         for (index, (key, values)) in cases.iter().enumerate() {
             let entry = definition_with_keywords(&[(key, values)]);
             assert_eq!(
@@ -624,8 +746,17 @@ mod tests {
             ("search_records_advanced", &["fuzzy lookup", "legacy"]),
         ]);
         assert_eq!(
-            resolve_search_keywords(Some(&entry), "search_records_advanced", "demo", ToolPrefix::Server),
-            vec!["records".to_string(), "fuzzy lookup".to_string(), "legacy".to_string()]
+            resolve_search_keywords(
+                Some(&entry),
+                "search_records_advanced",
+                "demo",
+                ToolPrefix::Server
+            ),
+            vec![
+                "records".to_string(),
+                "fuzzy lookup".to_string(),
+                "legacy".to_string()
+            ]
         );
     }
 
@@ -638,14 +769,29 @@ mod tests {
     #[test]
     fn resolve_search_keywords_returns_nothing_for_non_matching_or_malformed() {
         let other = definition_with_keywords(&[("other_tool", &["nope"])]);
-        assert!(resolve_search_keywords(Some(&other), "search_records_advanced", "demo", ToolPrefix::Server)
-            .is_empty());
+        assert!(
+            resolve_search_keywords(
+                Some(&other),
+                "search_records_advanced",
+                "demo",
+                ToolPrefix::Server
+            )
+            .is_empty()
+        );
         let blanks = definition_with_keywords(&[("search_records_advanced", &["ok", "  "])]);
         assert_eq!(
-            resolve_search_keywords(Some(&blanks), "search_records_advanced", "demo", ToolPrefix::Server),
+            resolve_search_keywords(
+                Some(&blanks),
+                "search_records_advanced",
+                "demo",
+                ToolPrefix::Server
+            ),
             vec!["ok".to_string()]
         );
-        assert!(resolve_search_keywords(None, "search_records_advanced", "demo", ToolPrefix::Server).is_empty());
+        assert!(
+            resolve_search_keywords(None, "search_records_advanced", "demo", ToolPrefix::Server)
+                .is_empty()
+        );
     }
 
     // ---- MCP-175 · the coverage gate --------------------------------------------------------------
@@ -657,7 +803,10 @@ mod tests {
         // 3 tokens, 2 matched = 0.667 ≥ 0.6 — survives.
         assert!(score_tool_match(&target, "srv", "alpha bravo zulu", None).is_some());
         // 3 tokens, 1 matched = 0.333 — dropped.
-        assert_eq!(score_tool_match(&target, "srv", "alpha yankee zulu", None), None);
+        assert_eq!(
+            score_tool_match(&target, "srv", "alpha yankee zulu", None),
+            None
+        );
         // 2 tokens, 1 matched — a short query must match ALL its tokens.
         assert_eq!(score_tool_match(&target, "srv", "alpha zulu", None), None);
     }
@@ -679,7 +828,11 @@ mod tests {
         let config = config_with(&[("linear-server", ServerEntry::default())]);
         let metadata = metadata_with(&[(
             "linear-server",
-            vec![ToolMetadata::new("linear-server_issues", "issues", "List issues")],
+            vec![ToolMetadata::new(
+                "linear-server_issues",
+                "issues",
+                "List issues",
+            )],
         )]);
         assert_eq!(
             rank_suggestions(&config, &metadata, "linear-server_issue", 5),
@@ -687,7 +840,10 @@ mod tests {
         );
         // No edit distance: a transposed/dropped letter falls off the coverage gate, upstream and here.
         assert!(rank_suggestions(&config, &metadata, "linear-server_isues", 5).is_empty());
-        assert_eq!(server_prefix("linear-server", ToolPrefix::Server), "linear-server");
+        assert_eq!(
+            server_prefix("linear-server", ToolPrefix::Server),
+            "linear-server"
+        );
         assert_eq!(server_prefix("gh-mcp", ToolPrefix::Short), "gh");
         assert_eq!(server_prefix("gh-mcp", ToolPrefix::Mcp), "mcp__gh-mcp");
         assert_eq!(server_prefix("gh-mcp", ToolPrefix::None), "");
@@ -698,11 +854,16 @@ mod tests {
         // Two servers whose prefixes nest: `foo-bar_x` must resolve against `foo-bar`, not `foo`.
         let mut candidates = vec![
             ("foo".to_string(), server_prefix("foo", ToolPrefix::Server)),
-            ("foo-bar".to_string(), server_prefix("foo-bar", ToolPrefix::Server)),
+            (
+                "foo-bar".to_string(),
+                server_prefix("foo-bar", ToolPrefix::Server),
+            ),
         ];
         candidates.retain(|(_, prefix)| "foo-bar_x".starts_with(&format!("{prefix}_")));
         candidates.sort_by_key(|(_, prefix)| std::cmp::Reverse(prefix.len()));
-        assert_eq!(candidates.first().map(|(name, _)| name.as_str()), Some("foo-bar"));
+        assert_eq!(
+            candidates.first().map(|(name, _)| name.as_str()),
+            Some("foo-bar")
+        );
     }
-
 }

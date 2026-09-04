@@ -9,13 +9,18 @@
 //!
 //! These tests assert the values a handler actually OBSERVES, from both tiers.
 #![cfg(feature = "wasm-host")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use cyrup_core::{CancelToken, ExtensionId};
 use crate::{
     CannedResponses, EventKind, ExtError, ExtensionHost, HookOutcome, HostConfig, HostCtx,
     HostEvent, InitApi, NativeExtension, RecordingServices,
 };
+use cyrup_core::{CancelToken, ExtensionId};
 use std::sync::{Arc, Mutex};
 
 /// A native built-in that records exactly what its ctx told it, from both an event handler and a
@@ -83,10 +88,14 @@ fn services() -> Arc<RecordingServices> {
 async fn a_native_event_handler_observes_the_live_ctx_state() {
     let host = ExtensionHost::with_wasm(HostConfig::default()).expect("host");
     let prober = Arc::new(Prober::default());
-    host.load_native_with_services(prober.clone(), services()).await.expect("load native");
+    host.load_native_with_services(prober.clone(), services())
+        .await
+        .expect("load native");
 
     let cancel = CancelToken::new();
-    host.dispatcher().dispatch_notify(&HostEvent::AgentStart, &cancel).await;
+    host.dispatcher()
+        .dispatch_notify(&HostEvent::AgentStart, &cancel)
+        .await;
 
     let seen = prober.seen();
     assert_eq!(seen.len(), 1, "the handler ran once: {seen:?}");
@@ -102,7 +111,9 @@ async fn a_native_event_handler_observes_the_live_ctx_state() {
 async fn a_native_command_handler_observes_the_live_ctx_state() {
     let host = ExtensionHost::with_wasm(HostConfig::default()).expect("host");
     let prober = Arc::new(Prober::default());
-    host.load_native_with_services(prober, services()).await.expect("load native");
+    host.load_native_with_services(prober, services())
+        .await
+        .expect("load native");
 
     let cancel = CancelToken::new();
     let out = host
@@ -130,10 +141,15 @@ async fn a_native_handler_without_a_backend_keeps_the_defaults() {
     host.load_native(prober.clone()).await.expect("load native");
 
     let cancel = CancelToken::new();
-    host.dispatcher().dispatch_notify(&HostEvent::AgentStart, &cancel).await;
+    host.dispatcher()
+        .dispatch_notify(&HostEvent::AgentStart, &cancel)
+        .await;
 
     let seen = prober.seen();
-    assert_eq!(seen[0], "event:idle=false trusted=false prompt=None model=None usage=false");
+    assert_eq!(
+        seen[0],
+        "event:idle=false trusted=false prompt=None model=None usage=false"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -155,8 +171,12 @@ async fn a_native_command_handler_reads_the_attached_system_prompt_options_bag()
         system_prompt_options: Some(bag.clone()),
         ..Default::default()
     }));
-    let ctx = crate::HostCtx::command(crate::ExtMode::Tui, true, std::path::PathBuf::from("/fallback"))
-        .with_rich(crate::native::rich_from_services(svc.as_ref()));
+    let ctx = crate::HostCtx::command(
+        crate::ExtMode::Tui,
+        true,
+        std::path::PathBuf::from("/fallback"),
+    )
+    .with_rich(crate::native::rich_from_services(svc.as_ref()));
 
     assert_eq!(ctx.system_prompt_options().expect("command tier"), bag);
 }
@@ -168,7 +188,10 @@ async fn a_native_command_handler_reads_the_attached_system_prompt_options_bag()
 #[tokio::test]
 async fn a_native_command_handler_with_no_bag_reads_pis_cwd_only_default() {
     let ctx = crate::HostCtx::command(crate::ExtMode::Tui, true, std::path::PathBuf::from("/proj"));
-    assert_eq!(ctx.system_prompt_options().expect("command tier"), serde_json::json!({"cwd": "/proj"}));
+    assert_eq!(
+        ctx.system_prompt_options().expect("command tier"),
+        serde_json::json!({"cwd": "/proj"})
+    );
 }
 
 /// (3) An EVENT-tier read is refused with the observable deadlock-guard error, never a silent empty

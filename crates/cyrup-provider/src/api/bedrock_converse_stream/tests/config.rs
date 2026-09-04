@@ -103,15 +103,13 @@ fn an_arn_region_beats_aws_region() {
     let ambient = env_map(&[("AWS_REGION", "us-east-1")]);
 
     let mut model = opus_48();
-    model.id =
-        "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/abc123".into();
+    model.id = "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/abc123".into();
     let config = resolve(&model, &BedrockOptions::default(), None, &ambient);
     assert_eq!(config.region.as_deref(), Some("us-west-2"));
 
     let mut gov = opus_48();
-    gov.id =
-        "arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:application-inference-profile/abc"
-            .into();
+    gov.id = "arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:application-inference-profile/abc"
+        .into();
     let config = resolve(&gov, &BedrockOptions::default(), None, &ambient);
     assert_eq!(config.region.as_deref(), Some("us-gov-west-1"));
 }
@@ -258,8 +256,7 @@ fn shared_credentials_files_are_read_for_a_configured_profile() {
         })
     );
     assert_eq!(
-        shared_profile_credentials("default", &env)
-            .map(|c| c.access_key_id),
+        shared_profile_credentials("default", &env).map(|c| c.access_key_id),
         Some("DEFAULTKEY".to_string())
     );
     assert_eq!(shared_profile_credentials("absent", &env), None);

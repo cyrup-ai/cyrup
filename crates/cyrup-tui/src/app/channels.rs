@@ -88,7 +88,11 @@ impl<B: Backend> App<B> {
     /// Shared by every reason so the interleave cannot drift between them, mirroring
     /// [`Self::apply_compact_outcome`].
     pub fn apply_queue_drain(&mut self, drained: QueueDrain, session: &Arc<AgentSession>) {
-        let QueueDrain { steering, follow_up, reason } = drained;
+        let QueueDrain {
+            steering,
+            follow_up,
+            reason,
+        } = drained;
         // TUI-031 — Pi's `clearAllQueues` (`interactive-mode.ts:3959-3971`) drains the SESSION's two
         // queues AND `compactionQueuedMessages`, in `[...steering, ...compactionSteering]` /
         // `[...followUp, ...compactionFollowUp]` order. Without the second source an Escape
@@ -100,9 +104,19 @@ impl<B: Backend> App<B> {
             let compaction = self.take_compaction_queue();
             steering
                 .into_iter()
-                .chain(compaction.iter().filter(|m| !m.follow_up).map(|m| m.text.clone()))
+                .chain(
+                    compaction
+                        .iter()
+                        .filter(|m| !m.follow_up)
+                        .map(|m| m.text.clone()),
+                )
                 .chain(follow_up)
-                .chain(compaction.iter().filter(|m| m.follow_up).map(|m| m.text.clone()))
+                .chain(
+                    compaction
+                        .iter()
+                        .filter(|m| m.follow_up)
+                        .map(|m| m.text.clone()),
+                )
                 .collect()
         };
         let restored = self.restore_queued_to_editor(&queued);
@@ -114,7 +128,10 @@ impl<B: Backend> App<B> {
                 session.abort_bash();
             }
             QueueDrainReason::Dequeue => match restored {
-                0 => self.state.transcript.push_status("No queued messages to restore"),
+                0 => self
+                    .state
+                    .transcript
+                    .push_status("No queued messages to restore"),
                 n => self.state.transcript.push_status(format!(
                     "Restored {n} queued message{} to editor",
                     if n > 1 { "s" } else { "" }
@@ -169,10 +186,15 @@ impl<B: Backend> App<B> {
             // CFG-038 — a rejected ENTRY is reported by id and the rest of the document still
             // applies; only an unusable DOCUMENT keeps the old whole-file wording.
             match self.reload_keybindings_from(&agent_dir) {
-                Err(e) => self.state.transcript.push_status(format!("keybindings error: {e}")),
+                Err(e) => self
+                    .state
+                    .transcript
+                    .push_status(format!("keybindings error: {e}")),
                 Ok(issues) => {
                     for issue in issues {
-                        self.state.transcript.push_status(format!("keybindings: ignoring {issue}"));
+                        self.state
+                            .transcript
+                            .push_status(format!("keybindings: ignoring {issue}"));
                     }
                 }
             }
@@ -224,12 +246,23 @@ impl<B: Backend> App<B> {
                 let session = session.clone();
                 tokio::spawn(async move {
                     let (steering, follow_up) = session.drain_queue().await;
-                    let _ = tx.send(QueueDrain { steering, follow_up, reason });
+                    let _ = tx.send(QueueDrain {
+                        steering,
+                        follow_up,
+                        reason,
+                    });
                 });
             }
             None => {
                 let (steering, follow_up) = session.drain_queue().await;
-                self.apply_queue_drain(QueueDrain { steering, follow_up, reason }, session);
+                self.apply_queue_drain(
+                    QueueDrain {
+                        steering,
+                        follow_up,
+                        reason,
+                    },
+                    session,
+                );
             }
         }
     }
@@ -245,7 +278,9 @@ impl<B: Backend> App<B> {
             // op (Pi appends a `CompactionSummaryMessage` after a manual `/compact`).
             Ok(result) => {
                 let usage = result.usage.clone();
-                self.state.transcript.push_compaction_summary(result.tokens_before, result.summary);
+                self.state
+                    .transcript
+                    .push_compaction_summary(result.tokens_before, result.summary);
                 // The manual half of pi's `compaction_end` cost notice
                 // (`interactive-mode.ts:3431-3437`). It rides HERE and not only on the event
                 // because of the `[CYRUP-DELTA]` recorded on the `CompactionEnd` arm
@@ -281,7 +316,10 @@ impl<B: Backend> App<B> {
             // wrapper its catch applies at `agent-session.ts:1908-1917`, which cyrup already emits
             // verbatim on the `compaction_end` event — this path was the one that disagreed).
             Err(e) if e == "Compaction cancelled" => self.state.transcript.push_error(e),
-            Err(e) => self.state.transcript.push_error(format!("Compaction failed: {e}")),
+            Err(e) => self
+                .state
+                .transcript
+                .push_error(format!("Compaction failed: {e}")),
         }
     }
 }

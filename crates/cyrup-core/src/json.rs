@@ -503,7 +503,11 @@ impl StreamingArgs {
         match &self.st {
             // A key with no colon yet, or a colon with no value yet, is DROPPED — the whole-buffer
             // parser breaks out of its loop without inserting.
-            St::LoopTop | St::Key(_) | St::Colon(_) | St::ValueStart(_) | St::Closed
+            St::LoopTop
+            | St::Key(_)
+            | St::Colon(_)
+            | St::ValueStart(_)
+            | St::Closed
             | St::Stopped => {}
             St::StrVal(k, s) => {
                 out.insert(k.clone(), Value::String(s.decoded.clone()));
@@ -834,10 +838,7 @@ fn literal_prefix_value(raw: &str) -> Option<Value> {
 /// Best-effort parse that recovers as much of an incomplete JSON document as possible. Returns
 /// `None` only when nothing parseable is present at all.
 fn parse_partial(input: &str) -> Option<Value> {
-    let mut p = PartialParser {
-        src: input,
-        pos: 0,
-    };
+    let mut p = PartialParser { src: input, pos: 0 };
     p.skip_ws();
     let value = p.parse_value()?;
     Some(value)

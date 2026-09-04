@@ -160,14 +160,19 @@ impl InputEditor {
     /// returns cross-line targets). The removed text carries the `\n`s so it yanks back verbatim.
     fn take_range(&mut self, start: (usize, usize), end: (usize, usize)) -> String {
         // Normalize so `start <= end`.
-        let (start, end) =
-            if (start.0, start.1) <= (end.0, end.1) { (start, end) } else { (end, start) };
+        let (start, end) = if (start.0, start.1) <= (end.0, end.1) {
+            (start, end)
+        } else {
+            (end, start)
+        };
         if start == end {
             return String::new();
         }
         // Same-line: drain within the row.
         if start.0 == end.0 {
-            let Some(line) = self.lines.get_mut(start.0) else { return String::new() };
+            let Some(line) = self.lines.get_mut(start.0) else {
+                return String::new();
+            };
             let lo = start.1.min(line.len());
             let hi = end.1.min(line.len());
             if lo >= hi {

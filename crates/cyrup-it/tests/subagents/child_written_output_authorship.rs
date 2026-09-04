@@ -41,18 +41,15 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::AcceptanceStatus;
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult, run_sync};
 use cyrup_ext_subagents::fork_context::ForkContext;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
-
-
 
 /// The artifact the child authors: prose plus the fenced `acceptance-report` block the inferred
 /// `attested` contract asks for.
@@ -95,7 +92,7 @@ fn agent_config(name: &str) -> AgentConfig {
         max_subagent_depth: None,
         memory: None,
         tool_budget: None,
-        runner: None, // SUBA-074: the native child, as before
+        runner: None,          // SUBA-074: the native child, as before
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         depth: DepthEnvelope {
@@ -216,7 +213,10 @@ async fn run_fixture(dir: &Path, output_path: &Path, lines: Vec<String>) -> Sing
     let mut opts = run_options(dir, output_path);
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture,
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
 
     tokio::time::timeout(

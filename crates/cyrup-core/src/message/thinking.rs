@@ -80,7 +80,10 @@ mod tests {
         assert_eq!(ModelThinkingLevel::Off.level(), None);
         assert_eq!(ModelThinkingLevel::High.level(), Some(ThinkingLevel::High));
         assert!(ModelThinkingLevel::Minimal.is_on());
-        assert_eq!(ModelThinkingLevel::from(ThinkingLevel::Low), ModelThinkingLevel::Low);
+        assert_eq!(
+            ModelThinkingLevel::from(ThinkingLevel::Low),
+            ModelThinkingLevel::Low
+        );
     }
 
     /// PROV-002: the `max` rung Pi added in fbdd4638 (`types.ts:79`). It must be an ON level and
@@ -90,9 +93,18 @@ mod tests {
     fn max_is_a_first_class_on_level() {
         assert_eq!(ModelThinkingLevel::Max.level(), Some(ThinkingLevel::Max));
         assert!(ModelThinkingLevel::Max.is_on());
-        assert_eq!(ModelThinkingLevel::from(ThinkingLevel::Max), ModelThinkingLevel::Max);
-        assert_eq!(serde_json::to_value(ModelThinkingLevel::Max).expect("ser"), serde_json::json!("max"));
-        assert_eq!(serde_json::to_value(ThinkingLevel::Max).expect("ser"), serde_json::json!("max"));
+        assert_eq!(
+            ModelThinkingLevel::from(ThinkingLevel::Max),
+            ModelThinkingLevel::Max
+        );
+        assert_eq!(
+            serde_json::to_value(ModelThinkingLevel::Max).expect("ser"),
+            serde_json::json!("max")
+        );
+        assert_eq!(
+            serde_json::to_value(ThinkingLevel::Max).expect("ser"),
+            serde_json::json!("max")
+        );
         assert_eq!(
             serde_json::from_value::<ModelThinkingLevel>(serde_json::json!("max")).expect("de"),
             ModelThinkingLevel::Max

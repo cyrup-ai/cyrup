@@ -4,11 +4,11 @@ use crate::api::content_cache::ContentCache;
 use crate::model::Model;
 use crate::usage::apply_cost;
 use crate::utils::provider_plumbing::now_millis;
-use std::sync::Arc;
 use cyrup_core::{
     ApiId, AssistantMessage, Content, LazyArgs, SharedStr, StopReason, ToolCall, ToolCallId, Usage,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// One in-progress content block, in first-appearance order (its index == `content_index`).
 pub(super) enum Block {

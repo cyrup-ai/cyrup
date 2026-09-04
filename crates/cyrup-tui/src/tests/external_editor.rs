@@ -1,5 +1,10 @@
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod external_editor_tests {
     use crate::app::*;
 
@@ -65,10 +70,16 @@ mod external_editor_tests {
     #[cfg(unix)]
     fn trailing_newline_is_stripped_once() {
         let dir = tempfile::tempdir().unwrap();
-        let editor = sh_editor(dir.path(), "nl-editor.sh", "printf 'line one\\n' > \"$1\"\n");
+        let editor = sh_editor(
+            dir.path(),
+            "nl-editor.sh",
+            "printf 'line one\\n' > \"$1\"\n",
+        );
         let file = dir.path().join("buffer.md");
         std::fs::write(&file, "x").unwrap();
-        assert_eq!(run_editor_over_file(&editor, &file).as_deref(), Some("line one"));
+        assert_eq!(
+            run_editor_over_file(&editor, &file).as_deref(),
+            Some("line one")
+        );
     }
 }
-

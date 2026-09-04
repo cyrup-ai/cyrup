@@ -168,11 +168,25 @@ pub fn discover_with_diagnostics(
 
     if let Some(cwd) = &roots.project_cwd {
         let dir = cwd.join(PROJECT_CONFIG_DIR).join(EXTENSIONS_SUBDIR);
-        scan_dir(&dir, ExtOrigin::Project, &disabled, &mut seen, &mut out, &mut diags);
+        scan_dir(
+            &dir,
+            ExtOrigin::Project,
+            &disabled,
+            &mut seen,
+            &mut out,
+            &mut diags,
+        );
     }
     if let Some(agent) = &roots.agent_dir {
         let dir = agent.join(EXTENSIONS_SUBDIR);
-        scan_dir(&dir, ExtOrigin::Global, &disabled, &mut seen, &mut out, &mut diags);
+        scan_dir(
+            &dir,
+            ExtOrigin::Global,
+            &disabled,
+            &mut seen,
+            &mut out,
+            &mut diags,
+        );
     }
     for p in &roots.configured {
         // A configured path may be a bare prebuilt `.wasm` artifact, a single extension dir, or a
@@ -203,7 +217,14 @@ pub fn discover_with_diagnostics(
             // `.cyrup/extensions` directory is the ordinary case, not a user error, and pi says
             // nothing about it either.
             let before = out.len();
-            scan_dir(p, ExtOrigin::Configured, &disabled, &mut seen, &mut out, &mut diags);
+            scan_dir(
+                p,
+                ExtOrigin::Configured,
+                &disabled,
+                &mut seen,
+                &mut out,
+                &mut diags,
+            );
             if out.len() == before {
                 diags.push(LoadError {
                     path: p.clone(),
@@ -258,7 +279,9 @@ fn scan_dir(
     out: &mut Vec<DiscoveredExtension>,
     diags: &mut Vec<LoadError>,
 ) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
     entries.sort(); // deterministic order (R-08-004)
     for path in entries {
@@ -350,29 +373,30 @@ fn push_dir(
     }
     let wasm = first_wasm(dir);
     let manifest_path = dir.join(MANIFEST_FILE);
-    let manifest = match ExtensionManifest::load(dir) {
-        Ok(m) => m,
-        Err(e) => {
-            // Synthesize a minimal manifest for a bare prebuilt `.wasm` (Pi's "direct file" rule):
-            // id from the artifact/dir stem, host world. No manifest + no wasm => skip.
-            //
-            // EXT-028 caveat: claiming [`HOST_WORLD`] makes `check_world` a tautology for this path,
-            // so a prebuilt artifact built against an older world is NOT caught by the version gate
-            // and still surfaces as a wasmtime link error at instantiation. There is nothing to
-            // check — the bytes carry no declared world — and refusing every manifest-less `.wasm`
-            // would drop Pi's direct-file rule. Ship an `extension.json` to get the typed error.
-            let id = wasm
-                .as_deref()
-                .and_then(|w| w.file_stem())
-                .and_then(|s| s.to_str())
-                .or_else(|| dir.file_name().and_then(|s| s.to_str()))
-                .unwrap_or("extension")
-                .to_string();
-            // The manifest is only "absent" if the file is not there; an existing-but-broken one is
-            // the operator-visible case. `is_file()` also catches an unreadable file (permissions),
-            // which is just as invisible to its author as a syntax error.
-            if manifest_path.is_file() {
-                diags.push(LoadError {
+    let manifest =
+        match ExtensionManifest::load(dir) {
+            Ok(m) => m,
+            Err(e) => {
+                // Synthesize a minimal manifest for a bare prebuilt `.wasm` (Pi's "direct file" rule):
+                // id from the artifact/dir stem, host world. No manifest + no wasm => skip.
+                //
+                // EXT-028 caveat: claiming [`HOST_WORLD`] makes `check_world` a tautology for this path,
+                // so a prebuilt artifact built against an older world is NOT caught by the version gate
+                // and still surfaces as a wasmtime link error at instantiation. There is nothing to
+                // check — the bytes carry no declared world — and refusing every manifest-less `.wasm`
+                // would drop Pi's direct-file rule. Ship an `extension.json` to get the typed error.
+                let id = wasm
+                    .as_deref()
+                    .and_then(|w| w.file_stem())
+                    .and_then(|s| s.to_str())
+                    .or_else(|| dir.file_name().and_then(|s| s.to_str()))
+                    .unwrap_or("extension")
+                    .to_string();
+                // The manifest is only "absent" if the file is not there; an existing-but-broken one is
+                // the operator-visible case. `is_file()` also catches an unreadable file (permissions),
+                // which is just as invisible to its author as a syntax error.
+                if manifest_path.is_file() {
+                    diags.push(LoadError {
                     path: dir.to_path_buf(),
                     // Pi keeps loading and does not abort startup on a malformed manifest.
                     fatal: false,
@@ -389,21 +413,26 @@ fn push_dir(
                         ),
                     },
                 });
+                }
+                if wasm.is_none() {
+                    return;
+                }
+                ExtensionManifest {
+                    id,
+                    version: "0.0.0".into(),
+                    world: HOST_WORLD.into(),
+                    entry: None,
+                    // EXT-054, deny-by-default — see `push_file`'s note: no manifest, no grant.
+                    capabilities: crate::manifest::Capabilities::none(),
+                }
             }
-            if wasm.is_none() {
-                return;
-            }
-            ExtensionManifest {
-                id,
-                version: "0.0.0".into(),
-                world: HOST_WORLD.into(),
-                entry: None,
-                // EXT-054, deny-by-default — see `push_file`'s note: no manifest, no grant.
-                capabilities: crate::manifest::Capabilities::none(),
-            }
-        }
-    };
-    out.push(DiscoveredExtension { dir: dir.to_path_buf(), manifest, wasm, origin });
+        };
+    out.push(DiscoveredExtension {
+        dir: dir.to_path_buf(),
+        manifest,
+        wasm,
+        origin,
+    });
 }
 
 /// Resolve the component bytes for a discovered extension: a prebuilt `.wasm` is read directly; an

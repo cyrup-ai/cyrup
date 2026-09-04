@@ -56,8 +56,10 @@ impl PermissionSystemExtension {
         // pi order (`refreshSessionRuntimeState`, v0.8.0 `index.ts:1819-1826`): config first,
         // manager second, agent-start cache invalidated third.
         self.refresh_extension_config();
-        *guard(&self.manager) =
-            manager_with_warnings(Self::manager_paths_for(&self.agent_dir, cwd), &self.warnings);
+        *guard(&self.manager) = manager_with_warnings(
+            Self::manager_paths_for(&self.agent_dir, cwd),
+            &self.warnings,
+        );
         self.invalidate_agent_start_cache();
     }
 

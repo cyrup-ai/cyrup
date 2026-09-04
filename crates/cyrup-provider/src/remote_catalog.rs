@@ -101,8 +101,18 @@ fn encode_path_segment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'!' | b'~' | b'*'
-            | b'\'' | b'(' | b')' => out.push(char::from(byte)),
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(char::from(byte)),
             other => out.push_str(&format!("%{other:02X}")),
         }
     }
@@ -185,7 +195,10 @@ pub fn parse_catalog(
 /// This is the fix for "persisted remote model catalogs overriding newer bundled catalogs after an
 /// upgrade" (pi #7016) — without it, upgrading cyrup would silently keep serving the pre-upgrade
 /// pi.dev snapshot on top of freshly refreshed embedded data.
-pub fn remote_models(entry: Option<&ModelsStoreEntry>, local_generated_at: Option<i64>) -> &[Model] {
+pub fn remote_models(
+    entry: Option<&ModelsStoreEntry>,
+    local_generated_at: Option<i64>,
+) -> &[Model] {
     let Some(entry) = entry else { return &[] };
     if let Some(local) = local_generated_at
         && entry.last_modified.is_none_or(|remote| remote <= local)
@@ -778,7 +791,11 @@ mod tests {
             models: &[Model],
             _credential: Option<&crate::auth::Credential>,
         ) -> Vec<Model> {
-            models.iter().filter(|m| m.id.as_str().starts_with("keep")).cloned().collect()
+            models
+                .iter()
+                .filter(|m| m.id.as_str().starts_with("keep"))
+                .cloned()
+                .collect()
         }
         fn stream(
             &self,
@@ -800,13 +817,23 @@ mod tests {
         headers.insert("x-inner".to_string(), Some("inner-value".to_string()));
         let inner: Arc<dyn Provider> = Arc::new(Decorated {
             id: "decorated".into(),
-            models: vec![model("decorated", "keep-a", 1), model("decorated", "drop-b", 2)],
+            models: vec![
+                model("decorated", "keep-a", 1),
+                model("decorated", "drop-b", 2),
+            ],
             headers,
         });
         // Assert PRESENCE on the inner first: a fixture that ever loses a declaration must fail
         // loudly rather than make the comparisons below vacuous.
-        assert_ne!(inner.name(), inner.id().as_str(), "fixture must not agree with the default");
-        assert!(inner.base_url().is_some(), "fixture must declare a base_url");
+        assert_ne!(
+            inner.name(),
+            inner.id().as_str(),
+            "fixture must not agree with the default"
+        );
+        assert!(
+            inner.base_url().is_some(),
+            "fixture must declare a base_url"
+        );
         assert!(inner.headers().is_some(), "fixture must declare headers");
 
         let overlay = vec![model("decorated", "keep-c", 3)];
@@ -815,18 +842,27 @@ mod tests {
         assert_eq!(w.id(), inner.id());
         assert_eq!(w.name(), "Decorated Display Name");
         assert_eq!(w.base_url(), Some("https://inner.invalid/v1"));
-        assert_eq!(w.headers().and_then(|h| h.get("x-inner")), Some(&Some("inner-value".to_string())));
+        assert_eq!(
+            w.headers().and_then(|h| h.get("x-inner")),
+            Some(&Some("inner-value".to_string()))
+        );
 
         // The overlay half still works: the merged catalog is the floor plus the overlay.
         let ids: Vec<&str> = w.models().iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["keep-a", "drop-b", "keep-c"]);
         // `get_model` resolves against the MERGED catalog (it must NOT be delegated to the inner).
-        assert!(w.get_model("keep-c").is_some(), "get_model must see the overlay");
+        assert!(
+            w.get_model("keep-c").is_some(),
+            "get_model must see the overlay"
+        );
 
         // The credential filter is the one whose loss was a live defect: the identity default would
         // return all three.
-        let filtered: Vec<String> =
-            w.filter_models(w.models(), None).into_iter().map(|m| m.id.to_string()).collect();
+        let filtered: Vec<String> = w
+            .filter_models(w.models(), None)
+            .into_iter()
+            .map(|m| m.id.to_string())
+            .collect();
         assert_eq!(filtered, ["keep-a", "keep-c"]);
     }
 
@@ -844,7 +880,10 @@ mod tests {
             .expect("github-copilot is a built-in")
             .clone();
         let catalog = copilot.models().to_vec();
-        assert!(catalog.len() > 2, "the embedded copilot catalog must be non-trivial");
+        assert!(
+            catalog.len() > 2,
+            "the embedded copilot catalog must be non-trivial"
+        );
 
         // An OAuth credential entitled to exactly one of the catalog's ids.
         let entitled = catalog[0].id.to_string();
@@ -861,7 +900,11 @@ mod tests {
         };
         // Presence first: the UNWRAPPED provider narrows.
         let bare = copilot.filter_models(&catalog, Some(&cred));
-        assert_eq!(bare.len(), 1, "the bare provider must narrow to the entitled id");
+        assert_eq!(
+            bare.len(),
+            1,
+            "the bare provider must narrow to the entitled id"
+        );
 
         let overlay = CatalogOverlay::from_entries(vec![(
             "github-copilot".to_string(),
@@ -874,7 +917,10 @@ mod tests {
         );
         let narrowed = wrapped.filter_models(wrapped.models(), Some(&cred));
         assert_eq!(
-            narrowed.iter().map(|m| m.id.to_string()).collect::<Vec<_>>(),
+            narrowed
+                .iter()
+                .map(|m| m.id.to_string())
+                .collect::<Vec<_>>(),
             vec![entitled],
             "the decorator must forward filter_models, not answer with the identity default"
         );
@@ -918,9 +964,12 @@ mod tests {
         );
         // Entries without an id, and entries that cannot become a Model, are dropped (not fatal).
         assert!(
-            parse_catalog("groq", &serde_json::json!([{"name": "no id"}, {"id": "partial"}]))
-                .unwrap()
-                .is_empty()
+            parse_catalog(
+                "groq",
+                &serde_json::json!([{"name": "no id"}, {"id": "partial"}])
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -975,7 +1024,10 @@ mod tests {
 
     #[test]
     fn encode_path_segment_cannot_escape_the_route() {
-        assert_eq!(encode_path_segment("openai-completions"), "openai-completions");
+        assert_eq!(
+            encode_path_segment("openai-completions"),
+            "openai-completions"
+        );
         assert_eq!(encode_path_segment("a/b"), "a%2Fb");
         assert_eq!(encode_path_segment("a b"), "a%20b");
     }

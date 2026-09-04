@@ -19,13 +19,18 @@
 // always true here. Re-spelled in cyrup-it it would name THIS crate's `wasm-host`, which
 // `--features it` does not enable, and every test below would SILENTLY not compile in.
 // See the `[[test]]` note in crates/cyrup-it/Cargo.toml.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::sync::Arc;
 
 use cyrup_core::{ExtensionId, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,7 +46,10 @@ use crate::support::bins;
 
 fn faux_with_ok() -> Arc<FauxProvider> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     faux
 }
 
@@ -55,8 +63,14 @@ async fn spawn_mock(headers: String, parts: Vec<Vec<u8>>) -> String {
 
 /// As [`spawn_mock`], with a caller-chosen status line (proves the streamed response's status isn't
 /// hardcoded to 200 anywhere on the path from `HttpCaps` to the guest).
-async fn spawn_mock_with_status(status_line: &'static str, headers: String, parts: Vec<Vec<u8>>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+async fn spawn_mock_with_status(
+    status_line: &'static str,
+    headers: String,
+    parts: Vec<Vec<u8>>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
@@ -77,8 +91,14 @@ async fn spawn_mock_with_status(status_line: &'static str, headers: String, part
 
 /// As [`spawn_mock`], but waits `delay` AFTER accepting the connection and draining the request
 /// BEFORE writing anything back — simulates a genuinely slow (but real) server, not a mocked clock.
-async fn spawn_mock_with_delay(headers: String, body: Vec<u8>, delay: std::time::Duration) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+async fn spawn_mock_with_delay(
+    headers: String,
+    body: Vec<u8>,
+    delay: std::time::Duration,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
@@ -111,7 +131,10 @@ async fn trusted_session() -> cyrup_session_svc::AgentSession {
     cfg.trust_override = Some(true); // TRUSTED project ⇒ the guest's http-client grant is live.
     cfg.no_extensions = true; // only the explicitly-loaded guest is present.
 
-    SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, cfg).build().await.expect("build session")
+    SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, cfg)
+        .build()
+        .await
+        .expect("build session")
 }
 
 /// THE headline proof (a): a TRUSTED live wasm guest's `ctx.http_request(GET url)` runs through the
@@ -133,12 +156,22 @@ async fn wasm_guest_http_request_gets_a_real_response_through_the_assembled_sess
         .await
         .expect("load + init the live wasm extension");
     assert!(
-        session.services().ext_host.registry().command_names().unwrap().iter().any(|n| n == "httpdemo"),
+        session
+            .services()
+            .ext_host
+            .registry()
+            .command_names()
+            .unwrap()
+            .iter()
+            .any(|n| n == "httpdemo"),
         "the guest-registered `/httpdemo` command is in the host command registry"
     );
 
     let body = b"hello from the real mock server";
-    let headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", body.len());
+    let headers = format!(
+        "Content-Type: text/plain\r\nContent-Length: {}\r\n",
+        body.len()
+    );
     let url = spawn_mock(headers, vec![body.to_vec()]).await;
 
     // Drive the command through the REAL public entry point (prompt → prepare →
@@ -177,8 +210,11 @@ async fn wasm_guest_http_stream_receives_real_chunks_in_order_then_eof() {
         .await
         .expect("load + init the live wasm extension");
 
-    let parts: Vec<Vec<u8>> =
-        vec![b"chunk-one-".to_vec(), b"chunk-two-".to_vec(), b"chunk-three".to_vec()];
+    let parts: Vec<Vec<u8>> = vec![
+        b"chunk-one-".to_vec(),
+        b"chunk-two-".to_vec(),
+        b"chunk-three".to_vec(),
+    ];
     let expected_body = String::from_utf8_lossy(&parts.concat()).into_owned();
     let total: usize = parts.iter().map(Vec::len).sum();
     let headers = format!("Content-Type: application/octet-stream\r\nContent-Length: {total}\r\n");
@@ -188,7 +224,10 @@ async fn wasm_guest_http_stream_receives_real_chunks_in_order_then_eof() {
     // export → `ctx.http_request_stream` + repeated `ctx.http_poll_stream_chunk` → the WIT
     // `http-client.request-stream`/`poll-stream-chunk` imports → LiveHostServices → the real
     // HttpCaps stream registry → reqwest's `bytes_stream()` off the real local TCP server).
-    let _ = session.prompt(format!("/httpstreamdemo {url}")).await.unwrap();
+    let _ = session
+        .prompt(format!("/httpstreamdemo {url}"))
+        .await
+        .unwrap();
     session.wait_for_idle().await;
 
     let notifications = ext.guest().notifications();
@@ -211,11 +250,16 @@ async fn wasm_guest_http_stream_receives_real_chunks_in_order_then_eof() {
         .unwrap_or_else(|| panic!("no http-stream notification recorded: {notifications:?}"));
 
     // Parse "http stream chunks: <N> body: <body>".
-    let rest = streamed.strip_prefix("http stream chunks: ").expect("prefix");
+    let rest = streamed
+        .strip_prefix("http stream chunks: ")
+        .expect("prefix");
     let (count_str, body) = rest.split_once(" body: ").expect("split");
     let chunk_count: u32 = count_str.parse().expect("chunk count parses");
 
-    assert_eq!(body, expected_body, "the guest's polled chunks concatenate back to the REAL body, in order");
+    assert_eq!(
+        body, expected_body,
+        "the guest's polled chunks concatenate back to the REAL body, in order"
+    );
     assert!(
         chunk_count >= 2,
         "the delayed writes arrived as multiple distinct REAL chunks across the wasm boundary: {chunk_count}"
@@ -249,9 +293,13 @@ async fn wasm_guest_http_stream_surfaces_real_non_2xx_status_and_headers_before_
         "Content-Type: text/event-stream\r\nMcp-Session-Id: sess-live-42\r\nContent-Length: {}\r\n",
         body.len()
     );
-    let url = spawn_mock_with_status("HTTP/1.1 401 Unauthorized", headers, vec![body.clone()]).await;
+    let url =
+        spawn_mock_with_status("HTTP/1.1 401 Unauthorized", headers, vec![body.clone()]).await;
 
-    let _ = session.prompt(format!("/httpstreamdemo {url}")).await.unwrap();
+    let _ = session
+        .prompt(format!("/httpstreamdemo {url}"))
+        .await
+        .unwrap();
     session.wait_for_idle().await;
 
     let notifications = ext.guest().notifications();
@@ -270,9 +318,15 @@ async fn wasm_guest_http_stream_surfaces_real_non_2xx_status_and_headers_before_
         .iter()
         .find(|n| n.starts_with("http stream chunks: "))
         .unwrap_or_else(|| panic!("no http-stream notification recorded: {notifications:?}"));
-    let rest = streamed.strip_prefix("http stream chunks: ").expect("prefix");
+    let rest = streamed
+        .strip_prefix("http stream chunks: ")
+        .expect("prefix");
     let (_count_str, streamed_body) = rest.split_once(" body: ").expect("split");
-    assert_eq!(streamed_body, String::from_utf8_lossy(&body), "the real body still drains after 401");
+    assert_eq!(
+        streamed_body,
+        String::from_utf8_lossy(&body),
+        "the real body still drains after 401"
+    );
 }
 
 /// Closes the CRITICAL finding that `http_client::Host` (`crates/cyrup-ext/src/host/live.rs`) never
@@ -303,7 +357,10 @@ async fn wasm_guest_http_request_delayed_past_the_epoch_budget_does_not_wedge_th
         .expect("load + init the live wasm extension");
 
     let body = b"slow but real response".to_vec();
-    let headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", body.len());
+    let headers = format!(
+        "Content-Type: text/plain\r\nContent-Length: {}\r\n",
+        body.len()
+    );
     let url = spawn_mock_with_delay(headers, body.clone(), std::time::Duration::from_secs(6)).await;
 
     let _ = session.prompt(format!("/httpdemo {url}")).await.unwrap();
@@ -324,7 +381,9 @@ async fn wasm_guest_http_request_delayed_past_the_epoch_budget_does_not_wedge_th
     let _ = session.prompt("/execdemo").await.unwrap();
     session.wait_for_idle().await;
     assert!(
-        ext.guest().notifications()[before..].iter().any(|n| n.starts_with("exec stdout:")),
+        ext.guest().notifications()[before..]
+            .iter()
+            .any(|n| n.starts_with("exec stdout:")),
         "the extension survives an http request delayed past the epoch budget — a later command \
          still genuinely runs, not a silent no-op: {:?}",
         ext.guest().notifications()

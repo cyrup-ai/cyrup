@@ -23,8 +23,12 @@ pub(super) fn install(api: &mut ExtensionApi) {
         // types.ts:489-497). The matching renderer is registered under the tool NAME below.
         .has_renderer(true),
         |call: ToolCall| {
-            let text =
-                call.params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let text = call
+                .params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             // Stream a partial-output chunk (Pi onUpdate).
             call.emit_update(json!({ "content": [{ "type": "text", "text": "working..." }] }));
             Ok(ToolOutput::text(format!("echo: {text}")))
@@ -34,8 +38,16 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // A tool that polls its cancellation `signal` (Pi `ToolDefinition.execute` `signal`, sdk gap #1):
     // a long tool would loop and bail when aborted; this demo just reports the current state.
     api.register_tool(
-        ToolDescriptor::new("signal_probe", json!({ "type": "object", "properties": {} }))
-            .description("Report whether the host has requested cancellation (demo signal)."),
-        |call: ToolCall| Ok(ToolOutput::text(format!("aborted: {}", call.signal().is_aborted()))),
+        ToolDescriptor::new(
+            "signal_probe",
+            json!({ "type": "object", "properties": {} }),
+        )
+        .description("Report whether the host has requested cancellation (demo signal)."),
+        |call: ToolCall| {
+            Ok(ToolOutput::text(format!(
+                "aborted: {}",
+                call.signal().is_aborted()
+            )))
+        },
     );
 }

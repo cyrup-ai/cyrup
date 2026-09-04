@@ -53,7 +53,11 @@ fn returns_true_when_experimental_default_agent_dir_and_no_settings_json() {
     let dir = tempfile::tempdir().unwrap();
     let settings_path = dir.path().join("settings.json");
 
-    assert!(should_run_first_time_setup_with(&settings_path, false, true));
+    assert!(should_run_first_time_setup_with(
+        &settings_path,
+        false,
+        true
+    ));
 }
 
 /// `it("returns false when experimental features are disabled")` (:41-43).
@@ -76,7 +80,11 @@ fn returns_false_when_a_custom_agent_dir_is_set() {
     let dir = tempfile::tempdir().unwrap();
     let settings_path = dir.path().join("settings.json");
 
-    assert!(!should_run_first_time_setup_with(&settings_path, true, true));
+    assert!(!should_run_first_time_setup_with(
+        &settings_path,
+        true,
+        true
+    ));
 }
 
 /// `it("returns false when settings.json already exists")` (:52-54).
@@ -86,7 +94,11 @@ fn returns_false_when_settings_json_already_exists() {
     let settings_path = dir.path().join("settings.json");
     std::fs::write(&settings_path, "{}").unwrap();
 
-    assert!(!should_run_first_time_setup_with(&settings_path, false, true));
+    assert!(!should_run_first_time_setup_with(
+        &settings_path,
+        false,
+        true
+    ));
 }
 
 /// `areExperimentalFeaturesEnabled` (experimental.ts) is `process.env.PI_EXPERIMENTAL === "1"` — a
@@ -102,18 +114,23 @@ fn experimental_flag_is_strict_one_under_either_name() {
     // the whole `environ` array under a concurrent `getenv` for any key at all. With 16 tests here
     // that condition was never satisfied, whatever the old comment claimed.
     let unset = |_: &str| None;
-    let pinned = |k: &'static str, v: &'static str| {
-        move |q: &str| (q == k).then(|| v.to_string())
-    };
+    let pinned = |k: &'static str, v: &'static str| move |q: &str| (q == k).then(|| v.to_string());
 
     assert!(!are_experimental_features_enabled_from(&unset));
-    assert!(are_experimental_features_enabled_from(&pinned("PI_EXPERIMENTAL", "1")));
-    assert!(are_experimental_features_enabled_from(&pinned("CYRUP_EXPERIMENTAL", "1")));
+    assert!(are_experimental_features_enabled_from(&pinned(
+        "PI_EXPERIMENTAL",
+        "1"
+    )));
+    assert!(are_experimental_features_enabled_from(&pinned(
+        "CYRUP_EXPERIMENTAL",
+        "1"
+    )));
 
     for not_one in ["true", "yes", "0", "on", ""] {
         assert!(
-            !are_experimental_features_enabled_from(&|q: &str| (q == "CYRUP_EXPERIMENTAL")
-                .then(|| not_one.to_string())),
+            !are_experimental_features_enabled_from(
+                &|q: &str| (q == "CYRUP_EXPERIMENTAL").then(|| not_one.to_string())
+            ),
             "{not_one:?} must not enable experimental features"
         );
     }
@@ -121,8 +138,16 @@ fn experimental_flag_is_strict_one_under_either_name() {
     // The env-reading wrapper composes the same way as the pure gate.
     let dir = tempfile::tempdir().unwrap();
     let settings_path = dir.path().join("settings.json");
-    assert!(should_run_first_time_setup_with(&settings_path, false, true));
-    assert!(!should_run_first_time_setup_with(&settings_path, false, false));
+    assert!(should_run_first_time_setup_with(
+        &settings_path,
+        false,
+        true
+    ));
+    assert!(!should_run_first_time_setup_with(
+        &settings_path,
+        false,
+        false
+    ));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -180,7 +205,9 @@ fn config_dir_name_is_the_directory_the_layout_uses() {
     let dirs = dirs_under(root.path());
 
     assert_eq!(
-        dirs.project_config_dir().file_name().and_then(|s| s.to_str()),
+        dirs.project_config_dir()
+            .file_name()
+            .and_then(|s| s.to_str()),
         Some(CONFIG_DIR_NAME)
     );
     assert_eq!(dirs.project_config_dir(), dirs.cwd.join(".cyrup"));
@@ -207,9 +234,17 @@ fn theme_step_matches_upstream_copy_and_options() {
     // SETUP_LOGO_LINES (:29).
     assert!(step.title.contains("██████\n██  ██\n████  ██\n██    ██"));
 
-    let labels: Vec<&str> = step.rows.iter().map(|(_, label, _)| label.as_str()).collect();
+    let labels: Vec<&str> = step
+        .rows
+        .iter()
+        .map(|(_, label, _)| label.as_str())
+        .collect();
     assert_eq!(labels, vec!["Dark", "Light"]);
-    let values: Vec<&str> = step.rows.iter().map(|(value, _, _)| value.as_str()).collect();
+    let values: Vec<&str> = step
+        .rows
+        .iter()
+        .map(|(value, _, _)| value.as_str())
+        .collect();
     assert_eq!(values, vec!["dark", "light"]);
 }
 
@@ -218,7 +253,10 @@ fn theme_step_matches_upstream_copy_and_options() {
 #[test]
 fn theme_step_preselects_the_detected_appearance() {
     assert_eq!(first_time_setup_theme_step(TerminalTheme::Dark).selected, 0);
-    assert_eq!(first_time_setup_theme_step(TerminalTheme::Light).selected, 1);
+    assert_eq!(
+        first_time_setup_theme_step(TerminalTheme::Light).selected,
+        1
+    );
     assert!(
         first_time_setup_theme_step(TerminalTheme::Light)
             .title
@@ -232,7 +270,10 @@ fn theme_step_preselects_the_detected_appearance() {
 fn analytics_step_matches_upstream_copy_and_options() {
     let step = first_time_setup_analytics_step();
 
-    assert!(step.title.contains("Opt-in to anonymous usage data sharing?"));
+    assert!(
+        step.title
+            .contains("Opt-in to anonymous usage data sharing?")
+    );
     assert!(
         step.title.contains(
             "Opting in stores a tracking identifier in settings.json and enables anonymous\nusage analytics. This helps us to better debug, reproduce, and resolve issues\nand bugs within cyrup. You can observe what is shared using /privacy and make\nchanges anytime in settings.json."
@@ -241,7 +282,11 @@ fn analytics_step_matches_upstream_copy_and_options() {
         step.title
     );
 
-    let labels: Vec<&str> = step.rows.iter().map(|(_, label, _)| label.as_str()).collect();
+    let labels: Vec<&str> = step
+        .rows
+        .iter()
+        .map(|(_, label, _)| label.as_str())
+        .collect();
     assert_eq!(labels, vec!["Share anonymous usage data", "Don't share"]);
     assert_eq!(step.selected, 0);
 }
@@ -261,8 +306,14 @@ fn confirm_values_map_back_to_the_upstream_options() {
     assert_eq!(parse_theme_choice("mauve"), None);
 
     let analytics_step = first_time_setup_analytics_step();
-    assert_eq!(parse_analytics_choice(&analytics_step.rows[0].0), Some(true));
-    assert_eq!(parse_analytics_choice(&analytics_step.rows[1].0), Some(false));
+    assert_eq!(
+        parse_analytics_choice(&analytics_step.rows[0].0),
+        Some(true)
+    );
+    assert_eq!(
+        parse_analytics_choice(&analytics_step.rows[1].0),
+        Some(false)
+    );
     assert_eq!(parse_analytics_choice("maybe"), None);
 }
 
@@ -287,7 +338,8 @@ async fn submitting_the_wizard_persists_theme_and_analytics_opt_in() {
             share_analytics: true,
         },
     )
-    .await.unwrap();
+    .await
+    .unwrap();
 
     let written = read_settings(&dirs);
     assert_eq!(written["theme"], serde_json::json!("light"));
@@ -325,7 +377,8 @@ async fn opting_out_persists_the_flag_without_a_tracking_id() {
             share_analytics: false,
         },
     )
-    .await.unwrap();
+    .await
+    .unwrap();
 
     let written = read_settings(&dirs);
     assert_eq!(written["theme"], serde_json::json!("dark"));

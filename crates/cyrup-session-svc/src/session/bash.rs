@@ -71,7 +71,10 @@ impl AgentSession {
         let cancel = self.session_cancel.child_token();
         let bash_cancel_id = self.next_bash_cancel_id();
         Self::lock(&self.bash_cancels).push((bash_cancel_id, cancel.clone()));
-        let _bash_guard = BashCancelGuard { session: self, id: bash_cancel_id };
+        let _bash_guard = BashCancelGuard {
+            session: self,
+            id: bash_cancel_id,
+        };
         let cwd = self.services.cwd.clone();
         // Managed bin dir (Pi `getBinDir()`, `config.ts:549`: `join(getAgentDir(), "bin")`), matching
         // `cyrup_config::ConfigDirs::bin_dir()`'s layout — see `run_bash`'s doc comment.
@@ -169,7 +172,10 @@ impl AgentSession {
         options: BashOptions,
         on_chunk: crate::bash::BashChunkSink,
     ) -> Result<BashResult, SessionServiceError> {
-        if let Some(result) = self.emit_user_bash_event(command, options.exclude_from_context).await {
+        if let Some(result) = self
+            .emit_user_bash_event(command, options.exclude_from_context)
+            .await
+        {
             self.record_bash_result(command, &result, options).await;
             return Ok(result);
         }
@@ -188,8 +194,17 @@ impl AgentSession {
     /// throws is caught and reported rather than being fatal — `dispatch_block_mutate` returning
     /// `Reduced::Handled` is cyrup's equivalent of the former, and the dispatcher's per-extension
     /// error isolation of the latter.
-    async fn emit_user_bash_event(&self, command: &str, exclude_from_context: bool) -> Option<BashResult> {
-        if self.services.ext_host.dispatcher().no_subscribers(cyrup_ext::EventKind::UserBash) {
+    async fn emit_user_bash_event(
+        &self,
+        command: &str,
+        exclude_from_context: bool,
+    ) -> Option<BashResult> {
+        if self
+            .services
+            .ext_host
+            .dispatcher()
+            .no_subscribers(cyrup_ext::EventKind::UserBash)
+        {
             return None;
         }
         let cancel = self.session_cancel.child_token();
@@ -198,8 +213,12 @@ impl AgentSession {
             exclude_from_context,
             cwd: self.services.cwd.display().to_string(),
         };
-        let reduced =
-            self.services.ext_host.dispatcher().dispatch_block_mutate(event, &cancel).await;
+        let reduced = self
+            .services
+            .ext_host
+            .dispatcher()
+            .dispatch_block_mutate(event, &cancel)
+            .await;
         // A handler that returned a `UserBashEventResult.result` (Pi types.ts:1043-1048) fully
         // serviced the command; deserialize the override `BashResult`. Other outcomes fall through
         // to normal execution.
@@ -216,7 +235,12 @@ impl AgentSession {
     /// Record a bash result into the transcript + session (Pi `recordBashResult`,
     /// agent-session.ts:2628). While a run streams, the message is deferred to avoid breaking
     /// tool_use/tool_result ordering and flushed after the turn.
-    pub async fn record_bash_result(&self, command: &str, result: &BashResult, options: BashOptions) {
+    pub async fn record_bash_result(
+        &self,
+        command: &str,
+        result: &BashResult,
+        options: BashOptions,
+    ) {
         let payload = bash_message_payload(command, result, options.exclude_from_context);
         // The transcript message is the full pi wire object — `role` and `timestamp` included —
         // which is exactly what a compaction re-seed produces for the same execution via
@@ -227,9 +251,15 @@ impl AgentSession {
             // Unreachable: `bash_message_payload` always builds an object.
             return;
         };
-        wire.insert("role".to_string(), serde_json::Value::from(AppRole::BashExecution.as_str()));
+        wire.insert(
+            "role".to_string(),
+            serde_json::Value::from(AppRole::BashExecution.as_str()),
+        );
         wire.insert("timestamp".to_string(), serde_json::Value::from(now_ms()));
-        let msg = AgentMessage::App { role: AppRole::BashExecution, payload: wire };
+        let msg = AgentMessage::App {
+            role: AppRole::BashExecution,
+            payload: wire,
+        };
         // AGENT-030 — pi defers on `this.isStreaming`, the session latch `_isAgentRunActive`
         // (agent-session.ts:900-901, :3007: "If agent is streaming, defer adding to avoid breaking
         // tool_use/tool_result ordering"), so a result landing in the post-`agent_end` gap waits for
@@ -254,8 +284,10 @@ impl AgentSession {
     /// `CancelToken::cancel` runs registered callbacks synchronously, one of which could re-enter
     /// this session, so the lock is released before any token is fired.
     pub fn abort_bash(&self) {
-        let snapshot: Vec<CancelToken> =
-            Self::lock(&self.bash_cancels).iter().map(|(_, c)| c.clone()).collect();
+        let snapshot: Vec<CancelToken> = Self::lock(&self.bash_cancels)
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect();
         for c in snapshot {
             c.cancel();
         }
@@ -292,10 +324,11 @@ impl AgentSession {
         // One locked edit. Reached only after the run has settled (`flush_pending_bash_messages`)
         // or when not streaming (`record_bash_result`), so `RunActive` cannot occur.
         let _ = self.agent.edit_transcript(|m| m.push(msg));
-        let _ = self
-            .manager
-            .lock()
-            .await
-            .append_custom_message("bashExecution", payload.clone(), true, None);
+        let _ = self.manager.lock().await.append_custom_message(
+            "bashExecution",
+            payload.clone(),
+            true,
+            None,
+        );
     }
 }

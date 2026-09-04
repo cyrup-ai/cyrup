@@ -97,7 +97,11 @@ impl InputEditor {
     pub fn layout_width(&self, width: u16) -> u16 {
         let pad = self.effective_padding(width);
         let content = width.saturating_sub(pad.saturating_mul(2)).max(1);
-        if pad > 0 { content } else { content.saturating_sub(1).max(1) }
+        if pad > 0 {
+            content
+        } else {
+            content.saturating_sub(1).max(1)
+        }
     }
 
     /// Set the reasoning level driving the editor's rule color (spec/tui/03 §3.3). Called by the app
@@ -267,7 +271,11 @@ impl InputEditor {
 
     /// The full buffer text with `\n` line joins.
     pub fn text(&self) -> String {
-        self.lines.iter().map(|l| l.iter().collect::<String>()).collect::<Vec<_>>().join("\n")
+        self.lines
+            .iter()
+            .map(|l| l.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Whether the buffer is empty (no chars on any line).

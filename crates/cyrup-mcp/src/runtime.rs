@@ -147,9 +147,10 @@ pub async fn initialize_mcp(
     options: InitializeOptions,
 ) -> McpResult<Arc<McpState>> {
     // Step 1 — the config this generation runs. `loadMcpConfig` cannot fail (MCP-003).
-    let config = options.programmatic_config.clone().unwrap_or_else(|| {
-        crate::config::load_mcp_config(&dirs, snapshot.config_path.as_deref())
-    });
+    let config = options
+        .programmatic_config
+        .clone()
+        .unwrap_or_else(|| crate::config::load_mcp_config(&dirs, snapshot.config_path.as_deref()));
 
     // MCP-015's two derivations. The fenced handle is built BEFORE anything asynchronous can hold
     // it, which is the whole point: what crosses the await is already inert-on-stop.
@@ -164,8 +165,7 @@ pub async fn initialize_mcp(
         .then(|| snapshot.services.clone())
         .flatten()
         .map(|services| Arc::new(OwnedServices::new(services, Arc::clone(&owner))));
-    let runtime_signal =
-        crate::abort::combine(&owner.token(), snapshot.initial_signal.as_ref());
+    let runtime_signal = crate::abort::combine(&owner.token(), snapshot.initial_signal.as_ref());
 
     // Steps 2-4. `getAuthStorageOptions(settings.oauthDir, cwd)` — and **only** `settings.oauthDir`:
     // `$MCP_OAUTH_DIR` and the `<agent_dir>/mcp-oauth` default are the store's own precedence ladder
@@ -354,7 +354,8 @@ pub async fn initialize_mcp(
         let options = Arc::new(crate::elicitation::ElicitationOptions {
             allow_url: snapshot.is_tui_mode(),
             session: Arc::clone(&session),
-            launcher: Arc::new(crate::oauth::OpenerLauncher) as Arc<dyn crate::oauth::BrowserLauncher>,
+            launcher: Arc::new(crate::oauth::OpenerLauncher)
+                as Arc<dyn crate::oauth::BrowserLauncher>,
             // `options.onUrlAccepted` — the registry write the completion notice's dedupe reads.
             // `Weak`, so the hook the manager owns does not own the manager back; a dead weak is a
             // no-op, which is the right answer for a generation that has already been torn down.
@@ -392,7 +393,10 @@ pub async fn initialize_mcp(
     }
 
     // Step 7. `hasPendingAuth` is the OAuth runtime's, so an authenticating server is never reaped.
-    let lifecycle = Arc::new(McpLifecycleManager::new(Arc::clone(&manager), Arc::new(|_| false)));
+    let lifecycle = Arc::new(McpLifecycleManager::new(
+        Arc::clone(&manager),
+        Arc::new(|_| false),
+    ));
     lifecycle.set_global_idle_timeout(config.settings_or_default().idle_timeout_minutes());
 
     // Steps 8-9.
@@ -415,7 +419,10 @@ pub async fn initialize_mcp(
             // `if (!owner.isActive()) return;` then `pi.sendMessage(...)`. The owner check IS the
             // guard — a stale generation must not inject into the session that replaced it.
             if owner.is_active() {
-                tracing::debug!("MCP: send_message not yet wired — dropping {} bytes", message.len());
+                tracing::debug!(
+                    "MCP: send_message not yet wired — dropping {} bytes",
+                    message.len()
+                );
             }
         })
     };
@@ -469,7 +476,9 @@ pub async fn initialize_mcp(
                 &state,
                 &dirs,
                 server,
-                crate::live::MetadataCacheOptions { preserve_empty_resources: false },
+                crate::live::MetadataCacheOptions {
+                    preserve_empty_resources: false,
+                },
             );
             state.notify_tool_metadata_updated(server, reason);
             crate::live::update_status_bar(&state);
@@ -536,15 +545,19 @@ pub async fn initialize_mcp(
         // `persistsAfterFirstSpawn` is `eager | lazy-keep-alive` (`init.ts:245`) — NOT
         // [`ServerLifecycle::is_prewarmed`], which is `eager | keep-alive` and answers §11's
         // question instead. The two sets differ and swapping them is silent.
-        let persists = matches!(mode, ServerLifecycle::Eager | ServerLifecycle::LazyKeepAlive);
+        let persists = matches!(
+            mode,
+            ServerLifecycle::Eager | ServerLifecycle::LazyKeepAlive
+        );
         // `definition.idleTimeout ?? (persistsAfterFirstSpawn ? 0 : undefined)` (`init.ts:246`) —
         // the `?? 0` is what stops an eager or lazy-keep-alive server ever idling out by default.
         let idle_timeout = definition.idle_timeout.or_else(|| persists.then_some(0.0));
         state.lifecycle.register_server(
             name,
             definition.clone(),
-            idle_timeout
-                .map(|minutes| crate::lifecycle::LifecycleOverrides { idle_timeout: Some(minutes) }),
+            idle_timeout.map(|minutes| crate::lifecycle::LifecycleOverrides {
+                idle_timeout: Some(minutes),
+            }),
         );
         // ONLY `keep-alive` at registration (`init.ts:252`); `lazy-keep-alive` waits for its first
         // successful connect, which is [`McpLifecycleManager::mark_keep_alive_after_connect`].
@@ -600,7 +613,8 @@ pub async fn initialize_mcp(
                     Ok(connection) if connection.status() == ConnectionStatus::NeedsAuth => {
                         // BYTE-EXACT (`init.ts:288`). The `/mcp-auth {name}` form is what the user
                         // copies; a reworded line is a support burden, not a style choice.
-                        let message = format!("OAuth authentication required. Run /mcp-auth {name}.");
+                        let message =
+                            format!("OAuth authentication required. Run /mcp-auth {name}.");
                         (name, definition, None, Some(message))
                     }
                     Ok(connection) => (name, definition, Some(connection), None),
@@ -617,7 +631,11 @@ pub async fn initialize_mcp(
     // `if (initialSignal?.aborted) return state;` (`init.ts:301`) — BEFORE the owner check, and it
     // returns `Ok`, not `Err`. This is the FIFTH exit from this function: a caller-cancelled init
     // hands back the state it built rather than failing.
-    if snapshot.initial_signal.as_ref().is_some_and(CancelToken::is_cancelled) {
+    if snapshot
+        .initial_signal
+        .as_ref()
+        .is_some_and(CancelToken::is_cancelled)
+    {
         return Ok(state);
     }
     // MCP-046 checkpoint 1 (`init.ts:302`).
@@ -634,17 +652,21 @@ pub async fn initialize_mcp(
     let mut startup_known: indexmap::IndexMap<String, Vec<crate::proxy::ToolMetadata>> =
         indexmap::IndexMap::new();
     for (name, definition, connection, _) in &results {
-        let Some(connection) = connection.as_ref() else { continue };
+        let Some(connection) = connection.as_ref() else {
+            continue;
+        };
         let effective_prefix = crate::registration::resolve_tool_prefix(Some(definition), prefix);
         let mut metadata: Vec<crate::proxy::ToolMetadata> = connection
             .tools()
             .iter()
             .filter(|tool| !tool.name.is_empty())
-            .map(|tool| crate::proxy::ToolMetadata::new(
-                crate::registration::format_tool_name(&tool.name, name, effective_prefix),
-                tool.name.to_string(),
-                tool.description.as_deref().unwrap_or_default(),
-            ))
+            .map(|tool| {
+                crate::proxy::ToolMetadata::new(
+                    crate::registration::format_tool_name(&tool.name, name, effective_prefix),
+                    tool.name.to_string(),
+                    tool.description.as_deref().unwrap_or_default(),
+                )
+            })
             .collect();
         // `definition.exposeResources !== false ? … : []` (`init.ts:313`), and the `resource?.name
         // && resource?.uri` guard that goes with it.
@@ -688,7 +710,11 @@ pub async fn initialize_mcp(
                 // `if (initialSignal?.aborted) continue;` FIRST (`init.ts:330`), before anything is
                 // recorded: a cancelled init must not poison the next sixty seconds of every
                 // server's availability.
-                if snapshot.initial_signal.as_ref().is_some_and(CancelToken::is_cancelled) {
+                if snapshot
+                    .initial_signal
+                    .as_ref()
+                    .is_some_and(CancelToken::is_cancelled)
+                {
                     continue;
                 }
                 // `if (error) recordFailure(...)` — the abort arm has no message and records
@@ -781,12 +807,20 @@ pub async fn initialize_mcp(
     }
 
     // ── §13 — the startup summary (`init.ts:364-372`) ──────────────────────────────────────
-    let connected_count =
-        results.iter().filter(|(_, _, connection, _)| connection.is_some()).count();
-    let failed_count = results.iter().filter(|(_, _, _, error)| error.is_some()).count();
+    let connected_count = results
+        .iter()
+        .filter(|(_, _, connection, _)| connection.is_some())
+        .count();
+    let failed_count = results
+        .iter()
+        .filter(|(_, _, _, error)| error.is_some())
+        .count();
     if let Some(ui) = state.ui.as_ref()
         && connected_count > 0
-        && state.config.settings_or_default().notify_on_startup_connect()
+        && state
+            .config
+            .settings_or_default()
+            .notify_on_startup_connect()
     {
         let total_tools = total_tool_count(&state);
         // `{total}` is `startupServers.length`, NOT the config count: a lazy server that was never
@@ -824,9 +858,9 @@ pub async fn initialize_mcp(
             let pending: Vec<String> = missing
                 .into_iter()
                 .filter(|name| {
-                    !results.iter().any(|(other, _, connection, _)| {
-                        other == name && connection.is_some()
-                    })
+                    !results
+                        .iter()
+                        .any(|(other, _, connection, _)| other == name && connection.is_some())
                 })
                 .collect();
             let bootstrap = crate::live::parallel_limit(
@@ -848,7 +882,11 @@ pub async fn initialize_mcp(
                             );
                             return (name, false);
                         };
-                        match state.manager.connect(&name, &definition, Some(&signal)).await {
+                        match state
+                            .manager
+                            .connect(&name, &definition, Some(&signal))
+                            .await
+                        {
                             Ok(connection)
                                 if connection.status() == ConnectionStatus::NeedsAuth =>
                             {
@@ -884,8 +922,10 @@ pub async fn initialize_mcp(
                 },
             )
             .await;
-            let bootstrapped: Vec<String> =
-                bootstrap.into_iter().filter_map(|(name, ok)| ok.then_some(name)).collect();
+            let bootstrapped: Vec<String> = bootstrap
+                .into_iter()
+                .filter_map(|(name, ok)| ok.then_some(name))
+                .collect();
             // MCP-046 checkpoint 3 (`init.ts:411`), INSIDE the `missingCacheServers.length > 0`
             // arm — not outside it.
             owner.throw_if_inactive()?;
@@ -952,7 +992,9 @@ pub async fn initialize_mcp(
             crate::live::update_status_bar(&state);
         })
     };
-    state.lifecycle.set_reconnect_failure_callback(on_reconnect_failure);
+    state
+        .lifecycle
+        .set_reconnect_failure_callback(on_reconnect_failure);
 
     let on_health_restored: crate::lifecycle::HealthRestoredCallback = {
         let state = Arc::clone(&state);
@@ -968,7 +1010,9 @@ pub async fn initialize_mcp(
             })
         })
     };
-    state.lifecycle.set_health_restored_callback(on_health_restored);
+    state
+        .lifecycle
+        .set_health_restored_callback(on_health_restored);
 
     let on_auth_required: crate::lifecycle::AuthRequiredCallback = {
         let state = Arc::clone(&state);
@@ -1054,7 +1098,9 @@ fn total_tool_count(state: &McpState) -> usize {
 /// directly, skipping both.
 fn effective_idle_timeout_minutes(state: &McpState, server: &str) -> f64 {
     let global = || state.config.settings_or_default().idle_timeout_minutes();
-    let Some(definition) = state.config.mcp_servers.get(server) else { return global() };
+    let Some(definition) = state.config.mcp_servers.get(server) else {
+        return global();
+    };
     if let Some(minutes) = definition.idle_timeout {
         return minutes;
     }
@@ -1075,7 +1121,9 @@ fn effective_idle_timeout_minutes(state: &McpState, server: &str) -> f64 {
 /// handshake it did not need.
 #[must_use]
 pub fn needs_load_time_initialization(config: &McpConfig) -> bool {
-    config.enabled_servers().any(|(_, entry)| entry.lifecycle_mode().is_prewarmed())
+    config
+        .enabled_servers()
+        .any(|(_, entry)| entry.lifecycle_mode().is_prewarmed())
 }
 
 /// `MCP_DIRECT_TOOLS`'s "no servers" sentinel (MCP-013). Not an empty string: an empty value is
@@ -1129,11 +1177,23 @@ mod tests {
 
     #[test]
     fn prewarm_gate_matches_the_two_lifecycles_and_skips_disabled() {
-        assert!(!needs_load_time_initialization(&config_with(None, false)), "lazy is the default");
-        assert!(needs_load_time_initialization(&config_with(Some(ServerLifecycle::Eager), false)));
-        assert!(needs_load_time_initialization(&config_with(Some(ServerLifecycle::KeepAlive), false)));
         assert!(
-            !needs_load_time_initialization(&config_with(Some(ServerLifecycle::LazyKeepAlive), false)),
+            !needs_load_time_initialization(&config_with(None, false)),
+            "lazy is the default"
+        );
+        assert!(needs_load_time_initialization(&config_with(
+            Some(ServerLifecycle::Eager),
+            false
+        )));
+        assert!(needs_load_time_initialization(&config_with(
+            Some(ServerLifecycle::KeepAlive),
+            false
+        )));
+        assert!(
+            !needs_load_time_initialization(&config_with(
+                Some(ServerLifecycle::LazyKeepAlive),
+                false
+            )),
             "lazy-keep-alive connects on first call, not at load"
         );
         assert!(
@@ -1155,7 +1215,9 @@ mod tests {
     #[test]
     fn only_keep_alive_is_marked_at_registration() {
         assert!(marks_keep_alive_at_registration(ServerLifecycle::KeepAlive));
-        assert!(!marks_keep_alive_at_registration(ServerLifecycle::LazyKeepAlive));
+        assert!(!marks_keep_alive_at_registration(
+            ServerLifecycle::LazyKeepAlive
+        ));
         assert!(!marks_keep_alive_at_registration(ServerLifecycle::Eager));
     }
 
@@ -1170,7 +1232,10 @@ mod tests {
             services: None,
         };
         assert!(!snap.is_tui_mode());
-        let tui = ContextSnapshot { mode: "tui".to_string(), ..snap };
+        let tui = ContextSnapshot {
+            mode: "tui".to_string(),
+            ..snap
+        };
         assert!(tui.is_tui_mode());
     }
 
@@ -1223,7 +1288,9 @@ mod tests {
             ServerEntry {
                 // Port 1 on loopback: reserved, never listening, and refused immediately.
                 url: Some("http://127.0.0.1:1/mcp".to_string()),
-                auth: Some(crate::config::AuthMode::Named(crate::config::AuthKind::Oauth)),
+                auth: Some(crate::config::AuthMode::Named(
+                    crate::config::AuthKind::Oauth,
+                )),
                 ..ServerEntry::default()
             },
         );
@@ -1292,9 +1359,9 @@ use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use futures::StreamExt as _;
 // `http` and `sse-stream` are declared dependencies for exactly this reason: implementing
 // `StreamableHttpClient` (here for [`SessionIdProbe`], in `request_headers_command.rs` for the
 // signing decorator) means naming the trait's argument and return types, and a trait impl leaves no
@@ -1308,15 +1375,15 @@ use sse_stream::{Error as SseError, Sse, SseStream};
 #[allow(deprecated)]
 use rmcp::model::{
     ClientCapabilities, ClientInfo, CreateMessageRequestMethod, CreateMessageRequestParams,
-    CreateMessageResult, CustomNotification, ElicitRequestParams, ElicitResult,
-    ElicitationAction, ElicitationCapability, FormElicitationCapability, Implementation,
-    ProtocolVersion, SamplingCapability, UrlElicitationCapability,
+    CreateMessageResult, CustomNotification, ElicitRequestParams, ElicitResult, ElicitationAction,
+    ElicitationCapability, FormElicitationCapability, Implementation, ProtocolVersion,
+    SamplingCapability, UrlElicitationCapability,
 };
+use rmcp::model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::service::{
     ClientInitializeError, ClientLifecycleMode, MaybeSendFuture, NotificationContext, Peer,
     PeerRequestOptions, RequestContext, RoleClient, RunningService, ServiceError,
 };
-use rmcp::model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::transport::common::http_header::{
     EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
 };
@@ -1324,8 +1391,9 @@ use rmcp::transport::streamable_http_client::{
     AuthRequiredError, InsufficientScopeError, StreamableHttpClient,
     StreamableHttpClientTransportConfig, StreamableHttpError, StreamableHttpPostResponse,
 };
-use rmcp::transport::{ConfigureCommandExt, IntoTransport, StreamableHttpClientTransport,
-    TokioChildProcess};
+use rmcp::transport::{
+    ConfigureCommandExt, IntoTransport, StreamableHttpClientTransport, TokioChildProcess,
+};
 use rmcp::{ClientHandler, ErrorData};
 use tokio::process::ChildStderr;
 
@@ -1626,8 +1694,8 @@ pub fn spawn_stdio_transport(
         })?;
     }
 
-    let mut builder = TokioChildProcess::builder(tokio::process::Command::new(&spec.command)
-        .configure(|command| {
+    let mut builder = TokioChildProcess::builder(
+        tokio::process::Command::new(&spec.command).configure(|command| {
             command.args(&spec.args);
             // The replace-not-merge semantics of `StdioClientTransport`'s `env` option. See
             // `StdioTransportSpec::env`.
@@ -1638,7 +1706,8 @@ pub fn spawn_stdio_transport(
             if let Some(cwd) = spec.cwd.as_ref() {
                 command.current_dir(cwd);
             }
-        }));
+        }),
+    );
 
     if !spec.debug {
         builder = builder.stderr(Stdio::piped());
@@ -1851,8 +1920,7 @@ impl<C> SessionIdProbe<C> {
         if carried {
             // `Relaxed` is enough: the flag is read once, after the handshake future has been
             // awaited to completion, and that await is the happens-before edge.
-            self.seen
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.seen.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -2122,7 +2190,9 @@ impl UnauthorizedProbe {
         }
         for (name, value) in custom_headers {
             if is_reserved_header(&name) {
-                return Err(StreamableHttpError::ReservedHeaderConflict(name.to_string()));
+                return Err(StreamableHttpError::ReservedHeaderConflict(
+                    name.to_string(),
+                ));
             }
             request = request.header(name, value);
         }
@@ -2462,7 +2532,10 @@ pub const CLIENT_VERSION: &str = "1.0.0";
 /// to express the omission through rmcp's typed handshake.
 #[must_use]
 #[allow(deprecated)]
-pub fn build_client_capabilities(sampling: bool, elicitation: Option<ElicitationMode>) -> ClientCapabilities {
+pub fn build_client_capabilities(
+    sampling: bool,
+    elicitation: Option<ElicitationMode>,
+) -> ClientCapabilities {
     // `ClientCapabilities` is `#[non_exhaustive]` and its `builder()` is generated behind the
     // `server`/`macros` features this crate does not enable — `Default` + field assignment is the
     // only construction route. Same for the two capability structs.
@@ -2635,7 +2708,10 @@ pub type ElicitationCompleteHook = Arc<dyn Fn(ElicitationCompleteEvent) + Send +
 /// seam it plugs into. See the import block for why the SEP-2577 deprecation is suppressed.
 #[allow(deprecated)]
 pub type SamplingHook = Arc<
-    dyn Fn(String, CreateMessageRequestParams) -> BoxFuture<'static, Result<CreateMessageResult, ErrorData>>
+    dyn Fn(
+            String,
+            CreateMessageRequestParams,
+        ) -> BoxFuture<'static, Result<CreateMessageResult, ErrorData>>
         + Send
         + Sync,
 >;
@@ -2669,7 +2745,9 @@ pub struct ElicitationConfig {
 
 impl std::fmt::Debug for ElicitationConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ElicitationConfig").field("mode", &self.mode).finish_non_exhaustive()
+        f.debug_struct("ElicitationConfig")
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2732,12 +2810,13 @@ impl McpClientHandler {
     /// cannot serve. Deriving from the hook makes that state unrepresentable.
     #[must_use]
     pub fn new(parts: McpClientHandlerParts) -> Self {
-        let allow_url = parts
-            .elicitation_mode
-            .is_some_and(|mode| mode.allow_url);
+        let allow_url = parts.elicitation_mode.is_some_and(|mode| mode.allow_url);
         let capabilities = build_client_capabilities(
             parts.sampling.is_some(),
-            parts.elicitation.is_some().then_some(ElicitationMode { allow_url }),
+            parts
+                .elicitation
+                .is_some()
+                .then_some(ElicitationMode { allow_url }),
         );
         let info = client_info(&parts.server, capabilities);
         Self {
@@ -2839,7 +2918,8 @@ impl ClientHandler for McpClientHandler {
         &self,
         params: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<ElicitResult, ErrorData>> + MaybeSendFuture + '_ {
+    ) -> impl std::future::Future<Output = Result<ElicitResult, ErrorData>> + MaybeSendFuture + '_
+    {
         let hook = self.shared.elicitation.clone();
         let server = self.shared.server.clone();
         async move {
@@ -3027,7 +3107,10 @@ pub async fn connect_client_bounded<T, E, A>(
     lifecycle: ClientLifecycleMode,
     ct: CancelToken,
     timeout: Option<Duration>,
-) -> Result<Result<RunningService<RoleClient, McpClientHandler>, Box<ClientInitializeError>>, Duration>
+) -> Result<
+    Result<RunningService<RoleClient, McpClientHandler>, Box<ClientInitializeError>>,
+    Duration,
+>
 where
     T: IntoTransport<RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
@@ -3044,8 +3127,11 @@ where
         // transport in a local, so the transport (and, for stdio, `ChildWithCleanup::drop`'s
         // `kill()`) goes with it.
         Some(budget) => {
-            match tokio::time::timeout(budget, connect_client(handler, transport, lifecycle, service))
-                .await
+            match tokio::time::timeout(
+                budget,
+                connect_client(handler, transport, lifecycle, service),
+            )
+            .await
             {
                 Ok(outcome) => Ok(outcome),
                 Err(_elapsed) => Err(budget),
@@ -3098,7 +3184,9 @@ fn detachable_from(attempt: &CancelToken) -> (CancelToken, CancelToken) {
         // off-runtime. Degrading to the attempt token itself keeps the abort half working and
         // restores the old over-long lifetime, which is strictly better than a connect that cannot
         // be aborted at all. Unreachable in practice — this is an `async fn`, so a runtime exists.
-        tracing::warn!("MCP: no tokio runtime to scope the connect signal on — using the attempt's");
+        tracing::warn!(
+            "MCP: no tokio runtime to scope the connect signal on — using the attempt's"
+        );
         return (attempt.clone(), detach);
     };
     let watched = attempt.clone();
@@ -3167,7 +3255,10 @@ pub fn normalize_request_timeout_ms(timeout_ms: Option<f64>) -> Option<Duration>
 /// A porter who writes `definition.or(global)` after normalising gets a plausible-looking
 /// implementation that silently reinstates a 30-second cap the user disabled on purpose.
 #[must_use]
-pub fn resolve_request_timeout(entry: Option<&ServerEntry>, global_ms: Option<f64>) -> Option<Duration> {
+pub fn resolve_request_timeout(
+    entry: Option<&ServerEntry>,
+    global_ms: Option<f64>,
+) -> Option<Duration> {
     match entry.and_then(|entry| entry.request_timeout_ms) {
         Some(per_server) => normalize_request_timeout_ms(Some(per_server)),
         None => normalize_request_timeout_ms(global_ms),
@@ -3466,7 +3557,9 @@ impl SessionSlot {
 
 impl std::fmt::Debug for SessionSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionSlot").field("bound", &self.0.get().is_some()).finish()
+        f.debug_struct("SessionSlot")
+            .field("bound", &self.0.get().is_some())
+            .finish()
     }
 }
 
@@ -3798,9 +3891,9 @@ impl ConnectionResource for McpConnection {
             // rather than the service itself.
             let outcome = service.close().await;
             drop(slot.take());
-            outcome.map(|_| ()).map_err(|join| {
-                McpError::other(format!("MCP connection close failed: {join}"))
-            })
+            outcome
+                .map(|_| ())
+                .map_err(|join| McpError::other(format!("MCP connection close failed: {join}")))
         })
     }
 
@@ -4083,7 +4176,10 @@ impl ConnectionBuilder {
             process,
             lifecycle,
             request.attempt.clone(),
-            request.request_options.as_ref().and_then(|options| options.timeout),
+            request
+                .request_options
+                .as_ref()
+                .and_then(|options| options.timeout),
         )
         .await;
         let handshake = match handshake {
@@ -4199,11 +4295,13 @@ impl ConnectionBuilder {
         // fresh per attempt is the MCP client, not the HTTP one.
         let http_client = UnauthorizedProbe::new(build_http_client()?);
         let signing_client = match entry.request_headers_command.clone() {
-            Some(config) => Some(crate::request_headers_command::RequestHeadersCommandClient::new(
-                http_client.clone(),
-                config,
-                Some(request.attempt.clone()),
-            )?),
+            Some(config) => Some(
+                crate::request_headers_command::RequestHeadersCommandClient::new(
+                    http_client.clone(),
+                    config,
+                    Some(request.attempt.clone()),
+                )?,
+            ),
             None => None,
         };
 
@@ -4230,7 +4328,14 @@ impl ConnectionBuilder {
             };
 
             let attempt = self
-                .http_attempt(request, &spec, entry, &http_client, signing_client.as_ref(), oauth_token)
+                .http_attempt(
+                    request,
+                    &spec,
+                    entry,
+                    &http_client,
+                    signing_client.as_ref(),
+                    oauth_token,
+                )
                 .await?;
 
             let failure = match attempt {
@@ -4388,7 +4493,10 @@ impl ConnectionBuilder {
         // `requestOptions.timeout`, per attempt — upstream's object is built once and passed to
         // every `client.connect`, so each turn of the ladder gets the full budget rather than a
         // share of one. See [`connect_client_bounded`].
-        let budget = request.request_options.as_ref().and_then(|options| options.timeout);
+        let budget = request
+            .request_options
+            .as_ref()
+            .and_then(|options| options.timeout);
         // [`SessionIdProbe`] wraps whichever client this attempt uses, so `has_session_id` below is
         // a read of what the server actually sent rather than a constant. The flag is cloned out
         // BEFORE the probe is handed to the transport, which takes its client by value.
@@ -4484,9 +4592,12 @@ fn start_stderr_pump(mut stderr: ChildStderr) -> StderrPump {
                 match stderr.read(&mut buffer).await {
                     Ok(0) | Err(_) => return,
                     Ok(read) => {
-                        let Some(chunk) = buffer.get(..read) else { return };
-                        let mut tail =
-                            sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let Some(chunk) = buffer.get(..read) else {
+                            return;
+                        };
+                        let mut tail = sink
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         append_stderr_tail(&mut tail, chunk);
                     }
                 }
@@ -4676,7 +4787,10 @@ async fn discover(
         None => (false, false, None),
     };
 
-    let budget = request.request_options.as_ref().and_then(|options| options.timeout);
+    let budget = request
+        .request_options
+        .as_ref()
+        .and_then(|options| options.timeout);
     let (tools, resources_result, prompts_result) = tokio::join!(
         bounded_list(budget, peer.list_all_tools()),
         async {
@@ -4901,7 +5015,10 @@ mod wire_tests {
         let mut e = entry();
         e.command = Some(String::new());
         e.url = Some("http://x".to_string());
-        assert_eq!(select_transport("s", &e).unwrap(), TransportKind::StreamableHttp);
+        assert_eq!(
+            select_transport("s", &e).unwrap(),
+            TransportKind::StreamableHttp
+        );
     }
 
     #[test]
@@ -4911,9 +5028,15 @@ mod wire_tests {
         let mut both = entry();
         both.command = Some("a".to_string());
         both.url = Some("b".to_string());
-        assert_eq!(select_transport("s", &both).unwrap_err().to_string(), expected);
+        assert_eq!(
+            select_transport("s", &both).unwrap_err().to_string(),
+            expected
+        );
 
-        assert_eq!(select_transport("s", &entry()).unwrap_err().to_string(), expected);
+        assert_eq!(
+            select_transport("s", &entry()).unwrap_err().to_string(),
+            expected
+        );
     }
 
     #[test]
@@ -4931,7 +5054,10 @@ mod wire_tests {
         let mut e = entry();
         e.url = Some("http://x".to_string());
         e.http_transport = Some(HttpTransport::StreamableHttp);
-        assert_eq!(select_transport("s", &e).unwrap(), TransportKind::StreamableHttp);
+        assert_eq!(
+            select_transport("s", &e).unwrap(),
+            TransportKind::StreamableHttp
+        );
     }
 
     #[test]
@@ -4945,7 +5071,10 @@ mod wire_tests {
     #[test]
     fn a_one_mib_burst_is_bounded_before_it_is_appended() {
         let burst = vec![b'x'; 1024 * 1024];
-        assert_eq!(bounded_stderr_chunk(&burst).len(), MAX_CAPTURED_STDERR_BYTES);
+        assert_eq!(
+            bounded_stderr_chunk(&burst).len(),
+            MAX_CAPTURED_STDERR_BYTES
+        );
 
         let mut tail = VecDeque::new();
         append_stderr_tail(&mut tail, &burst);
@@ -4970,8 +5099,14 @@ mod wire_tests {
     fn the_suffix_is_the_last_three_non_empty_lines_joined_by_an_em_dash() {
         let mut tail = VecDeque::new();
         append_stderr_tail(&mut tail, b"zero\r\n\n  one  \r\ntwo\nthree\n\n");
-        assert_eq!(stderr_tail_detail(&tail).as_deref(), Some("one \u{2014} two \u{2014} three"));
-        assert_eq!(with_stderr_tail("boom", &tail), "boom (one \u{2014} two \u{2014} three)");
+        assert_eq!(
+            stderr_tail_detail(&tail).as_deref(),
+            Some("one \u{2014} two \u{2014} three")
+        );
+        assert_eq!(
+            with_stderr_tail("boom", &tail),
+            "boom (one \u{2014} two \u{2014} three)"
+        );
     }
 
     #[test]
@@ -4982,7 +5117,11 @@ mod wire_tests {
 
         let mut blank = VecDeque::new();
         append_stderr_tail(&mut blank, b"   \n\r\n  ");
-        assert_eq!(stderr_tail_detail(&blank), None, "debug-mode parity: no tail, no `(...)`");
+        assert_eq!(
+            stderr_tail_detail(&blank),
+            None,
+            "debug-mode parity: no tail, no `(...)`"
+        );
     }
 
     // --- MCP-117 --------------------------------------------------------------------------------
@@ -5004,7 +5143,10 @@ mod wire_tests {
         let mut auto = entry();
         auto.protocol_version = Some(ProtocolVersionSetting::Auto);
         match version_negotiation(&auto).expect("auto") {
-            ClientLifecycleMode::Auto { preferred_versions, legacy_version } => {
+            ClientLifecycleMode::Auto {
+                preferred_versions,
+                legacy_version,
+            } => {
                 assert_eq!(preferred_versions, vec![ProtocolVersion::V_2026_07_28]);
                 assert_eq!(legacy_version, Some(ProtocolVersion::LATEST));
             }
@@ -5045,18 +5187,46 @@ mod wire_tests {
     #[test]
     fn an_unknown_revision_throws_upstreams_sentence_at_connect() {
         for (json, message) in [
-            (r#"{"command":"x","protocolVersion":"2025-06-18"}"#, "Invalid MCP protocolVersion: 2025-06-18"),
-            (r#"{"command":"x","protocolVersion":5}"#, "Invalid MCP protocolVersion: 5"),
-            (r#"{"command":"x","protocolVersion":1.5}"#, "Invalid MCP protocolVersion: 1.5"),
-            (r#"{"command":"x","protocolVersion":true}"#, "Invalid MCP protocolVersion: true"),
-            (r#"{"command":"x","protocolVersion":null}"#, "Invalid MCP protocolVersion: null"),
-            (r#"{"command":"x","protocolVersion":[1,2]}"#, "Invalid MCP protocolVersion: 1,2"),
-            (r#"{"command":"x","protocolVersion":{"a":1}}"#, "Invalid MCP protocolVersion: [object Object]"),
-            (r#"{"command":"x","protocolVersion":""}"#, "Invalid MCP protocolVersion: "),
+            (
+                r#"{"command":"x","protocolVersion":"2025-06-18"}"#,
+                "Invalid MCP protocolVersion: 2025-06-18",
+            ),
+            (
+                r#"{"command":"x","protocolVersion":5}"#,
+                "Invalid MCP protocolVersion: 5",
+            ),
+            (
+                r#"{"command":"x","protocolVersion":1.5}"#,
+                "Invalid MCP protocolVersion: 1.5",
+            ),
+            (
+                r#"{"command":"x","protocolVersion":true}"#,
+                "Invalid MCP protocolVersion: true",
+            ),
+            (
+                r#"{"command":"x","protocolVersion":null}"#,
+                "Invalid MCP protocolVersion: null",
+            ),
+            (
+                r#"{"command":"x","protocolVersion":[1,2]}"#,
+                "Invalid MCP protocolVersion: 1,2",
+            ),
+            (
+                r#"{"command":"x","protocolVersion":{"a":1}}"#,
+                "Invalid MCP protocolVersion: [object Object]",
+            ),
+            (
+                r#"{"command":"x","protocolVersion":""}"#,
+                "Invalid MCP protocolVersion: ",
+            ),
         ] {
-            let entry: ServerEntry = serde_json::from_str(json).expect("parses — the loader is not the validator");
+            let entry: ServerEntry =
+                serde_json::from_str(json).expect("parses — the loader is not the validator");
             assert!(
-                matches!(entry.protocol_version, Some(ProtocolVersionSetting::Other(_))),
+                matches!(
+                    entry.protocol_version,
+                    Some(ProtocolVersionSetting::Other(_))
+                ),
                 "the deserialiser must not have dropped it: {json}"
             );
             assert_eq!(
@@ -5068,9 +5238,18 @@ mod wire_tests {
 
         // The three known revisions are untouched by the passthrough arm.
         for (json, expected) in [
-            (r#"{"command":"x","protocolVersion":"legacy"}"#, ProtocolVersionSetting::Legacy),
-            (r#"{"command":"x","protocolVersion":"auto"}"#, ProtocolVersionSetting::Auto),
-            (r#"{"command":"x","protocolVersion":"2026-07-28"}"#, ProtocolVersionSetting::V20260728),
+            (
+                r#"{"command":"x","protocolVersion":"legacy"}"#,
+                ProtocolVersionSetting::Legacy,
+            ),
+            (
+                r#"{"command":"x","protocolVersion":"auto"}"#,
+                ProtocolVersionSetting::Auto,
+            ),
+            (
+                r#"{"command":"x","protocolVersion":"2026-07-28"}"#,
+                ProtocolVersionSetting::V20260728,
+            ),
         ] {
             let entry: ServerEntry = serde_json::from_str(json).expect("entry");
             assert_eq!(entry.protocol_version, Some(expected), "{json}");
@@ -5092,7 +5271,8 @@ mod wire_tests {
             serde_json::json!({ "sampling": {} })
         );
 
-        let form_only = build_client_capabilities(false, Some(ElicitationMode { allow_url: false }));
+        let form_only =
+            build_client_capabilities(false, Some(ElicitationMode { allow_url: false }));
         assert_eq!(
             serde_json::to_value(&form_only).unwrap(),
             serde_json::json!({ "elicitation": { "form": {} } })
@@ -5182,7 +5362,10 @@ mod wire_tests {
         };
 
         let (transport, stderr) = spawn_stdio_transport(&spec).unwrap();
-        assert!(plugin_data.is_dir(), "pluginDataDir is mkdir -p'd before the spawn");
+        assert!(
+            plugin_data.is_dir(),
+            "pluginDataDir is mkdir -p'd before the spawn"
+        );
 
         let mut stderr = stderr.expect("debug: false pipes stderr and hands back the handle");
         let mut captured = Vec::new();
@@ -5190,7 +5373,10 @@ mod wire_tests {
 
         let mut tail = VecDeque::new();
         append_stderr_tail(&mut tail, &captured);
-        assert_eq!(stderr_tail_detail(&tail).as_deref(), Some("bar \u{2014} unset"));
+        assert_eq!(
+            stderr_tail_detail(&tail).as_deref(),
+            Some("bar \u{2014} unset")
+        );
         assert_eq!(
             with_stderr_tail("MCP connection setup failed", &tail),
             "MCP connection setup failed (bar \u{2014} unset)"
@@ -5210,7 +5396,10 @@ mod wire_tests {
             debug: true,
         };
         let (transport, stderr) = spawn_stdio_transport(&spec).unwrap();
-        assert!(stderr.is_none(), "debug: true is rmcp's default Stdio::inherit()");
+        assert!(
+            stderr.is_none(),
+            "debug: true is rmcp's default Stdio::inherit()"
+        );
         drop(transport);
     }
 
@@ -5250,7 +5439,10 @@ mod wire_tests {
             !config.reinit_on_expired_session,
             "rmcp defaults this ON; MCP-135 owns session recovery, not the transport"
         );
-        assert!(config.allow_stateless, "rmcp's default, and the upstream-equivalent value");
+        assert!(
+            config.allow_stateless,
+            "rmcp's default, and the upstream-equivalent value"
+        );
         assert_eq!(
             config.auth_header.as_deref(),
             Some("hunter2"),
@@ -5268,15 +5460,19 @@ mod wire_tests {
             bearer_token: None,
         };
         let err = build_http_transport_config(&spec).unwrap_err();
-        assert!(err.to_string().contains("X-A"), "the offending header is named: {err}");
+        assert!(
+            err.to_string().contains("X-A"),
+            "the offending header is named: {err}"
+        );
     }
 
     // --- MCP-083, the two deferred call sites -----------------------------------------------------
 
     #[test]
     fn the_stdio_spec_resolves_its_env_through_secrets_and_reports_the_failing_key() {
-        let base: HashMap<String, String> =
-            [("HOST_ONLY".to_string(), "kept".to_string())].into_iter().collect();
+        let base: HashMap<String, String> = [("HOST_ONLY".to_string(), "kept".to_string())]
+            .into_iter()
+            .collect();
 
         let mut e = entry();
         e.command = Some("/bin/true".to_string());
@@ -5306,12 +5502,19 @@ mod wire_tests {
             Some("kept"),
             "`resolveEnv` copies the WHOLE base environment before layering"
         );
-        assert_eq!(spec.plugin_data_dir.as_deref(), Some(std::path::Path::new("/tmp/cyrup-mcp-plugin-data")));
+        assert_eq!(
+            spec.plugin_data_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/cyrup-mcp-plugin-data"))
+        );
         assert!(!spec.debug, "`debug` absent is `false`, i.e. stderr piped");
 
         // A failing secret is an error carrying the `stdio env` context string — never an empty
         // environment variable the child would silently authenticate with.
-        e.env = Some([("TOKEN".to_string(), "!exit 9".to_string())].into_iter().collect());
+        e.env = Some(
+            [("TOKEN".to_string(), "!exit 9".to_string())]
+                .into_iter()
+                .collect(),
+        );
         // `StdioTransportSpec` is not `Debug` (it carries a resolved environment), so the failure is
         // destructured rather than `unwrap_err`'d — the same shape the spawn tests above use.
         let Err(err) = StdioTransportSpec::resolve(
@@ -5345,13 +5548,9 @@ mod wire_tests {
         e.auth = Some(AuthMode::Named(AuthKind::Bearer));
         e.bearer_token = Some("!printf hunter2".to_string());
 
-        let spec = HttpTransportSpec::resolve(
-            &e,
-            "srv",
-            "https://example.test/mcp".to_string(),
-            &env,
-        )
-        .unwrap();
+        let spec =
+            HttpTransportSpec::resolve(&e, "srv", "https://example.test/mcp".to_string(), &env)
+                .unwrap();
         assert_eq!(spec.server, "srv");
         assert_eq!(
             spec.headers,
@@ -5460,9 +5659,12 @@ done
     /// `StdioClientTransport`'s `env` option are observable: anything the child sees beyond `PATH`
     /// came from `definition.env`.
     fn base_env() -> HashMap<String, String> {
-        [("PATH".to_string(), std::env::var("PATH").unwrap_or_default())]
-            .into_iter()
-            .collect()
+        [(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        )]
+        .into_iter()
+        .collect()
     }
 
     fn builder() -> ConnectionBuilder {
@@ -5611,7 +5813,10 @@ done
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn args_are_interpolated_and_cwd_follows_resolve_config_path() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut entry = stdio_entry(TINY_MCP, &["${TOKEN}", "$env:TOKEN", "{env:TOKEN}", "${NOPE}"]);
+        let mut entry = stdio_entry(
+            TINY_MCP,
+            &["${TOKEN}", "$env:TOKEN", "{env:TOKEN}", "${NOPE}"],
+        );
         entry.env = Some(record(&[(
             "PV",
             rmcp::model::ProtocolVersion::LATEST.as_str(),
@@ -5714,7 +5919,10 @@ done
             DISCOVERY_MCP,
             &[&log, capabilities, tools, prompts, resources],
         );
-        entry.env = Some(record(&[("PV", rmcp::model::ProtocolVersion::LATEST.as_str())]));
+        entry.env = Some(record(&[(
+            "PV",
+            rmcp::model::ProtocolVersion::LATEST.as_str(),
+        )]));
         entry
     }
 
@@ -5764,7 +5972,10 @@ done
         assert!(!created.discovery.prompt_discovery_failed);
 
         let methods = wire_log(&log);
-        assert!(methods.iter().any(|method| method == "tools/list"), "{methods:?}");
+        assert!(
+            methods.iter().any(|method| method == "tools/list"),
+            "{methods:?}"
+        );
         assert!(
             !methods.iter().any(|method| method == "resources/list"),
             "the resources capability was absent, so NO request may be sent: {methods:?}"
@@ -5802,7 +6013,10 @@ done
             .collect();
         assert_eq!(names, vec!["first", "second"], "both pages, in order");
         assert_eq!(
-            wire_log(&log).iter().filter(|method| *method == "tools/list").count(),
+            wire_log(&log)
+                .iter()
+                .filter(|method| *method == "tools/list")
+                .count(),
             2,
             "one request per page"
         );
@@ -5857,9 +6071,16 @@ done
 
         assert_eq!(created.status, ConnectionStatus::Connected);
         assert!(created.discovery.resources.is_empty());
-        assert!(!created.discovery.prompt_discovery_failed, "prompts are a different list");
+        assert!(
+            !created.discovery.prompt_discovery_failed,
+            "prompts are a different list"
+        );
         assert_eq!(created.discovery.tools.len(), 1);
-        assert!(wire_log(&log).iter().any(|method| method == "resources/list"));
+        assert!(
+            wire_log(&log)
+                .iter()
+                .any(|method| method == "resources/list")
+        );
 
         created.resource.close().await.expect("close");
     }
@@ -5913,13 +6134,19 @@ done
         let nested = temp.path().join("plugin/data/dir");
         let mut entry = stdio_entry("test -d \"$D\" && printf ready >&2; exit 3", &[]);
         entry.plugin_data_dir = Some(nested.to_string_lossy().into_owned());
-        entry.env = Some(record(&[("D", nested.to_string_lossy().into_owned().as_str())]));
+        entry.env = Some(record(&[(
+            "D",
+            nested.to_string_lossy().into_owned().as_str(),
+        )]));
 
         let error = builder()
             .connect_stdio(&request("plugin", entry))
             .await
             .expect_err("the fixture exits 3");
-        assert!(nested.is_dir(), "the directory must exist after the connect");
+        assert!(
+            nested.is_dir(),
+            "the directory must exist after the connect"
+        );
         assert!(
             error.to_string().ends_with("(ready)"),
             "the CHILD must have seen it, not just the test: {error}"
@@ -6123,7 +6350,8 @@ done
                         // nothing below the MCP layer fails, and only `requestTimeoutMs` can end it.
                         held.push(socket);
                         continue;
-                    } else if !authorized || (is_initialize && initializes <= unauthorized_initializes)
+                    } else if !authorized
+                        || (is_initialize && initializes <= unauthorized_initializes)
                     {
                         let challenge_header = if challenge {
                             "WWW-Authenticate: Bearer realm=\"mcp\", resource_metadata=\"https://example.invalid/.well-known\"\r\n"
@@ -6148,7 +6376,9 @@ done
                                 payload.len()
                             )
                         } else {
-                            format!("HTTP/1.1 401 Unauthorized\r\n{challenge_header}Content-Length: 0\r\nConnection: close\r\n\r\n")
+                            format!(
+                                "HTTP/1.1 401 Unauthorized\r\n{challenge_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
                         }
                     } else if is_initialize {
                         let id = json_id(&recorded.body);
@@ -6176,22 +6406,25 @@ done
                         // these tests are about the transport and the OAuth ladder, not the
                         // inventory.
                         let id = json_id(&recorded.body);
-                        let payload =
-                            format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[]}}}}");
+                        let payload = format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[]}}}}"
+                        );
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                             payload.len()
                         )
                     } else if recorded.body.contains("\"id\":") {
                         let id = json_id(&recorded.body);
-                        let payload = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}");
+                        let payload =
+                            format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}");
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                             payload.len()
                         )
                     } else {
                         // A notification. 202 with no body is what the spec asks for.
-                        "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
                     };
                     use tokio::io::AsyncWriteExt as _;
                     let _ = socket.write_all(response.as_bytes()).await;
@@ -6422,7 +6655,11 @@ done
             .expect("a bare 401 is `needs-auth`, not a connect failure");
 
         assert_eq!(connection.status, ConnectionStatus::NeedsAuth);
-        assert_eq!(fixture.initializes(), 2, "implicit-deferred promotes and retries once");
+        assert_eq!(
+            fixture.initializes(),
+            2,
+            "implicit-deferred promotes and retries once"
+        );
         assert_eq!(auth.invalidations(), vec!["bare".to_string()]);
         // The retry carried an EMPTY challenge, because there genuinely was none — that is what
         // `Some("")` means, and the arm the old doc claimed existed but nothing could produce.
@@ -6439,7 +6676,11 @@ done
     /// 403 with it.
     #[test]
     fn the_401_predicate_still_refuses_every_other_status() {
-        for status in ["HTTP 403 Forbidden: nope", "HTTP 500 Internal Server Error: ", "HTTP 404 Not Found: "] {
+        for status in [
+            "HTTP 403 Forbidden: nope",
+            "HTTP 500 Internal Server Error: ",
+            "HTTP 404 Not Found: ",
+        ] {
             let error: rmcp::transport::streamable_http_client::StreamableHttpError<
                 reqwest::Error,
             > = rmcp::transport::streamable_http_client::StreamableHttpError::UnexpectedServerResponse(
@@ -6478,9 +6719,17 @@ done
             .expect("a 401 is `needs-auth` whatever body it carries");
 
         assert_eq!(connection.status, ConnectionStatus::NeedsAuth);
-        assert_eq!(fixture.initializes(), 2, "implicit-deferred promotes and retries once");
+        assert_eq!(
+            fixture.initializes(),
+            2,
+            "implicit-deferred promotes and retries once"
+        );
         assert_eq!(auth.invalidations(), vec!["jsonrpc401".to_string()]);
-        assert_eq!(auth.calls(), vec![Some(String::new())], "no header, so an empty challenge");
+        assert_eq!(
+            auth.calls(),
+            vec![Some(String::new())],
+            "no header, so an empty challenge"
+        );
     }
 
     /// An OAuth token and a **configured** `Authorization` header must not both go on the wire.
@@ -6495,7 +6744,9 @@ done
     async fn an_oauth_token_never_joins_a_configured_authorization_header() {
         let fixture = HttpFixture::start(0).await;
         let mut entry = http_entry(&fixture.url);
-        entry.auth = Some(crate::config::AuthMode::Named(crate::config::AuthKind::Oauth));
+        entry.auth = Some(crate::config::AuthMode::Named(
+            crate::config::AuthKind::Oauth,
+        ));
         entry.headers = Some(record(&[("Authorization", "Static abc123")]));
         let auth = CountingAuth::with_token("from-store");
 
@@ -6644,7 +6895,9 @@ done
             ("x-escaped", "!!literal"),
             ("x-plain", "${HOME}"),
         ]));
-        entry.auth = Some(crate::config::AuthMode::Named(crate::config::AuthKind::Bearer));
+        entry.auth = Some(crate::config::AuthMode::Named(
+            crate::config::AuthKind::Bearer,
+        ));
         entry.bearer_token = Some("${TOKEN}".to_string());
 
         let connection = builder()
@@ -6706,9 +6959,7 @@ done
         assert_eq!(calls.len(), 1, "one provider construction");
         assert_eq!(
             calls.first().and_then(Clone::clone).as_deref(),
-            Some(
-                "Bearer realm=\"mcp\", resource_metadata=\"https://example.invalid/.well-known\""
-            ),
+            Some("Bearer realm=\"mcp\", resource_metadata=\"https://example.invalid/.well-known\""),
             "the challenge is carried into the provider"
         );
         // The retried attempt carried the token; the first did not.
@@ -6717,12 +6968,18 @@ done
             .into_iter()
             .filter(|request| request.body.contains("\"method\":\"initialize\""))
             .collect();
-        assert_eq!(initializes.first().and_then(|r| r.header("authorization")), None);
+        assert_eq!(
+            initializes.first().and_then(|r| r.header("authorization")),
+            None
+        );
         assert_eq!(
             initializes.get(1).and_then(|r| r.header("authorization")),
             Some("Bearer from-store")
         );
-        assert!(auth.invalidations().is_empty(), "a success invalidates nothing");
+        assert!(
+            auth.invalidations().is_empty(),
+            "a success invalidates nothing"
+        );
         connection.resource.close().await.expect("close");
     }
 
@@ -6733,7 +6990,9 @@ done
         let fixture = HttpFixture::start(0).await;
         let auth = CountingAuth::with_token("eager");
         let mut entry = http_entry(&fixture.url);
-        entry.auth = Some(crate::config::AuthMode::Named(crate::config::AuthKind::Oauth));
+        entry.auth = Some(crate::config::AuthMode::Named(
+            crate::config::AuthKind::Oauth,
+        ));
 
         let connection = builder()
             .with_auth_provider(Arc::clone(&auth) as Arc<dyn HttpAuthProvider>)
@@ -6829,7 +7088,10 @@ done
             matches!(error, McpError::Aborted(_)),
             "expected an abort, got {error}"
         );
-        assert!(auth.invalidations().is_empty(), "an abort invalidates nothing");
+        assert!(
+            auth.invalidations().is_empty(),
+            "an abort invalidates nothing"
+        );
     }
 
     // ── MCP-115 · the STORE-BACKED provider — journey A, the returning user ───────────────────
@@ -6922,7 +7184,9 @@ done
 
     fn explicit_oauth_entry(url: &str) -> ServerEntry {
         ServerEntry {
-            auth: Some(crate::config::AuthMode::Named(crate::config::AuthKind::Oauth)),
+            auth: Some(crate::config::AuthMode::Named(
+                crate::config::AuthKind::Oauth,
+            )),
             ..http_entry(url)
         }
     }
@@ -7056,7 +7320,11 @@ done
             .expect("the retry carries the stored token");
 
         assert_eq!(connection.status, ConnectionStatus::Connected);
-        assert_eq!(fixture.initializes(), 2, "one 401, then one authorized attempt");
+        assert_eq!(
+            fixture.initializes(),
+            2,
+            "one 401, then one authorized attempt"
+        );
         let initializes: Vec<Recorded> = fixture
             .requests()
             .into_iter()
@@ -7152,14 +7420,20 @@ done
         let (provider, runtime) = stored_provider(&store);
 
         assert_eq!(
-            provider.authorize("rotating", url, None).await.expect("empty"),
+            provider
+                .authorize("rotating", url, None)
+                .await
+                .expect("empty"),
             None,
             "nothing is stored yet"
         );
 
         seed_credential(&store, "rotating", url, "late-token", now_secs() + 3600);
         assert_eq!(
-            provider.authorize("rotating", url, None).await.expect("cached"),
+            provider
+                .authorize("rotating", url, None)
+                .await
+                .expect("cached"),
             None,
             "the cached absence still stands — this is what makes the eviction load-bearing"
         );
@@ -7222,7 +7496,9 @@ done
     async fn the_request_headers_command_signs_every_request_and_owns_authorization() {
         let fixture = HttpFixture::start(0).await;
         let mut entry = http_entry(&fixture.url);
-        entry.auth = Some(crate::config::AuthMode::Named(crate::config::AuthKind::Bearer));
+        entry.auth = Some(crate::config::AuthMode::Named(
+            crate::config::AuthKind::Bearer,
+        ));
         entry.bearer_token = Some("static-bearer".to_string());
         entry.request_headers_command = Some(crate::config::HttpRequestHeadersCommand {
             command: Some("sh".to_string()),
@@ -7286,7 +7562,6 @@ done
         );
     }
 
-
     // ── MCP-124 · does the taxonomy actually unblock `close`'s pending-connect rethrow? ────────
 
     /// A factory that parks until released, then fails with whatever it was given.
@@ -7297,7 +7572,10 @@ done
     }
 
     impl ConnectionFactory for ParkedFactory {
-        fn create(&self, _request: CreateConnection) -> BoxFuture<'static, McpResult<NewConnection>> {
+        fn create(
+            &self,
+            _request: CreateConnection,
+        ) -> BoxFuture<'static, McpResult<NewConnection>> {
             let gate = Arc::clone(&self.gate);
             let error = self
                 .error
@@ -7355,7 +7633,10 @@ done
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            assert!(manager.is_connecting("parked"), "the connect must be in flight");
+            assert!(
+                manager.is_connecting("parked"),
+                "the connect must be in flight"
+            );
 
             let closing = {
                 let manager = Arc::clone(&manager);
@@ -7369,12 +7650,12 @@ done
         }
 
         // The teardown failure: re-thrown.
-        let outcome = race_close_against(McpError::SetupFailed(crate::errors::CleanupErrors::from(
-            vec![
+        let outcome = race_close_against(McpError::SetupFailed(
+            crate::errors::CleanupErrors::from(vec![
                 McpError::other("connect ECONNREFUSED"),
                 McpError::other("transport close failed"),
-            ],
-        )))
+            ]),
+        ))
         .await;
         let error = outcome.expect_err("a setup failure must reach the closer");
         assert_eq!(
@@ -7432,7 +7713,11 @@ done
 
         // `NewConnection` is not `Debug`, so the Ok arm is destructured rather than `expect_err`'d.
         let Err(error) = builder()
-            .post_handshake(&connect, Arc::new(FailingClose) as Arc<dyn ConnectionResource>, false)
+            .post_handshake(
+                &connect,
+                Arc::new(FailingClose) as Arc<dyn ConnectionResource>,
+                false,
+            )
             .await
         else {
             panic!("an aborted post-handshake step is a failure");
@@ -7441,7 +7726,10 @@ done
             matches!(error, McpError::SetupFailed(_)),
             "expected `SetupFailed`, got {error:?}"
         );
-        assert!(error.is_cleanup_failure(), "and `close_inner` must be able to see it");
+        assert!(
+            error.is_cleanup_failure(),
+            "and `close_inner` must be able to see it"
+        );
 
         // The pairing: the SAME abort with a cleanup that SUCCEEDS is the abort, not a setup
         // failure. That is what makes the aggregate mean "the teardown failed too".
@@ -7453,7 +7741,11 @@ done
             }
         }
         let Err(error) = builder()
-            .post_handshake(&connect, Arc::new(CleanClose) as Arc<dyn ConnectionResource>, false)
+            .post_handshake(
+                &connect,
+                Arc::new(CleanClose) as Arc<dyn ConnectionResource>,
+                false,
+            )
             .await
         else {
             panic!("still an abort");
@@ -7480,7 +7772,6 @@ done
         manager.close("live").await.expect("close");
     }
 
-
     /// A failed handshake must not leak the child, and the *mechanism* is worth pinning because it
     /// is not the obvious one: nothing in this port calls `close()` on that path.
     /// `serve_client_with_ct_inner` drops the transport, and `ChildWithCleanup::drop`
@@ -7501,7 +7792,10 @@ done
             // `pid (comm) state …`; `comm` may contain spaces and parentheses, so the state is the
             // first field after the LAST `)`. A killed-but-unreaped child is `Z` and is NOT alive.
             stat.rsplit_once(')').is_some_and(|(_, rest)| {
-                rest.trim_start().chars().next().is_some_and(|state| state != 'Z')
+                rest.trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|state| state != 'Z')
             })
         }
 
@@ -7511,7 +7805,10 @@ done
         // `sleep` ignores stdin entirely, which is the whole point.
         let script = "printf '%s' \"$$\" > \"$P\"; exec sleep 60";
         let mut entry = stdio_entry(script, &[]);
-        entry.env = Some(record(&[("P", pid_file.to_string_lossy().into_owned().as_str())]));
+        entry.env = Some(record(&[(
+            "P",
+            pid_file.to_string_lossy().into_owned().as_str(),
+        )]));
 
         let connect = request("hung", entry);
         let token = connect.attempt.clone();
@@ -7539,7 +7836,9 @@ done
         while std::time::Instant::now() < deadline && alive(pid) {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(!alive(pid), "the child survived a failed handshake (pid {pid})");
+        assert!(
+            !alive(pid),
+            "the child survived a failed handshake (pid {pid})"
+        );
     }
-
 }

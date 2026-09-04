@@ -51,7 +51,7 @@ const DETACHED: &str = "detached";
 /// the whole upward `.git` walk; two copies of one predicate is the shape SESS-044 had just been
 /// filed for, and a fix applied to one of them (the linked-worktree `commondir` rung, say) would
 /// silently not reach the footer.
-pub use cyrup_session_svc::{find_git_paths, GitPaths};
+pub use cyrup_session_svc::{GitPaths, find_git_paths};
 
 /// Pi's `resolveGitBranchSync`: the branch named by `HEAD`, `"detached"` when HEAD holds a raw
 /// commit, and `None` when HEAD cannot be read at all.
@@ -66,7 +66,9 @@ pub fn resolve_branch(paths: &GitPaths) -> Option<String> {
     };
     if name == REFTABLE_PLACEHOLDER {
         // Pi: `resolveBranchWithGitSync(repoDir) ?? "detached"`.
-        return Some(resolve_branch_with_git(&paths.repo_dir).unwrap_or_else(|| DETACHED.to_string()));
+        return Some(
+            resolve_branch_with_git(&paths.repo_dir).unwrap_or_else(|| DETACHED.to_string()),
+        );
     }
     if name.is_empty() {
         return None;
@@ -81,7 +83,13 @@ pub fn resolve_branch(paths: &GitPaths) -> Option<String> {
 /// spawns a process for the footer.
 fn resolve_branch_with_git(repo_dir: &Path) -> Option<String> {
     let out = std::process::Command::new("git")
-        .args(["--no-optional-locks", "symbolic-ref", "--quiet", "--short", "HEAD"])
+        .args([
+            "--no-optional-locks",
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+        ])
         .current_dir(repo_dir)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -91,7 +99,11 @@ fn resolve_branch_with_git(repo_dir: &Path) -> Option<String> {
         return None;
     }
     let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if branch.is_empty() { None } else { Some(branch) }
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch)
+    }
 }
 
 /// A cheap "did the refs move?" fingerprint: `(len, mtime)` of the watched files. Pi gets this
@@ -123,7 +135,11 @@ impl FooterGitBranch {
         let paths = find_git_paths(cwd);
         let branch = paths.as_ref().and_then(resolve_branch);
         let fingerprint = paths.as_ref().map(fingerprint_of).unwrap_or_default();
-        Self { paths, branch, fingerprint }
+        Self {
+            paths,
+            branch,
+            fingerprint,
+        }
     }
 
     /// The cached branch — Pi's `getGitBranch()`. `None` outside a repo (and for an empty ref).
@@ -141,7 +157,9 @@ impl FooterGitBranch {
     /// `refreshGitBranchAsync` → `notifyBranchChange`). A `stat` that shows nothing moved returns
     /// `false` without re-reading HEAD.
     pub fn poll(&mut self) -> bool {
-        let Some(paths) = self.paths.as_ref() else { return false };
+        let Some(paths) = self.paths.as_ref() else {
+            return false;
+        };
         let next = fingerprint_of(paths);
         if next == self.fingerprint {
             return false;
@@ -173,7 +191,12 @@ fn fingerprint_of(paths: &GitPaths) -> Fingerprint {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     /// A temp dir that deletes itself when dropped, derefing to [`Path`] so it is still used
@@ -292,7 +315,11 @@ mod tests {
         assert!(!b.poll());
         // A checkout rewrites HEAD. The fingerprint carries the file LENGTH as well as the mtime,
         // so this is detected even when the clock has not ticked.
-        std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        std::fs::write(
+            root.join(".git").join("HEAD"),
+            "ref: refs/heads/feature/x\n",
+        )
+        .unwrap();
         assert!(b.poll());
         assert_eq!(b.branch(), Some("feature/x"));
         assert!(!b.poll());

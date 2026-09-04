@@ -64,7 +64,9 @@ pub fn derive_base() -> PathBuf {
 #[must_use]
 pub fn parse_frontmatter(path: &Path) -> BTreeMap<String, String> {
     let mut data = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(path) else { return data };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return data;
+    };
     if !text.starts_with("---") {
         return data;
     }
@@ -101,7 +103,10 @@ pub fn collect_todos(base: &Path) -> Vec<(String, String, String)> {
     entries.sort();
     for md in entries {
         let fm = parse_frontmatter(&md);
-        let stem = md.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let stem = md
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         rows.push((
             stem,
             fm.get("stage").cloned().unwrap_or_default(),
@@ -128,7 +133,12 @@ pub fn collect_done(base: &Path) -> Vec<DoneGroup> {
         return groups;
     }
     let mut ts_dirs: Vec<PathBuf> = std::fs::read_dir(&done_dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
         .unwrap_or_default();
     ts_dirs.sort();
     ts_dirs.reverse();
@@ -145,15 +155,23 @@ pub fn collect_done(base: &Path) -> Vec<DoneGroup> {
         let mut rows = Vec::new();
         for md in mds {
             let fm = parse_frontmatter(&md);
-            let stem = md.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let stem = md
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             rows.push((
                 stem,
                 fm.get("stage").cloned().unwrap_or_default(),
-                fm.get("status").cloned().unwrap_or_else(|| "completed".to_string()),
+                fm.get("status")
+                    .cloned()
+                    .unwrap_or_else(|| "completed".to_string()),
             ));
         }
         if !rows.is_empty() {
-            let name = ts_dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = ts_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             groups.push((format_timestamp(&name), rows));
         }
     }
@@ -198,7 +216,10 @@ pub fn collect_reviews(base: &Path) -> Vec<(String, String)> {
             .unwrap_or_default();
         mds.sort();
         for md in mds {
-            let stem = md.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let stem = md
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             out.push((stem, sev.to_string()));
         }
     }

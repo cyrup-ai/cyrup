@@ -15,11 +15,7 @@ const COMMAND_USAGE: &str = "Usage: /permission-system [debug|yoloMode on|off] [
 
 /// pi `toOnOff` (`config-modal.ts:20-22`).
 fn on_off(value: bool) -> &'static str {
-    if value {
-        "on"
-    } else {
-        "off"
-    }
+    if value { "on" } else { "off" }
 }
 
 impl PermissionSystemExtension {
@@ -114,7 +110,10 @@ impl PermissionSystemExtension {
         match setting {
             // pi `applySetting` `case "debug"` (`config-modal.ts:49-50`) → `setConfig` (`:78`).
             "debug" => {
-                let next = ExtensionConfig { debug: enabled, ..guard(&self.config).clone() };
+                let next = ExtensionConfig {
+                    debug: enabled,
+                    ..guard(&self.config).clone()
+                };
                 match self.save_extension_config(&next) {
                     Ok(()) => Some(format!(
                         "Debug logging {}.\n{}",
@@ -141,11 +140,16 @@ impl PermissionSystemExtension {
             // pi `applySetting` `case "yoloMode"` (`config-modal.ts:51-52`) → `setConfig` (`:75`),
             // the SAME writer the debug row uses. Not `setYoloMode` — that is the runtime API.
             "yoloMode" => {
-                let next = ExtensionConfig { yolo_mode: enabled, ..guard(&self.config).clone() };
+                let next = ExtensionConfig {
+                    yolo_mode: enabled,
+                    ..guard(&self.config).clone()
+                };
                 match self.save_extension_config(&next) {
-                    Ok(()) => {
-                        Some(format!("YOLO mode {}.\n{}", on_off(enabled), self.config_path_line()))
-                    }
+                    Ok(()) => Some(format!(
+                        "YOLO mode {}.\n{}",
+                        on_off(enabled),
+                        self.config_path_line()
+                    )),
                     // Same failure shape as the debug row: pi notifies through `ctx.ui.notify` and
                     // leaves the live config untouched (`index.ts:1405-1409`), so the value reported
                     // here is the one still in effect.
@@ -235,7 +239,9 @@ impl PermissionSystemExtension {
             format_args!(
                 "Policy file: {}\n  `/permission-system schema` prints the JSON Schema; \
                  `/permission-system example` prints a starter policy.",
-                policy_agent_dir(&self.agent_dir).join(POLICY_FILE).display()
+                policy_agent_dir(&self.agent_dir)
+                    .join(POLICY_FILE)
+                    .display()
             )
         )
     }
@@ -244,6 +250,9 @@ impl PermissionSystemExtension {
     /// `getPermissionSystemConfigPath`, `index.ts:1509`) — the RESOLVED path, so the
     /// `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` override is what the human is told about.
     fn config_path_line(&self) -> String {
-        format!("Config file: {}", Self::resolved_config_path_for(&self.agent_dir).display())
+        format!(
+            "Config file: {}",
+            Self::resolved_config_path_for(&self.agent_dir).display()
+        )
     }
 }

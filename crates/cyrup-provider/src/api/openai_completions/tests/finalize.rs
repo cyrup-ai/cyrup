@@ -30,9 +30,10 @@ async fn a_finish_reason_is_recorded_raw_beside_the_narrowed_one() {
 
     // MIRROR 2: no `finish_reason` ever arrives → nothing recorded, and the terminal is the
     // truncation error, not a fabricated raw value.
-    let events =
-        collect_events("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n")
-            .await;
+    let events = collect_events(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+    )
+    .await;
     let Some(StreamEvent::Error { error, .. }) = events.last() else {
         panic!("expected an error terminal, got {:?}", events.last());
     };

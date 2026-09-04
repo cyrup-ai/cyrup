@@ -43,18 +43,15 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult, run_sync};
 use cyrup_ext_subagents::fork_context::ForkContext;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
-
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -186,7 +183,10 @@ async fn run_fixture(dir: &Path, agent: &str, task: &str, output: &str) -> Singl
     let mut opts = run_options(dir);
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture,
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
 
     tokio::time::timeout(

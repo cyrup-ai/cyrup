@@ -490,12 +490,15 @@ async fn process_file_args(
         match detect_image_mime(&bytes) {
             Some(mime) => match process_image(&bytes, mime, auto_resize) {
                 Ok(processed) => {
-                    out.images
-                        .push(Content::Image { data: processed.data, mime_type: processed.mime_type });
+                    out.images.push(Content::Image {
+                        data: processed.data,
+                        mime_type: processed.mime_type,
+                    });
                     // Reference the image with its processing hints (Pi file-processor.ts:67-72): the
                     // hint lines joined with "\n" inside the `<file>` tag, or an empty tag when none.
                     if processed.hints.is_empty() {
-                        out.text.push_str(&format!("<file name=\"{name}\"></file>\n"));
+                        out.text
+                            .push_str(&format!("<file name=\"{name}\"></file>\n"));
                     } else {
                         out.text.push_str(&format!(
                             "<file name=\"{name}\">{}</file>\n",
@@ -514,7 +517,8 @@ async fn process_file_args(
             None => {
                 // Text file: wrap content in <file> tags with the absolute path.
                 let content = String::from_utf8_lossy(&bytes);
-                out.text.push_str(&format!("<file name=\"{name}\">\n{content}\n</file>\n"));
+                out.text
+                    .push_str(&format!("<file name=\"{name}\">\n{content}\n</file>\n"));
             }
         }
     }
@@ -711,9 +715,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let empty = dir.path().join("empty.txt");
         std::fs::write(&empty, "").unwrap();
-        let processed = process_file_args(&[empty.to_string_lossy().into_owned()], dir.path(), true)
-            .await
-            .unwrap();
+        let processed =
+            process_file_args(&[empty.to_string_lossy().into_owned()], dir.path(), true)
+                .await
+                .unwrap();
         assert!(processed.text.is_empty());
 
         let err = process_file_args(&["does-not-exist.txt".to_string()], dir.path(), true)

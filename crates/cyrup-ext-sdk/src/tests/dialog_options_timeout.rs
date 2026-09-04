@@ -19,15 +19,26 @@ use crate::descriptor::DialogOptions;
 #[test]
 fn a_dialog_options_bag_accepts_pis_timeout_key_and_the_legacy_timeout_ms_alias() {
     let upstream: DialogOptions = serde_json::from_str(r#"{"timeout": 5000}"#).unwrap();
-    assert_eq!(upstream.timeout_ms, Some(5000), "pi's own key must be honoured");
+    assert_eq!(
+        upstream.timeout_ms,
+        Some(5000),
+        "pi's own key must be honoured"
+    );
 
     let legacy: DialogOptions = serde_json::from_str(r#"{"timeoutMs": 5000}"#).unwrap();
-    assert_eq!(legacy.timeout_ms, Some(5000), "bags cyrup's SDK already wrote keep working");
+    assert_eq!(
+        legacy.timeout_ms,
+        Some(5000),
+        "bags cyrup's SDK already wrote keep working"
+    );
 
     // The CANONICAL name on the way out is pi's, so a bag cyrup produces is one pi would accept.
     let wire = serde_json::to_value(DialogOptions::timeout(5000)).unwrap();
     assert_eq!(wire.get("timeout"), Some(&serde_json::json!(5000)));
-    assert!(wire.get("timeoutMs").is_none(), "we no longer EMIT the invented key: {wire}");
+    assert!(
+        wire.get("timeoutMs").is_none(),
+        "we no longer EMIT the invented key: {wire}"
+    );
 
     // `signal` is the other member of upstream's two-field bag and is unaffected.
     let both: DialogOptions =

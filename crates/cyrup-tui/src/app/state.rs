@@ -340,7 +340,8 @@ pub struct AppState {
     /// one-shot (`login_dialog::TuiAuthInteraction::prompt`, Pi's `inputResolver`/`inputRejecter`
     /// pair, `login-dialog.ts:16-17`); [`App::confirm_selector`] resolves it with the typed answer
     /// and [`App::handle_selector_key`]'s `Cancel` arm rejects it with `"Login cancelled"`.
-    pub(super) pending_login_prompt: Option<tokio::sync::oneshot::Sender<Result<String, OAuthError>>>,
+    pub(super) pending_login_prompt:
+        Option<tokio::sync::oneshot::Sender<Result<String, OAuthError>>>,
     /// The dialog's `AbortController` (`login-dialog.ts:15`, `:73-75`) for the flow currently on
     /// screen: `cancel()` fires it so a flow blocked on something other than a prompt (a callback
     /// server, a device-code poll) also unwinds. `None` whenever no login is in flight.
@@ -507,7 +508,10 @@ impl AppState {
     ///
     /// Accepts either a bare key-id (`ExtensionHost::shortcut_keys()`'s `Vec<String>`) or an
     /// `(id, description)` pair — see [`ShortcutSpec`] for why both forms exist.
-    pub fn set_extension_shortcuts(&mut self, specs: impl IntoIterator<Item = impl Into<ShortcutSpec>>) {
+    pub fn set_extension_shortcuts(
+        &mut self,
+        specs: impl IntoIterator<Item = impl Into<ShortcutSpec>>,
+    ) {
         self.extension_shortcuts = specs
             .into_iter()
             .map(Into::into)
@@ -551,19 +555,28 @@ pub struct ShortcutSpec {
 
 impl From<String> for ShortcutSpec {
     fn from(id: String) -> Self {
-        ShortcutSpec { id, description: None }
+        ShortcutSpec {
+            id,
+            description: None,
+        }
     }
 }
 
 impl From<&str> for ShortcutSpec {
     fn from(id: &str) -> Self {
-        ShortcutSpec { id: id.to_string(), description: None }
+        ShortcutSpec {
+            id: id.to_string(),
+            description: None,
+        }
     }
 }
 
 impl From<(String, String)> for ShortcutSpec {
     fn from((id, description): (String, String)) -> Self {
-        ShortcutSpec { id, description: Some(description) }
+        ShortcutSpec {
+            id,
+            description: Some(description),
+        }
     }
 }
 
@@ -640,7 +653,11 @@ pub(crate) fn default_ui_reply(kind: UiKind) -> UiReply {
 /// displayed value belongs to the tick, not to whenever the string happens to be formatted. Reading
 /// the clock in here instead left [`App::tick_extension_dialog_countdown_at`]'s injected instant
 /// governing only the expiry branch, so a ticked-forward countdown still printed its opening value.
-pub(crate) fn countdown_title(base: &str, deadline: tokio::time::Instant, now: tokio::time::Instant) -> String {
+pub(crate) fn countdown_title(
+    base: &str,
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> String {
     let remaining = deadline.saturating_duration_since(now);
     let secs = remaining.as_millis().div_ceil(1000);
     format!("{base} ({secs}s)")

@@ -157,14 +157,12 @@ pub const STRUCTURED_OUTPUT_CAPTURE_ENV: &str = "CYRUP_SUBAGENT_STRUCTURED_OUTPU
 /// child produced prose. pi runs its structured-output check on every clean exit
 /// (`execution.ts:791`) and fails on a missing capture file unconditionally; prose is never an
 /// exemption. This is the observable divergence C12's structured-output note calls out.
-pub const STRUCTURED_OUTPUT_MISSING_ERROR: &str =
-    "Missing structured_output call; this step has outputSchema and must finish by calling structured_output.";
+pub const STRUCTURED_OUTPUT_MISSING_ERROR: &str = "Missing structured_output call; this step has outputSchema and must finish by calling structured_output.";
 
 /// The child-facing instruction injected when a schema is declared: the run MUST finish by calling
 /// the `structured_output` tool. Kept here as the one canonical wording the spawn/task-text
 /// assembly (or a future child-side prompt runtime) injects, mirroring pi's boundary instruction.
-pub const STRUCTURED_OUTPUT_INSTRUCTION: &str =
-    "This step has a declared output schema. You MUST finish by calling the `structured_output` \
+pub const STRUCTURED_OUTPUT_INSTRUCTION: &str = "This step has a declared output schema. You MUST finish by calling the `structured_output` \
      tool exactly once with a value conforming to the schema; prose alone is not accepted as the \
      structured result for this step.";
 
@@ -421,12 +419,18 @@ mod tests {
         let schema = sample_schema();
         let runtime = create_structured_output_runtime(&schema, base.path()).expect("runtime");
         assert!(runtime.schema_path.exists(), "schema.json must be written");
-        assert!(!runtime.output_path.exists(), "capture file must not exist until the child writes it");
+        assert!(
+            !runtime.output_path.exists(),
+            "capture file must not exist until the child writes it"
+        );
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&runtime.schema_path).unwrap()).unwrap();
         assert_eq!(written, schema);
         cleanup_structured_output_runtime(&runtime);
-        assert!(!runtime.schema_path.exists(), "cleanup removes the runtime dir");
+        assert!(
+            !runtime.schema_path.exists(),
+            "cleanup removes the runtime dir"
+        );
     }
 
     #[test]
@@ -434,7 +438,8 @@ mod tests {
         // The defining pi property: NO structured_output call (capture file absent) is a hard
         // failure regardless of any prose the child produced.
         let base = tempfile::tempdir().expect("tempdir");
-        let runtime = create_structured_output_runtime(&sample_schema(), base.path()).expect("runtime");
+        let runtime =
+            create_structured_output_runtime(&sample_schema(), base.path()).expect("runtime");
         let err = read_structured_output(&runtime).expect_err("missing capture must fail");
         assert_eq!(err, STRUCTURED_OUTPUT_MISSING_ERROR);
         assert!(err.contains("must finish by calling structured_output"));
@@ -443,7 +448,8 @@ mod tests {
     #[test]
     fn read_structured_output_present_and_valid_returns_the_value() {
         let base = tempfile::tempdir().expect("tempdir");
-        let runtime = create_structured_output_runtime(&sample_schema(), base.path()).expect("runtime");
+        let runtime =
+            create_structured_output_runtime(&sample_schema(), base.path()).expect("runtime");
         std::fs::write(&runtime.output_path, br#"{"summary":"ok","count":3}"#).unwrap();
         let value = read_structured_output(&runtime).expect("valid capture");
         assert_eq!(value, serde_json::json!({"summary": "ok", "count": 3}));
@@ -452,17 +458,27 @@ mod tests {
     #[test]
     fn read_structured_output_present_but_schema_invalid_is_a_hard_failure() {
         let base = tempfile::tempdir().expect("tempdir");
-        let runtime = create_structured_output_runtime(&sample_schema(), base.path()).expect("runtime");
+        let runtime =
+            create_structured_output_runtime(&sample_schema(), base.path()).expect("runtime");
         std::fs::write(&runtime.output_path, br#"{"summary":"ok","count":"three"}"#).unwrap();
         let err = read_structured_output(&runtime).expect_err("invalid capture must fail");
-        assert!(err.contains("validation failed") && err.contains("count"), "got: {err}");
+        assert!(
+            err.contains("validation failed") && err.contains("count"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn structured_output_instruction_and_env_constants_are_stable() {
         assert!(structured_output_instruction().contains("structured_output"));
-        assert_eq!(STRUCTURED_OUTPUT_SCHEMA_ENV, "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA");
-        assert_eq!(STRUCTURED_OUTPUT_CAPTURE_ENV, "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE");
+        assert_eq!(
+            STRUCTURED_OUTPUT_SCHEMA_ENV,
+            "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA"
+        );
+        assert_eq!(
+            STRUCTURED_OUTPUT_CAPTURE_ENV,
+            "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE"
+        );
     }
 
     // ---- StructuredOutputCleanupGuard: pi's `finally { if (!r?.detached) cleanup(...) }` ----
@@ -488,7 +504,10 @@ mod tests {
         {
             let guard = StructuredOutputCleanupGuard::new(runtime);
             assert!(guard.is_armed());
-            assert!(dir.exists(), "the guard must not clean up while it is alive");
+            assert!(
+                dir.exists(),
+                "the guard must not clean up while it is alive"
+            );
         }
 
         assert!(!dir.exists(), "dropping an armed guard removes the dir");
@@ -516,7 +535,10 @@ mod tests {
             assert!(!guard.is_armed());
         }
 
-        assert!(dir.exists(), "a detach receipt must not delete the live child's capture dir");
+        assert!(
+            dir.exists(),
+            "a detach receipt must not delete the live child's capture dir"
+        );
         // The whole point: the child can still write its captured value afterwards.
         std::fs::write(&output_path, br#"{"summary":"late","count":1}"#)
             .expect("the still-live child must be able to write its capture file");
@@ -525,6 +547,9 @@ mod tests {
             schema_path: dir.join("schema.json"),
             output_path,
         });
-        assert!(!dir.exists(), "the detached-exit path still cleans up eventually");
+        assert!(
+            !dir.exists(),
+            "the detached-exit path still cleans up eventually"
+        );
     }
 }

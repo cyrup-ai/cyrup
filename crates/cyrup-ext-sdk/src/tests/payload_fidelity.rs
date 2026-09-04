@@ -2,7 +2,12 @@
 //! serialize to the EXACT Pi `extensions/types.ts` shape — field names, optionality, and the set of
 //! keys. Pi (`packages/coding-agent/src/core/extensions/types.ts`) is ground truth; each test cites
 //! the interface and `serde_json::to_value`-compares the struct against the literal Pi object.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::events::*;
 use serde_json::json;
@@ -109,7 +114,9 @@ fn user_bash_is_command_exclude_cwd() {
 /// `{role}`. Full shape: `{message}` (the full AgentMessage).
 #[test]
 fn message_start_carries_full_message() {
-    let ev = MessageStartEvent { message: json!({ "role": "assistant", "content": [] }) };
+    let ev = MessageStartEvent {
+        message: json!({ "role": "assistant", "content": [] }),
+    };
     assert_eq!(
         serde_json::to_value(&ev).unwrap(),
         json!({ "message": { "role": "assistant", "content": [] } })

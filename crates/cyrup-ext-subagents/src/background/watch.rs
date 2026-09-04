@@ -248,8 +248,13 @@ impl ResultsWatcher {
     /// are established once by extension initialization).
     pub fn install(
         &self,
-    ) -> Result<(notify::PollWatcher, tokio::sync::mpsc::UnboundedReceiver<()>), SubagentError>
-    {
+    ) -> Result<
+        (
+            notify::PollWatcher,
+            tokio::sync::mpsc::UnboundedReceiver<()>,
+        ),
+        SubagentError,
+    > {
         use notify::Watcher;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -469,7 +474,13 @@ impl ResultsWatcher {
             .get(&key)
             .map_or(0, |entry| entry.attempts)
             .saturating_add(1);
-        retry_attempts.insert(key, RetryEntry { attempts, inserted_at: Instant::now() });
+        retry_attempts.insert(
+            key,
+            RetryEntry {
+                attempts,
+                inserted_at: Instant::now(),
+            },
+        );
         // R-SA-102's bound itself is enforced on the READ side, by `check_and_mark_seen` comparing
         // this stored `attempts` count against `MAX_PROCESSING_ATTEMPTS` the next time this key is
         // scanned — this method's own job is only to record that one more failure happened.
@@ -488,7 +499,12 @@ impl ResultsWatcher {
             .get(key)
             .map_or(0, |entry| entry.attempts);
 
-        seen.insert(key.clone(), SeenEntry { inserted_at: Instant::now() });
+        seen.insert(
+            key.clone(),
+            SeenEntry {
+                inserted_at: Instant::now(),
+            },
+        );
 
         if prior_attempts >= MAX_PROCESSING_ATTEMPTS {
             SeenOutcome::Exhausted
@@ -675,10 +691,21 @@ impl CompletionSink for HostServicesCompletionSink {
         // (no live turn loop / injection unavailable) degrades to "not delivered" → the result file
         // is retried in place next scan, never silently dropped.
         let services = self.services.clone();
-        let CompletionMessage { custom_type, content, display, trigger_turn } = message;
+        let CompletionMessage {
+            custom_type,
+            content,
+            display,
+            trigger_turn,
+        } = message;
         tokio::task::spawn_blocking(move || {
             services
-                .inject_message(&content, Some(custom_type.as_str()), display, None, trigger_turn)
+                .inject_message(
+                    &content,
+                    Some(custom_type.as_str()),
+                    display,
+                    None,
+                    trigger_turn,
+                )
                 .is_ok()
         })
         .await
@@ -697,7 +724,11 @@ fn result_display_summary(result: &ResultFile) -> String {
         .iter()
         .filter_map(|child| {
             let text = child.final_output.clone().or_else(|| child.error.clone())?;
-            if text.trim().is_empty() { None } else { Some(text) }
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text)
+            }
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -718,7 +749,11 @@ pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
         // `Background task <status>: **<agent>**` header.
         ClassifiedOutcome::Stopped => "stopped",
     };
-    let agent = if result.agent.is_empty() { "unknown" } else { result.agent.as_str() };
+    let agent = if result.agent.is_empty() {
+        "unknown"
+    } else {
+        result.agent.as_str()
+    };
 
     let summary = result_display_summary(result);
     let display_summary = if summary.trim().is_empty() {
@@ -939,7 +974,10 @@ pub fn install_completion_watcher_with_observer(
     let watcher = ResultsWatcher::new(results_dir);
     let (poll_watcher, rx) = watcher.install()?;
     let task = tokio::spawn(drive_completion_watcher(watcher, rx, sink, observer));
-    Ok(CompletionWatcherHandle { _poll_watcher: poll_watcher, task })
+    Ok(CompletionWatcherHandle {
+        _poll_watcher: poll_watcher,
+        task,
+    })
 }
 
 /// The background drain loop [`install_completion_watcher`] spawns: prime once (so results already
@@ -1064,7 +1102,9 @@ mod tests {
         let stopped = sample_result("run-stop-3", RunState::Stopped, false);
         let message = format_completion_message(&stopped);
         assert!(
-            message.content.starts_with("Background task stopped: **researcher**"),
+            message
+                .content
+                .starts_with("Background task stopped: **researcher**"),
             "{}",
             message.content
         );
@@ -1114,7 +1154,9 @@ mod tests {
     #[tokio::test]
     async fn scan_finds_a_freshly_written_result_file() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00001", RunState::Complete, true);
         write_atomic_json(&results_dir.join("run00001.json"), &result)
             .await
@@ -1130,7 +1172,9 @@ mod tests {
     #[tokio::test]
     async fn scan_does_not_renotify_an_already_seen_result() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00002", RunState::Complete, true);
         write_atomic_json(&results_dir.join("run00002.json"), &result)
             .await
@@ -1152,10 +1196,14 @@ mod tests {
     #[tokio::test]
     async fn scan_for_session_defers_a_result_that_does_not_belong_to_the_session() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00009", RunState::Complete, true);
         let path = results_dir.join("run00009.json");
-        write_atomic_json(&path, &result).await.expect("write result");
+        write_atomic_json(&path, &result)
+            .await
+            .expect("write result");
 
         let watcher = ResultsWatcher::new(results_dir);
 
@@ -1190,10 +1238,14 @@ mod tests {
     #[tokio::test]
     async fn delete_after_notify_removes_the_file_and_tolerates_a_double_delete() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00003", RunState::Complete, true);
         let path = results_dir.join("run00003.json");
-        write_atomic_json(&path, &result).await.expect("write result");
+        write_atomic_json(&path, &result)
+            .await
+            .expect("write result");
 
         let watcher = ResultsWatcher::new(results_dir);
         let found = watcher.scan().await.expect("scan");
@@ -1213,12 +1265,19 @@ mod tests {
     #[tokio::test]
     async fn malformed_result_file_is_skipped_not_deleted() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let path = results_dir.join("garbage.json");
-        tokio::fs::write(&path, b"not valid json").await.expect("write garbage");
+        tokio::fs::write(&path, b"not valid json")
+            .await
+            .expect("write garbage");
 
         let watcher = ResultsWatcher::new(results_dir);
-        let found = watcher.scan().await.expect("scan does not error on a malformed sibling");
+        let found = watcher
+            .scan()
+            .await
+            .expect("scan does not error on a malformed sibling");
         assert!(found.is_empty());
         assert!(
             path.exists(),
@@ -1229,7 +1288,9 @@ mod tests {
     #[tokio::test]
     async fn non_json_sibling_files_are_ignored() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         tokio::fs::write(results_dir.join("README.md"), b"not a result")
             .await
             .expect("write sibling");
@@ -1256,7 +1317,9 @@ mod tests {
     #[tokio::test]
     async fn record_processing_failure_makes_the_result_reappear_on_the_next_scan() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00010", RunState::Complete, true);
         write_atomic_json(&results_dir.join("run00010.json"), &result)
             .await
@@ -1273,7 +1336,10 @@ mod tests {
         // Simulate the caller failing to process the notification (retry-in-place, R-SA-102).
         watcher.record_processing_failure(&first[0]).await;
 
-        let third = watcher.scan().await.expect("third scan after recorded failure");
+        let third = watcher
+            .scan()
+            .await
+            .expect("third scan after recorded failure");
         assert_eq!(
             third.len(),
             1,
@@ -1285,7 +1351,9 @@ mod tests {
     #[tokio::test]
     async fn processing_failure_bound_eventually_marks_the_result_exhausted() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00011", RunState::Complete, true);
         write_atomic_json(&results_dir.join("run00011.json"), &result)
             .await
@@ -1321,7 +1389,10 @@ mod tests {
         let paused = sample_result("run00004", RunState::Paused, false);
         assert_eq!(classify_outcome(&paused), ClassifiedOutcome::Paused);
         let paused_success_true = sample_result("run00005", RunState::Paused, true);
-        assert_eq!(classify_outcome(&paused_success_true), ClassifiedOutcome::Paused);
+        assert_eq!(
+            classify_outcome(&paused_success_true),
+            ClassifiedOutcome::Paused
+        );
     }
 
     #[test]
@@ -1349,7 +1420,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn install_observes_a_real_filesystem_write() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
 
         let watcher = ResultsWatcher::new(results_dir.clone());
         let (_native_watcher, mut rx) = watcher.install().expect("watcher installs");
@@ -1383,7 +1456,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watcher_fires_exactly_once_under_duplicate_filesystem_events() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
 
         let watcher = ResultsWatcher::new(results_dir.clone());
         let (_native_watcher, mut rx) = watcher.install().expect("watcher installs");
@@ -1578,7 +1653,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn install_completion_watcher_fires_exactly_one_notify_and_deletes_the_result() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir results_dir");
 
         let sink = CapturingSink::default();
         let delivered = Arc::clone(&sink.delivered);
@@ -1595,7 +1672,9 @@ mod tests {
             vec![child_result("worker", Some("all done"), 0)],
         );
         let result_path = results_dir.join("run-notify-1.json");
-        write_atomic_json(&result_path, &result).await.expect("write result");
+        write_atomic_json(&result_path, &result)
+            .await
+            .expect("write result");
 
         // Wait for the watcher to fire and delete the file (bounded).
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1606,9 +1685,7 @@ mod tests {
                 break;
             }
             if Instant::now() >= deadline {
-                panic!(
-                    "watcher did not fire+delete in time: delivered={count}, file_gone={gone}"
-                );
+                panic!("watcher did not fire+delete in time: delivered={count}, file_gone={gone}");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1622,12 +1699,18 @@ mod tests {
             "a completing background run must fire exactly one notify, got: {messages:?}"
         );
         assert_eq!(messages[0].custom_type, "subagent-notify");
-        assert!(messages[0].trigger_turn, "the notify must trigger a turn (R-SA-101)");
+        assert!(
+            messages[0].trigger_turn,
+            "the notify must trigger a turn (R-SA-101)"
+        );
         assert_eq!(
             messages[0].content,
             "Background task completed: **worker**\n\nall done"
         );
-        assert!(!result_path.exists(), "the result file must be deleted after notify");
+        assert!(
+            !result_path.exists(),
+            "the result file must be deleted after notify"
+        );
 
         drop(handle);
     }
@@ -1686,10 +1769,11 @@ mod tests {
         #[async_trait::async_trait]
         impl CompletionObserver for Recorder {
             async fn observe(&self, notification: &CompletionNotification) {
-                self.log
-                    .lock()
-                    .await
-                    .push(format!("{}:{}", self.tag, notification.result.run_id.as_str()));
+                self.log.lock().await.push(format!(
+                    "{}:{}",
+                    self.tag,
+                    notification.result.run_id.as_str()
+                ));
             }
         }
 
@@ -1697,9 +1781,15 @@ mod tests {
         let bus = CompletionBus::new();
         let mut rx = bus.subscribe();
         let composite = CompositeCompletionObserver::new(vec![
-            Arc::new(Recorder { tag: "first", log: Arc::clone(&log) }),
+            Arc::new(Recorder {
+                tag: "first",
+                log: Arc::clone(&log),
+            }),
             Arc::new(bus),
-            Arc::new(Recorder { tag: "last", log: Arc::clone(&log) }),
+            Arc::new(Recorder {
+                tag: "last",
+                log: Arc::clone(&log),
+            }),
         ]);
 
         composite
@@ -1712,11 +1802,17 @@ mod tests {
 
         assert_eq!(
             log.lock().await.clone(),
-            vec!["first:run-fanout".to_string(), "last:run-fanout".to_string()],
+            vec![
+                "first:run-fanout".to_string(),
+                "last:run-fanout".to_string()
+            ],
             "both recorders must run, in registration order"
         );
         assert_eq!(
-            rx.try_recv().expect("the bus member published too").run_id.as_str(),
+            rx.try_recv()
+                .expect("the bus member published too")
+                .run_id
+                .as_str(),
             "run-fanout",
             "the bus sitting BETWEEN two other members must not be skipped"
         );

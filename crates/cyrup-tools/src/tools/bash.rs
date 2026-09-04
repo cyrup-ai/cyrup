@@ -14,8 +14,8 @@ use crate::ops::{ExecSpec, ExitStatus, ProcOps, ShellConfig, shell_env};
 use crate::output::OutputAccumulator;
 use crate::truncate::{TruncOpts, TruncatedBy, Truncation, format_size, truncate_tail};
 use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
+    CancelToken, Content, TerminateHint, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate,
+    ToolUpdateSink,
 };
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -110,7 +110,9 @@ impl std::fmt::Debug for ValidatorCache {
             .lock()
             .map(|entries| entries.len())
             .unwrap_or_default();
-        f.debug_struct("ValidatorCache").field("entries", &len).finish()
+        f.debug_struct("ValidatorCache")
+            .field("entries", &len)
+            .finish()
     }
 }
 
@@ -144,7 +146,9 @@ mod tests {
         let schema = json!({"$schema": "https://example.invalid/schema", "type": "object"});
         let error = compile(&schema).expect_err("an unknown dialect is refused");
         assert!(
-            error.to_string().contains(&unsupported_dialect_message("https://example.invalid/schema")),
+            error.to_string().contains(&unsupported_dialect_message(
+                "https://example.invalid/schema"
+            )),
             "got {error}"
         );
     }
@@ -153,7 +157,10 @@ mod tests {
     #[test]
     fn only_one_trailing_hash_is_stripped() {
         let schema = json!({"$schema": "http://json-schema.org/draft-07/schema##"});
-        assert!(compile(&schema).is_err(), "a double hash stays unrecognised");
+        assert!(
+            compile(&schema).is_err(),
+            "a double hash stays unrecognised"
+        );
     }
 
     /// A non-string `$schema` is `unstamped` to [`dialect`] — `typeof schema.$schema !== "string"`
@@ -169,7 +176,9 @@ mod tests {
         assert_eq!(dialect(&schema), None, "a non-string stamp is unstamped");
         let error = compile(&schema).expect_err("the validator enforces the spec");
         assert!(
-            !error.to_string().contains("Unsupported JSON Schema dialect"),
+            !error
+                .to_string()
+                .contains("Unsupported JSON Schema dialect"),
             "this must be the compiler's refusal, not the dialect arm's; got {error}"
         );
     }
@@ -187,9 +196,16 @@ mod tests {
     #[test]
     fn the_cache_returns_the_same_compilation_for_an_equal_schema() {
         let cache = ValidatorCache::default();
-        let first = cache.get_or_compile(&json!({"type": "object"})).expect("compiles");
+        let first = cache
+            .get_or_compile(&json!({"type": "object"}))
+            .expect("compiles");
         // A DIFFERENT `Value` with the same content — the case `collect_valid_field` produces.
-        let second = cache.get_or_compile(&json!({"type": "object"})).expect("cached");
-        assert!(Arc::ptr_eq(&first, &second), "an equal schema must hit the cache");
+        let second = cache
+            .get_or_compile(&json!({"type": "object"}))
+            .expect("cached");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an equal schema must hit the cache"
+        );
     }
 }

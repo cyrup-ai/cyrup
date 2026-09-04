@@ -45,15 +45,19 @@ pub(crate) fn config_object(
 /// a valid identifier -> `Err(is invalid after sanitization)`. Note this is a HARD error at the
 /// management layer, unlike the low-level `create_agent`/`update_agent` silent-skip (which this
 /// handler never reaches, since it pre-validates here).
-pub(crate) fn parse_package_config(value: Option<&serde_json::Value>) -> Result<Option<String>, String> {
+pub(crate) fn parse_package_config(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<String>, String> {
     match value {
         None => Ok(None),
         Some(serde_json::Value::Bool(false)) => Ok(None),
         Some(serde_json::Value::String(s)) if s.is_empty() => Ok(None),
-        Some(serde_json::Value::String(s)) => match super::helpers::normalize_package_identifier(Some(s)) {
-            Some(pkg) => Ok(Some(pkg)),
-            None => Err("config.package is invalid after sanitization.".to_string()),
-        },
+        Some(serde_json::Value::String(s)) => {
+            match super::helpers::normalize_package_identifier(Some(s)) {
+                Some(pkg) => Ok(Some(pkg)),
+                None => Err("config.package is invalid after sanitization.".to_string()),
+            }
+        }
         Some(_) => Err("config.package must be a string or false when provided.".to_string()),
     }
 }
@@ -113,8 +117,12 @@ pub(crate) fn apply_agent_config(
         if v == &Value::Bool(false) || v.as_str() == Some("") {
             fields.aliases = Some(Vec::new());
         } else if let Some(raw) = v.as_str() {
-            fields.aliases =
-                Some(parse_csv(raw).into_iter().filter(|a| a != target_name).collect());
+            fields.aliases = Some(
+                parse_csv(raw)
+                    .into_iter()
+                    .filter(|a| a != target_name)
+                    .collect(),
+            );
         } else if let Some(arr) = v.as_array()
             && arr.iter().all(Value::is_string)
         {
@@ -191,9 +199,15 @@ pub(crate) fn apply_agent_config(
             fields.tools = Some(None);
         } else if let Some(s) = v.as_str() {
             let parsed = parse_tools(s);
-            fields.tools = Some(if parsed.is_empty() { None } else { Some(parsed) });
+            fields.tools = Some(if parsed.is_empty() {
+                None
+            } else {
+                Some(parsed)
+            });
         } else {
-            return Err("config.tools must be a comma-separated string or false when provided.".to_string());
+            return Err(
+                "config.tools must be a comma-separated string or false when provided.".to_string(),
+            );
         }
     }
     if let Some(v) = cfg.get("skills") {
@@ -202,7 +216,10 @@ pub(crate) fn apply_agent_config(
         } else if let Some(s) = v.as_str() {
             fields.skills = Some(parse_csv(s));
         } else {
-            return Err("config.skills must be a comma-separated string or false when provided.".to_string());
+            return Err(
+                "config.skills must be a comma-separated string or false when provided."
+                    .to_string(),
+            );
         }
     }
     if let Some(v) = cfg.get("extensions") {
@@ -247,7 +264,10 @@ pub(crate) fn apply_agent_config(
             Some("append") => fields.system_prompt_mode = Some(SystemPromptMode::Append),
             Some("replace") => fields.system_prompt_mode = Some(SystemPromptMode::Replace),
             _ => {
-                return Err("config.systemPromptMode must be 'append' or 'replace' when provided.".to_string())
+                return Err(
+                    "config.systemPromptMode must be 'append' or 'replace' when provided."
+                        .to_string(),
+                );
             }
         }
     }
@@ -255,7 +275,9 @@ pub(crate) fn apply_agent_config(
         match v.as_bool() {
             Some(b) => fields.inherit_project_context = Some(b),
             None => {
-                return Err("config.inheritProjectContext must be a boolean when provided.".to_string())
+                return Err(
+                    "config.inheritProjectContext must be a boolean when provided.".to_string(),
+                );
             }
         }
     }
@@ -273,7 +295,10 @@ pub(crate) fn apply_agent_config(
         } else if v.as_str() == Some("fork") {
             fields.default_context = Some(Some(ContextMode::Fork));
         } else {
-            return Err("config.defaultContext must be 'fresh', 'fork', or false when provided.".to_string());
+            return Err(
+                "config.defaultContext must be 'fresh', 'fork', or false when provided."
+                    .to_string(),
+            );
         }
     }
     if let Some(v) = cfg.get("output") {
@@ -295,7 +320,9 @@ pub(crate) fn apply_agent_config(
             let reads: Vec<PathBuf> = parse_csv(s).into_iter().map(PathBuf::from).collect();
             fields.default_reads = Some(if reads.is_empty() { None } else { Some(reads) });
         } else {
-            return Err("config.reads must be a comma-separated string or false when provided.".to_string());
+            return Err(
+                "config.reads must be a comma-separated string or false when provided.".to_string(),
+            );
         }
     }
     if let Some(v) = cfg.get("progress") {
@@ -311,23 +338,33 @@ pub(crate) fn apply_agent_config(
             match u32::try_from(n) {
                 Ok(depth) => fields.max_subagent_depth = Some(Some(depth)),
                 Err(_) => {
-                    return Err("config.maxSubagentDepth must be an integer >= 0 or false when provided.".to_string())
+                    return Err(
+                        "config.maxSubagentDepth must be an integer >= 0 or false when provided."
+                            .to_string(),
+                    );
                 }
             }
         } else {
-            return Err("config.maxSubagentDepth must be an integer >= 0 or false when provided.".to_string());
+            return Err(
+                "config.maxSubagentDepth must be an integer >= 0 or false when provided."
+                    .to_string(),
+            );
         }
     }
     if let Some(v) = cfg.get("completionGuard") {
         match v.as_bool() {
             Some(b) => fields.completion_guard = Some(Some(b)),
-            None => return Err("config.completionGuard must be a boolean when provided.".to_string()),
+            None => {
+                return Err("config.completionGuard must be a boolean when provided.".to_string());
+            }
         }
     }
     Ok(())
 }
 
-pub(crate) fn parse_step_list(raw: Option<&serde_json::Value>) -> Result<Vec<ChainStepConfig>, String> {
+pub(crate) fn parse_step_list(
+    raw: Option<&serde_json::Value>,
+) -> Result<Vec<ChainStepConfig>, String> {
     use serde_json::Value;
     let Some(Value::Array(arr)) = raw else {
         return Err("config.steps must be an array.".to_string());
@@ -342,11 +379,20 @@ pub(crate) fn parse_step_list(raw: Option<&serde_json::Value>) -> Result<Vec<Cha
         };
         let agent = match obj.get("agent").and_then(Value::as_str) {
             Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => return Err(format!("config.steps[{i}].agent must be a non-empty string.")),
+            _ => {
+                return Err(format!(
+                    "config.steps[{i}].agent must be a non-empty string."
+                ));
+            }
         };
         let mut step = ChainStepConfig {
             agent: Some(agent),
-            task: Some(obj.get("task").and_then(Value::as_str).unwrap_or("").to_string()),
+            task: Some(
+                obj.get("task")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
             ..ChainStepConfig::default()
         };
         if let Some(v) = obj.get("phase") {
@@ -371,7 +417,9 @@ pub(crate) fn parse_step_list(raw: Option<&serde_json::Value>) -> Result<Vec<Cha
             match v.as_str() {
                 Some(s) => step.output_schema = Some(Value::String(s.to_string())),
                 None => {
-                    return Err(format!("config.steps[{i}].outputSchema must be a schema file path string for saved chains."))
+                    return Err(format!(
+                        "config.steps[{i}].outputSchema must be a schema file path string for saved chains."
+                    ));
                 }
             }
         }
@@ -381,7 +429,9 @@ pub(crate) fn parse_step_list(raw: Option<&serde_json::Value>) -> Result<Vec<Cha
             } else if let Some(s) = v.as_str() {
                 step.output = Some(ChainOutputBinding::Name(s.to_string()));
             } else {
-                return Err(format!("config.steps[{i}].output must be a string or false."));
+                return Err(format!(
+                    "config.steps[{i}].output must be a string or false."
+                ));
             }
         }
         if let Some(v) = obj.get("outputMode") {
@@ -389,7 +439,9 @@ pub(crate) fn parse_step_list(raw: Option<&serde_json::Value>) -> Result<Vec<Cha
                 Some("inline") => step.output_mode = Some("inline".to_string()),
                 Some("file-only") => step.output_mode = Some("file-only".to_string()),
                 _ => {
-                    return Err(format!("config.steps[{i}].outputMode must be 'inline' or 'file-only'."))
+                    return Err(format!(
+                        "config.steps[{i}].outputMode must be 'inline' or 'file-only'."
+                    ));
                 }
             }
         }
@@ -405,7 +457,9 @@ pub(crate) fn parse_step_list(raw: Option<&serde_json::Value>) -> Result<Vec<Cha
                     .collect();
                 step.reads = Some(ChainListBinding::List(list));
             } else {
-                return Err(format!("config.steps[{i}].reads must be an array or false."));
+                return Err(format!(
+                    "config.steps[{i}].reads must be an array or false."
+                ));
             }
         }
         if let Some(v) = obj.get("model") {
@@ -426,7 +480,9 @@ pub(crate) fn parse_step_list(raw: Option<&serde_json::Value>) -> Result<Vec<Cha
                     .collect();
                 step.skills = Some(ChainListBinding::List(list));
             } else {
-                return Err(format!("config.steps[{i}].skills must be an array or false."));
+                return Err(format!(
+                    "config.steps[{i}].skills must be an array or false."
+                ));
             }
         }
         if let Some(v) = obj.get("progress") {

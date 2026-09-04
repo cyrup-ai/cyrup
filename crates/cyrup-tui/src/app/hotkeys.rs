@@ -10,7 +10,11 @@ impl<B: Backend> App<B> {
         };
         let g =
             |a: Action| crate::chrome::format_key_text(&km.keys_label(a).unwrap_or_default(), true);
-        let win_note = if cfg!(windows) { " (Ctrl+Enter on Windows Terminal)" } else { "" };
+        let win_note = if cfg!(windows) {
+            " (Ctrl+Enter on Windows Terminal)"
+        } else {
+            ""
+        };
         let mut out = format!(
             "**Navigation**\n\
              | Key | Action |\n\

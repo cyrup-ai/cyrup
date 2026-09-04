@@ -36,7 +36,10 @@ fn build_params_basic_shape() {
 #[test]
 fn a_reasoning_model_never_carries_temperature() {
     let m = model();
-    assert!(m.reasoning, "fixture must be a reasoning model for this to bite");
+    assert!(
+        m.reasoning,
+        "fixture must be a reasoning model for this to bite"
+    );
     let opts = StreamOptions {
         temperature: Some(0.7),
         ..Default::default()
@@ -237,7 +240,11 @@ fn explicit_prompt_cache_mode_only_on_opt_in_and_none_retention() {
         ..Default::default()
     };
     // Flag absent ⇒ never, regardless of retention (the older-model regression guard).
-    for r in [CacheRetention::None, CacheRetention::Short, CacheRetention::Long] {
+    for r in [
+        CacheRetention::None,
+        CacheRetention::Short,
+        CacheRetention::Long,
+    ] {
         assert!(
             build_params(&m, &ctx, &opts(r), None)
                 .get("prompt_cache_options")

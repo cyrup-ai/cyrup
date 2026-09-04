@@ -78,7 +78,9 @@ pub fn assert_no_live_broker(pid_path: &Path) -> std::io::Result<()> {
     let Ok(pid) = i32::try_from(pid) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
-            format!("Refusing to replace live intercom broker process {pid}: not a valid process id"),
+            format!(
+                "Refusing to replace live intercom broker process {pid}: not a valid process id"
+            ),
         ));
     };
 
@@ -202,12 +204,21 @@ fn parse_pid(text: &str) -> Option<u64> {
         return None;
     }
     let value: u64 = significant.parse().ok()?;
-    if value > MAX_SAFE_INTEGER { None } else { Some(value) }
+    if value > MAX_SAFE_INTEGER {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
     use super::*;
 
     /// Mirrors upstream `v0.9.2 broker/runtime-claim.test.ts:8-20` ("broker startup refuses to
@@ -227,7 +238,10 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
         assert_eq!(
             err.to_string(),
-            format!("Refusing to replace live intercom broker process {}", std::process::id())
+            format!(
+                "Refusing to replace live intercom broker process {}",
+                std::process::id()
+            )
         );
     }
 
@@ -308,7 +322,10 @@ mod tests {
 
         let err = assert_no_live_broker(&pid_path).expect_err("a live broker must not be replaced");
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
-        assert!(err.to_string().contains(&std::process::id().to_string()), "{err}");
+        assert!(
+            err.to_string().contains(&std::process::id().to_string()),
+            "{err}"
+        );
     }
 
     /// The other early-return arms of `runtime-claim.ts:12`, which upstream's own suite does not
@@ -318,7 +335,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_path = dir.path().join("broker.pid");
 
-        for raw in ["0\n", "-1\n", "-0\n", "  \n", "9007199254740992\n", "99999999999999999999\n"] {
+        for raw in [
+            "0\n",
+            "-1\n",
+            "-0\n",
+            "  \n",
+            "9007199254740992\n",
+            "99999999999999999999\n",
+        ] {
             std::fs::write(&pid_path, raw).unwrap();
             assert!(
                 assert_no_live_broker(&pid_path).is_ok(),
@@ -337,7 +361,10 @@ mod tests {
         std::fs::write(&pid_path, format!("{} (crashed?)\n", std::process::id())).unwrap();
 
         let err = assert_no_live_broker(&pid_path).expect_err("parseInt reads the digit prefix");
-        assert!(err.to_string().contains(&std::process::id().to_string()), "{err}");
+        assert!(
+            err.to_string().contains(&std::process::id().to_string()),
+            "{err}"
+        );
     }
 
     #[test]
@@ -347,14 +374,25 @@ mod tests {
         assert_eq!(parse_pid("0123"), Some(123));
         assert_eq!(parse_pid("123abc"), Some(123));
         assert_eq!(parse_pid("2147483647"), Some(2_147_483_647));
-        assert_eq!(parse_pid(&MAX_SAFE_INTEGER.to_string()), Some(MAX_SAFE_INTEGER));
+        assert_eq!(
+            parse_pid(&MAX_SAFE_INTEGER.to_string()),
+            Some(MAX_SAFE_INTEGER)
+        );
 
         assert_eq!(parse_pid(""), None);
         assert_eq!(parse_pid("abc"), None);
-        assert_eq!(parse_pid("abc123"), None, "parseInt only reads a digit PREFIX");
+        assert_eq!(
+            parse_pid("abc123"),
+            None,
+            "parseInt only reads a digit PREFIX"
+        );
         assert_eq!(parse_pid("0"), None);
         assert_eq!(parse_pid("-5"), None);
-        assert_eq!(parse_pid("9007199254740992"), None, "2^53 is not a safe integer");
+        assert_eq!(
+            parse_pid("9007199254740992"),
+            None,
+            "2^53 is not a safe integer"
+        );
         assert_eq!(parse_pid("12345678901234567890"), None);
     }
 }

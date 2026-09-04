@@ -43,18 +43,16 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::child_protocol::MAX_CHILD_STDERR_BYTES;
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult};
 use cyrup_ext_subagents::fork_context::ForkContext;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -88,7 +86,7 @@ fn base_agent_config(model: &str) -> AgentConfig {
         max_subagent_depth: None,
         memory: None,
         tool_budget: None,
-        runner: None, // SUBA-074: the native child, as before
+        runner: None,          // SUBA-074: the native child, as before
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         depth: DepthEnvelope {
@@ -104,7 +102,10 @@ fn base_agent_config(model: &str) -> AgentConfig {
 fn fixture_spawn_command(script_path: &Path) -> SpawnCommand {
     SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     }
 }
 

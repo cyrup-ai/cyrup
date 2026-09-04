@@ -164,9 +164,10 @@ impl McpRuntimeOwner {
         if self.is_active() {
             return Ok(());
         }
-        Err(McpError::Aborted(
-            self.stop_reason().map_or_else(|| DEFAULT_STOP_REASON.to_string(), |r| r.to_string()),
-        ))
+        Err(McpError::Aborted(self.stop_reason().map_or_else(
+            || DEFAULT_STOP_REASON.to_string(),
+            |r| r.to_string(),
+        )))
     }
 
     /// `addCleanup(cb)`.
@@ -267,8 +268,9 @@ impl McpRuntimeOwner {
     /// Publish the reason, *then* cancel. The order is the contract.
     fn publish_reason_and_cancel(&self, reason: Option<&str>) {
         if self.is_active() {
-            self.reason
-                .store(Some(Arc::new(reason.unwrap_or(DEFAULT_STOP_REASON).to_string())));
+            self.reason.store(Some(Arc::new(
+                reason.unwrap_or(DEFAULT_STOP_REASON).to_string(),
+            )));
         }
         self.token.cancel();
     }
@@ -319,7 +321,10 @@ impl OwnedServices {
     /// [`crate::runtime::initialize_mcp`]'s `ui = rawUi ? createOwnedUi(rawUi, owner) : undefined`.
     #[must_use]
     pub fn new(services: Arc<dyn cyrup_ext::HostServices>, owner: Arc<McpRuntimeOwner>) -> Self {
-        Self { inner: services, owner }
+        Self {
+            inner: services,
+            owner,
+        }
     }
 
     /// The owner this handle is fenced behind.
@@ -338,7 +343,9 @@ impl OwnedServices {
 
 impl std::fmt::Debug for OwnedServices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OwnedServices").field("active", &self.owner.is_active()).finish()
+        f.debug_struct("OwnedServices")
+            .field("active", &self.owner.is_active())
+            .finish()
     }
 }
 
@@ -547,7 +554,9 @@ impl OwnedServices {
     /// The text a fenced `Result`-returning method reports. Carries the stop reason so a log line
     /// says *why* the handle is dead rather than merely that it is.
     fn inert_reason(owner: &McpRuntimeOwner) -> String {
-        owner.stop_reason().map_or_else(|| DEFAULT_STOP_REASON.to_string(), |r| r.to_string())
+        owner
+            .stop_reason()
+            .map_or_else(|| DEFAULT_STOP_REASON.to_string(), |r| r.to_string())
     }
 }
 
@@ -612,7 +621,10 @@ impl McpDialog {
     /// A dialog over an arbitrary services backend.
     #[must_use]
     pub fn new(services: Arc<dyn cyrup_ext::HostServices>) -> Self {
-        Self { services, human_wait: None }
+        Self {
+            services,
+            human_wait: None,
+        }
     }
 
     /// A dialog over the generation's **fenced** handle — `state.ui`, i.e. `createOwnedUi`'s
@@ -636,7 +648,10 @@ impl McpDialog {
     /// way to write this that compiles and does nothing.
     async fn enter(
         &self,
-    ) -> (Option<cyrup_ext::HumanInteractionGuard>, Option<cyrup_ext::HumanWaitGuard>) {
+    ) -> (
+        Option<cyrup_ext::HumanInteractionGuard>,
+        Option<cyrup_ext::HumanWaitGuard>,
+    ) {
         // `acquire()` WAITS (it never rejects): an MCP approval queues behind an in-flight
         // permission prompt rather than being dropped. A backend with no lock — the default host,
         // a headless embedding — has no other human to collide with, so `None` is not a failure.
@@ -644,14 +659,18 @@ impl McpDialog {
             Some(lock) => Some(lock.acquire().await),
             None => None,
         };
-        let wait = self.human_wait.as_ref().map(cyrup_ext::HostCtx::begin_human_wait);
+        let wait = self
+            .human_wait
+            .as_ref()
+            .map(cyrup_ext::HostCtx::begin_human_wait);
         (human, wait)
     }
 
     /// `ui.confirm(title, message)` — upstream passes no options bag, so neither does this.
     pub async fn confirm(&self, prompt: &str, message: &str) -> bool {
         let _guards = self.enter().await;
-        self.services.confirm(prompt, message, &cyrup_ext::DialogOptions::default())
+        self.services
+            .confirm(prompt, message, &cyrup_ext::DialogOptions::default())
     }
 
     /// `ui.select(prompt, options)` — the chosen label, or `None` for a dismissal, a timeout, or
@@ -659,9 +678,13 @@ impl McpDialog {
     pub async fn select(&self, prompt: &str, options: &[&str]) -> Option<String> {
         let _guards = self.enter().await;
         let rendered = serde_json::Value::Array(
-            options.iter().map(|option| serde_json::Value::String((*option).to_string())).collect(),
+            options
+                .iter()
+                .map(|option| serde_json::Value::String((*option).to_string()))
+                .collect(),
         );
-        self.services.select(prompt, &rendered, &cyrup_ext::DialogOptions::default())
+        self.services
+            .select(prompt, &rendered, &cyrup_ext::DialogOptions::default())
     }
 
     /// `ui.input(title, placeholder)` — the typed value, or `None` for a dismissal.
@@ -715,8 +738,7 @@ pub const SAMPLING_RESPONSE_APPROVAL_TITLE: &str = "Return MCP sampling response
 /// The sentence names the setting that makes headless sampling legal, which is the only reason it
 /// is a distinct message from [`SAMPLING_REQUEST_DECLINED`]: one is "I cannot ask you", the other
 /// is "I asked and you said no", and a user who cannot tell them apart cannot fix the first.
-pub const SAMPLING_REQUIRES_INTERACTIVE_APPROVAL: &str =
-    "MCP sampling requires interactive approval. Set settings.samplingAutoApprove to true to allow it without UI.";
+pub const SAMPLING_REQUIRES_INTERACTIVE_APPROVAL: &str = "MCP sampling requires interactive approval. Set settings.samplingAutoApprove to true to allow it without UI.";
 
 /// `sampling-handler.ts:192` — thrown when the human answered the dialog with "no".
 pub const SAMPLING_REQUEST_DECLINED: &str = "MCP sampling request was declined";
@@ -823,7 +845,9 @@ pub fn format_request_approval(
     let mut lines: Vec<String> = Vec::with_capacity(messages.len() + 2);
     let count = messages.len();
     let plural = if count == 1 { "" } else { "s" };
-    lines.push(format!("{server_name} wants to sample {count} message{plural} with {model_name}."));
+    lines.push(format!(
+        "{server_name} wants to sample {count} message{plural} with {model_name}."
+    ));
     if let Some(prompt) = system_prompt.filter(|prompt| !prompt.is_empty()) {
         lines.push(format!("System: {}", truncate_at_word(prompt, 400)));
     }
@@ -951,14 +975,18 @@ mod tests {
     fn recording_cleanup(
         log: Arc<Mutex<Vec<&'static str>>>,
         name: &'static str,
-        fail: bool
+        fail: bool,
     ) -> Cleanup {
         Box::new(move || {
             async move {
                 if let Ok(mut l) = log.lock() {
                     l.push(name);
                 }
-                if fail { Err(McpError::other(name)) } else { Ok(()) }
+                if fail {
+                    Err(McpError::other(name))
+                } else {
+                    Ok(())
+                }
             }
             .boxed()
         })
@@ -972,9 +1000,19 @@ mod tests {
         owner.add_cleanup(recording_cleanup(log.clone(), "two", true));
         owner.add_cleanup(recording_cleanup(log.clone(), "three", false));
 
-        let err = owner.stop(None).await.expect_err("the middle cleanup failed");
-        assert_eq!(*log.lock().unwrap(), vec!["three", "two", "one"], "strict LIFO");
-        assert!(err.to_string().contains("two"), "the aggregate names the failure: {err}");
+        let err = owner
+            .stop(None)
+            .await
+            .expect_err("the middle cleanup failed");
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["three", "two", "one"],
+            "strict LIFO"
+        );
+        assert!(
+            err.to_string().contains("two"),
+            "the aggregate names the failure: {err}"
+        );
         assert!(err.is_cleanup_failure());
     }
 
@@ -1049,7 +1087,10 @@ mod tests {
     async fn default_stop_reason_is_the_literal_upstream_string() {
         let owner = McpRuntimeOwner::new();
         let _ = owner.stop(None).await;
-        assert_eq!(owner.throw_if_inactive().unwrap_err().to_string(), DEFAULT_STOP_REASON);
+        assert_eq!(
+            owner.throw_if_inactive().unwrap_err().to_string(),
+            DEFAULT_STOP_REASON
+        );
     }
 
     // ==============================================================================================
@@ -1087,7 +1128,10 @@ mod tests {
         }
 
         fn observe(&self) {
-            self.waiting_during_dialog.lock().unwrap().push(self.gate.is_waiting());
+            self.waiting_during_dialog
+                .lock()
+                .unwrap()
+                .push(self.gate.is_waiting());
             let depth = self.depth.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_depth.fetch_max(depth, Ordering::SeqCst);
             std::thread::sleep(self.hold);
@@ -1136,7 +1180,10 @@ mod tests {
         assert!(!gate.is_waiting(), "idle before the first dialog");
         assert!(dialog.confirm("t", "m").await);
         assert!(!gate.is_waiting(), "released as soon as `confirm` returned");
-        assert_eq!(dialog.select("p", &["Allow once"]).await.as_deref(), Some("Allow once"));
+        assert_eq!(
+            dialog.select("p", &["Allow once"]).await.as_deref(),
+            Some("Allow once")
+        );
         assert!(!gate.is_waiting(), "released as soon as `select` returned");
 
         assert_eq!(
@@ -1193,13 +1240,19 @@ mod tests {
 
     impl SamplingUi {
         fn answering(approved: bool) -> Arc<Self> {
-            Arc::new(Self { approved, calls: Mutex::new(Vec::new()) })
+            Arc::new(Self {
+                approved,
+                calls: Mutex::new(Vec::new()),
+            })
         }
     }
 
     impl cyrup_ext::HostServices for SamplingUi {
         fn confirm(&self, prompt: &str, message: &str, _opts: &cyrup_ext::DialogOptions) -> bool {
-            self.calls.lock().unwrap().push((prompt.to_string(), message.to_string()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((prompt.to_string(), message.to_string()));
             self.approved
         }
     }
@@ -1208,8 +1261,7 @@ mod tests {
         SamplingApproval {
             auto_approve,
             has_ui: ui.is_some(),
-            dialog: ui
-                .map(|ui| McpDialog::new(ui as Arc<dyn cyrup_ext::HostServices>)),
+            dialog: ui.map(|ui| McpDialog::new(ui as Arc<dyn cyrup_ext::HostServices>)),
         }
     }
 
@@ -1217,25 +1269,48 @@ mod tests {
     /// tell the two dialogs apart.
     #[test]
     fn the_two_sampling_dialog_titles_are_the_upstream_literals() {
-        assert_eq!(SAMPLING_REQUEST_APPROVAL_TITLE, "Approve MCP sampling request");
-        assert_eq!(SAMPLING_RESPONSE_APPROVAL_TITLE, "Return MCP sampling response");
+        assert_eq!(
+            SAMPLING_REQUEST_APPROVAL_TITLE,
+            "Approve MCP sampling request"
+        );
+        assert_eq!(
+            SAMPLING_RESPONSE_APPROVAL_TITLE,
+            "Return MCP sampling response"
+        );
     }
 
     /// Branch 1 — `if (options.autoApprove) return;`, evaluated **before** the UI is looked at, so
     /// a headless auto-approving session samples without a dialog and without the no-UI error.
     #[tokio::test]
     async fn auto_approve_short_circuits_before_the_ui_is_consulted() {
-        let headless = SamplingApproval { auto_approve: true, has_ui: false, dialog: None };
-        assert!(confirm_sampling(&headless, SAMPLING_REQUEST_APPROVAL_TITLE, "body").await.is_ok());
+        let headless = SamplingApproval {
+            auto_approve: true,
+            has_ui: false,
+            dialog: None,
+        };
+        assert!(
+            confirm_sampling(&headless, SAMPLING_REQUEST_APPROVAL_TITLE, "body")
+                .await
+                .is_ok()
+        );
 
         let ui = SamplingUi::answering(false);
         let would_decline = SamplingApproval {
             auto_approve: true,
             has_ui: true,
-            dialog: Some(McpDialog::new(Arc::clone(&ui) as Arc<dyn cyrup_ext::HostServices>)),
+            dialog: Some(McpDialog::new(
+                Arc::clone(&ui) as Arc<dyn cyrup_ext::HostServices>
+            )),
         };
-        assert!(confirm_sampling(&would_decline, SAMPLING_RESPONSE_APPROVAL_TITLE, "b").await.is_ok());
-        assert!(ui.calls.lock().unwrap().is_empty(), "no dialog is opened at all");
+        assert!(
+            confirm_sampling(&would_decline, SAMPLING_RESPONSE_APPROVAL_TITLE, "b")
+                .await
+                .is_ok()
+        );
+        assert!(
+            ui.calls.lock().unwrap().is_empty(),
+            "no dialog is opened at all"
+        );
     }
 
     /// Branches 2 and 3 — the two messages, byte for byte, and the fact that they are **different
@@ -1267,11 +1342,16 @@ mod tests {
         let ui = SamplingUi::answering(true);
         let approval = approval_with(Some(Arc::clone(&ui)), false);
         assert!(
-            confirm_sampling(&approval, SAMPLING_REQUEST_APPROVAL_TITLE, "the body").await.is_ok()
+            confirm_sampling(&approval, SAMPLING_REQUEST_APPROVAL_TITLE, "the body")
+                .await
+                .is_ok()
         );
         assert_eq!(
             *ui.calls.lock().unwrap(),
-            vec![("Approve MCP sampling request".to_string(), "the body".to_string())]
+            vec![(
+                "Approve MCP sampling request".to_string(),
+                "the body".to_string()
+            )]
         );
     }
 
@@ -1279,7 +1359,11 @@ mod tests {
     /// case, because a gate with nothing to ask through has no UI whatever a flag says.
     #[tokio::test]
     async fn a_ui_flag_without_a_dialog_handle_fails_closed() {
-        let broken = SamplingApproval { auto_approve: false, has_ui: true, dialog: None };
+        let broken = SamplingApproval {
+            auto_approve: false,
+            has_ui: true,
+            dialog: None,
+        };
         assert_eq!(
             confirm_sampling(&broken, SAMPLING_REQUEST_APPROVAL_TITLE, "body")
                 .await
@@ -1293,7 +1377,10 @@ mod tests {
 
     fn user_text(text: &str) -> Message {
         Message::User {
-            content: vec![Content::Text { text: text.into(), text_signature: None }],
+            content: vec![Content::Text {
+                text: text.into(),
+                text_signature: None,
+            }],
             timestamp: 0,
         }
     }
@@ -1319,10 +1406,13 @@ mod tests {
             "docs",
             "anthropic/claude-opus-4",
             Some("be terse"),
-            &[user_text("hello"), assistant_blocks(vec![Content::Text {
-                text: "hi".into(),
-                text_signature: None,
-            }])],
+            &[
+                user_text("hello"),
+                assistant_blocks(vec![Content::Text {
+                    text: "hi".into(),
+                    text_signature: None,
+                }]),
+            ],
         );
         assert_eq!(
             body,
@@ -1370,8 +1460,14 @@ mod tests {
     #[test]
     fn message_text_renders_every_reachable_block_spelling() {
         let message = assistant_blocks(vec![
-            Content::Text { text: "plain".into(), text_signature: None },
-            Content::Image { data: "AAAA".to_string(), mime_type: "image/png".to_string() },
+            Content::Text {
+                text: "plain".into(),
+                text_signature: None,
+            },
+            Content::Image {
+                data: "AAAA".to_string(),
+                mime_type: "image/png".to_string(),
+            },
             Content::Thinking {
                 thinking: "hidden".into(),
                 thinking_signature: None,
@@ -1400,7 +1496,10 @@ mod tests {
         let tool_result = Message::ToolResult {
             tool_call_id: cyrup_core::ToolCallId::from("call-1"),
             tool_name: "search".to_string(),
-            content: vec![Content::Text { text: "rows".into(), text_signature: None }],
+            content: vec![Content::Text {
+                text: "rows".into(),
+                text_signature: None,
+            }],
             is_error: false,
             details: None,
             usage: None,
@@ -1447,5 +1546,4 @@ mod tests {
         assert!(rendered.ends_with("..."));
         assert!(rendered.contains("will receive this response from m:\n\n"));
     }
-
 }

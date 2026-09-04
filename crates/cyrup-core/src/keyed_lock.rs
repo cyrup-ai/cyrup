@@ -17,7 +17,7 @@
 
 use crate::CancelToken;
 use dashmap::DashMap;
-use std::future::{poll_fn, Future};
+use std::future::{Future, poll_fn};
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -419,8 +419,14 @@ mod tests {
         // …waited on in the OPPOSITE order.
         let mut wait_second = pin!(second.wait(&cancel));
         let mut wait_first = pin!(first.wait(&cancel));
-        assert!(poll_once(wait_second.as_mut()).is_pending(), "the lock is held");
-        assert!(poll_once(wait_first.as_mut()).is_pending(), "the lock is held");
+        assert!(
+            poll_once(wait_second.as_mut()).is_pending(),
+            "the lock is held"
+        );
+        assert!(
+            poll_once(wait_first.as_mut()).is_pending(),
+            "the lock is held"
+        );
 
         drop(held);
         assert!(
@@ -449,7 +455,10 @@ mod tests {
         assert!(map.contains_key(&"k"));
 
         drop(held);
-        assert!(map.contains_key(&"k"), "a live waiter must keep its entry alive");
+        assert!(
+            map.contains_key(&"k"),
+            "a live waiter must keep its entry alive"
+        );
         drop(queued);
         assert!(
             !map.contains_key(&"k"),

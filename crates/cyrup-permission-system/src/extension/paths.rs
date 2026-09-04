@@ -48,7 +48,9 @@ impl PermissionSystemExtension {
     /// [`Self::refresh_config_and_manager`] (a `session_start` / `resources_discover` reload rebuilds
     /// this from the CURRENT cwd, not just the process's original one).
     pub(super) fn manager_paths_for(agent_dir: &Path, cwd: &Path) -> ManagerPaths {
-        let project_dir = PROJECT_AGENT_SUBDIR.iter().fold(cwd.to_path_buf(), |acc, seg| acc.join(seg));
+        let project_dir = PROJECT_AGENT_SUBDIR
+            .iter()
+            .fold(cwd.to_path_buf(), |acc, seg| acc.join(seg));
         // PERM-025 / pi `defaultGlobalConfigPath` / `defaultAgentsDir` /
         // `defaultLegacyGlobalSettingsPath` / `defaultGlobalMcpConfigPath`
         // (v0.8.0 `permission-manager.ts:35-38`): all four GLOBAL artifacts hang off
@@ -102,6 +104,8 @@ impl PermissionSystemExtension {
     /// enables it. Overridable per write via `CYRUP_PERMISSION_SYSTEM_LOGS_DIR`
     /// ([`crate::logging::resolve_logs_dir`]).
     pub(super) fn logs_dir_for(agent_dir: &Path) -> PathBuf {
-        agent_dir.join(CONFIG_DIR).join(crate::logging::LOGS_DIR_NAME)
+        agent_dir
+            .join(CONFIG_DIR)
+            .join(crate::logging::LOGS_DIR_NAME)
     }
 }

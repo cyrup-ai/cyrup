@@ -112,10 +112,7 @@ impl App<InlineBackend<Stdout>> {
         // `select!` arm below expresses as a `pending()` future rather than a spinning interval.
         let overlay_tick: Option<tokio::time::Interval> = None;
         Self::install_error_listener(&session.services().ext_host, ext_error_tx.clone());
-        Self::install_commands_listener(
-            &session.services().ext_host,
-            commands_changed_tx.clone(),
-        );
+        Self::install_commands_listener(&session.services().ext_host, commands_changed_tx.clone());
         self.seed_session_ui(&session, runtime.as_ref()).await;
         self.draw_synchronized()?;
         // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** something
@@ -159,7 +156,8 @@ impl App<InlineBackend<Stdout>> {
         // A fired extension shortcut is spawned onto its own tokio task (see the
         // `AppAction::ExtensionShortcut` arm below for why); this channel carries its status/error
         // line back to the transcript once it settles, mirroring the `bash_rx` pattern above.
-        let (shortcut_status_tx, mut shortcut_status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (shortcut_status_tx, mut shortcut_status_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
         let (_tmux_warning_tx, mut tmux_warning_rx) = Self::spawn_tmux_keyboard_check();
         // A `/tree` navigation runs on its OWN task (see `App::begin_tree_navigation`) and posts its
         // outcome back here, so a branch summarization's provider round-trip never blocks this loop

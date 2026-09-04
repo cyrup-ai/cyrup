@@ -20,9 +20,11 @@
 use std::sync::Arc;
 
 use cyrup_ext::native::{InitApi, NativeExtension};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::{RunId, RunPaths};
-use cyrup_ext_subagents::extension::{subagent_extension_for, SubagentExecutor, SubagentsExtension};
+use cyrup_ext_subagents::extension::{
+    SubagentExecutor, SubagentsExtension, subagent_extension_for,
+};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
 /// The sandbox root for one test, handed over as `SubagentExtensionConfig::roots`.
@@ -53,22 +55,30 @@ async fn child_env_gate_controls_what_is_registered() {
 
     // Plain child → no extension → no `subagent` tool registered anywhere (regardless of the
     // opt-in `installed` signal — a plain child is never gated on it).
-    let disabled =
-        subagent_extension_for(sandboxed(home.path()), cwd.clone(), true, false, true);
-    assert!(disabled.is_none(), "a plain subagent child registers no subagent surface at all");
+    let disabled = subagent_extension_for(sandboxed(home.path()), cwd.clone(), true, false, true);
+    assert!(
+        disabled.is_none(),
+        "a plain subagent child registers no subagent surface at all"
+    );
 
     // Fanout-authorized child → an extension whose init installs NO lifecycle subscriptions.
     // `installed = false` proves the child-safe surface attaches REGARDLESS of the opt-in gate.
-    let child_safe =
-        subagent_extension_for(sandboxed(home.path()), cwd.clone(), true, true, false)
-            .expect("a fanout-authorized child registers the restricted tool");
+    let child_safe = subagent_extension_for(sandboxed(home.path()), cwd.clone(), true, true, false)
+        .expect("a fanout-authorized child registers the restricted tool");
     let mut api = InitApi::new();
-    child_safe.init(&mut api).await.expect("child-safe init succeeds");
+    child_safe
+        .init(&mut api)
+        .await
+        .expect("child-safe init succeeds");
     assert!(
-        !api.subscriptions().contains(cyrup_ext::EventKind::SessionStart),
+        !api.subscriptions()
+            .contains(cyrup_ext::EventKind::SessionStart),
         "a child-safe extension installs no SessionStart watcher/housekeeping"
     );
-    assert!(!api.subscriptions().contains(cyrup_ext::EventKind::SessionShutdown));
+    assert!(
+        !api.subscriptions()
+            .contains(cyrup_ext::EventKind::SessionShutdown)
+    );
 
     // Non-child (root orchestrator) that HAS opted in (`installed = true`) → the full lifecycle
     // surface.
@@ -76,8 +86,14 @@ async fn child_env_gate_controls_what_is_registered() {
         .expect("a non-child process registers the full orchestrator extension");
     let mut api = InitApi::new();
     full.init(&mut api).await.expect("full init succeeds");
-    assert!(api.subscriptions().contains(cyrup_ext::EventKind::SessionStart));
-    assert!(api.subscriptions().contains(cyrup_ext::EventKind::SessionShutdown));
+    assert!(
+        api.subscriptions()
+            .contains(cyrup_ext::EventKind::SessionStart)
+    );
+    assert!(
+        api.subscriptions()
+            .contains(cyrup_ext::EventKind::SessionShutdown)
+    );
 }
 
 /// The opt-in flip side (requirement (b)/(c) semantics via the pure form): once opted in
@@ -99,7 +115,8 @@ async fn top_level_with_optin_attaches_full() {
     let mut api = InitApi::new();
     ext.init(&mut api).await.expect("full init succeeds");
     assert!(
-        api.subscriptions().contains(cyrup_ext::EventKind::SessionStart),
+        api.subscriptions()
+            .contains(cyrup_ext::EventKind::SessionStart),
         "the full orchestrator surface installs the SessionStart housekeeping"
     );
 }
@@ -117,8 +134,14 @@ async fn init_registers_the_tool_and_all_thirteen_commands() {
     // InitApi has no public inspector beyond subscriptions in this phase's surface; the real
     // proof that registration actually reaches the host is `main.rs`'s wiring plus the
     // end-to-end smoke test, which drives `init` through a real `SessionBuilder`.
-    assert!(api.subscriptions().contains(cyrup_ext::EventKind::SessionStart));
-    assert!(api.subscriptions().contains(cyrup_ext::EventKind::SessionShutdown));
+    assert!(
+        api.subscriptions()
+            .contains(cyrup_ext::EventKind::SessionStart)
+    );
+    assert!(
+        api.subscriptions()
+            .contains(cyrup_ext::EventKind::SessionShutdown)
+    );
 }
 
 /// A minimal [`cyrup_ext::host::HostServices`] double reporting a fixed session id/name.
@@ -161,7 +184,10 @@ async fn teardown_session_stops_the_tracker_and_clears_the_parent_session_anchor
         name: "root-session",
     }));
     executor.capture_parent_session_anchor();
-    assert_eq!(executor.root_parent_session().as_deref(), Some("sess-abc123"));
+    assert_eq!(
+        executor.root_parent_session().as_deref(),
+        Some("sess-abc123")
+    );
 
     // Track a job, as `resume_tracking`/`spawn_background` do — this starts the shared poll
     // loop (R-SA-093).
@@ -171,7 +197,10 @@ async fn teardown_session_stops_the_tracker_and_clears_the_parent_session_anchor
     let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
     executor.tracker().track(run_id.clone(), paths, None).await;
     assert_eq!(executor.tracker().tracked_count(), 1);
-    assert!(executor.tracker().is_polling().await, "tracking a job must start the poll loop");
+    assert!(
+        executor.tracker().is_polling().await,
+        "tracking a job must start the poll loop"
+    );
 
     // Install a completion watcher over a real (creatable) results dir, as `on_event
     // (SessionStart)` does.

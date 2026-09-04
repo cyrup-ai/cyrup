@@ -57,14 +57,25 @@ pub async fn dispatch() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
     use super::*;
 
     #[test]
     fn is_selected_matches_the_exact_internal_subcommand_token() {
-        assert!(is_selected(&["cyrup".to_string(), "__intercom-broker".to_string()]));
+        assert!(is_selected(&[
+            "cyrup".to_string(),
+            "__intercom-broker".to_string()
+        ]));
         assert!(!is_selected(&["cyrup".to_string()]));
-        assert!(!is_selected(&["cyrup".to_string(), "__subagent-runner".to_string()]));
+        assert!(!is_selected(&[
+            "cyrup".to_string(),
+            "__subagent-runner".to_string()
+        ]));
         assert!(!is_selected(&["cyrup".to_string(), "--help".to_string()]));
         assert!(!is_selected(&[]));
     }
@@ -117,8 +128,12 @@ mod tests {
                 .lines()
                 .position(|l| l.contains("[CYRUP-DELTA]") && l.contains("SEAM-109"))
                 .unwrap_or_else(|| panic!("{module} must carry a [CYRUP-DELTA] naming SEAM-109"));
-            let block: String =
-                src.lines().skip(delta).take(24).collect::<Vec<_>>().join("\n");
+            let block: String = src
+                .lines()
+                .skip(delta)
+                .take(24)
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(
                 block.contains(upstream),
                 "{module}'s delta must name the upstream mechanism it replaces ({upstream}): {block}"

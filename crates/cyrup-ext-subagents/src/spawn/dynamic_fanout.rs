@@ -67,7 +67,8 @@ pub fn assert_json_pointer(pointer: &str, label: &str) -> Result<(), String> {
 fn has_invalid_tilde_escape(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     (0..bytes.len()).any(|index| {
-        bytes.get(index) == Some(&b'~') && !matches!(bytes.get(index + 1), Some(&b'0') | Some(&b'1'))
+        bytes.get(index) == Some(&b'~')
+            && !matches!(bytes.get(index + 1), Some(&b'0') | Some(&b'1'))
     })
 }
 
@@ -148,7 +149,11 @@ fn scalar_to_key(value: &Value, label: &str) -> Result<String, String> {
         Value::String(s) => s.clone(),
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
-        _ => return Err(format!("{label} must resolve to a string, number, or boolean.")),
+        _ => {
+            return Err(format!(
+                "{label} must resolve to a string, number, or boolean."
+            ));
+        }
     };
     if key.trim().is_empty() {
         return Err(format!("{label} resolved to an empty key."));
@@ -360,8 +365,14 @@ fn scan_brace_tokens(chars: &[char]) -> Vec<(String, String)> {
                 j += 1;
             }
             if chars.get(j).copied() == Some('}') {
-                let inner: String = chars.get(i + 1..j).map(|s| s.iter().collect()).unwrap_or_default();
-                let raw: String = chars.get(i..=j).map(|s| s.iter().collect()).unwrap_or_default();
+                let inner: String = chars
+                    .get(i + 1..j)
+                    .map(|s| s.iter().collect())
+                    .unwrap_or_default();
+                let raw: String = chars
+                    .get(i..=j)
+                    .map(|s| s.iter().collect())
+                    .unwrap_or_default();
                 tokens.push((raw, inner));
                 i = j + 1;
                 continue;
@@ -402,7 +413,10 @@ fn is_full_item_ref_token(raw: &str) -> bool {
 fn has_unclosed_item_ref(template: &str, item_name: &str) -> bool {
     let needle = format!("{{{item_name}");
     let mut search_start = 0usize;
-    while let Some(rel) = template.get(search_start..).and_then(|hay| hay.find(&needle)) {
+    while let Some(rel) = template
+        .get(search_start..)
+        .and_then(|hay| hay.find(&needle))
+    {
         let occurrence = search_start + rel;
         let after = occurrence + needle.len();
         let rest = template.get(after..).unwrap_or_default();
@@ -455,7 +469,9 @@ pub fn assert_no_unresolved_item_references(
         match name {
             Some(n) if RESERVED_TEMPLATE_NAMES.contains(&n.as_str()) => {}
             Some(_) => {
-                return Err(format!("Unsupported template reference '{raw}' in {label}."));
+                return Err(format!(
+                    "Unsupported template reference '{raw}' in {label}."
+                ));
             }
             None => {}
         }
@@ -732,7 +748,10 @@ mod tests {
     #[test]
     fn json_pointer_unescapes_tilde_segments() {
         let value = json!({ "a/b": { "c~d": 7 } });
-        assert_eq!(resolve_json_pointer(&value, "/a~1b/c~0d", "p").unwrap(), &json!(7));
+        assert_eq!(
+            resolve_json_pointer(&value, "/a~1b/c~0d", "p").unwrap(),
+            &json!(7)
+        );
     }
 
     // ---- normalize_item_key_for_id ----
@@ -814,8 +833,8 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("Invalid item reference"), "got: {err}");
         // Empty-path `{item.}`.
-        let err = assert_no_unresolved_item_references("Review {target.}", "target", "task")
-            .unwrap_err();
+        let err =
+            assert_no_unresolved_item_references("Review {target.}", "target", "task").unwrap_err();
         assert!(err.contains("Invalid item reference"), "got: {err}");
         // `..` traversal.
         let err = assert_no_unresolved_item_references("Review {target.a..b}", "target", "task")
@@ -825,12 +844,14 @@ mod tests {
 
     #[test]
     fn accepts_valid_item_and_reserved_references() {
-        assert!(assert_no_unresolved_item_references(
-            "Review {target.path} then {previous} and {outputs.x}",
-            "target",
-            "task"
-        )
-        .is_ok());
+        assert!(
+            assert_no_unresolved_item_references(
+                "Review {target.path} then {previous} and {outputs.x}",
+                "target",
+                "task"
+            )
+            .is_ok()
+        );
         assert!(assert_no_unresolved_item_references("{item}", "item", "task").is_ok());
     }
 
@@ -843,7 +864,10 @@ mod tests {
     #[test]
     fn materializes_items_with_index_keys_by_default() {
         let items = resolve_dynamic_fanout_items(&targets(), None, Some(4), 2).unwrap();
-        assert_eq!(items.iter().map(|i| i.key.clone()).collect::<Vec<_>>(), ["0", "1"]);
+        assert_eq!(
+            items.iter().map(|i| i.key.clone()).collect::<Vec<_>>(),
+            ["0", "1"]
+        );
         assert_eq!(items.iter().map(|i| i.index).collect::<Vec<_>>(), [0, 1]);
     }
 
@@ -907,15 +931,17 @@ mod tests {
             final_output: Some("ok".to_string()),
             ..CollectChildResult::default()
         };
-        let collected =
-            collect_dynamic_results(&items, &[Some(ok), Some(timed_out)], "reviewer");
+        let collected = collect_dynamic_results(&items, &[Some(ok), Some(timed_out)], "reviewer");
 
         assert_eq!(
             collected.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
             ["src/a.ts", "src/b.ts"]
         );
         assert_eq!(
-            collected.iter().map(|r| r.structured.clone()).collect::<Vec<_>>(),
+            collected
+                .iter()
+                .map(|r| r.structured.clone())
+                .collect::<Vec<_>>(),
             [Some(json!({ "ok": "a" })), Some(json!({ "ok": "b" }))]
         );
         assert!(collected[1].timed_out);
@@ -924,8 +950,11 @@ mod tests {
 
         // Aggregate schema validation (pi: array minItems ok; object type fails).
         assert!(
-            validate_dynamic_collection(Some(&json!({ "type": "array", "minItems": 2 })), &collected)
-                .is_ok()
+            validate_dynamic_collection(
+                Some(&json!({ "type": "array", "minItems": 2 })),
+                &collected
+            )
+            .is_ok()
         );
         assert!(
             validate_dynamic_collection(Some(&json!({ "type": "object" })), &collected).is_err()

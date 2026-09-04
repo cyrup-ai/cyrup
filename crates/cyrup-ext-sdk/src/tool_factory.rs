@@ -11,7 +11,10 @@ use serde_json::json;
 /// Bundle a descriptor + executor into a [`RegisteredTool`] (Pi `defineTool`, types.ts:509). Pass
 /// the result to [`crate::ExtensionApi::register_tool_def`].
 pub fn define_tool(descriptor: ToolDescriptor, exec: impl ToolExec) -> RegisteredTool {
-    RegisteredTool { descriptor, exec: Box::new(exec) }
+    RegisteredTool {
+        descriptor,
+        exec: Box::new(exec),
+    }
 }
 
 /// A `bash` tool descriptor scoped to `cwd` (Pi `createBashTool(cwd)`, bash.ts:451). The author

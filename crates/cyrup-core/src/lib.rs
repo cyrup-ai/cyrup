@@ -22,27 +22,26 @@ pub mod tool;
 
 pub use cancel::{CancelToken, RunCancel};
 pub use constrained_sampling::{
-    experimental_tool_sampling, experimental_tool_sampling_from, ConstrainedSampling,
-    ConstrainedSamplingConfig, GrammarVariants, StrictSampling,
+    ConstrainedSampling, ConstrainedSamplingConfig, GrammarVariants, StrictSampling,
+    experimental_tool_sampling, experimental_tool_sampling_from,
 };
 pub use diagnostics::{
+    AssistantMessageDiagnostic, DiagnosticCode, DiagnosticErrorInfo,
     append_assistant_message_diagnostic, create_assistant_message_diagnostic,
     create_assistant_message_diagnostic_from, extract_diagnostic_error, format_thrown_value,
-    AssistantMessageDiagnostic, DiagnosticCode, DiagnosticErrorInfo,
 };
 pub use error::CoreError;
-pub use event_stream::{
-    finalizing_channel, Finalizing, FinalizingSink, FinalizingStream,
-};
+pub use event_stream::{Finalizing, FinalizingSink, FinalizingStream, finalizing_channel};
 pub use keyed_lock::{Cancelled, KeyedAcquire, KeyedGuard, KeyedLockMap, KeyedLocks};
 pub use lazy_args::LazyArgs;
 pub use message::{
     AssistantMessage, Content, Cost, DeferredHandle, Message, ModelThinkingLevel, StopReason,
-    TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, Usage, UNRESOLVED_API,
+    TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, UNRESOLVED_API, Usage,
 };
 pub use shared_str::SharedStr;
 pub use tool::{
-    ExecMode, Tool, ToolError, ToolRenderKind, TerminateHint, ToolResult, ToolUpdate, ToolUpdateSink,
+    ExecMode, TerminateHint, Tool, ToolError, ToolRenderKind, ToolResult, ToolUpdate,
+    ToolUpdateSink,
 };
 
 /// The single streaming primitive used across provider, agent, and tools (arch-00 §3.1).
@@ -125,7 +124,11 @@ mod tests {
             api: Some("anthropic-messages".into()),
             model: "x".into(),
         };
-        let b = ModelRef { provider: "anthropic".into(), api: None, model: "x".into() };
+        let b = ModelRef {
+            provider: "anthropic".into(),
+            api: None,
+            model: "x".into(),
+        };
         assert_ne!(a, b);
     }
 }

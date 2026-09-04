@@ -223,8 +223,12 @@ mod tests {
     // `Failed to parse {subject} at '{file_path}' (...)` wrapper.
     #[test]
     fn parse_config_formats_error_like_pi_parse_jsonc_config() {
-        let err = parse_config("{not json", "/tmp/pi-permissions.jsonc", "permission config")
-            .expect_err("malformed JSONC must fail to parse");
+        let err = parse_config(
+            "{not json",
+            "/tmp/pi-permissions.jsonc",
+            "permission config",
+        )
+        .expect_err("malformed JSONC must fail to parse");
         assert!(
             err.starts_with("Failed to parse permission config at '/tmp/pi-permissions.jsonc' ("),
             "unexpected error format: {err}"
@@ -234,12 +238,8 @@ mod tests {
 
     #[test]
     fn parse_ordered_config_formats_error_like_pi_parse_jsonc_config() {
-        let err = parse_ordered_config(
-            "{not json",
-            "/tmp/config.json",
-            "permission-system config",
-        )
-        .expect_err("malformed JSONC must fail to parse");
+        let err = parse_ordered_config("{not json", "/tmp/config.json", "permission-system config")
+            .expect_err("malformed JSONC must fail to parse");
         assert!(
             err.starts_with("Failed to parse permission-system config at '/tmp/config.json' ("),
             "unexpected error format: {err}"

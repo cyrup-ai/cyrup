@@ -64,11 +64,20 @@ async fn init_publishes_the_yolo_control_surface_and_shutdown_retracts_it_body()
     // From here on, the test holds ONLY the module path — no extension handle is used to drive
     // the API, which is exactly the position a second extension is in.
     let api = crate::runtime_api::runtime_api().expect("init must publish the runtime API");
-    assert!(!api.get_yolo_mode(), "pi `getYoloMode` reads the live config");
+    assert!(
+        !api.get_yolo_mode(),
+        "pi `getYoloMode` reads the live config"
+    );
 
     let result = api.toggle_yolo_mode(&YoloModeControlOptions::transient("second-extension"));
-    assert!(result.changed && result.yolo_mode, "the toggle must report the move: {result:?}");
-    assert!(!result.persisted, "`persist: false` is in-memory only (index.ts:1433)");
+    assert!(
+        result.changed && result.yolo_mode,
+        "the toggle must report the move: {result:?}"
+    );
+    assert!(
+        !result.persisted,
+        "`persist: false` is in-memory only (index.ts:1433)"
+    );
     assert!(
         ext.yolo_mode(),
         "the flip must reach the config the GATE reads, not a copy — this is the half of \
@@ -78,7 +87,10 @@ async fn init_publishes_the_yolo_control_surface_and_shutdown_retracts_it_body()
     let ctx = event_ctx(agent_dir.clone());
     let _ = ext
         .on_event(
-            &HostEvent::SessionShutdown { reason: "exit".to_string(), target_session_file: None },
+            &HostEvent::SessionShutdown {
+                reason: "exit".to_string(),
+                target_session_file: None,
+            },
             &ctx,
         )
         .await;
@@ -132,7 +144,11 @@ async fn a_gated_request_is_published_on_the_permission_request_channel_body() {
     );
 
     let events = bus.taken();
-    assert_eq!(events.len(), 1, "exactly one state event per decision: {events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one state event per decision: {events:?}"
+    );
     let (topic, payload) = &events[0];
     assert_eq!(topic, PERMISSION_REQUEST_EVENT_CHANNEL);
     assert_eq!(payload["state"], json!("approved"));

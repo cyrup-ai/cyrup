@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 //! The three JS operators pi uses on header arguments, and the ways they disagree.
 //!
 //! Pi does not apply one coercion to these arguments — it applies a DIFFERENT operator at each
@@ -54,7 +59,15 @@ fn js_truthy_is_ecmascript_to_boolean() {
         assert!(!js_truthy(&falsy), "{falsy} must be falsy");
     }
     // `"0"` is a NON-EMPTY string and therefore truthy — the case a numeric test gets wrong.
-    for truthy in [json!(true), json!(1), json!(-1), json!("0"), json!("x"), json!([]), json!({})] {
+    for truthy in [
+        json!(true),
+        json!(1),
+        json!(-1),
+        json!("0"),
+        json!("x"),
+        json!([]),
+        json!({}),
+    ] {
         assert!(js_truthy(&truthy), "{truthy} must be truthy");
     }
 }
@@ -77,14 +90,26 @@ fn read_line_range_ports_all_four_rules() {
     // Rule 3 — `limit !== undefined`, so a `null` limit still computes: `1 + null - 1` is `0`.
     // Rule 4 then drops the `-<end>` half because `0` is falsy.
     assert_eq!(read_line_range(&json!({"limit": null})).unwrap(), ":1");
-    assert_eq!(read_line_range(&json!({"offset": 1, "limit": 0})).unwrap(), ":1");
+    assert_eq!(
+        read_line_range(&json!({"offset": 1, "limit": 0})).unwrap(),
+        ":1"
+    );
 
     // The ordinary case.
-    assert_eq!(read_line_range(&json!({"offset": 1, "limit": 3})).unwrap(), ":1-3");
-    assert_eq!(read_line_range(&json!({"offset": 10, "limit": 5})).unwrap(), ":10-14");
+    assert_eq!(
+        read_line_range(&json!({"offset": 1, "limit": 3})).unwrap(),
+        ":1-3"
+    );
+    assert_eq!(
+        read_line_range(&json!({"offset": 10, "limit": 5})).unwrap(),
+        ":10-14"
+    );
 
     // JS `+` is string CONCATENATION when either side is a string, and the trailing `- 1` then
     // coerces back to a number: `1 + "5"` is `"15"`, and `"15" - 1` is `14`. Absurd, and exactly
     // what pi renders.
-    assert_eq!(read_line_range(&json!({"offset": 1, "limit": "5"})).unwrap(), ":1-14");
+    assert_eq!(
+        read_line_range(&json!({"offset": 1, "limit": "5"})).unwrap(),
+        ":1-14"
+    );
 }

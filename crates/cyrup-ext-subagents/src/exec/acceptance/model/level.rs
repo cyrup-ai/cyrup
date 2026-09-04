@@ -3,7 +3,11 @@
 
 use crate::exec::completion_guard::{any_word_boundary, word_boundary_contains};
 
-use super::types::{level_rank, AcceptanceConfig, AcceptanceEvidenceKind, AcceptanceInput, AcceptanceLevel, AcceptanceReviewGate, AcceptanceRole, CriterionInput, GateSeverity, ResolvedAcceptanceConfig, ResolvedAcceptanceGate, ReviewSetting};
+use super::types::{
+    AcceptanceConfig, AcceptanceEvidenceKind, AcceptanceInput, AcceptanceLevel,
+    AcceptanceReviewGate, AcceptanceRole, CriterionInput, GateSeverity, ResolvedAcceptanceConfig,
+    ResolvedAcceptanceGate, ReviewSetting, level_rank,
+};
 
 // --------------------------------------------------------------------------------------------
 // requiredEvidenceForLevel (acceptance.ts:55-67) + level inference (acceptance.ts:69-125)
@@ -16,7 +20,13 @@ fn required_evidence_for_level(level: AcceptanceLevel) -> Vec<AcceptanceEvidence
         AcceptanceLevel::None | AcceptanceLevel::Auto => Vec::new(),
         AcceptanceLevel::Attested => vec![ManualNotes, ResidualRisks],
         AcceptanceLevel::Checked => {
-            vec![ChangedFiles, TestsAdded, CommandsRun, ResidualRisks, NoStagedFiles]
+            vec![
+                ChangedFiles,
+                TestsAdded,
+                CommandsRun,
+                ResidualRisks,
+                NoStagedFiles,
+            ]
         }
         AcceptanceLevel::Verified => vec![
             ChangedFiles,
@@ -73,16 +83,16 @@ fn forbids_patch(task_lower: &str) -> bool {
             continue;
         }
         if boundary_before(task_lower, i)
-            && let Some(after_phrase) = ["do not", "don't", "must not"]
-                .iter()
-                .find_map(|phrase| {
-                    task_lower
-                        .get(i..)
-                        .filter(|rest| rest.starts_with(phrase))
-                        .map(|_| i + phrase.len())
-                })
+            && let Some(after_phrase) = ["do not", "don't", "must not"].iter().find_map(|phrase| {
+                task_lower
+                    .get(i..)
+                    .filter(|rest| rest.starts_with(phrase))
+                    .map(|_| i + phrase.len())
+            })
             && let Some(after_ws) = skip_ws1(task_lower, after_phrase)
-            && task_lower.get(after_ws..).is_some_and(|rest| rest.starts_with("patch"))
+            && task_lower
+                .get(after_ws..)
+                .is_some_and(|rest| rest.starts_with("patch"))
             && boundary_after(task_lower, after_ws + "patch".len())
         {
             return true;
@@ -129,7 +139,9 @@ fn role_patch_object_at(rest: &str) -> bool {
         .find(|(_, c)| !is_path_segment_char(*c))
         .map_or(path_body.len(), |(idx, _)| idx);
     if seg1 > 0
-        && let Some(after_slash) = path_body.get(seg1..).and_then(|tail| tail.strip_prefix(['/', '\\']))
+        && let Some(after_slash) = path_body
+            .get(seg1..)
+            .and_then(|tail| tail.strip_prefix(['/', '\\']))
         && after_slash.chars().next().is_some_and(is_path_segment_char)
     {
         return true;
@@ -162,7 +174,8 @@ fn role_patch_object_at(rest: &str) -> bool {
     {
         cursor = after_ws;
     }
-    rest.get(cursor..).is_some_and(|tail| tail.starts_with("parser"))
+    rest.get(cursor..)
+        .is_some_and(|tail| tail.starts_with("parser"))
         && boundary_after(rest, cursor + "parser".len())
 }
 
@@ -230,7 +243,11 @@ fn infer_level(input: &AcceptanceResolveInput) -> InferredLevel {
     // mutation independently of the actual agent name." With no role declared the agent name is
     // passed straight through, as before.
     let intent = crate::exec::task_intent::classify_task_mutation_intent(
-        if role.is_some() { "worker" } else { &input.agent_name },
+        if role.is_some() {
+            "worker"
+        } else {
+            &input.agent_name
+        },
         input.task.as_deref().unwrap_or(""),
     );
     // `const readOnlyTask = intent.kind === "read-only" || (intent.kind === "unknown" &&
@@ -405,8 +422,7 @@ fn infer_level(input: &AcceptanceResolveInput) -> InferredLevel {
             level: AcceptanceLevel::Attested,
             reasons,
             criteria: vec![CriterionInput::Text(
-                "Return concrete findings with file paths and severity when applicable"
-                    .to_string(),
+                "Return concrete findings with file paths and severity when applicable".to_string(),
             )],
             evidence: vec![
                 AcceptanceEvidenceKind::ReviewFindings,
@@ -532,7 +548,11 @@ pub fn resolve_effective_acceptance(input: &AcceptanceResolveInput) -> ResolvedA
         // MAX(explicit, inferred) by rank.
         let er = level_rank(explicit_level).unwrap_or(0);
         let ir = level_rank(inferred.level).unwrap_or(0);
-        if er >= ir { explicit_level } else { inferred.level }
+        if er >= ir {
+            explicit_level
+        } else {
+            inferred.level
+        }
     };
 
     let base_evidence = if level == inferred.level {
@@ -582,7 +602,6 @@ mod tests {
 
     use super::*;
     use crate::exec::acceptance::model::testsupport::resolve;
-
 
     // ---- inferLevel / resolveEffectiveAcceptance ----
 
@@ -712,12 +731,14 @@ mod tests {
             AcceptanceLevel::Checked,
             "`must-patch` is stripped before the probe sees `patch src/auth.ts`"
         );
-        assert_eq!(resolved("Patch src/auth.ts").level, AcceptanceLevel::Checked);
+        assert_eq!(
+            resolved("Patch src/auth.ts").level,
+            AcceptanceLevel::Checked
+        );
         assert_ne!(
             resolved("Do not patch src/auth.ts; explain the flow").level,
             AcceptanceLevel::Checked,
             "the prohibition guard wins"
         );
     }
-
 }

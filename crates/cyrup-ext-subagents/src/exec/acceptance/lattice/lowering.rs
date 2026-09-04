@@ -119,9 +119,9 @@ pub fn lower_acceptance_input(
                 .is_some_and(|reason| !reason.trim().is_empty());
             let policy = lower_acceptance_policy(config);
             match level.and_then(level_to_status) {
-                Some(status) if can_disable => {
-                    Ok(Some(policy.apply(AcceptanceContract::explicit(status, verify))))
-                }
+                Some(status) if can_disable => Ok(Some(
+                    policy.apply(AcceptanceContract::explicit(status, verify)),
+                )),
                 Some(status) => Ok(Some(
                     policy.apply(AcceptanceContract::explicit_floor(status, verify)),
                 )),
@@ -141,12 +141,9 @@ pub fn lower_acceptance_input(
                 // floor is discarded by [`AcceptanceContract::resolve_effective`]'s max in favour of
                 // the inferred level, and the policy rides along. Returning `None` here (as this arm
                 // did before SUBA-C13) threw the whole policy away.
-                None if policy.is_declared() => Ok(Some(
-                    policy.apply(AcceptanceContract::explicit_floor(
-                        AcceptanceStatus::NotRequired,
-                        Vec::new(),
-                    )),
-                )),
+                None if policy.is_declared() => Ok(Some(policy.apply(
+                    AcceptanceContract::explicit_floor(AcceptanceStatus::NotRequired, Vec::new()),
+                ))),
                 None => Ok(None),
             }
         }
@@ -188,13 +185,13 @@ fn lower_verify_command(item: &serde_json::Value, index: usize) -> Option<Verify
                 entries
                     .iter()
                     .filter_map(|(key, value)| {
-                        value
-                            .as_str()
-                            .map(|value| (key.clone(), value.to_string()))
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
                     })
                     .collect()
             }),
-        allow_failure: item.get("allowFailure").and_then(serde_json::Value::as_bool),
+        allow_failure: item
+            .get("allowFailure")
+            .and_then(serde_json::Value::as_bool),
     })
 }
 
@@ -262,19 +259,23 @@ fn lower_acceptance_policy(
 
     // `review: AcceptanceReviewGate | false` (shared/types.ts:679).
     let review = match config.get("review") {
-        Some(serde_json::Value::Bool(flag)) => Some(crate::exec::acceptance::model::ReviewSetting::Disabled(*flag)),
+        Some(serde_json::Value::Bool(flag)) => Some(
+            crate::exec::acceptance::model::ReviewSetting::Disabled(*flag),
+        ),
         Some(serde_json::Value::Object(gate)) => {
-            Some(crate::exec::acceptance::model::ReviewSetting::Gate(crate::exec::acceptance::model::AcceptanceReviewGate {
-                agent: gate
-                    .get("agent")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-                focus: gate
-                    .get("focus")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-                required: gate.get("required").and_then(serde_json::Value::as_bool),
-            }))
+            Some(crate::exec::acceptance::model::ReviewSetting::Gate(
+                crate::exec::acceptance::model::AcceptanceReviewGate {
+                    agent: gate
+                        .get("agent")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    focus: gate
+                        .get("focus")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    required: gate.get("required").and_then(serde_json::Value::as_bool),
+                },
+            ))
         }
         _ => None,
     };
@@ -302,7 +303,9 @@ fn lower_acceptance_policy(
 
 /// Lower one authored `acceptance.criteria[i]` — a bare `must` string, or a full `AcceptanceGate`
 /// object (shared/types.ts:652-657). Anything else yields `None` (unreachable past validation).
-fn lower_criterion(item: &serde_json::Value) -> Option<crate::exec::acceptance::model::CriterionInput> {
+fn lower_criterion(
+    item: &serde_json::Value,
+) -> Option<crate::exec::acceptance::model::CriterionInput> {
     match item {
         serde_json::Value::String(must) => Some(crate::exec::acceptance::model::CriterionInput::Text(must.clone())),
         serde_json::Value::Object(gate) => {
@@ -341,7 +344,6 @@ mod tests {
 
     use super::*;
 
-
     /// `explicitAcceptanceCanDisable` (`acceptance.ts:167-169`) requires a non-blank `reason`, and
     /// a bare `"none"` string carries none. v0.34.0 accepted the string and fell through to
     /// `LEVEL_RANK["none"] >= LEVEL_RANK[inferred]`, leaving the gate armed at the inferred level;
@@ -373,7 +375,6 @@ mod tests {
         assert!(!effective.is_no_op(), "the gate must still be evaluated");
     }
 
-
     /// Both forms upstream DOES accept as an "off" switch: the `false` shorthand (whose reason
     /// `normalizeAcceptanceInput` supplies itself) and an object `{ level: "none", reason }` with
     /// a non-blank reason.
@@ -398,7 +399,6 @@ mod tests {
             assert!(effective.is_no_op(), "policy {policy}");
         }
     }
-
 
     // ---------------------------------------------------------------------------------------
     // SUBA-C12b regression: the per-command `verify[]` fields upstream's ACCEPTANCE_VERIFY_KEYS
@@ -431,14 +431,22 @@ mod tests {
         let declared = &contract.verify[0];
         assert_eq!(declared.id, "lint");
         assert_eq!(declared.command, "npm run lint");
-        assert_eq!(declared.timeout_ms, Some(5000), "timeoutMs must survive lowering");
+        assert_eq!(
+            declared.timeout_ms,
+            Some(5000),
+            "timeoutMs must survive lowering"
+        );
         assert_eq!(
             declared.cwd.as_deref(),
             Some("packages/api"),
             "cwd must survive lowering"
         );
         assert_eq!(
-            declared.env.as_ref().and_then(|env| env.get("CI")).map(String::as_str),
+            declared
+                .env
+                .as_ref()
+                .and_then(|env| env.get("CI"))
+                .map(String::as_str),
             Some("1"),
             "env must survive lowering"
         );
@@ -448,7 +456,6 @@ mod tests {
             "allowFailure must survive lowering"
         );
     }
-
 
     // ---------------------------------------------------------------------------------------
     // G78 — `reviewed` is not a requestable level, on the LIVE wire-lowering path every
@@ -461,7 +468,10 @@ mod tests {
             .expect_err("a bare `reviewed` level is rejected at v0.43.0");
         assert_eq!(
             bare,
-            format!("acceptance {}", crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE)
+            format!(
+                "acceptance {}",
+                crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE
+            )
         );
         // The message must point the caller at the replacement mechanism, not merely refuse.
         assert!(bare.contains("acceptance.review.required"));
@@ -470,10 +480,12 @@ mod tests {
             .expect_err("an object-form `reviewed` level is rejected at v0.43.0");
         assert_eq!(
             object,
-            format!("acceptance.level {}", crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE)
+            format!(
+                "acceptance.level {}",
+                crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE
+            )
         );
     }
-
 
     /// The advertise-vs-dispatch invariant: upstream v0.43.0 deliberately KEEPS `"reviewed"` in the
     /// advertised `AcceptanceOverride` enum (`schemas.ts:83-88`, marked `deprecated`) precisely so
@@ -488,7 +500,6 @@ mod tests {
         );
         assert!(lower_acceptance_input(&serde_json::json!("reviewed")).is_err());
     }
-
 
     /// The advertise-vs-dispatch invariant, driven over the SCHEMA rather than a hand-written list:
     /// every string value `sj_acceptance_override` offers the model must be one `lower_acceptance_input`
@@ -561,7 +572,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn bare_none_and_verified_level_strings_are_rejected() {
         // `AcceptanceInput = Exclude<AcceptanceLevel, "none" | "verified"> | …` (`shared/types.ts:684-685`).
@@ -582,7 +592,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn object_form_verified_without_runtime_commands_is_rejected() {
@@ -610,5 +619,4 @@ mod tests {
         .expect_err("a verify[] entry with no id is still rejected");
         assert!(bad_item.contains("verify[0].id is required."), "{bad_item}");
     }
-
 }

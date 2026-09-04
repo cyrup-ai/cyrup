@@ -1,40 +1,39 @@
 //! Conformance tests for arch-05 / A-05-1..10 (compaction & branch-summary generation).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use cyrup_core::{
-    AssistantMessage, CancelToken, Content, EntryId, Message, ModelThinkingLevel, StopReason,
-    ToolCall, ToolCallId, Usage,
-};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, FauxProvider, FauxResponseStep,
-};
-use cyrup_provider::{CacheRetention, Model, RetryPolicy, StreamOptions};
-use crate::compaction::cutpoint::{find_cut_point, CutPoint};
+use crate::agent_message::{AgentMessage, BashExecutionMessage};
+use crate::compaction::cutpoint::{CutPoint, find_cut_point};
 use crate::compaction::hooks::{
     BeforeCompactDecision, BeforeCompactEvent, BeforeTreeDecision, BeforeTreeEvent,
     BeforeTreeOverrides, BranchSummaryEntry, CompactionHooks, CompactionOverride, CompactionReason,
     PostCompactEvent, PostTreeEvent,
 };
-use crate::compaction::summarize::{
-    ProviderSummarizer, SummarizationRequest, Summarizer,
-};
-use crate::compaction::tokens::{
-    estimate_context_tokens, estimate_context_tokens_raw, TokenCache,
-};
+use crate::compaction::summarize::{ProviderSummarizer, SummarizationRequest, Summarizer};
+use crate::compaction::tokens::{TokenCache, estimate_context_tokens, estimate_context_tokens_raw};
 use crate::compaction::{
-    branch, prepare_compaction, serialize_conversation, CompactionError,
-    BRANCH_SUMMARY_EMPTY_PLACEHOLDER,
+    BRANCH_SUMMARY_EMPTY_PLACEHOLDER, CompactionError, branch, prepare_compaction,
+    serialize_conversation,
 };
 use crate::context::{build_context_agent_messages, build_context_messages};
-use crate::agent_message::{AgentMessage, BashExecutionMessage};
 use crate::{
-    BranchSummarySettings, Compactor, CompactionSettings, Entry, EntryBase, KnownEntry,
+    BranchSummarySettings, CompactionSettings, Compactor, Entry, EntryBase, KnownEntry,
     NewSessionOpts, NoHooks, SessionLayout, SessionManager,
 };
+use cyrup_core::{
+    AssistantMessage, CancelToken, Content, EntryId, Message, ModelThinkingLevel, StopReason,
+    ToolCall, ToolCallId, Usage,
+};
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
+use cyrup_provider::{CacheRetention, Model, RetryPolicy, StreamOptions};
 use serde_json::json;
 
 // ----------------------------------------------------------------- fixtures -------------------
@@ -48,7 +47,10 @@ fn faux_model() -> Model {
 }
 
 fn user(s: &str) -> Message {
-    Message::User { content: vec![Content::text(s)], timestamp: 0 }
+    Message::User {
+        content: vec![Content::text(s)],
+        timestamp: 0,
+    }
 }
 
 fn assistant(s: &str) -> Message {
@@ -75,7 +77,11 @@ fn assistant_tool(name: &str, path: &str) -> Message {
         content: vec![Content::ToolCall(ToolCall {
             id: ToolCallId::from(format!("tc-{name}-{path}")),
             name: name.to_string(),
-            arguments: json!({ "path": path }).as_object().cloned().expect("object").into(),
+            arguments: json!({ "path": path })
+                .as_object()
+                .cloned()
+                .expect("object")
+                .into(),
             thought_signature: None,
         })],
         provider: "faux".into(),
@@ -115,7 +121,8 @@ fn msg_entry(id: &str, parent: Option<&str>, message: Message) -> Entry {
             id: EntryId::from(id),
             parent_id: parent.map(EntryId::from),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
- extra: Default::default() },
+            extra: Default::default(),
+        },
         message: AgentMessage::Core(message),
     })
 }
@@ -146,8 +153,16 @@ impl Summarizer for RecordingSummarizer {
         _cancel: CancelToken,
     ) -> Result<AssistantMessage, CompactionError> {
         self.captured.lock().unwrap().push(req.prompt_text.clone());
-        let body = self.responses.lock().unwrap().pop_front().unwrap_or_else(|| "SUMMARY".into());
-        Ok(faux_assistant_message(vec![faux_text(body)], StopReason::Stop))
+        let body = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| "SUMMARY".into());
+        Ok(faux_assistant_message(
+            vec![faux_text(body)],
+            StopReason::Stop,
+        ))
     }
 }
 
@@ -181,7 +196,12 @@ impl CompactionHooks for ScriptHooks {
         _ev: &BeforeTreeEvent,
         _cancel: CancelToken,
     ) -> Result<BeforeTreeDecision, CompactionError> {
-        Ok(self.before_tree.lock().unwrap().clone().unwrap_or(BeforeTreeDecision::proceed()))
+        Ok(self
+            .before_tree
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(BeforeTreeDecision::proceed()))
     }
     async fn post_tree(&self, ev: &PostTreeEvent) {
         self.post_tree.lock().unwrap().push(ev.clone());
@@ -189,7 +209,9 @@ impl CompactionHooks for ScriptHooks {
 }
 
 fn has_compaction(m: &SessionManager) -> bool {
-    m.entries().iter().any(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })))
+    m.entries()
+        .iter()
+        .any(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })))
 }
 
 fn first_text(m: &Message) -> String {
@@ -224,12 +246,18 @@ async fn a05_1_auto_compaction_appends_entry_keeps_jsonl() {
     let summ = ProviderSummarizer::new(faux.clone(), model.clone());
     let compactor = Compactor::new(summ, NoHooks);
 
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 40 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 40,
+    };
 
     let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
     for i in 0..4 {
-        m.append_message(user(&format!("question number {i} with several words to add some size")))
-            .unwrap();
+        m.append_message(user(&format!(
+            "question number {i} with several words to add some size"
+        )))
+        .unwrap();
         m.append_message(assistant(&format!(
             "answer number {i} with several words to add some size as well"
         )))
@@ -239,7 +267,10 @@ async fn a05_1_auto_compaction_appends_entry_keeps_jsonl() {
 
     // Trigger check fires below the window (R-05-001).
     let path: Vec<Entry> = m.branch_path(None).into_iter().cloned().collect();
-    assert!(compactor.should_compact(&path, 60, &settings), "should trigger over threshold");
+    assert!(
+        compactor.should_compact(&path, 60, &settings),
+        "should trigger over threshold"
+    );
 
     let entry = compactor
         .run_compaction(
@@ -261,7 +292,10 @@ async fn a05_1_auto_compaction_appends_entry_keeps_jsonl() {
     // Next built context = summary + kept-recent (R-05-009).
     let ctx = m.build_context();
     assert!(first_text(&ctx.messages[0]).contains("## Goal"));
-    assert!(ctx.messages.len() < original_entry_count, "context is reduced vs full history");
+    assert!(
+        ctx.messages.len() < original_entry_count,
+        "context is reduced vs full history"
+    );
 
     // Full JSONL still has every original message + the compaction (R-05-011, DI-9).
     assert_eq!(m.entries().len(), original_entry_count + 1);
@@ -275,10 +309,22 @@ async fn a05_1_auto_compaction_appends_entry_keeps_jsonl() {
 fn a05_2_cut_never_splits_tool_call_from_result() {
     // user, assistant(tool call), tool result, assistant(final).
     let entries = vec![
-        msg_entry("e0", None, user("do the thing with enough words to matter here")),
+        msg_entry(
+            "e0",
+            None,
+            user("do the thing with enough words to matter here"),
+        ),
         msg_entry("e1", Some("e0"), assistant_tool("read", "src/main.rs")),
-        msg_entry("e2", Some("e1"), tool_result("read", "src/main.rs", "fn main() {}")),
-        msg_entry("e3", Some("e2"), assistant("done with a short final answer here")),
+        msg_entry(
+            "e2",
+            Some("e1"),
+            tool_result("read", "src/main.rs", "fn main() {}"),
+        ),
+        msg_entry(
+            "e3",
+            Some("e2"),
+            assistant("done with a short final answer here"),
+        ),
     ];
     let cache = TokenCache::default();
     let cut: CutPoint = find_cut_point(&entries, &cache, 0, entries.len(), 8);
@@ -297,7 +343,10 @@ fn a05_2_cut_never_splits_tool_call_from_result() {
     // ...and the call (e1) + its result (e2) end up on the SAME side of the cut.
     let call_kept = cut.first_kept_index <= 1;
     let result_kept = cut.first_kept_index <= 2;
-    assert_eq!(call_kept, result_kept, "tool call and its result must not be split by the cut");
+    assert_eq!(
+        call_kept, result_kept,
+        "tool call and its result must not be split by the cut"
+    );
 }
 
 // ----------------------------------------------------------------- A-05-3 ---------------------
@@ -311,15 +360,24 @@ async fn a05_3_split_turn_two_summaries_merged() {
         faux_assistant_message(vec![faux_text("PREFIX-SUMMARY")], StopReason::Stop),
     ]);
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
+    let compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), model.clone()),
+        NoHooks,
+    );
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 20,
+    };
 
     let cwd = PathBuf::from("/proj/a05_3");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m.append_message(user("first turn question short")).unwrap();
-    m.append_message(assistant("first turn answer short")).unwrap();
+    m.append_message(assistant("first turn answer short"))
+        .unwrap();
     // A single oversized final turn (user + a very large assistant reply).
-    m.append_message(user("second turn question short")).unwrap();
+    m.append_message(user("second turn question short"))
+        .unwrap();
     let big = "x ".repeat(120);
     m.append_message(assistant(&big)).unwrap();
 
@@ -337,10 +395,23 @@ async fn a05_3_split_turn_two_summaries_merged() {
         .unwrap()
         .expect("split-turn compaction should produce an entry");
 
-    assert!(entry.summary.contains("HISTORY-SUMMARY"), "history summary present");
-    assert!(entry.summary.contains("PREFIX-SUMMARY"), "turn-prefix summary present");
-    assert!(entry.summary.contains("split turn"), "the two summaries are merged with a marker");
-    assert_eq!(faux.call_count(), 2, "exactly two summarization calls (R-05-006)");
+    assert!(
+        entry.summary.contains("HISTORY-SUMMARY"),
+        "history summary present"
+    );
+    assert!(
+        entry.summary.contains("PREFIX-SUMMARY"),
+        "turn-prefix summary present"
+    );
+    assert!(
+        entry.summary.contains("split turn"),
+        "the two summaries are merged with a marker"
+    );
+    assert_eq!(
+        faux.call_count(),
+        2,
+        "exactly two summarization calls (R-05-006)"
+    );
 }
 
 // ----------------------------------------------------------------- A-05-4 ---------------------
@@ -350,13 +421,23 @@ async fn a05_4_compact_custom_instructions_in_request() {
     let summarizer = Arc::new(RecordingSummarizer::new(vec![FULL_SUMMARY]));
     let compactor = Compactor::new(RecordingArc(summarizer.clone()), NoHooks);
     let model = faux_model();
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 20,
+    };
 
     let cwd = PathBuf::from("/proj/a05_4");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     for i in 0..3 {
-        m.append_message(user(&format!("auth question {i} with enough words here to matter"))).unwrap();
-        m.append_message(assistant(&format!("auth answer {i} with enough words here to matter"))).unwrap();
+        m.append_message(user(&format!(
+            "auth question {i} with enough words here to matter"
+        )))
+        .unwrap();
+        m.append_message(assistant(&format!(
+            "auth answer {i} with enough words here to matter"
+        )))
+        .unwrap();
     }
 
     compactor
@@ -376,7 +457,9 @@ async fn a05_4_compact_custom_instructions_in_request() {
     let prompts = summarizer.prompts();
     assert!(!prompts.is_empty());
     assert!(
-        prompts.iter().any(|p| p.contains("focus on the auth refactor")),
+        prompts
+            .iter()
+            .any(|p| p.contains("focus on the auth refactor")),
         "custom instructions must appear in the summarization request (R-05-014)"
     );
     assert!(prompts.iter().any(|p| p.contains("Additional focus:")));
@@ -399,16 +482,32 @@ impl Summarizer for RecordingArc {
 #[tokio::test]
 async fn a05_5_overflow_recovery_then_retry() {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text(FULL_SUMMARY)], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text(FULL_SUMMARY)],
+        StopReason::Stop,
+    )]);
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
+    let compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), model.clone()),
+        NoHooks,
+    );
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 20,
+    };
 
     let cwd = PathBuf::from("/proj/a05_5");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     for i in 0..4 {
-        m.append_message(user(&format!("overflow question {i} with enough words to matter"))).unwrap();
-        m.append_message(assistant(&format!("overflow answer {i} with enough words to matter"))).unwrap();
+        m.append_message(user(&format!(
+            "overflow question {i} with enough words to matter"
+        )))
+        .unwrap();
+        m.append_message(assistant(&format!(
+            "overflow answer {i} with enough words to matter"
+        )))
+        .unwrap();
     }
 
     // Overflow recovery: compaction runs with reason=Overflow and will_retry=true (R-05-003).
@@ -430,7 +529,10 @@ async fn a05_5_overflow_recovery_then_retry() {
 
     // The retried request now sees a reduced context (summary + kept), so the loop can proceed.
     let ctx = m.build_context();
-    assert!(first_text(&ctx.messages[0]).contains("## Goal"), "rebuilt context leads with summary");
+    assert!(
+        first_text(&ctx.messages[0]).contains("## Goal"),
+        "rebuilt context leads with summary"
+    );
 }
 
 // ----------------------------------------------------------------- A-05-6 ---------------------
@@ -440,35 +542,75 @@ async fn a05_6_cumulative_file_lists_across_two_compactions() {
     let summarizer = Arc::new(RecordingSummarizer::new(vec![FULL_SUMMARY, FULL_SUMMARY]));
     let compactor = Compactor::new(RecordingArc(summarizer.clone()), NoHooks);
     let model = faux_model();
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 20,
+    };
 
     let cwd = PathBuf::from("/proj/a05_6");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
 
     // First batch: read a.rs, edit c.rs.
-    m.append_message(user("first batch start with enough words to matter here now")).unwrap();
+    m.append_message(user(
+        "first batch start with enough words to matter here now",
+    ))
+    .unwrap();
     m.append_message(assistant_tool("read", "a.rs")).unwrap();
-    m.append_message(tool_result("read", "a.rs", "contents")).unwrap();
+    m.append_message(tool_result("read", "a.rs", "contents"))
+        .unwrap();
     m.append_message(assistant_tool("edit", "c.rs")).unwrap();
     m.append_message(tool_result("edit", "c.rs", "ok")).unwrap();
-    m.append_message(user("first batch end with enough words to matter here now ok")).unwrap();
-    m.append_message(assistant("first batch reply with enough words to matter here ok")).unwrap();
+    m.append_message(user(
+        "first batch end with enough words to matter here now ok",
+    ))
+    .unwrap();
+    m.append_message(assistant(
+        "first batch reply with enough words to matter here ok",
+    ))
+    .unwrap();
 
     compactor
-        .run_compaction(&mut m, &model, &settings, CompactionReason::Manual, None, false, CancelToken::new())
+        .run_compaction(
+            &mut m,
+            &model,
+            &settings,
+            CompactionReason::Manual,
+            None,
+            false,
+            CancelToken::new(),
+        )
         .await
         .unwrap()
         .expect("first compaction");
 
     // Second batch: read b.rs.
-    m.append_message(user("second batch start with enough words to matter here now ok")).unwrap();
+    m.append_message(user(
+        "second batch start with enough words to matter here now ok",
+    ))
+    .unwrap();
     m.append_message(assistant_tool("read", "b.rs")).unwrap();
-    m.append_message(tool_result("read", "b.rs", "more")).unwrap();
-    m.append_message(user("second batch end with enough words to matter here now okay")).unwrap();
-    m.append_message(assistant("second batch reply with enough words to matter here ok")).unwrap();
+    m.append_message(tool_result("read", "b.rs", "more"))
+        .unwrap();
+    m.append_message(user(
+        "second batch end with enough words to matter here now okay",
+    ))
+    .unwrap();
+    m.append_message(assistant(
+        "second batch reply with enough words to matter here ok",
+    ))
+    .unwrap();
 
     let second = compactor
-        .run_compaction(&mut m, &model, &settings, CompactionReason::Manual, None, false, CancelToken::new())
+        .run_compaction(
+            &mut m,
+            &model,
+            &settings,
+            CompactionReason::Manual,
+            None,
+            false,
+            CancelToken::new(),
+        )
         .await
         .unwrap()
         .expect("second compaction");
@@ -477,9 +619,18 @@ async fn a05_6_cumulative_file_lists_across_two_compactions() {
     let read: Vec<String> = serde_json::from_value(details["readFiles"].clone()).unwrap();
     let modified: Vec<String> = serde_json::from_value(details["modifiedFiles"].clone()).unwrap();
 
-    assert!(read.contains(&"a.rs".to_string()), "first-compaction read file accumulates (R-05-015)");
-    assert!(read.contains(&"b.rs".to_string()), "second-compaction read file present");
-    assert!(modified.contains(&"c.rs".to_string()), "first-compaction modified file accumulates");
+    assert!(
+        read.contains(&"a.rs".to_string()),
+        "first-compaction read file accumulates (R-05-015)"
+    );
+    assert!(
+        read.contains(&"b.rs".to_string()),
+        "second-compaction read file present"
+    );
+    assert!(
+        modified.contains(&"c.rs".to_string()),
+        "first-compaction modified file accumulates"
+    );
 }
 
 // ----------------------------------------------------------------- A-05-7 ---------------------
@@ -487,10 +638,19 @@ async fn a05_6_cumulative_file_lists_across_two_compactions() {
 #[tokio::test]
 async fn a05_7_branch_summary_appended_at_nav_abandoned_intact() {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text(FULL_SUMMARY)], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text(FULL_SUMMARY)],
+        StopReason::Stop,
+    )]);
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
-    let settings = BranchSummarySettings { reserve_tokens: 16384, skip_prompt: false };
+    let compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), model.clone()),
+        NoHooks,
+    );
+    let settings = BranchSummarySettings {
+        reserve_tokens: 16384,
+        skip_prompt: false,
+    };
 
     let cwd = PathBuf::from("/proj/a05_7");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
@@ -526,8 +686,15 @@ async fn a05_7_branch_summary_appended_at_nav_abandoned_intact() {
     // position (newLeafId), not the old branch". These two assertions previously contradicted each
     // other (`from_id` = abandoned leaf, `parent_id` = target) and cited `R-05-016`, which is not
     // in this workspace and cannot be used to defend behaviour contradicting pi's code.
-    assert_eq!(entry.from_id, l2, "fromId is the navigation TARGET (session-manager.ts:1397)");
-    assert_eq!(entry.parent_id.as_ref(), Some(&l2), "appended at the navigation point");
+    assert_eq!(
+        entry.from_id, l2,
+        "fromId is the navigation TARGET (session-manager.ts:1397)"
+    );
+    assert_eq!(
+        entry.parent_id.as_ref(),
+        Some(&l2),
+        "appended at the navigation point"
+    );
     assert_eq!(
         Some(entry.from_id.clone()),
         entry.parent_id,
@@ -537,7 +704,11 @@ async fn a05_7_branch_summary_appended_at_nav_abandoned_intact() {
     // The abandoned branch is never deleted (R-05-017).
     assert!(m.entry(&b1q).is_some());
     assert!(m.entry(&l1).is_some());
-    assert_eq!(m.entries().len(), total_before + 1, "only one entry appended");
+    assert_eq!(
+        m.entries().len(),
+        total_before + 1,
+        "only one entry appended"
+    );
 }
 
 #[test]
@@ -555,8 +726,14 @@ fn prepare_branch_entries_fills_the_token_budget_newest_first() {
     // A tiny budget keeps only the newest entry.
     let prep = branch::prepare_branch_entries(&entries, 5);
     let texts: Vec<String> = prep.messages.iter().map(first_text).collect();
-    assert!(texts.iter().any(|t| t.contains("newest short")), "newest entry kept");
-    assert!(!texts.iter().any(|t| t.contains("old old")), "oldest dropped under tiny budget");
+    assert!(
+        texts.iter().any(|t| t.contains("newest short")),
+        "newest entry kept"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("old old")),
+        "oldest dropped under tiny budget"
+    );
 }
 
 // ----------------------------------------------------------------- A-05-8 ---------------------
@@ -569,18 +746,37 @@ async fn a05_8_before_compact_cancel_and_custom() {
     {
         let hooks = ScriptHooks::default();
         *hooks.before_compact.lock().unwrap() = Some(BeforeCompactDecision::Cancel);
-        let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
-        let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
+        let compactor = Compactor::new(
+            RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))),
+            hooks,
+        );
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 10,
+            keep_recent_tokens: 20,
+        };
 
         let cwd = PathBuf::from("/proj/a05_8a");
         let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-        m.append_message(user("q one with enough words to matter here now")).unwrap();
-        m.append_message(assistant("a one with enough words to matter here now")).unwrap();
-        m.append_message(user("q two with enough words to matter here now")).unwrap();
-        m.append_message(assistant("a two with enough words to matter here now")).unwrap();
+        m.append_message(user("q one with enough words to matter here now"))
+            .unwrap();
+        m.append_message(assistant("a one with enough words to matter here now"))
+            .unwrap();
+        m.append_message(user("q two with enough words to matter here now"))
+            .unwrap();
+        m.append_message(assistant("a two with enough words to matter here now"))
+            .unwrap();
 
         let out = compactor
-            .run_compaction(&mut m, &model, &settings, CompactionReason::Manual, None, false, CancelToken::new())
+            .run_compaction(
+                &mut m,
+                &model,
+                &settings,
+                CompactionReason::Manual,
+                None,
+                false,
+                CancelToken::new(),
+            )
             .await
             .unwrap();
         assert!(out.is_none(), "cancel returns no entry");
@@ -602,29 +798,54 @@ async fn a05_8_before_compact_cancel_and_custom() {
             details: Some(json!({ "readFiles": ["x.rs"], "modifiedFiles": [] })),
             usage: None,
         });
-        let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
-        let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
+        let compactor = Compactor::new(
+            RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))),
+            hooks,
+        );
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 10,
+            keep_recent_tokens: 20,
+        };
 
         let cwd = PathBuf::from("/proj/a05_8b");
         let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-        m.append_message(user("q one with enough words to matter here now")).unwrap();
-        m.append_message(assistant("a one with enough words to matter here now")).unwrap();
-        m.append_message(user("q two with enough words to matter here now")).unwrap();
-        m.append_message(assistant("a two with enough words to matter here now")).unwrap();
+        m.append_message(user("q one with enough words to matter here now"))
+            .unwrap();
+        m.append_message(assistant("a one with enough words to matter here now"))
+            .unwrap();
+        m.append_message(user("q two with enough words to matter here now"))
+            .unwrap();
+        m.append_message(assistant("a two with enough words to matter here now"))
+            .unwrap();
 
         let entry = compactor
-            .run_compaction(&mut m, &model, &settings, CompactionReason::Manual, None, false, CancelToken::new())
+            .run_compaction(
+                &mut m,
+                &model,
+                &settings,
+                CompactionReason::Manual,
+                None,
+                false,
+                CancelToken::new(),
+            )
             .await
             .unwrap()
             .expect("custom compaction produces an entry");
 
-        assert_eq!(entry.summary, "CUSTOM-EXTENSION-SUMMARY", "custom summary used verbatim");
+        assert_eq!(
+            entry.summary, "CUSTOM-EXTENSION-SUMMARY",
+            "custom summary used verbatim"
+        );
         assert!(entry.from_hook, "entry marked extension-sourced");
         assert_eq!(entry.tokens_before, 42);
         assert_eq!(entry.first_kept_entry_id, first_kept);
         let posted = compactor.hooks().post_compact.lock().unwrap().clone();
         assert_eq!(posted.len(), 1);
-        assert!(posted[0].from_extension, "post-compact reports extension source (R-05-021)");
+        assert!(
+            posted[0].from_extension,
+            "post-compact reports extension source (R-05-021)"
+        );
     }
 }
 
@@ -633,13 +854,19 @@ async fn a05_8_before_compact_cancel_and_custom() {
 #[tokio::test]
 async fn a05_9_before_tree_cancel_and_replace() {
     let model = faux_model();
-    let settings = BranchSummarySettings { reserve_tokens: 16384, skip_prompt: false };
+    let settings = BranchSummarySettings {
+        reserve_tokens: 16384,
+        skip_prompt: false,
+    };
 
     // (a) Cancel aborts navigation: leaf unchanged, nothing appended.
     {
         let hooks = ScriptHooks::default();
         *hooks.before_tree.lock().unwrap() = Some(BeforeTreeDecision::Cancel);
-        let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
+        let compactor = Compactor::new(
+            RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))),
+            hooks,
+        );
 
         let cwd = PathBuf::from("/proj/a05_9a");
         let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
@@ -652,11 +879,23 @@ async fn a05_9_before_tree_cancel_and_replace() {
 
         let before = m.entries().len();
         let out = compactor
-            .run_branch_summary(&mut m, &model, l2, Some(l1.clone()), true, &settings, CancelToken::new())
+            .run_branch_summary(
+                &mut m,
+                &model,
+                l2,
+                Some(l1.clone()),
+                true,
+                &settings,
+                CancelToken::new(),
+            )
             .await
             .unwrap();
         assert!(out.is_none(), "cancel returns no entry");
-        assert_eq!(m.leaf_id(), Some(&l1), "navigation cancelled — leaf unchanged");
+        assert_eq!(
+            m.leaf_id(),
+            Some(&l1),
+            "navigation cancelled — leaf unchanged"
+        );
         assert_eq!(m.entries().len(), before, "nothing appended on cancel");
     }
 
@@ -668,7 +907,10 @@ async fn a05_9_before_tree_cancel_and_replace() {
             details: None,
             overrides: BeforeTreeOverrides::default(),
         });
-        let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
+        let compactor = Compactor::new(
+            RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))),
+            hooks,
+        );
 
         let cwd = PathBuf::from("/proj/a05_9b");
         let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
@@ -680,13 +922,25 @@ async fn a05_9_before_tree_cancel_and_replace() {
         m.branch(&l1).unwrap();
 
         let entry = compactor
-            .run_branch_summary(&mut m, &model, l2.clone(), Some(l1), true, &settings, CancelToken::new())
+            .run_branch_summary(
+                &mut m,
+                &model,
+                l2.clone(),
+                Some(l1),
+                true,
+                &settings,
+                CancelToken::new(),
+            )
             .await
             .unwrap()
             .expect("replace produces a branch summary");
         assert_eq!(entry.summary, "REPLACED-BRANCH-SUMMARY");
         assert!(entry.from_hook, "replacement marked extension-sourced");
-        assert_eq!(m.leaf_id(), Some(&entry.id), "navigated, summary at the nav point");
+        assert_eq!(
+            m.leaf_id(),
+            Some(&entry.id),
+            "navigated, summary at the nav point"
+        );
     }
 }
 
@@ -695,23 +949,52 @@ async fn a05_9_before_tree_cancel_and_replace() {
 #[tokio::test]
 async fn a05_10_summary_has_all_sections_and_file_blocks() {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text(FULL_SUMMARY)], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text(FULL_SUMMARY)],
+        StopReason::Stop,
+    )]);
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
+    let compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), model.clone()),
+        NoHooks,
+    );
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 20,
+    };
 
     let cwd = PathBuf::from("/proj/a05_10");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-    m.append_message(user("start with enough words to matter here now okay then")).unwrap();
-    m.append_message(assistant_tool("read", "src/lib.rs")).unwrap();
-    m.append_message(tool_result("read", "src/lib.rs", "code")).unwrap();
-    m.append_message(assistant_tool("edit", "src/main.rs")).unwrap();
-    m.append_message(tool_result("edit", "src/main.rs", "ok")).unwrap();
-    m.append_message(user("end with enough words to matter here now okay then done")).unwrap();
-    m.append_message(assistant("reply with enough words to matter here now okay done")).unwrap();
+    m.append_message(user("start with enough words to matter here now okay then"))
+        .unwrap();
+    m.append_message(assistant_tool("read", "src/lib.rs"))
+        .unwrap();
+    m.append_message(tool_result("read", "src/lib.rs", "code"))
+        .unwrap();
+    m.append_message(assistant_tool("edit", "src/main.rs"))
+        .unwrap();
+    m.append_message(tool_result("edit", "src/main.rs", "ok"))
+        .unwrap();
+    m.append_message(user(
+        "end with enough words to matter here now okay then done",
+    ))
+    .unwrap();
+    m.append_message(assistant(
+        "reply with enough words to matter here now okay done",
+    ))
+    .unwrap();
 
     let entry = compactor
-        .run_compaction(&mut m, &model, &settings, CompactionReason::Manual, None, false, CancelToken::new())
+        .run_compaction(
+            &mut m,
+            &model,
+            &settings,
+            CompactionReason::Manual,
+            None,
+            false,
+            CancelToken::new(),
+        )
         .await
         .unwrap()
         .expect("compaction should run");
@@ -730,9 +1013,15 @@ async fn a05_10_summary_has_all_sections_and_file_blocks() {
     ] {
         assert!(s.contains(section), "summary missing section: {section}");
     }
-    assert!(s.contains("<read-files>"), "machine read-files block present (R-05-013)");
+    assert!(
+        s.contains("<read-files>"),
+        "machine read-files block present (R-05-013)"
+    );
     assert!(s.contains("</read-files>"));
-    assert!(s.contains("<modified-files>"), "machine modified-files block present");
+    assert!(
+        s.contains("<modified-files>"),
+        "machine modified-files block present"
+    );
     assert!(s.contains("src/main.rs"), "modified file listed");
 }
 
@@ -755,16 +1044,26 @@ fn g1_tokens_before_pure_core_raw_equals_rendered() {
     let path: Vec<Entry> = m.branch_path(None).into_iter().cloned().collect();
 
     let cache = TokenCache::default();
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 5 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 5,
+    };
     let prep = prepare_compaction(&path, &cache, &settings).expect("history to summarize");
 
     // 4 × (2 + 3) = 20 tokens; raw and rendered agree on pure core.
-    assert_eq!(prep.tokens_before, 20, "tokensBefore pins the raw-context estimate");
+    assert_eq!(
+        prep.tokens_before, 20,
+        "tokensBefore pins the raw-context estimate"
+    );
     let refs: Vec<&Entry> = path.iter().collect();
     let raw = build_context_agent_messages(&refs);
     let rendered = build_context_messages(&refs);
     assert_eq!(prep.tokens_before, estimate_context_tokens_raw(&raw).tokens);
-    assert_eq!(estimate_context_tokens_raw(&raw).tokens, estimate_context_tokens(&rendered).tokens);
+    assert_eq!(
+        estimate_context_tokens_raw(&raw).tokens,
+        estimate_context_tokens(&rendered).tokens
+    );
 }
 
 /// M1 (CRITICAL): `tokensBefore` / `should_compact` estimate over Pi's RAW `AgentMessage` context
@@ -780,11 +1079,20 @@ fn g1_tokens_before_pure_core_raw_equals_rendered() {
 #[test]
 fn m1_tokens_before_byte_matches_pi_over_raw_agent_context() {
     fn base(id: &str, parent: Option<&str>) -> EntryBase {
-        EntryBase { id: EntryId::from(id), parent_id: parent.map(EntryId::from), timestamp: "2026-01-01T00:00:00Z".into(), extra: Default::default() }
+        EntryBase {
+            id: EntryId::from(id),
+            parent_id: parent.map(EntryId::from),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            extra: Default::default(),
+        }
     }
 
     // e1: user core message (content len 42 → 11)
-    let e1 = msg_entry("e1", None, user("hello world this is the first user message"));
+    let e1 = msg_entry(
+        "e1",
+        None,
+        user("hello world this is the first user message"),
+    );
     // e2: compaction (summary len 53 → 14); firstKeptEntryId = e1
     let e2 = Entry::known(KnownEntry::Compaction {
         base: base("e2", Some("e1")),
@@ -793,14 +1101,15 @@ fn m1_tokens_before_byte_matches_pi_over_raw_agent_context() {
         tokens_before: 1234,
         details: None,
         usage: None,
-            from_hook: None,
+        from_hook: None,
     });
     // e3: EXCLUDED bash (cmd 15 + out 75 = 90 → 23) — Pi raw context still counts it.
     let e3 = Entry::known(KnownEntry::Message {
         base: base("e3", Some("e2")),
         message: AgentMessage::BashExecution(BashExecutionMessage {
             command: "cat /etc/passwd".into(),
-            output: "root:x:0:0:root:/root:/bin/bash\nsecret data here that is fairly long output".into(),
+            output: "root:x:0:0:root:/root:/bin/bash\nsecret data here that is fairly long output"
+                .into(),
             exit_code: Some(0),
             cancelled: false,
             truncated: false,
@@ -816,7 +1125,7 @@ fn m1_tokens_before_byte_matches_pi_over_raw_agent_context() {
         summary: "a branch summary body describing the abandoned branch in some detail".into(),
         details: None,
         usage: None,
-            from_hook: None,
+        from_hook: None,
     });
     // e5: custom_message (content len 48 → 12)
     let e5 = Entry::known(KnownEntry::CustomMessage {
@@ -833,7 +1142,10 @@ fn m1_tokens_before_byte_matches_pi_over_raw_agent_context() {
     // The fixed RAW path byte-matches Pi's captured tokensBefore = 77.
     let raw = build_context_agent_messages(&refs);
     let raw_tokens = estimate_context_tokens_raw(&raw).tokens;
-    assert_eq!(raw_tokens, 77, "tokensBefore must byte-match Pi's captured value (77)");
+    assert_eq!(
+        raw_tokens, 77,
+        "tokensBefore must byte-match Pi's captured value (77)"
+    );
 
     // And it genuinely DIFFERS from the old rendered basis (excluded bash dropped + summary
     // wrappers over-counted), proving the fix is load-bearing, not a no-op.
@@ -846,9 +1158,16 @@ fn m1_tokens_before_byte_matches_pi_over_raw_agent_context() {
 
     // prepare_compaction persists exactly this raw value into CompactionEntry.tokensBefore.
     let cache = TokenCache::default();
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 5 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 5,
+    };
     let prep = prepare_compaction(&path, &cache, &settings).expect("history to summarize");
-    assert_eq!(prep.tokens_before, 77, "persisted tokensBefore must equal Pi's 77");
+    assert_eq!(
+        prep.tokens_before, 77,
+        "persisted tokensBefore must equal Pi's 77"
+    );
 }
 
 // ----------------------------------------------------------------- M2 truncation encoding -----
@@ -877,7 +1196,10 @@ fn m2_truncation_counts_utf16_code_units_like_pi() {
     assert!(out.ends_with("\u{1F600}\n\n[... 1000 more characters truncated]"));
     // The OLD scalar logic would have left all 1500 emoji untruncated (no marker at all).
     assert_eq!(text.chars().count(), 1500);
-    assert!(!out.contains(&text), "must not pass the full untruncated body through");
+    assert!(
+        !out.contains(&text),
+        "must not pass the full untruncated body through"
+    );
 }
 
 // ----------------------------------------------------------------- G-3/G-8 empty branch -------
@@ -891,15 +1213,23 @@ async fn g3_empty_branch_appends_no_content_placeholder() {
     // the branch: it appends the placeholder entry too.
     let faux = Arc::new(FauxProvider::new()); // no scripted response needed: short-circuits the model
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
-    let settings = BranchSummarySettings { reserve_tokens: 16384, skip_prompt: false };
+    let compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), model.clone()),
+        NoHooks,
+    );
+    let settings = BranchSummarySettings {
+        reserve_tokens: 16384,
+        skip_prompt: false,
+    };
 
     let cwd = PathBuf::from("/proj/g3");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m.append_message(user("shared question")).unwrap();
     let shared_a = m.append_message(assistant("shared answer")).unwrap();
     // Abandoned branch off shared_a that filters to NO messages (a lone tool result is dropped).
-    let abandoned = m.append_message(tool_result("read", "x.rs", "data")).unwrap();
+    let abandoned = m
+        .append_message(tool_result("read", "x.rs", "data"))
+        .unwrap();
 
     let entry = compactor
         .run_branch_summary(
@@ -920,7 +1250,11 @@ async fn g3_empty_branch_appends_no_content_placeholder() {
     // SESS-017/SESS-032: `fromId` is the navigation TARGET, not the abandoned leaf
     // (`session-manager.ts:1391-1397`).
     assert_eq!(entry.from_id, shared_a, "fromId is the navigation TARGET");
-    assert_eq!(entry.parent_id.as_ref(), Some(&shared_a), "appended at the navigation target");
+    assert_eq!(
+        entry.parent_id.as_ref(),
+        Some(&shared_a),
+        "appended at the navigation target"
+    );
     // The abandoned branch is never deleted (R-05-017).
     assert!(m.entry(&abandoned).is_some());
 }
@@ -933,7 +1267,8 @@ fn custom_message_entry(id: &str, parent: Option<&str>, content: &str) -> Entry 
             id: EntryId::from(id),
             parent_id: parent.map(EntryId::from),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
- extra: Default::default() },
+            extra: Default::default(),
+        },
         custom_type: "ext.injected".to_string(),
         content: json!(content),
         display: true,
@@ -947,12 +1282,13 @@ fn branch_summary_entry(id: &str, parent: Option<&str>, summary: &str) -> Entry 
             id: EntryId::from(id),
             parent_id: parent.map(EntryId::from),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
- extra: Default::default() },
+            extra: Default::default(),
+        },
         summary: summary.to_string(),
         from_id: EntryId::from("from"),
         details: None,
         usage: None,
-            from_hook: None,
+        from_hook: None,
     })
 }
 
@@ -972,7 +1308,11 @@ fn sess002_custom_message_tokens_count_toward_the_keep_recent_budget() {
         msg_entry("e4", Some("e3"), assistant("recent answer two")),
     ];
     let cache = TokenCache::default();
-    assert_eq!(cache.estimate_raw_entry(&entries[2]), 10_000, "the injected entry is not free");
+    assert_eq!(
+        cache.estimate_raw_entry(&entries[2]),
+        10_000,
+        "the injected entry is not free"
+    );
 
     let keep_recent_tokens = 2_000;
     let cut = find_cut_point(&entries, &cache, 0, entries.len(), keep_recent_tokens);
@@ -1002,7 +1342,10 @@ fn sess002_branch_summary_tokens_count_toward_the_keep_recent_budget() {
     let cache = TokenCache::default();
     assert_eq!(cache.estimate_raw_entry(&entries[2]), 10_000);
     let cut = find_cut_point(&entries, &cache, 0, entries.len(), 2_000);
-    assert_eq!(cut.first_kept_index, 2, "cut lands at the branch_summary, got {cut:?}");
+    assert_eq!(
+        cut.first_kept_index, 2,
+        "cut lands at the branch_summary, got {cut:?}"
+    );
 }
 
 #[test]
@@ -1031,14 +1374,18 @@ fn sess002_back_scan_stops_at_a_context_visible_entry() {
                 id: EntryId::from("e1"),
                 parent_id: Some(EntryId::from("e0")),
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
- extra: Default::default() },
+                extra: Default::default(),
+            },
             provider: "p".into(),
             model_id: "m".into(),
         }),
         msg_entry("e2", Some("e1"), user("recent enough words here to matter")),
     ];
     let cut2 = find_cut_point(&entries2, &TokenCache::default(), 0, entries2.len(), 5);
-    assert_eq!(cut2.first_kept_index, 1, "a model_change is still folded into the kept region");
+    assert_eq!(
+        cut2.first_kept_index, 1,
+        "a model_change is still folded into the kept region"
+    );
 }
 
 #[test]
@@ -1055,7 +1402,8 @@ fn sess002_previous_compaction_summary_counts_toward_the_keep_recent_budget() {
                 id: EntryId::from("e1"),
                 parent_id: Some(EntryId::from("e0")),
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
- extra: Default::default() },
+                extra: Default::default(),
+            },
             summary: prior_summary,
             first_kept_entry_id: Some(EntryId::from("e0")),
             tokens_before: 99_999,
@@ -1067,7 +1415,11 @@ fn sess002_previous_compaction_summary_counts_toward_the_keep_recent_budget() {
         msg_entry("e3", Some("e2"), assistant("recent answer")),
     ];
     let cache = TokenCache::default();
-    assert_eq!(cache.estimate_raw_entry(&entries[1]), 10_000, "a compaction summary is not free");
+    assert_eq!(
+        cache.estimate_raw_entry(&entries[1]),
+        10_000,
+        "a compaction summary is not free"
+    );
 
     let cut = find_cut_point(&entries, &cache, 0, entries.len(), 2_000);
     assert_eq!(
@@ -1091,7 +1443,8 @@ fn agent_msg_entry(id: &str, parent: Option<&str>, message: AgentMessage) -> Ent
             id: EntryId::from(id),
             parent_id: parent.map(EntryId::from),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
- extra: Default::default() },
+            extra: Default::default(),
+        },
         message,
     })
 }
@@ -1145,27 +1498,46 @@ fn f1_empty_branch_summary_is_neither_a_cut_point_nor_a_turn_start() {
     // `KnownEntry::BranchSummary { .. }` structurally at both sites, so it snapped the cut onto the
     // empty entry AND reported it as the turn start — producing an empty turn prefix.
     let entries = vec![
-        msg_entry("e0", None, user("please refactor the parser module thoroughly")),
+        msg_entry(
+            "e0",
+            None,
+            user("please refactor the parser module thoroughly"),
+        ),
         msg_entry("e1", Some("e0"), assistant_tool("read", "src/main.rs")),
         msg_entry(
             "e2",
             Some("e1"),
-            tool_result("read", "src/main.rs", "0123456789012345678901234567890123456789"),
+            tool_result(
+                "read",
+                "src/main.rs",
+                "0123456789012345678901234567890123456789",
+            ),
         ),
         branch_summary_entry("e3", Some("e2"), ""),
         msg_entry("e4", Some("e3"), user("recent")),
     ];
     let cache = TokenCache::default();
-    assert_eq!(cache.estimate_raw_entry(&entries[3]), 0, "an empty branch summary costs nothing");
+    assert_eq!(
+        cache.estimate_raw_entry(&entries[3]),
+        0,
+        "an empty branch summary costs nothing"
+    );
 
     // Budget walk: e4 = 2 tokens, e3 = 0 (skipped), e2 = 10 ⇒ crosses 8 at e2, snapping forward.
     let cut = find_cut_point(&entries, &cache, 0, entries.len(), 8);
-    assert_eq!(cut.first_kept_index, 3, "back-scan folds the invisible entry in — got {cut:?}");
+    assert_eq!(
+        cut.first_kept_index, 3,
+        "back-scan folds the invisible entry in — got {cut:?}"
+    );
     assert!(
         cut.is_split_turn,
         "the empty branch summary does not start a turn, so the cut splits e0's turn — got {cut:?}"
     );
-    assert_eq!(cut.turn_start_index, Some(0), "the turn starts at the user message e0");
+    assert_eq!(
+        cut.turn_start_index,
+        Some(0),
+        "the turn starts at the user message e0"
+    );
 }
 
 #[tokio::test]
@@ -1174,12 +1546,18 @@ async fn f1_empty_branch_summary_compaction_summarizes_the_split_turn() {
     let summ = RecordingSummarizer::new(vec!["PREFIX-SUMMARY"]);
     let compactor = Compactor::new(summ, NoHooks);
     let model = faux_model();
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 8 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 100,
+        keep_recent_tokens: 8,
+    };
 
     let cwd = PathBuf::from("/proj/f1");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-    m.append_message(user("please refactor the parser module thoroughly")).unwrap();
-    m.append_message(assistant_tool("read", "src/main.rs")).unwrap();
+    m.append_message(user("please refactor the parser module thoroughly"))
+        .unwrap();
+    m.append_message(assistant_tool("read", "src/main.rs"))
+        .unwrap();
     m.append_message(tool_result(
         "read",
         "src/main.rs",
@@ -1187,7 +1565,8 @@ async fn f1_empty_branch_summary_compaction_summarizes_the_split_turn() {
     ))
     .unwrap();
     let from = m.leaf_id().cloned().unwrap();
-    m.append_branch_summary(from, String::new(), None, None, false).unwrap();
+    m.append_branch_summary(from, String::new(), None, None, false)
+        .unwrap();
     m.append_message(user("recent")).unwrap();
 
     let entry = compactor
@@ -1205,7 +1584,11 @@ async fn f1_empty_branch_summary_compaction_summarizes_the_split_turn() {
         .expect("compaction runs");
 
     let prompts = compactor.summarizer().prompts();
-    assert_eq!(prompts.len(), 1, "only the turn-prefix half is summarized: {prompts:?}");
+    assert_eq!(
+        prompts.len(),
+        1,
+        "only the turn-prefix half is summarized: {prompts:?}"
+    );
     assert!(
         prompts[0].contains("This is the PREFIX of a turn"),
         "the single call is the turn-prefix prompt: {}",
@@ -1224,9 +1607,20 @@ async fn f1_empty_branch_summary_compaction_summarizes_the_split_turn() {
 
     // The built context keeps only the empty branch summary (invisible) + the recent user message.
     let ctx = m.build_context();
-    let joined = ctx.messages.iter().map(first_text).collect::<Vec<_>>().join("\n");
-    assert!(joined.contains("recent"), "the kept tail survives: {joined}");
-    assert!(!joined.contains("refactor the parser"), "the summarized history is gone: {joined}");
+    let joined = ctx
+        .messages
+        .iter()
+        .map(first_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("recent"),
+        "the kept tail survives: {joined}"
+    );
+    assert!(
+        !joined.contains("refactor the parser"),
+        "the summarized history is gone: {joined}"
+    );
 }
 
 // ------------------------------------------------------------------ F-2 -----------------------
@@ -1253,7 +1647,10 @@ fn f2_custom_role_message_entry_starts_a_turn() {
     ];
     let cut = find_cut_point(&entries, &TokenCache::default(), 0, entries.len(), 3);
     assert_eq!(cut.first_kept_index, 2);
-    assert!(!cut.is_split_turn, "a custom-role message is a clean turn boundary — got {cut:?}");
+    assert!(
+        !cut.is_split_turn,
+        "a custom-role message is a clean turn boundary — got {cut:?}"
+    );
     assert_eq!(cut.turn_start_index, None);
 }
 
@@ -1265,11 +1662,18 @@ fn f2_bash_execution_cut_is_not_a_split_turn() {
     let entries = vec![
         msg_entry("e0", None, user("older question about the parser")),
         msg_entry("e1", Some("e0"), assistant("older answer")),
-        agent_msg_entry("e2", Some("e1"), bash_msg("npm test", "all green here ok", false)),
+        agent_msg_entry(
+            "e2",
+            Some("e1"),
+            bash_msg("npm test", "all green here ok", false),
+        ),
     ];
     let cut = find_cut_point(&entries, &TokenCache::default(), 0, entries.len(), 3);
     assert_eq!(cut.first_kept_index, 2);
-    assert!(!cut.is_split_turn, "a bashExecution starts a turn — got {cut:?}");
+    assert!(
+        !cut.is_split_turn,
+        "a bashExecution starts a turn — got {cut:?}"
+    );
     assert_eq!(cut.turn_start_index, None);
 }
 
@@ -1281,9 +1685,12 @@ fn f2_bash_execution_cut_is_not_a_split_turn() {
 fn f3_session() -> SessionManager {
     let cwd = PathBuf::from("/proj/f3");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-    m.append_agent_message(bash_msg("npm test", "ok", false)).unwrap();
-    m.append_agent_message(bash_msg("cat secret", "s3cr3t", true)).unwrap();
-    m.append_custom_message("ext.note", json!("injected note"), true, None).unwrap();
+    m.append_agent_message(bash_msg("npm test", "ok", false))
+        .unwrap();
+    m.append_agent_message(bash_msg("cat secret", "s3cr3t", true))
+        .unwrap();
+    m.append_custom_message("ext.note", json!("injected note"), true, None)
+        .unwrap();
     m.append_message(user("recent question here")).unwrap();
     m.append_message(assistant("recent answer here")).unwrap();
     m
@@ -1299,7 +1706,11 @@ async fn f3_before_compact_event_carries_raw_agent_messages() {
     let summ = RecordingSummarizer::new(vec!["HISTORY-SUMMARY"]);
     let compactor = Compactor::new(summ, CapturingHooks::default());
     let model = faux_model();
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 7 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 100,
+        keep_recent_tokens: 7,
+    };
     let mut m = f3_session();
 
     compactor
@@ -1320,23 +1731,41 @@ async fn f3_before_compact_event_carries_raw_agent_messages() {
     assert_eq!(events.len(), 1);
     let msgs = serde_json::to_value(&events[0].messages_to_summarize).unwrap();
     let arr = msgs.as_array().expect("array");
-    assert_eq!(arr.len(), 3, "every projected entry is present, `!!` included: {msgs}");
-    assert_eq!(arr[0]["role"], "bashExecution", "roles are preserved: {msgs}");
+    assert_eq!(
+        arr.len(),
+        3,
+        "every projected entry is present, `!!` included: {msgs}"
+    );
+    assert_eq!(
+        arr[0]["role"], "bashExecution",
+        "roles are preserved: {msgs}"
+    );
     assert_eq!(arr[0]["command"], "npm test");
     assert_eq!(arr[0]["output"], "ok");
     assert_eq!(arr[0]["exitCode"], 0);
     assert_eq!(arr[1]["role"], "bashExecution");
     assert_eq!(arr[1]["command"], "cat secret");
     assert_eq!(arr[1]["excludeFromContext"], true);
-    assert_eq!(arr[2]["role"], "custom", "a custom_message keeps its role: {msgs}");
+    assert_eq!(
+        arr[2]["role"], "custom",
+        "a custom_message keeps its role: {msgs}"
+    );
     assert_eq!(arr[2]["customType"], "ext.note");
     assert_eq!(arr[2]["content"], "injected note");
 
     // ...and the summarization prompt text is UNCHANGED: `convertToLlm` still runs, just later.
     let prompts = compactor.summarizer().prompts();
     assert_eq!(prompts.len(), 1, "one summarization call: {prompts:?}");
-    assert!(prompts[0].contains("[User]: Ran `npm test`"), "bash renders as before: {}", prompts[0]);
-    assert!(prompts[0].contains("[User]: injected note"), "custom renders as before: {}", prompts[0]);
+    assert!(
+        prompts[0].contains("[User]: Ran `npm test`"),
+        "bash renders as before: {}",
+        prompts[0]
+    );
+    assert!(
+        prompts[0].contains("[User]: injected note"),
+        "custom renders as before: {}",
+        prompts[0]
+    );
     assert!(
         !prompts[0].contains("cat secret"),
         "an `!!` command is still excluded from the LLM transcript: {}",
@@ -1356,11 +1785,19 @@ fn f3_history_of_only_excluded_bash_still_compacts() {
         msg_entry("e2", Some("e1"), user("recent question here")),
         msg_entry("e3", Some("e2"), assistant("recent answer here")),
     ];
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 7 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 100,
+        keep_recent_tokens: 7,
+    };
     let prep = prepare_compaction(&entries, &TokenCache::default(), &settings)
         .expect("a history of `!!` bash entries is still compactable");
     assert_eq!(prep.first_kept_entry_id, EntryId::from("e2"));
-    assert_eq!(prep.messages_to_summarize.len(), 2, "both excluded commands are carried");
+    assert_eq!(
+        prep.messages_to_summarize.len(),
+        2,
+        "both excluded commands are carried"
+    );
 }
 
 #[tokio::test]
@@ -1371,9 +1808,12 @@ async fn f3_compaction_is_append_only_on_disk() {
     let cwd = PathBuf::from("/proj/f3_append");
     let lay = layout(root.path(), &cwd);
     let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
-    m.append_agent_message(bash_msg("npm test", "ok", false)).unwrap();
-    m.append_agent_message(bash_msg("cat secret", "s3cr3t", true)).unwrap();
-    m.append_custom_message("ext.note", json!("injected note"), true, None).unwrap();
+    m.append_agent_message(bash_msg("npm test", "ok", false))
+        .unwrap();
+    m.append_agent_message(bash_msg("cat secret", "s3cr3t", true))
+        .unwrap();
+    m.append_custom_message("ext.note", json!("injected note"), true, None)
+        .unwrap();
     m.append_message(user("recent question here")).unwrap();
     m.append_message(assistant("recent answer here")).unwrap();
 
@@ -1381,7 +1821,11 @@ async fn f3_compaction_is_append_only_on_disk() {
     let before = std::fs::read_to_string(&file).unwrap();
 
     let compactor = Compactor::new(RecordingSummarizer::new(vec!["HISTORY-SUMMARY"]), NoHooks);
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 7 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 100,
+        keep_recent_tokens: 7,
+    };
     compactor
         .run_compaction(
             &mut m,
@@ -1397,8 +1841,14 @@ async fn f3_compaction_is_append_only_on_disk() {
         .expect("compaction runs");
 
     let after = std::fs::read_to_string(&file).unwrap();
-    assert!(after.starts_with(&before), "existing JSONL bytes are untouched");
-    let added: Vec<&str> = after[before.len()..].lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        after.starts_with(&before),
+        "existing JSONL bytes are untouched"
+    );
+    let added: Vec<&str> = after[before.len()..]
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     assert_eq!(added.len(), 1, "exactly one line was appended: {added:?}");
     let v: serde_json::Value = serde_json::from_str(added[0]).unwrap();
     assert_eq!(v["type"], "compaction");
@@ -1435,7 +1885,8 @@ fn context_message_role_stays_in_lockstep_with_the_raw_projection() {
                 id: EntryId::from("m9"),
                 parent_id: None,
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
- extra: Default::default() },
+                extra: Default::default(),
+            },
             summary: "prior".to_string(),
             first_kept_entry_id: Some(EntryId::from("m0")),
             tokens_before: 10,
@@ -1448,7 +1899,8 @@ fn context_message_role_stays_in_lockstep_with_the_raw_projection() {
                 id: EntryId::from("m10"),
                 parent_id: None,
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
- extra: Default::default() },
+                extra: Default::default(),
+            },
             provider: "p".into(),
             model_id: "m".into(),
         }),
@@ -1457,7 +1909,8 @@ fn context_message_role_stays_in_lockstep_with_the_raw_projection() {
                 id: EntryId::from("m11"),
                 parent_id: None,
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
- extra: Default::default() },
+                extra: Default::default(),
+            },
             custom_type: "ext.state".to_string(),
             data: None,
         }),
@@ -1481,7 +1934,11 @@ fn context_message_role_stays_in_lockstep_with_the_raw_projection() {
     }
 
     // The two entries that the harness fork got wrong, spelled out.
-    assert_eq!(crate::context::context_message_role(&entries[8]), None, "empty branch_summary");
+    assert_eq!(
+        crate::context::context_message_role(&entries[8]),
+        None,
+        "empty branch_summary"
+    );
     assert_eq!(
         crate::context::context_message_role(&entries[5]),
         Some(crate::MessageRole::Custom),
@@ -1520,7 +1977,10 @@ struct UsageSummarizer {
 
 impl UsageSummarizer {
     fn new(usages: Vec<Usage>) -> Self {
-        Self { usages: Mutex::new(usages.into()), calls: Mutex::new(0) }
+        Self {
+            usages: Mutex::new(usages.into()),
+            calls: Mutex::new(0),
+        }
     }
     fn calls(&self) -> usize {
         *self.calls.lock().unwrap()
@@ -1569,14 +2029,20 @@ async fn f4_compaction_entry_records_the_summed_usage_of_a_split_turn() {
     prefix.reasoning = Some(4); // present on ONE side only — Pi still emits the merged key
     let compactor = Compactor::new(UsageSummarizer::new(vec![history, prefix]), NoHooks);
     let model = faux_model();
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 20,
+    };
 
     // The A-05-3 transcript: two complete turns then one oversized final turn, so the cut lands
     // mid-turn and both summarization halves run.
     let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
     m.append_message(user("first turn question short")).unwrap();
-    m.append_message(assistant("first turn answer short")).unwrap();
-    m.append_message(user("second turn question short")).unwrap();
+    m.append_message(assistant("first turn answer short"))
+        .unwrap();
+    m.append_message(user("second turn question short"))
+        .unwrap();
     m.append_message(assistant(&"x ".repeat(120))).unwrap();
 
     let entry = compactor
@@ -1593,15 +2059,33 @@ async fn f4_compaction_entry_records_the_summed_usage_of_a_split_turn() {
         .unwrap()
         .expect("split-turn compaction produces an entry");
 
-    assert_eq!(compactor.summarizer().calls(), 2, "history + turn-prefix halves both ran");
-    let recorded = entry.usage.clone().expect("the entry records the summarization spend");
+    assert_eq!(
+        compactor.summarizer().calls(),
+        2,
+        "history + turn-prefix halves both ran"
+    );
+    let recorded = entry
+        .usage
+        .clone()
+        .expect("the entry records the summarization spend");
     assert_eq!(recorded.input, 107, "inputs of both calls are summed");
     assert_eq!(recorded.output, 23);
     assert_eq!(recorded.cache_read, 11);
     assert_eq!(recorded.total_tokens, 130);
-    assert!((recorded.cost.total - 0.75).abs() < 1e-9, "costs are summed: {}", recorded.cost.total);
-    assert_eq!(recorded.reasoning, Some(4), "a one-sided optional field still merges");
-    assert_eq!(recorded.cache_write_1h, None, "an absent-on-both optional stays absent");
+    assert!(
+        (recorded.cost.total - 0.75).abs() < 1e-9,
+        "costs are summed: {}",
+        recorded.cost.total
+    );
+    assert_eq!(
+        recorded.reasoning,
+        Some(4),
+        "a one-sided optional field still merges"
+    );
+    assert_eq!(
+        recorded.cache_write_1h, None,
+        "an absent-on-both optional stays absent"
+    );
 
     // On disk, in Pi's camelCase shape, on the compaction line itself.
     let line = compaction_line(&m);
@@ -1640,12 +2124,18 @@ async fn f4_a_single_summarization_call_records_exactly_its_own_usage() {
     let only = usage_of(64, 8, 0.125);
     let compactor = Compactor::new(UsageSummarizer::new(vec![only.clone()]), NoHooks);
     let model = faux_model();
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 8 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 100,
+        keep_recent_tokens: 8,
+    };
 
     // The F-1 transcript: an empty branch summary makes the cut a split turn with NO history half.
     let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
-    m.append_message(user("please refactor the parser module thoroughly")).unwrap();
-    m.append_message(assistant_tool("read", "src/main.rs")).unwrap();
+    m.append_message(user("please refactor the parser module thoroughly"))
+        .unwrap();
+    m.append_message(assistant_tool("read", "src/main.rs"))
+        .unwrap();
     m.append_message(tool_result(
         "read",
         "src/main.rs",
@@ -1653,7 +2143,8 @@ async fn f4_a_single_summarization_call_records_exactly_its_own_usage() {
     ))
     .unwrap();
     let from = m.leaf_id().cloned().unwrap();
-    m.append_branch_summary(from, String::new(), None, None, false).unwrap();
+    m.append_branch_summary(from, String::new(), None, None, false)
+        .unwrap();
     m.append_message(user("recent")).unwrap();
 
     let entry = compactor
@@ -1670,12 +2161,26 @@ async fn f4_a_single_summarization_call_records_exactly_its_own_usage() {
         .unwrap()
         .expect("compaction runs");
 
-    assert_eq!(compactor.summarizer().calls(), 1, "only the turn-prefix half is summarized");
-    assert!(entry.summary.starts_with("No prior history."), "no history half ran");
-    assert_eq!(entry.usage, Some(only), "the lone call's usage is recorded verbatim");
+    assert_eq!(
+        compactor.summarizer().calls(),
+        1,
+        "only the turn-prefix half is summarized"
+    );
+    assert!(
+        entry.summary.starts_with("No prior history."),
+        "no history half ran"
+    );
+    assert_eq!(
+        entry.usage,
+        Some(only),
+        "the lone call's usage is recorded verbatim"
+    );
     let line = compaction_line(&m);
     assert_eq!(line["usage"]["input"], 64);
-    assert!(line["usage"].get("reasoning").is_none(), "absent optionals stay absent");
+    assert!(
+        line["usage"].get("reasoning").is_none(),
+        "absent optionals stay absent"
+    );
 }
 
 #[test]
@@ -1737,12 +2242,28 @@ fn f5_an_earlier_compaction_inside_the_kept_window_stays_in_the_context() {
     m.append_message(assistant("oldest answer")).unwrap();
     let keep = m.append_message(user("kept question")).unwrap();
     m.append_message(assistant("kept answer")).unwrap();
-    m.append_compaction("SUMMARY-ONE".to_string(), keep.clone(), 100, None, None, false).unwrap();
+    m.append_compaction(
+        "SUMMARY-ONE".to_string(),
+        keep.clone(),
+        100,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     m.append_message(user("later question")).unwrap();
     m.append_message(assistant("later answer")).unwrap();
     // A second compaction whose cut lands BEFORE the first compaction entry — what happens on a
     // small context window, where `keep_recent_tokens` is not reachable inside window − reserve.
-    m.append_compaction("SUMMARY-TWO".to_string(), keep.clone(), 200, None, None, false).unwrap();
+    m.append_compaction(
+        "SUMMARY-TWO".to_string(),
+        keep.clone(),
+        200,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     m.append_message(user("newest question")).unwrap();
 
     let texts: Vec<String> = m.build_context().messages.iter().map(first_text).collect();
@@ -1751,7 +2272,10 @@ fn f5_an_earlier_compaction_inside_the_kept_window_stays_in_the_context() {
         7,
         "latest summary + 2 kept + the earlier summary + 2 after + 1 newest: {texts:?}"
     );
-    assert!(texts[0].contains("SUMMARY-TWO"), "the governing summary leads: {texts:?}");
+    assert!(
+        texts[0].contains("SUMMARY-TWO"),
+        "the governing summary leads: {texts:?}"
+    );
     assert_eq!(texts[1], "kept question");
     assert_eq!(texts[2], "kept answer");
     assert!(
@@ -1777,11 +2301,17 @@ fn f5_an_earlier_compaction_inside_the_kept_window_stays_in_the_context() {
     let path: Vec<&Entry> = m.entries().iter().collect();
     let raw = build_context_agent_messages(&path);
     assert_eq!(
-        raw.iter().filter(|msg| matches!(msg, AgentMessage::CompactionSummary(_))).count(),
+        raw.iter()
+            .filter(|msg| matches!(msg, AgentMessage::CompactionSummary(_)))
+            .count(),
         2,
         "both compaction summaries are measured: {raw:?}"
     );
-    assert_eq!(raw.len(), texts.len(), "measured and rendered projections have the same shape");
+    assert_eq!(
+        raw.len(),
+        texts.len(),
+        "measured and rendered projections have the same shape"
+    );
 }
 
 #[test]
@@ -1793,13 +2323,19 @@ fn f5_a_compaction_outside_the_kept_window_is_still_dropped() {
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     let q1 = m.append_message(user("oldest question")).unwrap();
     m.append_message(assistant("oldest answer")).unwrap();
-    m.append_compaction("SUMMARY-ONE".to_string(), q1, 100, None, None, false).unwrap();
+    m.append_compaction("SUMMARY-ONE".to_string(), q1, 100, None, None, false)
+        .unwrap();
     let later = m.append_message(user("later question")).unwrap();
     m.append_message(assistant("later answer")).unwrap();
-    m.append_compaction("SUMMARY-TWO".to_string(), later, 200, None, None, false).unwrap();
+    m.append_compaction("SUMMARY-TWO".to_string(), later, 200, None, None, false)
+        .unwrap();
 
     let texts: Vec<String> = m.build_context().messages.iter().map(first_text).collect();
-    assert_eq!(texts.len(), 3, "latest summary + the two kept messages: {texts:?}");
+    assert_eq!(
+        texts.len(),
+        3,
+        "latest summary + the two kept messages: {texts:?}"
+    );
     assert!(texts[0].contains("SUMMARY-TWO"));
     assert!(
         !texts.iter().any(|t| t.contains("SUMMARY-ONE")),
@@ -1855,8 +2391,10 @@ fn f6_session(root: &Path, cwd: &Path) -> SessionManager {
     let lay = layout(root, cwd);
     let mut m = SessionManager::create(cwd, &lay, NewSessionOpts::default()).unwrap();
     for i in 0..4 {
-        m.append_message(user(&format!("question number {i} with several words to add some size")))
-            .unwrap();
+        m.append_message(user(&format!(
+            "question number {i} with several words to add some size"
+        )))
+        .unwrap();
         m.append_message(assistant(&format!(
             "answer number {i} with several words to add some size as well"
         )))
@@ -1866,7 +2404,11 @@ fn f6_session(root: &Path, cwd: &Path) -> SessionManager {
 }
 
 fn f6_settings() -> CompactionSettings {
-    CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 40 }
+    CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 40,
+    }
 }
 
 #[tokio::test]
@@ -1910,13 +2452,20 @@ async fn f6_a_transient_stream_drop_is_retried_and_the_compaction_still_lands() 
         .unwrap()
         .expect("the retried attempt produces a compaction entry");
 
-    assert_eq!(faux.call_count(), 3, "two summarization halves, the first one retried once");
+    assert_eq!(
+        faux.call_count(),
+        3,
+        "two summarization halves, the first one retried once"
+    );
     assert!(
         entry.summary.contains("HISTORY-OK"),
         "the SUCCEEDING attempt's text is what is stored: {}",
         entry.summary
     );
-    assert!(entry.summary.contains("PREFIX-OK"), "and the second half still ran");
+    assert!(
+        entry.summary.contains("PREFIX-OK"),
+        "and the second half still ran"
+    );
 
     // Observable end state: the summary heads the rebuilt context, and the append-only JSONL grew
     // by exactly the one compaction entry.
@@ -1925,10 +2474,17 @@ async fn f6_a_transient_stream_drop_is_retried_and_the_compaction_still_lands() 
         first_text(&ctx.messages[0]).contains("HISTORY-OK"),
         "context leads with the summary"
     );
-    assert!(ctx.messages.len() < entries_before, "context is reduced vs the full history");
+    assert!(
+        ctx.messages.len() < entries_before,
+        "context is reduced vs the full history"
+    );
     assert_eq!(m.entries().len(), entries_before + 1);
     let reopened = SessionManager::open(m.session_file().unwrap()).unwrap();
-    assert_eq!(reopened.entries().len(), entries_before + 1, "history is intact on reload");
+    assert_eq!(
+        reopened.entries().len(),
+        entries_before + 1,
+        "history is intact on reload"
+    );
 }
 
 #[tokio::test]
@@ -1944,7 +2500,10 @@ async fn f6_a_with_retries_disabled_the_same_drop_kills_the_compaction() {
         faux_assistant_message(vec![faux_text(FULL_SUMMARY)], StopReason::Stop).into(),
     ]);
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+    let compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), model.clone()),
+        NoHooks,
+    );
 
     let mut m = f6_session(root.path(), &cwd);
     let entries_before = m.entries().len();
@@ -1968,7 +2527,10 @@ async fn f6_a_with_retries_disabled_the_same_drop_kills_the_compaction() {
     assert!(!has_compaction(&m), "nothing was appended");
     assert_eq!(m.entries().len(), entries_before);
     let after: Vec<String> = m.build_context().messages.iter().map(first_text).collect();
-    assert_eq!(after, before, "the built context is untouched by the failed compaction");
+    assert_eq!(
+        after, before,
+        "the built context is untouched by the failed compaction"
+    );
 }
 
 #[tokio::test]
@@ -2025,7 +2587,10 @@ async fn f6_b_summarization_is_isolated_from_the_session_cache_and_routing() {
     // Enough scripted steps for both rounds whether or not either cut splits a turn.
     faux.set_response_steps((0..6).map(|_| spy.step(FULL_SUMMARY)).collect());
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+    let compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), model.clone()),
+        NoHooks,
+    );
 
     let mut m = f6_session(root.path(), &cwd);
     for round in 0..2 {
@@ -2043,19 +2608,30 @@ async fn f6_b_summarization_is_isolated_from_the_session_cache_and_routing() {
             .unwrap()
             .unwrap_or_else(|| panic!("round {round} compacts"));
         assert!(entry.summary.contains("## Goal"));
-        m.append_message(user("another question with several words to add some size")).unwrap();
-        m.append_message(assistant("another answer with several words to add some size")).unwrap();
+        m.append_message(user("another question with several words to add some size"))
+            .unwrap();
+        m.append_message(assistant(
+            "another answer with several words to add some size",
+        ))
+        .unwrap();
     }
 
     let seen = spy.seen();
-    assert!(seen.len() >= 2, "at least one summarization call per round: {}", seen.len());
+    assert!(
+        seen.len() >= 2,
+        "at least one summarization call per round: {}",
+        seen.len()
+    );
     for (i, opts) in seen.iter().enumerate() {
         assert_eq!(
             opts.cache_retention,
             Some(CacheRetention::None),
             "call {i} must not write a prompt-cache entry it can never read back"
         );
-        assert!(opts.session_id.is_some(), "call {i} carries its own routing id");
+        assert!(
+            opts.session_id.is_some(),
+            "call {i} carries its own routing id"
+        );
     }
     let mut ids: Vec<String> = seen
         .iter()
@@ -2093,24 +2669,36 @@ async fn f6_c_the_session_thinking_level_reaches_both_summarization_halves() {
     // so summaries on a reasoning model were produced without reasoning.
     let spy = OptionSpy::default();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_response_steps(vec![spy.step("HISTORY-SUMMARY"), spy.step("PREFIX-SUMMARY")]);
+    faux.set_response_steps(vec![
+        spy.step("HISTORY-SUMMARY"),
+        spy.step("PREFIX-SUMMARY"),
+    ]);
     let mut model = faux.model().clone();
     model.reasoning = true;
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks)
-        .with_thinking(ModelThinkingLevel::High);
+    let compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), model.clone()),
+        NoHooks,
+    )
+    .with_thinking(ModelThinkingLevel::High);
 
     let cwd = PathBuf::from("/proj/f6_thinking");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m.append_message(user("first turn question short")).unwrap();
-    m.append_message(assistant("first turn answer short")).unwrap();
-    m.append_message(user("second turn question short")).unwrap();
+    m.append_message(assistant("first turn answer short"))
+        .unwrap();
+    m.append_message(user("second turn question short"))
+        .unwrap();
     m.append_message(assistant(&"x ".repeat(120))).unwrap();
 
     let entry = compactor
         .run_compaction(
             &mut m,
             &model,
-            &CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 },
+            &CompactionSettings {
+                enabled: true,
+                reserve_tokens: 10,
+                keep_recent_tokens: 20,
+            },
             CompactionReason::Manual,
             None,
             false,
@@ -2123,7 +2711,11 @@ async fn f6_c_the_session_thinking_level_reaches_both_summarization_halves() {
     let seen = spy.seen();
     assert_eq!(seen.len(), 2, "history half + turn-prefix half");
     for (i, opts) in seen.iter().enumerate() {
-        assert_eq!(opts.reasoning, ModelThinkingLevel::High, "half {i} was summarized WITH thinking");
+        assert_eq!(
+            opts.reasoning,
+            ModelThinkingLevel::High,
+            "half {i} was summarized WITH thinking"
+        );
     }
     // And the merged text of both halves is what the session records + shows the model.
     assert!(entry.summary.contains("HISTORY-SUMMARY"));
@@ -2144,22 +2736,38 @@ async fn f6_c_thinking_is_withheld_from_non_reasoning_models_and_branch_summarie
 
     let cwd = PathBuf::from("/proj/f6_nothink");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-    m.append_message(user("shared question with some words")).unwrap();
-    let shared = m.append_message(assistant("shared answer with some words")).unwrap();
-    m.append_message(user("branch one question with some words")).unwrap();
-    let l1 = m.append_message(assistant("branch one answer with some words")).unwrap();
+    m.append_message(user("shared question with some words"))
+        .unwrap();
+    let shared = m
+        .append_message(assistant("shared answer with some words"))
+        .unwrap();
+    m.append_message(user("branch one question with some words"))
+        .unwrap();
+    let l1 = m
+        .append_message(assistant("branch one answer with some words"))
+        .unwrap();
     m.branch(&shared).unwrap();
-    m.append_message(user("branch two question with some words")).unwrap();
-    let l2 = m.append_message(assistant("branch two answer with some words")).unwrap();
+    m.append_message(user("branch two question with some words"))
+        .unwrap();
+    let l2 = m
+        .append_message(assistant("branch two answer with some words"))
+        .unwrap();
 
     // (a) A non-reasoning model never receives a level, however the session is configured.
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks)
-        .with_thinking(ModelThinkingLevel::High);
+    let compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), model.clone()),
+        NoHooks,
+    )
+    .with_thinking(ModelThinkingLevel::High);
     compactor
         .run_compaction(
             &mut m,
             &model,
-            &CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 },
+            &CompactionSettings {
+                enabled: true,
+                reserve_tokens: 10,
+                keep_recent_tokens: 20,
+            },
             CompactionReason::Manual,
             None,
             false,
@@ -2172,9 +2780,11 @@ async fn f6_c_thinking_is_withheld_from_non_reasoning_models_and_branch_summarie
     // (b) A branch summary on a REASONING model still carries no level.
     let mut reasoning_model = faux.model().clone();
     reasoning_model.reasoning = true;
-    let branch_compactor =
-        Compactor::new(ProviderSummarizer::new(faux.clone(), reasoning_model.clone()), NoHooks)
-            .with_thinking(ModelThinkingLevel::High);
+    let branch_compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), reasoning_model.clone()),
+        NoHooks,
+    )
+    .with_thinking(ModelThinkingLevel::High);
     let summary = branch_compactor
         .run_branch_summary(
             &mut m,
@@ -2182,7 +2792,10 @@ async fn f6_c_thinking_is_withheld_from_non_reasoning_models_and_branch_summarie
             l2,
             Some(l1),
             true,
-            &BranchSummarySettings { reserve_tokens: 16384, skip_prompt: false },
+            &BranchSummarySettings {
+                reserve_tokens: 16384,
+                skip_prompt: false,
+            },
             CancelToken::new(),
         )
         .await
@@ -2191,9 +2804,21 @@ async fn f6_c_thinking_is_withheld_from_non_reasoning_models_and_branch_summarie
     assert!(summary.summary.contains("## Goal"));
 
     let seen = spy.seen();
-    assert_eq!(seen.len(), 2, "one compaction call + one branch-summary call");
-    assert_eq!(seen[0].reasoning, ModelThinkingLevel::Off, "non-reasoning model gets no level");
-    assert_eq!(seen[1].reasoning, ModelThinkingLevel::Off, "branch summaries never set reasoning");
+    assert_eq!(
+        seen.len(),
+        2,
+        "one compaction call + one branch-summary call"
+    );
+    assert_eq!(
+        seen[0].reasoning,
+        ModelThinkingLevel::Off,
+        "non-reasoning model gets no level"
+    );
+    assert_eq!(
+        seen[1].reasoning,
+        ModelThinkingLevel::Off,
+        "branch summaries never set reasoning"
+    );
 }
 
 #[tokio::test]
@@ -2215,7 +2840,8 @@ async fn f6_d_a_zero_context_window_still_caps_the_branch_summary_prompt() {
     m.append_message(user("shared question")).unwrap();
     let shared = m.append_message(assistant("shared answer")).unwrap();
     for i in 0..12 {
-        m.append_message(user(&big(&format!("ABANDONED-{i}")))).unwrap();
+        m.append_message(user(&big(&format!("ABANDONED-{i}"))))
+            .unwrap();
     }
     let abandoned_leaf = m.leaf_id().cloned().unwrap();
     m.branch(&shared).unwrap();
@@ -2223,7 +2849,10 @@ async fn f6_d_a_zero_context_window_still_caps_the_branch_summary_prompt() {
 
     let mut zero_window = faux_model();
     zero_window.context_window = 0;
-    let settings = BranchSummarySettings { reserve_tokens: RESERVE, skip_prompt: false };
+    let settings = BranchSummarySettings {
+        reserve_tokens: RESERVE,
+        skip_prompt: false,
+    };
 
     let entry = compactor
         .run_branch_summary(
@@ -2239,10 +2868,22 @@ async fn f6_d_a_zero_context_window_still_caps_the_branch_summary_prompt() {
         .unwrap()
         .expect("a branch summary is appended");
     assert!(entry.summary.contains("## Goal"));
-    assert!(m.build_context().messages.iter().any(|msg| first_text(msg).contains("## Goal")));
+    assert!(
+        m.build_context()
+            .messages
+            .iter()
+            .any(|msg| first_text(msg).contains("## Goal"))
+    );
 
-    let prompt = compactor.summarizer().prompts().pop().expect("one summarization call");
-    assert!(prompt.contains("ABANDONED-11"), "the newest abandoned work is always summarized");
+    let prompt = compactor
+        .summarizer()
+        .prompts()
+        .pop()
+        .expect("one summarization call");
+    assert!(
+        prompt.contains("ABANDONED-11"),
+        "the newest abandoned work is always summarized"
+    );
     assert!(
         !prompt.contains("ABANDONED-0 "),
         "the oldest abandoned entry is over the 111616-token cap and must be dropped"
@@ -2257,7 +2898,8 @@ async fn f6_d_a_zero_context_window_still_caps_the_branch_summary_prompt() {
     m2.append_message(user("shared question")).unwrap();
     let shared2 = m2.append_message(assistant("shared answer")).unwrap();
     for i in 0..12 {
-        m2.append_message(user(&big(&format!("ABANDONED-{i}")))).unwrap();
+        m2.append_message(user(&big(&format!("ABANDONED-{i}"))))
+            .unwrap();
     }
     let leaf2 = m2.leaf_id().cloned().unwrap();
     m2.branch(&shared2).unwrap();
@@ -2275,8 +2917,15 @@ async fn f6_d_a_zero_context_window_still_caps_the_branch_summary_prompt() {
         .await
         .unwrap()
         .expect("a branch summary is appended");
-    let wide_prompt = wide_compactor.summarizer().prompts().pop().expect("one call");
-    assert!(wide_prompt.contains("ABANDONED-0 "), "a 400k window fits the whole branch");
+    let wide_prompt = wide_compactor
+        .summarizer()
+        .prompts()
+        .pop()
+        .expect("one call");
+    assert!(
+        wide_prompt.contains("ABANDONED-0 "),
+        "a 400k window fits the whole branch"
+    );
 }
 
 // ------------------------------------------- StopReason::Pending guard ------------------------
@@ -2412,7 +3061,8 @@ fn compaction_entry_with_details(
             id: EntryId::from(id),
             parent_id: parent.map(EntryId::from),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
- extra: Default::default() },
+            extra: Default::default(),
+        },
         summary: "PRIOR SUMMARY".to_string(),
         first_kept_entry_id: Some(EntryId::from(first_kept)),
         tokens_before: 100,
@@ -2430,14 +3080,22 @@ fn prev_details() -> serde_json::Value {
 /// (v0.84.1 coding-agent/src/core/compaction/compaction.ts:52).
 #[test]
 fn g21_prepare_compaction_ignores_from_hook_prev_details() {
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 5 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 5,
+    };
     let cache = TokenCache::default();
 
     let build = |from_hook: Option<bool>| {
         vec![
             msg_entry("e0", None, user("the first user message in this session")),
             compaction_entry_with_details("e1", Some("e0"), "e0", prev_details(), from_hook),
-            msg_entry("e2", Some("e1"), user("history that will be summarized away now")),
+            msg_entry(
+                "e2",
+                Some("e1"),
+                user("history that will be summarized away now"),
+            ),
             msg_entry("e3", Some("e2"), user("recent tail kept verbatim")),
         ]
     };
@@ -2480,7 +3138,8 @@ fn g21_prepare_branch_entries_ignores_from_hook_details() {
                 id: EntryId::from("b1"),
                 parent_id: None,
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
- extra: Default::default() },
+                extra: Default::default(),
+            },
             from_id: EntryId::from("from"),
             summary: "abandoned branch summary".to_string(),
             details: Some(prev_details()),
@@ -2501,7 +3160,11 @@ fn g21_prepare_branch_entries_ignores_from_hook_details() {
     for pi_generated in [None, Some(false)] {
         let prep = branch::prepare_branch_entries(&build(pi_generated), 0);
         let (read, modified) = prep.file_ops.compute_lists();
-        assert_eq!(read, vec!["/proj/read-by-hook.rs".to_string()], "from_hook={pi_generated:?}");
+        assert_eq!(
+            read,
+            vec!["/proj/read-by-hook.rs".to_string()],
+            "from_hook={pi_generated:?}"
+        );
         assert_eq!(
             modified,
             vec!["/proj/edited-by-hook.rs".to_string()],
@@ -2528,7 +3191,10 @@ async fn sess022_declined_summary_never_calls_the_summarizer_or_appends() {
     for skip_prompt in [false, true] {
         let rec = Arc::new(RecordingSummarizer::new(vec!["SHOULD-NEVER-RUN"]));
         let compactor = Compactor::new(RecordingArc(rec.clone()), ScriptHooks::default());
-        let settings = BranchSummarySettings { reserve_tokens: 16384, skip_prompt };
+        let settings = BranchSummarySettings {
+            reserve_tokens: 16384,
+            skip_prompt,
+        };
 
         let cwd = PathBuf::from("/proj/sess022");
         let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
@@ -2551,14 +3217,25 @@ async fn sess022_declined_summary_never_calls_the_summarizer_or_appends() {
             .await
             .unwrap();
 
-        assert!(out.is_none(), "skip_prompt={skip_prompt}: no summary entry is returned");
+        assert!(
+            out.is_none(),
+            "skip_prompt={skip_prompt}: no summary entry is returned"
+        );
         assert!(
             rec.prompts().is_empty(),
             "skip_prompt={skip_prompt}: the summarizer must never be invoked"
         );
-        assert_eq!(m.entries().len(), before, "skip_prompt={skip_prompt}: nothing appended");
+        assert_eq!(
+            m.entries().len(),
+            before,
+            "skip_prompt={skip_prompt}: nothing appended"
+        );
         // The navigation itself still happens (pi's gate is on the summary, not the move).
-        assert_eq!(m.leaf_id(), Some(&shared), "skip_prompt={skip_prompt}: leaf moved");
+        assert_eq!(
+            m.leaf_id(),
+            Some(&shared),
+            "skip_prompt={skip_prompt}: leaf moved"
+        );
     }
 }
 
@@ -2617,7 +3294,10 @@ async fn sess034_before_tree_instructions_and_label_reach_the_generator() {
         "branch-summarization.ts:331; got:\n{}",
         prompts[0]
     );
-    assert!(prompts[0].contains(crate::compaction::BRANCH_SUMMARY_PROMPT), "prompt still present");
+    assert!(
+        prompts[0].contains(crate::compaction::BRANCH_SUMMARY_PROMPT),
+        "prompt still present"
+    );
 
     // (b) replaceInstructions + customInstructions → the custom text ALONE.
     let (prompts, _m, _e) = run(BeforeTreeDecision::Proceed {
@@ -2628,7 +3308,11 @@ async fn sess034_before_tree_instructions_and_label_reach_the_generator() {
         },
     })
     .await;
-    assert!(prompts[0].ends_with("ONLY THIS"), "branch-summarization.ts:329; got:\n{}", prompts[0]);
+    assert!(
+        prompts[0].ends_with("ONLY THIS"),
+        "branch-summarization.ts:329; got:\n{}",
+        prompts[0]
+    );
     assert!(
         !prompts[0].contains(crate::compaction::BRANCH_SUMMARY_PROMPT),
         "replaceInstructions drops the standard prompt"
@@ -2653,7 +3337,11 @@ async fn sess034_before_tree_instructions_and_label_reach_the_generator() {
     })
     .await;
     let entry = entry.expect("a summary was produced");
-    assert_eq!(m.label(&entry.id), Some("explored"), "label lands on the summary entry");
+    assert_eq!(
+        m.label(&entry.id),
+        Some("explored"),
+        "label lands on the summary entry"
+    );
 }
 
 /// SESS-042 — a cancel landing before the append must not mutate the session file, on ANY of the
@@ -2678,7 +3366,12 @@ async fn sess042_cancel_before_append_writes_nothing_on_every_summary_source() {
             _cancel: CancelToken,
         ) -> Result<BeforeCompactDecision, CompactionError> {
             self.cancel.cancel();
-            Ok(self.summary.lock().unwrap().take().unwrap_or(BeforeCompactDecision::Proceed))
+            Ok(self
+                .summary
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(BeforeCompactDecision::Proceed))
         }
         async fn post_compact(&self, _ev: &PostCompactEvent) {
             panic!("post_compact must not fire for a cancelled compaction");
@@ -2696,13 +3389,21 @@ async fn sess042_cancel_before_append_writes_nothing_on_every_summary_source() {
     fn seeded(dir: &str) -> SessionManager {
         let mut m =
             SessionManager::in_memory(&PathBuf::from(dir), NewSessionOpts::default()).unwrap();
-        m.append_message(user("q one with enough words to matter here now")).unwrap();
-        m.append_message(assistant("a one with enough words to matter here now")).unwrap();
-        m.append_message(user("q two with enough words to matter here now")).unwrap();
-        m.append_message(assistant("a two with enough words to matter here now")).unwrap();
+        m.append_message(user("q one with enough words to matter here now"))
+            .unwrap();
+        m.append_message(assistant("a one with enough words to matter here now"))
+            .unwrap();
+        m.append_message(user("q two with enough words to matter here now"))
+            .unwrap();
+        m.append_message(assistant("a two with enough words to matter here now"))
+            .unwrap();
         m
     }
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 20,
+    };
 
     // (a) hook-supplied `Custom` summary — the only path with no cancellation awareness at all.
     let cancel = CancelToken::new();
@@ -2716,7 +3417,10 @@ async fn sess042_cancel_before_append_writes_nothing_on_every_summary_source() {
             usage: None,
         })),
     };
-    let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
+    let compactor = Compactor::new(
+        RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))),
+        hooks,
+    );
     let mut m = seeded("/proj/sess042a");
     let before = m.entries().len();
     let err = compactor
@@ -2732,7 +3436,10 @@ async fn sess042_cancel_before_append_writes_nothing_on_every_summary_source() {
         .await
         .expect_err("a cancelled compaction is an error, not a success");
     assert!(matches!(err, CompactionError::Aborted), "got {err:?}");
-    assert!(!has_compaction(&m), "no compaction entry is written after a cancel");
+    assert!(
+        !has_compaction(&m),
+        "no compaction entry is written after a cancel"
+    );
     assert_eq!(m.entries().len(), before, "the session file is not mutated");
 
     // (b) extension override — `run_compaction_prepared`'s `external_override` branch.
@@ -2742,7 +3449,9 @@ async fn sess042_cancel_before_append_writes_nothing_on_every_summary_source() {
         ScriptHooks::default(),
     );
     let mut m = seeded("/proj/sess042b");
-    let (prep, branch_entries) = compactor.prepare(&m, &settings).expect("something to compact");
+    let (prep, branch_entries) = compactor
+        .prepare(&m, &settings)
+        .expect("something to compact");
     let before = m.entries().len();
     cancel.cancel();
     let err = compactor
@@ -2764,6 +3473,9 @@ async fn sess042_cancel_before_append_writes_nothing_on_every_summary_source() {
         .await
         .expect_err("a cancelled compaction is an error");
     assert!(matches!(err, CompactionError::Aborted), "got {err:?}");
-    assert!(!has_compaction(&m), "an extension override is not exempt from the abort re-check");
+    assert!(
+        !has_compaction(&m),
+        "an extension override is not exempt from the abort re-check"
+    );
     assert_eq!(m.entries().len(), before);
 }

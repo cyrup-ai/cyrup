@@ -86,7 +86,11 @@ pub fn publish_parent_session_anchor(session_id: &str) {
     let mut slot = ROOT_PARENT_SESSION_ANCHOR
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *slot = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+    *slot = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
 }
 
 /// Clear the published anchor (pi `delete process.env[SUBAGENT_PARENT_SESSION_ENV]`,
@@ -264,15 +268,23 @@ mod tests {
     /// produces a non-empty overlay once nothing is published.
     #[test]
     fn register_round_trips_and_feeds_the_detached_runner_overlay() {
-        let _guard = REGISTER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = REGISTER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         publish_parent_session_anchor("session-root-1");
-        assert_eq!(published_parent_session_anchor().as_deref(), Some("session-root-1"));
+        assert_eq!(
+            published_parent_session_anchor().as_deref(),
+            Some("session-root-1")
+        );
 
         publish_parent_session_anchor("   ");
         assert_eq!(published_parent_session_anchor(), None);
 
         publish_parent_session_anchor("  session-root-2  ");
-        assert_eq!(published_parent_session_anchor().as_deref(), Some("session-root-2"));
+        assert_eq!(
+            published_parent_session_anchor().as_deref(),
+            Some("session-root-2")
+        );
 
         let overlay = detached_runner_env_overlay();
         assert_eq!(
@@ -310,7 +322,9 @@ mod tests {
     /// returned as an anchor.
     #[test]
     fn published_anchor_shadows_an_inherited_one_like_pis_assignment() {
-        let _guard = REGISTER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = REGISTER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // A PARENT-role session that ALSO inherited an anchor: pi's assignment makes its own id win.
         publish_parent_session_anchor("live-root-session");
@@ -333,11 +347,17 @@ mod tests {
         );
 
         // Neither rung ever yields an empty anchor.
-        assert_eq!(resolve_parent_session_anchor_from(Some("   ".to_string())), None);
+        assert_eq!(
+            resolve_parent_session_anchor_from(Some("   ".to_string())),
+            None
+        );
         assert_eq!(resolve_parent_session_anchor_from(None), None);
         publish_parent_session_anchor("   ");
-        assert_eq!(resolve_parent_session_anchor_from(Some("inherited".to_string())), Some("inherited".to_string()),
-            "a blank publish CLEARS the register rather than shadowing with an empty string");
+        assert_eq!(
+            resolve_parent_session_anchor_from(Some("inherited".to_string())),
+            Some("inherited".to_string()),
+            "a blank publish CLEARS the register rather than shadowing with an empty string"
+        );
 
         clear_parent_session_anchor();
     }

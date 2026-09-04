@@ -22,13 +22,18 @@
 //! it asserts per-column `cell_width()` parity between the linked and unlinked
 //! renders, because `paint`'s symbol stream cannot observe the cursor at all.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::ansi::strip_ansi;
 use crate::transcript::*;
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::CellWidth;
-use ratatui::Terminal;
 use serde_json::json;
 
 /// A deterministic session cwd. Absolute and outside `$HOME`, so `shorten_path`
@@ -103,7 +108,10 @@ fn the_href_is_the_raw_path_percent_encoded_and_the_text_is_shortened() {
     use std::path::Path;
 
     // `path.rs:276-299` — SAFE excludes space, `#`, `%` and every non-ASCII byte.
-    assert_eq!(path_to_file_url(Path::new("/tmp/café")), "file:///tmp/caf%C3%A9");
+    assert_eq!(
+        path_to_file_url(Path::new("/tmp/café")),
+        "file:///tmp/caf%C3%A9"
+    );
     assert_eq!(path_to_file_url(Path::new("/tmp/a b")), "file:///tmp/a%20b");
     assert_eq!(path_to_file_url(Path::new("/tmp/a#b")), "file:///tmp/a%23b");
     assert_eq!(path_to_file_url(Path::new("/tmp/a%b")), "file:///tmp/a%25b");
@@ -111,13 +119,18 @@ fn the_href_is_the_raw_path_percent_encoded_and_the_text_is_shortened() {
     // And through the render: `shorten_path` shortens the SPAN, never the href.
     // Read `$HOME` rather than writing it — six sibling test binaries share this
     // process's environment.
-    let Ok(home) = std::env::var("HOME") else { return };
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
     if home.is_empty() || !home.starts_with('/') {
         return;
     }
     let raw = format!("{home}/aug osc/café.rs");
     let href = path_to_file_url(Path::new(&raw));
-    assert!(href.contains("/aug%20osc/caf%C3%A9.rs"), "href not encoded: {href}");
+    assert!(
+        href.contains("/aug%20osc/caf%C3%A9.rs"),
+        "href not encoded: {href}"
+    );
 
     let theme = UiTheme::dark();
     let mut v = view("read", json!({ "file_path": raw.clone() }), true);
@@ -127,8 +140,14 @@ fn the_href_is_the_raw_path_percent_encoded_and_the_text_is_shortened() {
         "the href must be raw+encoded and the text `~`-shortened:\n{text:?}"
     );
     let plain = strip_ansi(&text);
-    assert!(plain.contains("~/aug osc/café.rs"), "visible text lost:\n{plain}");
-    assert!(!plain.contains("%20"), "the encoded form must never be visible:\n{plain}");
+    assert!(
+        plain.contains("~/aug osc/café.rs"),
+        "visible text lost:\n{plain}"
+    );
+    assert!(
+        !plain.contains("%20"),
+        "the encoded form must never be visible:\n{plain}"
+    );
 }
 
 /// Clause 3: all three arms of `tool_path_span` (`tool_args.rs:47-55`) — the
@@ -150,14 +169,26 @@ fn ls_links_the_session_cwd_and_the_two_unlinked_arms_emit_no_escape() {
     // A non-string path → `StrArg::Invalid` → `[invalid arg]`, error_style, no link.
     let mut invalid = view("read", json!({ "file_path": 42 }), true);
     let text = paint(&mut invalid, &theme, 60, 12);
-    assert!(strip_ansi(&text).contains("[invalid arg]"), "arm lost:\n{text:?}");
-    assert!(!text.contains('\u{1b}'), "`[invalid arg]` must stay inert:\n{text:?}");
+    assert!(
+        strip_ansi(&text).contains("[invalid arg]"),
+        "arm lost:\n{text:?}"
+    );
+    assert!(
+        !text.contains('\u{1b}'),
+        "`[invalid arg]` must stay inert:\n{text:?}"
+    );
 
     // No path at all and no fallback → the `...` placeholder, tool_output_style, no link.
     let mut missing = view("read", json!({}), true);
     let text = paint(&mut missing, &theme, 60, 12);
-    assert!(strip_ansi(&text).contains("read ..."), "arm lost:\n{text:?}");
-    assert!(!text.contains('\u{1b}'), "the `...` placeholder must stay inert:\n{text:?}");
+    assert!(
+        strip_ansi(&text).contains("read ..."),
+        "arm lost:\n{text:?}"
+    );
+    assert!(
+        !text.contains('\u{1b}'),
+        "the `...` placeholder must stay inert:\n{text:?}"
+    );
 }
 
 /// Clause 4: the deliberate non-parity — only four call sites link, and
@@ -169,7 +200,11 @@ fn grep_find_tails_and_the_compact_read_header_stay_unlinked() {
     let theme = UiTheme::dark();
 
     for tool in ["grep", "find"] {
-        let mut v = view(tool, json!({ "pattern": "x", "path": "/tmp/aug-osc" }), true);
+        let mut v = view(
+            tool,
+            json!({ "pattern": "x", "path": "/tmp/aug-osc" }),
+            true,
+        );
         let text = paint(&mut v, &theme, 60, 12);
         assert!(
             strip_ansi(&text).contains("/tmp/aug-osc"),
@@ -183,13 +218,20 @@ fn grep_find_tails_and_the_compact_read_header_stay_unlinked() {
 
     // The collapsed compact `read` header is `compact_read_call` (`tool_args.rs:351`),
     // which never reaches `tool_path_span`.
-    let mut v = view("read", json!({ "file_path": "/tmp/aug-osc/CLAUDE.md" }), true);
+    let mut v = view(
+        "read",
+        json!({ "file_path": "/tmp/aug-osc/CLAUDE.md" }),
+        true,
+    );
     let text = paint(&mut v, &theme, 60, 12);
     assert!(
         strip_ansi(&text).contains("read resource CLAUDE.md"),
         "compact header lost:\n{text:?}"
     );
-    assert!(!text.contains('\u{1b}'), "the compact header is unlinked:\n{text:?}");
+    assert!(
+        !text.contains('\u{1b}'),
+        "the compact header is unlinked:\n{text:?}"
+    );
 }
 
 /// Clause 5: pi's `if (!getCapabilities().hyperlinks) return styledText` early
@@ -201,9 +243,18 @@ fn the_gate_off_buffer_is_byte_identical_to_today() {
     let args = json!({ "file_path": "/tmp/aug-osc/main.rs" });
     let mut off = view("read", args.clone(), false);
     let text = paint(&mut off, &theme, 60, 12);
-    assert!(text.contains("/tmp/aug-osc/main.rs"), "path lost:\n{text:?}");
-    assert!(!text.contains('\u{1b}'), "no ESC with the gate off:\n{text:?}");
-    assert!(!text.contains("]8;;"), "no OSC-8 payload with the gate off:\n{text:?}");
+    assert!(
+        text.contains("/tmp/aug-osc/main.rs"),
+        "path lost:\n{text:?}"
+    );
+    assert!(
+        !text.contains('\u{1b}'),
+        "no ESC with the gate off:\n{text:?}"
+    );
+    assert!(
+        !text.contains("]8;;"),
+        "no OSC-8 payload with the gate off:\n{text:?}"
+    );
 
     // And the gate-on render is the same STRING once the escapes are stripped —
     // the same buffer, plus escapes, never plus columns.
@@ -238,9 +289,17 @@ fn a_wrapped_path_emits_one_pair_per_row_with_the_same_href() {
         2,
         "expected one `open` per wrapped row:\n{linked:?}"
     );
-    assert_eq!(linked.matches(CLOSE).count(), 2, "unbalanced close:\n{linked:?}");
+    assert_eq!(
+        linked.matches(CLOSE).count(),
+        2,
+        "unbalanced close:\n{linked:?}"
+    );
     // No OTHER href was emitted — a cyclic id scheme would have produced one.
-    assert_eq!(linked.matches("\u{1b}]8;;file://").count(), 2, "stray href:\n{linked:?}");
+    assert_eq!(
+        linked.matches("\u{1b}]8;;file://").count(),
+        2,
+        "stray href:\n{linked:?}"
+    );
 }
 
 /// Clause 7 — the most important test in the module. This is the regression the
@@ -267,7 +326,11 @@ fn two_links_in_one_pass_resolve_to_distinct_hrefs() {
             "`{name}` is not wrapped by its own href:\n{linked:?}"
         );
     }
-    assert_eq!(linked.matches("\u{1b}]8;;file://").count(), 2, "id reuse:\n{linked:?}");
+    assert_eq!(
+        linked.matches("\u{1b}]8;;file://").count(),
+        2,
+        "id reuse:\n{linked:?}"
+    );
 
     // Columns do not move, and the content height is gate-independent.
     let mut off = TranscriptView::new();
@@ -276,7 +339,10 @@ fn two_links_in_one_pass_resolve_to_distinct_hrefs() {
     off.push_tool_start("read", json!({ "file_path": "/tmp/aug-osc/first.rs" }));
     off.push_tool_start("write", json!({ "file_path": "/tmp/aug-osc/second.rs" }));
     assert_eq!(strip_ansi(&linked), paint(&mut off, &theme, 60, 16));
-    assert_eq!(on.content_height(60, &theme), off.content_height(60, &theme));
+    assert_eq!(
+        on.content_height(60, &theme),
+        off.content_height(60, &theme)
+    );
 }
 
 /// Clause 8, redirected: the `!bel.contains("8;;")` assertion is already covered at
@@ -302,7 +368,10 @@ fn a_linked_header_sits_above_a_result_body_whose_own_osc_8_was_stripped() {
         "header link lost:\n{text:?}"
     );
     // The body's did not — `result_text` → `ansi::sanitize_display_text` removed it.
-    assert!(!text.contains("file:///tmp/evil"), "body OSC-8 survived:\n{text:?}");
+    assert!(
+        !text.contains("file:///tmp/evil"),
+        "body OSC-8 survived:\n{text:?}"
+    );
     let plain = strip_ansi(&text);
     assert!(plain.contains("linked"), "body content lost:\n{plain}");
     assert!(plain.contains("plain.txt"), "body content lost:\n{plain}");
@@ -328,10 +397,19 @@ fn there_is_no_visible_url_fallback() {
         let mut off = view(tool, args, false);
         let plain = paint(&mut off, &theme, 60, 16);
 
-        assert!(linked.contains("\u{1b}]8;;file://"), "`{tool}` must link:\n{linked:?}");
+        assert!(
+            linked.contains("\u{1b}]8;;file://"),
+            "`{tool}` must link:\n{linked:?}"
+        );
         let visible = strip_ansi(&linked);
-        assert!(!visible.contains("(file://"), "`{tool}` grew a url suffix:\n{visible}");
-        assert!(!visible.contains(" (url"), "`{tool}` grew a url suffix:\n{visible}");
+        assert!(
+            !visible.contains("(file://"),
+            "`{tool}` grew a url suffix:\n{visible}"
+        );
+        assert!(
+            !visible.contains(" (url"),
+            "`{tool}` grew a url suffix:\n{visible}"
+        );
         // The strongest form of the same claim: the gate adds bytes, never columns.
         assert_eq!(visible, plain, "`{tool}` moved a column when linked");
     }
@@ -382,7 +460,10 @@ fn a_wide_grapheme_at_a_run_boundary_keeps_its_true_column_count() {
                 );
             }
         }
-        assert!(saw_wide, "fixture painted no wide grapheme — the test proves nothing");
+        assert!(
+            saw_wide,
+            "fixture painted no wide grapheme — the test proves nothing"
+        );
     }
 
     let theme = UiTheme::dark();
@@ -416,8 +497,16 @@ fn a_wide_grapheme_at_a_run_boundary_keeps_its_true_column_count() {
     }
     // Six runs — the ASCII head plus its first katakana, then one per remaining
     // katakana — and every open is balanced by a close.
-    assert_eq!(linked.matches(&open(href)).count(), 6, "run count moved:\n{linked:?}");
-    assert_eq!(linked.matches(CLOSE).count(), 6, "unbalanced close:\n{linked:?}");
+    assert_eq!(
+        linked.matches(&open(href)).count(),
+        6,
+        "run count moved:\n{linked:?}"
+    );
+    assert_eq!(
+        linked.matches(CLOSE).count(),
+        6,
+        "unbalanced close:\n{linked:?}"
+    );
     assert_eq!(strip_ansi(&linked), paint(&mut off, &theme, 60, 12));
 
     // (b) HEAD-wide, via a wrap. At width 40 `box_lines` gives content width 38; this

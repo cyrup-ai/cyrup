@@ -117,8 +117,7 @@ static DEFAULT_TEMPLATE: PromptTemplate = PromptTemplate {
     // [CYRUP-DELTA] docs pointer references cyrup docs (Pi `system-prompt.ts:131`, "Pi
     // documentation (read only when the user asks about pi itself, its SDK, extensions, themes,
     // skills, or TUI):").
-    docs_header:
-        "cyrup documentation (read only when the user asks about cyrup itself, its SDK, \
+    docs_header: "cyrup documentation (read only when the user asks about cyrup itself, its SDK, \
          extensions, themes, skills, or TUI):",
     // [CYRUP-DELTA] product name only; the instructions are Pi's `:135`, `:137`, `:138` verbatim.
     docs_guidance: &[
@@ -151,7 +150,9 @@ impl Default for SystemPromptBuilder {
 
 impl SystemPromptBuilder {
     pub fn new() -> Self {
-        Self { tmpl: &DEFAULT_TEMPLATE }
+        Self {
+            tmpl: &DEFAULT_TEMPLATE,
+        }
     }
 
     /// Build the full prompt (R-06-001..004). Pure: no I/O, no clock, no panics.
@@ -429,7 +430,11 @@ fn emit_context_files(out: &mut String, t: &PromptTemplate, files: &[ContextFile
 /// [`SystemPromptBuilder::inputs_fingerprint`] hashed `today`, which forced a daily rebuild.
 fn emit_footer(out: &mut String, inp: &PromptInputs) {
     use std::fmt::Write as _;
-    let _ = write!(out, "\nCurrent working directory: {}", normalize_slashes(&inp.cwd));
+    let _ = write!(
+        out,
+        "\nCurrent working directory: {}",
+        normalize_slashes(&inp.cwd)
+    );
 }
 
 fn normalize_slashes(p: &Path) -> String {

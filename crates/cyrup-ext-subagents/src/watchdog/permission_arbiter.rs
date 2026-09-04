@@ -746,7 +746,11 @@ pub async fn request_watchdog_permission(
             // one: upstream's mid-turn abort aborts the agent, whose rejected `prompt` lands in
             // `catch` (`:127-137`) and is reported as `error`. Only the PRE-turn check (`:73`)
             // produces the `cancelled` decision.
-            let decision = if reason.contains("timed out") { "timeout" } else { "error" };
+            let decision = if reason.contains("timed out") {
+                "timeout"
+            } else {
+                "error"
+            };
             finish(
                 request,
                 created_at,
@@ -759,10 +763,17 @@ pub async fn request_watchdog_permission(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
-    use crate::watchdog::child_status::{encode_child_watchdog_config, resolve_child_watchdog_config};
+    use crate::watchdog::child_status::{
+        encode_child_watchdog_config, resolve_child_watchdog_config,
+    };
     use crate::watchdog::settings::default_watchdog_config;
     use tempfile::TempDir;
 
@@ -900,7 +911,10 @@ mod tests {
             "a [redacted] b [redacted] c"
         );
         // Non-ASCII survives intact.
-        assert_eq!(redact_secret_values("héllo sk-abcdefgh ✓"), "héllo [redacted] ✓");
+        assert_eq!(
+            redact_secret_values("héllo sk-abcdefgh ✓"),
+            "héllo [redacted] ✓"
+        );
         assert_eq!(redact_secret_values("Bearer café"), "[redacted]é");
     }
 
@@ -934,7 +948,9 @@ mod tests {
         assert_eq!(concise_reason("   "), "Watchdog returned an empty reason.");
         assert_eq!(concise_reason("  ok  "), "ok");
         assert_eq!(
-            concise_reason(&"y".repeat(MAX_REASON_CHARS + 100)).chars().count(),
+            concise_reason(&"y".repeat(MAX_REASON_CHARS + 100))
+                .chars()
+                .count(),
             MAX_REASON_CHARS
         );
     }
@@ -987,7 +1003,10 @@ mod tests {
         )
         .await;
         assert!(!result.approved);
-        assert_eq!(result.reason, "Watchdog permission arbiter returned no decision.");
+        assert_eq!(
+            result.reason,
+            "Watchdog permission arbiter returned no decision."
+        );
     }
 
     #[tokio::test]
@@ -1013,8 +1032,7 @@ mod tests {
         let raw = encode_child_watchdog_config(
             resolve_child_watchdog_config(&config, None, None, None).as_ref(),
         );
-        let result =
-            request_watchdog_permission(&request(raw, None), &HangingAgent).await;
+        let result = request_watchdog_permission(&request(raw, None), &HangingAgent).await;
         assert!(!result.approved);
         assert_eq!(
             result.reason,
@@ -1110,7 +1128,10 @@ mod tests {
     #[test]
     fn the_five_upstream_validation_errors_all_fire() {
         let cases = [
-            ("[]", "must be an object mapping tool names to allow, ask, or deny."),
+            (
+                "[]",
+                "must be an object mapping tool names to allow, ask, or deny.",
+            ),
             ("{\"  \":\"deny\"}", "contains an empty tool name."),
             (
                 "{\"bash\":\"deny\"}",
@@ -1127,7 +1148,9 @@ mod tests {
             assert!(error.contains(fragment), "{raw} -> {error}");
         }
         assert!(
-            decode_permission_rules(Some("not json")).unwrap_err().contains("not valid JSON"),
+            decode_permission_rules(Some("not json"))
+                .unwrap_err()
+                .contains("not valid JSON"),
         );
     }
 
@@ -1136,8 +1159,13 @@ mod tests {
         // A rule set that validation would refuse, built directly — a parent on another version
         // could still ship it, which is why the decision function checks again.
         let mut rules = PermissionRules::new();
-        for tool in ["bash", "contact_supervisor", "intercom", "subagent_wait", "structured_output"]
-        {
+        for tool in [
+            "bash",
+            "contact_supervisor",
+            "intercom",
+            "subagent_wait",
+            "structured_output",
+        ] {
             rules.insert(tool.to_string(), PermissionRuleDecision::Deny);
             assert_eq!(
                 permission_decision(Some(&rules), tool),
@@ -1147,9 +1175,18 @@ mod tests {
         }
         // An unlisted tool defaults to allow; a listed one gets its rule.
         rules.insert("write".to_string(), PermissionRuleDecision::Ask);
-        assert_eq!(permission_decision(Some(&rules), "write"), PermissionRuleDecision::Ask);
-        assert_eq!(permission_decision(Some(&rules), "read"), PermissionRuleDecision::Allow);
-        assert_eq!(permission_decision(None, "write"), PermissionRuleDecision::Allow);
+        assert_eq!(
+            permission_decision(Some(&rules), "write"),
+            PermissionRuleDecision::Ask
+        );
+        assert_eq!(
+            permission_decision(Some(&rules), "read"),
+            PermissionRuleDecision::Allow
+        );
+        assert_eq!(
+            permission_decision(None, "write"),
+            PermissionRuleDecision::Allow
+        );
     }
 
     #[test]
@@ -1164,7 +1201,10 @@ mod tests {
             "Tool: write\nRedacted arguments: {\"a\":1}"
         );
         let schema = permission_decision_parameters_schema();
-        assert_eq!(schema["properties"]["decision"]["enum"], json!(["approve", "deny"]));
+        assert_eq!(
+            schema["properties"]["decision"]["enum"],
+            json!(["approve", "deny"])
+        );
         assert_eq!(schema["additionalProperties"], json!(false));
     }
 }

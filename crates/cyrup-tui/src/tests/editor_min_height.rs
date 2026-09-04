@@ -41,7 +41,12 @@
 //! vertical budget at all, so nothing there can squeeze anything. cyrup has one inline layout with
 //! a fixed row budget, which is the situation the dock's floors exist to answer, so the dock is the
 //! thing to port — and "no budget" is not an alternative cyrup's renderer can express.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;

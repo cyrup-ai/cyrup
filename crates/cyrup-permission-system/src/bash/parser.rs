@@ -32,7 +32,9 @@ pub fn parse_command_units(command: &str) -> Option<Vec<BashCommand>> {
         if slot.is_none() {
             let mut parser = Parser::new();
             // `set_language` fails only on an ABI mismatch between `tree-sitter` and the grammar.
-            parser.set_language(&tree_sitter_bash::LANGUAGE.into()).ok()?;
+            parser
+                .set_language(&tree_sitter_bash::LANGUAGE.into())
+                .ok()?;
             *slot = Some(parser);
         }
         let parser = slot.as_mut()?;

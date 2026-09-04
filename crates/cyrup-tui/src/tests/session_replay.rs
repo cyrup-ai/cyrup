@@ -16,22 +16,27 @@
 //!   components rather than the `user` prose `convertToLlm` renders them to at the LLM boundary
 //!   (`messages.ts:148-195`; Pi feeds `renderSessionEntries` the raw
 //!   `sessionEntryToContextMessages` projection, `:3506-3516`).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::Arc;
 
+use crate::{App, UiTheme};
 use cyrup_core::{
     ApiId, AssistantMessage, Content, EntryId, Message, ProviderId, StopReason, ToolCall,
     ToolCallId,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::agent_message::{
     AgentMessage, BashExecutionMessage, BranchSummaryMessage, CompactionSummaryMessage,
     CustomRoleMessage,
 };
 use cyrup_session_svc::{AgentSessionRuntime, SessionConfig, SessionFactory, SessionTarget};
-use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
 
@@ -41,7 +46,10 @@ fn app() -> App<TestBackend> {
 
 fn user(text: &str) -> AgentMessage {
     AgentMessage::Core(Message::User {
-        content: vec![Content::Text { text: text.into(), text_signature: None }],
+        content: vec![Content::Text {
+            text: text.into(),
+            text_signature: None,
+        }],
         timestamp: 0,
     })
 }
@@ -60,7 +68,10 @@ fn assistant(content: Vec<Content>) -> AgentMessage {
 }
 
 fn text(t: &str) -> Content {
-    Content::Text { text: t.into(), text_signature: None }
+    Content::Text {
+        text: t.into(),
+        text_signature: None,
+    }
 }
 
 fn tool_call(name: &str, args: serde_json::Value) -> Content {
@@ -85,7 +96,10 @@ fn tool_result_id(id: &str, name: &str, body: &str) -> AgentMessage {
     AgentMessage::Core(Message::ToolResult {
         tool_call_id: ToolCallId::from(id),
         tool_name: name.to_string(),
-        content: vec![Content::Text { text: body.into(), text_signature: None }],
+        content: vec![Content::Text {
+            text: body.into(),
+            text_signature: None,
+        }],
         is_error: false,
         details: None,
         timestamp: 0,
@@ -126,7 +140,9 @@ async fn a_swapped_in_session_replays_its_conversation() {
     )]);
     let provider: Arc<dyn Provider> = faux;
     let factory = Arc::new(SessionFactory::new(provider, config));
-    let rt = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+    let rt = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap();
     let session = rt.session().await;
     let _ = session.prompt("what is the meaning of life").await.unwrap();
     session.wait_for_idle().await;
@@ -180,7 +196,10 @@ fn replay_preserves_message_order_including_tools() {
         "/etc/app.toml",
         "The port is 8080.",
     ] {
-        assert!(out.contains(needle), "replay must render {needle:?}; got:\n{out}");
+        assert!(
+            out.contains(needle),
+            "replay must render {needle:?}; got:\n{out}"
+        );
     }
     let order = |needle: &str| out.find(needle).unwrap();
     assert!(order("read the config") < order("I should open it first"));
@@ -203,13 +222,19 @@ fn replay_attaches_tool_results_to_their_calls() {
     app.state_mut().transcript.tool_expanded = true;
     app.replay_session(&[
         user("what is in the file"),
-        assistant(vec![tool_call("read", serde_json::json!({ "file_path": "/etc/app.toml" }))]),
+        assistant(vec![tool_call(
+            "read",
+            serde_json::json!({ "file_path": "/etc/app.toml" }),
+        )]),
         tool_result("read", "port = 8080"),
     ]);
     app.draw().unwrap();
 
     let out = app.scrollback_text();
-    assert!(out.contains("port = 8080"), "the tool result body must render; got:\n{out}");
+    assert!(
+        out.contains("port = 8080"),
+        "the tool result body must render; got:\n{out}"
+    );
 }
 
 /// `populateHistory` (interactive-mode.ts:3387): replayed prompts are recallable with Up, newest
@@ -243,9 +268,18 @@ fn replay_splits_a_skill_block_submission() {
     app.draw().unwrap();
 
     let out = app.scrollback_text();
-    assert!(out.contains("[skill]"), "the skill invocation block renders; got:\n{out}");
-    assert!(out.contains("deploy"), "the skill name renders; got:\n{out}");
-    assert!(out.contains("ship it"), "the trailing user message renders; got:\n{out}");
+    assert!(
+        out.contains("[skill]"),
+        "the skill invocation block renders; got:\n{out}"
+    );
+    assert!(
+        out.contains("deploy"),
+        "the skill name renders; got:\n{out}"
+    );
+    assert!(
+        out.contains("ship it"),
+        "the trailing user message renders; got:\n{out}"
+    );
 }
 
 /// A `compactionSummary` must reach `CompactionSummaryMessageComponent`, NOT the `user` block —
@@ -268,9 +302,18 @@ fn a_compaction_summary_replays_as_its_own_block_not_a_user_turn() {
     app.draw().unwrap();
 
     let out = app.scrollback_text();
-    assert!(out.contains("[compaction]"), "the compaction block renders; got:\n{out}");
-    assert!(out.contains("Compacted from 42,000 tokens"), "with its token count; got:\n{out}");
-    assert!(out.contains("we refactored the parser"), "and its summary; got:\n{out}");
+    assert!(
+        out.contains("[compaction]"),
+        "the compaction block renders; got:\n{out}"
+    );
+    assert!(
+        out.contains("Compacted from 42,000 tokens"),
+        "with its token count; got:\n{out}"
+    );
+    assert!(
+        out.contains("we refactored the parser"),
+        "and its summary; got:\n{out}"
+    );
     assert!(
         !out.contains("The conversation history before this point was compacted"),
         "the LLM wrapper prose must never be shown; got:\n{out}"
@@ -295,9 +338,18 @@ fn a_branch_summary_replays_as_its_own_block() {
     app.draw().unwrap();
 
     let out = app.scrollback_text();
-    assert!(out.contains("[branch]"), "the branch block renders; got:\n{out}");
-    assert!(out.contains("Branch Summary"), "with its header; got:\n{out}");
-    assert!(out.contains("tried the async rewrite"), "and its summary; got:\n{out}");
+    assert!(
+        out.contains("[branch]"),
+        "the branch block renders; got:\n{out}"
+    );
+    assert!(
+        out.contains("Branch Summary"),
+        "with its header; got:\n{out}"
+    );
+    assert!(
+        out.contains("tried the async rewrite"),
+        "and its summary; got:\n{out}"
+    );
     assert!(
         !out.contains("The following is a summary of a branch"),
         "the LLM wrapper prose must never be shown; got:\n{out}"
@@ -322,8 +374,14 @@ fn a_bash_execution_replays_as_a_bash_block() {
     app.draw().unwrap();
 
     let out = app.scrollback_text();
-    assert!(out.contains("$ git status"), "the bash header renders; got:\n{out}");
-    assert!(out.contains("nothing to commit"), "with its output; got:\n{out}");
+    assert!(
+        out.contains("$ git status"),
+        "the bash header renders; got:\n{out}"
+    );
+    assert!(
+        out.contains("nothing to commit"),
+        "with its output; got:\n{out}"
+    );
     assert!(
         out.contains("$ cat .env") && out.contains("SECRET=xyz"),
         "a `!!` run survives the replay too; got:\n{out}"
@@ -362,13 +420,22 @@ fn a_custom_message_replays_only_when_it_asked_to_be_displayed() {
     app.draw().unwrap();
 
     let out = app.scrollback_text();
-    assert!(out.contains("[review.note]"), "the displayed custom block renders; got:\n{out}");
-    assert!(out.contains("three findings, all minor"), "with its body; got:\n{out}");
+    assert!(
+        out.contains("[review.note]"),
+        "the displayed custom block renders; got:\n{out}"
+    );
+    assert!(
+        out.contains("three findings, all minor"),
+        "with its body; got:\n{out}"
+    );
     assert!(
         !out.contains("internal bookkeeping"),
         "a `display: false` custom message stays hidden; got:\n{out}"
     );
-    assert!(app.editor_mut().history().is_empty(), "an extension message is not a user prompt");
+    assert!(
+        app.editor_mut().history().is_empty(),
+        "an extension message is not a user prompt"
+    );
 }
 
 /// Replaying nothing (a fresh `/new` session) must not invent entries.
@@ -377,7 +444,10 @@ fn replaying_an_empty_session_renders_nothing() {
     let mut app = app();
     app.replay_session(&[]);
     app.draw().unwrap();
-    assert!(app.scrollback_text().trim().is_empty(), "an empty session replays nothing");
+    assert!(
+        app.scrollback_text().trim().is_empty(),
+        "an empty session replays nothing"
+    );
 }
 
 /// **Two calls to the SAME tool in one assistant turn** — the batched-tool shape cyrup's own
@@ -394,8 +464,16 @@ fn replay_pairs_same_name_tool_results_by_call_id() {
     app.replay_session(&[
         user("read both configs"),
         assistant(vec![
-            tool_call_id("call_a", "read", serde_json::json!({ "file_path": "/etc/alpha.toml" })),
-            tool_call_id("call_b", "read", serde_json::json!({ "file_path": "/etc/bravo.toml" })),
+            tool_call_id(
+                "call_a",
+                "read",
+                serde_json::json!({ "file_path": "/etc/alpha.toml" }),
+            ),
+            tool_call_id(
+                "call_b",
+                "read",
+                serde_json::json!({ "file_path": "/etc/bravo.toml" }),
+            ),
         ]),
         tool_result_id("call_a", "read", "alpha_port = 1111"),
         tool_result_id("call_b", "read", "bravo_port = 2222"),
@@ -404,7 +482,8 @@ fn replay_pairs_same_name_tool_results_by_call_id() {
 
     let out = app.scrollback_text();
     let at = |needle: &str| {
-        out.find(needle).unwrap_or_else(|| panic!("replay must render {needle:?}; got:\n{out}"))
+        out.find(needle)
+            .unwrap_or_else(|| panic!("replay must render {needle:?}; got:\n{out}"))
     };
     assert!(
         at("/etc/alpha.toml") < at("alpha_port = 1111"),
@@ -463,7 +542,8 @@ fn live_tool_events_pair_same_name_results_by_call_id() {
 
     let out = app.scrollback_text();
     let at = |needle: &str| {
-        out.find(needle).unwrap_or_else(|| panic!("the live path must render {needle:?}; got:\n{out}"))
+        out.find(needle)
+            .unwrap_or_else(|| panic!("the live path must render {needle:?}; got:\n{out}"))
     };
     assert!(
         at("/etc/alpha.toml") < at("alpha_port = 1111")

@@ -28,14 +28,11 @@ mod usage;
 #[cfg(test)]
 mod tests;
 
-pub use options::{AnthropicOptions, AnthropicThinkingDisplay};
 pub(crate) use driver::decode_stream;
+pub use options::{AnthropicOptions, AnthropicThinkingDisplay};
 #[cfg(test)]
 pub(crate) use params::build_body;
 
-use claude_code::resolve_is_oauth;
-use headers::{build_headers, resolve_url};
-use params::build_params;
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::AuthResult;
 use crate::context::Context;
@@ -44,7 +41,10 @@ use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::stream::sse::SseRequest;
 use crate::utils::provider_plumbing::connect_sse;
+use claude_code::resolve_is_oauth;
 use cyrup_core::{ApiId, CancelToken};
+use headers::{build_headers, resolve_url};
+use params::build_params;
 use std::sync::Arc;
 
 /// The wire-protocol id this impl serves.

@@ -13,7 +13,7 @@ use crate::ids::{gen_session_id, gen_short_id, now_ts};
 use crate::layout::SessionLayout;
 use crate::store::{DiskStore, MemStore, SessionStore};
 
-use super::{entries_have_assistant, SessionManager};
+use super::{SessionManager, entries_have_assistant};
 
 impl SessionManager {
     /// Re-root this session onto the path from root through an EXPLICIT `leaf_id` and switch this
@@ -30,8 +30,11 @@ impl SessionManager {
         leaf_id: &EntryId,
         layout: &SessionLayout,
     ) -> Result<Option<PathBuf>, SessionError> {
-        let path_entries: Vec<Entry> =
-            self.branch_path(Some(leaf_id)).into_iter().cloned().collect();
+        let path_entries: Vec<Entry> = self
+            .branch_path(Some(leaf_id))
+            .into_iter()
+            .cloned()
+            .collect();
         if path_entries.is_empty() {
             // Pi: `throw new Error(`Entry ${leafId} not found`)` (`session-manager.ts:1295-1297`).
             return Err(SessionError::EntryNotFound(leaf_id.clone()));
@@ -67,7 +70,10 @@ impl SessionManager {
         // deterministic and matches Pi (ids themselves are irreducibly random in both ports).
         let mut order: Vec<EntryId> = Vec::new();
         for e in &self.entries {
-            if let Entry::Known(KnownEntry::Label { target_id, label, .. }) = e {
+            if let Entry::Known(KnownEntry::Label {
+                target_id, label, ..
+            }) = e
+            {
                 match label {
                     Some(_) => {
                         if !order.contains(target_id) {
@@ -89,7 +95,8 @@ impl SessionManager {
                     id: gen_short_id(),
                     parent_id: prev.clone(),
                     timestamp: label_ts.clone(),
- extra: Default::default() };
+                    extra: Default::default(),
+                };
                 let lbl = Entry::known(KnownEntry::Label {
                     base,
                     target_id: target_id.clone(),
@@ -100,14 +107,20 @@ impl SessionManager {
             }
         }
 
-        let previous_session_file = self.session_file().map(|p| p.to_string_lossy().into_owned());
+        let previous_session_file = self
+            .session_file()
+            .map(|p| p.to_string_lossy().into_owned());
         let persisted = self.store.is_persisted();
         let id = gen_session_id();
         let ts = now_ts();
         let mut header = SessionHeader::new(id.clone(), self.cwd.to_string_lossy(), ts.clone());
         // Pi: `parentSession: this.persist ? previousSessionFile : undefined`
         // (`session-manager.ts:1321`).
-        header.parent_session = if persisted { previous_session_file } else { None };
+        header.parent_session = if persisted {
+            previous_session_file
+        } else {
+            None
+        };
 
         // Pi `createBranchedSession` in-memory branch (`session-manager.ts:1373-1391`): replace the
         // entries + id, rebuild the index, and return `undefined` — no disk write.

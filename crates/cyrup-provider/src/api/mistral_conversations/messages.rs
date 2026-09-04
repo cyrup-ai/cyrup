@@ -1,10 +1,10 @@
 //! Request encoding — the chat-message encoder (Pi `toChatMessages`,
 //! mistral-conversations.ts:513-598).
 
+use super::tools::build_tool_result_text;
 use crate::api::compat::sanitize_surrogates;
 use cyrup_core::{Content, Message};
 use serde_json::{Map, Value, json};
-use super::tools::build_tool_result_text;
 
 /// Convert cyrup [`Message`]s to Mistral chat messages (Pi `toChatMessages`,
 /// mistral-conversations.ts:513-598).

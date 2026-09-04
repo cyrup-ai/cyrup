@@ -10,12 +10,17 @@
 //! The `ctrl+pageUp`/`ctrl+pageDown` and `ctrl+home`/`ctrl+end` aliases asserted at the bottom are
 //! **v0.84.1** additions (`keybindings.ts:92-99,108-109`), i.e. version lag rather than a port bug;
 //! they are covered here because they land in the same key table.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::*;
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{App, InputEditor, UiTheme};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 fn press(ed: &mut InputEditor, code: KeyCode) {
     ed.handle_key(&KeyEvent::new(code, KeyModifiers::NONE));
@@ -26,7 +31,10 @@ fn new_app() -> App<TestBackend> {
 }
 
 fn numbered(n: usize) -> String {
-    (0..n).map(|i| format!("line{i:02}")).collect::<Vec<_>>().join("\n")
+    (0..n)
+        .map(|i| format!("line{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A buffer of `n` short logical lines, none of which wrap at 40 columns, caret parked at `(0, 0)`.
@@ -73,7 +81,11 @@ fn page_down_moves_the_caret_a_full_page_and_clamps_at_the_last_visual_line() {
     for _ in 0..10 {
         press(&mut ed, KeyCode::PageDown);
     }
-    assert_eq!(ed.cursor().0, 29, "clamped at the last visual line, never past it");
+    assert_eq!(
+        ed.cursor().0,
+        29,
+        "clamped at the last visual line, never past it"
+    );
 }
 
 #[test]
@@ -112,7 +124,11 @@ fn a_page_hop_keeps_the_sticky_goal_column_like_up_and_down() {
     press(&mut ed, KeyCode::PageDown);
     assert_eq!(ed.cursor(), (7, 0), "clamped to the short line");
     press(&mut ed, KeyCode::PageDown);
-    assert_eq!(ed.cursor(), (14, 8), "the goal column is restored, not lost to the short line");
+    assert_eq!(
+        ed.cursor(),
+        (14, 8),
+        "the goal column is restored, not lost to the short line"
+    );
 }
 
 #[test]
@@ -123,7 +139,11 @@ fn a_page_hop_does_not_recall_history() {
     ed.set_terminal_height(24);
     ed.push_history("an older prompt");
     press(&mut ed, KeyCode::PageUp);
-    assert_eq!(ed.text(), "", "PageUp on an empty editor must not pull history in");
+    assert_eq!(
+        ed.text(),
+        "",
+        "PageUp on an empty editor must not pull history in"
+    );
     press(&mut ed, KeyCode::Up);
     assert_eq!(ed.text(), "an older prompt", "cursorUp still does");
 }
@@ -161,7 +181,10 @@ fn pgup_with_an_empty_editor_still_pages_the_transcript() {
     let mut app = new_app();
     assert!(app.state().editor.is_empty());
     app.handle_input(&key(KeyCode::PageUp));
-    assert!(app.state().transcript.scroll_offset() > 0, "the transcript still pages");
+    assert!(
+        app.state().transcript.scroll_offset() > 0,
+        "the transcript still pages"
+    );
 }
 
 #[test]
@@ -209,7 +232,10 @@ fn the_hotkeys_table_names_the_editor_page_binding() {
         .map(|e| format!("{e:?}"))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(text.contains("Scroll by page"), "the row is present:\n{text}");
+    assert!(
+        text.contains("Scroll by page"),
+        "the row is present:\n{text}"
+    );
     // The `KeyId` is camelCase upstream — `"tui.editor.pageUp": { defaultKeys: ["pageUp",
     // "ctrl+pageUp"] }` (`tui/src/keybindings.ts:108-109` @v0.84.1; `:89-90` @v0.83.0 has the bare
     // `"pageUp"`), `keys.ts:122-123` spells the id itself `pageUp`/`pageDown`, `getKeys` returns

@@ -15,7 +15,12 @@
 //!
 //! These tests therefore never touch the `LiveExtension` handle: they ask the HOST to render by
 //! name/type and assert the guest's own text came back.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::fixture;
 
@@ -27,13 +32,24 @@ use std::sync::Arc;
 async fn the_host_routes_a_tool_row_to_the_guest_that_renders_it() {
     let bytes = std::fs::read(fixture::component()).expect("read fixture component bytes");
     let host = cyrup_ext::ExtensionHost::with_wasm(fixture::cfg()).expect("host with wasm runtime");
-    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices)).await.expect("load + init");
+    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load + init");
 
     // The cheap pre-check a UI makes before paying for a guest round trip (Pi
     // `hasRendererDefinition`). `demo_echo` declares `has_renderer`; `signal_probe` does not.
-    assert!(host.has_tool_renderer("demo_echo"), "demo_echo declared a renderer");
-    assert!(!host.has_tool_renderer("signal_probe"), "signal_probe declared none");
-    assert!(!host.has_tool_renderer("bash"), "a built-in with no extension renderer");
+    assert!(
+        host.has_tool_renderer("demo_echo"),
+        "demo_echo declared a renderer"
+    );
+    assert!(
+        !host.has_tool_renderer("signal_probe"),
+        "signal_probe declared none"
+    );
+    assert!(
+        !host.has_tool_renderer("bash"),
+        "a built-in with no extension renderer"
+    );
 
     // Render by TOOL NAME only — no `LiveExtension` handle in sight.
     let call = host
@@ -46,7 +62,10 @@ async fn the_host_routes_a_tool_row_to_the_guest_that_renders_it() {
     // `cyrup-tui/tests/wasm_renderer_screen.rs` for the end-to-end draw).
     assert_eq!(call["widget"], json!("container"));
     assert!(
-        call["children"][0]["text"].as_str().unwrap_or("").contains("guest-rendered echo call"),
+        call["children"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("guest-rendered echo call"),
         "the rendered widget came from the GUEST: {call}"
     );
 
@@ -55,12 +74,19 @@ async fn the_host_routes_a_tool_row_to_the_guest_that_renders_it() {
         .await
         .expect("the host resolved and CALLED the guest's tool-result renderer");
     assert!(
-        result["text"].as_str().unwrap_or("").contains("guest-rendered echo result"),
+        result["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("guest-rendered echo result"),
         "the rendered widget came from the GUEST: {result}"
     );
 
     // A tool nobody renders falls back to the host's own framing (`None`), never an error.
-    assert!(host.render_tool_call("signal_probe", &json!({})).await.is_none());
+    assert!(
+        host.render_tool_call("signal_probe", &json!({}))
+            .await
+            .is_none()
+    );
     assert!(host.render_tool_result("bash", &json!({})).await.is_none());
 }
 
@@ -68,9 +94,14 @@ async fn the_host_routes_a_tool_row_to_the_guest_that_renders_it() {
 async fn the_host_routes_a_custom_message_to_its_registered_renderer() {
     let bytes = std::fs::read(fixture::component()).expect("read fixture component bytes");
     let host = cyrup_ext::ExtensionHost::with_wasm(fixture::cfg()).expect("host with wasm runtime");
-    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices)).await.expect("load + init");
+    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load + init");
 
-    assert!(host.has_message_renderer("demo"), "the guest registered a renderer for `demo`");
+    assert!(
+        host.has_message_renderer("demo"),
+        "the guest registered a renderer for `demo`"
+    );
     assert!(!host.has_message_renderer("nope"));
 
     let widget = host
@@ -93,11 +124,18 @@ async fn the_host_routes_a_custom_message_to_its_registered_renderer() {
 async fn the_first_extension_in_load_order_owns_a_custom_type() {
     let bytes = std::fs::read(fixture::component()).expect("read fixture component bytes");
     let host = cyrup_ext::ExtensionHost::with_wasm(fixture::cfg()).expect("host with wasm runtime");
-    host.load_wasm("demo-first".into(), &bytes, Arc::new(DenyServices)).await.expect("load 1");
-    host.load_wasm("demo-second".into(), &bytes, Arc::new(DenyServices)).await.expect("load 2");
+    host.load_wasm("demo-first".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load 1");
+    host.load_wasm("demo-second".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load 2");
 
     assert_eq!(
-        host.registry().message_renderer_owner("demo").expect("registry").map(|i| i.to_string()),
+        host.registry()
+            .message_renderer_owner("demo")
+            .expect("registry")
+            .map(|i| i.to_string()),
         Some("demo-first".to_string()),
         "the FIRST extension to register a custom type keeps it"
     );
@@ -118,16 +156,30 @@ async fn the_first_extension_in_load_order_owns_a_custom_type() {
 async fn the_host_routes_a_custom_entry_to_its_registered_guest_renderer() {
     let bytes = std::fs::read(fixture::component()).expect("read fixture component bytes");
     let host = cyrup_ext::ExtensionHost::with_wasm(fixture::cfg()).expect("host with wasm runtime");
-    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices)).await.expect("load + init");
+    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load + init");
 
-    assert!(host.has_entry_renderer("demo_card"), "the guest registered an ENTRY renderer");
-    assert!(!host.has_entry_renderer("demo"), "`demo` is a MESSAGE renderer, not an entry one");
-    assert!(!host.has_message_renderer("demo_card"), "and not the other way round either");
+    assert!(
+        host.has_entry_renderer("demo_card"),
+        "the guest registered an ENTRY renderer"
+    );
+    assert!(
+        !host.has_entry_renderer("demo"),
+        "`demo` is a MESSAGE renderer, not an entry one"
+    );
+    assert!(
+        !host.has_message_renderer("demo_card"),
+        "and not the other way round either"
+    );
     assert!(!host.has_entry_renderer("nope"));
 
     match host.render_entry("demo_card", &json!({ "n": 7 })).await {
         cyrup_ext::RenderOutcome::Rendered(v) => assert!(
-            v["text"].as_str().unwrap_or("").contains("guest-rendered entry card"),
+            v["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("guest-rendered entry card"),
             "the rendered widget came from the GUEST: {v}"
         ),
         other => panic!("expected the guest's output, got {other:?}"),
@@ -135,7 +187,10 @@ async fn the_host_routes_a_custom_entry_to_its_registered_guest_renderer() {
 
     // "No renderer claims this type" stays `None` — never `Failed`, or the failure box would draw
     // for every unrendered entry (`interactive-mode.ts:3433-3435` draws nothing at all).
-    assert_eq!(host.render_entry("nope", &json!({})).await, cyrup_ext::RenderOutcome::None);
+    assert_eq!(
+        host.render_entry("nope", &json!({})).await,
+        cyrup_ext::RenderOutcome::None
+    );
 }
 
 /// THE REGRESSION, guest arm. A guest entry renderer that FAULTS (a panic lowers to a wasm trap) is
@@ -146,9 +201,14 @@ async fn the_host_routes_a_custom_entry_to_its_registered_guest_renderer() {
 async fn a_faulting_guest_entry_renderer_reports_failed_not_none() {
     let bytes = std::fs::read(fixture::component()).expect("read fixture component bytes");
     let host = cyrup_ext::ExtensionHost::with_wasm(fixture::cfg()).expect("host with wasm runtime");
-    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices)).await.expect("load + init");
+    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load + init");
 
-    assert!(host.has_entry_renderer("demo_boom"), "the faulting renderer IS registered");
+    assert!(
+        host.has_entry_renderer("demo_boom"),
+        "the faulting renderer IS registered"
+    );
 
     let out = host.render_entry("demo_boom", &json!({})).await;
     assert!(

@@ -12,25 +12,29 @@
 //! with the keyboard, and submitting a prompt — and assert the indicator arms and clears.
 //!
 //! **No network.** The session runs on `FauxProvider`, an in-process canned-response provider.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
-use cyrup_provider::Provider;
-use cyrup_session_svc::{AgentSession, AgentSessionEvent, SessionBuilder, SessionConfig};
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
 use crate::{
-    App, AppAction, AppCommand, SelectorKind, TerminalProgress, UiTheme,
-    TERMINAL_PROGRESS_ACTIVE_SEQUENCE, TERMINAL_PROGRESS_CLEAR_SEQUENCE,
-    TERMINAL_PROGRESS_KEEPALIVE,
+    App, AppAction, AppCommand, SelectorKind, TERMINAL_PROGRESS_ACTIVE_SEQUENCE,
+    TERMINAL_PROGRESS_CLEAR_SEQUENCE, TERMINAL_PROGRESS_KEEPALIVE, TerminalProgress, UiTheme,
 };
+use cyrup_core::StopReason;
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
+use cyrup_session_svc::{AgentSession, AgentSessionEvent, SessionBuilder, SessionConfig};
 use ratatui::backend::TestBackend;
-use tokio_stream::StreamExt;
 use tempfile::TempDir;
-use super::harness::*;
+use tokio_stream::StreamExt;
 
 struct Fixture {
     _tmp: TempDir,
@@ -71,8 +75,12 @@ async fn cycle_terminal_progress_row(
     app: &mut App<TestBackend>,
     session: &Arc<AgentSession>,
 ) -> AppCommand {
-    app.execute_command(AppCommand::OpenSelector(SelectorKind::Settings), session, None)
-        .await;
+    app.execute_command(
+        AppCommand::OpenSelector(SelectorKind::Settings),
+        session,
+        None,
+    )
+    .await;
     assert_eq!(
         app.active_selector_kind(),
         Some(SelectorKind::Settings),
@@ -158,12 +166,18 @@ async fn settings_row_then_a_real_prompt_arms_and_clears_the_indicator() {
         .await
         .expect("the session's event stream should settle");
 
-    assert!(armed_at_start, "agent_start must light the indicator (interactive-mode.ts:2865-2867)");
+    assert!(
+        armed_at_start,
+        "agent_start must light the indicator (interactive-mode.ts:2865-2867)"
+    );
     assert!(
         kept_through_the_turn,
         "the indicator must stay lit, and stay un-rewritten, for the whole turn"
     );
-    assert!(cleared_at_end, "agent_end must clear it (interactive-mode.ts:3057-3059)");
+    assert!(
+        cleared_at_end,
+        "agent_end must clear it (interactive-mode.ts:3057-3059)"
+    );
 }
 
 /// The gate really gates. With the row left OFF — the default — a real turn must produce no
@@ -174,7 +188,10 @@ async fn settings_row_then_a_real_prompt_arms_and_clears_the_indicator() {
 async fn with_the_row_off_a_real_turn_emits_nothing() {
     let fx = fixture().await;
     let mut app = app();
-    assert!(!app.state().terminal_progress.enabled(), "default is off (settings.rs:779-783)");
+    assert!(
+        !app.state().terminal_progress.enabled(),
+        "default is off (settings.rs:779-783)"
+    );
 
     let mut events = fx.session.subscribe();
     let _ = fx.session.prompt("hi").await.unwrap();
@@ -196,7 +213,10 @@ async fn with_the_row_off_a_real_turn_emits_nothing() {
     .await
     .expect("the session's event stream should settle");
 
-    assert!(clean, "with the setting off no event may produce an OSC 9;4 write");
+    assert!(
+        clean,
+        "with the setting off no event may produce an OSC 9;4 write"
+    );
 }
 
 /// A `/compact` is its own progress window (`interactive-mode.ts:3076-3078` / `:3090-3092`) — the
@@ -219,7 +239,10 @@ async fn a_compaction_is_its_own_progress_window() {
     app.ingest_event(&AgentSessionEvent::CompactionStart {
         reason: cyrup_session_svc::CompactionReason::Manual,
     });
-    assert!(app.state().terminal_progress.is_active(), "compaction_start arms");
+    assert!(
+        app.state().terminal_progress.is_active(),
+        "compaction_start arms"
+    );
     assert_eq!(app.state_mut().terminal_progress.take_pending(), Some(true));
 
     app.ingest_event(&AgentSessionEvent::CompactionEnd {
@@ -229,8 +252,14 @@ async fn a_compaction_is_its_own_progress_window() {
         will_retry: false,
         error_message: None,
     });
-    assert!(!app.state().terminal_progress.is_active(), "compaction_end clears");
-    assert_eq!(app.state_mut().terminal_progress.take_pending(), Some(false));
+    assert!(
+        !app.state().terminal_progress.is_active(),
+        "compaction_end clears"
+    );
+    assert_eq!(
+        app.state_mut().terminal_progress.take_pending(),
+        Some(false)
+    );
 }
 
 /// Turning the row back OFF while a turn is running takes the taskbar down with it — the documented
@@ -260,7 +289,10 @@ async fn turning_the_row_off_mid_turn_takes_the_indicator_down() {
     app.execute_command(off, &fx.session, None).await;
 
     assert!(!app.state().terminal_progress.enabled());
-    assert!(!app.state().terminal_progress.is_active(), "the lit indicator must be taken down");
+    assert!(
+        !app.state().terminal_progress.is_active(),
+        "the lit indicator must be taken down"
+    );
     assert_eq!(
         app.state_mut().terminal_progress.take_pending(),
         Some(false),
@@ -276,8 +308,14 @@ async fn turning_the_row_off_mid_turn_takes_the_indicator_down() {
 /// was dropping the stray `;` this asserts is absent.
 #[test]
 fn mirror_the_wire_sequences_are_pis() {
-    assert_eq!(TERMINAL_PROGRESS_ACTIVE_SEQUENCE.as_bytes(), b"\x1b]9;4;3\x07");
-    assert_eq!(TERMINAL_PROGRESS_CLEAR_SEQUENCE.as_bytes(), b"\x1b]9;4;0\x07");
+    assert_eq!(
+        TERMINAL_PROGRESS_ACTIVE_SEQUENCE.as_bytes(),
+        b"\x1b]9;4;3\x07"
+    );
+    assert_eq!(
+        TERMINAL_PROGRESS_CLEAR_SEQUENCE.as_bytes(),
+        b"\x1b]9;4;0\x07"
+    );
     assert!(
         !TERMINAL_PROGRESS_CLEAR_SEQUENCE.contains(";0;"),
         "v0.83.0's trailing `;` was removed at v0.84.1"

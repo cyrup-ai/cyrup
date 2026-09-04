@@ -178,9 +178,13 @@ pub fn sanitize_json_display_value(value: &Value) -> (Value, bool) {
             (Value::String(safe), changed)
         }
         Value::Array(items) => {
-            let sanitized: Vec<(Value, bool)> = items.iter().map(sanitize_json_display_value).collect();
+            let sanitized: Vec<(Value, bool)> =
+                items.iter().map(sanitize_json_display_value).collect();
             let changed = sanitized.iter().any(|(_, c)| *c);
-            (Value::Array(sanitized.into_iter().map(|(v, _)| v).collect()), changed)
+            (
+                Value::Array(sanitized.into_iter().map(|(v, _)| v).collect()),
+                changed,
+            )
         }
         Value::Object(map) => {
             let mut changed = false;
@@ -373,39 +377,60 @@ pub fn validate_transcript_path(
     if trusted_roots.is_empty() {
         return (
             None,
-            Some(format!("Transcript preview has no trusted root: {}", file_path.display())),
+            Some(format!(
+                "Transcript preview has no trusted root: {}",
+                file_path.display()
+            )),
         );
     }
     let resolved = std::path::absolute(file_path).unwrap_or_else(|_| file_path.to_path_buf());
-    if !trusted_roots.iter().any(|root| path_within(root, &resolved)) {
+    if !trusted_roots
+        .iter()
+        .any(|root| path_within(root, &resolved))
+    {
         return (
             None,
-            Some(format!("Transcript is outside trusted roots: {}", file_path.display())),
+            Some(format!(
+                "Transcript is outside trusted roots: {}",
+                file_path.display()
+            )),
         );
     }
     let meta = match std::fs::symlink_metadata(&resolved) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, None),
         Err(e) => {
-            return (None, Some(format!("Transcript could not be inspected: {e}")));
+            return (
+                None,
+                Some(format!("Transcript could not be inspected: {e}")),
+            );
         }
     };
     if meta.file_type().is_symlink() {
         return (
             None,
-            Some(format!("Transcript preview refused a symlink: {}", file_path.display())),
+            Some(format!(
+                "Transcript preview refused a symlink: {}",
+                file_path.display()
+            )),
         );
     }
     if !meta.is_file() {
         return (
             None,
-            Some(format!("Transcript path is not a file: {}", file_path.display())),
+            Some(format!(
+                "Transcript path is not a file: {}",
+                file_path.display()
+            )),
         );
     }
     let real_path = match std::fs::canonicalize(&resolved) {
         Ok(p) => p,
         Err(e) => {
-            return (None, Some(format!("Transcript path could not be resolved: {e}")));
+            return (
+                None,
+                Some(format!("Transcript path could not be resolved: {e}")),
+            );
         }
     };
     let real_roots: Vec<PathBuf> = trusted_roots
@@ -416,7 +441,10 @@ pub fn validate_transcript_path(
     if !real_roots.iter().any(|root| path_within(root, &real_path)) {
         return (
             None,
-            Some(format!("Transcript resolves outside trusted roots: {}", file_path.display())),
+            Some(format!(
+                "Transcript resolves outside trusted roots: {}",
+                file_path.display()
+            )),
         );
     }
     (Some(real_path), None)
@@ -514,7 +542,11 @@ fn read_tail_lines(path: &Path, max_bytes: u64) -> TailRead {
     {
         lines.pop();
     }
-    TailRead { lines, truncated: start > 0, warning: None }
+    TailRead {
+        lines,
+        truncated: start > 0,
+        warning: None,
+    }
 }
 
 // =================================================================================================
@@ -533,7 +565,11 @@ fn clip_message(text: &str) -> String {
 /// pi `stringValue` (`fleet-transcript.ts:137-139`) — a non-blank string, else `None`.
 fn string_value(value: Option<&Value>) -> Option<String> {
     let s = value?.as_str()?;
-    if s.trim().is_empty() { None } else { Some(s.to_string()) }
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 /// pi `numberValue` (`fleet-transcript.ts:141-143`) — a finite number, else `None`.
@@ -552,18 +588,24 @@ fn object_value(value: Option<&Value>) -> Option<&serde_json::Map<String, Value>
 #[must_use]
 pub fn safe_transcript_event(event: &FleetTranscriptEvent) -> FleetTranscriptEvent {
     match event {
-        FleetTranscriptEvent::Assistant { text, model, timestamp } => {
-            FleetTranscriptEvent::Assistant {
-                text: safe_display_text(text),
-                model: model.as_deref().map(safe_display_text),
-                timestamp: *timestamp,
-            }
-        }
+        FleetTranscriptEvent::Assistant {
+            text,
+            model,
+            timestamp,
+        } => FleetTranscriptEvent::Assistant {
+            text: safe_display_text(text),
+            model: model.as_deref().map(safe_display_text),
+            timestamp: *timestamp,
+        },
         FleetTranscriptEvent::User { text, timestamp } => FleetTranscriptEvent::User {
             text: safe_display_text(text),
             timestamp: *timestamp,
         },
-        FleetTranscriptEvent::Notice { text, tone, timestamp } => FleetTranscriptEvent::Notice {
+        FleetTranscriptEvent::Notice {
+            text,
+            tone,
+            timestamp,
+        } => FleetTranscriptEvent::Notice {
             text: safe_display_text(text),
             tone: *tone,
             timestamp: *timestamp,
@@ -636,9 +678,16 @@ fn append_text_event(
         return;
     }
     if assistant {
-        events.push(FleetTranscriptEvent::Assistant { text: clipped, model, timestamp });
+        events.push(FleetTranscriptEvent::Assistant {
+            text: clipped,
+            model,
+            timestamp,
+        });
     } else {
-        events.push(FleetTranscriptEvent::User { text: clipped, timestamp });
+        events.push(FleetTranscriptEvent::User {
+            text: clipped,
+            timestamp,
+        });
     }
 }
 
@@ -688,89 +737,106 @@ pub fn parse_transcript_lines(lines: &[String], conversation_started: bool) -> P
         // spreads over several (a settled `result` holds both the assistant output and the run's
         // error; a `tool_execution_end` holds both the completion and the tool's output), so the
         // rewrite yields a LIST. A record carrying pi's own `recordType` passes through untouched.
-        let rewritten: Vec<serde_json::Map<String, Value>> =
-            if record.contains_key("recordType") { Vec::new() } else { rewrite_cyrup_record(record) };
-        let dispatch: Vec<&serde_json::Map<String, Value>> =
-            if rewritten.is_empty() { vec![record] } else { rewritten.iter().collect() };
+        let rewritten: Vec<serde_json::Map<String, Value>> = if record.contains_key("recordType") {
+            Vec::new()
+        } else {
+            rewrite_cyrup_record(record)
+        };
+        let dispatch: Vec<&serde_json::Map<String, Value>> = if rewritten.is_empty() {
+            vec![record]
+        } else {
+            rewritten.iter().collect()
+        };
 
         for record in dispatch {
-        let record_type = string_value(record.get("recordType"));
-        let timestamp = number_value(record.get("ts"));
+            let record_type = string_value(record.get("recordType"));
+            let timestamp = number_value(record.get("ts"));
 
-        match record_type.as_deref() {
-            Some("truncated") => {
-                explicit_truncation = true;
-            }
-            Some("tool_start") => {
-                let name = string_value(record.get("toolName")).unwrap_or_else(|| "tool".to_string());
-                events.push(FleetTranscriptEvent::Tool(FleetToolEvent {
-                    tool_call_id: string_value(record.get("toolCallId")),
-                    name,
-                    args: string_value(record.get("argsPreview")),
-                    args_payload: string_value(record.get("argsPayload")),
-                    status: ToolStatus::Running,
-                    timestamp,
-                    started_at: timestamp,
-                    ..FleetToolEvent::default()
-                }));
-            }
-            Some("tool_end") => {
-                let is_error = record.get("isError") == Some(&Value::Bool(true));
-                let call_id = string_value(record.get("toolCallId"));
-                let tool_name = string_value(record.get("toolName"));
-                if let Some(tool) =
-                    find_tool(&mut events, call_id.as_deref(), tool_name.as_deref())
-                {
-                    if !tool.result_seen {
-                        tool.status = if is_error { ToolStatus::Error } else { ToolStatus::Complete };
-                    }
-                    if timestamp.is_some() && tool.ended_at.is_none() {
-                        tool.ended_at = timestamp;
-                    }
+            match record_type.as_deref() {
+                Some("truncated") => {
+                    explicit_truncation = true;
                 }
-            }
-            Some("stderr") => {
-                if let Some(text) = string_value(record.get("text")) {
-                    events.push(FleetTranscriptEvent::Notice {
-                        text: clip_message(&text),
-                        tone: NoticeTone::Error,
+                Some("tool_start") => {
+                    let name =
+                        string_value(record.get("toolName")).unwrap_or_else(|| "tool".to_string());
+                    events.push(FleetTranscriptEvent::Tool(FleetToolEvent {
+                        tool_call_id: string_value(record.get("toolCallId")),
+                        name,
+                        args: string_value(record.get("argsPreview")),
+                        args_payload: string_value(record.get("argsPayload")),
+                        status: ToolStatus::Running,
                         timestamp,
-                    });
+                        started_at: timestamp,
+                        ..FleetToolEvent::default()
+                    }));
                 }
-            }
-            Some("message") => {
-                let message = object_value(record.get("message"));
-                let role = string_value(record.get("role"))
-                    .or_else(|| string_value(message.and_then(|m| m.get("role"))));
-                let text = string_value(record.get("text"))
-                    .or_else(|| string_value(message.and_then(|m| m.get("text"))))
-                    .or_else(|| string_value(message.and_then(|m| m.get("content"))));
-                match role.as_deref() {
-                    Some("toolResult" | "tool_result") => {
-                        apply_tool_result(&mut events, record, message, text.as_deref(), timestamp);
+                Some("tool_end") => {
+                    let is_error = record.get("isError") == Some(&Value::Bool(true));
+                    let call_id = string_value(record.get("toolCallId"));
+                    let tool_name = string_value(record.get("toolName"));
+                    if let Some(tool) =
+                        find_tool(&mut events, call_id.as_deref(), tool_name.as_deref())
+                    {
+                        if !tool.result_seen {
+                            tool.status = if is_error {
+                                ToolStatus::Error
+                            } else {
+                                ToolStatus::Complete
+                            };
+                        }
+                        if timestamp.is_some() && tool.ended_at.is_none() {
+                            tool.ended_at = timestamp;
+                        }
                     }
-                    Some("assistant") => {
-                        assistant_seen = true;
-                        if let Some(text) = text {
-                            append_text_event(
+                }
+                Some("stderr") => {
+                    if let Some(text) = string_value(record.get("text")) {
+                        events.push(FleetTranscriptEvent::Notice {
+                            text: clip_message(&text),
+                            tone: NoticeTone::Error,
+                            timestamp,
+                        });
+                    }
+                }
+                Some("message") => {
+                    let message = object_value(record.get("message"));
+                    let role = string_value(record.get("role"))
+                        .or_else(|| string_value(message.and_then(|m| m.get("role"))));
+                    let text = string_value(record.get("text"))
+                        .or_else(|| string_value(message.and_then(|m| m.get("text"))))
+                        .or_else(|| string_value(message.and_then(|m| m.get("content"))));
+                    match role.as_deref() {
+                        Some("toolResult" | "tool_result") => {
+                            apply_tool_result(
                                 &mut events,
-                                true,
-                                &text,
-                                string_value(record.get("model")),
+                                record,
+                                message,
+                                text.as_deref(),
                                 timestamp,
                             );
                         }
-                    }
-                    Some("user") => {
-                        if assistant_seen && let Some(text) = text {
-                            append_text_event(&mut events, false, &text, None, timestamp);
+                        Some("assistant") => {
+                            assistant_seen = true;
+                            if let Some(text) = text {
+                                append_text_event(
+                                    &mut events,
+                                    true,
+                                    &text,
+                                    string_value(record.get("model")),
+                                    timestamp,
+                                );
+                            }
                         }
+                        Some("user") => {
+                            if assistant_seen && let Some(text) = text {
+                                append_text_event(&mut events, false, &text, None, timestamp);
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                _ => {}
             }
-            _ => {}
-        }
         }
     }
 
@@ -781,7 +847,11 @@ pub fn parse_transcript_lines(lines: &[String], conversation_started: bool) -> P
         }
     }
     let events = events.iter().map(safe_transcript_event).collect();
-    ParsedTranscript { events, malformed, explicit_truncation }
+    ParsedTranscript {
+        events,
+        malformed,
+        explicit_truncation,
+    }
 }
 
 /// pi's `role === "toolResult"` branch (`fleet-transcript.ts:338-363`), lifted so the `message`
@@ -806,7 +876,11 @@ fn apply_tool_result(
         events.push(FleetTranscriptEvent::Tool(FleetToolEvent {
             tool_call_id: tool_call_id.clone(),
             name: name.clone(),
-            status: if failed { ToolStatus::Error } else { ToolStatus::Complete },
+            status: if failed {
+                ToolStatus::Error
+            } else {
+                ToolStatus::Complete
+            },
             timestamp,
             ..FleetToolEvent::default()
         }));
@@ -818,7 +892,11 @@ fn apply_tool_result(
         return;
     }
     tool.result_seen = true;
-    tool.status = if failed { ToolStatus::Error } else { ToolStatus::Complete };
+    tool.status = if failed {
+        ToolStatus::Error
+    } else {
+        ToolStatus::Complete
+    };
     if timestamp.is_some() && tool.ended_at.is_none() {
         tool.ended_at = timestamp;
     }
@@ -878,7 +956,9 @@ fn apply_tool_result(
 fn rewrite_cyrup_record(
     record: &serde_json::Map<String, Value>,
 ) -> Vec<serde_json::Map<String, Value>> {
-    let Some(tag) = record.get("type").and_then(Value::as_str) else { return Vec::new() };
+    let Some(tag) = record.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
     match tag {
         // --- vocabulary 1: the settled-run artifact ------------------------------------------
         "tool_call" => {
@@ -928,8 +1008,12 @@ fn rewrite_cyrup_record(
         }
         // --- vocabulary 2: the raw child NDJSON stream ---------------------------------------
         "message_end" => {
-            let Some(message) = object_value(record.get("message")) else { return Vec::new() };
-            let Some(role) = message.get("role").and_then(Value::as_str) else { return Vec::new() };
+            let Some(message) = object_value(record.get("message")) else {
+                return Vec::new();
+            };
+            let Some(role) = message.get("role").and_then(Value::as_str) else {
+                return Vec::new();
+            };
             let timestamp = number_value(message.get("timestamp"));
             let mut out = serde_json::Map::new();
             out.insert("recordType".into(), Value::String("message".into()));
@@ -952,7 +1036,9 @@ fn rewrite_cyrup_record(
                     out.insert("isError".into(), Value::Bool(true));
                 }
             }
-            if role == "assistant" && let Some(model) = string_value(message.get("model")) {
+            if role == "assistant"
+                && let Some(model) = string_value(message.get("model"))
+            {
                 out.insert("model".into(), Value::String(model));
             }
             vec![out]
@@ -1065,7 +1151,10 @@ pub fn read_fleet_transcript(
         };
     };
     let max_records = options.max_records.unwrap_or(DEFAULT_MAX_RECORDS).max(1);
-    let tail = read_tail_lines(&resolved, options.max_bytes.unwrap_or(DEFAULT_MAX_BYTES).max(1024));
+    let tail = read_tail_lines(
+        &resolved,
+        options.max_bytes.unwrap_or(DEFAULT_MAX_BYTES).max(1024),
+    );
     let records_omitted = tail.truncated || tail.lines.len() > max_records;
     let selected = tail
         .lines
@@ -1122,7 +1211,10 @@ fn json_scalar(value: Option<&Value>) -> Option<String> {
 /// pi `parseToolArgs` (`fleet-transcript.ts:418-425`).
 fn parse_tool_args(event: &FleetToolEvent) -> Option<serde_json::Map<String, Value>> {
     let payload = event.args_payload.as_ref()?;
-    serde_json::from_str::<Value>(payload).ok()?.as_object().cloned()
+    serde_json::from_str::<Value>(payload)
+        .ok()?
+        .as_object()
+        .cloned()
 }
 
 /// JS `Number.prototype.toFixed(1)` — rounds half AWAY FROM ZERO, where Rust's `{:.1}` rounds half
@@ -1140,7 +1232,10 @@ fn to_fixed_1(value: f64) -> String {
 pub fn tool_duration(event: &FleetToolEvent) -> Option<String> {
     let started = event.started_at?;
     let ended = event.ended_at?;
-    Some(format!("{}s", to_fixed_1((ended - started) as f64 / 1000.0)))
+    Some(format!(
+        "{}s",
+        to_fixed_1((ended - started) as f64 / 1000.0)
+    ))
 }
 
 /// pi `bounded` (`fleet-transcript.ts:488-490`).
@@ -1168,7 +1263,11 @@ fn render_expanded_tool(event: &FleetToolEvent, width: usize) -> Vec<Line<'stati
     let args = parse_tool_args(event);
     let glyph = tool_status_glyph(event.status);
     let output = event.output.as_ref().or(event.error.as_ref());
-    let output_role = if event.status == ToolStatus::Error { Role::Error } else { Role::ToolOutput };
+    let output_role = if event.status == ToolStatus::Error {
+        Role::Error
+    } else {
+        Role::ToolOutput
+    };
     let body_width = width.saturating_sub(4).max(1);
 
     if event.name == "bash" {
@@ -1176,7 +1275,11 @@ fn render_expanded_tool(event: &FleetToolEvent, width: usize) -> Vec<Line<'stati
             .or_else(|| event.args.clone())
             .unwrap_or_else(|| "(unknown command)".to_string());
         lines.push(rail_line(
-            vec![glyph, th::raw(" "), th::fg_bold(Role::ToolTitle, format!("$ {command}"))],
+            vec![
+                glyph,
+                th::raw(" "),
+                th::fg_bold(Role::ToolTitle, format!("$ {command}")),
+            ],
             width,
         ));
         if let Some(output) = output {
@@ -1189,7 +1292,10 @@ fn render_expanded_tool(event: &FleetToolEvent, width: usize) -> Vec<Line<'stati
             }
         }
         if let Some(duration) = tool_duration(event) {
-            lines.push(rail_line(vec![th::fg(Role::Dim, format!("  Took {duration}"))], width));
+            lines.push(rail_line(
+                vec![th::fg(Role::Dim, format!("  Took {duration}"))],
+                width,
+            ));
         }
         return lines;
     }
@@ -1207,13 +1313,14 @@ fn render_expanded_tool(event: &FleetToolEvent, width: usize) -> Vec<Line<'stati
                 .split('\n')
                 .map(|l| Line::from(vec![th::fg(Role::Error, l)]))
                 .collect(),
-            Some(output) => output.split('\n').map(|l| Line::from(vec![th::raw(l)])).collect(),
+            Some(output) => output
+                .split('\n')
+                .map(|l| Line::from(vec![th::raw(l)]))
+                .collect(),
         };
         let title = format!(
             "read {}",
-            file_path
-                .or_else(|| event.args.clone())
-                .unwrap_or_default()
+            file_path.or_else(|| event.args.clone()).unwrap_or_default()
         );
         lines.push(rail_line(
             vec![glyph, th::raw(" "), th::fg_bold(Role::ToolTitle, title)],
@@ -1230,7 +1337,11 @@ fn render_expanded_tool(event: &FleetToolEvent, width: usize) -> Vec<Line<'stati
     }
 
     lines.push(rail_line(
-        vec![glyph, th::raw(" "), th::fg_bold(Role::ToolTitle, event.name.clone())],
+        vec![
+            glyph,
+            th::raw(" "),
+            th::fg_bold(Role::ToolTitle, event.name.clone()),
+        ],
         width,
     ));
     if let Some(payload) = event.args_payload.as_ref() {
@@ -1328,10 +1439,7 @@ pub fn render_fleet_transcript(
                 {
                     let output_lines: Vec<&str> = output.trim_end().split('\n').collect();
                     let hidden = output_lines.len().saturating_sub(TOOL_PREVIEW_LINES);
-                    let visible = output_lines
-                        .get(hidden..)
-                        .unwrap_or(&output_lines)
-                        .to_vec();
+                    let visible = output_lines.get(hidden..).unwrap_or(&output_lines).to_vec();
                     for output_line in visible {
                         for wrapped in
                             render_wrapped(vec![th::fg(Role::ToolOutput, output_line)], body_width)
@@ -1381,7 +1489,10 @@ pub fn render_fleet_transcript(
                             .iter()
                             .map(|s| s.content.as_ref())
                             .collect();
-                        lines.push(rail_line(vec![th::fg(Role::Error, format!("  {text}"))], width));
+                        lines.push(rail_line(
+                            vec![th::fg(Role::Error, format!("  {text}"))],
+                            width,
+                        ));
                     }
                 }
             }
@@ -1394,8 +1505,11 @@ pub fn render_fleet_transcript(
                 for notice_line in
                     render_wrapped(vec![th::raw(text.clone())], width.saturating_sub(2).max(1))
                 {
-                    let content: String =
-                        notice_line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    let content: String = notice_line
+                        .spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect();
                     lines.push(rail_line(vec![th::fg(role, content)], width));
                 }
             }
@@ -1409,10 +1523,7 @@ pub fn render_fleet_transcript(
     }
 
     // pi `:575` — drop trailing rail-only spacer lines.
-    while lines
-        .last()
-        .is_some_and(|line| th::line_width(line) == 1)
-    {
+    while lines.last().is_some_and(|line| th::line_width(line) == 1) {
         lines.pop();
     }
     lines
@@ -1438,7 +1549,10 @@ fn render_message(
         head.push(th::fg(Role::Dim, format!(" · {model}")));
     }
     lines.push(bounded(Line::from(head), width));
-    for body in render_wrapped(vec![th::raw(text.to_string())], width.saturating_sub(2).max(1)) {
+    for body in render_wrapped(
+        vec![th::raw(text.to_string())],
+        width.saturating_sub(2).max(1),
+    ) {
         lines.push(rail_line(body.spans, width));
     }
     lines.push(Line::from(vec![th::fg(Role::BorderMuted, "│")]));
@@ -1486,7 +1600,10 @@ mod tests {
             r#"{"type":"result","agent":"reviewer","exitCode":0,"model":"opus","output":"All good.","error":null}"#.into(),
         ];
         let parsed = parse_transcript_lines(&lines, false);
-        assert!(!parsed.events.is_empty(), "the real artifact must not parse to nothing");
+        assert!(
+            !parsed.events.is_empty(),
+            "the real artifact must not parse to nothing"
+        );
 
         let tools: Vec<&FleetToolEvent> = parsed
             .events
@@ -1499,7 +1616,11 @@ mod tests {
         assert_eq!(tools.len(), 2, "one row per recorded call");
         assert_eq!(tools[0].name, "bash", "the `$ ` prefix identifies bash");
         assert_eq!(tools[0].args.as_deref(), Some("ls -la"));
-        assert_eq!(tools[0].status, ToolStatus::Complete, "a settled run's tools are not running");
+        assert_eq!(
+            tools[0].status,
+            ToolStatus::Complete,
+            "a settled run's tools are not running"
+        );
         assert_eq!(tools[1].name, "read");
         assert_eq!(tools[1].args.as_deref(), Some("src/main.rs"));
 
@@ -1576,7 +1697,10 @@ mod tests {
             .collect();
         assert_eq!(tools.len(), 2, "one row per call the writer recorded");
         assert_eq!(tools[0].name, "bash");
-        assert_eq!(tools[0].args.as_deref(), Some("cargo test -p cyrup-ext-subagents"));
+        assert_eq!(
+            tools[0].args.as_deref(),
+            Some("cargo test -p cyrup-ext-subagents")
+        );
         assert_eq!(tools[0].status, ToolStatus::Complete);
         assert_eq!(tools[1].name, "read");
         assert_eq!(tools[1].args.as_deref(), Some("src/lib.rs"));
@@ -1596,15 +1720,22 @@ mod tests {
         let transcript = transcript_with(parsed.events.clone());
         let rendered = render_fleet_transcript(&transcript, 60, false);
         let flat = th::lines_text(&rendered);
-        assert!(flat.contains("The change is safe."), "the assistant turn is painted");
-        assert!(flat.contains("cargo test -p cyrup-ext-subagents"), "the bash args are painted");
+        assert!(
+            flat.contains("The change is safe."),
+            "the assistant turn is painted"
+        );
+        assert!(
+            flat.contains("cargo test -p cyrup-ext-subagents"),
+            "the bash args are painted"
+        );
         assert!(flat.contains("src/lib.rs"), "the read args are painted");
     }
 
     #[test]
     fn a_failed_run_records_its_error_as_a_notice() {
         let lines = vec![
-            r#"{"type":"result","agent":"a","exitCode":1,"output":null,"error":"boom"}"#.to_string(),
+            r#"{"type":"result","agent":"a","exitCode":1,"output":null,"error":"boom"}"#
+                .to_string(),
         ];
         let parsed = parse_transcript_lines(&lines, false);
         let notice = parsed.events.iter().find_map(|e| match e {
@@ -1624,21 +1755,31 @@ mod tests {
         ];
         let parsed = parse_transcript_lines(&lines, false);
         let assistant = parsed.events.iter().find_map(|e| match e {
-            FleetTranscriptEvent::Assistant { text, model, timestamp } => {
-                Some((text.clone(), model.clone(), *timestamp))
-            }
+            FleetTranscriptEvent::Assistant {
+                text,
+                model,
+                timestamp,
+            } => Some((text.clone(), model.clone(), *timestamp)),
             _ => None,
         });
         assert_eq!(
             assistant,
-            Some(("hello there".to_string(), Some("sonnet".to_string()), Some(42))),
+            Some((
+                "hello there".to_string(),
+                Some("sonnet".to_string()),
+                Some(42)
+            )),
             "the text block must be lifted out of the content array; thinking must not"
         );
         let user = parsed.events.iter().find_map(|e| match e {
             FleetTranscriptEvent::User { text, .. } => Some(text.clone()),
             _ => None,
         });
-        assert_eq!(user, Some("do it".to_string()), "a supervisor turn after an assistant one");
+        assert_eq!(
+            user,
+            Some("do it".to_string()),
+            "a supervisor turn after an assistant one"
+        );
     }
 
     #[test]
@@ -1655,8 +1796,15 @@ mod tests {
         let tool = tool.expect("one tool row");
         assert_eq!(tool.name, "bash");
         assert_eq!(tool.status, ToolStatus::Complete);
-        assert_eq!(tool.args.as_deref(), Some("echo hi"), "args object must become a preview");
-        assert!(tool.args_payload.is_some(), "the full args object must survive for `x` expansion");
+        assert_eq!(
+            tool.args.as_deref(),
+            Some("echo hi"),
+            "args object must become a preview"
+        );
+        assert!(
+            tool.args_payload.is_some(),
+            "the full args object must survive for `x` expansion"
+        );
         assert_eq!(
             tool.output.as_deref(),
             Some("hi"),
@@ -1684,7 +1832,8 @@ mod tests {
     fn pis_own_record_type_vocabulary_still_wins_untouched() {
         // A record carrying BOTH must be read as pi's — the rewrite is the fallback, not an override.
         let lines = vec![
-            r#"{"recordType":"message","type":"tool_call","role":"assistant","text":"pi wins"}"#.to_string(),
+            r#"{"recordType":"message","type":"tool_call","role":"assistant","text":"pi wins"}"#
+                .to_string(),
         ];
         let parsed = parse_transcript_lines(&lines, false);
         assert!(matches!(
@@ -1695,24 +1844,46 @@ mod tests {
 
     #[test]
     fn lifecycle_only_records_rewrite_to_nothing() {
-        for tag in ["agent_start", "turn_start", "turn_end", "message_start", "message_update", "agent_settled"] {
+        for tag in [
+            "agent_start",
+            "turn_start",
+            "turn_end",
+            "message_start",
+            "message_update",
+            "agent_settled",
+        ] {
             let lines = vec![format!(r#"{{"type":"{tag}"}}"#)];
             let parsed = parse_transcript_lines(&lines, false);
             assert!(parsed.events.is_empty(), "{tag} must render nothing");
-            assert_eq!(parsed.malformed, 0, "{tag} is well-formed, just not displayable");
+            assert_eq!(
+                parsed.malformed, 0,
+                "{tag} is well-formed, just not displayable"
+            );
         }
     }
 
     #[test]
     fn a_formatted_tool_preview_splits_back_into_name_and_args() {
-        assert_eq!(split_formatted_tool_call("$ git status"), ("bash".into(), "git status".into()));
-        assert_eq!(split_formatted_tool_call("edit a/b.rs"), ("edit".into(), "a/b.rs".into()));
+        assert_eq!(
+            split_formatted_tool_call("$ git status"),
+            ("bash".into(), "git status".into())
+        );
+        assert_eq!(
+            split_formatted_tool_call("edit a/b.rs"),
+            ("edit".into(), "a/b.rs".into())
+        );
         assert_eq!(
             split_formatted_tool_call("grep {\"pattern\":\"x\"}"),
             ("grep".into(), "{\"pattern\":\"x\"}".into())
         );
-        assert_eq!(split_formatted_tool_call("bare"), ("bare".into(), String::new()));
-        assert_eq!(split_formatted_tool_call("   "), ("tool".into(), String::new()));
+        assert_eq!(
+            split_formatted_tool_call("bare"),
+            ("bare".into(), String::new())
+        );
+        assert_eq!(
+            split_formatted_tool_call("   "),
+            ("tool".into(), String::new())
+        );
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1736,7 +1907,10 @@ mod tests {
                 model: Some("opus".into()),
                 timestamp: None,
             },
-            FleetTranscriptEvent::User { text: "ask".into(), timestamp: None },
+            FleetTranscriptEvent::User {
+                text: "ask".into(),
+                timestamp: None,
+            },
         ]);
         let lines = render_fleet_transcript(&transcript, 60, false);
         assert!(
@@ -1772,7 +1946,10 @@ mod tests {
             })]);
             let lines = render_fleet_transcript(&transcript, 60, false);
             let painted = th::painted_style(&lines, 60, glyph);
-            assert!(th::paints_as(painted, role), "{glyph} must paint as {role:?}");
+            assert!(
+                th::paints_as(painted, role),
+                "{glyph} must paint as {role:?}"
+            );
         }
     }
 
@@ -1785,9 +1962,18 @@ mod tests {
             ..FleetToolEvent::default()
         })]);
         let lines = render_fleet_transcript(&transcript, 60, false);
-        assert!(th::paints_as(th::painted_style(&lines, 60, "grep"), Role::ToolTitle));
-        assert!(th::paints_as(th::painted_style(&lines, 60, "needle"), Role::Dim));
-        assert!(th::paints_as(th::painted_style(&lines, 60, "├─"), Role::BorderMuted));
+        assert!(th::paints_as(
+            th::painted_style(&lines, 60, "grep"),
+            Role::ToolTitle
+        ));
+        assert!(th::paints_as(
+            th::painted_style(&lines, 60, "needle"),
+            Role::Dim
+        ));
+        assert!(th::paints_as(
+            th::painted_style(&lines, 60, "├─"),
+            Role::BorderMuted
+        ));
     }
 
     #[test]
@@ -1814,12 +2000,18 @@ mod tests {
     fn a_transcript_warning_paints_warning_and_the_truncation_hint_paints_dim() {
         let transcript = FleetTranscript {
             path: PathBuf::from("/tmp/t.jsonl"),
-            events: vec![FleetTranscriptEvent::User { text: "hi".into(), timestamp: None }],
+            events: vec![FleetTranscriptEvent::User {
+                text: "hi".into(),
+                timestamp: None,
+            }],
             truncated: true,
             warning: Some("clipped".into()),
         };
         let lines = render_fleet_transcript(&transcript, 60, false);
-        assert!(th::paints_as(th::painted_style(&lines, 60, "clipped"), Role::Warning));
+        assert!(th::paints_as(
+            th::painted_style(&lines, 60, "clipped"),
+            Role::Warning
+        ));
         assert!(th::paints_as(
             th::painted_style(&lines, 60, "↑ Earlier activity omitted"),
             Role::Dim
@@ -1861,7 +2053,10 @@ mod tests {
 
     #[test]
     fn tool_args_payload_falls_back_to_text_sanitization_when_unparseable() {
-        assert_eq!(safe_tool_args_payload("not json\u{202e}"), "not json[U+202E]");
+        assert_eq!(
+            safe_tool_args_payload("not json\u{202e}"),
+            "not json[U+202E]"
+        );
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1880,8 +2075,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let other = tempfile::TempDir::new().unwrap();
         let path = write_transcript(other.path(), "t.jsonl", &["{}"]);
-        let (resolved, warning) =
-            validate_transcript_path(&path, &[dir.path().to_path_buf()]);
+        let (resolved, warning) = validate_transcript_path(&path, &[dir.path().to_path_buf()]);
         assert!(resolved.is_none());
         assert!(warning.unwrap().contains("outside trusted roots"));
     }
@@ -1889,8 +2083,10 @@ mod tests {
     #[test]
     fn missing_file_is_neither_resolved_nor_warned() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (resolved, warning) =
-            validate_transcript_path(&dir.path().join("absent.jsonl"), &[dir.path().to_path_buf()]);
+        let (resolved, warning) = validate_transcript_path(
+            &dir.path().join("absent.jsonl"),
+            &[dir.path().to_path_buf()],
+        );
         assert!(resolved.is_none());
         assert!(warning.is_none());
     }
@@ -1944,7 +2140,11 @@ mod tests {
         );
         assert_eq!(transcript.warning, None);
         assert_eq!(
-            transcript.events.iter().map(FleetTranscriptEvent::kind).collect::<Vec<_>>(),
+            transcript
+                .events
+                .iter()
+                .map(FleetTranscriptEvent::kind)
+                .collect::<Vec<_>>(),
             vec!["assistant", "tool", "user", "notice"]
         );
         let FleetTranscriptEvent::Tool(tool) = &transcript.events[1] else {
@@ -2003,7 +2203,11 @@ mod tests {
         let path = write_transcript(
             dir.path(),
             "t.jsonl",
-            &["not json", "[1,2]", r#"{"recordType":"message","role":"assistant","text":"ok"}"#],
+            &[
+                "not json",
+                "[1,2]",
+                r#"{"recordType":"message","role":"assistant","text":"ok"}"#,
+            ],
         );
         let transcript = read_fleet_transcript(
             &path,
@@ -2074,10 +2278,18 @@ mod tests {
             },
         );
         assert_eq!(
-            transcript.events.iter().map(FleetTranscriptEvent::kind).collect::<Vec<_>>(),
+            transcript
+                .events
+                .iter()
+                .map(FleetTranscriptEvent::kind)
+                .collect::<Vec<_>>(),
             vec!["assistant", "tool"]
         );
-        let FleetTranscriptEvent::Assistant { text, model, timestamp } = &transcript.events[0]
+        let FleetTranscriptEvent::Assistant {
+            text,
+            model,
+            timestamp,
+        } = &transcript.events[0]
         else {
             panic!("expected assistant event");
         };
@@ -2111,7 +2323,12 @@ mod tests {
     // -----------------------------------------------------------------------------------------
 
     fn transcript_with(events: Vec<FleetTranscriptEvent>) -> FleetTranscript {
-        FleetTranscript { path: PathBuf::from("t.jsonl"), events, truncated: false, warning: None }
+        FleetTranscript {
+            path: PathBuf::from("t.jsonl"),
+            events,
+            truncated: false,
+            warning: None,
+        }
     }
 
     #[test]
@@ -2122,7 +2339,10 @@ mod tests {
                 model: Some("m1".into()),
                 timestamp: None,
             },
-            FleetTranscriptEvent::User { text: "go".into(), timestamp: None },
+            FleetTranscriptEvent::User {
+                text: "go".into(),
+                timestamp: None,
+            },
         ]);
         let text = th::lines_text(&render_fleet_transcript(&transcript, 40, false));
         assert!(text.contains("◆ Assistant · m1"), "{text}");
@@ -2131,7 +2351,10 @@ mod tests {
 
     #[test]
     fn collapsed_bash_tool_previews_the_output_tail_and_reports_hidden_lines() {
-        let output = (0..12).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let output = (0..12)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let transcript = transcript_with(vec![FleetTranscriptEvent::Tool(FleetToolEvent {
             name: "bash".into(),
             args: Some("ls".into()),

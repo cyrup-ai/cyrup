@@ -17,14 +17,11 @@
 
 use std::path::PathBuf;
 
-
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::artifacts::project_artifacts_dir;
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::SpawnCommand;
-
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -76,7 +73,6 @@ fn artifact_file_names(dir: &std::path::Path) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_foreground_run_writes_the_four_artifact_files() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
     let home_dir = tempfile::tempdir().expect("real tempdir to isolate CYRUP_HOME artifacts");
     write_fixture_persona(work_dir.path(), "worker");
@@ -123,13 +119,28 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
     let executor = extension.executor().clone();
 
     let result = executor
-        .run_foreground(work_dir.path(), "worker", "do the trivial thing", None, None, None)
+        .run_foreground(
+            work_dir.path(),
+            "worker",
+            "do the trivial thing",
+            None,
+            None,
+            None,
+        )
         .await;
 
     let result = result.expect("the foreground run completes without an orchestration-level error");
-    assert_eq!(result.exit_code, 0, "the fixture child exits cleanly; error: {:?}", result.error);
+    assert_eq!(
+        result.exit_code, 0,
+        "the fixture child exits cleanly; error: {:?}",
+        result.error
+    );
     assert!(
-        result.final_output.as_deref().unwrap_or("").contains("ARTIFACT_TEST_OUTPUT"),
+        result
+            .final_output
+            .as_deref()
+            .unwrap_or("")
+            .contains("ARTIFACT_TEST_OUTPUT"),
         "the run's final output must carry the fixture child's emitted text"
     );
 
@@ -142,10 +153,22 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
 
     // All four artifact files (the `<runId>_worker` base is random; assert one of each suffix).
     let has_suffix = |suffix: &str| names.iter().any(|n| n.ends_with(suffix));
-    assert!(has_suffix("_input.md"), "missing _input.md artifact; got: {names:?}");
-    assert!(has_suffix("_output.md"), "missing _output.md artifact; got: {names:?}");
-    assert!(has_suffix(".jsonl"), "missing .jsonl artifact; got: {names:?}");
-    assert!(has_suffix("_meta.json"), "missing _meta.json artifact; got: {names:?}");
+    assert!(
+        has_suffix("_input.md"),
+        "missing _input.md artifact; got: {names:?}"
+    );
+    assert!(
+        has_suffix("_output.md"),
+        "missing _output.md artifact; got: {names:?}"
+    );
+    assert!(
+        has_suffix(".jsonl"),
+        "missing .jsonl artifact; got: {names:?}"
+    );
+    assert!(
+        has_suffix("_meta.json"),
+        "missing _meta.json artifact; got: {names:?}"
+    );
 
     // The output artifact carries the delivered answer; the input artifact carries the task.
     let output_file = names.iter().find(|n| n.ends_with("_output.md")).unwrap();

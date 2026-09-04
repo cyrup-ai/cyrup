@@ -55,7 +55,11 @@ pub(super) fn load(path: &Path) -> Result<(SessionHeader, Vec<Entry>, bool), Ses
             }
             match serde_json::from_str::<SessionHeader>(&line) {
                 Ok(h) if h.kind == "session" => header = Some(h),
-                _ => return Err(SessionError::NotASession { path: path.to_path_buf() }),
+                _ => {
+                    return Err(SessionError::NotASession {
+                        path: path.to_path_buf(),
+                    });
+                }
             }
             continue;
         }
@@ -69,6 +73,8 @@ pub(super) fn load(path: &Path) -> Result<(SessionHeader, Vec<Entry>, bool), Ses
         }
     }
 
-    let header = header.ok_or_else(|| SessionError::NotASession { path: path.to_path_buf() })?;
+    let header = header.ok_or_else(|| SessionError::NotASession {
+        path: path.to_path_buf(),
+    })?;
     Ok((header, entries, recovered))
 }

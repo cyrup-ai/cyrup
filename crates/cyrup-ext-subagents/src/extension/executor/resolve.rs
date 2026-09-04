@@ -7,19 +7,18 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::discovery::{discover_agents, AgentDiscoveryConfig};
 use crate::discovery::types::{AgentDefinition, AgentReadScope};
+use crate::discovery::{AgentDiscoveryConfig, discover_agents};
 use crate::error::SubagentError;
 use crate::exec::ResolvedAgentPersona;
 use crate::exec::model_scope::ModelScopeConfig;
-use crate::fork_context::{ContextMode, ForkContext, ForkContextResolver};
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::{
     builtin_agents_dir, enumerate_installed_packages, unreachable_session_manager,
 };
+use crate::fork_context::{ContextMode, ForkContext, ForkContextResolver};
 
 impl SubagentExecutor {
-
     // ---------------------------------------------------------------------------------------
     // Discovery config assembly (bridges HostCtx.cwd -> a real AgentDiscoveryConfig)
     // ---------------------------------------------------------------------------------------
@@ -148,9 +147,8 @@ impl SubagentExecutor {
         // settings file that does not exist while its agents came from the real project root, and it
         // made `subagents.projectRootResolution` unobservable: the very setting that MOVES the root
         // lives in the file the root selects.
-        let project_settings = crate::discovery::project_settings_path(
-            cfg.project_root.as_deref().unwrap_or(cwd),
-        );
+        let project_settings =
+            crate::discovery::project_settings_path(cfg.project_root.as_deref().unwrap_or(cwd));
         // Tier 7: carry BOTH scopes UNFLATTENED (each with its own path) so `merge.rs` can resolve
         // project-beats-user at application time and record the true winning scope + path in
         // provenance (rather than a pre-flattened single scope that always looked like `Project`).
@@ -177,7 +175,8 @@ impl SubagentExecutor {
         scope: AgentReadScope,
         roots: &crate::paths::Roots,
     ) -> Result<AgentDefinition, SubagentError> {
-        self.resolve_agent_with_model_scope(cwd, name, scope, roots).map(|(agent, _, _)| agent)
+        self.resolve_agent_with_model_scope(cwd, name, scope, roots)
+            .map(|(agent, _, _)| agent)
     }
 
     /// [`Self::resolve_agent`] plus the effective `subagents.modelScope` policy this cwd's settings
@@ -261,7 +260,9 @@ impl SubagentExecutor {
         cwd: &Path,
         roots: &crate::paths::Roots,
     ) -> Result<Option<ModelScopeConfig>, SubagentError> {
-        Ok(Self::discovery_config_on_disk(cwd, roots)?.override_settings.model_scope())
+        Ok(Self::discovery_config_on_disk(cwd, roots)?
+            .override_settings
+            .model_scope())
     }
 
     /// Plan-time persona map (T0.1's C13 root-cause seam): resolve every DISTINCT agent named across
@@ -347,27 +348,35 @@ impl SubagentExecutor {
         // already only reaches it for a `context: "fork"` request, at which point
         // `resolve`'s own `is_persisted`/`leaf_id` checks are the authoritative fail-hard gate).
         let manager = cyrup_session::SessionManager::continue_recent(cwd, &layout)
-            .or_else(|_| cyrup_session::SessionManager::in_memory(cwd, cyrup_session::NewSessionOpts::default()))
+            .or_else(|_| {
+                cyrup_session::SessionManager::in_memory(
+                    cwd,
+                    cyrup_session::NewSessionOpts::default(),
+                )
+            })
             .unwrap_or_else(|_| {
                 // Even `in_memory` is documented infallible for a `None` id (see
                 // `SessionManager::in_memory`'s own doc: "A `None` id is generated and never
                 // fails"), so this arm is unreachable in practice; kept as a last-resort
                 // in-memory fallback rather than a panic, matching this crate's no-panic policy.
-                cyrup_session::SessionManager::in_memory(cwd, cyrup_session::NewSessionOpts::default())
-                    .unwrap_or_else(|_| {
-                        // Structurally unreachable (see above) but this crate forbids
-                        // unwrap/expect/panic outside tests; the SessionManager type has no
-                        // "empty" sentinel constructor, so the only remaining option that upholds
-                        // both the no-panic policy and a total function signature is to retry
-                        // once more with a definitely-valid cwd. Real production cwds are always
-                        // valid paths by construction (HostCtx.cwd), so this loop terminates on
-                        // the first or second attempt in every real scenario.
-                        cyrup_session::SessionManager::in_memory(
-                            Path::new("."),
-                            cyrup_session::NewSessionOpts::default(),
-                        )
-                        .unwrap_or_else(|_| unreachable_session_manager())
-                    })
+                cyrup_session::SessionManager::in_memory(
+                    cwd,
+                    cyrup_session::NewSessionOpts::default(),
+                )
+                .unwrap_or_else(|_| {
+                    // Structurally unreachable (see above) but this crate forbids
+                    // unwrap/expect/panic outside tests; the SessionManager type has no
+                    // "empty" sentinel constructor, so the only remaining option that upholds
+                    // both the no-panic policy and a total function signature is to retry
+                    // once more with a definitely-valid cwd. Real production cwds are always
+                    // valid paths by construction (HostCtx.cwd), so this loop terminates on
+                    // the first or second attempt in every real scenario.
+                    cyrup_session::SessionManager::in_memory(
+                        Path::new("."),
+                        cyrup_session::NewSessionOpts::default(),
+                    )
+                    .unwrap_or_else(|_| unreachable_session_manager())
+                })
             });
         ForkContextResolver::new(Arc::new(AsyncMutex::new(manager)), layout)
     }
@@ -415,7 +424,12 @@ impl SubagentExecutor {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::testsupport::seed_scope_fixture;
@@ -468,14 +482,27 @@ mod tests {
             ("develop", "worker"),
         ] {
             let agent = executor
-                .resolve_agent(dir.path(), alias, AgentReadScope::Both, &crate::paths::Roots::from_env())
+                .resolve_agent(
+                    dir.path(),
+                    alias,
+                    AgentReadScope::Both,
+                    &crate::paths::Roots::from_env(),
+                )
                 .unwrap_or_else(|e| panic!("alias {alias:?} must resolve: {e}"));
-            assert_eq!(agent.name, canonical, "alias {alias:?} resolved to the wrong agent");
+            assert_eq!(
+                agent.name, canonical,
+                "alias {alias:?} resolved to the wrong agent"
+            );
         }
         // The canonical names still resolve to themselves.
         assert_eq!(
             executor
-                .resolve_agent(dir.path(), "oracle", AgentReadScope::Both, &crate::paths::Roots::from_env())
+                .resolve_agent(
+                    dir.path(),
+                    "oracle",
+                    AgentReadScope::Both,
+                    &crate::paths::Roots::from_env()
+                )
                 .expect("oracle resolves")
                 .name,
             "oracle"
@@ -505,16 +532,29 @@ mod tests {
         // the fixtures failing to be discovered at all.
         assert_eq!(
             executor
-                .resolve_agent(dir.path(), "seer", AgentReadScope::Both, &crate::paths::Roots::from_env())
+                .resolve_agent(
+                    dir.path(),
+                    "seer",
+                    AgentReadScope::Both,
+                    &crate::paths::Roots::from_env()
+                )
                 .expect("seer resolves by name")
                 .name,
             "seer"
         );
 
         let err = executor
-            .resolve_agent(dir.path(), "prophet", AgentReadScope::Both, &crate::paths::Roots::from_env())
+            .resolve_agent(
+                dir.path(),
+                "prophet",
+                AgentReadScope::Both,
+                &crate::paths::Roots::from_env(),
+            )
             .expect_err("an ambiguous alias must refuse");
-        assert_eq!(err.to_string(), "Ambiguous agent alias 'prophet': augur, seer");
+        assert_eq!(
+            err.to_string(),
+            "Ambiguous agent alias 'prophet': augur, seer"
+        );
         assert!(
             !matches!(err, SubagentError::AgentNotFound(_)),
             "an ambiguous alias must NOT be reported as not found"
@@ -526,7 +566,12 @@ mod tests {
         let executor = SubagentExecutor::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
-            .resolve_agent(dir.path(), "no-such-agent", AgentReadScope::Both, &crate::paths::Roots::from_env())
+            .resolve_agent(
+                dir.path(),
+                "no-such-agent",
+                AgentReadScope::Both,
+                &crate::paths::Roots::from_env(),
+            )
             .expect_err("unknown agent must error");
         assert!(matches!(err, SubagentError::AgentNotFound(_)));
     }
@@ -540,7 +585,9 @@ mod tests {
         seed_scope_fixture(
             dir.path(),
             "scoped",
-            Some(r#"{"subagents":{"modelScope":{"enforce":true,"allow":["anthropic/claude-opus-4"]}}}"#),
+            Some(
+                r#"{"subagents":{"modelScope":{"enforce":true,"allow":["anthropic/claude-opus-4"]}}}"#,
+            ),
         );
         let executor = SubagentExecutor::new();
 
@@ -564,9 +611,10 @@ mod tests {
 
         // The mirror case is asserted at the decision boundary rather than through `run_foreground`,
         // because an ALLOWED model proceeds to a real subprocess spawn (this crate never fakes that).
-        let scope = SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env())
-            .expect("settings parse")
-            .expect("a modelScope block is configured");
+        let scope =
+            SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env())
+                .expect("settings parse")
+                .expect("a modelScope block is configured");
         let mut available = Vec::new();
         let allowed = ModelId::from("anthropic/claude-opus-4:max");
         assert!(
@@ -590,7 +638,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         seed_scope_fixture(dir.path(), "scoped", None);
         assert_eq!(
-            SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env()).expect("settings parse"),
+            SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env())
+                .expect("settings parse"),
             None,
             "no settings block means no policy — enforcement stays off"
         );
@@ -606,7 +655,10 @@ mod tests {
             None,
         )
         .expect("no policy configured, so nothing can be refused");
-        assert_eq!(resolved, crate::exec::fallback::ModelOverride::Explicit(requested.clone()));
+        assert_eq!(
+            resolved,
+            crate::exec::fallback::ModelOverride::Explicit(requested.clone())
+        );
 
         // With a policy that REFUSES it, the outcome is an error — never `Ok(<some other model>)`.
         let scope = crate::exec::model_scope::ModelScopeConfig {
@@ -637,9 +689,15 @@ mod tests {
     #[test]
     fn a_malformed_model_scope_block_aborts_discovery_instead_of_silently_disarming() {
         for (label, json) in [
-            ("enforce without allow", r#"{"subagents":{"modelScope":{"enforce":true}}}"#),
+            (
+                "enforce without allow",
+                r#"{"subagents":{"modelScope":{"enforce":true}}}"#,
+            ),
             ("non-object", r#"{"subagents":{"modelScope":[]}}"#),
-            ("non-boolean enforce", r#"{"subagents":{"modelScope":{"enforce":"yes"}}}"#),
+            (
+                "non-boolean enforce",
+                r#"{"subagents":{"modelScope":{"enforce":"yes"}}}"#,
+            ),
             (
                 "non-string allow entries",
                 r#"{"subagents":{"modelScope":{"enforce":true,"allow":[1]}}}"#,
@@ -647,8 +705,11 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             seed_scope_fixture(dir.path(), "scoped", Some(json));
-            let err = SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env())
-                .expect_err(&format!("{label} must abort, not silently disarm the policy"));
+            let err =
+                SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env())
+                    .expect_err(&format!(
+                        "{label} must abort, not silently disarm the policy"
+                    ));
             assert!(
                 matches!(err, SubagentError::MalformedSettings(_)),
                 "{label}: expected MalformedSettings, got {err:?}"
@@ -666,14 +727,18 @@ mod tests {
             "scoped",
             Some(r#"{"subagents":{"modelScope":{"enforce":true,"allow":["  anthropic/*  "]}}}"#),
         );
-        let scope = SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env())
-            .expect("settings parse")
-            .expect("the configured block must be read, not dropped");
+        let scope =
+            SubagentExecutor::resolve_model_scope(dir.path(), &crate::paths::Roots::from_env())
+                .expect("settings parse")
+                .expect("the configured block must be read, not dropped");
         assert_eq!(scope.enforce, Some(true));
-        assert_eq!(scope.allow, Some(vec!["anthropic/*".to_string()]), "patterns are trimmed");
+        assert_eq!(
+            scope.allow,
+            Some(vec!["anthropic/*".to_string()]),
+            "patterns are trimmed"
+        );
         assert!(scope.is_armed());
     }
-
 
     // -----------------------------------------------------------------------------------------
     // SUBA-086 — a malformed definition blocks its own name on the LIVE execution path
@@ -696,9 +761,17 @@ mod tests {
         .expect("write");
 
         let err = executor
-            .resolve_agent(dir.path(), "worker", AgentReadScope::Both, &crate::paths::Roots::from_env())
+            .resolve_agent(
+                dir.path(),
+                "worker",
+                AgentReadScope::Both,
+                &crate::paths::Roots::from_env(),
+            )
             .expect_err("a broken outranking definition must refuse the launch");
-        assert!(matches!(err, SubagentError::InvalidAgentConfiguration { .. }), "{err}");
+        assert!(
+            matches!(err, SubagentError::InvalidAgentConfiguration { .. }),
+            "{err}"
+        );
         assert_eq!(
             err.to_string(),
             "Agent 'worker' has invalid configuration: Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer."
@@ -706,7 +779,12 @@ mod tests {
         // The diagnostic blocks ONLY its own name — an unrelated bundled persona still resolves.
         assert_eq!(
             executor
-                .resolve_agent(dir.path(), "oracle", AgentReadScope::Both, &crate::paths::Roots::from_env())
+                .resolve_agent(
+                    dir.path(),
+                    "oracle",
+                    AgentReadScope::Both,
+                    &crate::paths::Roots::from_env()
+                )
                 .expect("oracle resolves")
                 .name,
             "oracle"

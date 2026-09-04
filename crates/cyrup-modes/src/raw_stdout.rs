@@ -154,11 +154,19 @@ mod tests {
     /// transient condition into a mode-fatal `io::Error`.
     #[tokio::test]
     async fn retries_would_block_and_resumes_at_the_offset() {
-        let mut sink = Flaky { blocks: 3, chunk: 4, buf: Vec::new(), flush_blocks: 2 };
+        let mut sink = Flaky {
+            blocks: 3,
+            chunk: 4,
+            buf: Vec::new(),
+            flush_blocks: 2,
+        };
         write_raw_stdout(&mut sink, "abcdefghij\n").await.unwrap();
         flush_raw_stdout(&mut sink).await.unwrap();
         assert_eq!(String::from_utf8(sink.buf).unwrap(), "abcdefghij\n");
-        assert_eq!(sink.blocks, 0, "every simulated block was retried, not skipped");
+        assert_eq!(
+            sink.blocks, 0,
+            "every simulated block was retried, not skipped"
+        );
         assert_eq!(sink.flush_blocks, 0);
     }
 
@@ -166,7 +174,12 @@ mod tests {
     /// reaches the sink at all.
     #[tokio::test]
     async fn an_empty_chunk_is_a_no_op() {
-        let mut sink = Flaky { blocks: 99, chunk: 1, buf: Vec::new(), flush_blocks: 0 };
+        let mut sink = Flaky {
+            blocks: 99,
+            chunk: 1,
+            buf: Vec::new(),
+            flush_blocks: 0,
+        };
         write_raw_stdout(&mut sink, "").await.unwrap();
         assert_eq!(sink.blocks, 99, "an empty write must not touch the sink");
     }

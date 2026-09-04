@@ -72,21 +72,17 @@ pub mod model;
 
 // The lattice half's public surface, re-exported at the paths it had before the split:
 // `crate::exec::acceptance::<name>`. `model` keeps its own paths through its own re-exports.
-pub use lattice::{
-    build_timed_out_acceptance_ledger, AcceptanceLedger, AcceptanceStatus,
-};
-pub use lattice::contract::{
-    AcceptanceContract, ReviewerResult, VerifyCommand,
-};
+pub use lattice::contract::{AcceptanceContract, ReviewerResult, VerifyCommand};
 pub use lattice::gate::{
-    evaluate_acceptance, evaluate_acceptance_with_cancel, CleanCompletionGate,
+    CleanCompletionGate, evaluate_acceptance, evaluate_acceptance_with_cancel,
 };
 pub use lattice::inject::inject_acceptance_contract;
 pub use lattice::lowering::lower_acceptance_input;
 pub use lattice::post_hoc::{
-    apply_post_hoc_correction, ACCEPTANCE_REJECTED_EXIT_CODE, PostHocCorrection,
+    ACCEPTANCE_REJECTED_EXIT_CODE, PostHocCorrection, apply_post_hoc_correction,
 };
 pub use lattice::report_source::AcceptanceFileOutput;
 pub use lattice::verify::{
     run_verify_commands, run_verify_commands_memoized, run_verify_commands_memoized_with_cancel,
 };
+pub use lattice::{AcceptanceLedger, AcceptanceStatus, build_timed_out_acceptance_ledger};

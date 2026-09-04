@@ -80,15 +80,26 @@ pub fn dispatch() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
     use super::*;
 
     #[test]
     fn is_selected_matches_the_exact_internal_subcommand_token() {
         assert_eq!(SUBCOMMAND, "__mcp-keyring-helper");
-        assert!(is_selected(&["cyrup".to_string(), "__mcp-keyring-helper".to_string()]));
+        assert!(is_selected(&[
+            "cyrup".to_string(),
+            "__mcp-keyring-helper".to_string()
+        ]));
         assert!(!is_selected(&["cyrup".to_string()]));
-        assert!(!is_selected(&["cyrup".to_string(), "__intercom-broker".to_string()]));
+        assert!(!is_selected(&[
+            "cyrup".to_string(),
+            "__intercom-broker".to_string()
+        ]));
         assert!(!is_selected(&["cyrup".to_string(), "--help".to_string()]));
         assert!(!is_selected(&[]));
     }

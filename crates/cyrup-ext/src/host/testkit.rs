@@ -35,7 +35,9 @@ pub async fn epoch_preemption_demo() -> Result<ExtError, ExtError> {
         .map_err(|e| ExtError::Component(e.to_string()))?;
 
     match run.call_async(&mut store, ()).await {
-        Ok(()) => Err(ExtError::Trap("guest unexpectedly completed (no preemption)".into())),
+        Ok(()) => Err(ExtError::Trap(
+            "guest unexpectedly completed (no preemption)".into(),
+        )),
         Err(e) => Ok(map_wasm_error(&e)),
     }
 }
@@ -54,7 +56,10 @@ pub async fn oom_demo() -> Result<ExtError, ExtError> {
     .map_err(|e| ExtError::Component(e.to_string()))?;
 
     // 2 MiB cap; growing by 4000 pages (~256 MiB) is denied.
-    let mut store = Store::new(&engine, StoreLimits::default().with_max_memory(2 * 1024 * 1024));
+    let mut store = Store::new(
+        &engine,
+        StoreLimits::default().with_max_memory(2 * 1024 * 1024),
+    );
     store.limiter(|s| s);
     // Epoch interruption is enabled on the engine; with no driver and no deadline the default
     // deadline (0) would trap immediately. Set a far deadline so ONLY the limiter denies here.
@@ -68,7 +73,9 @@ pub async fn oom_demo() -> Result<ExtError, ExtError> {
         .map_err(|e| ExtError::Component(e.to_string()))?;
 
     match grow.call_async(&mut store, ()).await {
-        Ok(pages) => Err(ExtError::Trap(format!("grow unexpectedly succeeded: {pages}"))),
+        Ok(pages) => Err(ExtError::Trap(format!(
+            "grow unexpectedly succeeded: {pages}"
+        ))),
         Err(e) => Ok(map_wasm_error(&e)),
     }
 }

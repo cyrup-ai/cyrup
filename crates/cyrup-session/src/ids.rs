@@ -31,15 +31,19 @@ pub fn validate_session_id(id: &str) -> Result<(), String> {
         [first, mid @ .., last] => {
             alnum(*first)
                 && alnum(*last)
-                && mid.iter().all(|&b| alnum(b) || matches!(b, b'.' | b'_' | b'-'))
+                && mid
+                    .iter()
+                    .all(|&b| alnum(b) || matches!(b, b'.' | b'_' | b'-'))
         }
     };
     if ok {
         Ok(())
     } else {
-        Err("Session id must be non-empty, contain only alphanumeric characters, '-', '_', and \
+        Err(
+            "Session id must be non-empty, contain only alphanumeric characters, '-', '_', and \
 '.', and start and end with an alphanumeric character"
-            .to_string())
+                .to_string(),
+        )
     }
 }
 

@@ -7,15 +7,11 @@ use std::time::Duration;
 
 use cyrup_core::CancelToken;
 
-use crate::exec::ndjson::SubagentEvent;
-use crate::exec::output::{
-    is_terminal_assistant_stop,
-    message_end_has_error_message,
-};
-use crate::spawn::SpawnedChild;
-use crate::exec::progress::AgentProgress;
 use crate::exec::agent_config::RunOptions;
-
+use crate::exec::ndjson::SubagentEvent;
+use crate::exec::output::{is_terminal_assistant_stop, message_end_has_error_message};
+use crate::exec::progress::AgentProgress;
+use crate::spawn::SpawnedChild;
 
 /// The runtime facts [`crate::exec::fallback::AttemptRunner::run_attempt`]'s exit-0 re-diagnosis (pi
 /// `execution.ts:747-790`, T3 group A) needs from [`drive_attempt`] beyond the raw exit status.
@@ -63,7 +59,6 @@ pub(crate) struct DriveOutcome {
     pub(crate) turn_budget: crate::exec::turn_budget::TurnBudgetTracker,
 }
 
-
 /// The final-stop grace window (pi `FINAL_STOP_GRACE_MS`, `execution.ts:333`): once a terminal
 /// assistant stop is observed, a child that has not exited (released its stdout) within this window
 /// is force-drained via [`SpawnedChild::terminate`]'s real SIGINT->SIGTERM->SIGKILL ladder rather
@@ -91,10 +86,15 @@ const POST_EXIT_DRAIN_MS: u64 = 1000;
 /// variant is needed: a blocking ask surfaces as an ordinary `ToolExecutionStart` for the
 /// `contact_supervisor` tool, which this reuses (per `AttemptSignal::detached`'s own recipe).
 fn contact_supervisor_block_prompt(event: &crate::exec::ndjson::SubagentEvent) -> Option<String> {
-    if let crate::exec::ndjson::SubagentEvent::ToolExecutionStart { tool_name, args, .. } = event
+    if let crate::exec::ndjson::SubagentEvent::ToolExecutionStart {
+        tool_name, args, ..
+    } = event
         && tool_name == "contact_supervisor"
     {
-        let reason = args.get("reason").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let reason = args
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
         if matches!(reason, "need_decision" | "interview") {
             return Some(
                 args.get("message")
@@ -159,7 +159,6 @@ fn is_sole_structured_output_tool_call(event: &SubagentEvent) -> bool {
             .and_then(serde_json::Value::as_str)
             == Some("structured_output")
 }
-
 
 /// The witnesses [`drive_attempt`]'s read loop accumulates across iterations and hands to every
 /// [`DriveOutcome`] it can settle with, gathered into one value so the loop's arms — and the

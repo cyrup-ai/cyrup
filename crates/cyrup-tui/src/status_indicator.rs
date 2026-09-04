@@ -35,10 +35,10 @@
 
 use std::time::{Duration, Instant};
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::theme::UiTheme;
 
@@ -90,7 +90,10 @@ impl RetryCountdown {
     /// The message at `elapsed` (`status-indicator.ts:46-47`), before the cancel suffix.
     fn message_at(self, elapsed: Duration) -> String {
         let remaining = self.initial_seconds.saturating_sub(elapsed.as_secs());
-        format!("Retrying ({}/{}) in {}s...", self.attempt, self.max_attempts, remaining)
+        format!(
+            "Retrying ({}/{}) in {}s...",
+            self.attempt, self.max_attempts, remaining
+        )
     }
 }
 
@@ -127,7 +130,11 @@ impl WorkingIndicator {
     pub fn from_json(opts: &serde_json::Value) -> Self {
         let frames = opts.get("frames").and_then(|f| f.as_array()).map_or_else(
             || SPINNER_FRAMES.iter().map(|f| (*f).to_string()).collect(),
-            |a| a.iter().filter_map(|f| f.as_str().map(str::to_string)).collect(),
+            |a| {
+                a.iter()
+                    .filter_map(|f| f.as_str().map(str::to_string))
+                    .collect()
+            },
         );
         let interval = opts
             .get("intervalMs")
@@ -143,8 +150,8 @@ impl WorkingIndicator {
         if self.frames.len() <= 1 {
             return self.frames.first().map_or("", String::as_str);
         }
-        let idx = (elapsed.as_millis() / self.interval.as_millis().max(1)) as usize
-            % self.frames.len();
+        let idx =
+            (elapsed.as_millis() / self.interval.as_millis().max(1)) as usize % self.frames.len();
         self.frames.get(idx).map_or("", String::as_str)
     }
 }
@@ -344,7 +351,9 @@ impl StatusIndicator {
     /// `setInterval` with the new period inside `setIndicator` (`:69` → `:77-80`); cyrup's run loop
     /// re-creates its `tokio::time::interval` from this on the same event.
     pub fn spinner_period(&self) -> Duration {
-        self.working_indicator.as_ref().map_or(SPINNER_INTERVAL, |i| i.interval)
+        self.working_indicator
+            .as_ref()
+            .map_or(SPINNER_INTERVAL, |i| i.interval)
     }
 
     /// Shortcut: return to idle (`AgentEnd` / interrupt).
@@ -395,8 +404,10 @@ impl StatusIndicator {
         // passes `workingIndicatorOptions` to `new WorkingStatusIndicator` alone
         // (`interactive-mode.ts:3116-3120`) and re-applies it only when the live band's kind is
         // `"working"` (`:2112`). Retry / compaction / branch-summary keep the built-in spinner.
-        let custom =
-            self.working_indicator.as_ref().filter(|_| self.kind == IndicatorKind::Working);
+        let custom = self
+            .working_indicator
+            .as_ref()
+            .filter(|_| self.kind == IndicatorKind::Working);
         let spinner = custom.map_or_else(|| Self::spinner_at(elapsed), |i| i.frame_at(elapsed));
         let spinner_style = match self.kind {
             IndicatorKind::Retry => theme.warning_style(),
@@ -443,7 +454,13 @@ impl StatusIndicator {
     }
 
     /// Render the band into `area` (the live region's 2-row status slot).
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &UiTheme, cancel_hint: Option<&str>) {
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &UiTheme,
+        cancel_hint: Option<&str>,
+    ) {
         let lines = self.lines(theme, cancel_hint);
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
     }

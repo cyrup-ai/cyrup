@@ -91,16 +91,13 @@ pub use models_store::{
     InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ModelsStoreOperationOptions,
     ProviderModelsStore,
 };
-pub use remote_catalog::{
-    CatalogOverlay, DEFAULT_CATALOG_BASE_URL, REMOTE_CATALOG_REFRESH_INTERVAL_MS, RefreshOptions,
-    RemoteCatalog, RemoteCatalogProvider, merge_models, parse_catalog, remote_models,
-};
 pub use provider::{Provider, RefreshModelsContext};
 pub use providers::all::{
     BUILTIN_CATALOG_MANIFEST_JSON, all_images_providers, all_providers, all_providers_with,
     all_providers_with_overlay, builtin_model_data_generated_at, default_images_models,
     default_models,
 };
+pub use providers::builtin_provider_oauth;
 pub use providers::fleet::{FLEET, FleetSpec, fleet_providers_with, fleet_spec};
 pub use providers::{
     ANTHROPIC_BASE_URL, ANTHROPIC_FLEET, ANTHROPIC_PROVIDER_ID, AnthropicFleetSpec, anthropic_auth,
@@ -144,22 +141,24 @@ pub use providers::{
 pub use providers::{
     TOGETHER_BASE_URL, together_models, together_provider, together_provider_with,
 };
-pub use providers::builtin_provider_oauth;
 pub use providers::{openrouter_images_auth, openrouter_images_provider};
+pub use remote_catalog::{
+    CatalogOverlay, DEFAULT_CATALOG_BASE_URL, REMOTE_CATALOG_REFRESH_INTERVAL_MS, RefreshOptions,
+    RemoteCatalog, RemoteCatalogProvider, merge_models, parse_catalog, remote_models,
+};
 pub use stream::sse::{
     DEFAULT_HTTP_IDLE_TIMEOUT_MS, OnRequest, OnResponse, SseFrame, SseRequest, build_client,
     build_client_for, build_client_for_target, build_client_with_proxy,
     configure_http_idle_timeout, configure_http_proxy, configured_http_proxy, decode_sse_bytes,
     http_idle_timeout_ms, open_sse,
 };
-pub use utils::error_body::{MAX_PROVIDER_ERROR_BODY_CHARS, truncate_error_text};
-pub use utils::provider_retry::{DEFAULT_MAX_RETRY_DELAY_MS, ProviderRetry};
 pub use stream::{
     AssistantMessageEventSink, AssistantMessageEventStream, CacheRetention, OnPayload,
     OnResponseHook, ProviderResponse, StreamEvent, StreamOptions, ToolChoice, Transport,
     collect_message, create_assistant_message_event_stream,
 };
 pub use usage::{apply_cost, compute_cost};
+pub use utils::error_body::{MAX_PROVIDER_ERROR_BODY_CHARS, truncate_error_text};
 pub use utils::estimate::{
     ContextUsageEstimate, calculate_context_tokens, estimate_context_tokens,
     estimate_message_tokens, estimate_text_tokens,
@@ -172,6 +171,7 @@ pub use utils::node_http_proxy::{
     ProxyError, UNSUPPORTED_PROXY_PROTOCOL_MESSAGE, resolve_http_proxy_url_for_target,
 };
 pub use utils::overflow::{is_context_overflow, overflow_patterns};
+pub use utils::provider_retry::{DEFAULT_MAX_RETRY_DELAY_MS, ProviderRetry};
 pub use utils::refresh::RefreshDedup;
 pub use utils::retry::{
     RetryObserver, RetryPolicy, is_retryable_assistant_error, retry_assistant_call,

@@ -14,7 +14,12 @@
 //! rendered output and hands it to `positionHardwareCursor`. The port scans the rendered CELLS for
 //! the reverse-video caret instead (`selector::caret_cell`), which every selector draws through the
 //! one shared `search_input_spans`, and the accessor is gone.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use cyrup_ext::host::DialogOptions;
 use cyrup_session_svc::{UiKind, UiRequest};
@@ -30,7 +35,10 @@ fn caret_in_buffer(app: &App<TestBackend>) -> Option<(u16, u16)> {
     let area = buf.area;
     for y in (0..area.height).rev() {
         for x in 0..area.width {
-            if buf.cell((x, y)).is_some_and(|c| c.modifier.contains(Modifier::REVERSED)) {
+            if buf
+                .cell((x, y))
+                .is_some_and(|c| c.modifier.contains(Modifier::REVERSED))
+            {
                 return Some((x, y));
             }
         }
@@ -48,10 +56,16 @@ fn app_with_input_dialog() -> App<TestBackend> {
         options: serde_json::Value::Null,
         message: String::new(),
         placeholder: None,
-        opts: DialogOptions { timeout_ms: None, signal_id: None },
+        opts: DialogOptions {
+            timeout_ms: None,
+            signal_id: None,
+        },
         reply: tx,
     });
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionInput));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionInput)
+    );
     app
 }
 
@@ -87,7 +101,10 @@ fn the_show_hardware_cursor_setting_still_gates_the_selector_slot() {
     let mut app = app_with_input_dialog();
     app.state_mut().editor.set_show_hardware_cursor(false);
     app.draw().unwrap();
-    assert!(caret_in_buffer(&app).is_some(), "the software caret is drawn either way");
+    assert!(
+        caret_in_buffer(&app).is_some(),
+        "the software caret is drawn either way"
+    );
     assert!(
         !app.terminal().backend().cursor_visible(),
         "showHardwareCursor=false must leave the terminal cursor hidden",
@@ -107,11 +124,21 @@ fn a_list_selector_without_an_input_shows_no_hardware_cursor() {
         options: serde_json::Value::Null,
         message: String::new(),
         placeholder: None,
-        opts: DialogOptions { timeout_ms: None, signal_id: None },
+        opts: DialogOptions {
+            timeout_ms: None,
+            signal_id: None,
+        },
         reply: tx,
     });
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionConfirm));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionConfirm)
+    );
     app.draw().unwrap();
-    assert_eq!(caret_in_buffer(&app), None, "a confirm dialog has no Input and no caret");
+    assert_eq!(
+        caret_in_buffer(&app),
+        None,
+        "a confirm dialog has no Input and no caret"
+    );
     assert!(!app.terminal().backend().cursor_visible());
 }

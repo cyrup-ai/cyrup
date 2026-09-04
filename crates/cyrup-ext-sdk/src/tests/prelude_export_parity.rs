@@ -53,11 +53,15 @@ fn reexports(region: &str) -> BTreeSet<String> {
     let code = code_only(region);
     let mut names = BTreeSet::new();
     for chunk in code.split("pub use ").skip(1) {
-        let Some(statement) = chunk.split(';').next() else { continue };
+        let Some(statement) = chunk.split(';').next() else {
+            continue;
+        };
         let path = statement.trim();
         let path = path.strip_prefix("crate::").unwrap_or(path);
         if let Some((_, after_brace)) = path.split_once('{') {
-            let Some((inner, _)) = after_brace.split_once('}') else { continue };
+            let Some((inner, _)) = after_brace.split_once('}') else {
+                continue;
+            };
             names.extend(
                 inner
                     .split(',')

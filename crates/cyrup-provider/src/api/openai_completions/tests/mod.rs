@@ -30,8 +30,8 @@ use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::utils::hash::short_hash;
 use crate::utils::provider_plumbing::resolve_cache_retention;
 use cyrup_core::{
-    ApiId, AssistantMessage, Content, Message, ModelThinkingLevel, StopReason, ToolCall, ToolCallId,
-    Usage,
+    ApiId, AssistantMessage, Content, Message, ModelThinkingLevel, StopReason, ToolCall,
+    ToolCallId, Usage,
 };
 use serde_json::{Map, Value, json};
 

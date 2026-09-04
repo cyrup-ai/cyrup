@@ -51,12 +51,16 @@ impl Default for ContextStore {
 impl ContextStore {
     /// An empty store (no context files / skills) — the pre-`reload` state.
     pub fn new() -> Self {
-        Self { snapshot: ArcSwap::from_pointee(ContextSnapshot::default()) }
+        Self {
+            snapshot: ArcSwap::from_pointee(ContextSnapshot::default()),
+        }
     }
 
     /// Seed the store with a pre-built snapshot (e.g. in tests / restore).
     pub fn from_snapshot(snap: ContextSnapshot) -> Self {
-        Self { snapshot: ArcSwap::from_pointee(snap) }
+        Self {
+            snapshot: ArcSwap::from_pointee(snap),
+        }
     }
 
     /// Lock-free read of the current snapshot (the build hot path).
@@ -93,7 +97,10 @@ impl ContextStore {
                 diagnostics: Arc::from(diags),
             })
         };
-        let snap = cancel.run_until(load).await.ok_or(ContextError::Cancelled)??;
+        let snap = cancel
+            .run_until(load)
+            .await
+            .ok_or(ContextError::Cancelled)??;
         self.snapshot.store(Arc::new(snap)); // atomic publish (R-06-016)
         Ok(())
     }

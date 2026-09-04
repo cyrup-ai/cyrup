@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::transcript::*;
 
@@ -9,7 +14,10 @@ fn line_text(line: &Line<'static>) -> String {
 /// A user entry whose `interactive-mode.ts:3500` gate is already decided — this module is about
 /// the pad, not about where the leading `Spacer(1)` comes from.
 fn user(text: &str, lead_spacer: bool) -> Entry {
-    Entry::User { text: text.to_string(), lead_spacer }
+    Entry::User {
+        text: text.to_string(),
+        lead_spacer,
+    }
 }
 
 /// F12: a fresh transcript defaults to Pi's `outputPad = 1` and `set_output_pad` drives it.
@@ -36,17 +44,57 @@ fn output_pad_left_indents_committed_messages() {
     let theme = UiTheme::dark();
     // pad = 1 → the body starts one column in.
     let u1 = entry_lines(&user("hello", true), &theme, 80, 1, ImageOpts::default());
-    assert_eq!(line_text(&u1[0]), "", "user leading Spacer(1): {:?}", line_text(&u1[0]));
-    assert_eq!(line_text(&u1[1]).trim(), "", "user top paddingY row: {:?}", line_text(&u1[1]));
-    assert!(line_text(&u1[2]).starts_with(" hello"), "pad=1 user: {:?}", line_text(&u1[2]));
-    let a1 = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 1, ImageOpts::default());
+    assert_eq!(
+        line_text(&u1[0]),
+        "",
+        "user leading Spacer(1): {:?}",
+        line_text(&u1[0])
+    );
+    assert_eq!(
+        line_text(&u1[1]).trim(),
+        "",
+        "user top paddingY row: {:?}",
+        line_text(&u1[1])
+    );
+    assert!(
+        line_text(&u1[2]).starts_with(" hello"),
+        "pad=1 user: {:?}",
+        line_text(&u1[2])
+    );
+    let a1 = entry_lines(
+        &Entry::Assistant("hi".into()),
+        &theme,
+        80,
+        1,
+        ImageOpts::default(),
+    );
     assert_eq!(line_text(&a1[0]), "", "assistant leading Spacer(1)");
-    assert_eq!(line_text(&a1[1]), " hi", "pad=1 assistant: {:?}", line_text(&a1[1]));
+    assert_eq!(
+        line_text(&a1[1]),
+        " hi",
+        "pad=1 assistant: {:?}",
+        line_text(&a1[1])
+    );
     // pad = 0 → flush-left (no leading space).
     let u0 = entry_lines(&user("hello", true), &theme, 80, 0, ImageOpts::default());
-    assert!(line_text(&u0[2]).starts_with("hello"), "pad=0 user: {:?}", line_text(&u0[2]));
-    let a0 = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 0, ImageOpts::default());
-    assert_eq!(line_text(&a0[1]), "hi", "pad=0 assistant: {:?}", line_text(&a0[1]));
+    assert!(
+        line_text(&u0[2]).starts_with("hello"),
+        "pad=0 user: {:?}",
+        line_text(&u0[2])
+    );
+    let a0 = entry_lines(
+        &Entry::Assistant("hi".into()),
+        &theme,
+        80,
+        0,
+        ImageOpts::default(),
+    );
+    assert_eq!(
+        line_text(&a0[1]),
+        "hi",
+        "pad=0 assistant: {:?}",
+        line_text(&a0[1])
+    );
 
     // MIRROR (X1): no role label at any pad, in either arm.
     for pad in [0usize, 1] {
@@ -102,31 +150,77 @@ const LONG: &str = "The quick brown fox jumps over the lazy dog and then keeps r
 fn l2_every_wrapped_row_of_a_message_carries_the_margin_and_a_right_gutter() {
     let theme = UiTheme::dark();
     for width in [20usize, 40, 80] {
-        let rows = entry_lines(&Entry::Assistant(LONG.into()), &theme, width, 1, ImageOpts::default());
+        let rows = entry_lines(
+            &Entry::Assistant(LONG.into()),
+            &theme,
+            width,
+            1,
+            ImageOpts::default(),
+        );
         // Row 0 is `assistant-message.ts:100-102`'s `Spacer(1)`; the body follows.
         let body = &rows[1..];
-        assert!(body.len() > 1, "width={width}: expected a wrapped body, got {body:?}");
+        assert!(
+            body.len() > 1,
+            "width={width}: expected a wrapped body, got {body:?}"
+        );
         for row in body {
             let t = line_text(row);
-            assert!(t.starts_with(' '), "width={width}: row lost its leftMargin: {t:?}");
-            assert!(!t.starts_with("  "), "width={width}: over-indented row: {t:?}");
+            assert!(
+                t.starts_with(' '),
+                "width={width}: row lost its leftMargin: {t:?}"
+            );
+            assert!(
+                !t.starts_with("  "),
+                "width={width}: over-indented row: {t:?}"
+            );
             // `contentWidth = width - paddingX*2` plus one column of `leftMargin` — the last
             // column stays empty, which is the `rightMargin` (`markdown.ts:330`/`:340`).
-            assert!(row.width() < width, "width={width}: no right gutter: {t:?} ({})", row.width());
+            assert!(
+                row.width() < width,
+                "width={width}: no right gutter: {t:?} ({})",
+                row.width()
+            );
         }
         // MIRROR: at `outputPad = 0` there is no margin, and the wrap uses the full width.
-        let flush = entry_lines(&Entry::Assistant(LONG.into()), &theme, width, 0, ImageOpts::default());
+        let flush = entry_lines(
+            &Entry::Assistant(LONG.into()),
+            &theme,
+            width,
+            0,
+            ImageOpts::default(),
+        );
         for row in &flush[1..] {
-            assert!(row.width() <= width, "pad=0 width={width}: {:?}", line_text(row));
+            assert!(
+                row.width() <= width,
+                "pad=0 width={width}: {:?}",
+                line_text(row)
+            );
         }
-        assert!(!line_text(&flush[1]).starts_with(' '), "pad=0 must be flush-left");
+        assert!(
+            !line_text(&flush[1]).starts_with(' '),
+            "pad=0 must be flush-left"
+        );
     }
 
     // MIRROR: a short message still occupies exactly one body row, and an empty turn none.
-    let short = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 1, ImageOpts::default());
+    let short = entry_lines(
+        &Entry::Assistant("hi".into()),
+        &theme,
+        80,
+        1,
+        ImageOpts::default(),
+    );
     assert_eq!(short.len(), 2, "spacer + one row: {short:?}");
-    assert!(entry_lines(&Entry::Assistant("   ".into()), &theme, 80, 1, ImageOpts::default())
-        .is_empty());
+    assert!(
+        entry_lines(
+            &Entry::Assistant("   ".into()),
+            &theme,
+            80,
+            1,
+            ImageOpts::default()
+        )
+        .is_empty()
+    );
 }
 
 /// The same for the LIVE streaming partial (`transcript.rs:1000`'s call site) — the row a user
@@ -165,7 +259,10 @@ fn error_and_warning_rows_wrap_inside_the_output_pad() {
             assert!(row.width() <= 39, "row has no right gutter: {t:?}");
         }
         // The colour rides on the span, inside the margins (`theme.fg("error", text)`).
-        assert!(rows[1].spans.iter().any(|s| s.style.fg.is_some()), "colour lost: {rows:?}");
+        assert!(
+            rows[1].spans.iter().any(|s| s.style.fg.is_some()),
+            "colour lost: {rows:?}"
+        );
     }
 }
 
@@ -195,7 +292,12 @@ fn the_migrated_credential_notice_renders_first_and_verbatim_in_the_transcript()
     view.push_warning(MIGRATED);
     view.push_warning(FALLBACK);
     // PRESENCE before absence: an empty queue would make every row assertion below vacuous.
-    assert_eq!(view.pending().len(), 2, "both warnings queued: {:?}", view.pending());
+    assert_eq!(
+        view.pending().len(),
+        2,
+        "both warnings queued: {:?}",
+        view.pending()
+    );
 
     // The production render path: `app.rs:1851` maps every entry through `entry_lines` at the
     // transcript's own `output_pad`. Width 100 is wider than either line, so a row that does

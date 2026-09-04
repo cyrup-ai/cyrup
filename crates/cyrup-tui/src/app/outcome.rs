@@ -60,13 +60,13 @@ impl ExtensionWidget {
         let below = placement == "belowEditor";
         let content = obj.and_then(|o| o.get("lines"));
         let mut lines: Vec<String> = match content {
-            Some(serde_json::Value::String(text)) => {
-                text.lines().map(str::to_string).collect()
-            }
+            Some(serde_json::Value::String(text)) => text.lines().map(str::to_string).collect(),
             Some(serde_json::Value::Array(items)) => items
                 .iter()
                 .map(|i| {
-                    i.as_str().map(str::to_string).unwrap_or_else(|| i.to_string())
+                    i.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| i.to_string())
                 })
                 .collect(),
             // `content === undefined` removes the widget (`:1935-1938`) — an empty line list is
@@ -156,6 +156,9 @@ impl TreeNavMsg {
     /// [`App::apply_tree_nav_outcome`] a synthetic outcome (notably the abort case, which is
     /// otherwise a race to provoke) — the crate's established run-loop-only testing seam.
     pub fn new(target: impl Into<String>, outcome: Result<NavigateTreeOutcome, String>) -> Self {
-        TreeNavMsg { target: target.into(), outcome }
+        TreeNavMsg {
+            target: target.into(),
+            outcome,
+        }
     }
 }

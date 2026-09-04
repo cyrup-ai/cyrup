@@ -7,10 +7,9 @@ use std::collections::VecDeque;
 
 use cyrup_core::Usage;
 
-use crate::exec::{RECENT_OUTPUT_CAP, RECENT_OUTPUT_TAIL_LINES, bound_output_line};
 use crate::exec::ndjson::SubagentEvent;
 use crate::exec::tool_call_summary::ToolCallSummary;
-
+use crate::exec::{RECENT_OUTPUT_CAP, RECENT_OUTPUT_TAIL_LINES, bound_output_line};
 
 // ================================================================================================
 // AgentProgress: the live per-attempt fold (R-SA-027/028)
@@ -133,8 +132,7 @@ impl AgentProgress {
                         .push_back(crate::tui::events::RecentToolCall {
                             tool,
                             args: std::mem::take(&mut self.current_tool_args),
-                            end_ms: u64::try_from(crate::time::now_epoch_millis())
-                                .unwrap_or(0),
+                            end_ms: u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0),
                         });
                 }
                 self.current_tool_args.clear();
@@ -266,10 +264,7 @@ impl AgentProgress {
             // progress.currentTool; }` (`execution.ts:909-913` @v0.34.0) — BOTH conditions, so a
             // clean run names no failed tool and a failure with nothing in flight names none
             // either.
-            failed_tool: input
-                .error
-                .as_ref()
-                .and_then(|_| self.current_tool.clone()),
+            failed_tool: input.error.as_ref().and_then(|_| self.current_tool.clone()),
             recent_output: self.recent_output.iter().cloned().collect(),
         }
     }
@@ -324,7 +319,6 @@ mod tests {
     use super::*;
     use crate::exec::RECENT_OUTPUT_LINE_CHARS;
 
-
     // ---- AgentProgress: R-SA-027/028 folding ----
 
     #[test]
@@ -349,7 +343,6 @@ mod tests {
         assert_eq!(progress.message_end_events.len(), 2);
     }
 
-
     #[test]
     fn record_event_increments_tool_count_and_sets_current_tool() {
         let mut progress = AgentProgress::default();
@@ -367,7 +360,6 @@ mod tests {
         assert_eq!(progress.current_tool.as_deref(), Some("edit"));
     }
 
-
     #[test]
     fn recent_output_buffer_is_capped_at_50_lines_oldest_evicted_first() {
         let mut progress = AgentProgress::default();
@@ -375,14 +367,16 @@ mod tests {
             progress.append_recent_output(&format!("line-{i}"));
         }
         assert_eq!(progress.recent_output.len(), RECENT_OUTPUT_CAP);
-        assert_eq!(progress.recent_output.front().map(String::as_str), Some("line-10"));
+        assert_eq!(
+            progress.recent_output.front().map(String::as_str),
+            Some("line-10")
+        );
         let expected_last = format!("line-{}", RECENT_OUTPUT_CAP + 9);
         assert_eq!(
             progress.recent_output.back().map(String::as_str),
             Some(expected_last.as_str())
         );
     }
-
 
     #[test]
     fn append_recent_output_keeps_pis_last_ten_nonblank_lines_of_one_chunk() {
@@ -397,8 +391,14 @@ mod tests {
         }
         progress.append_recent_output(&chunk);
         assert_eq!(progress.recent_output.len(), RECENT_OUTPUT_TAIL_LINES);
-        assert_eq!(progress.recent_output.front().map(String::as_str), Some("l15"));
-        assert_eq!(progress.recent_output.back().map(String::as_str), Some("l24"));
+        assert_eq!(
+            progress.recent_output.front().map(String::as_str),
+            Some("l15")
+        );
+        assert_eq!(
+            progress.recent_output.back().map(String::as_str),
+            Some("l24")
+        );
 
         let mut blanks = AgentProgress::default();
         blanks.append_recent_output("a\n\n   \n  b  \n");
@@ -408,7 +408,6 @@ mod tests {
             "blank lines are dropped; surviving lines keep their own leading/trailing space"
         );
     }
-
 
     #[test]
     fn append_recent_output_truncates_one_enormous_line_to_pis_char_cap() {
@@ -424,7 +423,10 @@ mod tests {
             .front()
             .cloned()
             .expect("one line must be stored");
-        assert_eq!(stored.chars().count(), RECENT_OUTPUT_LINE_CHARS + "… [truncated]".chars().count());
+        assert_eq!(
+            stored.chars().count(),
+            RECENT_OUTPUT_LINE_CHARS + "… [truncated]".chars().count()
+        );
         assert!(stored.ends_with("… [truncated]"), "pi's suffix, verbatim");
 
         // A multi-byte line must be cut on a char boundary, not a byte one.
@@ -444,7 +446,6 @@ mod tests {
             Some(RECENT_OUTPUT_LINE_CHARS)
         );
     }
-
 
     #[test]
     fn record_event_appends_extracted_text_never_the_raw_ndjson_envelope() {
@@ -474,15 +475,20 @@ mod tests {
         });
         assert_eq!(
             progress.recent_output.iter().cloned().collect::<Vec<_>>(),
-            vec!["hello from the child".to_string(), "tool said ok".to_string()]
+            vec![
+                "hello from the child".to_string(),
+                "tool said ok".to_string()
+            ]
         );
         assert!(
-            !progress.recent_output.iter().any(|line| line.contains("\"type\"")),
+            !progress
+                .recent_output
+                .iter()
+                .any(|line| line.contains("\"type\"")),
             "no raw NDJSON envelope may reach recent_output: {:?}",
             progress.recent_output
         );
     }
-
 
     #[test]
     fn summarized_tool_calls_previews_each_started_calls_arguments_in_order() {
@@ -513,5 +519,4 @@ mod tests {
             ]
         );
     }
-
 }

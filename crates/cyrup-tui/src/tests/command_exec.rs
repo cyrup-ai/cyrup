@@ -3,12 +3,17 @@
 //! Drive `App::handle_input` with a submitted slash line and assert the routed [`AppAction`]: in-crate
 //! effects (open the dependency-free selectors, push info blocks, quit) vs. session/data-bound effects
 //! surfaced as [`AppCommand`] for the run loop.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
 use crate::{App, AppAction, AppCommand, Entry, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 /// Submit `line` through the real editor → dispatch path, returning the resulting [`AppAction`].
 fn submit(app: &mut App<TestBackend>, line: &str) -> AppAction {
@@ -66,12 +71,18 @@ fn data_bound_commands_route_to_open_selector() {
 #[test]
 fn lifecycle_commands_route_with_arguments() {
     let mut app = new_app();
-    assert_eq!(submit(&mut app, "/new"), AppAction::Command(AppCommand::NewSession));
+    assert_eq!(
+        submit(&mut app, "/new"),
+        AppAction::Command(AppCommand::NewSession)
+    );
     assert_eq!(
         submit(&mut app, "/compact tighten it"),
         AppAction::Command(AppCommand::Compact(Some("tighten it".to_string())))
     );
-    assert_eq!(submit(&mut app, "/compact"), AppAction::Command(AppCommand::Compact(None)));
+    assert_eq!(
+        submit(&mut app, "/compact"),
+        AppAction::Command(AppCommand::Compact(None))
+    );
     assert_eq!(
         submit(&mut app, "/name my session"),
         AppAction::Command(AppCommand::SetName("my session".to_string()))
@@ -80,8 +91,14 @@ fn lifecycle_commands_route_with_arguments() {
         submit(&mut app, "/export out.jsonl"),
         AppAction::Command(AppCommand::Export(Some("out.jsonl".to_string())))
     );
-    assert_eq!(submit(&mut app, "/copy"), AppAction::Command(AppCommand::Copy));
-    assert_eq!(submit(&mut app, "/session"), AppAction::Command(AppCommand::SessionInfo));
+    assert_eq!(
+        submit(&mut app, "/copy"),
+        AppAction::Command(AppCommand::Copy)
+    );
+    assert_eq!(
+        submit(&mut app, "/session"),
+        AppAction::Command(AppCommand::SessionInfo)
+    );
 }
 
 #[test]
@@ -102,15 +119,32 @@ fn changelog_block_mirrors_the_hotkeys_envelope() {
     let text = app.scrollback_text();
     let rows: Vec<&str> = text.lines().collect();
     let rule = "─".repeat(80);
-    let top = rows.iter().position(|r| r.trim_end() == rule).expect("opening rule");
-    assert_eq!(rows[top + 1], " What's New", "title inset by Text's paddingX 1:\n{text}");
-    assert!(rows[top + 2].trim().is_empty(), "Spacer(1) after the title:\n{text}");
-    assert!(rows[top + 3].trim().is_empty(), "Markdown paddingY blank:\n{text}");
+    let top = rows
+        .iter()
+        .position(|r| r.trim_end() == rule)
+        .expect("opening rule");
     assert_eq!(
-        rows[top + 4], " No changelog entries found.",
+        rows[top + 1],
+        " What's New",
+        "title inset by Text's paddingX 1:\n{text}"
+    );
+    assert!(
+        rows[top + 2].trim().is_empty(),
+        "Spacer(1) after the title:\n{text}"
+    );
+    assert!(
+        rows[top + 3].trim().is_empty(),
+        "Markdown paddingY blank:\n{text}"
+    );
+    assert_eq!(
+        rows[top + 4],
+        " No changelog entries found.",
         "body inset by Markdown's paddingX 1:\n{text}"
     );
-    assert!(rows[top + 5].trim().is_empty(), "trailing paddingY blank:\n{text}");
+    assert!(
+        rows[top + 5].trim().is_empty(),
+        "trailing paddingY blank:\n{text}"
+    );
     assert_eq!(rows[top + 6].trim_end(), rule, "closing rule:\n{text}");
 }
 
@@ -122,7 +156,10 @@ fn hotkeys_command_pushes_a_scrollback_block_and_no_overlay() {
     // `handleHotkeysCommand` (interactive-mode.ts:6197-6203) calls `chatContainer.addChild(...)` six
     // times and never touches `ui.showOverlay`; the help is scrollback, exactly like `/changelog`
     // (:6067-6072). This assertion previously demanded the opposite.
-    assert!(!app.overlay_open(), "/hotkeys must not open the overlay z-stack");
+    assert!(
+        !app.overlay_open(),
+        "/hotkeys must not open the overlay z-stack"
+    );
     assert!(
         app.state()
             .transcript
@@ -140,8 +177,16 @@ fn confirming_a_data_selector_emits_confirm_selection_command() {
     app.open_data_selector(
         SelectorKind::Model,
         vec![
-            ("anthropic/opus".to_string(), "Claude Opus".to_string(), Some("anthropic".to_string())),
-            ("openai/gpt".to_string(), "GPT".to_string(), Some("openai".to_string())),
+            (
+                "anthropic/opus".to_string(),
+                "Claude Opus".to_string(),
+                Some("anthropic".to_string()),
+            ),
+            (
+                "openai/gpt".to_string(),
+                "GPT".to_string(),
+                Some("openai".to_string()),
+            ),
         ],
         0,
     );
@@ -220,7 +265,10 @@ fn export_and_import_route_one_quote_aware_path_token() {
 #[test]
 fn a_bare_name_command_routes_to_the_getter() {
     let mut app = new_app();
-    assert_eq!(submit(&mut app, "/name"), AppAction::Command(AppCommand::ShowName));
+    assert_eq!(
+        submit(&mut app, "/name"),
+        AppAction::Command(AppCommand::ShowName)
+    );
     // The setter half is untouched.
     assert_eq!(
         submit(&mut app, "/name my session"),

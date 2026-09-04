@@ -74,7 +74,12 @@
 //! `deny`) cannot be re-allowed by an inner attribute. That is what stops the defect from regrowing:
 //! the next author who reaches for `std::env::set_var` in a test gets a compile error, not a flake.
 #![forbid(unsafe_code)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 pub mod agent_start_cache;
 pub mod ask;
@@ -82,11 +87,11 @@ pub mod bash;
 pub mod common;
 pub mod config_modal;
 pub mod dedup;
-pub mod error;
-pub mod evaluate;
 /// The crate's single process-environment accessor. PRIVATE on purpose: nothing outside this crate
 /// may reach the test overlay, and nothing inside it may read the environment any other way.
 mod envx;
+pub mod error;
+pub mod evaluate;
 pub mod ext_config;
 pub mod extension;
 pub mod forwarding;
@@ -115,24 +120,23 @@ pub use ask::{
 pub use error::PermissionError;
 pub use ext_config::ExtensionConfig;
 pub use extension::{
-    is_installed, permission_extension_for_env, PermissionSystemExtension, CHILD_ENV_VAR,
-    EXTENSION_ID, INSTALL_ENV_VAR, PERMISSIONS_EXAMPLE_CONFIG, PERMISSIONS_JSON_SCHEMA,
-    PERMISSION_REQUEST_EVENT_CHANNEL, PERMISSION_SYSTEM_COMMAND, POLICY_AGENT_DIR_ENV_KEY,
+    CHILD_ENV_VAR, EXTENSION_ID, INSTALL_ENV_VAR, PERMISSION_REQUEST_EVENT_CHANNEL,
+    PERMISSION_SYSTEM_COMMAND, PERMISSIONS_EXAMPLE_CONFIG, PERMISSIONS_JSON_SCHEMA,
+    POLICY_AGENT_DIR_ENV_KEY, PermissionSystemExtension, is_installed,
+    permission_extension_for_env,
 };
 pub use forwarding::{
+    ForwardedPermissionRequest, ForwardedPermissionResponse, ForwardingLocation,
+    PERMISSION_FORWARDING_TIMEOUT, ProcessForwardedOptions, SharedExtensionConfig, SharedHasUi,
     process_forwarded_requests, resolve_child_wait_timeout, spawn_forwarding_watcher,
-    wait_for_forwarded_approval, ForwardedPermissionRequest, ForwardedPermissionResponse,
-    ForwardingLocation, ProcessForwardedOptions, SharedExtensionConfig, SharedHasUi,
-    PERMISSION_FORWARDING_TIMEOUT,
+    wait_for_forwarded_approval,
 };
 pub use logging::AuditTrail;
 pub use manager::{ManagerPaths, PermissionManager};
 // PERM-011 half A: the publish seam, so a second extension can read/flip yolo mode without
 // holding this extension (pi `globalThis.__piPermissionSystem`, `yolo-mode-api.ts:20-43`).
 pub use runtime_api::{
-    register_runtime_api, runtime_api, unregister_runtime_api, PermissionSystemRuntimeApi,
+    PermissionSystemRuntimeApi, register_runtime_api, runtime_api, unregister_runtime_api,
 };
-pub use types::{
-    CheckSource, PermissionCheckResult, PermissionState,
-};
-pub use yolo_api::{YoloModeControlOptions, YoloModeControlResult, DEFAULT_YOLO_CONTROL_SOURCE};
+pub use types::{CheckSource, PermissionCheckResult, PermissionState};
+pub use yolo_api::{DEFAULT_YOLO_CONTROL_SOURCE, YoloModeControlOptions, YoloModeControlResult};

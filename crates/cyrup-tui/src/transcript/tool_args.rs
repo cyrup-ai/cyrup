@@ -15,7 +15,11 @@ pub(super) fn str_arg(args: &Value, keys: &[&str]) -> StrArg {
         match args.get(k) {
             None | Some(Value::Null) => continue,
             Some(Value::String(s)) => {
-                return if s.is_empty() { StrArg::Missing } else { StrArg::Value(s.clone()) };
+                return if s.is_empty() {
+                    StrArg::Missing
+                } else {
+                    StrArg::Value(s.clone())
+                };
             }
             Some(_) => return StrArg::Invalid,
         }
@@ -72,7 +76,9 @@ fn link_style(raw_path: &str, theme: &UiTheme, opts: ImageOpts<'_>) -> Style {
     if !opts.hyperlinks {
         return accent;
     }
-    let Some(sink) = opts.links else { return accent };
+    let Some(sink) = opts.links else {
+        return accent;
+    };
     let base = match opts.cwd {
         Some(c) => c.to_path_buf(),
         None => match std::env::current_dir() {
@@ -89,7 +95,10 @@ fn link_style(raw_path: &str, theme: &UiTheme, opts: ImageOpts<'_>) -> Style {
 /// non-string → `[invalid arg]`). The caller has already pushed the `" in "` label span.
 pub(super) fn push_search_path(args: &Value, theme: &UiTheme, spans: &mut Vec<Span<'static>>) {
     match str_arg(args, &["path"]) {
-        StrArg::Invalid => spans.push(Span::styled("[invalid arg]".to_string(), theme.error_style())),
+        StrArg::Invalid => spans.push(Span::styled(
+            "[invalid arg]".to_string(),
+            theme.error_style(),
+        )),
         StrArg::Missing => {
             spans.push(Span::styled(shorten_path("."), theme.tool_output_style()));
         }
@@ -134,7 +143,11 @@ pub(super) fn js_number(n: f64) -> String {
         return "NaN".to_string();
     }
     if n.is_infinite() {
-        return if n < 0.0 { "-Infinity".to_string() } else { "Infinity".to_string() };
+        return if n < 0.0 {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        };
     }
     // Step 1 — the shortest round-tripping digit count `k`. Rust's `LowerExp` produces exactly that
     // many digits; only its tie-breaking differs, so re-rounding to the same `k` through the
@@ -147,22 +160,38 @@ pub(super) fn js_number(n: f64) -> String {
         // `LowerExp` for `f64` always emits an `e`; unreachable defensiveness.
         return format!("{n}");
     };
-    let digit_count = shortest_mantissa.chars().filter(char::is_ascii_digit).count();
+    let digit_count = shortest_mantissa
+        .chars()
+        .filter(char::is_ascii_digit)
+        .count();
     let rounded = format!("{:.*e}", digit_count.saturating_sub(1), n);
-    let repr = if rounded.parse::<f64>().is_ok_and(|v| v == n) { rounded } else { shortest };
+    let repr = if rounded.parse::<f64>().is_ok_and(|v| v == n) {
+        rounded
+    } else {
+        shortest
+    };
     // Step 2 — split into ECMA-262's `(s, k, n)`: `s` is the digit string, `k` its length, and `n`
     // the position of the decimal point, which is one more than `{:e}`'s exponent (that exponent is
     // the power of ten sitting on a single leading digit).
-    let Some((mantissa, exponent)) = repr.split_once('e') else { return format!("{n}") };
-    let Ok(exp) = exponent.parse::<i32>() else { return format!("{n}") };
+    let Some((mantissa, exponent)) = repr.split_once('e') else {
+        return format!("{n}");
+    };
+    let Ok(exp) = exponent.parse::<i32>() else {
+        return format!("{n}");
+    };
     let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-    let Ok(k) = i32::try_from(digits.chars().count()) else { return format!("{n}") };
+    let Ok(k) = i32::try_from(digits.chars().count()) else {
+        return format!("{n}");
+    };
     let point = exp + 1;
     let sign = if mantissa.starts_with('-') { "-" } else { "" };
     // Step 3 — ECMA-262 `Number::toString` steps 6-10, in order.
     if k <= point && point <= 21 {
         // The digits, then `n - k` trailing zeros.
-        format!("{sign}{digits}{}", "0".repeat(usize::try_from(point - k).unwrap_or(0)))
+        format!(
+            "{sign}{digits}{}",
+            "0".repeat(usize::try_from(point - k).unwrap_or(0))
+        )
     } else if 0 < point && point <= 21 {
         // A decimal point after `n` digits.
         let mut body = String::with_capacity(digits.len() + 1);
@@ -175,7 +204,10 @@ pub(super) fn js_number(n: f64) -> String {
         format!("{sign}{body}")
     } else if -6 < point && point <= 0 {
         // `0.`, then `-n` leading zeros, then the digits.
-        format!("{sign}0.{}{digits}", "0".repeat(usize::try_from(-point).unwrap_or(0)))
+        format!(
+            "{sign}0.{}{digits}",
+            "0".repeat(usize::try_from(-point).unwrap_or(0))
+        )
     } else {
         // Exponential, with the SIGNED exponent `n - 1` that JS always writes.
         let mut rest = digits.chars();
@@ -212,7 +244,11 @@ pub(super) fn js_arg(v: &Value) -> String {
 /// `Array.prototype.join`'s element rule: `null` and `undefined` render as the empty string rather
 /// than as `"null"`, which is why this is not [`js_arg`] applied directly.
 fn js_arg_element(v: &Value) -> String {
-    if v.is_null() { String::new() } else { js_arg(v) }
+    if v.is_null() {
+        String::new()
+    } else {
+        js_arg(v)
+    }
 }
 
 /// ECMAScript `ToBoolean`.
@@ -242,7 +278,11 @@ fn js_to_number(v: &Value) -> f64 {
         // `Number("")` is `0`; `Number("  12  ")` is `12`; anything else is `NaN`.
         Value::String(s) => {
             let t = s.trim();
-            if t.is_empty() { 0.0 } else { t.parse::<f64>().unwrap_or(f64::NAN) }
+            if t.is_empty() {
+                0.0
+            } else {
+                t.parse::<f64>().unwrap_or(f64::NAN)
+            }
         }
         Value::Array(a) => match a.as_slice() {
             [] => 0.0,
@@ -267,7 +307,6 @@ fn js_add(a: &Value, b: &Value) -> Value {
         Value::from(js_to_number(a) + js_to_number(b))
     }
 }
-
 
 /// `formatReadLineRange` (read.ts:73-78): `:<start>` or `:<start>-<end>` from `offset`/`limit`.
 ///
@@ -381,8 +420,13 @@ pub(super) fn more_lines_hint(
 /// (`core/tools/read.ts:43` `COMPACT_RESOURCE_FILE_NAMES`). Verbatim, including the two `.MD`
 /// spellings — the set is matched case-SENSITIVELY upstream (`Set.has(basename(absolutePath))`), so
 /// `agents.md` is deliberately not in it.
-pub(super) const COMPACT_RESOURCE_FILE_NAMES: [&str; 5] =
-    ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+pub(super) const COMPACT_RESOURCE_FILE_NAMES: [&str; 5] = [
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+];
 
 /// The `kind` union of `CompactReadClassification` (`read.ts:38-41`):
 /// `kind: "docs" | "resource" | "skill"`. A closed enum rather than a `&'static str` so the
@@ -432,7 +476,10 @@ fn docs_classification(absolute: &std::path::Path) -> Option<CompactRead> {
     // (`:117`). The trailing separator is REQUIRED: a read of the `docs` directory itself is not a
     // docs read upstream, and must not become one here.
     if label == "README.md" || label.starts_with("docs/") || label.starts_with("examples/") {
-        return Some(CompactRead { kind: CompactReadKind::Docs, label });
+        return Some(CompactRead {
+            kind: CompactReadKind::Docs,
+            label,
+        });
     }
     None
 }
@@ -501,7 +548,10 @@ pub(super) fn compact_read_classification(
             .map(|s| s.to_string_lossy().into_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or(file_name);
-        return Some(CompactRead { kind: CompactReadKind::Skill, label });
+        return Some(CompactRead {
+            kind: CompactReadKind::Skill,
+            label,
+        });
     }
     // `const docsClassification = getPiDocsClassification(absolutePath);` (`:136-137`) — SECOND,
     // ahead of the resource set. A `docs/AGENTS.md` inside the shipped tree is a `docs` read
@@ -516,7 +566,10 @@ pub(super) fn compact_read_classification(
         // because a bare `strip_prefix` loses Pi's `relativePath || "."` (`:116`) — a path that IS
         // the cwd rendered as the EMPTY label, not `.`.
         let label = cyrup_tools::path::format_path_relative_to_cwd_or_absolute(&absolute, &base);
-        return Some(CompactRead { kind: CompactReadKind::Resource, label });
+        return Some(CompactRead {
+            kind: CompactReadKind::Resource,
+            label,
+        });
     }
     None
 }
@@ -546,8 +599,14 @@ pub(super) fn compact_read_call(
         // The `\x1b[1m…\x1b[22m` pair inside the interpolation is bold-on/bold-off around the
         // bracket label only; `custom_message_label_style` already carries BOLD.
         CompactReadKind::Skill => {
-            spans.push(Span::styled("[skill] ".to_string(), theme.custom_message_label_style()));
-            spans.push(Span::styled(c.label.clone(), theme.custom_message_text_style()));
+            spans.push(Span::styled(
+                "[skill] ".to_string(),
+                theme.custom_message_label_style(),
+            ));
+            spans.push(Span::styled(
+                c.label.clone(),
+                theme.custom_message_text_style(),
+            ));
         }
         // `read.ts:161-167` — docs and resource share ONE branch upstream; the kind word is
         // interpolated into the bold title and the label follows in accent.
@@ -563,6 +622,9 @@ pub(super) fn compact_read_call(
     if let Some(range) = read_line_range(args) {
         spans.push(Span::styled(range, theme.warning_style()));
     }
-    spans.push(Span::styled(format!(" ({expand_key} to expand)"), theme.dim_style()));
+    spans.push(Span::styled(
+        format!(" ({expand_key} to expand)"),
+        theme.dim_style(),
+    ));
     Line::from(spans)
 }

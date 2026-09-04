@@ -19,7 +19,12 @@
 //!
 //! Gated on `test-fixtures` (matching the `cyrup-subagent-fixture` `[[bin]]` `required-features`).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -27,18 +32,17 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-
 use cyrup_core::{CancelToken, Content, ModelId, Tool, ToolCallId};
 use cyrup_ext_subagents::background::RunId;
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions};
 use cyrup_ext_subagents::extension::SubagentsExtension;
-use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::fork_context::ForkContext;
+use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 use cyrup_ext_subagents::tui::intercom::{
     AskLock, ClarifyChannel, ClarifyDispatch, ClarifyRequest, DeliveryChannel, IntercomPayload,
@@ -55,7 +59,11 @@ fn scoped_config(root: &std::path::Path) -> SubagentExtensionConfig {
     SubagentExtensionConfig {
         missions: Some(cyrup_ext_subagents::missions::MissionStoreConfig {
             global_index_dir: Some(
-                root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+                root.join("agent")
+                    .join("missions")
+                    .join("index")
+                    .to_string_lossy()
+                    .into_owned(),
             ),
             ..Default::default()
         }),
@@ -65,7 +73,6 @@ fn scoped_config(root: &std::path::Path) -> SubagentExtensionConfig {
         ..Default::default()
     }
 }
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -116,7 +123,10 @@ fn base_agent_config(model: &str) -> AgentConfig {
         memory: None,
         tool_budget: None,
         runner: None, // SUBA-074: the native child, as before
-        depth: DepthEnvelope { current_depth: 0, max_depth: 5 },
+        depth: DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        },
     }
 }
 
@@ -151,7 +161,10 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         runtime_cwd: None,
         include_progress: None,
         agent_scope: None,
-        acceptance: Some(AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![])),
+        acceptance: Some(AcceptanceContract::explicit(
+            AcceptanceStatus::NotRequired,
+            vec![],
+        )),
         fork_context: ForkContext::fresh(),
         live_events: None,
         parent_session_id: None,
@@ -175,8 +188,12 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
 }
 
 fn read_attempt_tee(child_cwd: &Path) -> String {
-    std::fs::read_to_string(child_cwd.join(".cyrup-subagent-scratch").join("attempt-0.jsonl"))
-        .unwrap_or_default()
+    std::fs::read_to_string(
+        child_cwd
+            .join(".cyrup-subagent-scratch")
+            .join("attempt-0.jsonl"),
+    )
+    .unwrap_or_default()
 }
 
 // =================================================================================================
@@ -212,7 +229,10 @@ async fn parent_session_anchor_is_emitted_into_the_real_child_subprocess_env() {
     // concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     // The EXPLICIT anchor the root orchestrator captures from `HostServices::session_id()` at
     // SessionStart and threads through `RunOptions.parent_session_id` (extension.rs) → the spawn env.
@@ -222,7 +242,9 @@ async fn parent_session_anchor_is_emitted_into_the_real_child_subprocess_env() {
     // overlay MUST fold these into the real child's env so its `IntercomExtension` reads
     // `read_child_orchestrator_metadata() == Some` and registers `contact_supervisor` live.
     opts.orchestrator_intercom_target = Some("subagent-chat-2f9a11ab".to_string());
-    opts.run_id = Some(cyrup_ext_subagents::background::RunId::from_token("run-2f9a11"));
+    opts.run_id = Some(cyrup_ext_subagents::background::RunId::from_token(
+        "run-2f9a11",
+    ));
     opts.child_index = Some(0);
 
     let result = tokio::time::timeout(
@@ -279,7 +301,10 @@ struct RecordingClarifyChannel {
     asks: Arc<Mutex<Vec<ClarifyRequest>>>,
 }
 impl ClarifyChannel for RecordingClarifyChannel {
-    fn ask(&self, request: ClarifyRequest) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+    fn ask(
+        &self,
+        request: ClarifyRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         let asks = self.asks.clone();
         Box::pin(async move {
             asks.lock().expect("asks lock").push(request);
@@ -312,7 +337,9 @@ async fn child_contact_supervisor_block_fires_clarify_and_marks_the_attempt_deta
     // The executor's single-slot AskLock backed by a REAL (recording) ClarifyChannel — exactly what
     // `with_channels` wires from the intercom companion's broker channel in production.
     let asks = Arc::new(Mutex::new(Vec::new()));
-    let lock = Arc::new(AskLock::new(Arc::new(RecordingClarifyChannel { asks: asks.clone() })));
+    let lock = Arc::new(AskLock::new(Arc::new(RecordingClarifyChannel {
+        asks: asks.clone(),
+    })));
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
@@ -320,7 +347,10 @@ async fn child_contact_supervisor_block_fires_clarify_and_marks_the_attempt_deta
     // concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     opts.clarify = Some(ClarifyDispatch {
         lock,
@@ -337,7 +367,10 @@ async fn child_contact_supervisor_block_fires_clarify_and_marks_the_attempt_deta
     .expect("run_sync must not hang");
 
     // R-SA-037: the attempt is marked detached (bypasses acceptance/completion-guard/truncation).
-    assert!(result.detached, "the blocking contact_supervisor ask must mark the attempt detached: {result:?}");
+    assert!(
+        result.detached,
+        "the blocking contact_supervisor ask must mark the attempt detached: {result:?}"
+    );
 
     // R-SA-119/120: the ask was surfaced through the REAL ClarifyChannel (the foreground flow paused
     // on it) — wait briefly for the spawned clarify task to record it.
@@ -346,13 +379,28 @@ async fn child_contact_supervisor_block_fires_clarify_and_marks_the_attempt_deta
         if !asks.lock().expect("asks lock").is_empty() {
             break;
         }
-        assert!(Instant::now() < deadline, "the clarify channel was never reached (no pause/surface)");
+        assert!(
+            Instant::now() < deadline,
+            "the clarify channel was never reached (no pause/surface)"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let recorded = asks.lock().expect("asks lock");
-    assert_eq!(recorded.len(), 1, "exactly one clarify surfaced, got: {:?}", recorded.len());
-    assert_eq!(recorded[0].prompt, "Which database should I use?", "the child's ask prompt was surfaced verbatim");
-    assert_eq!(recorded[0].step_index, Some(0), "the affected step was carried through");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "exactly one clarify surfaced, got: {:?}",
+        recorded.len()
+    );
+    assert_eq!(
+        recorded[0].prompt, "Which database should I use?",
+        "the child's ask prompt was surfaced verbatim"
+    );
+    assert_eq!(
+        recorded[0].step_index,
+        Some(0),
+        "the affected step was carried through"
+    );
 }
 
 // =================================================================================================
@@ -365,7 +413,10 @@ struct ConfirmingDeliveryChannel {
     received: Arc<Mutex<Vec<IntercomPayload>>>,
 }
 impl DeliveryChannel for ConfirmingDeliveryChannel {
-    fn send(&self, payload: IntercomPayload) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+    fn send(
+        &self,
+        payload: IntercomPayload,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
         let received = self.received.clone();
         Box::pin(async move {
             received.lock().expect("received lock").push(payload);
@@ -377,7 +428,10 @@ impl DeliveryChannel for ConfirmingDeliveryChannel {
 /// A no-op ClarifyChannel (this proof exercises only the delivery leg).
 struct InertClarifyChannel;
 impl ClarifyChannel for InertClarifyChannel {
-    fn ask(&self, _request: ClarifyRequest) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+    fn ask(
+        &self,
+        _request: ClarifyRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async { Err("inert".to_string()) })
     }
 }
@@ -413,7 +467,9 @@ async fn grouped_result_is_delivered_out_of_band_and_the_inline_receipt_is_reduc
     // Build the extension with the REAL (confirming) DeliveryChannel — exactly what `with_channels`
     // threads from the intercom companion in production.
     let received = Arc::new(Mutex::new(Vec::new()));
-    let delivery: Arc<dyn DeliveryChannel> = Arc::new(ConfirmingDeliveryChannel { received: received.clone() });
+    let delivery: Arc<dyn DeliveryChannel> = Arc::new(ConfirmingDeliveryChannel {
+        received: received.clone(),
+    });
     let clarify: Arc<dyn ClarifyChannel> = Arc::new(InertClarifyChannel);
     // This proof exercises only the delivery leg; the steer leg (R-SA-086 live-child follow-up) is
     // the no-transport default, which never fires in this out-of-band-delivery scenario.
@@ -421,7 +477,10 @@ async fn grouped_result_is_delivered_out_of_band_and_the_inline_receipt_is_reduc
     let mut ext_config = scoped_config(work_dir.path());
     ext_config.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     let ext = SubagentsExtension::with_channels(
         ext_config,
@@ -459,9 +518,16 @@ async fn grouped_result_is_delivered_out_of_band_and_the_inline_receipt_is_reduc
 
     // R-SA-124: the FULL grouped result reached the out-of-band channel (with the heavy output).
     let got = received.lock().expect("received lock");
-    assert_eq!(got.len(), 1, "the grouped result was delivered out-of-band exactly once");
+    assert_eq!(
+        got.len(),
+        1,
+        "the grouped result was delivered out-of-band exactly once"
+    );
     assert!(
-        got[0].outputs.iter().any(|o| o.contains("HEAVY_TASK_OUTPUT_marker_zzz")),
+        got[0]
+            .outputs
+            .iter()
+            .any(|o| o.contains("HEAVY_TASK_OUTPUT_marker_zzz")),
         "the out-of-band payload carries the full per-task output: {:?}",
         got[0].outputs,
     );
@@ -482,5 +548,10 @@ async fn grouped_result_is_delivered_out_of_band_and_the_inline_receipt_is_reduc
 
     // The structured details flag the out-of-band delivery for the LLM/host.
     let details = result.details.expect("details present");
-    assert_eq!(details.get("outOfBandDelivered").and_then(serde_json::Value::as_bool), Some(true));
+    assert_eq!(
+        details
+            .get("outOfBandDelivered")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
 }

@@ -21,11 +21,11 @@ impl AgentSession {
         content: serde_json::Value,
         display: bool,
     ) -> Result<EntryId, SessionServiceError> {
-        let id = self
-            .manager
-            .lock()
-            .await
-            .append_custom_message(custom_type, content, display, None)?;
+        let id =
+            self.manager
+                .lock()
+                .await
+                .append_custom_message(custom_type, content, display, None)?;
         Ok(id)
     }
 
@@ -84,12 +84,18 @@ impl AgentSession {
                 _ => self.agent.steer(msg),
             },
             _ => {
-                self.manager
-                    .lock()
-                    .await
-                    .append_custom_message(custom_type, content, display, details)?;
-                self.fanout_emit(AgentSessionEvent::MessageStart { message: msg.clone() }).await;
-                self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg }).await;
+                self.manager.lock().await.append_custom_message(
+                    custom_type,
+                    content,
+                    display,
+                    details,
+                )?;
+                self.fanout_emit(AgentSessionEvent::MessageStart {
+                    message: msg.clone(),
+                })
+                .await;
+                self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg })
+                    .await;
             }
         }
         Ok(())
@@ -141,12 +147,18 @@ impl AgentSession {
             self.spawn_run(vec![msg]).await?;
         } else {
             // Pi else-branch: append durably + surface via message_start/message_end.
-            self.manager
-                .lock()
-                .await
-                .append_custom_message(&kind, serde_json::Value::String(content), display, details)?;
-            self.fanout_emit(AgentSessionEvent::MessageStart { message: msg.clone() }).await;
-            self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg }).await;
+            self.manager.lock().await.append_custom_message(
+                &kind,
+                serde_json::Value::String(content),
+                display,
+                details,
+            )?;
+            self.fanout_emit(AgentSessionEvent::MessageStart {
+                message: msg.clone(),
+            })
+            .await;
+            self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg })
+                .await;
         }
         Ok(())
     }

@@ -54,7 +54,12 @@ impl OAuthCallbacks {
             expires_in_seconds,
         );
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = (user_code, verification_uri, interval_seconds, expires_in_seconds);
+        let _ = (
+            user_code,
+            verification_uri,
+            interval_seconds,
+            expires_in_seconds,
+        );
     }
 
     /// Prompt for a value (e.g. "Paste the callback URL"); `Err` = the user cancelled (Pi `onPrompt`).
@@ -86,7 +91,10 @@ impl OAuthCallbacks {
     /// Show an interactive selector over `[(id, label)]`; returns the chosen id (Pi `onSelect`).
     pub fn on_select(&self, message: &str, options: &[(&str, &str)]) -> Option<String> {
         let options_json = serde_json::to_string(
-            &options.iter().map(|(id, label)| serde_json::json!({"id": id, "label": label})).collect::<Vec<_>>(),
+            &options
+                .iter()
+                .map(|(id, label)| serde_json::json!({"id": id, "label": label}))
+                .collect::<Vec<_>>(),
         )
         .unwrap_or_else(|_| "[]".into());
         #[cfg(target_arch = "wasm32")]
@@ -114,7 +122,9 @@ impl ProviderStream {
     /// guest glue builds this for a `provider-stream-simple` call; a `streamSimple` handler
     /// receives it rather than constructing one.
     pub fn new(stream_id: impl Into<String>) -> Self {
-        Self { stream_id: stream_id.into() }
+        Self {
+            stream_id: stream_id.into(),
+        }
     }
     /// The host-assigned id of this stream.
     pub fn id(&self) -> &str {
@@ -144,7 +154,10 @@ impl ProviderStream {
             }
         };
         #[cfg(target_arch = "wasm32")]
-        crate::guest::bindings::cyrup::ext::provider_stream::emit_event(&self.stream_id, &event_json);
+        crate::guest::bindings::cyrup::ext::provider_stream::emit_event(
+            &self.stream_id,
+            &event_json,
+        );
         #[cfg(not(target_arch = "wasm32"))]
         let _ = event_json;
     }
@@ -191,16 +204,22 @@ impl ProviderStream {
         let payload_json = match serde_json::to_string(&payload) {
             Ok(s) => s,
             Err(e) => {
-                let m = format!("ProviderStream::on_payload({id}): host not consulted, encode failed: {e}");
+                let m = format!(
+                    "ProviderStream::on_payload({id}): host not consulted, encode failed: {e}"
+                );
                 crate::ctx::Ui.notify_with(&m, crate::ctx::NotifyKind::Error);
                 return Ok(None);
             }
         };
         #[cfg(target_arch = "wasm32")]
         return crate::guest::bindings::cyrup::ext::provider_stream::on_payload(id, &payload_json)
-            .map(|s| serde_json::from_str(&s).map_err(|e| {
-                format!("ProviderStream::on_payload({id}): host replacement is not valid JSON: {e}")
-            }))
+            .map(|s| {
+                serde_json::from_str(&s).map_err(|e| {
+                    format!(
+                        "ProviderStream::on_payload({id}): host replacement is not valid JSON: {e}"
+                    )
+                })
+            })
             .transpose();
         #[cfg(not(target_arch = "wasm32"))]
         {

@@ -37,15 +37,15 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use cyrup_core::StopReason;
 use crate::run_rpc;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
+use cyrup_core::StopReason;
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{AgentSessionRuntime, SessionFactory};
 use serde_json::Value;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 
-use super::support::{base_config_no_ext, create_runtime, fixture, parse_lines, Fixture};
+use super::support::{Fixture, base_config_no_ext, create_runtime, fixture, parse_lines};
 
 // ---------------------------------------------------------------------------------------------
 // A genuinely stalled peer
@@ -194,14 +194,18 @@ async fn a_stalled_client_cannot_park_the_command_loop() {
     };
 
     // 1. A command whose response the host will try to write — and stall on.
-    client.write_all(b"{\"type\":\"get_state\",\"id\":\"a\"}\n").await.unwrap();
+    client
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"a\"}\n")
+        .await
+        .unwrap();
     assert!(
         within(Duration::from_secs(20), || gate.attempts() > 0).await,
         "the host must reach its first write (the stall point) before the probe is sent"
     );
 
     // 2. The probe, sent while the writer is provably stalled.
-    let probe_line = format!("{{\"type\":\"set_auto_compaction\",\"id\":\"b\",\"enabled\":{probe}}}\n");
+    let probe_line =
+        format!("{{\"type\":\"set_auto_compaction\",\"id\":\"b\",\"enabled\":{probe}}}\n");
     client.write_all(probe_line.as_bytes()).await.unwrap();
 
     // Poll the session's own state (never the wire — the wire is what is unavailable). The deadline
@@ -231,7 +235,10 @@ async fn a_stalled_client_cannot_park_the_command_loop() {
          awaited its writes inline inside the `select!`, so `abort`/`abort_bash`/`shutdown` could \
          not be delivered to a session whose client had stopped reading"
     );
-    ended.expect("run_rpc must return once the peer drains and stdin closes").unwrap().unwrap();
+    ended
+        .expect("run_rpc must return once the peer drains and stdin closes")
+        .unwrap()
+        .unwrap();
 }
 
 /// The property the decoupling must not break: everything queued while the peer was stalled is
@@ -266,7 +273,10 @@ async fn nothing_queued_during_the_stall_is_lost_at_shutdown() {
         within(Duration::from_secs(20), || gate.attempts() > 0).await,
         "the host must reach its first write"
     );
-    assert!(gate.bytes().is_empty(), "a stalled peer has received nothing yet");
+    assert!(
+        gate.bytes().is_empty(),
+        "a stalled peer has received nothing yet"
+    );
 
     gate.open();
     tokio::time::timeout(Duration::from_secs(30), host)
@@ -276,8 +286,10 @@ async fn nothing_queued_during_the_stall_is_lost_at_shutdown() {
         .unwrap();
 
     let lines = parse_lines(&gate.bytes());
-    let types: Vec<&str> =
-        lines.iter().map(|v| v.get("type").and_then(Value::as_str).unwrap_or("")).collect();
+    let types: Vec<&str> = lines
+        .iter()
+        .map(|v| v.get("type").and_then(Value::as_str).unwrap_or(""))
+        .collect();
     assert!(
         types.contains(&"agent_settled"),
         "the run's terminal event survives the stall: {types:?}"
@@ -286,8 +298,10 @@ async fn nothing_queued_during_the_stall_is_lost_at_shutdown() {
         .iter()
         .filter(|v| v.get("type").and_then(Value::as_str) == Some("response"))
         .collect();
-    let ids: Vec<&str> =
-        responses.iter().filter_map(|v| v.get("id").and_then(Value::as_str)).collect();
+    let ids: Vec<&str> = responses
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .collect();
     assert!(
         ids.contains(&"1") && ids.contains(&"2"),
         "both correlated responses survive the stall: {ids:?}"

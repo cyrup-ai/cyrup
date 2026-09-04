@@ -24,14 +24,18 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::{
-    CommandDescriptor, ExtMode, ExtensionHost, HookOutcome, HostConfig, HostCtx, HostEvent, InitApi,
-    NativeExtension,
+    CommandDescriptor, ExtMode, ExtensionHost, HookOutcome, HostConfig, HostCtx, HostEvent,
+    InitApi, NativeExtension,
 };
 use cyrup_core::{CancelToken, ExtensionId};
 use std::sync::{Arc, Mutex};
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: std::path::PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: std::path::PathBuf::from("."),
+    }
 }
 
 /// A native built-in shaped like the real ones: it registers ONE command under a fixed name and its
@@ -55,7 +59,10 @@ impl NativeExtension for DeployExt {
     async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
         api.register_command(
             "deploy",
-            CommandDescriptor { description: "ship it".into(), completions: vec![] },
+            CommandDescriptor {
+                description: "ship it".into(),
+                completions: vec![],
+            },
         );
         Ok(())
     }
@@ -70,23 +77,36 @@ impl NativeExtension for DeployExt {
     ) -> Result<Option<String>, crate::ExtError> {
         self.seen.lock().unwrap().push(name.to_string());
         if name != "deploy" {
-            return Err(crate::ExtError::Component(format!("no such command: {name}")));
+            return Err(crate::ExtError::Component(format!(
+                "no such command: {name}"
+            )));
         }
         Ok(Some(format!("{}:{args}", self.tag)))
     }
 }
 
-async fn two_colliding_deploys() -> (ExtensionHost, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>)
-{
+async fn two_colliding_deploys() -> (
+    ExtensionHost,
+    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Vec<String>>>,
+) {
     let host = ExtensionHost::new(cfg());
     let first = Arc::new(Mutex::new(Vec::new()));
     let second = Arc::new(Mutex::new(Vec::new()));
-    host.load_native(Arc::new(DeployExt { id: "first".into(), tag: "A", seen: first.clone() }))
-        .await
-        .unwrap();
-    host.load_native(Arc::new(DeployExt { id: "second".into(), tag: "B", seen: second.clone() }))
-        .await
-        .unwrap();
+    host.load_native(Arc::new(DeployExt {
+        id: "first".into(),
+        tag: "A",
+        seen: first.clone(),
+    }))
+    .await
+    .unwrap();
+    host.load_native(Arc::new(DeployExt {
+        id: "second".into(),
+        tag: "B",
+        seen: second.clone(),
+    }))
+    .await
+    .unwrap();
     (host, first, second)
 }
 
@@ -99,8 +119,15 @@ async fn each_colliding_deploy_executes_at_its_own_suffix_and_sees_its_registere
 
     // Guard against a vacuous pass: the suffixes must exist at all before asserting what they do.
     let resolved = host.registry().resolved_commands().unwrap();
-    let invocations: Vec<&str> = resolved.iter().map(|r| r.invocation_name.as_str()).collect();
-    assert_eq!(invocations, vec!["deploy:1", "deploy:2"], "load-order suffixing, pi's rule");
+    let invocations: Vec<&str> = resolved
+        .iter()
+        .map(|r| r.invocation_name.as_str())
+        .collect();
+    assert_eq!(
+        invocations,
+        vec!["deploy:1", "deploy:2"],
+        "load-order suffixing, pi's rule"
+    );
 
     let one = host
         .execute_native_command("deploy:1", "prod", &cancel)
@@ -126,8 +153,14 @@ async fn each_colliding_deploy_executes_at_its_own_suffix_and_sees_its_registere
 
     // The load-bearing half: pi's suffix is a ROUTING key and never reaches the handler. Before the
     // fix these vectors held `["deploy:1"]` / `["deploy:2"]` and both calls came back `Err`.
-    assert_eq!(first_seen.lock().unwrap().as_slice(), ["deploy".to_string()]);
-    assert_eq!(second_seen.lock().unwrap().as_slice(), ["deploy".to_string()]);
+    assert_eq!(
+        first_seen.lock().unwrap().as_slice(),
+        ["deploy".to_string()]
+    );
+    assert_eq!(
+        second_seen.lock().unwrap().as_slice(),
+        ["deploy".to_string()]
+    );
 }
 
 /// The BARE name of a collided command is not a command at all upstream: `resolveRegisteredCommands`
@@ -139,7 +172,8 @@ async fn each_colliding_deploy_executes_at_its_own_suffix_and_sees_its_registere
 /// `resolved_command_owner`. That fallback was the last-registration-wins defect surviving in the
 /// one place the disambiguation tier could not cover, so `/deploy` silently meant "extension B".
 #[tokio::test]
-async fn the_bare_name_of_a_collided_command_falls_through_instead_of_picking_the_last_registrant() {
+async fn the_bare_name_of_a_collided_command_falls_through_instead_of_picking_the_last_registrant()
+{
     let (host, first_seen, second_seen) = two_colliding_deploys().await;
     let cancel = CancelToken::new();
 
@@ -158,7 +192,10 @@ async fn the_bare_name_of_a_collided_command_falls_through_instead_of_picking_th
         "pi's getCommand matches invocationName only, and no ResolvedCommand is named `deploy`"
     );
     assert!(
-        host.execute_native_command("deploy", "prod", &cancel).await.expect("routing succeeds").is_none(),
+        host.execute_native_command("deploy", "prod", &cancel)
+            .await
+            .expect("routing succeeds")
+            .is_none(),
         "Ok(None) is pi's `false`: the caller falls through to a normal prompt"
     );
     // And no handler ran.
@@ -173,9 +210,13 @@ async fn the_bare_name_of_a_collided_command_falls_through_instead_of_picking_th
 async fn an_uncollided_command_still_dispatches_under_its_bare_name() {
     let host = ExtensionHost::new(cfg());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    host.load_native(Arc::new(DeployExt { id: "solo".into(), tag: "S", seen: seen.clone() }))
-        .await
-        .unwrap();
+    host.load_native(Arc::new(DeployExt {
+        id: "solo".into(),
+        tag: "S",
+        seen: seen.clone(),
+    }))
+    .await
+    .unwrap();
 
     assert_eq!(
         host.registry()
@@ -200,18 +241,20 @@ async fn an_uncollided_command_still_dispatches_under_its_bare_name() {
 #[tokio::test]
 async fn an_unregistered_command_name_routes_nowhere() {
     let (host, _a, _b) = two_colliding_deploys().await;
-    assert!(host
-        .execute_native_command("nope", "", &CancelToken::new())
-        .await
-        .expect("routing succeeds")
-        .is_none());
+    assert!(
+        host.execute_native_command("nope", "", &CancelToken::new())
+            .await
+            .expect("routing succeeds")
+            .is_none()
+    );
     // A suffix past the end is equally unrouted — `takenInvocationNames` only ever assigns as many
     // as there are registrations.
-    assert!(host
-        .execute_native_command("deploy:3", "", &CancelToken::new())
-        .await
-        .expect("routing succeeds")
-        .is_none());
+    assert!(
+        host.execute_native_command("deploy:3", "", &CancelToken::new())
+            .await
+            .expect("routing succeeds")
+            .is_none()
+    );
 }
 
 /// SEAM-048's LAST reader — RED before this pass.

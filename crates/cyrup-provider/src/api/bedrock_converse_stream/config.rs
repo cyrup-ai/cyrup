@@ -76,8 +76,11 @@ pub(super) fn resolve_client_config(
     let configured_region = configured_bedrock_region(bedrock, env);
     let has_ambient_profile = env.ambient("AWS_PROFILE").is_some();
     let endpoint_region = standard_bedrock_endpoint_region(&base_url);
-    let use_explicit_endpoint =
-        should_use_explicit_bedrock_endpoint(&base_url, configured_region.as_deref(), has_ambient_profile);
+    let use_explicit_endpoint = should_use_explicit_bedrock_endpoint(
+        &base_url,
+        configured_region.as_deref(),
+        has_ambient_profile,
+    );
 
     let skip_auth = env.get("AWS_BEDROCK_SKIP_AUTH").as_deref() == Some("1");
     let bearer_token = bedrock
@@ -216,14 +219,12 @@ fn arn_region(model_id: &str) -> Option<String> {
         Some(r) => r,
         None => {
             let partition = rest.strip_prefix('-')?;
-            let end = partition
-                .find(':')
-                .filter(|i| *i > 0)
-                .filter(|i| {
-                    partition
-                        .get(..*i)
-                        .is_some_and(|p| p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
-                })?;
+            let end = partition.find(':').filter(|i| *i > 0).filter(|i| {
+                partition.get(..*i).is_some_and(|p| {
+                    p.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                })
+            })?;
             partition.get(end + 1..)?
         }
     };
