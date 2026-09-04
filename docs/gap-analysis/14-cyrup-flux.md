@@ -118,7 +118,7 @@ in areas 07 and 08.
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | FLUX-001 | **medium** | cyrup-original | S | The bundled prompt/skill tree is resolved through a build-machine `CARGO_MANIFEST_DIR` path, so a binary without an intact source tree loses all 15 `/flux/*` templates and the skill — silently, while the three native commands, `ctrl+f` and `ask_user_question` still register |
-| FLUX-002 | **medium** | parity-bug | S | Four templates instruct the model to call the `subagent` tool, which is default-OFF, while Flux itself is default-ON — the rename `invoke_agent` → `subagent` ported the name and dropped the availability |
+| ~~FLUX-002~~ | ~~medium~~ **CLOSED 2026-09-04** | parity-bug | S | Four templates instruct the model to call the `subagent` tool, which is default-OFF, while Flux itself is default-ON — the rename `invoke_agent` → `subagent` ported the name and dropped the availability. **CLOSED 2026-09-04, cyrup `c7d21bbb`.** Landed as the row's prescribed template fix, not the rejected gate-arming: each of the four multi-task branches now opens with an availability pre-condition — check the tool list for `subagent` BEFORE calling it; if absent, do NOT call it or substitute another tool, tell the user ONCE (naming the `CYRUP_SUBAGENTS=1` / `subagents/config.json` opt-in) and take the sequential single-task path — at `resources/prompts/flux/exec.md:48-49` (dispatch `ELSE:`) + `:181` (MULTI-TASK MODE), `aug.md:50-51` + `:158`, `qa.md:48-49` + `:163`, and `review.md:109` (STEP 6, degrade = review each group in-line, extended to STEP 7's second launch at `:192`); the skill's `N` row (`resources/skills/flux/SKILL.md:56`), `docs/guide/extensions/flux.md:52-55` and `spec/flux.md` §0.3 (next to the rename map, as the row required) record the same. The armed path is unchanged (one `subagent` call, `tasks:[]`, `concurrency: $ARGUMENTS`). The gate itself is untouched: `crates/cyrup-ext-subagents/src/extension/host/registration.rs:99-129` `is_installed`/`is_installed_with`, tool name at `extension/mod.rs:104`; flux still attaches unconditionally at `crates/cyrup/src/session_launch.rs:136` (the `main.rs:726/930/1060` seams this row cited have since moved there). Upstream re-read at **v0.0.40** (ADR-0006; `flux_bootstrap/` is byte-identical to v0.0.6): `bundled/commands/flux/exec.md:181`, `aug.md:158`, `qa.md:163`, `review.md:110` name `invoke_agent` unconditionally, which is correct there because it is a core `TOOL_REGISTRY` tool. **Tests (red before / green after):** `crates/cyrup-flux/tests/flux_002_subagent_fallback.rs` — 4 of 6 failed against the unedited templates (`every_multi_task_template_checks_tool_availability_before_calling_subagent`, `the_three_n_argument_templates_route_a_missing_tool_to_the_sequential_path_in_dispatch`, `review_degrades_in_line_and_covers_its_second_subagent_launch_in_step_7`, `the_skill_tells_the_model_the_n_mode_needs_the_subagent_tool`), 6/6 after; the two that held both times pin the armed path and the four-template census. **Residual (low):** the row's Verify is a live-model observation (`/flux/exec 3` on a three-todo fixture with the gate off completing sequentially with one notice) and was NOT executed — what is pinned is the prompt contract, and whether a given model honours a tool-list check is not testable here; the harness has no template-time signal of tool availability (prompt templates are static files contributed via `ResourcesDiscover`), so a wiring-level degrade would need a new seam and is not filed. |
 | FLUX-003 | **medium** | test-defect | M | The crate has zero tests at 1,513 lines — a state parser, three renderers, an overlay and a tool with no red-before evidence for anything, and no pin on the cross-harness state contract the port calls a requirement |
 | FLUX-004 | **medium** | cyrup-original | S | `ctrl+f` silently takes the editor's `tui.editor.cursorRight` away from the user, with no diagnostic and no rebind path — the first LIVE instance of `EXT-039`'s open residual |
 | FLUX-005 | low | cyrup-original | S | The four `_docs/*.md` reference files are byte-identical duplicates of `skills/flux/reference/*.md` with no sync mechanism, and one of them is additionally compiled into `/flux/cheatsheet` |
@@ -191,9 +191,49 @@ anywhere above it, unset `CYRUP_FLUX_RESOURCES_DIR`, run it, and assert `/flux/n
 15 `.md` files and `bundled_skill_md()` to an existing file with the env var unset and the manifest
 dir renamed. Neither test exists today — see `FLUX-003`.
 
-## FLUX-002 — Four templates instruct a tool that is off by default, in an extension that is on by default
+## ~~FLUX-002~~ — Four templates instruct a tool that is off by default, in an extension that is on by default — **CLOSED 2026-09-04**
 
-**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+**Kind** parity-bug · **Severity** ~~medium~~ · **Effort** S · **Confidence** confirmed
+**CLOSED 2026-09-04, cyrup `c7d21bbb`** (`fix(flux): FLUX-002 gate the multi-task fan-out on `subagent` tool availability`).
+Landed exactly as **Fix** below prescribes — the four-file template edit — and the alternative it says to
+REJECT (arming subagents from flux) was rejected. What each template now says, first, in its multi-task
+branch: check the tool list for `subagent` BEFORE calling it; if it is absent, do NOT call it and do NOT
+substitute another tool, tell the user ONCE that it is not available (naming the opt-in:
+`CYRUP_SUBAGENTS=1` or a `subagents/config.json` at user or project scope), then run every
+`$FLUX_BASE/todo/*.md` task in SINGLE-TASK MODE one after another exactly as `all` does
+(`exec`/`aug`/`qa`) or review each group in-line, one group at a time, with the same sub-agent prompt
+template (`review`, whose STEP 7 second launch is covered too). The dispatch block's pure-integer `ELSE:`
+branch carries the same condition so the model never commits to fan-out before checking. Landed lines:
+`crates/cyrup-flux/resources/prompts/flux/exec.md:48-49` + `:181`, `aug.md:50-51` + `:158`,
+`qa.md:48-49` + `:163`, `review.md:109` + `:192`; `resources/skills/flux/SKILL.md:56` (the system-prompt
+table's `N` row); `docs/guide/extensions/flux.md:52-55`; `spec/flux.md` §0.3 (the note the **Fix** asks
+for, next to the rename map). The armed path — one `subagent` call with `tasks: [...]` and
+`concurrency: $ARGUMENTS` — is unchanged. Nothing in the wiring moved: `is_installed` /
+`is_installed_with` at `crates/cyrup-ext-subagents/src/extension/host/registration.rs:99-129`,
+`TOOL_NAME = "subagent"` at `extension/mod.rs:104`, and flux still attaches unconditionally — the seam
+is now `crates/cyrup/src/session_launch.rs:136` (`attach_native_extensions`, item 7 of its doc comment),
+not the three `main.rs` lines cited below, which moved in the interim. **Upstream re-read at v0.0.40**
+(ADR-0006; `flux_bootstrap/` is byte-identical to the v0.0.6 baseline): `code_puppy_core_plugins/`
+`flux_bootstrap/bundled/commands/flux/exec.md:181`, `aug.md:158`, `qa.md:163`, `review.md:110` name
+`invoke_agent` with no availability check, which is correct there and only there. **Tests, red before /
+green after:** `crates/cyrup-flux/tests/flux_002_subagent_fallback.rs` (read through
+`resources::bundled_prompts_dir()` / `bundled_skill_md()`, the same resolver `ResourcesDiscover`
+contributes) — against the unedited templates 4 of 6 failed:
+`every_multi_task_template_checks_tool_availability_before_calling_subagent` (the shared trigger
+sentence, the once-only notice, the no-call/no-substitute rule, the named opt-in),
+`the_three_n_argument_templates_route_a_missing_tool_to_the_sequential_path_in_dispatch`,
+`review_degrades_in_line_and_covers_its_second_subagent_launch_in_step_7`,
+`the_skill_tells_the_model_the_n_mode_needs_the_subagent_tool`; 6/6 after. The two that passed both
+times — `every_multi_task_template_still_names_the_subagent_tool_for_the_armed_path` and
+`only_the_four_multi_task_templates_name_the_subagent_tool` (the `4 — aug, exec, qa, review` census) — are
+regression pins, not closure evidence. `cargo nextest run -p cyrup-flux` 6/6, clippy `--all-targets -D
+warnings` and `RUSTDOCFLAGS='-D warnings' cargo doc` clean, `cargo check -p cyrup` clean. This is the
+crate's first test binary; `FLUX-003` is NOT claimed by it. **Residual (low):** the **Verify** below is a
+live-model observation and was not executed — what is pinned is the prompt contract; whether a given
+model honours a tool-list check is not testable here. A harness-level degrade (flux observing the
+subagent gate and rewriting or selecting templates) would need a new seam — prompt templates are static
+files contributed by directory via `ResourcesDiscover` — and is not filed: the row's own **Fix** names the
+template edit as the correct shape.
 **cyrup** — Flux attaches unconditionally at all three `AppMode` seams:
 `crates/cyrup/src/main.rs:726`, `:930`, `:1060`, each `if let Some(ext) =
 cyrup_flux::flux_extension_for_env()`, whose only `None` is a subagent CHILD
