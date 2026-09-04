@@ -158,14 +158,11 @@ use cyrup_session_svc::{NotifyKind, UiEffect, UiKind, UiReply, UiRequest};
 use futures::{FutureExt, StreamExt};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::cursor::MoveTo;
-use ratatui::crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
-};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, enable_raw_mode,
 };
-use ratatui::crossterm::{ExecutableCommand, execute, queue};
+use ratatui::crossterm::{ExecutableCommand, queue};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};

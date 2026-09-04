@@ -22,13 +22,48 @@
 //! no flags report, ⇒ it is not, and Pi falls back to xterm's `modifyOtherKeys` (`CSI > 4 ; 2 m`,
 //! `:320-324`, undone with `CSI > 4 ; 0 m` at `:326-330`).
 //!
-//! # What cyrup does, and the one deliberate delta
+//! # What cyrup does, and the two deliberate deltas
 //!
-//! Everything above except the `modifyOtherKeys` write. [`negotiate`] pushes (the caller's
-//! `PushKeyboardEnhancementFlags`, [`crate::App::into_stdout`]), queries, consumes the reply behind
-//! the same DA1 sentinel [`crate::terminal_query`] uses, and records the outcome in a process-global
-//! ([`current`]) so the rest of the TUI — and the user-facing diagnostics — can tell whether modified
-//! keys are actually disambiguated.
+//! Everything above except the `modifyOtherKeys` write, and with one bit fewer in the pushed flag
+//! set. [`push_flags`] writes [`DESIRED_FLAGS`] (the single source of truth for all three push
+//! sites — [`crate::App::into_stdout`], `App::suspend` and the external-editor round trip), then
+//! [`negotiate`] queries, consumes the reply behind the same DA1 sentinel [`crate::terminal_query`]
+//! uses, and records the outcome in a process-global ([`current`]) so the rest of the TUI — and the
+//! user-facing diagnostics — can tell whether modified keys are actually disambiguated.
+//!
+//! `[CYRUP-DELTA]` **`REPORT_EVENT_TYPES` (bit 2) is withheld: cyrup pushes `CSI > 5 u` where Pi
+//! pushes `CSI > 7 u`** (`TUI-046`). Bit 1 (`DISAMBIGUATE_ESCAPE_CODES`) and bit 4
+//! (`REPORT_ALTERNATE_KEYS`) are pushed, and bit 4 is the half with a user-visible effect cyrup was
+//! missing: crossterm resolves a Kitty CSI-u's alternate codepoint into the emitted keycode
+//! (`crossterm-0.29.0/src/event/sys/unix/parse.rs:597-606`), so a shifted key on a non-US layout
+//! reports the character that layout actually produces instead of the base one, which is what a
+//! keybinding is matched against.
+//!
+//! Bit 2 is withheld because its two upstream *guards* have no expressible form at cyrup's seam,
+//! while bit 2 itself buys cyrup nothing:
+//!
+//! * All bit 2 adds is `Repeat`/`Release` reports (crossterm `event.rs:296-299`), and
+//!   `App::map_event_on` (`crate::app::input_reader`) discards every `KeyEventKind::Release` — so no
+//!   cyrup code path consumes one.
+//! * Guard one, Pi's `pendingKittyPrintableCodepoint` (`stdin-buffer.ts:186-192`, `:399-408`,
+//!   commit `bdb416cbc`, pi issue #3780), drops a raw character that duplicates the Kitty CSI-u for
+//!   the same codepoint. Pi filters RAW BYTES, so it can see the difference; cyrup filters events,
+//!   and crossterm decodes `\x1b[224u` and a bare `à` into byte-identical
+//!   `KeyEvent { code: Char('à'), modifiers: NONE, kind: Press, state: NONE }` values
+//!   (`parse.rs:540-568` vs `:118-135`). At the event level the guard degenerates to "drop the
+//!   second of two identical printable presses", which would eat the second `l` of `hello`.
+//! * Guard two, Pi's WezTerm split (`stdin-buffer.ts:207-232`), emits a lone `ESC` and restarts
+//!   when `\x1b\x1b` is followed by `[`/`]`/`O`/`P`/`_` — the shape WezTerm produces for the Escape
+//!   key once event types are reported (a raw `\x1b` press plus a `CSI 27 ; … : 3 u` release).
+//!   crossterm collapses `\x1b\x1b` into one `Esc` event before cyrup sees it (`parse.rs:77`), so
+//!   [`crate::escape_reassembly`] cannot tell that shape from the genuine split-at-`ESC` it exists
+//!   to repair.
+//!
+//! Withholding bit 2 does not merely leave those guards unported — it makes guard two's hazard
+//! **unreachable**, because the release report it keys off is only sent when event types are
+//! requested. Guard one's hazard is a terminal/layout quirk rather than a flag-gated one and stays
+//! a recorded residual on `TUI-046`. The bit goes in the moment cyrup owns the bytes ahead of
+//! crossterm's parser rather than the events behind it.
 //!
 //! `[CYRUP-DELTA]` **`modifyOtherKeys` is negotiated but not enabled.** Pi hand-rolls its key parser
 //! (`tui/src/keys.ts`) and therefore understands xterm's `CSI 27 ; <mod> ; <code> ~` reports.
@@ -58,10 +93,41 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
+use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+use ratatui::crossterm::execute;
+
+/// The Kitty keyboard-protocol flags this process asks for — Pi's
+/// `DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS` (`terminal.ts:15`, `= 7`) minus `REPORT_EVENT_TYPES`.
+///
+/// `DISAMBIGUATE_ESCAPE_CODES | REPORT_ALTERNATE_KEYS` = `0b101` = 5, so the wire form is
+/// `CSI > 5 u` against Pi's `CSI > 7 u`. See the module docs for why bit 2 is withheld
+/// (`TUI-046`); it is a `[CYRUP-DELTA]`, not an oversight.
+///
+/// One constant rather than three literals because there are three push sites
+/// ([`crate::App::into_stdout`], `App::suspend`, the external-editor round trip) and a terminal
+/// whose re-entry push disagrees with its startup push has a flag stack that no longer matches the
+/// negotiated state [`current`] reports.
+pub const DESIRED_FLAGS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
+
+/// Write the `CSI > <flags> u` push — the first third of Pi's `KITTY_KEYBOARD_PROTOCOL_QUERY`
+/// (`terminal.ts:17`), which Pi also re-writes on every `start()` (`terminal.ts:164-166`).
+///
+/// Best-effort at every call site: a terminal that does not understand the sequence ignores it, and
+/// [`negotiate`] is what discovers whether the push actually took.
+///
+/// # Errors
+///
+/// Propagates the write/flush error from `out`.
+pub fn push_flags<W: std::io::Write>(out: &mut W) -> std::io::Result<()> {
+    execute!(out, PushKeyboardEnhancementFlags(DESIRED_FLAGS))
+}
+
 /// `CSI ? u` — Pi's flags query, the middle third of `KITTY_KEYBOARD_PROTOCOL_QUERY`
-/// (`terminal.ts:17`). The leading `CSI > <flags> u` push is the caller's
-/// (`PushKeyboardEnhancementFlags`) and the trailing `CSI c` sentinel is appended by
-/// [`crate::terminal_query`]'s exchange, so this constant is only the query itself.
+/// (`terminal.ts:17`). The leading `CSI > <flags> u` push is the caller's ([`push_flags`]) and the
+/// trailing `CSI c` sentinel is appended by [`crate::terminal_query`]'s exchange, so this constant
+/// is only the query itself.
 pub const KITTY_FLAGS_QUERY: &str = "\x1b[?u";
 
 /// `CSI > 4 ; 2 m` — Pi's `enableModifyOtherKeys` (`terminal.ts:322`). Not written by cyrup; see the
@@ -238,6 +304,47 @@ mod tests {
         clippy::panic
     )]
     use super::*;
+
+    // ------------------------------------------------------- TUI-046: the pushed flag set ----
+
+    /// The `[CYRUP-DELTA]` in the module docs, as an assertion. Pi's
+    /// `DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7` (`terminal.ts:15` @v0.84.4); cyrup asks for 5.
+    ///
+    /// RED before TUI-046: every push site constructed
+    /// `KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES` alone, so the set was `1` — no
+    /// alternate-key reports at all, and a shifted key on a non-US layout resolved to the base
+    /// character.
+    #[test]
+    fn cyrup_asks_for_disambiguate_and_alternate_keys_and_withholds_event_types() {
+        assert_eq!(DESIRED_FLAGS.bits(), 0b101, "disambiguate | alternate keys");
+        assert!(DESIRED_FLAGS.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(
+            DESIRED_FLAGS.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS),
+            "the half of Pi's 7 that cyrup can consume: crossterm resolves the alternate codepoint"
+        );
+        assert!(
+            !DESIRED_FLAGS.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES),
+            "withheld deliberately — both guards it requires live below cyrup's event-level seam"
+        );
+        assert!(!DESIRED_FLAGS.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    }
+
+    /// The bytes the three push sites actually put on the wire, through the one function they all
+    /// call — Pi writes `\x1b[>7u`, cyrup writes `\x1b[>5u`.
+    #[test]
+    fn push_flags_writes_the_csi_push_all_three_sites_share() {
+        let mut wire = Vec::new();
+        push_flags(&mut wire).expect("writing to a Vec cannot fail");
+        assert_eq!(String::from_utf8(wire).unwrap(), "\x1b[>5u");
+    }
+
+    /// The push and the read-back are one loop: a terminal that honours [`DESIRED_FLAGS`] answers
+    /// the `CSI ? u` query with those same flags, and that answer must decide `Kitty`.
+    #[test]
+    fn a_terminal_echoing_the_flags_cyrup_pushed_is_read_as_kitty() {
+        assert_eq!(decide("\x1b[?5u\x1b[?62;c"), KeyboardProtocol::Kitty);
+        assert_eq!(find_kitty_flags("\x1b[?5u\x1b[?62;c"), Some(5));
+    }
 
     #[test]
     fn parses_pis_two_recognized_frames() {

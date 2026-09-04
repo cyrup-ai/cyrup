@@ -978,6 +978,28 @@ mod tests {
         );
     }
 
+    /// `TUI-046` — `REPORT_ALTERNATE_KEYS` is now part of
+    /// [`crate::keyboard_protocol::DESIRED_FLAGS`], so a Kitty CSI-u can carry
+    /// `unicode-key-code:shifted-key:base-layout-key`. That shape is reachable input from this
+    /// commit on, and split or not it must decode the way crossterm's own
+    /// `parse_csi_u_encoded_key_code` does (`parse.rs:597-606`): with `SHIFT` held the alternate
+    /// (shifted) codepoint replaces the base keycode and `SHIFT` is cleared, so a keybinding is
+    /// matched against the character the user's layout actually produces.
+    #[test]
+    fn a_split_kitty_alternate_key_sequence_resolves_the_layout_character() {
+        // German layout, Shift+2 → `"`: base codepoint 50 (`2`), shifted 34 (`"`), modifier 2.
+        assert_eq!(
+            run(split_at_esc("[50:34;2u")),
+            vec![key(KeyCode::Char('"'), KeyModifiers::NONE)]
+        );
+        // Unmodified press carrying only a base-layout key (Dvorak `a`): the base keycode wins,
+        // exactly as crossterm's shifted branch is gated on `SHIFT`.
+        assert_eq!(
+            run(split_at_esc("[97::113u")),
+            vec![key(KeyCode::Char('a'), KeyModifiers::NONE)]
+        );
+    }
+
     #[test]
     fn a_split_bracketed_paste_is_reassembled_into_one_paste_event() {
         let mut v = split_at_esc("[200~hello world");

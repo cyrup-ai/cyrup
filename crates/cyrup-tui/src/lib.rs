@@ -165,11 +165,11 @@ pub use image::{
     reset_capabilities_cache, seed_capabilities, seed_hyperlink_support, set_capabilities,
 };
 pub use keyboard_protocol::{
-    KITTY_FLAGS_QUERY, KeyboardProtocol, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE,
-    NEGOTIATION_TIMEOUT, NegotiationSequence, current as keyboard_protocol,
-    decide as decide_keyboard_protocol, find_kitty_flags, is_negotiation_prefix,
-    negotiate as negotiate_keyboard_protocol, parse_negotiation_sequence,
-    set_current as set_keyboard_protocol,
+    DESIRED_FLAGS as KITTY_DESIRED_FLAGS, KITTY_FLAGS_QUERY, KeyboardProtocol,
+    MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE, NEGOTIATION_TIMEOUT, NegotiationSequence,
+    current as keyboard_protocol, decide as decide_keyboard_protocol, find_kitty_flags,
+    is_negotiation_prefix, negotiate as negotiate_keyboard_protocol, parse_negotiation_sequence,
+    push_flags as push_kitty_flags, set_current as set_keyboard_protocol,
 };
 pub use keymap::{
     Action, AltScreenAction, AltScreenKeymap, AutocompleteAction, AutocompleteKeymap, EditorAction,
