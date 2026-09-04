@@ -107,6 +107,7 @@ corrections are applied and recorded at the item.
 | ~~SUBA-086~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / diagnostics | **Promoted out of `## Carried` 2026-09-04** (both sides read; three corrections to the filed text recorded in the section) **and ported at `275c1f85`**: `AgentDiscoveryDiagnostic`, `parse_agent_file_checked`, `find_blocking_agent_diagnostic`, rendered by `list`/`get`/`models`/doctor and enforced at both delegation seams |
 | ~~SUBA-087~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | M | background control / child-scoped stop | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; one filing error corrected) **and ported at `2d9d0d0a`**: `childId` on the tool, `control/stop-requests/` queue with `targetIndex`/`childId`, `child_identity`/`child_stop` modules, the runner stops ONE step and keeps the run alive with pi's events and texts. Residual: a `ParallelGroup`/`DynamicGroup`'s members are one step to cyrup's status, so a `tasks[]` fan-out's members are not individually addressable |
 | ~~SUBA-088~~ | ~~medium~~ **CLOSED 2026-09-04** | M | config / discovery / model ladder | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; two citation corrections and one impact correction) **and ported at `ba24e5e5`**: `subagents.defaultProvider` + per-agent `agentOverrides.<name>.defaultProvider` parse with upstream's messages, `AgentDefinition::model_provider` stamped per `applySubagentDefaultModel`, the ladder takes `agent.model_provider ?? parent-session provider` and QUALIFIES a bare id to `provider/id` on the child's `--model`, the `models` report resolves per agent. Residuals (low): v0.64.0's `providerOverrides` and the discovery-cache provider key are not ported; a qualified id the provider does not offer fails in the child rather than at the parent |
+| ~~SUBA-089~~ | ~~medium~~ **CLOSED 2026-09-04** | S | model-fallback ladder (foreground + background) | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.47.1, v0.57.0 and v0.64.0; confirmed exactly as filed, one correction: the filing's "retryable patterns present and correct" missed that the same upstream commit added the `connection` + whitespace + `error`/`reset`/`closed`/`aborted` pattern) **and ported at `cde2ddfc`**: `is_retryable_model_failure_attempt` is the ladder's sole retry gate — `tool_count > 0` never re-dispatches, the two empty-output sentinels, the no-activity clause, and per-message `errorMessage` corroboration over the new `AttemptSignal::message_errors`; the connection pattern lands with it. Residual (low): cyrup never emits the v0.64.0 terminal-stopReason sentinel it now recognises |
 | ~~SUBA-092~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / agent schema | `excludeTools:`/`allowNestedSubagents:` ported at `247ff97b` — frontmatter, settings-override, serializer, and the spawn-plan tool subtraction / nested-fanout grant. v0.64.0's cross-field custom-override precedence change (`31562d76`) is a recorded residual, not this row |
 
 > **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
@@ -187,14 +188,15 @@ corrections are applied and recorded at the item.
 >   from the base commit's own files). Every implementer hit it and reverted the churn by hand.
 >   Repo-level decision, ownerless.
 
-Carried-but-unverified (`## Carried — NOT adversarially verified`): **three rows, all medium** —
-`SUBA-089`, `SUBA-090`, `SUBA-091`. (The three highs that sat here,
+Carried-but-unverified (`## Carried — NOT adversarially verified`): **two rows, both medium** —
+`SUBA-090`, `SUBA-091`. (The three highs that sat here,
 `SUBA-082`/`SUBA-084`/`SUBA-086`, were promoted and closed on 2026-09-04 — see the blockquote
 above; `SUBA-087` was promoted, confirmed and PARTIALLY CLOSED on 2026-09-04 at `2d9d0d0a` — see
 `## ~~SUBA-087~~`; `SUBA-088` was promoted, confirmed and CLOSED on 2026-09-04 at `ba24e5e5` — see
-`## ~~SUBA-088~~`.) All were re-checked port-side at cyrup HEAD `2571969` this pass: every zero-hit
+`## ~~SUBA-088~~`; `SUBA-089` was promoted, confirmed and CLOSED on 2026-09-04 at `cde2ddfc` — see
+`## ~~SUBA-089~~`.) All were re-checked port-side at cyrup HEAD `2571969` this pass: every zero-hit
 grep this file recorded for them still returns zero hits — none of the 210 commits since baseline
-`4fb5e40` touched any of these symbols/behaviours. The three remaining are left exactly as filed,
+`4fb5e40` touched any of these symbols/behaviours. The two remaining are left exactly as filed,
 still held to the lower evidence standard the section header states (upstream line numbers not
 re-verified) — no pass has yet re-read `git show v0.57.0:<path>` for any of them, only the cyrup
 side.
@@ -1695,13 +1697,142 @@ for a bare id) is not rendered by cyrup at all; the describe view prints the raw
 
 ---
 
+## ~~SUBA-089~~ — ~~medium~~ **CLOSED 2026-09-04** — The model-fallback retry decision ignores whether the failed attempt already ran tools, so a half-completed mutating run is re-dispatched
+
+> **PROMOTED OUT OF `## Carried — NOT adversarially verified`, CONFIRMED EXACTLY AS FILED, AND
+> CLOSED 2026-09-04 — landing commit `cde2ddfc` (code), parent `f81573bb`.** Upstream re-read with
+> `git show` at v0.47.1, v0.57.0 and v0.64.0. Every filed upstream line resolves: v0.57.0
+> `model-fallback.ts:461-474` (`messageError` + `isRetryableModelFailureAttempt`, the `:469`
+> `toolCount > 0` refusal, `:471-473` the correlation clauses), `execution.ts:2051` the sole
+> foreground gate and `:2058` `if (!retryableModelFailure || modelIndex === modelsToTry.length - 1)
+> break`, and `v0.47.1:execution.ts:1633` the bare `isRetryableModelFailure(result.error)` — so the
+> window is exact (`d8d1408d fix: retry provider connection errors`, 2026-08-25, first tag v0.57.0).
+> **One correction to the filing's *Relation* note** ("retryable patterns … present and correct"):
+> `d8d1408d` is a two-part change — the SAME commit added
+> `/connection\s+(?:error|reset|closed|aborted)/i` to `RETRYABLE_MODEL_FAILURE_PATTERNS`
+> (`v0.57.0:model-fallback.ts:428`) precisely because the broader text would otherwise re-run a
+> child that had done real work, and the narrowed gate is what makes it safe. Cyrup had only
+> `connection refused`; `is_retryable_model_failure(Some("APIConnectionError: Connection closed."))`
+> was `false` at HEAD (upstream's own test asserts `true`, `test/unit/model-fallback.test.ts:203-205`
+> @v0.57.0). Both halves are ported together. **Port-side at `f81573bb`, before the change:**
+> `rg 'is_retryable_model_failure_attempt|message_errors' crates/cyrup-ext-subagents/src` → 0 hits;
+> `exec/fallback.rs:1329` `if !is_retryable_model_failure(signal.error.as_deref())` was the whole
+> retry gate, after the timed_out/detached/success/startup/`is_last_candidate` arms (the ordering is
+> net-equivalent to upstream's `!retryable || last`); `StartupEvidence::{message_count, tool_count}`
+> existed but were read only by `is_retryable_subagent_startup_failure`, a separate same-model
+> relaunch gate consulted earlier and only for silent exits — it does not block the re-dispatch.
+> **v0.57.0 → v0.64.0:** the predicate gains a second empty-output sentinel
+> (`/^Subagent produced no output after terminal assistant stopReason "[^"]+"\.$/`,
+> `v0.64.0:model-fallback.ts:533`, produced by `shared/utils.ts:472`
+> `formatEmptyTerminalAssistantResponseError`), and the BACKGROUND runner gates on the same predicate
+> (`background/subagent-runner.ts:90,2090,2097` — at v0.57.0 `:1993`). Cyrup's background runner
+> reaches the ladder through `exec::run_sync` → `run_fallback_ladder`, so one gate covers both.
+> Severity `medium` stands; effort S was exact. Port target v0.64.0.
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed (2026-09-04, three tags)
+**Subsystem** model-fallback ladder (foreground + background)
+**Window** v0.47.1..v0.57.0 · `d8d1408d`
+
+**upstream (v0.64.0)** — `src/runs/shared/model-fallback.ts:489`
+`/connection\s+(?:error|reset|closed|aborted)/i` (between `temporar(?:ily)? unavailable` and
+`connection refused`); `:524-528` `messageError(message)` — the `errorMessage` string of any
+message object, no role filter, untrimmed; `:530-537`:
+```ts
+export function isRetryableModelFailureAttempt(input: { error: string | undefined; messages?: readonly unknown[]; toolCount?: number }): boolean {
+	if (!isRetryableModelFailure(input.error)) return false;
+	if ((input.toolCount ?? 0) > 0) return false;
+	if (input.error === "Subagent produced no output (possible model cold-start or empty response)." || /^Subagent produced no output after terminal assistant stopReason "[^"]+"\.$/.test(input.error ?? "")) return true;
+	if ((input.toolCount ?? 0) === 0 && (input.messages?.length ?? 0) === 0) return true;
+	const error = input.error?.trim();
+	return Boolean(error && input.messages?.some((message) => messageError(message)?.trim() === error));
+}
+```
+Call sites: `src/runs/foreground/execution.ts:2144` `isRetryableModelFailureAttempt({ error:
+result.error, messages: result.messages, toolCount: result.progressSummary?.toolCount })`, `:2151`
+`if (!retryableModelFailure || modelIndex === modelsToTry.length - 1) break modelAttemptsLoop;`;
+`src/runs/background/subagent-runner.ts:2090` `({ error, messages: run.messages, toolCount:
+run.toolCount })`, `:2097` the same break. `result.messages` is every `message_end` message
+(`execution.ts:1122,1190`; `subagent-runner.ts:854`). Tests: `test/unit/model-fallback.test.ts:317-319`
+(`Connection error`, `APIConnectionError: Connection closed.`, `Connection reset by peer` retryable)
+and `:341-346` "does not retry raw process stderr after child activity" (the four attempt cases).
+
+**cyrup (at `cde2ddfc`)** — `crates/cyrup-ext-subagents/src/exec/fallback.rs:802`
+`is_retryable_model_failure_attempt(&AttemptSignal) -> bool`, upstream's five clauses in order over
+`signal.error`, `signal.startup.tool_count`, `signal.startup.message_count` and the new
+`AttemptSignal::message_errors: Vec<String>` (`:974`); `:761-775`
+`EMPTY_OUTPUT_AFTER_STOP_REASON_PREFIX/SUFFIX` + `is_empty_output_sentinel` (exact, untrimmed match
+of `exec::output::EMPTY_OUTPUT_ERROR` or the anchored stopReason form — non-empty, no inner quote);
+`:1448` the ladder gate is now `if !is_retryable_model_failure_attempt(&signal)`, in the same
+position (after timeout/detach/success/startup/last-candidate); `:475` `RetryPattern::WsThenAny`
+(`first\s+(?:a|b|…)`, at least one whitespace character — distinct from `OptionalWsBetween`'s
+`\s*`), `:510` the `connection` entry in upstream's position, `:611` its matcher arm.
+`exec/output.rs:751` `message_error_messages(&[SubagentEvent]) -> Vec<String>` — every
+`MessageEnd`'s string `errorMessage`, any role, untrimmed, order kept (pi's `messageError`).
+`exec/attempt_runner.rs:191` `run_attempt` fills `message_errors` from
+`progress.message_end_events` (`:591`/`:624` interrupted and timed-out attempts likewise; `:560`
+setup failure empty — nothing ran). Doc comments on the ladder (`run_fallback_ladder` step 3) and
+the module header name the new gate and cite `execution.ts:2144,2151` / `subagent-runner.ts:2090,2097`.
+
+**Design decision (recorded per DESIGN-GUIDANCE, in the commit body):** functional core /
+imperative shell — the decision stays a pure function over the signal, like its neighbour
+`is_retryable_subagent_startup_failure(&AttemptSignal)`; the shell (`attempt_runner`) supplies one
+new fact. `message_errors` lives on `AttemptSignal`, not `StartupEvidence`, because that struct's
+stated contract is "every field is a reason NOT to relaunch" and this list is corroborating
+evidence FOR advancing. Rejected: a `RetryableAttemptInput` struct mirroring upstream's object
+(ceremony; the signal already carries all four inputs); a regex dependency for the stopReason
+sentinel (the crate hand-rolls every pattern; a prefix/suffix strip is exact for `"[^"]+"`); a
+`\s*`-based approximation with the existing `OptionalWsBetween` (would match `connectionreset`,
+which upstream's `\s+` does not).
+
+**Tests (fail before / pass after):** `exec::fallback::tests::retryable_error_after_tools_ran_does_not_advance_the_ladder`
+and `…::uncorroborated_retryable_text_after_messages_stops_but_corroborated_advances` — RED run
+recorded against the bare gate (`is_retryable_model_failure(signal.error.as_deref())` swapped back
+in, everything else in place): both fail with the ladder advancing to `b`; GREEN at `cde2ddfc`.
+`…::attempt_predicate_matches_upstreams_stderr_after_activity_cases` (upstream's four cases
+verbatim), `…::attempt_predicate_never_advances_once_a_tool_ran`,
+`…::attempt_predicate_empty_output_sentinels_advance_despite_messages` (both sentinels; four
+near-misses refused), `…::attempt_predicate_correlates_a_trimmed_message_error_message`,
+`…::attempt_predicate_still_requires_a_retryable_text` — name a symbol absent at `f81573bb` and so
+cannot compile there; the first of them was additionally observed RED in this session before the
+connection pattern landed (`APIConnectionError: Connection closed.` not retryable).
+`…::a_dropped_provider_connection_is_retryable_but_only_across_real_whitespace` plus the three
+upstream strings added to `retryable_error_text_is_classified_as_retryable`'s list — fail at
+`f81573bb` (`connection` pattern absent). `exec::output::tests::message_error_messages_collects_every_message_end_error_message_untrimmed`
+— symbol absent at `f81573bb`. Checks: `cargo fmt --all -- --check`, `cargo clippy -p
+cyrup-ext-subagents --all-targets -- -D warnings`, `cargo nextest run -p cyrup-ext-subagents`
+(2716/2716), `RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-ext-subagents --no-deps` — all clean. No
+crate outside `cyrup-ext-subagents` constructs `AttemptSignal`/`StartupEvidence` (`rg` across
+`crates/`), so the added field is API-additive.
+
+**Falsification** — a foreground or background child whose `attempt-N.jsonl` shows ≥1
+`tool_execution_start` and whose run then ends with an error such as `connection reset by peer`
+or `overloaded` must produce ONE row in `model_attempts` and no `[fallback] … Retrying with …`
+note, even with fallback models configured; the same error with zero tools and zero messages must
+still advance; `APIConnectionError: Connection closed.` from a child that emitted an assistant
+turn WITHOUT an `errorMessage` must stop the ladder, and WITH a matching `errorMessage` must
+advance. Any of those failing reopens the row.
+
+**Residuals — recorded, not closed by this row.** (1) **low — cyrup never emits the v0.64.0
+terminal-stopReason sentinel it now recognises**: `formatEmptyTerminalAssistantResponseError`
+(`shared/utils.ts:462-474`) prefers the last assistant `errorMessage`, then `Subagent produced no
+output after terminal assistant stopReason "<reason>".` for a non-`stop` reason; cyrup's
+empty-output re-diagnosis (`exec/output.rs` `EMPTY_OUTPUT_ERROR`) emits only the cold-start form.
+Unfiled `v0.57.0..v0.64.0` drift in the empty-output diagnosis, not this row. (2) **low —
+`recordRetryableModelFailure`** (the per-session failed-model cache upstream updates only when the
+attempt predicate says retryable, `execution.ts:2145`) has no cyrup counterpart; already outside this
+row's scope. (3) **text-only —** the crate evaluates patterns per line, so `connection\n reset`
+(whitespace run containing a newline) does not match where JS `\s+` would; the same pre-existing
+limitation applies to `rate\s*limit`, and no producer emits either shape.
+
+---
+
 ## Carried — NOT adversarially verified
 
 > **2026-09-04: three of the eight rows this section was written for — `SUBA-082`, `SUBA-084`,
 > `SUBA-086` — were held to the confirmed bar, confirmed, ported and CLOSED; each now has a full
-> section in the confirmed set above (in id order) and only a pointer remains here; `SUBA-087` and
-> `SUBA-088` followed the same day. The three below are unchanged and still carried at this
-> section's lower standard.**
+> section in the confirmed set above (in id order) and only a pointer remains here; `SUBA-087`,
+> `SUBA-088` and `SUBA-089` followed the same day. The two below are unchanged and still carried at
+> this section's lower standard.**
 
 > **READ THIS BEFORE ACTING ON ANYTHING IN THIS SECTION.** The refutation pass for this batch was
 > capped at twelve items. The eight items below were produced by the same analyst lenses as the
@@ -1726,44 +1857,7 @@ for a bare id) is not rendered by cyrup at all; the describe view prints the raw
 
 ### ~~SUBA-088~~ — **PROMOTED AND CLOSED 2026-09-04** — see `## ~~SUBA-088~~` in the confirmed set above (landing commit `ba24e5e5`)
 
-### SUBA-089 — The model-fallback retry decision ignores whether the failed attempt already ran tools, so a half-completed mutating run is re-dispatched
-
-**Severity** medium (as filed) · **Effort** S · **Window** v0.47.1..v0.57.0 · `d8d1408d`
-
-*Upstream, as filed (unverified):* `src/runs/shared/model-fallback.ts:467-474`
-`isRetryableModelFailureAttempt({error, messages, toolCount})` — retryable only if
-`isRetryableModelFailure(error)` AND `(toolCount ?? 0) === 0` (`:469`
-`if ((input.toolCount ?? 0) > 0) return false;`), with a further correlation requirement that the
-error be the cold-start sentinel, or the run produced no messages, or some assistant message's own
-`errorMessage` equals the run error (`:471-473`). `src/runs/foreground/execution.ts:2051` is the sole
-foreground ladder gate, and `:2058` breaks the loop on `!retryableModelFailure`. At v0.43.0 and
-v0.47.1 the same line was the bare `isRetryableModelFailure(result.error)`
-(`v0.47.1:execution.ts:1633`), so the narrowing is new in the window.
-
-*Port (re-verified at HEAD):* `crates/cyrup-ext-subagents/src/exec/fallback.rs:1265-1270` is the whole
-retry gate —
-```rust
-if !is_retryable_model_failure(signal.error.as_deref()) {
-    last_signal = Some(signal);
-    last_attempt = Some(attempt);
-    break 'ladder;
-}
-```
-— the attempt's tool count and message set are never consulted.
-`grep -rn 'is_retryable_model_failure_attempt' --include=*.rs crates/cyrup-ext-subagents/src` →
-**0 hits**; `grep -n 'tool_count' src/exec/fallback.rs` shows the only uses are in `StartupEvidence`
-and inside `is_retryable_subagent_startup_failure`, a different gate that fires before any model is
-retried.
-
-*Behaviour gap:* a foreground subagent that ran ten tool calls — edits, writes, git commands — and
-then hit a transient `connection reset` / `overloaded` error is re-dispatched from scratch on the next
-fallback model. Upstream stops the ladder because `toolCount > 0`, precisely so a half-completed
-mutating run is not repeated. The port duplicates the child's side effects and doubles the token spend
-on every mid-run provider blip.
-
-*Relation:* new. This pass confirmed the rest of the fallback ladder (R-SA-036 ordering, retryable
-patterns, attempt notes, usage aggregation, the startup-retry sub-ladder) present and correct — this
-is a single missing predicate inside ported code.
+### ~~SUBA-089~~ — **PROMOTED AND CLOSED 2026-09-04** — see `## ~~SUBA-089~~` in the confirmed set above (landing commit `cde2ddfc`)
 
 ### SUBA-090 — Completion notices are always rendered: the port hardcodes `display: true` where upstream hides a plain successful background completion and groups a batch
 
