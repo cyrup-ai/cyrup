@@ -296,6 +296,10 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 
 ## Open items
 
+> ### BATCH 2 — 2026-09-04 (ledger audit): **2 closed, 5 open** — counted set **0 critical, 0 high, 2 medium, 3 low = 5**, 49 closed (`scripts/count_open_items.py`); authoritative over every block below.
+>
+> **`ICOM-053`** CLOSED at `1d2b4418` (the feature-matrix gate now RUNS the `cyrup-it` seam suite instead of type-checking it; two seam targets that had stopped compiling were fixed on the way) and **`ICOM-060`** CLOSED at `a91e3c41` (pi-intercom v0.12.1 `5fe0ee3`'s misdirected-reply guard, line for line). The two remaining mediums are `ICOM-054` (broker-owned endpoint epochs, v0.11.0) and `ICOM-055` (scoped routing, v0.12.0). Note for the next pass: no `cyrup-it --features it` run happened after `ICOM-053`'s own; `SUBA-072`/`088`/`090` edited ~30 `cyrup-it` test files later the same day and were `cargo check`ed only (disk).
+>
 > ### SWEEP 9 — 2026-08-15, area 11 worked in full: **3 closed (2 ported, 1 refuted), 6 open**
 >
 > Counted set now **0 critical, 0 high, 4 medium, 2 low = 6** (was 5 medium / 4 low = 9).

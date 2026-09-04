@@ -374,9 +374,13 @@ def parse_09a(path):
     # (each now has a full '## ~~SUBA-0xx~~' section in the confirmed set).
     # They are therefore counted from the table above, and MUST NOT also be
     # listed here, or each would count a second time as an open carried row.
-    # Only the five carried mediums remain prose-only.
+    # 2026-09-04 (batch 2): the five carried mediums (SUBA-087..SUBA-091) were
+    # promoted and closed / partially closed the same way, so both lists are
+    # now empty and every 09a row is table-derived. '## Carried' holds only
+    # pointer lines. Re-populate a list ONLY for an id that is prose-only
+    # again (no table row), never for one that has a table row.
     carried_high = []
-    carried_medium = ["SUBA-087", "SUBA-088", "SUBA-089", "SUBA-090", "SUBA-091"]
+    carried_medium = []
     for cid in carried_high:
         parsed.append({"id": cid, "line": None, "closed": False, "severity": "high",
                         "kind": "upstream-drift", "raw_severity_cell": "(carried, not adversarially verified)"})

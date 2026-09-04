@@ -5,6 +5,161 @@ next work item**.
 
 ---
 
+# RECONCILED 2026-09-04 (eighth edition) — batch 2: twenty-five medium rows worked in one day on landed code; 18 closed, 6 partially closed, 1 refuted; the set above medium is still ONE row
+
+> **Read this block before planning.** cyrup **code** HEAD **`6cf2cb9f`**, branch
+> `claude/beautiful-feynman-odz1v5` (68 commits off `main` = `a4805955`, 35 of them touching
+> `crates/`/`xtask`; the last code commit is `6cf2cb9f fix(subagents): SUBA-087 review fixes`). The docs
+> commit carrying this block cannot cite its own sha. Counts are `scripts/count_open_items.py`'s, re-run
+> after every closure and correction below was written: **103 open = 0 critical, 1 high, 28 medium,
+> 74 low; 564 closed** (seventh edition: 125 = 0/1/49/75; 539 closed). §0 of `PARITY-GAPS.md` carries
+> the per-area table (tenth edition) and §0a the above-medium table (seventh edition, with a batch-2
+> note); neither is duplicated here. **One census correction landed with this edition:** the script's
+> hand-enumerated `carried_medium` list (`SUBA-087..091`) was emptied — all five are table rows now —
+> so the interim figure of "8 open / 7 medium" for `09a` was a double count; the true figure is 3 / 2.
+
+## How this edition was produced, and what it checked
+
+Each implementer wrote its own row and section in the owning area file in the same batch as the code
+(new this batch); five independent review groups then re-read both sides (the Rust at the landing sha
+and at HEAD, the TypeScript at the named tag via `git -C tmp/<repo> show`) and blocked on anything
+false; review-fix commits followed; and this ledger audit re-opened every one of the twenty-five rows
+and sections, confirmed the closure mark, date, landing sha, residual and severity against the reports
+and against HEAD, and spot-checked citations with `rg` at HEAD and `git show` at the tag (every one
+resolved; the audit's own corrections are listed below). Repo checks at HEAD from the last review:
+`cargo fmt --all -- --check` clean, `cargo clippy -p <crate> --all-targets -- -D warnings` clean for
+every touched crate, per-crate `cargo nextest run` green (`cyrup-ext-subagents` 2725/2725,
+`cyrup-tui` 1372/1372, `cyrup-config` 226/226). **Not run anywhere this batch after `ICOM-053`'s own
+run: `cargo nextest run -p cyrup-it --features it` — the shared disk sat at 94–100% and the nested
+`it` build ENOSPCs.** `SUBA-072`/`088`/`090` edited ~30 `cyrup-it` test files after that run and were
+`cargo check`ed only; a maintainer must run the `it` suite once before trusting those seams.
+
+## What closed, and on what evidence — each row re-read in its area file, not taken from a commit subject
+
+| id | area | landing commit | what landed (see the area row for citations) |
+|---|---|---|---|
+| `SESS-049` | 03 | `23abca0f` | one pure gate `check_summarization_response` at all FOUR summarization sites (the fourth, `session-svc/session/forking.rs`, the row had not named); pi v0.84.4 `getSummarizationFailure` — first tagged v0.84.4, not v0.84.2 as filed |
+| `TOOL-042` | 04 | *measurement* | 300 concurrent `cargo nextest` runs of the archived `cyrup-tools` binaries at a 100 ms tripwire (5× tighter than the gate) under a 10 ms `/proc` pipe sampler: 0 LEAK, 0 FAIL; plus 4 amplified main-tree and 34 stock runs. The harness is named clean from `nextest-runner 0.122.1` source; `2daaa32d` (2026-08-27, post-sweep-8) is recorded as the fix + pins. Closure states its own falsification condition; macOS unmeasured (low residual) |
+| `EXT-024` | 06 | `75532cee` | `Tool::render_kind` consumed in the TUI tool row (pi `renderShell: "self"`); **`75532cee`/`651bac70` do not build checked out alone** (another track's hunks were swept in) — disclosed in the row; step to `0e8c62fa` |
+| `TUI-037` | 07 | `0e8c62fa` | `/reload` persists an implicitly-granted project trust (`maybeSaveImplicitProjectTrustAfterReload`), pure decision + shell |
+| `TUI-068` | 07 | `eacd771a` | `app.session.deleteNoninvasive` (Ctrl+Backspace) bound in `/resume` |
+| `TUI-081` | 07 | `84b205a1` | `/import` asks before replacing the live session (first-party `ImportConfirm` selector) |
+| `TUI-025` | 07 | `0e8c62fa` | its one residual (`; saved project trust` status variant) landed with `TUI-037`; closed by this audit |
+| `SEAM-115` | 08 | `c6142d01` | three RED/GREEN tests over a branched session pin the `context_usage` fixes |
+| `SEAM-116` | 08 | `4481e807` | RPC `clear_queue` verb + shared `ClearedQueue` wire struct |
+| `SEAM-117` | 08 | `1d9d422f` | `message_update` wire shape: `usage` + `toolcall_start.{id,toolName}` (v0.84.4) |
+| `SUBA-072` | 09 | `7791b26a` | per-attempt scratch dir moved out of the project tree to `<run_scratch>/scratch/<cwd_key>` |
+| `SUBA-088` | 09a | `ba24e5e5` | `subagents.defaultProvider` / agent `modelProvider` through the launch ladder (promoted from `## Carried`, confirmed with three corrections) |
+| `SUBA-089` | 09a | `cde2ddfc` | `isRetryableModelFailureAttempt` — no re-dispatch after tools ran; the paired `connection\s+(error|reset|closed|aborted)` pattern ported with it |
+| `SUBA-091` | 09a | `681f6255` | fleet inspector passes pi's two trusted session roots to the transcript fallback |
+| `ICOM-053` | 11 | `1d2b4418` | the feature-matrix gate now RUNS the `cyrup-it` seam suite; two seam targets that had stopped compiling fixed on the way |
+| `ICOM-060` | 11 | `a91e3c41` | pi-intercom v0.12.1 `5fe0ee3` misdirected-reply guard, line for line |
+| `FLUX-001` | 14 | `03f3add0` | bundled prompt/skill tree embedded at build time and materialised under the agent dir (port of `installer.py`) |
+| `FLUX-002` | 14 | `c7d21bbb` | the four multi-task templates check for `subagent` before calling it |
+| `FLUX-003` | 14 | `4bb3569c` | 37 tests whose every expectation is the upstream Python's output at v0.0.40; six real defects fixed by the pins |
+| `FLUX-004` | 14 | `c846ff97` | status overlay moved off the editor's `ctrl+f` to `ctrl+alt+f`, one constant, cross-crate pin against the real default keymaps |
+
+**Refuted (1):** `TUI-089` (07) — cyrup already orders the picker at pi's two points by pi's rules
+(`applyModelsJson` replace-in-place / push-at-end, provider-only stable sort); guard test `d685eff1`;
+the review corrected the row's `provider-composer.ts` line numbers to `:168-206`/`:199`/`:202-203`.
+
+**Partially closed (6), each with its residual stated at its severity in the row:** `PROV-014` (01,
+`1471a16f` — radius + qwen-token-plan ×3 registered; re-rated low: dynamic catalogs, no shell trigger
+for `refresh_models`, `configureRadiusProviders` unported), `CFG-067` (05, `91ca02e5` — three of nine
+vars ported; still medium for the six mechanism-less ones, chiefly `TOOL_TIMEOUT_MS` and the
+run-fan-out ledger), `EXT-041` (06, `a0134787` — tool surface done; custom-ENTRY replay open, low, fix
+site area 08), `SUBA-087` (09a, `2d9d0d0a` + `6cf2cb9f` — child-scoped stop; group members not
+individually addressable → **filed as `SUBA-093`**, medium), `SUBA-090` (09a, `79ee7eff` — the
+`display` predicate; session-svc drops it on the trigger-turn path → **filed as `SUBA-094`**, medium,
+fix site areas 08/03), `FLUX-005` (14, with `4bb3569c`, low).
+
+## The above-medium set: ONE row, unchanged
+
+| id | area | sev | why it is above medium |
+|---|---|---|---|
+| `SUBA-074` | 09a | high | Agent `runner:` frontmatter — stage 1 (the refusal path) closed 2026-09-04; **stage 2, the external-runner adapter protocol itself, is the open residual under this id.** Effort L, needs design; unchanged this edition. |
+
+## Corrections this audit made in place (docs only)
+
+`TOOL-042` closed with the finished measurement (the implementer's note was written at 110 of the 300
+runs); `TUI-025` closed (residual landed); `TUI-089`'s "tooling residual" marked resolved (`9cd2d6f0`
+cleared the `input_reader.rs:443` lint `3e69ea2a` introduced); `09a` `SUBA-090` `notify.ts:444` →
+`:440`; `14` `FLUX-003`'s quotation of the retracted "another team owns tests" line annotated; `CFG-080`
+filed (below); batch-2 recount blocks added to 06/07/09/11/14's `## Open items` headers; the census
+script's `carried_medium` list emptied. Everything else in the twenty-five rows was found as reported.
+
+## Residual leads the closures produced — recorded, ownerless unless an id is named, NOT counted
+
+(1) `SEAM-115`: pi's footer occupancy is `estimateContextTokens` — `usage.totalTokens` preferred plus a
+trailing-messages estimate (`compaction.ts:202-230`, `:146-148` @v0.84.4); cyrup's
+`ContextUsage::from_last_assistant` is the four-field sum alone (low, area 08, unfiled). (2) `PROV-014`
+review: `baseten` (`all.ts:95` @v0.84.4) is now the one unregistered v0.84.x built-in, with no row
+(area 01). (3) `EXT-041`: `ReplayItem` has no custom-entry variant, so `cyrup-intercom`'s inbound card
+is lost on `/resume` (area 08 producer). (4) `TUI-068`: pi refuses to delete the CURRENT session from
+`/resume` (`session-selector.ts:398-401` @v0.84.4); neither cyrup delete path has that guard (low, 07).
+(5) `TUI-081`: pi's `MissingSessionCwdError` re-prompt (`interactive-mode.ts:6084-6095`) unported;
+`import error:` vs `Failed to import session:` channel (low, 07). (6) `FLUX-001`: the three sibling
+`CARGO_MANIFEST_DIR` resolvers in `cyrup-ext-subagents` (`registration/resources.rs:46`, plus the
+agents-dir twin the `FLUX-001` report names) and `cyrup-intercom` (`resources.rs:41`) are untouched — the `build.rs` +
+`install.rs` mechanism is reusable as-is (medium class, areas 09/11, unfiled). (7) `SUBA-091`: the
+`trustedSessionFiles`/`trustedSessionFileRoot` second containment rung and `trackedJob.sessionRoot`
+are unported; `subagent status view:transcript` trusts a different root triple than pi (low, 09a row).
+(8) `SUBA-088`: a bare model id offered only by a provider other than the preferred one is forced
+onto the preferred provider and fails in the child (`resolveExactIdMatches` unique-match fallback
+absent; low). (9) `SUBA-087`: cross-process `ts` ties in stop-request names still drain arbitrarily
+(identical to upstream); a pi-shaped request file without `source` is DROPPED by `parse_stop_request`
+because cyrup's `StopRequest` requires `ts`/`source` (upstream optional, `control-channel.ts:56-57`) —
+an undeclared interop `[CYRUP-DELTA]`, low. (10) `SEAM-116`: `data` key order `followUp, steering`
+(BTreeMap) vs pi's literal order — meaningless on the wire, documented. (11) `SEAM-117`:
+`exec/ndjson.rs:100-106`'s "two-key object" doc comment is stale (area 09). (12) `ICOM-053`:
+`crates/cyrup-it/tests/misc/main.rs` is an empty `[[test]]` target; nothing runs the gate for anyone
+(no CI, no schedule — README says so). (13) `SUBA-072`: `.gitignore:20`'s `.cyrup-subagent-scratch/`
+entry is dead. (14) Git history: `75532cee` and `651bac70` do not build alone (see `EXT-024`); the
+brief's "row in the SAME commit as the code" rule was followed by no track — every closure is a code
+commit plus a `docs(gap-analysis): <id> row` commit. (15) `TUI-N11` (07) reads "**fixed this pass**"
+in its title cell while its severity cell is unstruck, so the script counts it open medium — settle it
+next pass (not touched here: neither side was re-read).
+
+## Workspace hygiene and retractions this batch
+
+- **`3e69ea2a style: apply rustfmt across the workspace`** — the seventh edition's lead (6) is
+  discharged: the workspace is `cargo fmt --all -- --check` clean and every track kept it so. The
+  reflow introduced one `clippy::redundant_closure` denial at `crates/cyrup-tui/src/app/input_reader.rs:443`
+  that blocked `-D warnings` for every crate depending on `cyrup-tui` for most of the day; `9cd2d6f0`
+  (with `TUI-081`) cleared it. Every "pre-existing lint" note in a batch-2 row refers to that window.
+- **`d0d601c9`** retracted "another team owns area 13" in `README.md`, `PARITY-GAPS.md` and this file;
+  **`f239fc3d`** retracted "another team owns tests / benchmarks" from the `/split` template, its
+  `.claude/commands` copy, `spec/flux/README.md`, three `.flux/backlog` tasks and the three ledger
+  files. This audit grepped `docs/gap-analysis/**` for any surviving ownership claim: the only hit was
+  `14-cyrup-flux.md`'s `FLUX-003` Fix paragraph QUOTING the retracted spec line, now annotated as such.
+  No text in this directory says another team owns anything.
+- Untracked `docs/gap-analysis/scripts/__pycache__/` was deleted and is not committed.
+
+## Recommended next batch — area 13 first, then the mediums ranked port bugs → test defects → S-effort drift
+
+1. **Area 13 — the MCP port. Re-audit `13-cyrup-mcp-STATUS.md` (and `13a`–`13i`) against
+   `tmp/pi-mcp-adapter` at v2.32.1 FIRST**: `git -C tmp/pi-mcp-adapter diff --stat v2.25.0..v2.32.1`
+   and `git -C tmp/pi-mcp-adapter show v2.32.1:<path>` for every file the STATUS file cites, per
+   `README.md`'s baseline hazards. No edition has opened those files since the clone was re-pulled;
+   area 13 is this repository's work (the "MCP team" claim was retracted) and is outside the census
+   only by counting rule.
+2. **Port bugs (medium):** `TOOL-022` (04; fix site `cyrup-tui` + `cyrup-core`), `EXT-006` (06),
+   `TUI-046` (07, Kitty flag 7 — needs the guard flags first), `TUI-N02` (07), `SEAM-015` (08),
+   `SUBA-093` (09a, new — status-model change), `SUBA-094` (09a → areas 08/03, new — `display` through
+   `AgentMessage::Custom`), `ICOM-054`, `ICOM-055` (11), the `EXT-003`/`EXT-039`/`EXT-064` partials
+   (`EXT-039`'s `resolve_shortcuts` caller is what `FLUX-004` proved live), `EXT-041`'s custom-entry
+   half (08), `CFG-067`'s six remaining vars (`TOOL_TIMEOUT_MS` and the run-fan-out ledger want
+   area-09 items of their own), `PROV-042` (01), `DRIFT-041` and `DRIFT-015` (12; the latter a
+   duplicate of `EXT-019`). `CFG-020` and `SUBA-016` are L and stay parked. `CFG-068`/`CFG-074` are
+   invented-surface decisions, not ports.
+3. **Test defects:** `TUI-N11` (07 — probably already fixed; settle the row), then the `cyrup-it
+   --features it` run (not a row, a gate).
+4. **S-effort drift:** `TUI-004` (07), `SUBA-054`, `SUBA-056` (09), `DRIFT-004`/`DRIFT-009`/`DRIFT-053`
+   (12), the low `CFG-078`/`CFG-079` (05, v0.84.4 additions) and `CFG-080` (05).
+5. Leads (1), (2) and (6) above are one both-sides read from being rows; file them before the batch.
+
+---
+
 # RECONCILED 2026-09-04 (seventh edition) — seven of the sixth edition's eight above-medium rows closed the same day, on landed code and on two live runs; the set is now ONE row
 
 > **Read this block before planning.** cyrup **code** HEAD **`275c1f85`**, branch

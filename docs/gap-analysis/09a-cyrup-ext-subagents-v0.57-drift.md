@@ -1910,7 +1910,7 @@ function sendCompletion(pi: Pick<ExtensionAPI, "sendMessage">, items: PendingCom
 	try {
 		pi.sendMessage({ customType: "subagent-notify", content, display }, { triggerTurn: items.some((item) => item.triggerTurn) });
 ```
-`:444` `const status = stopped ? "stopped" : paused ? "paused" : result.success ? "completed" :
+`:440` `const status = stopped ? "stopped" : paused ? "paused" : result.success ? "completed" :
 "failed"` (the `status` input); `:36-56` `SubagentNotifyDetails { status, source?: "async" |
 "foreground", scheduleOrigin?, … }`; `:605` `triggerTurn: result.triggerTurn !== false`; `:608-616`
 a foreground or non-`completed` completion is emitted at once, a `completed` one goes to the

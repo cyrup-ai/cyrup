@@ -83,6 +83,74 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 
 ## 0. Census — every open item in the fourteen area files, by class
 
+> **TENTH EDITION 2026-09-04 (batch 2), cyrup code HEAD `6cf2cb9f` — the same script, re-run after the
+> twenty-five-row medium batch and its two independent reviews.** `python3 scripts/count_open_items.py`
+> from `docs/gap-analysis/`, over the fourteen files' current `## Open items` tables (and `09a`'s
+> `## Summary — confirmed items` table), reproduced verbatim below; `SEAM-058` and `SUBA-005` are the
+> two hand-counted trackers outside any table, as before. **One script change in this commit, and it
+> is a correction, not a re-rule:** the hand-enumerated `carried_medium = [SUBA-087..091]` list in
+> `parse_09a` is now empty — all five became table rows this batch (closed or partially closed), so
+> the interim run counted `09a` as 8 open / 7 medium when 3 / 2 is the truth. Both carried lists are
+> now empty and the whole census is table-derived.
+>
+> **What moved since the ninth edition (125 → 103 open; 539 → 564 closed):** `01` 4 → 4 but 2 → 1
+> medium (`PROV-014` PARTIALLY CLOSED at `1471a16f`, re-rated low); `03` 4 → 3 (`SESS-049`,
+> `23abca0f`); `04` 3 → 2 (`TOOL-042` closed by measurement — 300 concurrent amplified runs, 0 LEAK);
+> `05` 14 → 15 (`CFG-067` PARTIALLY CLOSED at `91ca02e5`, still medium; `CFG-080` filed low from its
+> review); `06` 15 → 14 (`EXT-024` closed at `75532cee`; `EXT-041` PARTIALLY CLOSED at `a0134787`, still
+> medium); `07` 35 → 30 (`TUI-037`, `TUI-068`, `TUI-081`, `TUI-089` REFUTED, and `TUI-025` whose last
+> residual landed with `TUI-037`); `08` 7 → 4 (`SEAM-115`, `SEAM-116`, `SEAM-117`); `09` 12 → 11
+> (`SUBA-072`, `7791b26a`); `09a` 6 → 3 (`SUBA-088`, `SUBA-089`, `SUBA-091` closed; `SUBA-087`,
+> `SUBA-090` PARTIALLY CLOSED with their medium residuals FILED as `SUBA-093`, `SUBA-094`; only
+> `SUBA-074` high + those two remain); `11` 7 → 5 (`ICOM-053`, `ICOM-060`); `14` 7 → 1 (`FLUX-001`…
+> `FLUX-004`; `FLUX-005` partial, low); `02`, `10`, `12` untouched. Every closure was written by its
+> implementer in the area file and re-read by this edition's ledger audit against HEAD and the named
+> tags (`00-residual-ledger.md`, eighth edition, lists the findings).
+>
+> **Open set: 103 work items — 0 critical, 1 high, 28 medium, 74 low**, of which 101 sort into the
+> six Kind-derived classes and 2 do not (`EXT-058`, `PERM-032`; `ICOM-053` closed).
+>
+> | area | open | crit | high | med | low | trackers | closed |
+> |---|---:|---:|---:|---:|---:|---:|---:|
+> | [01 core + provider](01-cyrup-core-and-provider.md) | 4 | 0 | 0 | 1 | 3 | 0 | 56 |
+> | [02 agent](02-cyrup-agent.md) | 3 | 0 | 0 | 0 | 3 | 1 | 28 |
+> | [03 session](03-cyrup-session.md) | 3 | 0 | 0 | 0 | 3 | 1 | 32 |
+> | [04 tools](04-cyrup-tools.md) | 2 | 0 | 0 | 1 | 1 | 0 | 32 |
+> | [05 config + resources](05-cyrup-config-and-resources.md) | 15 | 0 | 0 | 4 | 11 | 0 | 52 |
+> | [06 ext host](06-cyrup-ext.md) | 14 | 0 | 0 | 5 | 9 | 0 | 58 |
+> | [07 tui](07-cyrup-tui.md) | 30 | 0 | 0 | 4 | 26 | 0 | 74 |
+> | [08 session-svc + modes](08-cyrup-session-svc-and-modes.md) | 4 | 0 | 0 | 1 | 3 | 0† | 70 |
+> | [09 subagents](09-cyrup-ext-subagents.md) | 11 | 0 | 0 | 3 | 8 | 0† | 40 |
+> | [09a v0.57 drift](09a-cyrup-ext-subagents-v0.57-drift.md) | 3 | 0 | 1 | 2 | 0 | 0 | 19 |
+> | [10 permission system](10-cyrup-permission-system.md) | 1 | 0 | 0 | 0 | 1 | 1 | 22 |
+> | [11 intercom](11-cyrup-intercom.md) | 5 | 0 | 0 | 2 | 3 | 0 | 49 |
+> | [12 pi core drift](12-upstream-drift-pi-core.md) | 7 | 0 | 0 | 5 | 2 | 3 | 26 |
+> | [14 flux](14-cyrup-flux.md) | 1 | 0 | 0 | 0 | 1 | 0 | 6 |
+> | **total** | **103** | **0** | **1** | **28** | **74** | **6 + 2‡** | **564** |
+>
+> † `SEAM-058` and `SUBA-005` sit outside their files' `## Open items` tables (standalone
+> `## Trackers` sections) and print as 0 here; ‡ they are the "+ 2" hand-counted in the total.
+>
+> | class | n |
+> |---|---:|
+> | **Port bug** (`not-ported` + `parity-bug` + `port-divergence`) | **61** |
+> | **Version lag** (`upstream-drift`; all 3 open `09a` rows count here) | **21** |
+> | **Reverse lag** (`stale-port`) | **1** |
+> | **Test defect** (`test-defect`) | **2** |
+> | **Invented surface** (`cyrup-original`) | **15** |
+> | **Tooling** (`tooling`) | **1** |
+> | *(unclassified — `EXT-058`, `PERM-032`)* | 2 |
+> | | **103** |
+>
+> **Above-medium open rows (1):** `09a` **`SUBA-074`** high (`upstream-drift`) — stage 2, the
+> external-runner adapter protocol. Unchanged; §0a's seventh-edition table stands, with the batch-2
+> note added there.
+>
+> **Not counted, deliberately, and read the next-batch note before planning:** area 13 (`13-cyrup-mcp*.md`)
+> stays outside this census by the standing counting rule, but it has NOT been re-audited against
+> `tmp/pi-mcp-adapter` v2.32.1 and is scheduled first in `00-residual-ledger.md`'s eighth edition.
+>
+> Every block below this one is superseded.
 > **NINTH EDITION 2026-09-04 (second pass), cyrup code HEAD `275c1f85` — the eighth edition's
 > script, re-run after seven closures.** `python3 scripts/count_open_items.py` from
 > `docs/gap-analysis/`, over the fourteen files' current `## Open items` tables (and `09a`'s
@@ -443,6 +511,12 @@ Where the re-audit moved an item to a different class, the id moves section and 
 ---
 
 ## 0a. Everything above medium, in one table
+
+> **BATCH-2 NOTE 2026-09-04 (eighth-edition ledger audit), cyrup code HEAD `6cf2cb9f`: the set is
+> UNCHANGED — still the one row below (`SUBA-074`, stage 2).** The twenty-five medium rows batch 2
+> worked (listed in §0's tenth edition) contained nothing above medium and produced nothing above
+> medium: the two residuals it filed as rows (`SUBA-093`, `SUBA-094`) and the one this audit filed
+> (`CFG-080`) are medium, medium and low. The seventh-edition table below stands as the table of record.
 
 > **SEVENTH EDITION 2026-09-04 (second pass), cyrup code HEAD `275c1f85`. ONE ROW.** Seven of the
 > sixth edition's eight rows closed the same day, each dispositioned in its area file on the evidence

@@ -109,6 +109,14 @@ in areas 07 and 08.
 
 ## Open items
 
+> **RECOUNTED 2026-09-04, batch 2 (ledger audit); authoritative over the paragraph below.** Counted set
+> **0 critical, 0 high, 0 medium, 1 low = 1 open** (`FLUX-007`), 6 closed (`scripts/count_open_items.py`). Four
+> closures on landed code, each independently reviewed: `FLUX-001` (`03f3add0`, bundle embedded and
+> materialised under the agent dir), `FLUX-002` (`c7d21bbb`, fan-out gated on `subagent` availability),
+> `FLUX-003` (`4bb3569c`, 37 tests whose expectations are the upstream Python's output, six defects fixed
+> on the way), `FLUX-004` (`c846ff97`, overlay chord moved to `ctrl+alt+f`); `FLUX-005` PARTIALLY CLOSED
+> with `FLUX-003` and re-rated low; review fixes in `16edcde2`. The paragraph below is the filing-time count.
+>
 > **Counted set: 0 critical, 0 high, 4 medium, 3 low = 7.** No trackers. Every row was filed from
 > reading both sides at the named revisions; none is inherited, and none is a sweep digest routed
 > here. **`FLUX-001` is the one to schedule first** — it is the only row that can make the whole
@@ -415,7 +423,7 @@ state into two trees. Nothing pins any of it, and nothing pins the interop contr
 states as the crate's purpose ("State on disk (`~/.flux/<flattened-cwd>/`) stays byte-identical to
 code-puppy's so one project's task tree is readable by both harnesses"). `FLUX-005` and `FLUX-006`
 below are both defects a single table test would have caught.
-**Fix** — `spec/flux/README.md:73` says "**No tests to be written** — another team owns tests", and
+**Fix** — `spec/flux/README.md:73` said "**No tests to be written** — another team owns tests" *(quoted as filed; that line was retracted by `f239fc3d` on 2026-09-04 — no such team exists, tests are in scope for every task, and `:73` now says so)*, and
 `:76` makes every definition of done manual ("one manual run-through, not a test suite"), which
 `spec/flux.md:920-933` then spells out as a list of things a human types. **That is a disclosure, not
 a closure**, and it is exactly the class `00-residual-ledger.md` calls out: a deferral nobody signed
