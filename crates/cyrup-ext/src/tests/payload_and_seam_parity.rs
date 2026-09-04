@@ -1207,10 +1207,13 @@ impl NativeExtension for BashRedirect {
 ///     per-event key filter — `decode_patch`'s per-kind shaping applies to `mutate` only) and out of
 ///     [`ExtensionHost::emit_user_bash`] as the whole `UserBashReduction::Handled(Value)`.
 ///
-/// So the drop is downstream of both, in `cyrup-session-svc`: `emit_user_bash_event`
-/// (`session.rs`) reads only the `"result"` key off this value, and `BashOptions` (`bash.rs`) has no
-/// `operations` field for it to land in. The assertion below fails the moment anyone "fixes" the
-/// omission by filtering `operations` out here instead.
+/// The drop used to be downstream of both, in `cyrup-session-svc`. It no longer is: `BashOptions`
+/// has an `operations` field and `execute_bash_with_user_event` fills it from the winning
+/// `user_bash` result (SEAM-015). The KEY tested here is still the one a WASM guest can put in the
+/// payload today, and the assertion below fails the moment anyone "fixes" anything by filtering
+/// `operations` out at this boundary. What a guest still cannot do is put a CALLABLE behind the key
+/// — that is the residual WIT round-trip in the CYRUP-DELTA register; a NATIVE extension supplies
+/// its backend through `NativeExtension::user_bash_operations` instead.
 ///
 /// Presence before absence: the `result` half is asserted first, so a reduction that dropped the
 /// whole payload could not pass by vacuously satisfying the `operations` check.

@@ -488,7 +488,12 @@ impl Dispatcher {
                         by: ext.id().clone(),
                     };
                 }
-                HookOutcome::Handled(HandledValue(v)) => return Reduced::Handled(HandledValue(v)),
+                HookOutcome::Handled(HandledValue(v)) => {
+                    return Reduced::Handled {
+                        value: HandledValue(v),
+                        by: ext.id().clone(),
+                    };
+                }
                 HookOutcome::Mutate(patch) => ev.apply_patch(patch),
                 HookOutcome::Noop => {}
             }

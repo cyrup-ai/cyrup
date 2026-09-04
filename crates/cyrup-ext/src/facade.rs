@@ -915,7 +915,7 @@ impl ExtensionHost {
         };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
             Reduced::Blocked { reason, by, .. } => InputReduction::Blocked { reason, by },
-            Reduced::Handled(_) => InputReduction::Handled,
+            Reduced::Handled { .. } => InputReduction::Handled,
             Reduced::Pass(ev) => {
                 if let HostEvent::Input { text, images, .. } = *ev
                     && (text != orig_text || images != orig_images)
@@ -997,8 +997,60 @@ impl ExtensionHost {
         };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
             Reduced::Blocked { reason, by, .. } => UserBashReduction::Blocked { reason, by },
-            Reduced::Handled(HandledValue(v)) => UserBashReduction::Handled(v),
+            Reduced::Handled {
+                value: HandledValue(v),
+                ..
+            } => UserBashReduction::Handled(v),
             Reduced::Pass(_) => UserBashReduction::Continue,
+        }
+    }
+
+    /// Resolve the per-call bash backend the extension `owner` supplied for a `user_bash` command
+    /// it just serviced — Pi `UserBashEventResult.operations`
+    /// (`packages/coding-agent/src/core/extensions/types.ts:1136-1142` @v0.84.4), read off the
+    /// winning `emitUserBash` result by the RPC host at
+    /// `packages/coding-agent/src/modes/rpc/rpc-mode.ts:581` and by the interactive `!`/`!!`
+    /// handler at `packages/coding-agent/src/modes/interactive/interactive-mode.ts:6524`.
+    ///
+    /// `owner` is [`Reduced::Handled`]'s `by` — the extension whose result won the reduction, which
+    /// is the only one upstream ever reads `operations` from (`extensions/runner.ts:1005-1032`
+    /// returns the FIRST truthy handler's whole result and stops).
+    ///
+    /// NATIVE-only and available in EVERY build, exactly like [`Self::render_via`]'s live-component
+    /// tier and for the same ADR-0002 reason: a [`cyrup_tools::ops::BashOperations`] is a callable,
+    /// not a value, so a WASM guest cannot return one — a guest owner therefore resolves to `None`
+    /// and the command falls through to `createLocalBashOperations` (`agent-session.ts:2782`'s
+    /// `??`). Closing THAT half is the `register-bash-operations` + `bash-operations-exec`
+    /// round-trip costed in this crate's CYRUP-DELTA register (SEAM-015's residual).
+    ///
+    /// A panicking supplier is contained (`warn!` + `None`) rather than propagated: pi's
+    /// `emitUserBash` wraps every handler in `try`/`catch` (`runner.ts:1012-1029`), so an extension
+    /// fault degrades the command to the local shell instead of failing it.
+    pub fn user_bash_operations(
+        &self,
+        owner: &ExtensionId,
+        command: &str,
+        exclude_from_context: bool,
+        cwd: &str,
+    ) -> Option<Arc<dyn cyrup_tools::ops::BashOperations>> {
+        let native = self
+            .native
+            .read()
+            .ok()
+            .and_then(|g| g.get(owner).cloned())?;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            native.user_bash_operations(command, exclude_from_context, cwd)
+        })) {
+            Ok(ops) => ops,
+            Err(panic) => {
+                let message = native_panic_msg(panic);
+                tracing::warn!(
+                    extension = %owner, error = %message,
+                    "native user_bash operations supplier panicked (contained; the command falls \
+                     back to the local shell)"
+                );
+                None
+            }
         }
     }
 
@@ -1035,7 +1087,7 @@ impl ExtensionHost {
                 _ => CompactionReduction::Proceed,
             },
             // `session_before_compact` has no `handled` channel (Pi returns only cancel/compaction).
-            Reduced::Handled(_) => CompactionReduction::Proceed,
+            Reduced::Handled { .. } => CompactionReduction::Proceed,
         }
     }
 
@@ -1060,7 +1112,7 @@ impl ExtensionHost {
                 } => TreeReduction::Override(v),
                 _ => TreeReduction::Proceed,
             },
-            Reduced::Handled(_) => TreeReduction::Proceed,
+            Reduced::Handled { .. } => TreeReduction::Proceed,
         }
     }
 

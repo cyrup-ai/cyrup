@@ -755,6 +755,42 @@ pub trait NativeExtension: Send + Sync {
         None
     }
 
+    /// Supply a per-call command-execution backend for a `user_bash` command this extension just
+    /// serviced — Pi `UserBashEventResult.operations`
+    /// (`packages/coding-agent/src/core/extensions/types.ts:1136-1142` @v0.84.4, the field at `:1139`:
+    /// *"Custom operations to use for execution"*), consumed by the RPC host at
+    /// `packages/coding-agent/src/modes/rpc/rpc-mode.ts:581` (`operations: eventResult?.operations`)
+    /// and by the interactive `!`/`!!` handler at
+    /// `packages/coding-agent/src/modes/interactive/interactive-mode.ts:6524`.
+    ///
+    /// Consulted ONLY on the extension whose [`HookOutcome::Handled`] won the `user_bash`
+    /// reduction, and only when that value carried no `result` — upstream reads exactly one
+    /// `UserBashEventResult`, the first truthy handler's (`extensions/runner.ts:1005-1032`), and its
+    /// `result` short-circuits execution before `operations` is ever looked at
+    /// (`rpc-mode.ts:571-576`; `interactive-mode.ts:6471-6499`).
+    ///
+    /// Native-only by construction, for the same reason as [`Self::render_live`]: a
+    /// [`cyrup_tools::ops::BashOperations`] is an object with an `exec` METHOD, and ADR-0002
+    /// (`docs/adr/ADR-0002-extension-io-is-serde.md`) makes extension I/O values rather than
+    /// references, so a WASM guest cannot hand one back across the WIT boundary. The guest half is
+    /// the `register-bash-operations` import + keyed `bash-operations-exec` export round-trip
+    /// costed in `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register.
+    ///
+    /// `None` — upstream's absent `operations` — falls through to
+    /// `createLocalBashOperations({ shellPath })` (`core/agent-session.ts:2782`'s `??`), i.e. the
+    /// local shell. The arguments repeat the live `UserBashEvent` fields
+    /// (`extensions/types.ts:813-821`) so a stateless extension can decide per command without
+    /// stashing what [`Self::on_event`] saw. Sync, and a PANIC is contained by the host and treated
+    /// as `None`, so a broken extension can never break a user's `!` command.
+    fn user_bash_operations(
+        &self,
+        _command: &str,
+        _exclude_from_context: bool,
+        _cwd: &str,
+    ) -> Option<Arc<dyn cyrup_tools::ops::BashOperations>> {
+        None
+    }
+
     /// Late-bind the live `Arc<dyn HostServices>` backend (reconciliation §2 item 1 / P-1). Called by
     /// [`crate::ExtensionHost::load_native_with_services`] BEFORE [`Self::init`], handing a native
     /// built-in the SAME capability backend the WASM path already receives (via `discover_and_load`).

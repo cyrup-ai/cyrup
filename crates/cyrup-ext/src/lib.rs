@@ -110,14 +110,20 @@
 //!   `tests::payload_and_seam_parity::user_bash_reduction_carries_the_operations_half_not_only_the_result_half`.
 //!   The host-side seam an override would be expressed AS also exists now:
 //!   [`cyrup_tools::ops::BashOperations`] with [`cyrup_tools::ops::LocalBashOperations`], the port
-//!   of `createLocalBashOperations`. **The consumption half is now built too**: `BashOptions` has an
+//!   of `createLocalBashOperations`. **The consumption half is built**: `BashOptions` has an
 //!   `operations` field, `AgentSession::execute_bash_with_user_event` forwards it and
 //!   `execute_bash` resolves pi's `options?.operations ?? createLocalBashOperations({ shellPath })`
-//!   (`agent-session.ts:2782`), pinned by the three `..._operations_override_...` tests in
-//!   `cyrup-session-svc/src/tests/round9_l5res.rs`. **What is open is (a) the WIT round-trip above
-//!   ALONE** — `emit_user_bash_event` can read the `"operations"` key out of the reduction payload
-//!   but there is nothing callable behind it until a guest can register one. **Owning item:
-//!   DRIFT-004 / SEAM-015, `docs/gap-analysis/06-cyrup-ext.md`.**
+//!   (`agent-session.ts:2782`), pinned by the `..._operations_override_...` tests in
+//!   `cyrup-session-svc/src/tests/round9_l5res.rs`. **The SUPPLY half is built for the NATIVE
+//!   tier**: [`Reduced::Handled`] now carries the `by` of the extension whose result won (upstream
+//!   reads `operations` off exactly that one result, `extensions/runner.ts:1005-1032`), and
+//!   [`ExtensionHost::user_bash_operations`] asks that extension's
+//!   [`NativeExtension::user_bash_operations`] for the live backend — the same native-only,
+//!   every-build tier `render_live` already occupies, and for the same ADR-0002 reason.
+//!   **What is open is the WIT round-trip above ALONE**, i.e. the GUEST tier: a WASM extension can
+//!   put the `"operations"` KEY in its reduction payload but cannot put a callable behind it until
+//!   it can register one. **Owning item: DRIFT-004 / SEAM-015,
+//!   `docs/gap-analysis/06-cyrup-ext.md`.**
 //!
 //! No-panic policy (arch-00 §8) is enforced crate-wide via `[workspace.lints]`; tests may
 //! `#[allow(...)]` where unwrap/expect is acceptable.
