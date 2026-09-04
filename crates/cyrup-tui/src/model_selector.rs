@@ -724,8 +724,9 @@ mod tests {
     /// `sorted.sort((a, b) => … a.provider.localeCompare(b.provider))`, and JS `Array.prototype.sort`
     /// is stable). Nothing on either side sorts by model id, so the catalog's ASSEMBLY order inside a
     /// provider is what the user sees — and that order is Pi `applyModelsJson`'s
-    /// (`provider-composer.ts:167-199` @v0.84.4): built-ins first, a `models.json` model with a NEW id
-    /// `push`ed at the END of its provider's block (`:196`), a wholly-new provider appended after every
+    /// (`provider-composer.ts:168-206` @v0.84.4): built-ins first, a `models.json` model whose id matches
+    /// a built-in replacing it in place (`:199` `findIndex`, `:202`), one with a NEW id `push`ed at the
+    /// END of its provider's block (`:203`), a wholly-new provider appended after every
     /// built-in (`model-runtime.ts:236-243` `providerIds()` insertion order). cyrup's
     /// `ModelFile::compose` / `apply_models_json` (`cyrup-config/src/model/compose.rs`) produce the
     /// same shape, so this test feeds that shape in and pins that the picker keeps every provider
