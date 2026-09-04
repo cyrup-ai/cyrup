@@ -413,12 +413,17 @@ async fn a_real_tool_result_renders_through_the_settled_branch() {
         "pi carries runId too: {details}"
     );
 
-    // `cyrup-agent`'s exact `tool_execution_end.result` projection.
-    let wire = json!({
-        "content": tool_result.content,
-        "details": details,
-        "terminate": tool_result.terminate,
-    });
+    // `cyrup-agent`'s exact `tool_execution_end.result` projection
+    // (`crates/cyrup-agent/src/agent/message.rs` `result_value_of`): `terminate` is three-valued
+    // (`cyrup_core::TerminateHint`), and the key is emitted iff `wire()` is `Some` — never as a
+    // null, exactly as pi's `JSON.stringify` drops an `undefined` `terminate`.
+    let mut wire = serde_json::Map::new();
+    wire.insert("content".to_string(), json!(tool_result.content));
+    wire.insert("details".to_string(), details);
+    if let Some(t) = tool_result.terminate.wire() {
+        wire.insert("terminate".to_string(), Value::Bool(t));
+    }
+    let wire = Value::Object(wire);
 
     let host = host_at(dir.path()).await;
     let drawn = flatten(

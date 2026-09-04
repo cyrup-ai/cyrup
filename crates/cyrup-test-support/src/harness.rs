@@ -198,8 +198,17 @@ impl Harness {
     }
 
     /// Drive one prompt turn to completion, returning that run's events (also appended to the
-    /// cumulative [`Self::events`]). The run-scoped stream terminates after `agent_end`, so capture
-    /// is deterministic and race-free.
+    /// cumulative [`Self::events`]). The run-scoped stream terminates after `agent_settled`, so
+    /// capture is deterministic and race-free — and then this waits for the session to go IDLE,
+    /// which is a separate, later fact: on an unbound session the stream is closed inside the
+    /// agent's `agent_end` emit (`cyrup-session-svc/src/subscriber.rs` `end_run`), BEFORE the
+    /// agent's `SettlementGuard::drop` releases its `running` latch, so a caller prompting again
+    /// the instant the stream ended could be refused with `StreamingNeedsBehavior`
+    /// (`session/run.rs` `prompt` via `is_run_active`). pi's multi-turn tests always follow
+    /// `await session.prompt(...)` with `await session.waitForIdle()` (`core/agent-session.ts:1626`
+    /// @v0.84.4); folding that wait in here gives every two-turn caller the same guarantee
+    /// without each having to remember it (`crates/cyrup-test-support/src/lib.rs`
+    /// `run_returns_only_once_the_session_is_idle`).
     pub async fn run(
         &self,
         text: impl Into<String>,
@@ -213,6 +222,7 @@ impl Harness {
                 .unwrap_or_else(|e| e.into_inner())
                 .push(ev);
         }
+        self.session.wait_for_idle().await;
         Ok(run_events)
     }
 

@@ -1945,11 +1945,13 @@ fn authorization_url_in(notice: &str) -> String {
         .split_whitespace()
         .filter_map(|token| {
             // Take the segment after the FIRST OSC-8 introducer — that is the link target — then
-            // everything up to the ESC that terminates it. `nth(1)`, not `rsplit().next()`: the
-            // sequence has a closing `ESC]8;;` too, so taking the last segment yields the trailing
-            // terminator rather than the URL. A bare URL has no introducer and `nth(1)` is `None`,
-            // so it passes through untouched.
-            let after = token.splitn(2, "\u{1b}]8;;").nth(1).unwrap_or(token);
+            // everything up to the ESC that terminates it. `split_once`, not `rsplit().next()`:
+            // the sequence has a closing `ESC]8;;` too, so taking the last segment yields the
+            // trailing terminator rather than the URL. A bare URL has no introducer and
+            // `split_once` is `None`, so it passes through untouched.
+            let after = token
+                .split_once("\u{1b}]8;;")
+                .map_or(token, |(_, after)| after);
             let candidate = after.split('\u{1b}').next().unwrap_or(after);
             (candidate.starts_with("http://") && candidate.contains("/authorize?"))
                 .then_some(candidate)

@@ -147,6 +147,8 @@ fn spawn_env_child_role_entry() {
 /// the persona name all come out of the same assembly a real `subagent` tool call performs.
 fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMap<String, String> {
     let agent = AgentConfig {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: CHILD_AGENT_NAME.to_string(),
         model: Some(ModelId::from("m1")),
         fallback_models: Vec::new(),
@@ -156,6 +158,9 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         tools: None,
         extensions: None,
         subagent_only_extensions: Vec::new(),
+        // SUBA-092: no `excludeTools`, no nested-delegation grant — the planner's defaults.
+        exclude_tools: Vec::new(),
+        allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
         inherit_skills: true,

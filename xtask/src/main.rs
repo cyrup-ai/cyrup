@@ -4,7 +4,9 @@
 //! * `gen-catalogs` — regenerate `crates/cyrup-provider/src/providers/catalog/*.json` and
 //!   `catalog_manifest.json` from a pinned pi revision (PROV-018 / PROV-060). Documented below.
 //! * `feature-matrix` — type-check the feature combinations `cargo check --workspace
-//!   --all-targets` does not reach. See [`features`] for the matrix and why each row is in it.
+//!   --all-targets` does not reach, and RUN the two suites the everyday gate skips (`cyrup-ext`
+//!   with `wasm-host` off, and the gated `cyrup-it` seam suite). See [`features`] for the matrix
+//!   and why each row is in it.
 //!
 //! # `gen-catalogs`
 //!

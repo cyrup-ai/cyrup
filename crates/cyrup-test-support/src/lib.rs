@@ -117,6 +117,34 @@ mod smoke {
         assert_eq!(texts, vec!["a", "b", "a"]);
     }
 
+    /// `Harness::run` returns only once the session is IDLE, not merely once the run stream has
+    /// ended. On an unbound session the run-scoped stream is closed inside the agent's `agent_end`
+    /// emit (`cyrup-session-svc/src/subscriber.rs` `end_run`), which is BEFORE the agent's own
+    /// `SettlementGuard::drop` releases its `running` latch — so a caller that prompts again the
+    /// instant the stream ends can be refused with `StreamingNeedsBehavior` (`session/run.rs`
+    /// `prompt`, via `is_run_active`). pi's multi-turn tests never do that: every one of them
+    /// does `await session.prompt(...)` and then `await session.waitForIdle()`
+    /// (`core/agent-session.ts:1626` @v0.84.4). The window is nanoseconds unloaded and
+    /// milliseconds under load (`cyrup-agent/src/tests/settlement_latch.rs`), which is exactly how
+    /// it surfaced: one two-turn seam test lost it once in a loaded full-suite run and passed 3/3
+    /// re-run alone. Many turns on the multi-thread runtime widen the odds; the assertion is the
+    /// guarantee `run` now makes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_returns_only_once_the_session_is_idle() {
+        let harness = create_harness(HarnessOptions::with_responses(vec![FauxResponse::text(
+            "done",
+        )]))
+        .await
+        .expect("build harness");
+        for turn in 0..40 {
+            harness.run(format!("turn {turn}")).await.expect("run");
+            assert!(
+                harness.session().is_idle(),
+                "turn {turn}: `run` returned while the session still reported a run in flight"
+            );
+        }
+    }
+
     /// The full session harness drives a turn and captures the ordered event sequence.
     #[tokio::test]
     async fn harness_runs_a_turn_and_captures_events() {
