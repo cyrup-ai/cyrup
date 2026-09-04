@@ -607,21 +607,55 @@ pub fn classify_outcome(result: &ResultFile) -> ClassifiedOutcome {
 // Completion notification (C6): format + deliver + delete (notify.ts / result-watcher.ts)
 // =================================================================================================
 
-/// The `subagent-notify` message a completed background run produces (pi `notify.ts:97-104`'s
-/// `pi.sendMessage({customType:"subagent-notify", content, display:true}, {triggerTurn:true})`).
-/// `custom_type`/`display`/`trigger_turn` are fixed exactly as pi fixes them; only `content` varies,
-/// built by [`format_completion_message`] to reproduce notify.ts's status/summary/session-line
-/// layout character-for-character.
+/// SUBA-090 — pi's `display` predicate for a `subagent-notify` completion
+/// (`v0.64.0:src/runs/background/notify.ts:402`):
+///
+/// ```ts
+/// const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined);
+/// ```
+///
+/// A plain successful background completion is injected as a NON-displayed context message — the
+/// parent LLM still sees it and the turn still fires (R-SA-101), but nothing is drawn — and the
+/// notice is rendered only when something needs attention: a failed/paused/stopped outcome, a
+/// detached-foreground completion, or a schedule-launched run. The predicate is identical at
+/// `v0.43.0:notify.ts:173` (minus the `scheduleOrigin` clause) and `v0.57.0:notify.ts:239`.
+///
+/// Cyrup's [`ResultFile`] carries neither `source` (every completion this crate observes is an
+/// async background run — detached-foreground completions are not ported) nor `scheduleOrigin`
+/// (durable schedules are not ported), so the first and third clauses are vacuously false here and
+/// the decision reduces to the [`classify_outcome`] status: displayed iff the outcome is anything
+/// but [`ClassifiedOutcome::Completed`]. When either input lands, OR it in here — this is the one
+/// place the predicate lives.
+#[must_use]
+pub fn completion_notice_display(outcome: ClassifiedOutcome) -> bool {
+    outcome != ClassifiedOutcome::Completed
+}
+
+/// The `subagent-notify` message a completed background run produces (pi `sendCompletion`,
+/// `v0.64.0:src/runs/background/notify.ts:399-412`:
+/// `pi.sendMessage({customType:"subagent-notify", content, display}, {triggerTurn: items.some((item) => item.triggerTurn)})`).
+/// `custom_type` is fixed; `content` is built by [`format_completion_message`] to reproduce
+/// notify.ts's status/summary/session-line layout character-for-character; `display` is upstream's
+/// outcome-dependent predicate ([`completion_notice_display`], `notify.ts:402`); `trigger_turn` is
+/// `true` for every completion cyrup can produce today (see the field).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionMessage {
     /// Always `"subagent-notify"` (pi's `customType`).
     pub custom_type: String,
     /// The rendered notification body (status header, blank line, summary, optional session line).
     pub content: String,
-    /// Always `true` (pi's `display: true`).
+    /// SUBA-090 — pi's `display` (`notify.ts:402` @v0.64.0): `false` for a plain successful
+    /// background completion (the message is context for the LLM, not a rendered notice), `true`
+    /// for a failed/paused/stopped outcome. Computed by [`completion_notice_display`] over
+    /// [`classify_outcome`]; NOT a constant — the previous "Always `true` (pi's `display: true`)"
+    /// claim was wrong at every upstream tag from v0.43.0 on.
     pub display: bool,
-    /// Always `true` (pi's `{ triggerTurn: true }`) — the completion re-enters the parent's normal
-    /// turn/prompt path so the LLM sees and can act on the background result (R-SA-101).
+    /// `true` for every completion cyrup produces — pi's per-completion
+    /// `triggerTurn: result.triggerTurn !== false` (`notify.ts:605` @v0.64.0), OR'd over the batch
+    /// at `:409`; a `CompletionNotification` may carry `triggerTurn: false`, but cyrup's
+    /// [`ResultFile`] has no such input, so the default (`true`) is the only value reachable. The
+    /// completion re-enters the parent's normal turn/prompt path so the LLM sees and can act on the
+    /// background result (R-SA-101) — this holds whether or not the notice is displayed.
     pub trigger_turn: bool,
 }
 
@@ -661,8 +695,8 @@ impl CompletionSink for LoggingCompletionSink {
 /// The REAL turn-injecting completion sink (R-SA-101): a completed background run's `subagent-notify`
 /// message is injected LIVE into the orchestrator session via the P-1
 /// [`cyrup_ext::host::HostServices::inject_message`] backend, with `trigger_turn: true` so the
-/// completion re-enters the parent's turn loop (pi `notify.ts:97-104`'s
-/// `pi.sendMessage({customType, content, display}, {triggerTurn: true})`) — instead of the
+/// completion re-enters the parent's turn loop (pi `sendCompletion`, `notify.ts:404-410` @v0.64.0:
+/// `pi.sendMessage({customType, content, display}, {triggerTurn})`) — instead of the
 /// stderr-only [`LoggingCompletionSink`] degradation. Installed by
 /// [`crate::extension::SubagentExecutor::install_completion_watcher`] whenever the host-services slot
 /// is bound (a live session is present); the logging sink remains the no-host-handle default.
@@ -737,11 +771,14 @@ fn result_display_summary(result: &ResultFile) -> String {
 /// Build the `subagent-notify` [`CompletionMessage`] for `result`, reproducing pi's `notify.ts`
 /// content layout (`notify.ts:58-104`): a `Background task <status>: **<agent>**` header, a blank
 /// line, the display summary (or `"(no output)"`), and — when a session file is present — a blank
-/// line followed by `Session file: <path>`. `<status>` is `completed`/`failed`/`paused` per
-/// [`classify_outcome`] (R-SA-100; a paused run is never reported as failed).
+/// line followed by `Session file: <path>`. `<status>` is `completed`/`failed`/`paused`/`stopped`
+/// per [`classify_outcome`] (R-SA-100; a paused run is never reported as failed). The same
+/// classification decides `display` ([`completion_notice_display`], SUBA-090): a plain
+/// `completed` outcome is injected hidden, anything else is rendered.
 #[must_use]
 pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
-    let status = match classify_outcome(result) {
+    let outcome = classify_outcome(result);
+    let status = match outcome {
         ClassifiedOutcome::Completed => "completed",
         ClassifiedOutcome::Failed => "failed",
         ClassifiedOutcome::Paused => "paused",
@@ -777,7 +814,9 @@ pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
     CompletionMessage {
         custom_type: "subagent-notify".to_string(),
         content: lines.join("\n"),
-        display: true,
+        display: completion_notice_display(outcome),
+        // pi: `triggerTurn: result.triggerTurn !== false` (`notify.ts:605`) — `ResultFile` carries
+        // no `triggerTurn`, so the default (`true`) is the only reachable value.
         trigger_turn: true,
     }
 }
@@ -1599,7 +1638,10 @@ mod tests {
         );
         let msg = format_completion_message(&result);
         assert_eq!(msg.custom_type, "subagent-notify");
-        assert!(msg.display);
+        assert!(
+            !msg.display,
+            "SUBA-090: a plain successful completion is not displayed (notify.ts:402 @v0.64.0)"
+        );
         assert!(msg.trigger_turn);
         assert_eq!(
             msg.content,
@@ -1645,6 +1687,92 @@ mod tests {
                 .content
                 .starts_with("Background task failed: **worker**")
         );
+    }
+
+    // =============================================================================================
+    // SUBA-090 — the `display` predicate (v0.64.0 `notify.ts:402`)
+    // =============================================================================================
+
+    /// A plain successful background completion is injected as a NON-displayed context message:
+    /// upstream's `display` is `details.some(d => d.source === "foreground" || d.status !==
+    /// "completed" || d.scheduleOrigin !== undefined)` (`notify.ts:402` @v0.64.0), and cyrup's
+    /// `ResultFile` carries neither `source` nor `scheduleOrigin`, so only the status clause can
+    /// hold — and for `completed` it does not. The turn is still triggered (R-SA-101).
+    #[test]
+    fn a_plain_successful_background_completion_is_not_displayed() {
+        let completed = result_with_children(
+            "run-display-1",
+            RunState::Complete,
+            true,
+            Some(PathBuf::from("/tmp/session.jsonl")),
+            vec![child_result("worker", Some("Done"), 0)],
+        );
+        let msg = format_completion_message(&completed);
+        assert_eq!(classify_outcome(&completed), ClassifiedOutcome::Completed);
+        assert!(
+            !msg.display,
+            "a `completed` status is the one outcome upstream keeps invisible"
+        );
+        assert!(
+            msg.trigger_turn,
+            "hidden is not inert: the completion still re-enters the turn loop"
+        );
+        assert!(!completion_notice_display(ClassifiedOutcome::Completed));
+    }
+
+    /// Every non-`completed` status satisfies upstream's `detail.status !== "completed"` clause, so
+    /// failed, paused and stopped completions are rendered — including the `state: Complete,
+    /// success: false` combination `classify_outcome` reports as failed (R-SA-100).
+    #[test]
+    fn failed_paused_and_stopped_completions_are_displayed() {
+        let failed = result_with_children(
+            "run-display-2",
+            RunState::Failed,
+            false,
+            None,
+            vec![child_result("worker", Some("boom"), 1)],
+        );
+        let acceptance_failed = result_with_children(
+            "run-display-3",
+            RunState::Complete,
+            false,
+            None,
+            vec![child_result("worker", Some("rejected"), 0)],
+        );
+        let paused = result_with_children(
+            "run-display-4",
+            RunState::Paused,
+            false,
+            None,
+            vec![child_result("worker", Some("Paused after interrupt."), 0)],
+        );
+        let stopped = result_with_children(
+            "run-display-5",
+            RunState::Stopped,
+            false,
+            None,
+            vec![child_result("worker", Some("stopped"), 0)],
+        );
+        for (label, result) in [
+            ("failed", &failed),
+            ("complete-but-unsuccessful", &acceptance_failed),
+            ("paused", &paused),
+            ("stopped", &stopped),
+        ] {
+            let msg = format_completion_message(result);
+            assert!(
+                msg.display,
+                "{label}: a non-completed status must be displayed"
+            );
+            assert!(msg.trigger_turn, "{label}: the turn is still triggered");
+        }
+        for outcome in [
+            ClassifiedOutcome::Failed,
+            ClassifiedOutcome::Paused,
+            ClassifiedOutcome::Stopped,
+        ] {
+            assert!(completion_notice_display(outcome), "{outcome:?}");
+        }
     }
 
     /// The load-bearing C6 test: a completing background run fires EXACTLY ONE notify and its
@@ -1702,6 +1830,10 @@ mod tests {
         assert!(
             messages[0].trigger_turn,
             "the notify must trigger a turn (R-SA-101)"
+        );
+        assert!(
+            !messages[0].display,
+            "SUBA-090: the `display` handed to the sink for a plain successful completion is false"
         );
         assert_eq!(
             messages[0].content,

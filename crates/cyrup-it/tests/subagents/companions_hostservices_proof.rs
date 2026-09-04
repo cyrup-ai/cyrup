@@ -262,7 +262,11 @@ async fn background_completion_injects_a_turn_triggering_message_on_the_real_hos
         Some("subagent-notify"),
         "pi's fixed customType"
     );
-    assert!(display, "pi's fixed display=true");
+    assert!(
+        !display,
+        "SUBA-090: a plain successful background completion is injected hidden \
+         (`display` false, notify.ts:402 @v0.64.0) while still triggering the turn"
+    );
     assert!(
         content.contains("Background task completed") && content.contains("researcher"),
         "the injected body is the real notify.ts content: {content}",
