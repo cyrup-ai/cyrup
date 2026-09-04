@@ -49,6 +49,13 @@ pub use builder::{
     extension_discovery_roots,
 };
 pub use command::{SessionCommand, SessionCommandOutput};
+/// The message carried on [`AgentSessionEvent::MessageStart`] / [`AgentSessionEvent::MessageUpdate`]
+/// / [`AgentSessionEvent::MessageEnd`]. Re-exported for the same reason as [`StreamEvent`]: it is
+/// already part of this crate's public surface, and a consumer that needs to distinguish the
+/// assistant arm — `cyrup-modes`' wire projection reads `message.usage` off `message_update`, as pi
+/// `toJsonEvent` does (`modes/json-event.ts:58` @v0.84.4) — could otherwise not match on it without
+/// a direct `cyrup-agent` dependency.
+pub use cyrup_agent::AgentMessage;
 pub use cyrup_ext::NotifyKind;
 /// The streaming delta carried on [`AgentSessionEvent::MessageUpdate`]. Re-exported because it is
 /// already part of this crate's public surface (the variant's `assistant_message_event` payload) —
