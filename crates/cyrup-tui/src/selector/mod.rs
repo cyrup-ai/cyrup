@@ -358,6 +358,13 @@ pub enum SelectorKind {
     /// `showExtensionEditor("Custom summarization instructions")` (`interactive-mode.ts:4769`).
     /// Escape loops back to the [`Self::BranchSummary`] prompt (Pi's `continue`, `:4772`).
     BranchSummaryInstructions,
+    /// TUI-081 — the Yes/No guard `/import <path>` shows BEFORE the live session is replaced: Pi's
+    /// `showExtensionConfirm("Import session", `Replace current session with ${inputPath}?`)`
+    /// (`interactive-mode.ts:6069` @v0.84.4), which is `showExtensionSelector` over `["Yes","No"]`
+    /// (`:2557-2565`). First-party (the path rides [`crate::app::AppState`], the answer rides an
+    /// ordinary `ConfirmSelection`) so it never occupies the single extension-dialog reply slot.
+    /// Escape or `No` → `Import cancelled` (`:6071`), nothing imported.
+    ImportConfirm,
     /// Project-trust picker (`/trust`, `trust-selector.ts`).
     Trust,
     /// Fork-from-message picker (`/fork`, `user-message-selector.ts`).
@@ -439,6 +446,10 @@ impl SelectorKind {
             // Pi's exact prompt string (`interactive-mode.ts:4755`).
             SelectorKind::BranchSummary => "Summarize branch?",
             SelectorKind::BranchSummaryInstructions => "Custom summarization instructions",
+            // Pi's confirm title (`interactive-mode.ts:6069` @v0.84.4); the body line
+            // (`Replace current session with {path}?`) is joined on at open time, as
+            // `showExtensionConfirm`'s `` `${title}\n${message}` `` does (`:2563`).
+            SelectorKind::ImportConfirm => "Import session",
             SelectorKind::Trust => "Project Trust",
             SelectorKind::UserMessage => "Fork from Message",
             // `OAuthSelectorComponent`'s own titles (`oauth-selector.ts:70`), verbatim.
@@ -464,10 +475,10 @@ impl SelectorKind {
     /// individual components, and at v0.84.1 exactly two build the
     /// `rawKeyHint("↑↓","navigate") + keyHint(confirm,…) + keyHint(cancel,…)` row:
     ///
-    /// * `ExtensionSelectorComponent` (`extension-selector.ts:63-73`) — "select"/"cancel". Four
+    /// * `ExtensionSelectorComponent` (`extension-selector.ts:63-73`) — "select"/"cancel". Five
     ///   cyrup kinds route through it: [`Self::ExtensionSelect`] and [`Self::BranchSummary`] via
-    ///   `showExtensionSelector`, [`Self::ExtensionConfirm`] via `showExtensionConfirm`
-    ///   (`interactive-mode.ts:2172-2179`), and [`Self::LoginAuthType`], which constructs one
+    ///   `showExtensionSelector`, [`Self::ExtensionConfirm`] and [`Self::ImportConfirm`] via
+    ///   `showExtensionConfirm` (`interactive-mode.ts:2172-2179`), and [`Self::LoginAuthType`], which constructs one
     ///   directly (`interactive-mode.ts:5286-5289`).
     /// * `TrustSelectorComponent` (`trust-selector.ts:75-85`) — the same row but with **"save"**
     ///   rather than "select". cyrup's `/trust` is [`crate::settings_selector`]'s bespoke selector,
@@ -491,6 +502,7 @@ impl SelectorKind {
             SelectorKind::ExtensionSelect
                 | SelectorKind::ExtensionConfirm
                 | SelectorKind::BranchSummary
+                | SelectorKind::ImportConfirm
                 | SelectorKind::LoginAuthType
         )
     }
@@ -535,7 +547,8 @@ impl SelectorKind {
     /// * `ExtensionSelectorComponent` (`extension-selector.ts:44-75`) — `DynamicBorder`(:44),
     ///   `Spacer`(:45), title(:47), `Spacer`(:49), list(:61), `Spacer`(:62), hint(:63-73),
     ///   `Spacer`(:74), `DynamicBorder`(:75). **Four.** Reached by [`Self::ExtensionSelect`],
-    ///   [`Self::ExtensionConfirm`], [`Self::BranchSummary`] and [`Self::LoginAuthType`].
+    ///   [`Self::ExtensionConfirm`], [`Self::BranchSummary`], [`Self::ImportConfirm`] and
+    ///   [`Self::LoginAuthType`].
     /// * `OAuthSelectorComponent` (`oauth-selector.ts:68-96`) — `DynamicBorder`(:68),
     ///   `Spacer`(:69), title(:73), `Spacer`(:74), search `Input`(:86), `Spacer`(:87), list(:91),
     ///   `Spacer`(:93), `DynamicBorder`(:96). **Four**, but one of them (`:87`) sits under the
@@ -555,6 +568,7 @@ impl SelectorKind {
             SelectorKind::ExtensionSelect
                 | SelectorKind::ExtensionConfirm
                 | SelectorKind::BranchSummary
+                | SelectorKind::ImportConfirm
                 | SelectorKind::LoginAuthType
                 | SelectorKind::Login
                 | SelectorKind::Logout

@@ -732,6 +732,11 @@ impl<B: Backend> App<B> {
             | C::ConfirmSelection {
                 kind: SelectorKind::UserMessage,
                 ..
+            }
+            // TUI-081 — the `/import` confirm's answer is the import itself (or its cancellation).
+            | C::ConfirmSelection {
+                kind: SelectorKind::ImportConfirm,
+                ..
             } => self.execute_session_switch(cmd, session, runtime).await,
 
             C::ConfirmSelection { kind, value } => {

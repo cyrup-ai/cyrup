@@ -323,22 +323,12 @@ impl<B: Backend> App<B> {
                 // `/import <path>` (handleImportCommand): copy + resume a JSONL session (Pi
                 // `importFromJsonl`, agent-session-runtime.ts:353).
                 //
-                // TUI-092 §5b.2 — SPAWNED: `import_from_jsonl` dispatches `HostEvent::SessionStart`
-                // to every live extension; see the `/fork` arm for the self-deadlock awaiting it on
-                // this task would reintroduce.
-                (Some(rt), Some(path)) => {
-                    self.state.pending_swap_status =
-                        Some(SwapCaption::Status(format!("imported session {path}")));
-                    let rt = Arc::clone(rt);
-                    self.dispatch_lifecycle(async move {
-                        LifecycleOutcome(match rt.import_from_jsonl(path, None).await {
-                            Ok(r) if r.cancelled => Err("import cancelled".to_string()),
-                            Ok(_) => Ok(LifecycleEffects::default()),
-                            Err(e) => Err(format!("import error: {e}")),
-                        })
-                    })
-                    .await;
-                }
+                // TUI-081 — pi asks FIRST: `await this.showExtensionConfirm("Import session",
+                // `Replace current session with ${inputPath}?`)` and shows `Import cancelled` on a
+                // decline (`interactive-mode.ts:6069-6072` @v0.84.4). The live session is only
+                // replaced from the confirm's `Yes` arm ([`Self::execute_session_switch`]); this arm
+                // opens the prompt and parks the path on `pending_import`.
+                (Some(_), Some(path)) => self.open_import_confirm(path),
                 // TUI-084 — pi's string and pi's CHANNEL: `Usage: /import <path.jsonl>` through
                 // `showError` (`interactive-mode.ts:5482` @v0.83.0). cyrup dropped the `.jsonl`
                 // constraint, lowercased the word, and routed a real error to the neutral status
@@ -379,6 +369,32 @@ impl<B: Backend> App<B> {
     ) {
         use AppCommand as C;
         match cmd {
+            C::ConfirmSelection {
+                kind: SelectorKind::ImportConfirm,
+                value,
+            } => {
+                // TUI-081 — the answer to "Replace current session with {path}?"
+                // (`handleImportCommand`, `interactive-mode.ts:6069-6082` @v0.84.4). Only `Yes`
+                // reaches `importFromJsonl`; `No` is `showStatus("Import cancelled")` (`:6071`).
+                // The stashed path is taken either way so it cannot outlive this answer.
+                let Some(pending) = self.state.pending_import.take() else {
+                    return;
+                };
+                if value != CONFIRM_YES {
+                    self.state.transcript.push_status("Import cancelled");
+                    return;
+                }
+                let Some(rt) = runtime else {
+                    // The prompt only opens with a runtime; a swap-less embedder cannot get here,
+                    // but degrade to the same status the bare `/import` path shows without one.
+                    self.state
+                        .transcript
+                        .push_status(format!("importing session {}", pending.path));
+                    return;
+                };
+                self.dispatch_import(rt, pending.path).await;
+            }
+
             C::ConfirmSelection {
                 kind: SelectorKind::UserMessage,
                 value,
@@ -545,5 +561,64 @@ impl<B: Backend> App<B> {
             let inner: Box<dyn Selector> = Box::new(selector);
             self.open_boxed_selector(SelectorKind::Session, inner);
         }
+    }
+}
+
+impl<B: Backend> App<B> {
+    /// TUI-081 — open pi's `/import` guard: `showExtensionConfirm("Import session", `Replace
+    /// current session with ${inputPath}?`)` (`interactive-mode.ts:6069` @v0.84.4), i.e.
+    /// `showExtensionSelector(`${title}\n${message}`, ["Yes", "No"])` (`:2557-2565`) — a Yes/No
+    /// [`ListSelector`] with `Yes` highlighted, under the `ExtensionSelectorComponent` chrome the
+    /// extension-driven confirm uses. The path is parked on [`AppState::pending_import`] until the
+    /// prompt is answered; the answer arrives as `ConfirmSelection { kind: ImportConfirm, .. }`
+    /// (`Enter`) or as the selector-cancel arm (`Escape`).
+    pub(crate) fn open_import_confirm(&mut self, path: String) {
+        let title = format!(
+            "{}\nReplace current session with {path}?",
+            SelectorKind::ImportConfirm.title()
+        );
+        self.state.pending_import = Some(PendingImport { path });
+        let rows = vec![
+            (CONFIRM_YES.to_string(), "Yes".to_string(), None),
+            ("no".to_string(), "No".to_string(), None),
+        ];
+        self.open_boxed_selector(
+            SelectorKind::ImportConfirm,
+            Box::new(
+                ListSelector::prompt(title, rows, 0)
+                    .with_upstream_chrome(SelectorKind::ImportConfirm, &self.state.select_keymap),
+            ),
+        );
+    }
+
+    /// TUI-081 — the decline half of the `/import` guard: drop the parked path and show pi's
+    /// `Import cancelled` (`interactive-mode.ts:6071` @v0.84.4). Reached from the confirm's `No`
+    /// row and from Escape on the prompt.
+    pub(crate) fn cancel_pending_import(&mut self) {
+        self.state.pending_import = None;
+        self.state.transcript.push_status("Import cancelled");
+    }
+
+    /// Run the confirmed `/import <path>` through the runtime (Pi `importFromJsonl`,
+    /// `agent-session-runtime.ts:353`). The swap caption is pi's `Session imported from:
+    /// ${inputPath}` (`interactive-mode.ts:6082` @v0.84.4); an extension veto of the switch
+    /// (`result.cancelled`) is pi's second `Import cancelled` (`:6079`).
+    ///
+    /// TUI-092 §5b.2 — SPAWNED: `import_from_jsonl` dispatches `HostEvent::SessionStart` to every
+    /// live extension; see the `/fork` arm for the self-deadlock awaiting it on this task would
+    /// reintroduce.
+    async fn dispatch_import(&mut self, rt: &Arc<AgentSessionRuntime>, path: String) {
+        self.state.pending_swap_status = Some(SwapCaption::Status(format!(
+            "Session imported from: {path}"
+        )));
+        let rt = Arc::clone(rt);
+        self.dispatch_lifecycle(async move {
+            LifecycleOutcome(match rt.import_from_jsonl(path, None).await {
+                Ok(r) if r.cancelled => Err("Import cancelled".to_string()),
+                Ok(_) => Ok(LifecycleEffects::default()),
+                Err(e) => Err(format!("import error: {e}")),
+            })
+        })
+        .await;
     }
 }

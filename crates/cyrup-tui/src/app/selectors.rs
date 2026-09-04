@@ -515,6 +515,11 @@ impl<B: Backend> App<B> {
                         self.open_branch_summary_prompt();
                         return AppAction::Redraw;
                     }
+                    // TUI-081 — Escape on the `/import` guard is a decline: `showExtensionSelector`
+                    // resolves `undefined` on Esc, `showExtensionConfirm` reads that as `false`
+                    // (`interactive-mode.ts:2564` @v0.84.4) and `handleImportCommand` shows
+                    // `Import cancelled` (`:6071`). The stashed path is dropped with it.
+                    SelectorKind::ImportConfirm => self.cancel_pending_import(),
                     _ => {}
                 }
                 AppAction::Redraw

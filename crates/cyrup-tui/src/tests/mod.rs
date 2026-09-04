@@ -82,6 +82,7 @@ mod fullscreen_scrollback;
 pub(crate) mod harness;
 mod image;
 mod image_capabilities;
+mod import_confirm;
 mod inline_stacking;
 mod input_pipeline;
 mod input_prompt;

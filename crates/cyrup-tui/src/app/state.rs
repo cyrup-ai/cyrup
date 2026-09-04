@@ -274,6 +274,13 @@ pub struct AppState {
     /// (`interactive-mode.ts:4749-4779`). Cleared the moment the navigation is dispatched or the
     /// prompt is escaped back to the tree.
     pub(super) pending_tree_nav: Option<PendingTreeNav>,
+    /// TUI-081 — the `/import <path>` awaiting its "Replace current session with …?" answer
+    /// ([`crate::SelectorKind::ImportConfirm`]). Pi holds the same value in `handleImportCommand`'s
+    /// `inputPath` local across the `await this.showExtensionConfirm(…)`
+    /// (`interactive-mode.ts:6063-6069` @v0.84.4). Taken the moment the prompt is answered — `Yes`
+    /// dispatches the import, `No`/Escape pushes `Import cancelled` — so a stale path can never be
+    /// imported by a later confirm.
+    pub(super) pending_import: Option<PendingImport>,
     /// The window title currently asked for — either by an extension (Pi `setTitle` →
     /// `ui.terminal.setTitle`, `interactive-mode.ts:2238` → `terminal.ts:504-507`) or by the
     /// automatic session/cwd title ([`App::update_terminal_title`], Pi `updateTerminalTitle`,
@@ -481,6 +488,7 @@ impl AppState {
             editor_mirror: cyrup_session_svc::EditorTextMirror::new(),
             theme_access: None,
             pending_tree_nav: None,
+            pending_import: None,
             terminal_title: None,
             // Off until a session binds and `terminal.showTerminalProgress` is read ([`App::run`]).
             // Pi has no seed at all — it re-reads the setting at each of its five call sites.
@@ -540,6 +548,19 @@ pub(crate) struct PendingTreeNav {
     /// The confirmed tree row's entry id.
     pub(crate) target: String,
 }
+
+/// The `/import` awaiting its confirmation (see [`AppState::pending_import`]).
+#[derive(Clone, Debug)]
+pub(crate) struct PendingImport {
+    /// The path the user typed after `/import`, verbatim — it is what the prompt names and what
+    /// `import_from_jsonl` receives.
+    pub(crate) path: String,
+}
+
+/// The row value of the `Yes` option in a first-party confirm prompt ([`PendingImport`]'s
+/// [`crate::SelectorKind::ImportConfirm`]). Pi's `showExtensionConfirm` reads `result === "Yes"`
+/// (`interactive-mode.ts:2564` @v0.84.4); anything else — `No`, Escape — is a decline.
+pub(crate) const CONFIRM_YES: &str = "yes";
 
 pub(crate) const BRANCH_SUMMARY_NONE: &str = "none";
 
