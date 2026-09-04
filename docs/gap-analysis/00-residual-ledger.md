@@ -5,6 +5,80 @@ next work item**.
 
 ---
 
+# RECONCILED 2026-09-04 (seventh edition) — seven of the sixth edition's eight above-medium rows closed the same day, on landed code and on two live runs; the set is now ONE row
+
+> **Read this block before planning.** cyrup **code** HEAD **`275c1f85`**, branch
+> `claude/beautiful-feynman-odz1v5` (five code commits off `main` = `a4805955`, itself the merge of the
+> sixth edition's `claude/gap-analysis-refresh`). The docs commit carrying this block cannot cite its
+> own sha; `275c1f85` is the last commit that changed `crates/`. Everything below this block is the
+> sixth edition and earlier. Counts are `scripts/count_open_items.py`'s, re-run over the fourteen
+> files after every closure below was written: **125 open = 0 critical, 1 high, 49 medium, 75 low;
+> 539 closed** (sixth edition: 132 = 0/8/49/75). §0 of `PARITY-GAPS.md` carries the per-area table
+> (ninth edition) and §0a the above-medium table (seventh edition); neither is duplicated here.
+
+## What closed, and on what evidence — each row re-read in its area file, not taken from a commit subject
+
+Five `09a` rows closed on **landed code, both sides read** (the Rust after the landing commit, the
+TypeScript at v0.57.0 and v0.64.0 via `git -C tmp/pi-subagents show`, the commit diff rather than its
+subject, plus an independent review that re-read both sides again; `cargo clippy … -D warnings`
+clean and `cargo nextest run -p cyrup-ext-subagents` 2666/2666 at `275c1f85`):
+
+| id | landing commit | what landed (see the `09a` section for citations) |
+|---|---|---|
+| `SUBA-085` | `5e3aa1c8` | `mission.resolve-decision` — seventh verb, store transition, upstream's open-decision status gate; goal driver moves past a resolved decision (pinned) |
+| `SUBA-092` | `247ff97b` | `excludeTools:`/`allowNestedSubagents:` — frontmatter, override, serializer, spawn-plan subtraction and nested-fanout grant, `--exclude-tools` to the child |
+| `SUBA-082` | `5a4ae4ed` | `acceptanceRole:`/`acceptance:` in the schema; role is the primary `infer_level` input; single-agent `acceptance:` launch default — **promoted out of `## Carried` first** (upstream re-read at both tags, confirmed as filed) |
+| `SUBA-084` | `dee8b9d0` | `RuntimeAgentRegistry`, `AgentSource::Runtime` (rank 4), collision checks, merge in `run_discovery`, clear on shutdown, public `register_agent` — **promoted first**; effort corrected L → M |
+| `SUBA-086` | `275c1f85` | `AgentDiscoveryDiagnostic`, `parse_agent_file_checked`, `find_blocking_agent_diagnostic`; rendered by `list`/`get`/`models`/doctor, enforced at both delegation seams — **promoted first**, with three corrections to the filed text |
+
+Two live-use rows closed on **observation** (`REPRO-LOG.md` §0e), per this file's own rule that no
+`TUI-*`/live item closes on a static read:
+
+- **`TUI-091`** (07) — **duplicate of `TUI-090`.** Driven in tmux 3.4 on a real pty at 120×40, HEAD
+  `a4805955`, the owner's exact `together`/Kimi-K3/`high` path through a local SSE server: the
+  reasoning block rendered live and committed above the answer in **seven variants** (short and
+  alternative delta fields, 90-line LONG with 0 rows lost, a TOOL round-trip, fullscreen,
+  `hideThinkingBlock`, `--continue` replay). `TUI-091` was filed 16:26 on 2026-08-15; `TUI-090` was
+  fixed 19:50 the same day with a commit body naming this exact asymmetry. No code changed.
+- **`SEAM-113`** (08) — **REFUTED as an open bug: stale under ADR-0006.** The row settled its contract
+  against v0.83.0; at the parity target v0.84.4 the contract is opt-in Ctrl+S persist and cyrup matches
+  it path for path (re-read on both sides). The row's "rank 4 input is permanently empty" claim is
+  false at HEAD — `crates/cyrup/src/bootstrap.rs:247-275` reads `defaultProvider`/`defaultModel` back,
+  proven by a headless `--mode rpc` run that reproduced the symptom and then cleared it by seeding the
+  keys. The `--default` flag residual never shipped in any pi tag (`5133c9284`, 2026-08-20, deleted it
+  inside the v0.84.3 window). The matched `set_thinking_level` sibling is dispositioned in the row.
+
+## The above-medium set: ONE row
+
+| id | area | sev | why it is above medium |
+|---|---|---|---|
+| `SUBA-074` | 09a | high | Agent `runner:` frontmatter — stage 1 (the refusal path) closed 2026-09-04; **stage 2, the external-runner adapter protocol itself, is the open residual under this id.** Effort L, needs design; unchanged this edition. |
+
+## Residual leads the closures produced — recorded, ownerless, NOT counted
+
+Each is cited in the closing row and collected in `09a`'s second 2026-09-04 summary blockquote; none
+was read on the confirmed bar by this edition, so none is a row: (1) pi-subagents v0.63.0 `0128385f`
+— `inferLevel` returns `none` for read-only reviewers and gates dynamic escalation on
+`dynamicResolvesReadOnly` (`v0.64.0:src/runs/shared/acceptance.ts:105,107,110-111,137`); cyrup's
+`infer_level` is deliberately the v0.57.0/v0.62.0 body. (2) v0.63.0 `31562d76` — custom-agent
+overrides no longer gated on frontmatter presence (`v0.64.0:src/agents/agents.ts:1476`); cyrup's
+`apply_custom_override` still fill-unset for all 20 fields. (3) v0.64.0's runtime-agent EVENT bridge
+(`src/agents/runtime-agent-events.ts`) — needs a request/response topic over cyrup's queued
+`SharedBus`. (4) Five `RuntimeAgentDefinition` fields refused with a marked `[CYRUP-DELTA]` pending
+their `AgentDefinition` landings. (5) `TUI-091`'s two cosmetic observations (live-tail duplication
+when the inline viewport exceeds the screen; `--no-extensions` not governing the compiled-in
+`cyrup-flux`). (6) Tooling: the workspace is not `rustfmt`-clean at `a4805955` under the pinned
+toolchain (no `rustfmt.toml`); every implementer hit it — a repo-level decision.
+
+## What this edition explicitly did NOT do
+
+- Did not re-walk any medium/low row in any area; the 49/75 are exactly the sixth edition's.
+- Did not re-audit area 13: `tmp/pi-mcp-adapter` was re-pulled to **v2.32.1** (`README.md` Baselines
+  records the new HEAD) but the MCP team owns that area; its files were not opened.
+- Did not file the six leads above as rows — each needs both sides read on the confirmed bar first.
+
+---
+
 # RECONCILED 2026-09-04 (sixth edition) — a full re-audit of all fourteen files, `09a` merged into this table for the first time, and the count is now a committed script rather than a hand-count
 
 > **Read this block before planning.** cyrup HEAD **`2571969`**, branch `claude/gap-analysis-refresh`

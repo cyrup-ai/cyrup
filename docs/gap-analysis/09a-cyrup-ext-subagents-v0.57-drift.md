@@ -100,9 +100,12 @@ corrections are applied and recorded at the item.
 | ~~SUBA-078~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery settings / thinking | `subagents.maxThinking` ceiling entirely absent — no parse, no bound, no enforcement, no env propagation |
 | ~~SUBA-079~~ | ~~high~~ **CLOSED 2026-09-04** | S | fork context / launch policy | `defaultContext: fork` hard-fails when the parent is unpersisted where upstream falls back to fresh; no config rung; no `context:"profile"` |
 | ~~SUBA-081~~ | ~~high~~ **PARTIALLY CLOSED 2026-09-04** | M | discovery / settings overrides | Ten `agentOverrides` fields never apply, and a legal `tools: "inherit"` fails the settings load — 6 of 10 landed, 4 fields remain |
+| ~~SUBA-082~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / acceptance | **Promoted out of `## Carried` 2026-09-04** (upstream re-read at v0.57.0 AND v0.64.0, confirmed exactly as filed) **and ported at `5a4ae4ed`**: `acceptanceRole:`/`acceptance:` are in the schema, the role is the primary input to `infer_level`, and `acceptance:` is the single-agent launch default |
 | ~~SUBA-083~~ | ~~high~~ **CLOSED 2026-09-04** | S | config / launch mode | `asyncByDefault` default is inverted, making the documented `asyncByDefault:false` opt-out a no-op |
-| SUBA-085 | high | S | missions | `mission.resolve-decision` unported: a decision is write-once and permanently open, wedging the goal driver — **re-verified open 2026-09-04** |
-| SUBA-092 | high | M | discovery / agent schema | **NEW 2026-09-04** — `excludeTools:`/`allowNestedSubagents:` (frontmatter + settings-override) unported; a declared tool exclusion has no effect. Window v0.57.0..v0.62.0, outside this file's original v0.57.0 scope |
+| ~~SUBA-084~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / runtime registry | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0) **and ported at `dee8b9d0`**: `RuntimeAgentRegistry`, `AgentSource::Runtime` at source rank 4, the three collision checks, merge inside `run_discovery`, clear on `SessionShutdown`, public `register_agent`. Effort was M, not the filed L; the v0.64.0 event bridge is a recorded residual |
+| ~~SUBA-085~~ | ~~high~~ **CLOSED 2026-09-04** | S | missions | `mission.resolve-decision` ported at `5e3aa1c8` — the seventh verb, the store transition, and upstream's open-decision status gate; the goal driver moves past a resolved decision, pinned by test |
+| ~~SUBA-086~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / diagnostics | **Promoted out of `## Carried` 2026-09-04** (both sides read; three corrections to the filed text recorded in the section) **and ported at `275c1f85`**: `AgentDiscoveryDiagnostic`, `parse_agent_file_checked`, `find_blocking_agent_diagnostic`, rendered by `list`/`get`/`models`/doctor and enforced at both delegation seams |
+| ~~SUBA-092~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / agent schema | `excludeTools:`/`allowNestedSubagents:` ported at `247ff97b` — frontmatter, settings-override, serializer, and the spawn-plan tool subtraction / nested-fanout grant. v0.64.0's cross-field custom-override precedence change (`31562d76`) is a recorded residual, not this row |
 
 > **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
 > eleven items counted "confirmed, schedulable" above, **nine are now closed and one is
@@ -130,13 +133,66 @@ corrections are applied and recorded at the item.
 > v0.57.0..v0.62.0). The rest of the window was NOT exhaustively walked — treat it as unaudited, not
 > as clean.
 
-Carried-but-unverified (`## Carried — NOT adversarially verified`): `SUBA-082`, `SUBA-084`,
-`SUBA-086` (high); `SUBA-087`, `SUBA-088`, `SUBA-089`, `SUBA-090`, `SUBA-091` (medium). **All eight
-re-checked port-side at cyrup HEAD `2571969` this pass (2026-09-04): every zero-hit grep this file
-recorded for them still returns zero hits at HEAD — none of the 210 commits since baseline `4fb5e40`
-touched any of these eight symbols/behaviours.** Left exactly as filed, still held to the lower
-evidence standard the section header states (upstream line numbers not re-verified) — this pass did
-not re-read `git show v0.57.0:<path>` for any of the eight, only the cyrup side.
+> **SECOND PASS 2026-09-04, cyrup code HEAD `275c1f85` (five code commits on
+> `claude/beautiful-feynman-odz1v5` after `a4805955`, which is `main`).** Five rows closed, each on
+> the confirmed bar — the Rust read at HEAD after the landing commit, the TypeScript read at the
+> named tag(s) with `git -C tmp/pi-subagents show`, the landing commit's diff read rather than its
+> subject trusted, and an independent review that re-read both sides again (`cargo clippy -p
+> cyrup-ext-subagents --all-targets -- -D warnings` clean; `cargo nextest run -p cyrup-ext-subagents`
+> 2666/2666 at `275c1f85`). In landing order: **`SUBA-085`** (`5e3aa1c8`), **`SUBA-092`**
+> (`247ff97b`), **`SUBA-082`** (`5a4ae4ed`), **`SUBA-084`** (`dee8b9d0`), **`SUBA-086`** (`275c1f85`).
+> Per ADR-0006 every port targets **v0.64.0**; where a row was filed at v0.57.0 the section says what
+> v0.64.0 changed and whether the port took it.
+>
+> **Three rows left `## Carried — NOT adversarially verified` this pass.** `SUBA-082`, `SUBA-084` and
+> `SUBA-086` were first held to the confirmed bar — every upstream line each filing quoted was re-read
+> at v0.57.0 and again at v0.64.0, and all three verdicts came back CONFIRMED (with `SUBA-084`'s
+> effort corrected L→M and three corrections to `SUBA-086`'s filed text, recorded in its section) —
+> **then** ported. Each now has a full section in the confirmed set above the `## Carried` heading, in
+> id order; a one-line pointer stays at its old location. `scripts/count_open_items.py`'s
+> hand-enumerated `carried_high` list was emptied in the same commit, so the three count once, as
+> closed rows of the table, and not a second time as open carried rows.
+>
+> **Residual leads recorded by the five closures, NOT filed as rows — ownerless until a pass reads
+> them on the confirmed bar** (the citations below were read by the implementers and the reviewer;
+> this ledger pass re-resolved each `git show` line but did not port-side re-read them):
+> - **v0.63.0 `0128385f` (#1799, 2026-08-31, first tag v0.63.0) — `inferLevel` omits inferred
+>   acceptance for read-only reviewers.** `git show v0.64.0:src/runs/shared/acceptance.ts:105`
+>   (`readOnlyAgent` feeds `inferredReadOnly`), `:107,110-111` (`dynamicResolvesReadOnly` guard),
+>   `:137` (the read-only branch returns level `none`, not `attested`). cyrup's
+>   `exec/acceptance/model/level.rs::infer_level` is deliberately the v0.57.0/v0.62.0 body
+>   (`SUBA-082`'s closure says why: the crate's lattice maps the read-only branch to `Attested`).
+>   Candidate `upstream-drift`, medium.
+> - **v0.63.0 `31562d76` (#1798, 2026-09-01) — custom-agent override precedence.**
+>   `git show v0.64.0:src/agents/agents.ts:1476` `applyCustomAgentOverride` now delegates to
+>   `applyBuiltinOverride` for every key, dropping the frontmatter-presence gate; cyrup's
+>   `discovery/merge.rs::apply_custom_override` still implements v0.62.0's fill-unset contract
+>   (R-SA-010) for all 20 override fields, the two `SUBA-092` added included. Cross-field; candidate
+>   `upstream-drift`, medium.
+> - **v0.64.0 runtime-agent EVENT bridge** — `git show v0.64.0:src/agents/runtime-agent-events.ts:4-5`
+>   (`pi-subagents:runtime-agent-register:v1`), `:29-48` `registerAgentViaEvents` (synchronous emit,
+>   handler mutates `request.result` in place), `:51-70` the listener; re-exported at
+>   `src/api/agents.ts:3-10`. cyrup's `SharedBus` (`crates/cyrup-ext/src/bus.rs:83-91`,
+>   `[CYRUP-DELTA]`) queues emits and passes payloads by value, so this needs a request/response
+>   topic design. Candidate `upstream-drift`, medium/L.
+> - **Five `RuntimeAgentDefinition` fields with no `AgentDefinition` landing** — `mcpDirectTools`,
+>   `inheritGlobalContext`, `mutationTools`, `skillPath`, `defaultToolTimeoutMs` — are validated with
+>   upstream's messages and then REFUSED with a marked `[CYRUP-DELTA] SUBA-084` error
+>   (`discovery/runtime_registry.rs` `UNREPRESENTABLE_FIELDS`), never silently dropped. Each closes
+>   with the row that lands its field.
+> - **Tooling, not parity:** the workspace is not `rustfmt`-clean at `a4805955` under the pinned
+>   toolchain (no `rustfmt.toml`; `cargo fmt --all -- --check` reports ~14 900 hunks, reproducible
+>   from the base commit's own files). Every implementer hit it and reverted the churn by hand.
+>   Repo-level decision, ownerless.
+
+Carried-but-unverified (`## Carried — NOT adversarially verified`): **five rows, all medium** —
+`SUBA-087`, `SUBA-088`, `SUBA-089`, `SUBA-090`, `SUBA-091`. (The three highs that sat here,
+`SUBA-082`/`SUBA-084`/`SUBA-086`, were promoted and closed on 2026-09-04 — see the blockquote
+above.) All five were re-checked port-side at cyrup HEAD `2571969` this pass: every zero-hit grep
+this file recorded for them still returns zero hits — none of the 210 commits since baseline
+`4fb5e40` touched any of these symbols/behaviours. Left exactly as filed, still held to the lower
+evidence standard the section header states (upstream line numbers not re-verified) — no pass has
+yet re-read `git show v0.57.0:<path>` for any of the five, only the cyrup side.
 Refuted: `SUBA-080`.
 
 ---
@@ -865,6 +921,122 @@ broader gap; land the two together.
 
 ---
 
+## ~~SUBA-082~~ — ~~high~~ **CLOSED 2026-09-04** — Agent `acceptanceRole:` and `acceptance:` frontmatter are not in the schema, so the acceptance classifier is driven purely by the agent-name regex
+
+> **PROMOTED OUT OF `## Carried — NOT adversarially verified`, CONFIRMED, AND CLOSED 2026-09-04 —
+> landing commit `5a4ae4ed`, cyrup code HEAD `275c1f85`.** The carried filing was held to the
+> confirmed bar before any code was written: every line it quoted was re-read with
+> `git -C tmp/pi-subagents show v0.57.0:<path>` and again at v0.64.0, the port side was re-read at
+> `a4805955`, and the verdict was CONFIRMED exactly as filed — the row's v0.57.0 line numbers
+> (`agents.ts:144-145`, `:1873-1884`, `:2011-2014`; `agent-serializer.ts:24-25`) are all exact; at
+> v0.64.0 the same code sits at `agents.ts:156-157`, `:1913-1924`, `:2046-2050` and
+> `agent-serializer.ts:26-27`, unchanged in substance. Window claim verified: `3c635cc1`
+> (*feat: add per-agent acceptance roles (#481)*, 2026-07-15) first appears in **v0.35.0**, so
+> in-baseline as filed. Then ported, then both sides re-read after the port by an independent review.
+
+**Kind** not-ported · **Severity** high · **Effort** M · **Confidence** confirmed (2026-09-04, both tags)
+**Subsystem** discovery / acceptance
+**Window** in-baseline (≤ v0.43.0) · `3c635cc1` → v0.35.0
+
+**upstream (re-read at v0.57.0 and v0.64.0)** — `AgentConfig.defaultAcceptance?: AcceptanceInput` and
+`acceptanceRole?: AcceptanceRole` (`v0.57.0:src/agents/agents.ts:144-145` = `v0.64.0:156-157`;
+`AcceptanceRole = "read-only" | "writer"`, `v0.64.0:src/shared/types.ts:31`).
+`parseAgentAcceptanceFrontmatter` (`v0.57.0:agents.ts:1873-1884` = `v0.64.0:1913-1924`): blank →
+undefined; YAML-parse; throw ``Agent '<name>' has invalid acceptance frontmatter: …``; then
+`validateAcceptanceInput(parsed, `Agent '<name>' acceptance frontmatter`)` with the errors joined.
+`acceptanceRole` is compared exactly and throws ``Agent '${localName}' has invalid acceptanceRole
+frontmatter; expected 'read-only' or 'writer'.`` (`v0.57.0:2011-2014` = `v0.64.0:2046-2050`); both
+are `KNOWN_FIELDS` (`agent-serializer.ts:24-25` / `:26-27`) and `serializeAgent` re-emits them
+(`v0.64.0:agent-serializer.ts:103-110`). The role is the PRIMARY input to the classifier —
+`v0.57.0:src/runs/shared/acceptance.ts:77-104 inferLevel`: intent classified on `"worker"` when a
+role is declared (`:90`), `rolePatchTask` with `stripSeverityCompounds` (`:93-96`,
+`task-intent.ts:78-82`), `readOnlyAgent = role === "read-only" || (role === undefined && /\b(?:reviewer|oracle|scout|researcher|analyst)\b/)`
+(`:98-99`), `writeTask` gains a `writer` arm (`:100-102`), `roleResolvesReadOnly` cancels the
+dynamic/dynamicGroup escalations (`:104-109`), reasons *declared writer acceptance role* (`:124`) /
+*declared read-only acceptance role* (`:133`). Threaded into every launch:
+`v0.64.0:src/runs/foreground/execution.ts:1834`, every background launch in
+`src/runs/background/async-execution.ts:978,1036,1044,1122,1130,1768,1799`, and the single-agent
+launch default `applySingleAgentLaunchDefaults` (`v0.64.0:src/runs/foreground/subagent-executor.ts:2690-2692`:
+`params.acceptance === undefined && agent.defaultAcceptance !== undefined`). Mirrored test:
+`v0.64.0:test/unit/acceptance.test.ts:91-165`.
+
+**cyrup before `5a4ae4ed` (re-read at `a4805955`)** — `discovery/frontmatter.rs:72-127 KNOWN_FIELDS`
+had neither key (its doc claimed to mirror upstream's list "exactly" — false); both were demoted to
+`extra_fields` unvalidated (`:1075-1081`); `AgentDefinition` (`discovery/types.rs:939`) had no
+`acceptance_role`/`default_acceptance`; `AcceptanceResolveInput` (`exec/acceptance/model/level.rs:43-51`)
+had no role, and `:81-91` said so in a comment; `resolve_run_acceptance` (`exec/mod.rs:217-223`)
+classified on `&agent.name` + task only; `single_agent_launch_defaults`
+(`extension/executor/nested_control.rs:148-173`) had no acceptance slot; `serialize_agent` had no
+emission arm, so the keys would have been deleted on the first management rewrite.
+`rg -n -i 'acceptance_role|acceptanceRole|default_acceptance|defaultAcceptance' src` → 9 hits, all
+comments/doc/one settings fixture asserting nothing.
+
+**What landed (`5a4ae4ed`, 43 files, +1399/−57; re-read at `275c1f85`)** —
+`discovery/types.rs` `AgentDefinition::{default_acceptance: Option<serde_json::Value>, acceptance_role: Option<AcceptanceRole>}`
+(`:1126`, `:1132`); `exec/acceptance/model/types.rs` `AcceptanceRole {ReadOnly, Writer}` +
+`parse_exact`. `discovery/frontmatter.rs` `KNOWN_FIELDS` now carries `"acceptance"`/`"acceptanceRole"`
+(`:130-131`); `parse_agent_acceptance_frontmatter` (called at `:1229`) ports the YAML-parse →
+`Agent '<name>' has invalid acceptance frontmatter: …` → `validate_acceptance_input(&value, "Agent '<name>' acceptance frontmatter")`
+chain (a new `serde_yml = "0.0.13"` dependency, so both `checked` scalars and
+`{ level: "none", reason: … }` maps parse as upstream's `parseYaml` does); `acceptanceRole` (`:1247`)
+uses upstream's verbatim refusal, under the crate's existing per-file-skip `[CYRUP-DELTA]`.
+`discovery/management/frontmatter_write.rs` `serialize_agent` emits `acceptance:` (compact JSON for
+an object, bare scalar otherwise, `""` under preserve) and `acceptanceRole:`; `agent_crud.rs`
+`merge_fields` preserves both across an update; `management/render.rs` adds `Acceptance:` /
+`Acceptance role:` detail lines (`agent-management.ts:901-902`). `exec/agent_config.rs`
+`AgentConfig` and the hop-2 `ResolvedAgentPersona` carry both, so a background child sees the role.
+`exec/acceptance/model/level.rs` `AcceptanceResolveInput::acceptance_role` and `infer_level`
+re-ported line for line from `v0.57.0:acceptance.ts:77-104` (with `strip_severity_compounds` added
+to `exec/task_intent.rs`); `lattice/contract.rs` `AcceptanceContract::{heuristic_default_for_role, resolve_effective_for_role}`;
+`exec/mod.rs` `resolve_run_acceptance` passes `agent.acceptance_role`. Launch default:
+`nested_control.rs` `single_agent_launch_defaults` returns a fourth slot and
+`extension/tool/routing.rs` `route_single` fills `p.acceptance` only when the call omitted it —
+single-agent only, never chain/parallel, per `docs/agents.md:326`.
+
+**Verify (each fails at `a4805955` by construction — every test names a symbol absent there — and
+passes at `275c1f85`)** — `src/tests/acceptance_role_inference.rs` (new, seven cases mirroring
+`v0.64.0:test/unit/acceptance.test.ts:91-173`: explorer+read-only → read-only branch with reason
+*declared read-only acceptance role*; reviewer+writer on "Handle the authentication flow" → `checked`,
+*declared writer acceptance role*; worker+read-only on implementation wording → `checked` (task intent
+wins); worker+writer on "Review only; do not edit files" → read-only branch; explorer+read-only +
+"Audit the security posture" → not escalated; explorer+read-only + `dynamic` → not escalated);
+`frontmatter.rs` `acceptance_role_frontmatter_parses_exactly_and_is_a_known_field`,
+`invalid_acceptance_role_frontmatter_skips_the_file`,
+`acceptance_frontmatter_parses_scalar_json_flow_map_and_block_defaults`,
+`invalid_acceptance_frontmatter_skips_the_file_with_upstreams_message`;
+`frontmatter_write.rs` `serialize_agent_round_trips_acceptance_and_acceptance_role`;
+`exec/mod.rs` `run_sync_threads_the_agents_declared_acceptance_role_into_the_inferred_floor`;
+`tests/read_only_agent_name_alternation.rs` now passes `acceptance_role: None` explicitly and is
+unchanged otherwise (the `undefined` branch regression guard). Crate: 2630/2630 at `5a4ae4ed`.
+
+**Falsification** — `acceptanceRole: writer` on a `security-reviewer` given "Handle the authentication
+flow" must resolve `checked` with reason *declared writer acceptance role*; `acceptanceRole: read-only`
+on a `worker` given "Explore the authentication flow" must take the read-only branch;
+`acceptance: checked` on an agent file must reach `RunOptions::acceptance` for a `subagent({agent,
+task})` call that omits `acceptance`. Any of those failing reopens the row.
+
+**Residuals — recorded, not closed by this row.** (1) **`infer_level` is the v0.57.0/v0.62.0 body,
+not v0.64.0's**: `0128385f` (#1799, first tag v0.63.0) makes the name-classified `readOnlyAgent` feed
+`inferredReadOnly` (`v0.64.0:acceptance.ts:105`), adds a `dynamicResolvesReadOnly` guard
+(`:107,110-111`) and returns level `none` instead of `attested` on the read-only branch (`:137`) —
+that collides with the crate's deliberate always-attest lattice mapping (`lattice/contract.rs`
+`None => Attested`), so it was left for its own row; the new tests assert branch/reason/evidence
+rather than the level so they survive that port. Ownerless lead, see the summary blockquote. (2) The
+`/run` slash surface does not apply the `acceptance:` launch default (its foreground branch uses the
+flat legacy `run_foreground` signature) — same standing gap as `output`/`outputMode`/`skill` there.
+(3) `SUBA-081`'s remainder, `agentOverrides.<n>.acceptanceRole` (incl. `false` to clear), is still not
+modeled; the `types.rs` doc note now says so precisely. (4) Management create/update inputs
+`config.acceptance`/`config.acceptanceRole` (`agent-management.ts:385-386,576-587` @v0.64.0) are not
+ported; `merge_fields` preserves existing values. (5) `completion-guard.ts:78-80` `isWriterRole` is not
+ported — its only consumer `validateImplementationToolContract` is unported (0 hits), so there is no
+seam. (6) `spawn/chain_graph.rs` `evaluate_dynamic_group_acceptance` still passes role `None`
+(upstream passes `step.parallel.acceptanceRole`, `subagent-runner.ts:4106` @v0.64.0) — the seam has
+no persona map. (7) `strip_severity_compounds` is applied only inside `rolePatchTask`; upstream also
+applies it in `classifyTaskMutationIntent`/`taskMayMutate` (`task-intent.ts:175,207` @v0.64.0,
+`2318fb07` in v0.48.0) — noted in `exec/task_intent.rs`'s doc.
+
+---
+
 ## ~~SUBA-083~~ — ~~high~~ **CLOSED 2026-09-04** — `asyncByDefault`'s default is inverted, and the documented `asyncByDefault:false` opt-out is a no-op
 
 > **CLOSED 2026-09-04, cyrup HEAD `2571969`**, verified by reading the current code.
@@ -931,7 +1103,138 @@ honoured; its default is inverted.
 
 ---
 
-## SUBA-085 — `mission.resolve-decision` unported: a mission decision is write-once and permanently open, so the goal driver proposes the same next action forever
+## ~~SUBA-084~~ — ~~high~~ **CLOSED 2026-09-04** — Runtime agent registration is entirely absent: no `registerAgent` API, no `runtime` source tier, no runtime/configured collision checks
+
+> **PROMOTED OUT OF `## Carried — NOT adversarially verified`, CONFIRMED, AND CLOSED 2026-09-04 —
+> landing commit `dee8b9d0`, cyrup code HEAD `275c1f85`.** Verified on the confirmed bar before the
+> port: `git -C tmp/pi-subagents show v0.57.0:src/agents/runtime-agent-registry.ts` is 424 lines (the
+> filing said 418 — harmless) with the 32-field `RuntimeAgentDefinition` exactly as filed; v0.64.0's
+> is 429 lines and 35 fields (+`excludeTools`, +`allowNestedSubagents`, +`inheritGlobalContext`,
+> +`mutationTools`, −`defaultTurnBudget`) and adds a cross-extension EVENT bridge absent at v0.57.0.
+> All five wiring claims verified at both tags (discovery merge, slash merge, management list section
+> + merge, `sourceRank` runtime = 4, clear on cleanup). Port side at `a4805955`: zero hits for every
+> symbol across the WHOLE workspace (`rg -e 'runtime_agent|RuntimeAgent|register_agent|registerAgent|runtime-agent-register|pi-subagents\.runtime' crates --glob '*.rs'`),
+> `AgentSource` four variants, `TieredAgents`/`merge_tiers` four tiers, `AgentDiscoveryConfig`
+> on-disk inputs only, the `SessionShutdown` arm (`extension/host/native_impl.rs:397-420`) clearing
+> nothing agent-related, `lib.rs` exporting no registration API. Refutation attempts (generic bus
+> mechanism, other names, the `registration` module, `BUILTIN_AGENT_NAMES`) all negative — nothing
+> partial existed. **Effort corrected L → M**: one new module plus a fifth enum variant threaded through
+> the exhaustive matches, which is what landed. Port target v0.64.0 per ADR-0006.
+
+**Kind** not-ported · **Severity** high · **Effort** M *(filed L)* · **Confidence** confirmed (2026-09-04, both tags)
+**Subsystem** discovery / runtime registry
+**Window** v0.47.1..v0.57.0 · `2c031d06 (#1320)`
+
+**upstream (re-read at v0.64.0; v0.57.0 diffed against it)** — `src/agents/runtime-agent-registry.ts`:
+caps 200 / 128 / 4096 / 1 MiB / 8192 (`:10-16`); `RuntimeAgentDefinition` (`:18-54`); name-sensitive
+defaults (`:78-88`); `validateString`/`StringList`/`PositiveInteger`/`Boolean` (`:116-146`);
+`validateRunner` with fourteen refusals (`:156-184`); `validateAcceptance`/`validateToolBudget`
+(`:186-196`); `validateDefinition` — supported set, unknown-field error, the five enum scalars
+(`:198-285`); `normalizeAliases`/`identityKeys` (`:287-295`); `assertNoIdentityCollisions` /
+`assertNoRuntimeCollision` / `assertNoBuiltinCollision` (`:297-323`); `toAgentConfig` stamping
+`source: "runtime"` and `filePath: runtime:<name>` (`:325-369`); `registerRuntimeAgent` — name cap,
+validate, code-owned-profile check, builtin collision, 200 cap, runtime collision, idempotent
+`dispose()` by record identity (`:371-398`); `clearRuntimeAgentsForPi`/`listRuntimeAgentConfigs`
+(`:400-406`); `assertNoConfiguredCollision` (`:408-421`); `mergeRuntimeAgents` — filters disabled,
+no-op when empty, fails closed (`:423-429`). Public API `src/api/agents.ts:2,12`. `AgentSource`
+includes `"runtime"` (`agents.ts:30`) at `sourceRank` 4 (`:687`). Wired: `extension/index.ts:528-546`
+(`discoverAgentsForRuntime` re-snapshots all four tiers when the registry is non-empty), `:971`
+(clear in cleanup); `slash/slash-commands.ts:120-130`; `agent-management.ts:132-141,254,744,849`.
+Tests `test/unit/runtime-agent-registration.test.ts:81-104,220-230,274-303,305-319,321-329,331-356,358-366`.
+
+**What landed (`dee8b9d0`, 22 files, +2460/−30; re-read at `275c1f85`)** — NEW
+`discovery/runtime_registry.rs`: the constants (`MAX_RUNTIME_AGENTS_PER_OWNER = 200` at `:60` …), the
+35-field `RuntimeAgentDefinition` (`:162`) whose `to_value()` feeds ONE Value-based
+`validate_definition` so typed and untyped input share upstream's messages verbatim,
+`validate_runner`, `normalize_aliases`/`identity_keys`, the three `assert_no_*_collision` checks plus
+`assert_no_configured_collision`, `to_agent_definition` (source `Runtime`, `file_path`
+`runtime:<name>`, name-sensitive defaults, `thinking:false` → `"off"`),
+`RuntimeAgentRegistry::{register, register_value, list, clear}` in upstream's check order,
+`RuntimeAgentRegistration::dispose` (idempotent, record-id based), `merge_runtime_agents`.
+`discovery/types.rs` `AgentSource::Runtime` (`:59`) threaded through every exhaustive match
+(`discovery/mod.rs::source_rank` Runtime = 4, `chain_run_precedence`, `merge.rs::apply_overrides`,
+`management/helpers.rs::source_str` `"runtime"`, `management/handlers.rs::agent_in_list_scope` always
+visible, `registration/doctor.rs::SourceCounts::record`). `AgentDiscoveryConfig::runtime_agents` and
+the merge inside `run_discovery` — the single seam every cyrup discovery consumer shares — against all
+four tiers at `Both` scope when non-empty, as `index.ts:528-546`. `SubagentExecutor` owns the registry
+(upstream's per-`ExtensionAPI` WeakMap partition); `extension/executor/resolve.rs::discovery_config`
+is now `&self` and fills the list; `session_state.rs::teardown_session` clears it (reached from the
+`SessionShutdown` arm). Public `SubagentsExtension::register_agent` / `SubagentExecutor::register_agent`
+and `lib.rs` re-exports of `RuntimeAgentDefinition`/`RuntimeAgentRegistration`/`RuntimeAgentRegistry`/`RuntimeThinking`.
+
+**Verify (21 tests; each names a symbol absent at `a4805955`, so the module fails to compile there;
+all pass at `275c1f85`)** — unit, in `runtime_registry.rs` (9): definition/name/runner validation
+against upstream's strings, nested-field labels, unrepresentable-field refusal, reserved-name guard
+before builtin collision, merge no-op/append/identity refusal. Integration,
+`src/tests/runtime_agent_registration_integration.rs` (12), ported 1:1 from upstream's test file:
+`runtime_agent_reaches_discovery_without_writing_config`, `runtime_agent_is_listed_by_management_list`
+(all three scopes), `fails_closed_for_builtin_identity`, `fails_closed_for_duplicate_runtime_identity`,
+`rejects_malformed_nested_definition_fields`,
+`fails_closed_when_cwd_discovery_introduces_configured_collision`,
+`fails_closed_against_configured_agent_hidden_by_scope`,
+`management_list_fails_closed_on_scoped_configured_collision`, `dispose_is_idempotent_and_removes_agent`,
+`registry_caps_at_200_per_owner`, `executor_discovery_sees_registered_agent_and_session_shutdown_clears_it`,
+`runtime_source_outranks_project_in_name_resolution`; `merge.rs` `merge_tiers_matches_precedence_rank_ordering`
+pins the fifth variant. Crate 2651/2651 at `dee8b9d0`.
+
+**Residuals — recorded, not closed by this row.** (1) **The v0.64.0 EVENT registration bridge is not
+ported** — `runtime-agent-events.ts:4-5,29-48,51-70` and `api/agents.ts:3-10` rely on a synchronous
+emit whose handler mutates `request.result` in place; cyrup's `SharedBus`
+(`crates/cyrup-ext/src/bus.rs:83-91`, `[CYRUP-DELTA]`) queues emits and passes payloads by value, so
+this needs a request/response topic design. Ownerless lead, see the summary blockquote (upstream
+tests `:143-218` cover it). (2) **Five definition fields have no `AgentDefinition` landing and are
+refused, not dropped**: `mcpDirectTools`, `inheritGlobalContext`, `mutationTools`, `skillPath`,
+`defaultToolTimeoutMs` — validated with upstream's messages, then refused by name with a
+`[CYRUP-DELTA] SUBA-084` error (`UNREPRESENTABLE_FIELDS`). The verifier's list of nine shrank to five
+because `SUBA-082` and `SUBA-092` landed first; drop each from the list when its field lands. (3)
+Builtin-collision roster is cyrup's seven shipped names; upstream's `builtin-names.ts` also holds the
+six code-owned adapter names cyrup does not ship (`SUBA-074` stage 2) — the read-only ones are still
+refused via `validate_code_owned_profile_runner`, the `-writer` twins are not. (4) The `models` report
+has no `source: runtime agent config` label (`AgentModelSourceInfo` has no runtime variant; the agent
+is still listed). (5) `AgentSource::Runtime` shares `precedence_rank` 0 with `Project` for totality;
+it never enters `merge_tiers` (pinned). (6) Unknown-field messages list keys sorted rather than in
+insertion order — text-only.
+
+---
+
+## ~~SUBA-085~~ — ~~high~~ **CLOSED 2026-09-04** — `mission.resolve-decision` unported: a mission decision is write-once and permanently open, so the goal driver proposes the same next action forever
+
+> **CLOSED 2026-09-04, landing commit `5e3aa1c8`, re-read at cyrup code HEAD `275c1f85`.** Upstream
+> re-read at both v0.57.0 and v0.64.0 with `git -C tmp/pi-subagents show`; the three mission files
+> are byte-identical between the two tags (`git diff --stat v0.57.0 v0.64.0 -- src/missions/{actions,store,types}.ts`
+> is empty), and `git log -S needs_decision v0.43.0..v0.47.1 -- src/missions/store.ts` = `1dec33dd`,
+> confirming the window. **What landed**: `src/missions/types.rs:693 MissionDecisionResolution {id, resolution}`
+> and `:732 MissionUpdateInput::resolve_decision` (counted by `is_empty()` at `:755`) —
+> `missions/types.ts:188`; `src/missions/store.rs:1091-1117` the resolve block after the append loop
+> (find by id; `Decision '<id>' was not found in mission '<id>'` / `Decision '<id>' is already resolved`
+> verbatim; `status = Resolved`, `resolved_at = created_at`, trimmed resolution through
+> `required_string(.., "mission.update.resolveDecision.resolution")`) — `store.ts:497-508`;
+> `store.rs:1162-1192` the decision status gate (`has_open_decisions` / `candidate_status` /
+> held `needs_decision`; back to `active` when the last open decision resolves) — `store.ts:521-529`,
+> replacing the v0.43.0-era `update.status.unwrap_or(current.status)`; `src/missions/actions.rs:56
+> MISSION_ACTIONS` (seven, upstream's order) and `:69 MUTATING_MISSION_ACTIONS` (five), `:89
+> MissionAction::ResolveDecision`, `:977-1016` the handler arm in upstream's check order (mission id →
+> `validate_mission_id(params.id, "id")` → `mission.resolve-decision requires a non-empty summary` →
+> store) with the `Resolved decision <id> for mission <id>.` receipt — `actions.ts:32-40`, `:391-397`;
+> `actions.rs:759 format_mission` `; resolution: <text>` suffix (`actions.ts:314`) and `:867`
+> `mission.list`'s `decisions: N open, M resolved` tally (`:361-366`); `src/extension/tool/text.rs:227
+> SUBAGENT_ACTIONS` carries the verb in pi's position (`shared/types.ts:2715`), from which
+> `schema.rs` derives the action enum; `routing.rs:892` dispatches it through the `mission.*` arm and
+> `is_mutating()` refuses it child-safe (`subagent-executor.ts:197`); `resources/docs/missions.md`
+> and `tool-reference.md` advertise it. **The goal driver needed no change** — `mission_state_action`
+> still returns the first OPEN decision (`goal-driver.ts:94-95` @v0.64.0), so resolving is what moves
+> it on. **Verify, each clause a passing test**: next ready action moves past the decision
+> (`goal_driver.rs:876 resolving_the_open_decision_moves_the_next_ready_action_past_it`); empty
+> `summary` fails with upstream's message (`actions.rs:1244`, `routing_tests.rs:939`); unknown id fails
+> rather than no-ops (`actions.rs:1244`, `store.rs:1749`); plus `store.rs:1719/:1797/:1847`,
+> `actions.rs:1173`, `mission_action_vocabulary_matches_upstream_exactly` (7 entries),
+> `child_safe_mission_gating_matches_upstreams_mutating_set` (5 verbs). Nine tests, each naming a
+> symbol absent at `a4805955`; crate 2601/2601 at `5e3aa1c8`. **Falsification**: any of those going
+> red, or `MissionDecisionStatus::Resolved` again produced only by the on-disk parser. **Behavioural
+> note, upstream-faithful but new in cyrup**: `mission.close … completed` while a decision is open now
+> yields `needs_decision` and the receipt says so — `decisionStatus`'s gate. **Not this row**: other
+> `v0.47.1..v0.64.0` `store.ts` changes (`upsertWorkflowChildren`, `projectMissionDirectory`, the
+> longer `MissionNotFoundError` text) are untouched.
 
 **Kind** not-ported · **Severity** high · **Effort** S · **Confidence** confirmed
 **Subsystem** missions
@@ -997,7 +1300,99 @@ the first schedulable filing of the behaviour and is not a duplicate of a counte
 
 ---
 
+## ~~SUBA-086~~ — ~~high~~ **CLOSED 2026-09-04** — Per-agent parse diagnostics are absent: a malformed agent file is silently degraded to defaults instead of being reported by name and blocking its own agent name
+
+> **PROMOTED OUT OF `## Carried — NOT adversarially verified`, CONFIRMED WITH THREE CORRECTIONS, AND
+> CLOSED 2026-09-04 — landing commit `275c1f85` (= cyrup code HEAD).** Upstream: the filing's v0.57.0
+> lines (`agents.ts:229-234`, `:244-264`, `:1923-2110`, `:2106`, `:2267-2273`;
+> `agent-management.ts:760-764`) are all accurate; at v0.64.0 the same machinery is
+> `agents.ts:238-278` (type, `AGENT_SOURCE_PRIORITY`, `agentDefinitionPriority`,
+> `findBlockingAgentDiagnostic` — byte-identical between the tags), `:1959-2154` (per-file try/catch,
+> catch at `:2149-2151`), `:2651-2662` (`discoveryDiagnostics` scope filter), `:2670`/`:2705-2710`;
+> `agent-management.ts:177-181`, `:818-825`, `:946`, `:985-989`, `:1074`, `:1084-1089`;
+> `subagent-executor.ts:2336-2350`; `preflight.ts:264-271`; `slash-commands.ts:891-896`;
+> `doctor.ts:146-150`. **Corrections to the filed text.** (a) "every field parser degrades a bad value
+> to None / agent loads with defaults" was STALE at `a4805955` for the fields `SUBA-073`/`SUBA-074`
+> ported — `package`, `toolBudget`, `turnBudget`, `permission(s)`, `runner`, code-owned squat, `async`,
+> `timeoutMs` did a per-FILE `tracing::warn! + return None` (`frontmatter.rs:868-1052`,
+> `[CYRUP-DELTA]`); the warn reached only the tracing log, never `list`/`get`/doctor/the delegation
+> error, and the dropped file made the name fall through to a lower-tier definition or
+> `AgentNotFound` — so the user-visible outcome the row described was exact, the mechanism was not.
+> (b) `outputMode`, `toolTimeoutMs`, `fast`, `allowNestedSubagents` (and `SUBA-082`'s two keys) DID
+> match the "coerced to absent" description — unparsed, into `extra_fields`, no warn. (c) The example
+> `defaultContext: forked` is wrong: upstream also degrades an unrecognised `defaultContext` silently
+> (`v0.64.0:agents.ts:2011-2015`); `timeoutMs: 30s` and `outputMode: file` are valid examples.
+> Severity `high` stands — a broken project-tier override of a builtin/user name silently ran the
+> unbroken lower-tier agent (wrong agent runs). Port target v0.64.0.
+
+**Kind** not-ported · **Severity** high · **Effort** M · **Confidence** confirmed (2026-09-04, both tags)
+**Subsystem** discovery / diagnostics
+**Window** v0.47.1..v0.57.0 · `e973fa3c`
+
+**What landed (`275c1f85`, 10 files, +1089/−173)** — `discovery/types.rs:1353
+AgentDiscoveryDiagnostic { source, file_path, error, name, runtime_name, package_specified, discovery_priority }`
++ `label()` (`agents.ts:238-249`). `discovery/frontmatter.rs:869 parse_agent_file_checked -> Result<Option<AgentDefinition>, AgentDiscoveryDiagnostic>`:
+every former warn-and-skip site returns the diagnostic with pi's verbatim message (package now carries
+`identity.ts:15`'s `Agent '<n>' package is invalid after sanitization.`), the three throws cyrup never
+checked are added — `toolTimeoutMs` (`:1186` = `agents.ts:2031-2038`, ≤ 2147483647), `outputMode`
+(`:1199` = `:2041-2044`), `fast` (`:1212` = `:2057-2062`) — and missing name/description stays
+`Ok(None)` (`:1970-1972`); `parse_agent_file` (`:787`) is the diagnostic-dropping wrapper for the ~20
+CRUD/serializer callers. `discovery/mod.rs:1107 AgentFileScan`, `:1134 walk_agent_dir_checked`,
+`walk_agent_dirs`, `expand_manifest_agent_entry`, `scan_{builtin,package}_agents_checked`,
+`:1448 scan_agent_tiers_scoped -> (TieredAgents, Vec<AgentDiscoveryDiagnostic>)`, `run_discovery` →
+`AgentDiscoveryResult::agent_diagnostics` (`:1415`), scope-narrowed for free because the excluded tier
+is never walked. `mod.rs:595 find_blocking_agent_diagnostic` + `agent_definition_priority`
+(rank × 1 000 000, builtin 0 / package 1 / user 2 / project 3 / runtime 4 via `source_rank` — NOT the
+inverted `AgentSource::precedence_rank`) = `agents.ts:251-278`; `mod.rs:551 blocking_candidates` =
+the Found/Ambiguous/NotFound candidate rule of `subagent-executor.ts:2337-2338`. Consumers:
+`management/handlers.rs:57 append_agent_diagnostic_lines` (`Invalid agent definitions:` /
+`- <name ?? file_path> (<source>): <error>`, `:818-825`) — list appends it after Chains and before
+proactive suggestions, UNFILTERED as `:946`; `:42 diagnostics_for_scope` (`:177-181`); `handle_get`
+(`:264`) blocking check, raw then `sanitize_name`, BEFORE ambiguity/not-found (`:1084-1089`);
+`handle_models` (`:422`) append when no agent requested (`:1074`). `extension/tool/routing.rs:151
+canonicalize_execution_params` keeps the whole discovery result and checks the blocking diagnostic
+FIRST — `Agent '<name>' has invalid configuration: <error>` + ` (<location>)`
+(`subagent-executor.ts:2336-2350`); `extension/executor/resolve.rs:223 resolve_agent_with_model_scope`
+the same for background/chain/slash launches via `error.rs:60 SubagentError::InvalidAgentConfiguration { name, error }`;
+`registration/doctor.rs:1025` prints `- invalid agent <name> (<source>): <error>` (`doctor.ts:146-150`).
+
+**Verify (15 tests; 11 name symbols with 0 `git grep` hits at `a4805955` so cannot compile there, 4
+assert strings with 0 hits there; all pass at `275c1f85`, crate 2666/2666)** — `frontmatter.rs`:
+`invalid_timeout_ms_is_reported_as_a_named_diagnostic_and_the_wrapper_still_skips`,
+`every_upstream_throw_carries_its_verbatim_message` (outputMode/toolTimeoutMs/fast/allowNestedSubagents/async/permission+permissions/acceptanceRole/toolBudget),
+`valid_tool_timeout_output_mode_and_fast_still_round_trip_as_extra_fields`,
+`invalid_package_diagnostic_carries_upstreams_message_and_package_specified`,
+`a_packaged_agents_diagnostic_carries_its_runtime_name`, `missing_description_is_still_a_silent_skip_not_a_diagnostic`;
+`discovery/mod.rs`: `a_malformed_project_agent_file_is_reported_by_name_and_scoped_like_upstream`,
+`a_broken_higher_tier_definition_blocks_the_valid_lower_tier_one`,
+`a_broken_lower_tier_definition_does_not_block_the_valid_higher_tier_one`,
+`find_blocking_agent_diagnostic_with_no_candidates_returns_the_trimmed_name_match`,
+`a_packaged_diagnostic_matches_by_runtime_name_and_gates_local_name_on_a_matching_candidate`;
+`management/mod.rs` `list_and_models_render_invalid_agent_definitions_and_get_refuses_a_blocked_name`;
+`doctor.rs` `build_doctor_report_lists_each_invalid_agent_definition`; `resolve.rs`
+`resolve_agent_refuses_a_name_whose_outranking_definition_is_malformed`; `routing_tests.rs`
+`dispatch_refuses_an_agent_whose_outranking_definition_is_malformed` (incl. the `(task 2)` suffix).
+Existing frontmatter skip tests still pass via the wrapper; doctor count assertions unchanged.
+
+**Residuals — recorded, not closed by this row.** (1) `discovery_priority` is always `None`: cyrup's
+`AgentDefinition` carries no per-directory ordinal (pi stamps it at `agents.ts:2471,2476`), so
+blocking reduces to source rank — exact for every cross-tier collision, differs only for a same-name
+collision across two directories of the SAME tier. (2) Valid `toolTimeoutMs`/`outputMode`/`fast` are
+validated only and still round-trip via `extra_fields` (deliberately not added to `KNOWN_FIELDS`, since
+no typed field consumes them yet); wiring them is separate work. (3) cyrup's `get`/`models` take no
+`agentScope`, so their `diagnostics_for_scope` filter is the `both` identity. (4) No preflight API in
+cyrup (`preflight.ts:267` has no seam); the slash path is covered through `resolve.rs`. (5) Upstream
+`parsePackageName` treats a whitespace-only `package:` as an error; cyrup treats it as absent —
+pre-existing.
+
+---
+
 ## Carried — NOT adversarially verified
+
+> **2026-09-04: three of the eight rows this section was written for — `SUBA-082`, `SUBA-084`,
+> `SUBA-086` — were held to the confirmed bar, confirmed, ported and CLOSED; each now has a full
+> section in the confirmed set above (in id order) and only a pointer remains here. The five below are
+> unchanged and still carried at this section's lower standard.**
 
 > **READ THIS BEFORE ACTING ON ANYTHING IN THIS SECTION.** The refutation pass for this batch was
 > capped at twelve items. The eight items below were produced by the same analyst lenses as the
@@ -1012,95 +1407,11 @@ the first schedulable filing of the behaviour and is not a duplicate of a counte
 > reproduced as filed, and a maintainer must settle each with `git show v0.57.0:<path>` before
 > scheduling the item. Where a filing asserts an upstream shape, treat it as a hypothesis.
 
-### SUBA-082 — Agent `acceptanceRole:` and `acceptance:` frontmatter are not in the schema, so the acceptance classifier is driven purely by the agent-name regex
+### ~~SUBA-082~~ — **PROMOTED AND CLOSED 2026-09-04** — see `## ~~SUBA-082~~` in the confirmed set above (landing commit `5a4ae4ed`)
 
-**Severity** high (as filed) · **Effort** M · **Window** in-baseline (≤ v0.43.0) · `3c635cc1`
+### ~~SUBA-084~~ — **PROMOTED AND CLOSED 2026-09-04** — see `## ~~SUBA-084~~` in the confirmed set above (landing commit `dee8b9d0`)
 
-*Upstream, as filed (unverified):* `agents.ts:144-145` puts `defaultAcceptance?: AcceptanceInput` and
-`acceptanceRole?: AcceptanceRole` on `AgentConfig`; `:1873-1884` `parseAgentAcceptanceFrontmatter`
-YAML-parses `frontmatter.acceptance` and validates it; `:2011-2015` parses `acceptanceRole`, throwing
-``Agent '<name>' has invalid acceptanceRole frontmatter; expected 'read-only' or 'writer'.``;
-`agent-serializer.ts:24-25` lists both in `KNOWN_FIELDS`. The role is the PRIMARY input to the
-acceptance-level classifier, which falls back to name matching only when it is `undefined`:
-`input.acceptanceRole === "read-only" || (input.acceptanceRole === undefined && /\b(?:reviewer|oracle|scout|researcher|analyst)\b/.test(agent))`.
-
-*Port (re-verified at HEAD):* `grep -rn 'acceptance_role' --include=*.rs crates/cyrup-ext-subagents/src`
-→ **0 hits**. `src/discovery/frontmatter.rs:72-116 KNOWN_FIELDS` contains neither `acceptance` nor
-`acceptanceRole`, so both are demoted to `extra_fields`. `AcceptanceResolveInput`
-(`src/exec/acceptance/model/level.rs:43-51`) has `explicit`, `agent_name`, `task`, `mode`, `is_async`,
-`dynamic`, `dynamic_group` — no role. The only `acceptanceRole` mentions in the crate are comments in
-`level.rs` and `src/tests/read_only_agent_name_alternation.rs`, each quoting upstream's
-`acceptanceRole === undefined` branch and noting the port implements only that branch.
-
-*Behaviour gap:* an agent named `security-reviewer` that declares `acceptanceRole: writer` is still
-gated read-only, and a writer-named agent declaring `read-only` is gated as a writer — a silently
-wrong acceptance level with no error telling the author the key did nothing. Agent-level `acceptance:`
-policy defaults are likewise unreachable; only the per-call `explicit` input exists.
-
-*Relation:* distinct from `SUBA-081`'s settings-override half (`agentOverrides.<n>.acceptanceRole`) —
-this is the frontmatter half, in a different parser. Land them together.
-
-### SUBA-084 — Runtime agent registration is entirely absent: no `registerAgent` API, no `runtime` source tier, no runtime/configured collision checks
-
-**Severity** high (as filed) · **Effort** L · **Window** v0.47.1..v0.57.0 · `2c031d06 (#1320)`
-
-*Upstream, as filed (unverified):* `src/agents/runtime-agent-registry.ts` (418 lines) — the registry
-key `"pi-subagents.runtime-agents.v1"`, per-runtime caps (200 agents, 128-char name, 4 KiB
-description, 1 MiB systemPrompt, 8 KiB per field), a 32-field `RuntimeAgentDefinition`, a per-field
-validator, alias normalization plus `assertNoIdentityCollisions` / `assertNoRuntimeCollision` /
-`assertNoBuiltinCollision`, `toAgentConfig` stamping `source: "runtime"` and
-`filePath: "runtime:<name>"`, `registerRuntimeAgent` returning an idempotent `dispose()`, and
-`mergeRuntimeAgents`. It is a PUBLIC API re-exported by `src/api/agents.ts` as `registerAgent(input)`
-and wired end to end: merged into every discovery, cleared on dispose, merged by the slash commands
-so a runtime agent is slash-invocable, merged into `{action:"list"}`, and given its own precedence
-rank above `project` in `agents.ts`.
-
-*Port (re-verified at HEAD):*
-`grep -rnE 'runtime_agent|RuntimeAgent|register_agent' --include=*.rs crates/cyrup-ext-subagents/src`
-→ **0 hits**. `src/discovery/types.rs:43-51` defines `pub enum AgentSource { Builtin, Package, User, Project }`
-— four variants, no `Runtime` — and `precedence_rank` at `:53-66` covers exactly those four.
-`src/discovery/merge.rs:104-124 merge_tiers` takes a
-`TieredAgents { builtin, package, user, project }` with no fifth tier and no in-memory registry input.
-
-*Behaviour gap:* nothing an embedder registers in-process can ever be delegated to; an agent can only
-exist as a file on disk.
-
-*Relation:* **NOT** the same as `SUBA-022` (typed extension delegation API — upstream's
-`executeDelegated`, a way to RUN a subagent, not to DEFINE one). Two lenses filed it independently;
-merged here.
-
-### SUBA-086 — Per-agent parse diagnostics are absent: a malformed agent file is silently degraded to defaults instead of being reported by name and blocking its own agent name
-
-**Severity** high (as filed) · **Effort** M · **Window** v0.47.1..v0.57.0 · `e973fa3c`
-
-*Upstream, as filed (unverified):* `agents.ts:229-234` `AgentDiscoveryDiagnostic { source, filePath,
-error, name?, runtimeName?, packageSpecified?, discoveryPriority? }`; `:1923-2110` wraps the whole
-per-file parse in `try { … } catch` and `:2106` pushes a diagnostic naming the file, the agent name
-and the exact throw message — so *every* validation throw in the parse body (invalid `package`,
-`async`, `timeoutMs`, `toolTimeoutMs`, `turnBudget`, `acceptance`, `outputMode`, `acceptanceRole`,
-`fast`, `toolBudget`, both-permission-spellings, runner profile) becomes a SURFACED diagnostic rather
-than a silent skip; `:2267-2273` returns them as `agentDiagnostics`; `:244-264`
-`agentDefinitionPriority` + `findBlockingAgentDiagnostic` make a broken definition BLOCK resolution of
-that name with its parse error instead of falling through to "Unknown agent";
-`agent-management.ts:760-764` renders them under `Invalid agent definitions:` in `{action:"list"}`.
-
-*Port (re-verified at HEAD):*
-`grep -rnE 'AgentDiscoveryDiagnostic|agent_diagnostic' --include=*.rs crates/cyrup-ext-subagents/src`
-→ **0 hits**. `src/discovery/mod.rs:1174-1191 AgentDiscoveryResult` carries
-`diagnostics: Vec<ChainDiscoveryDiagnostic>` — **chain** diagnostics only. The port states the design
-in-tree at `src/discovery/frontmatter.rs:753-757`: *"Never returns an `Err` for a malformed individual
-agent file"* — `parse_agent_file` returns `Option<AgentDefinition>` and every field parser degrades a
-bad value to `None`. `src/discovery/management/handlers.rs:109-113,142-150` filters and renders only
-`ChainDiscoveryDiagnostic`; there is no `Invalid agent definitions:` section anywhere.
-
-*Behaviour gap:* a typo (`timeoutMs: 30s`, `outputMode: file`, `defaultContext: forked`) is reported
-upstream by name and file and blocks delegation to that name; in the port the bad field is silently
-coerced to absent, the agent loads with default behaviour, and neither `list` nor the delegation path
-ever mentions the file.
-
-*Relation:* new. **Note for the planner: this is the highest-leverage item in the discovery cluster**,
-because it converts `SUBA-081`, `SUBA-082` and every "key demoted to `extra_fields`" row in this batch
-from silence into user-visible errors.
+### ~~SUBA-086~~ — **PROMOTED AND CLOSED 2026-09-04** — see `## ~~SUBA-086~~` in the confirmed set above (landing commit `275c1f85`)
 
 ### SUBA-087 — Child-scoped stop (`childId`) is unported: `stop` can only terminate an entire async run and its whole descendant subtree
 
@@ -1284,7 +1595,55 @@ missing sanitization. The fix is one call-site change reusing `status.rs:389`'s 
 
 ---
 
-## SUBA-092 — Agent `excludeTools:`/`allowNestedSubagents:` (frontmatter and settings-override) are unported: a declared tool exclusion has no effect, and nested-subagent authorization can only ever come from an explicit `tools:` allowlist
+## ~~SUBA-092~~ — ~~high~~ **CLOSED 2026-09-04** — Agent `excludeTools:`/`allowNestedSubagents:` (frontmatter and settings-override) are unported: a declared tool exclusion has no effect, and nested-subagent authorization can only ever come from an explicit `tools:` allowlist
+
+> **CLOSED 2026-09-04, landing commit `247ff97b`, re-read at cyrup code HEAD `275c1f85`.** Ported at
+> v0.64.0 per ADR-0006: the consumer `runs/shared/pi-args.ts` is byte-identical between v0.62.0 and
+> v0.64.0 for the tool-plan/exclusion logic (`git -C tmp/pi-subagents diff v0.62.0 v0.64.0 -- src/runs/shared/pi-args.ts`
+> touches only task-delivery/watchdog lines); `b26da18e` (#1778) is the introducing commit. **What
+> landed**: `discovery/types.rs:997 AgentDefinition::exclude_tools: Option<Vec<String>>` and `:1005
+> allow_nested_subagents: Option<bool>` (`agents.ts:140-141`); `AgentOverrideConfig::exclude_tools:
+> OverrideField<Vec<String>>` / `allow_nested_subagents: OverrideField<bool>` (`:687`, `:693`, in
+> `is_empty` at `:742-743`; `false` → `ExplicitClear`, pinned by
+> `parse_subagent_settings_reads_the_suba092_false_shapes`) (`agents.ts:104-105`, `:1097-1102`,
+> `parseOverrideStringArrayOrFalse` `:921-940`); `discovery/frontmatter.rs:95-96` both keys in
+> `KNOWN_FIELDS` (`agent-serializer.ts:12-13`), `:956` `excludeTools` via `parse_frontmatter_list`
+> (`agents.ts:1988`, `frontmatter.ts:46-57`), `:1166` `allowNestedSubagents` strict `true`/`false` with
+> the crate's per-file skip+warn (`agents.ts:2061-2066`); `frontmatter_write.rs:92-110` serializer arms
+> (`agent-serializer.ts:74-78`); `merge.rs:463-471` builtin arm full-replace (`agents.ts:1404-1405`
+> @v0.64.0: `false` → delete) and `:757-771` custom arm fill-unset gated on frontmatter presence
+> (`agents.ts:1547-1552` @v0.62.0 — see residual 1); `exec/agent_config.rs:54,58` on `AgentConfig`
+> and `:193,197` on `ResolvedAgentPersona` so chain/parallel/background dispatch carries them
+> (`async-execution.ts:948-949,1011-1012,1741-1742`); `exec/spawn_plan.rs::resolve_child_tools`
+> `:698-712` trims, dedups and subtracts `exclude_tools` from the ceiling-filtered declared builtins
+> (`pi-args.ts:502-504` `effectiveDeclaredBuiltinTools`), `:743-750` `fanout_authorized =
+> effective.includes(subagent) || (allow_nested_subagents == Some(true) && !excluded(subagent) &&
+> ceiling.is_none_or(has subagent))` (`:505-509`), `:804` MCP-name exclusion (`:478`), the filtered
+> list also feeding `--tools`/`--no-tools` and `REQUIRED_CHILD_TOOLS` (`:550,565`), and `:827-834`
+> `--exclude-tools <csv>` on the no-allowlist arm (`:776-777`) — consumed by cyrup's own CLI flag
+> `crates/cyrup/src/cli/args.rs:106` → `cyrup-session-svc/src/builder.rs::select_active_tools`.
+> **Verify, each clause a passing test** (`exec/spawn_plan.rs`):
+> `exclude_tools_on_an_agent_with_no_allowlist_reaches_the_child_as_exclude_tools` (no `tools:` +
+> `excludeTools:[bash]` → `--exclude-tools bash`, no `--tools`); `exclude_tools_subtracts_from_an_explicit_allowlist`
+> (`tools:[bash,edit]` + `excludeTools:[bash]` → `--tools edit`; excluding all → `--no-tools`);
+> `allow_nested_subagents_grants_fanout_without_an_explicit_tools_allowlist` (unset/false → fanout env
+> 0, true → 1 and `RegistrationMode::ChildSafe`); `excluding_the_subagent_tool_revokes_fanout_from_both_the_allowlist_and_the_nested_grant`;
+> `allow_nested_subagents_is_vetoed_by_a_ceiling_that_omits_the_subagent_tool` (`:508`); plus the
+> parse/serialize/override-merge tests in `frontmatter.rs`, `frontmatter_write.rs`, `merge.rs`,
+> `discovery/mod.rs`, `agent_config.rs` — 16 in all, each naming a field absent at `a4805955`; crate
+> 2613/2613 at `247ff97b`. **Residuals — recorded, not closed.** (1) **Custom-agent override
+> precedence at v0.64.0**: `31562d76` (#1798, first tag v0.63.0) made `applyCustomAgentOverride`
+> delegate to `applyBuiltinOverride` for EVERY key; cyrup's `apply_custom_override` still implements
+> v0.62.0's fill-unset (R-SA-010) for all 20 fields, these two included, for consistency — a
+> cross-field change, ownerless lead in the summary blockquote. (2) Management surface not ported:
+> `agentUpdate`'s `config.excludeTools` (`agent-management.ts:487-497`), the `excludes:` suffix in
+> list (`:738`), `Excluded tools:` in show (`:885`); update/rename preserve an author's values. (3)
+> `AgentDefinition::is_nested_fanout_eligible` (test-only consumers) does not consult the new fields.
+> (4) pi's `internalTools` exclusion (`pi-args.ts:517`) has no counterpart by the existing
+> `[CYRUP-DELTA]` on structured output. (5) The direct-MCP exclusion arm (`spawn_plan.rs:804`) is
+> untested in isolation. (6) Runtime-registry threading of the two fields landed with `SUBA-084`.
+> Also: the `crates/cyrup-it` `intercom` fixture was pre-broken by these two new fields and was
+> repaired inside `SUBA-082`'s commit (`5a4ae4ed`).
 
 **Kind** not-ported · **Severity** high · **Effort** M · **Confidence** confirmed
 **Subsystem** discovery / agent definition schema (new since this file's own v0.57.0 scope)
@@ -1557,6 +1916,8 @@ the twenty items above through that partition:
    permanently unreachable", and both are small relative to what they unlock.
 2. **The agent-definition schema's missing keys** — `SUBA-074`, `SUBA-081`, `SUBA-082`, `SUBA-088`,
    with `SUBA-086` as the amplifier that converts all of them from silence into user-visible errors.
-   **Land `SUBA-086` first.**
+   **Land `SUBA-086` first.** *(2026-09-04: `SUBA-086` landed at `275c1f85` and `SUBA-082` at
+   `5a4ae4ed`; `SUBA-081`'s four remaining fields, `SUBA-074` stage 2 and carried `SUBA-088` are
+   what is left of this partition.)*
 3. **The external-runner / `workflowScript` execution model** — `SUBA-074` stage 2, `VL-S2` and its
    dependents. This is the genuinely large remainder and the only part that needs design.

@@ -165,13 +165,13 @@ a deletion — `SEAM-035`…`SEAM-046` never existed, and area 08 records the ch
 
 | repo | HEAD | cyrup ported baseline | latest tag | delta |
 |---|---|---|---|---|
-| `cyrup/` | **`2571969`** — last full re-audit, branch `claude/gap-analysis-refresh` (off `main`). **Re-measure before trusting any status: the port moves faster than this directory does.** | — | — | 21 crates, ~714k lines of Rust under `crates/` (`find crates -name '*.rs' \| xargs wc -l \| tail -1` = 714 265; `for d in crates/*/; do [ -f "$d/Cargo.toml" ] && echo "$d"; done \| wc -l` = 21) |
+| `cyrup/` | **`275c1f85`** — last CODE commit as of the 2026-09-04 second pass (`feat(subagents): SUBA-086 …`, branch `claude/beautiful-feynman-odz1v5`, five commits off `main` = `a4805955`, which merged the `2571969` full re-audit). *The docs commit that wrote this row cannot cite its own sha; the code sha is the one a status is measured against.* **Re-measure before trusting any status: the port moves faster than this directory does.** | — | — | 21 crates, ~714k lines of Rust under `crates/` (`find crates -name '*.rs' \| xargs wc -l \| tail -1` = 714 265; `for d in crates/*/; do [ -f "$d/Cargo.toml" ] && echo "$d"; done \| wc -l` = 21) |
 | `pi/` | `6aedd1066` = `v0.84.3-453-g6aedd1066` | **v0.83.0** | **v0.84.4** | 775 files, +68 885 / −20 827 |
 | `pi-subagents/` | `a5f401e8` | **≈v0.43.0** (inferred — the crate records no version string) | **v0.64.0** | 485 files, +92 664 / −18 069 |
 | `pi-permission-system/` | `9affcc9` — **re-checked this pass, unchanged from the prior record** | **v0.7.1** | **v0.8.0** — **re-checked this pass, unchanged from the prior record** | 28 files, +4 023 / −1 851 (re-measured identical to the prior record) |
 | `pi-intercom/` | `199279a` | **v0.9.2** — *not v0.7.0; every prior doc had this wrong* | **v0.13.0** | true window `v0.9.2..v0.13.0` = 26 files, +4 701 / −976 |
 | `code_puppy_core_plugins/` | `8c6f852` | **v0.0.6** — *not recorded anywhere in `crates/cyrup-flux`; see `FLUX-007`* | **v0.0.40** | 139 files, +11 071 / −3 822 across the whole repo — but the ported surface is unchanged: `git diff --stat v0.0.6..v0.0.40 -- code_puppy_core_plugins/flux_bootstrap/ tests/test_flux_bootstrap.py` is empty, byte-identical across all 34 intervening tags. Ported surface is `flux_bootstrap/` — 18 bundled commands, 4 `_docs` files, 3 renderer scripts. cyrup ships 15 templates + 3 native renderers = the same 18 |
-| `pi-mcp-adapter/` | `14c0e6c` = `v2.25.0-4-g14c0e6c` | **not ported** — area 13 is the plan | **v2.25.0** | 203 paths / 164 `.ts` at the tag, ~24 200 lines; drift to HEAD is 17 files, +543 / −69 |
+| `pi-mcp-adapter/` | `6ba7d36` = `v2.32.1-3-g6ba7d36` — **clone re-pulled 2026-09-04; area 13 NOT re-audited against it** (the MCP team owns area 13; its files were not opened this pass). *Superseded: `14c0e6c` = `v2.25.0-4-g14c0e6c`.* | **not ported** — area 13 is the plan | **v2.32.1** *(was v2.25.0; the `v2.25.0..v2.32.1` window is unmeasured here)* | 203 paths / 164 `.ts` at the tag, ~24 200 lines; drift to HEAD is 17 files, +543 / −69 |
 
 **Read upstream with `git -C <repo> show <tag>:<path>`, never from a working tree.** Clone-HEAD line
 numbers and file existence both mislead; items have named files that never existed at any tag.
@@ -440,6 +440,24 @@ half:
   Both are opt-in via `SelectorKind::draws_hint_row()` / `insets_rows()`, whose doc comments carry
   the per-component evidence. **Generalising a per-caller behaviour onto a shared widget is a
   divergence, not a port.**
+
+**Live-use rows closed by measurement on 2026-09-04 — refute the transcript in `REPRO-LOG.md` §0e
+before re-filing any of these:**
+
+- **"cyrup never reads `defaultProvider`/`defaultModel` back — rank 4's input is permanently
+  empty"** (`SEAM-113`). Wrong at HEAD: `resolve_default_launch_model`
+  (`crates/cyrup/src/bootstrap.rs:247-275`) reads both keys at `:269-270` into
+  `default_launch_model` → `find_initial_model`; seeding the pair into
+  `<CYRUP_HOME>/.cyrup/agent/settings.json` changes what a fresh launch resolves. What is true is
+  that only the picker's Ctrl+S writes them — which is pi v0.84.4's contract, not a gap.
+- **"pi has a typed `--default` flag on `/model` and `/thinking` that cyrup lacks."** It lived one
+  day on pi `main` (added 2026-08-19, deleted by `5133c9284` on 2026-08-20, both inside the v0.84.3
+  window) and shipped in no tag; `git -C tmp/pi grep parseDefaultFlagArgs v0.84.4` is empty and the
+  v0.84.4 hints are `<provider/model>` / `<level>`, byte-identical to `crates/cyrup-tui/src/commands.rs:147,165`.
+- **"Reasoning blocks never render"** (`TUI-091`). At HEAD `a4805955`, in a real pty, they render
+  live and committed in seven variants including the reporter's exact launch; the report predates
+  `TUI-090`'s fix by three hours and its commit body names the mechanism. Reopen only on a new live
+  observation in a real terminal — never on `TestBackend`.
 
 **Verified-matching pairs — do not re-derive:**
 

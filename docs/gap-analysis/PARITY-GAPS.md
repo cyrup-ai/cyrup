@@ -1,5 +1,13 @@
 # PARITY-GAPS
 
+> **SECOND REFRESH 2026-09-04, cyrup code HEAD `275c1f85`** (branch `claude/beautiful-feynman-odz1v5`,
+> five code commits off `main` = `a4805955`). **Seven of the eight above-medium rows below closed the
+> same day** — five `09a` rows on landed, both-sides-read code (`SUBA-085`, `SUBA-092`, `SUBA-082`,
+> `SUBA-084`, `SUBA-086`) and the two live-use rows on live runs (`TUI-091` a duplicate of `TUI-090`,
+> observed in a real pty; `SEAM-113` refuted as stale under ADR-0006, observed headless). §0's ninth
+> edition and §0a's seventh edition are the current census: **125 open = 0/1/49/75, one row above
+> medium (`SUBA-074` stage 2)**. The blockquote below it is the sixth edition's, kept as written.
+>
 > **CENSUS REFRESH 2026-09-04, cyrup HEAD `2571969`.** Every area file (01–12, excluding area 13
 > which the MCP team owns, plus the `09a` v0.57-drift supplement and `14-cyrup-flux.md`) was
 > independently re-audited this pass against cyrup HEAD `2571969` (baseline `4fb5e40`, 210 commits)
@@ -59,7 +67,7 @@ difference costs behaviour, the entry says so and stays on the list as work.**
 
 | | |
 |---|---|
-| cyrup HEAD | **`2571969`** — measured 2026-09-04, branch `claude/gap-analysis-refresh` (off `main`), 210 commits ahead of the `4fb5e40` baseline this pass re-audited against. *Superseded: `e5c6933` at the third edition (2026-08-14, docs `0097149`); `04c1ba2` (docs `a9000b1`) when this file was first regenerated; `bdcb0d0` at the second edition. See `README.md`'s "Baselines measured against" table for the same figures kept current across passes.* |
+| cyrup HEAD | **`275c1f85`** — last CODE commit, 2026-09-04 (second pass), branch `claude/beautiful-feynman-odz1v5`, five commits off `main` = `a4805955`, which merged the `2571969` re-audit. *Superseded: `2571969` — measured 2026-09-04, branch `claude/gap-analysis-refresh` (off `main`), 210 commits ahead of the `4fb5e40` baseline that pass re-audited against; `e5c6933` at the third edition (2026-08-14, docs `0097149`); `04c1ba2` (docs `a9000b1`) when this file was first regenerated; `bdcb0d0` at the second edition. See `README.md`'s "Baselines measured against" table for the same figures kept current across passes.* |
 | `pi` | ported baseline **v0.83.0** → latest **v0.84.4** (HEAD `6aedd1066`) · delta v0.83.0..v0.84.4 = 775 files, +68 885 / −20 827 |
 | `pi-subagents` | ported baseline **≈v0.43.0** (inferred — the crate records no version string) → latest **v0.64.0** (HEAD `a5f401e8`) · delta v0.43.0..v0.64.0 = 485 files, +92 664 / −18 069 |
 | `pi-permission-system` | ported baseline **v0.7.1** → latest **v0.8.0** (HEAD `9affcc9`) · delta 28 files, +4 023 / −1 851 — **re-checked 2026-09-04, unchanged from every prior edition's figure** |
@@ -73,6 +81,61 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 ---
 
 ## 0. Census — every open item in the fourteen area files, by class
+
+> **NINTH EDITION 2026-09-04 (second pass), cyrup code HEAD `275c1f85` — the eighth edition's
+> script, re-run after seven closures.** `python3 scripts/count_open_items.py` from
+> `docs/gap-analysis/`, over the fourteen files' current `## Open items` tables (and `09a`'s
+> `## Summary — confirmed items` table plus its now five-row carried list), reproduced verbatim
+> below; the two hand-counted trackers outside any table are carried as before. **What moved since
+> the eighth edition, and nothing else did:** `09a` 11 → 6 open (five closures: `SUBA-085`,
+> `SUBA-092`, `SUBA-082`, `SUBA-084`, `SUBA-086` — the last three promoted out of `## Carried` and
+> closed, and the script's hand-enumerated `carried_high` list emptied in the same commit so they
+> count once); `07` 36 → 35 (`TUI-091`, duplicate of `TUI-090`, live pty); `08` 8 → 7 (`SEAM-113`,
+> refuted as stale under ADR-0006, live headless). No new row was filed; six residual leads are
+> recorded ownerless in `00-residual-ledger.md`'s seventh edition. The "closed this pass / new this
+> pass" columns the eighth edition added by hand are dropped here — the script does not produce
+> them, and the delta is fully stated in this paragraph.
+>
+> **Open set: 125 work items — 0 critical, 1 high, 49 medium, 75 low**, of which 122 sort into the
+> six Kind-derived classes and 3 do not (`EXT-058`, `PERM-032`, `ICOM-053`, unchanged).
+>
+> | area | open | crit | high | med | low | trackers | closed |
+> |---|---:|---:|---:|---:|---:|---:|---:|
+> | [01 core + provider](01-cyrup-core-and-provider.md) | 4 | 0 | 0 | 2 | 2 | 0 | 56 |
+> | [02 agent](02-cyrup-agent.md) | 3 | 0 | 0 | 0 | 3 | 1 | 28 |
+> | [03 session](03-cyrup-session.md) | 4 | 0 | 0 | 1 | 3 | 1 | 31 |
+> | [04 tools](04-cyrup-tools.md) | 3 | 0 | 0 | 2 | 1 | 0 | 31 |
+> | [05 config + resources](05-cyrup-config-and-resources.md) | 14 | 0 | 0 | 4 | 10 | 0 | 52 |
+> | [06 ext host](06-cyrup-ext.md) | 15 | 0 | 0 | 6 | 9 | 0 | 57 |
+> | [07 tui](07-cyrup-tui.md) | 35 | 0 | 0 | 8 | 27 | 0 | 69 |
+> | [08 session-svc + modes](08-cyrup-session-svc-and-modes.md) | 7 | 0 | 0 | 4 | 3 | 0† | 67 |
+> | [09 subagents](09-cyrup-ext-subagents.md) | 12 | 0 | 0 | 4 | 8 | 0† | 39 |
+> | [09a v0.57 drift](09a-cyrup-ext-subagents-v0.57-drift.md) | 6 | 0 | 1 | 5 | 0 | 0 | 14 |
+> | [10 permission system](10-cyrup-permission-system.md) | 1 | 0 | 0 | 0 | 1 | 1 | 22 |
+> | [11 intercom](11-cyrup-intercom.md) | 7 | 0 | 0 | 4 | 3 | 0 | 47 |
+> | [12 pi core drift](12-upstream-drift-pi-core.md) | 7 | 0 | 0 | 5 | 2 | 3 | 26 |
+> | [14 flux](14-cyrup-flux.md) | 7 | 0 | 0 | 4 | 3 | 0 | 0 |
+> | **total** | **125** | **0** | **1** | **49** | **75** | **6 + 2‡** | **539** |
+>
+> † `SEAM-058` and `SUBA-005` sit outside their files' `## Open items` tables (standalone
+> `## Trackers` sections) and print as 0 here; ‡ they are the "+ 2" hand-counted in the total, as
+> the eighth edition explains.
+>
+> | class | n |
+> |---|---:|
+> | **Port bug** (`not-ported` + `parity-bug` + `port-divergence`) | **69** |
+> | **Version lag** (`upstream-drift`; all 6 open `09a` rows count here) | **27** |
+> | **Reverse lag** (`stale-port`) | **2** |
+> | **Test defect** (`test-defect`) | **5** |
+> | **Invented surface** (`cyrup-original`) | **18** |
+> | **Tooling** (`tooling`) | **1** |
+> | *(unclassified — `EXT-058`, `PERM-032`, `ICOM-053`, as before)* | 3 |
+> | | **125** |
+>
+> **Above-medium open rows (1):** `09a` **`SUBA-074`** high (`upstream-drift`) — stage 2, the
+> external-runner adapter protocol.
+>
+> Every block below this one is superseded.
 
 > **EIGHTH EDITION 2026-09-04, cyrup HEAD `2571969` — RECOUNTED IN FULL, MECHANICALLY, FOR THE FIRST
 > TIME.** Every block below this one is superseded. What changed and why it is more trustworthy than
@@ -378,6 +441,32 @@ Where the re-audit moved an item to a different class, the id moves section and 
 ---
 
 ## 0a. Everything above medium, in one table
+
+> **SEVENTH EDITION 2026-09-04 (second pass), cyrup code HEAD `275c1f85`. ONE ROW.** Seven of the
+> sixth edition's eight rows closed the same day, each dispositioned in its area file on the evidence
+> `README.md` requires — not on a commit subject:
+>
+> | id | area | disposition |
+> |---|---|---|
+> | ~~`TUI-091`~~ | 07 | **CLOSED 2026-09-04 — duplicate of `TUI-090`.** Observed in a real pty (tmux 3.4, 120×40, HEAD `a4805955`): the reasoning block rendered live and committed above the answer in seven variants including the owner's exact `together`/Kimi-K3/`high` path. `TUI-091` was filed 16:26 on 2026-08-15; `TUI-090` was fixed 19:50 the same day with a body naming this asymmetry. `REPRO-LOG.md` §0e. |
+> | ~~`SEAM-113`~~ | 08 | **CLOSED 2026-09-04 — REFUTED as an open bug, stale under ADR-0006.** Contract settled against v0.83.0; at the target v0.84.4 the contract is opt-in Ctrl+S persist and cyrup matches it path for path. The "rank 4 input permanently empty" claim is false (`crates/cyrup/src/bootstrap.rs:247-275`; read-back proven by seeding in a headless run). The `--default` flag never shipped in a tag (`5133c9284`). `set_thinking_level` dispositioned alongside. |
+> | ~~`SUBA-085`~~ | 09a | **CLOSED 2026-09-04** at `5e3aa1c8` — `mission.resolve-decision` ported with upstream's status gate; the goal driver moves past a resolved decision (pinned). |
+> | ~~`SUBA-092`~~ | 09a | **CLOSED 2026-09-04** at `247ff97b` — `excludeTools:`/`allowNestedSubagents:` ported end to end (frontmatter, override, serializer, spawn-plan subtraction, nested-fanout grant). |
+> | ~~`SUBA-082`~~ | 09a | **PROMOTED from `## Carried` (upstream re-read at v0.57.0 and v0.64.0, confirmed as filed), then CLOSED 2026-09-04** at `5a4ae4ed`. |
+> | ~~`SUBA-084`~~ | 09a | **PROMOTED, confirmed (effort L → M), then CLOSED 2026-09-04** at `dee8b9d0`. |
+> | ~~`SUBA-086`~~ | 09a | **PROMOTED, confirmed with three corrections to the filed text, then CLOSED 2026-09-04** at `275c1f85`. |
+>
+> **The above-medium set is now:**
+>
+> | id | area | sev | one line |
+> |---|---|---|---|
+> | `SUBA-074` | 09a | high | Agent `runner:` frontmatter — stage 1 (the refusal path) closed 2026-09-04; **stage 2, the external-runner adapter protocol itself, is the open residual under this id.** Effort L, needs design. Unchanged this edition. |
+>
+> Six residual leads the closures produced (v0.63.0 `inferLevel` and custom-override drift, the
+> v0.64.0 runtime-agent event bridge, five refused `RuntimeAgentDefinition` fields, two cosmetic TUI
+> observations, the workspace's rustfmt state) are recorded ownerless in `00-residual-ledger.md`'s
+> seventh edition and in `09a`'s second 2026-09-04 summary blockquote; none is a row yet. Every
+> block below this one is superseded.
 
 > **SIXTH EDITION 2026-09-04, cyrup HEAD `2571969`. EIGHT ROWS, ZERO CRITICAL — the first time this
 > table has ever been empty of criticals.** Read this block before planning; every row below it,
