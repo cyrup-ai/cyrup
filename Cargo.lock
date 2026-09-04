@@ -1421,8 +1421,11 @@ dependencies = [
  "async-trait",
  "cyrup-core",
  "cyrup-ext",
+ "fs4",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
 ]
 

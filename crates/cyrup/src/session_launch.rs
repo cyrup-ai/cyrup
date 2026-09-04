@@ -86,7 +86,9 @@ use crate::timings;
 /// 7. **Flux** (spec/flux.md §3.4.5): the pipeline's bundled prompt templates + the three native
 ///    renderers. Attached unconditionally at the top level — unlike the three above there is no
 ///    install gate, because the whole point of moving flux into the binary is that it works with
-///    no install step. `flux_extension_for_env` still returns `None` inside a subagent CHILD: a
+///    no install step — the templates are EMBEDDED and materialised under `<agent_dir>/flux/`
+///    on `ResourcesDiscover` (FLUX-001), which is why it takes `agent_dir` like the two above.
+///    `flux_extension_for_env` still returns `None` inside a subagent CHILD: a
 ///    child re-execs this binary in Print/Json mode, and contributing 15 templates plus a skill to
 ///    every child would put the skill into every child's system prompt for a pipeline the child is
 ///    not running.
@@ -133,7 +135,7 @@ fn attach_native_extensions(
     {
         builder = builder.with_native_extension(ext);
     }
-    if let Some(ext) = cyrup_flux::flux_extension_for_env() {
+    if let Some(ext) = cyrup_flux::flux_extension_for_env(agent_dir) {
         builder = builder.with_native_extension(ext);
     }
     Ok(builder)

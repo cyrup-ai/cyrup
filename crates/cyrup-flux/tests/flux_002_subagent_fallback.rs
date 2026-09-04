@@ -14,16 +14,14 @@
 //! sequential single-task path (which `exec`/`aug`/`qa` already document for `1`/`all`) with one
 //! user-visible notice when it is absent.
 //!
-//! These tests pin that contract over the SHIPPED files, read through the same resolver the
-//! extension contributes to `ResourcesDiscover`, so a template regression fails here rather than
-//! mid-pipeline on a default install. They were red against the pre-fix templates (no fallback
-//! sentence anywhere under `resources/prompts/flux/`).
+//! These tests pin that contract over the SHIPPED files, read from the embedded bundle the
+//! extension materialises and contributes to `ResourcesDiscover` (FLUX-001: `build.rs` embeds
+//! `resources/**`, so the bytes read here are the bytes every install serves), so a template
+//! regression fails here rather than mid-pipeline on a default install. They were red against the
+//! pre-fix templates (no fallback sentence anywhere under `resources/prompts/flux/`).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::fs;
-use std::path::PathBuf;
-
-use cyrup_flux::resources::bundled_prompts_dir;
+use cyrup_flux::bundle::bundled_file;
 
 /// The exact rename-map census from `spec/flux.md` §0.3 (`invoke_agent` → `subagent`,
 /// "4 — aug, exec, qa, review"), matching upstream v0.0.40's four `invoke_agent` sites.
@@ -37,16 +35,17 @@ const FALLBACK_TRIGGER: &str = "If the `subagent` tool is NOT in your tool list"
 /// sequential path — `review` has no `$ARGUMENTS` dispatch block and degrades in STEP 6 instead.
 const DISPATCHING_TEMPLATES: [&str; 3] = ["aug", "exec", "qa"];
 
+fn embedded(rel: &str) -> String {
+    let bytes = bundled_file(rel).unwrap_or_else(|| panic!("{rel} is not in the embedded bundle"));
+    String::from_utf8(bytes.to_vec()).unwrap_or_else(|e| panic!("{rel} is not UTF-8: {e}"))
+}
+
 fn template(name: &str) -> String {
-    let path: PathBuf = bundled_prompts_dir()
-        .join("flux")
-        .join(format!("{name}.md"));
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+    embedded(&format!("prompts/flux/{name}.md"))
 }
 
 fn skill_md() -> String {
-    let path = cyrup_flux::resources::bundled_skill_md();
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+    embedded("skills/flux/SKILL.md")
 }
 
 #[test]
@@ -148,21 +147,14 @@ fn review_degrades_in_line_and_covers_its_second_subagent_launch_in_step_7() {
 fn only_the_four_multi_task_templates_name_the_subagent_tool() {
     // Pins the rename-map census: a fifth template growing a `subagent` call would need the same
     // pre-condition and would otherwise reintroduce this defect silently.
-    let dir = bundled_prompts_dir().join("flux");
-    let mut naming: Vec<String> = fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
-        .filter(|e| {
-            fs::read_to_string(e.path())
-                .map(|b| b.contains("`subagent` tool"))
-                .unwrap_or(false)
-        })
-        .filter_map(|e| {
-            e.path()
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-        })
+    // The fifteen `prompts/flux/*.md` templates — one level, so `_docs/` is not counted.
+    let mut naming: Vec<String> = cyrup_flux::bundle::bundled_files()
+        .iter()
+        .filter_map(|f| f.rel.strip_prefix("prompts/flux/"))
+        .filter(|rest| !rest.contains('/') && rest.ends_with(".md"))
+        .filter(|rest| embedded(&format!("prompts/flux/{rest}")).contains("`subagent` tool"))
+        .filter_map(|rest| rest.strip_suffix(".md"))
+        .map(str::to_string)
         .collect();
     naming.sort();
     let mut expected: Vec<String> = MULTI_TASK_TEMPLATES

@@ -639,6 +639,15 @@ impl NativeExtension for FluxExtension {
 [`bundled_resources_dir()`](../crates/cyrup-ext-subagents/src/registration/resources.rs):
 `env!("CARGO_MANIFEST_DIR").join("resources")` behind a `CYRUP_FLUX_RESOURCES_DIR` env override.
 
+> **Superseded by FLUX-001 (`docs/gap-analysis/14-cyrup-flux.md`).** `CARGO_MANIFEST_DIR` is the
+> build machine's source path, so a binary run anywhere else lost every template silently. The
+> tree is now EMBEDDED at build time (`build.rs` → `src/bundle.rs`) and materialised under
+> `<agent_dir>/flux/resources/` by `src/install.rs`, a port of upstream's `installer.py` (the
+> copy/manifest/version-gate/`.bak`/flock the row below said was deleted). `resources.rs` decides
+> `BundledRoot::{Vendored, Managed}` once at construction; `CYRUP_FLUX_RESOURCES_DIR` still names a
+> vendored tree that is read as-is, and a miss on either root is now a `notify` warning naming the
+> path, never a silent `Noop`.
+
 **Bundling = single source of truth.** The 15 templates + `_docs/` + skill live in the crate's
 `resources/` tree and are contributed at `ResourceScope::Discovered` (rank 6 — a floor, never
 an override; a user/project/package `flux/*` template still wins, §0.4).
@@ -855,7 +864,7 @@ Every row's source is under
 | `commands/flux/cheatsheet.md` + `flux_cheatsheet.py` | `/flux/cheatsheet` native command | **cyrup-ext-flux** | §3.4.3 — parses embedded `pipeline.md` |
 | `commands/flux/about.md` + `flux_about.py` | `/flux/about` native command | **cyrup-ext-flux** | §3.4.3 — embeds about body |
 | `commands/flux/_docs/*` | `prompts/flux/_docs/` + `skills/flux/` | content | §3.3 rule 8 |
-| `installer.py` + `register_callbacks.py` | **deleted** | replaced by `cyrup install` (Phase 1) + built-in registration (Phase 2) | no copy/manifest/version-gate |
+| `installer.py` + `register_callbacks.py` | ~~**deleted**~~ `src/install.rs` + `extension.rs::materialise_bundle` (FLUX-001) | ~~replaced by `cyrup install` (Phase 1) + built-in registration (Phase 2)~~ — `cyrup install` is the EXTENSION installer and never vendored this tree; ported after all | copy/manifest/version-gate/`.bak`/flock kept; marker = crate version + bundle sha256; target `<agent_dir>/flux/resources/` not the scanned `prompts/` root; no mode bits; no command-cache rescan |
 | `customizable_commands.py` (dispatch) | **n/a** | cyrup-resources prompt templates already provide it (§0.1) | |
 
 ---

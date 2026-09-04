@@ -23,6 +23,14 @@ focused task doesn't inherit fifteen pipeline commands and a skill for a workflo
 - **A structured `ask_user_question` tool** the pipeline templates use to ask you clarifying
   questions one at a time mid-task, with single- or multi-select options.
 
+The fifteen templates and the skill are compiled into the binary and copied out to
+`<agent dir>/flux/resources/` (by default `~/.cyrup/agent/flux/resources/`) the first time a
+session starts, and again whenever a new cyrup build ships different content. The copy is
+non-destructive: a template you have edited there is kept as `<name>.bak` before the fresh one
+lands, and a file of your own that was there first is never touched. Set `CYRUP_FLUX_RESOURCES_DIR`
+to point at a tree you maintain yourself instead; if either location is missing at startup you
+get a warning naming the path rather than a silent loss of the `/flux/*` commands.
+
 All pipeline state lives under `~/.flux/<flattened-cwd>/`, where `<flattened-cwd>` is your current
 working directory with every run of non-alphanumeric characters collapsed to a single `-`. That
 layout is byte-identical to the upstream tool Flux was ported from, so a project's task tree is

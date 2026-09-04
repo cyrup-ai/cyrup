@@ -14,6 +14,7 @@ include = [
     "src/**/*.rs",
     "resources/**",
     "Cargo.toml",
+    "build.rs",
 ]
 
 [lints]
@@ -31,3 +32,12 @@ serde_json = { workspace = true }
 # FLUX_10's `ask_user_question` hops the blocking `HostServices::select` call off the async
 # executor with `spawn_blocking`.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+# FLUX-001 — the installer port (`flux_bootstrap/installer.py` @v0.0.40) tells "user hand-edited it"
+# from "we wrote it last time" by a manifest of SHA-256 hashes (`:75-80`, `:139-149`), and takes a
+# best-effort exclusive `flock` on `.flux_bootstrap.lock` (`:247-256`). Both crates are already in
+# the lock at these versions (`cyrup-intercom` / `cyrup-config`).
+sha2 = { workspace = true }
+fs4 = "1.1.0"
+
+[dev-dependencies]
+tempfile = { workspace = true }
