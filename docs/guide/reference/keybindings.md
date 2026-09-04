@@ -143,6 +143,7 @@ Individual pickers add keys on top.
 | `Ctrl+S` | Cycle sort: threaded, recent, fuzzy |
 | `Ctrl+N` | Toggle between all sessions and named sessions |
 | `Ctrl+D` | Delete, with an inline confirm — `Enter` confirms, `Esc` cancels |
+| `Ctrl+Backspace` | Same delete confirm, but only while the search box is empty; otherwise the key goes to the search box |
 | `Ctrl+P` | Show or hide the path column |
 | `Ctrl+R` | Rename the highlighted session inline |
 | `Tab` | Toggle between this project and all projects |

@@ -385,6 +385,15 @@ impl SessionSelector {
             .map(|n| n.row)
     }
 
+    /// `startDeleteConfirmationForSelectedSession` (`session-selector.ts:394-403` @v0.84.4): arm
+    /// the delete confirmation for the highlighted row, or do nothing when the list is empty.
+    /// Shared by `app.session.delete` and `app.session.deleteNoninvasive`.
+    fn start_delete_confirmation_for_selected(&mut self) {
+        if let Some(row) = self.current() {
+            self.confirming_delete = Some(row.path);
+        }
+    }
+
     /// The number of currently-visible (filtered) rows (test/inspection).
     pub fn visible_len(&self) -> usize {
         self.filtered().len()
@@ -999,9 +1008,22 @@ impl Selector for SessionSelector {
                 SessionAction::ToggleSort => self.cycle_sort(),
                 SessionAction::ToggleNamedFilter => self.toggle_name_filter(),
                 SessionAction::TogglePath => self.show_path = !self.show_path,
-                SessionAction::Delete => {
-                    if let Some(row) = self.current() {
-                        self.confirming_delete = Some(row.path);
+                SessionAction::Delete => self.start_delete_confirmation_for_selected(),
+                // "Ctrl+Backspace: non-invasive convenience alias for delete. Only triggers
+                // deletion when the query is empty; otherwise it is forwarded to the input"
+                // (`session-selector.ts:590-600` @v0.84.4). Resolved HERE, ahead of the search
+                // `Input` fallthrough in 6), which is modifier-aware and would otherwise report
+                // the chord `Ignored` (TUI-068).
+                SessionAction::DeleteNoninvasive => {
+                    if !self.input.value().is_empty() {
+                        // `this.searchInput.handleInput(keyData); this.filterSessions(...)` —
+                        // whatever the live editor table makes of the chord (nothing, unless the
+                        // user bound it to an editor action), then re-filter from the top.
+                        if self.input.handle_key(key) == InputOutcome::Edited {
+                            self.selected = 0;
+                        }
+                    } else {
+                        self.start_delete_confirmation_for_selected();
                     }
                 }
                 SessionAction::Rename => {
@@ -1383,6 +1405,109 @@ mod tests {
         sel.handle(&key(KeyCode::Esc), &km);
         assert!(!sel.is_confirming_delete());
         assert_eq!(sel.visible_len(), 3);
+    }
+
+    fn ctrl_backspace() -> KeyEvent {
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)
+    }
+
+    /// TUI-068. `app.session.deleteNoninvasive` (`ctrl+backspace`, `core/keybindings.ts:177-180`
+    /// @v0.84.4): with an EMPTY query it is `startDeleteConfirmationForSelectedSession()`
+    /// (`session-selector.ts:599`). Before the port the chord fell through to the search `Input`,
+    /// which ignored it — the confirmation never armed.
+    #[test]
+    fn tui068_ctrl_backspace_with_an_empty_query_arms_the_delete_confirmation() {
+        let mut sel = SessionSelector::new(rows());
+        let km = SelectKeymap::default();
+        let out = sel.handle(&ctrl_backspace(), &km);
+        assert_eq!(out, SelectorOutcome::Redraw);
+        assert!(
+            sel.is_confirming_delete(),
+            "ctrl+backspace on an empty query = ctrl+d"
+        );
+        // And it is the same confirmation flow: Enter deletes the highlighted row.
+        let out = sel.handle(&key(KeyCode::Enter), &km);
+        assert_eq!(
+            match out {
+                SelectorOutcome::Apply(payload) => SessionSelectorOutcome::parse_apply(&payload),
+                other => panic!("expected Apply, got {other:?}"),
+            },
+            Some(SessionSelectorOutcome::Delete("/s/a.jsonl".to_string()))
+        );
+        assert_eq!(sel.visible_len(), 2);
+    }
+
+    /// TUI-068. With a NON-empty query the chord is "forwarded to the input" and the list is
+    /// re-filtered (`session-selector.ts:593-597`) — it never arms a delete. The search `Input`
+    /// has no default binding for `ctrl+backspace`, so the query is left as typed; the selector
+    /// still owns the key (`Redraw`, not the `Ignored` the pre-port fallthrough reported).
+    #[test]
+    fn tui068_ctrl_backspace_with_a_query_forwards_to_the_input_and_keeps_the_list() {
+        let mut sel = SessionSelector::new(rows());
+        let km = SelectKeymap::default();
+        for c in "docs".chars() {
+            sel.handle(&key(KeyCode::Char(c)), &km);
+        }
+        assert_eq!(sel.visible_len(), 1);
+        let out = sel.handle(&ctrl_backspace(), &km);
+        assert_eq!(out, SelectorOutcome::Redraw);
+        assert!(
+            !sel.is_confirming_delete(),
+            "a non-empty query never deletes"
+        );
+        assert_eq!(sel.visible_len(), 1, "the list is alive and still filtered");
+        assert_eq!(sel.current().unwrap().path, "/s/c.jsonl");
+    }
+
+    /// TUI-068. The forward really reaches the live editor table: bind `ctrl+backspace` to
+    /// `tui.editor.deleteWordBackward` and the chord edits the query and re-filters from the top,
+    /// exactly as `this.searchInput.handleInput(keyData); this.filterSessions(...)` would.
+    #[test]
+    fn tui068_ctrl_backspace_with_a_query_honours_an_editor_rebind() {
+        let mut editor = EditorKeymap::default();
+        editor.set_action(
+            EditorAction::DeleteWordBackward,
+            vec![Key::parse("ctrl+backspace").unwrap()],
+        );
+        let mut sel = SessionSelector::new(rows()).with_keymaps(&SessionKeymap::default(), &editor);
+        // The host hands the live editor table to the embedded search input through the
+        // `Selector` trait (`app/selectors.rs:266` does this for every opened selector).
+        sel.set_editor_keymap(&editor);
+        let km = SelectKeymap::default();
+        for c in "docs".chars() {
+            sel.handle(&key(KeyCode::Char(c)), &km);
+        }
+        assert_eq!(sel.visible_len(), 1);
+        sel.handle(&ctrl_backspace(), &km);
+        assert!(!sel.is_confirming_delete());
+        assert_eq!(
+            sel.visible_len(),
+            3,
+            "the word was deleted, so the filter cleared"
+        );
+        // Now the query IS empty, so the same chord arms the confirmation.
+        sel.handle(&ctrl_backspace(), &km);
+        assert!(sel.is_confirming_delete());
+    }
+
+    /// TUI-068. `{"app.session.deleteNoninvasive": "ctrl+k"}` moves the behaviour — the id used
+    /// to be skipped silently by `merge_entries` because `from_id` had no arm for it.
+    #[test]
+    fn tui068_delete_noninvasive_is_rebindable_from_json() {
+        let mut skm = SessionKeymap::default();
+        let issues = skm
+            .merge_json(r#"{"app.session.deleteNoninvasive": "ctrl+k"}"#)
+            .unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+        let mut sel = SessionSelector::new(rows()).with_keymaps(&skm, &EditorKeymap::default());
+        let km = SelectKeymap::default();
+        sel.handle(&ctrl_backspace(), &km);
+        assert!(
+            !sel.is_confirming_delete(),
+            "ctrl+backspace is no longer bound"
+        );
+        sel.handle(&ctrl('k'), &km);
+        assert!(sel.is_confirming_delete(), "ctrl+k is");
     }
 
     #[test]

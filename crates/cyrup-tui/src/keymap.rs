@@ -1174,9 +1174,10 @@ impl ModelsKeymap {
 /// 135-154` `app.session.*`). These bind only inside the session selector, on top of the shared
 /// `tui.select.*` navigation; resolved via [`SessionKeymap`] (R-10-018).
 ///
-/// The header's second hint row names **every one of them** through `keyHint("app.session.…", …)`
-/// (`session-selector.ts:171-179`), so a rebind has to reach the hint text as well as the handler —
-/// which is exactly what a hardcoded `"ctrl+s sort · ctrl+n named · …"` string cannot do.
+/// The header's second hint row names every one of them **except** [`SessionAction::DeleteNoninvasive`]
+/// through `keyHint("app.session.…", …)` (`session-selector.ts:171-179`), so a rebind has to reach
+/// the hint text as well as the handler — which is exactly what a hardcoded
+/// `"ctrl+s sort · ctrl+n named · …"` string cannot do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SessionAction {
     /// Cycle threaded → recent → fuzzy — `app.session.toggleSort` (Ctrl+S).
@@ -1189,6 +1190,13 @@ pub enum SessionAction {
     TogglePath,
     /// Rename the highlighted session — `app.session.rename` (Ctrl+R).
     Rename,
+    /// "Delete session when query is empty" — `app.session.deleteNoninvasive` (Ctrl+Backspace),
+    /// pi's "non-invasive convenience alias for delete": with an empty search query it opens the
+    /// same delete confirmation as [`SessionAction::Delete`]; with a non-empty query the key is
+    /// forwarded to the search input and the list is re-filtered
+    /// (`core/keybindings.ts:177-180`, `session-selector.ts:590-600` @v0.84.4; identical at
+    /// v0.83.0 `:151-154` / `:590-600`). TUI-068.
+    DeleteNoninvasive,
 }
 
 impl SessionAction {
@@ -1200,13 +1208,15 @@ impl SessionAction {
             "app.session.delete" => Some(SessionAction::Delete),
             "app.session.togglePath" => Some(SessionAction::TogglePath),
             "app.session.rename" => Some(SessionAction::Rename),
+            "app.session.deleteNoninvasive" => Some(SessionAction::DeleteNoninvasive),
             _ => None,
         }
     }
 }
 
 /// The configurable `/resume` binding table. Defaults are upstream's verbatim
-/// (`core/keybindings.ts:91-94` Ctrl+N, `:135-150` Ctrl+P / Ctrl+S / Ctrl+R / Ctrl+D).
+/// (`core/keybindings.ts:91-94` Ctrl+N, `:135-150` Ctrl+P / Ctrl+S / Ctrl+R / Ctrl+D, and
+/// `:177-180` @v0.84.4 `ctrl+backspace` for `deleteNoninvasive`).
 #[derive(Clone, Debug)]
 pub struct SessionKeymap {
     bindings: Vec<(Key, SessionAction)>,
@@ -1222,6 +1232,13 @@ impl Default for SessionKeymap {
                 (Key::ctrl('d'), S::Delete),
                 (Key::ctrl('p'), S::TogglePath),
                 (Key::ctrl('r'), S::Rename),
+                (
+                    Key {
+                        code: KeyCode::Backspace,
+                        mods: KeyModifiers::CONTROL,
+                    },
+                    S::DeleteNoninvasive,
+                ),
             ],
         }
     }

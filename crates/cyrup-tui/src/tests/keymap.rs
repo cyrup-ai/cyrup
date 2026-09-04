@@ -245,3 +245,25 @@ fn function_keys_and_insert_parse_and_round_trip_through_label() {
     // …and a bare `f` is still the letter f, not a malformed function key.
     assert_eq!(Key::parse("f").unwrap(), Key::plain(KeyCode::Char('f')));
 }
+
+/// TUI-068. `app.session.deleteNoninvasive` resolves and ships bound to `ctrl+backspace`
+/// (`core/keybindings.ts:177-180` @v0.84.4). It used to be the one `app.session.*` id `from_id`
+/// did not know, which made it unbindable AND unbound with no `KeybindingIssue`.
+#[test]
+fn tui068_session_delete_noninvasive_resolves_and_defaults_to_ctrl_backspace() {
+    use crate::keymap::{SessionAction, SessionKeymap};
+    assert_eq!(
+        SessionAction::from_id("app.session.deleteNoninvasive"),
+        Some(SessionAction::DeleteNoninvasive)
+    );
+    let km = SessionKeymap::default();
+    assert_eq!(
+        km.keys_label(SessionAction::DeleteNoninvasive).as_deref(),
+        Some("ctrl+backspace")
+    );
+    let ev = KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL);
+    assert_eq!(km.action_for(&ev), Some(SessionAction::DeleteNoninvasive));
+    // Plain Backspace stays with the search input.
+    let plain = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+    assert_eq!(km.action_for(&plain), None);
+}
