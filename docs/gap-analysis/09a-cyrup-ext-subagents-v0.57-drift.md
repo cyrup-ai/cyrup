@@ -93,7 +93,7 @@ corrections are applied and recorded at the item.
 |---|---|---|---|---|
 | ~~SUBA-072~~ | ~~critical~~ **CLOSED 2026-09-04** | M | foreground exec / tool allowlisting | Capability ceiling's `allowedTools` and `denyExtensions` axes are resolved and propagated but never applied to the child |
 | ~~SUBA-073~~ | ~~medium~~ **CLOSED 2026-09-04** | M | config / permissions / frontmatter | Subagent permission policy never reaches a spawned child; `permission:` frontmatter is accepted and inert |
-| SUBA-074 | high — **stage 1 CLOSED 2026-09-04, stage 2 open** | L | external runners / agent schema | `runner:` frontmatter is ignored entirely, so a sandboxed foreign-CLI profile runs as a full-capability native child |
+| ~~SUBA-074~~ | ~~high~~ **CLOSED 2026-09-04** | L | external runners / agent schema | Stage 1 (refusal) closed at `bf8b0f9`; **stage 2 ported at `af1a8a76`** — the capability/status contract, the hardened external-CLI runner, the generic no-adapter path (upstream's in-baseline `v0.43.0` half) and the `claude-code`/`claude-code-writer` adapter. A declared external profile now RUNS as the foreign process and resolves no model; `codex-exec`, `cursor-agent` and the whole `external-job` protocol stay refused by name through the new exhaustive `RunnerDispatch` |
 | ~~SUBA-075~~ | ~~high~~ **CLOSED 2026-09-04** | M | fork context / thinking | Forked child sessions are not sanitized: signed/redacted Anthropic thinking blocks inherited, no thinking-off override |
 | ~~SUBA-076~~ | ~~high~~ **CLOSED 2026-09-04** | S | acceptance / evidence scoring | Evidence checks are scored binary where upstream is tri-state, producing two spurious acceptance rejections |
 | ~~SUBA-077~~ | ~~high~~ **CLOSED 2026-09-04** | S | foreground exec / deadlines | A foreground run with no explicit timeout has NO wall-clock deadline, and there is no global `timeoutMs` |
@@ -393,7 +393,7 @@ the env write in `exec/spawn_plan.rs`.
 
 ---
 
-## SUBA-074 — Agent `runner:` frontmatter is ignored entirely, so a profile upstream runs as a sandboxed read-only foreign CLI runs in cyrup as a full-capability native child
+## ~~SUBA-074~~ — ~~Agent `runner:` frontmatter is ignored entirely, so a profile upstream runs as a sandboxed read-only foreign CLI runs in cyrup as a full-capability native child~~
 
 > **STAGE 1 CLOSED 2026-09-04, cyrup HEAD `2571969`.** Landed by `bf8b0f9` (same commit as
 > `SUBA-072`/`SUBA-073`), verified by reading the current code — this is exactly the item's own Fix
@@ -413,6 +413,65 @@ the env write in `exec/spawn_plan.rs`.
 > stage-2-specific ID). Re-scope this item's own Kind/Severity/Effort to stage 2 only next time it is
 > picked up — stage 1's `L` effort is spent; what remains is genuinely the adapter/protocol work the
 > original Fix called out as separable.
+
+> **STAGE 2 CLOSED 2026-09-04, cyrup HEAD `3e9633c4`.** Landed by `af1a8a76`, both sides re-read
+> at `v0.64.0` (ADR-0006 target) before implementing. What shipped: the capability/status contract
+> (`runner/contract.rs` + new `runner/status.rs` — `resolveExternalCliRunnerStatus`,
+> `normalizeExternalCliRunnerStatus` incl. the legacy `grok-build` branch,
+> `externalCliReceiptMetadata`, the six per-adapter `safety` blocks and the seven unsupported
+> reasons with their two prompt-file overrides); the hardened runner (`exec/external_cli/` —
+> sealed environments, bounded logs and byte tails, JSONL framing with the oversized-line rule,
+> the preflight probe with its `(binary, mtime, spec)` cache and typed invalidation, prompt-file
+> delivery, process-GROUP teardown on a deadline or a stop); **the generic no-adapter
+> `external-cli` path**, which is the in-baseline (`v0.43.0`) half this row noted was "never ported
+> either" — so the item is no longer window lag PLUS baseline lag; and **one adapter**,
+> `claude-code`/`claude-code-writer` (32-key env allowlist, plan/`acceptEdits` argv, the JSONL
+> parser, the version regex and the fourteen required help strings). `SingleResult` gained
+> `runner` and `externalProcess`, both optional on the wire.
+>
+> **The stage-1 gate was replaced, not extended.** `AgentRunnerConfig::refusal_reason() ->
+> Option<String>` is gone; `runner::dispatch::resolve_runner_dispatch` returns an exhaustive
+> `RunnerDispatch::{NativePi, ExternalCli(launch), Refused(reason)}` with no `_` arm, so
+> "did not refuse" can no longer be what selects the native child. That ordering was
+> non-negotiable: with the supported set non-empty and the gate still an `Option`, `None` would
+> again mean "spawn a full-capability native child", silently. The external arm returns from
+> `exec/mod.rs`'s Step 0b before `run_fallback_ladder`, because upstream resolves NO model for an
+> external runner at all (`api/preflight.ts:322-343`).
+>
+> **Deferred, with reasons, still refused by name:** `codex-exec` (a second output channel — the
+> `--output-last-message` artifact — and a second terminal vocabulary); `cursor-agent`
+> (prompt-file delivery, the `--add-dir` handoff dir, the `skipOversizedLine` rule); and the whole
+> `external-job` protocol — that one on a CONTRACT argument, not size:
+> `v0.64.0:src/api/external-job-provider.ts:1-2` is a pure embedder registry with **zero in-repo
+> providers**, so porting it into cyrup (which has no host-registration surface) would produce a
+> path that can never succeed, replacing an honest "not supported" with a dishonest "no provider
+> registered".
+>
+> **Three anchor/count corrections to the text below.** The refusal is at `exec/mod.rs:308-325`,
+> not `:287-303`; the tools doc is `discovery/types.rs:1025`, not `:728-730`; and the claude-code
+> env allowlist is **32** keys (`claude-code-adapter.ts:10-43`). Also ported here as a tag-to-tag
+> correction inside this item's own surface: `validateExternalRunnerProfile`'s Pi-only field list
+> is **seventeen** at `v0.64.0` (`agents.ts:1906`), not the fourteen stage 1 pinned —
+> `excludeTools`, `allowNestedSubagents` and `mutationTools` were added after that port.
+>
+> **Tests (34 added).** The behavioural fail-before/pass-after is
+> `run_sync_executes_a_generic_external_cli_profile_and_resolves_no_model`: at the previous HEAD
+> every `external-cli` runner took `pre_spawn_failure` (exit 1, no output); it now runs the foreign
+> process, delivers its stdout, and carries `model: None` with an empty ladder plus a runner and
+> process receipt. `only_a_pi_runner_is_honourable_today` is FALSIFIED by this change and was
+> split rather than deleted — `runner/dispatch.rs` pins both halves (claude-code + generic
+> dispatch to a launch; codex/cursor/external-job still refuse), and `spawn_plan.rs`'s hop-C test
+> now asserts the rebuilt config still dispatches EXTERNALLY.
+>
+> **Residuals (low).** (1) `StepResult` carries no external-runner receipt, so an ASYNC run's
+> `runner`/`externalProcess` do not survive the background projection
+> (`background/runner_main.rs`); the run itself executes identically on both paths. (2) The
+> external-runner consumers outside this crate's spawn path are unported: the steer/resume
+> refusals (`subagent-executor.ts:1135`, `:1589-1597`, `:1847-1852`), the `RunStatus::steps[].runner`
+> projection, and `api/preflight.ts`'s own external branch. Each depends only on the contract types
+> that now exist. (3) `runner_to_json_string` re-emits a `capabilities:` block in upstream's
+> capability order rather than the author's — strictly closer to upstream than the previous
+> alphabetical order.
 
 **Kind** not-ported · **Severity** high · **Effort** L · **Confidence** confirmed
 **Subsystem** external runners / agent definition schema
