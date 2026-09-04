@@ -569,7 +569,7 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | ~~TUI-078~~ | ~~low~~ **CLOSED 2026-08-17** | parity-bug | M | ~~A prompt template's `argument-hint` is parsed by cyrup-resources and dropped at the `slash_command_catalog` seam, so the `/` menu shows a bare description~~ — **filed 2026-08-14** — **CLOSED 2026-08-17** by `0b7c4f4` + `bae24f5` (the `CMDHINT_01` change; the feature it also shipped is `TUI-095`). Both halves of the Fix are at HEAD: the producer inserts the key spread-if-truthy (`cyrup-session-svc/src/session.rs:2635-2639`, rationale at `:2628-2634`) and the consumer reads it with pi's empty-string truthiness filter (`cyrup-tui/src/commands.rs:475-479`). Verify is satisfied twice — `crates/cyrup-tui/src/tests/commands.rs:248` (catalog row → `SlashCommand::argument_hint`) and `crates/cyrup-session-svc/src/tests/cmdhint01_argument_hint.rs:58`/`:82`/`:99` (the JSON key is emitted for a template with the hint, ABSENT without one, and never for a skill row). **ONE DELIBERATE DEVIATION, so the closure is complete-as-corrected rather than partial:** the "(and extension)" half of the Fix was declined with the upstream reason recorded in-source at `commands.rs:470-474` — pi's `interactive-mode.ts:691-698` forwards a COMPLETER to extension commands, not a hint, and `cyrup-ext/src/registry.rs:94-98` has no such field — so only `source:"prompt"` rows can produce a hint, which is upstream's behaviour. **The residual this row's own Fix asked for is NOT done:** it instructed "note in the RPC area that the field is a cyrup addition to `get_commands`", and `08-cyrup-session-svc-and-modes.md` has zero `argumentHint`/`CMDHINT` hits — routed there via `TUI-095`. |
 | ~~TUI-079~~ | ~~low~~ **CLOSED 2026-09-04** | not-ported | S | ~~`/export` and `/import` take the whole remainder as the path; pi parses one quote-aware token (`getPathCommandArgument`), so `/export "my session.html"` writes a file with the quotes in its name~~ — `path_command_argument` (`commands.rs:458`) is a real quote-aware parser, wired at both call sites (`app/submit.rs:90-91`). This was already flagged false by the 2026-08-19 round-2 note but never struck here until now. |
 | ~~TUI-080~~ | ~~low~~ **CLOSED 2026-09-04** | not-ported | S | ~~`/name` with no argument is a getter upstream; cyrup always prints usage, never reads the stored name, and echoes the INPUT rather than the normalized stored name~~ — `C::ShowName` (`app/execute_misc.rs:804`) reads and prints the stored session name. This was already flagged false by the 2026-08-19 round-2 note but never struck here until now. |
-| TUI-081 | medium | not-ported | S | `/import` replaces the live session with no confirmation — a mistyped path destroys the in-flight conversation; the `cancelled` arm the code already has is unreachable — **filed 2026-08-14** — **re-scoped 2026-09-04, left open:** the `cancelled` arm is no longer strictly unreachable — `AgentSessionRuntime::import_from_jsonl` (`cyrup-session-svc/src/runtime.rs:697-704`) now returns `cancelled: true` on an extension veto via `HostEvent::SessionBeforeSwitch` — but that is an extension-authored veto, not the interactive user confirmation this item asks for; a mistyped `/import <path>` still overwrites the live session with no prompt. |
+| ~~TUI-081~~ | ~~medium~~ **CLOSED 2026-09-04** | not-ported | S | ~~`/import` replaces the live session with no confirmation — a mistyped path destroys the in-flight conversation; the `cancelled` arm the code already has is unreachable~~ — **filed 2026-08-14** — **re-scoped 2026-09-04:** the `cancelled` arm was reachable only through an extension veto (`cyrup-session-svc/src/runtime.rs:697-704`), not a user confirmation — **CLOSED 2026-09-04 (`84b205a1`):** `/import <path>` now opens pi's `Import session` / `Replace current session with {path}?` Yes/No prompt (`SelectorKind::ImportConfirm`, `crates/cyrup-tui/src/app/execute_session.rs:575` `open_import_confirm`) BEFORE anything is touched; `No`/Escape push `Import cancelled` and drop the path; only `Yes` reaches `import_from_jsonl` (`:610` `dispatch_import`), whose captions are pi's `Session imported from: {path}` / `Import cancelled` (`interactive-mode.ts:6069-6082` @v0.84.4). Four app tests in `tests/import_confirm.rs`. |
 | ~~TUI-082~~ | ~~medium~~ **CLOSED 2026-09-04** | parity-bug | S | ~~Bare `/export` writes no file — it dumps the raw HTML into the transcript where pi writes to the session directory and names the path~~ — bare `/export` now writes a file and reports the path (`app/execute_session.rs:84-104`), with one status string for both branches matching pi's `Session exported to: ${filePath}`. |
 | ~~TUI-083~~ | ~~low~~ **CLOSED 2026-09-04, as a documented deliberate decision** | parity-bug | S | ~~`/quit`'s description is the literal `"Quit cyrup"` where pi templates `Quit ${APP_NAME}`; the templating mechanism is unported~~ — `commands.rs:187-192` now records this as a decision, not an oversight: cyrup has no config-name-override feature (pi's `piConfigName`) to template against, so there is nothing to template, and the comment states the line is the one to change if such an override is ever added. |
 | ~~TUI-084~~ | ~~low~~ **CLOSED 2026-09-04** | parity-bug | S | ~~The argument-less usage strings for `/import` and `/name` diverge in wording and in severity channel (pi's error/warning → cyrup's neutral status)~~ — `/name` now uses `push_warning("Usage: /name <name>")` (`app/execute_misc.rs:800-807`, pi's exact string and channel) and `/import` uses `push_error("Usage: /import <path.jsonl>")` (`app/execute_session.rs:296-298`, matching pi's `showError`). |
@@ -2406,9 +2406,59 @@ Upstream computes three default key sets from `process.platform`. cyrup binds al
 **Verify** — app tests for all three branches, including a name that normalizes, asserting the echoed string is the stored one.
 
 
-## TUI-081 — `/import` replaces the live session with no confirmation
+## ~~TUI-081~~ — ~~`/import` replaces the live session with no confirmation~~ **CLOSED 2026-09-04**
 
-**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+> ## CLOSED 2026-09-04 — `84b205a1` — `crates/cyrup-tui/src/{selector/mod.rs,app/state.rs,app/execute_session.rs,app/execute.rs,app/selectors.rs}`
+>
+> **What landed.** The `/import <path>` arm (`crates/cyrup-tui/src/app/execute_session.rs:331`) no longer
+> calls `import_from_jsonl`; it calls `App::open_import_confirm` (`:575`), which parks the typed path on
+> `AppState::pending_import` (`app/state.rs:283`, `PendingImport` `:554`) and opens
+> `SelectorKind::ImportConfirm` (`selector/mod.rs:367`, title `Import session` `:452`) — a first-party
+> Yes/No `ListSelector::prompt` whose title is pi's `${title}\n${message}` join, `Replace current session
+> with {path}?`, with `Yes` highlighted and the `ExtensionSelectorComponent` chrome (`draws_hint_row`,
+> `insets_rows`, `envelope_spacers`) the extension `ui.confirm` uses. It is the port of
+> `handleImportCommand`'s `await this.showExtensionConfirm("Import session", `Replace current session with
+> ${inputPath}?`)` (`interactive-mode.ts:6069` @v0.84.4) via `showExtensionConfirm` = `showExtensionSelector(…,
+> ["Yes","No"])`, `result === "Yes"` (`:2557-2565`). The answer is an ordinary
+> `ConfirmSelection { kind: ImportConfirm }` (routed at `app/execute.rs:738`, handled in
+> `execute_session_switch` at `app/execute_session.rs:373`): the parked path is `take()`n either way; anything
+> but `CONFIRM_YES` (`app/state.rs:563`) pushes pi's `Import cancelled` (`:6071`); `Yes` runs
+> `App::dispatch_import` (`:610`) — the former arm body, now captioned with pi's `Session imported from:
+> {path}` (`:6082`) and pi's second `Import cancelled` for a runtime `cancelled` (an extension veto, `:6079`).
+> Escape on the prompt is `App::cancel_pending_import` (`:597`) from the selector-cancel arm
+> (`app/selectors.rs:522`) — pi's Esc resolves `undefined`, read as a decline (`:2564`). The `cancelled` arm
+> this row called unreachable is now the veto path behind a user confirmation, which is pi's shape. Same
+> strings and order at v0.83.0 (`:5485-5493`).
+>
+> **Tests** (`crates/cyrup-tui/src/tests/import_confirm.rs`, a faux-provider `AgentSessionRuntime` driven
+> through the editor → `handle_input` → `execute_command` path; all four RED at HEAD — the variant did not
+> exist, and `/import typo.jsonl` produced `import error: …` with no selector — GREEN after):
+> `import_opens_pis_confirm_prompt_before_touching_the_session` (`:112` — prompt open, pi's title and body
+> on screen, generation still 0, no `import error`), `declining_the_prompt_cancels_the_import` (`:151` —
+> Down+Enter on `No`: `Import cancelled`, no swap, same session), `escaping_the_prompt_cancels_the_import`
+> (`:180` — Esc: same, plus a later stray `ConfirmSelection{ImportConfirm,"yes"}` imports nothing because the
+> path died with the decline), `confirming_the_prompt_imports_and_swaps` (`:222` — Enter on `Yes`: generation
+> 0→1, the install is the copy in the sessions dir, `Session imported from: {path}` surfaces on re-bind).
+> Full crate: 1372 passed, 1 skipped; clippy `-D warnings`, rustdoc `-D warnings`, `cargo check -p cyrup` clean.
+>
+> **Design** (DESIGN-GUIDANCE applied, recorded in the commit body). `Option<PendingImport>` on `AppState`,
+> taken on the answer, mirrors `pending_tree_nav`: the invariant is "the path imported is the path the user
+> was asked about, asked exactly once", and `take()` on both answers makes a stale path un-importable. Rejected:
+> a typestate (the transition is an external key event on a `Box<dyn Selector>`), carrying the path in the
+> selector row value (a user path on the `Confirm(String)` wire), and reusing the extension `pending_ui_reply`
+> one-shot (would make `/import` deny a guest dialog arriving while the prompt is open, and vice versa).
+>
+> **Residuals — low, not this row.** (1) pi's v0.84.4 `MissingSessionCwdError` re-prompt
+> (`interactive-mode.ts:6084-6095`: `promptForMissingSessionCwd` → a second confirm offering
+> `issue.fallbackCwd`, then `importFromJsonl(inputPath, selectedCwd)`) is not ported — cyrup's
+> `import_from_jsonl` returns `SessionServiceError::MissingSessionCwd` and the arm shows `import error: …`;
+> the runtime already accepts a `cwd_override`, so the port is a second `ImportConfirm`-style prompt.
+> (2) The failure wording stays `import error: {e}` where pi shows `Failed to import session: {message}`
+> through `showError` (`:6098-6101`); string + channel only.
+>
+> ---
+>
+> **Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
 
 **cyrup** — `crates/cyrup-tui/src/app/execute_session.rs:284-294` calls `rt.import_from_jsonl(path, None)` immediately. Its own `Ok(r) if r.cancelled` arm handles a cancellation the TUI never offers a way to trigger.
 
