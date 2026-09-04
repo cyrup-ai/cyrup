@@ -556,7 +556,7 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-065 | low | cyrup-original | S | `app.pageUp` / `app.pageDown` are cyrup-invented ids, and each now resolves in **two** keymaps at once, so one config entry rebinds two actions — **filed 2026-08-14** (sweep 10, keybinding-id surface). TUI-028's closure said these "are listed as a new gap"; **no row was ever added** — this is it. — **not independently re-checked this pass; left open.** |
 | TUI-066 | low | cyrup-original | S | The cyrup-only keybinding-id and key-spec vocabulary TUI-028's closure deliberately preserved — 5 `tui.autocomplete.*`, 19 bare `editor.*` aliases, 10 `Key::parse` tokens pi's `KeyId` has no word for — is tracked nowhere — **filed 2026-08-14** — **not independently re-checked this pass; left open.** |
 | ~~TUI-067~~ | ~~low~~ **CLOSED 2026-09-04** | parity-bug | S | ~~`tui.input.copy` migrates correctly and is then silently dropped by `merge_entries`: `EditorAction::from_id` has no arm, so pi's one "do not consume this key" id is inert~~ — `EditorAction::PassThrough` now exists (`keymap.rs:354`), `from_id` maps `"tui.input.copy" \| "copy" => E::PassThrough` (`:435`), and `handle_key` declines the key ahead of `apply_editor_action` (`editor/keys.rs:49,349`). Landed in `fda714d` ("give `tui.input.copy` a destination"); verified against the actual code, not the commit message. |
-| TUI-068 | medium | not-ported | S | `app.session.deleteNoninvasive` is unbound **and** unbindable — Ctrl+Backspace in `/resume` hits a modifier-blind `Backspace` catch-all and does nothing — **filed 2026-08-14**; the chord parses, so this is a missing destination, not a dead spec — **2026-08-15 (TUI-092 §4): `TUI-088` was checked as a possible THIRD instance of this class and is confirmed NOT one** — Ctrl+C is bound (`keymap.rs:656`), id-resolvable (`:268`) and wired (`app/input.rs:219-231`) at HEAD — so the class stays this row and `TUI-067`, and is **not** re-swept. **Shared root cause with `TUI-067`, stated once:** `merge_entries` silently skips any id `from_id` does not know — `crates/cyrup-tui/src/keymap.rs:128`, `let Some(action) = from_id(&id) else { continue };`, which is upstream's deliberate `if (!(keybinding in this.definitions)) continue` (`packages/tui/src/keybindings.ts:172-179`) — so an id present in a `Default` table but missing from the matching `from_id` is **unbindable and reports nothing**, not even a `KeybindingIssue`. — **re-verified 2026-09-04, unchanged: `rg 'deleteNoninvasive\|DeleteNoninvasive' crates/` is still zero.** |
+| ~~TUI-068~~ | ~~medium~~ **CLOSED 2026-09-04** | not-ported | S | ~~`app.session.deleteNoninvasive` is unbound **and** unbindable — Ctrl+Backspace in `/resume` hits a modifier-blind `Backspace` catch-all and does nothing — **filed 2026-08-14**; the chord parses, so this is a missing destination, not a dead spec — **2026-08-15 (TUI-092 §4): `TUI-088` was checked as a possible THIRD instance of this class and is confirmed NOT one** — Ctrl+C is bound (`keymap.rs:656`), id-resolvable (`:268`) and wired (`app/input.rs:219-231`) at HEAD — so the class stays this row and `TUI-067`, and is **not** re-swept. **Shared root cause with `TUI-067`, stated once:** `merge_entries` silently skips any id `from_id` does not know — `crates/cyrup-tui/src/keymap.rs:128`, `let Some(action) = from_id(&id) else { continue };`, which is upstream's deliberate `if (!(keybinding in this.definitions)) continue` (`packages/tui/src/keybindings.ts:172-179`) — so an id present in a `Default` table but missing from the matching `from_id` is **unbindable and reports nothing**, not even a `KeybindingIssue`. — **re-verified 2026-09-04, unchanged: `rg 'deleteNoninvasive\|DeleteNoninvasive' crates/` is still zero.** |~~ — landed in `eacd771a`: `SessionAction::DeleteNoninvasive` (`crates/cyrup-tui/src/keymap.rs:1199`), the `"app.session.deleteNoninvasive"` arm in `SessionAction::from_id` (`:1211`), default `ctrl+backspace` in `SessionKeymap::default()` (`:1240`), and the handler arm in `SessionSelector::handle` step 4 (`crates/cyrup-tui/src/session_selector.rs:1017`) — empty query → `start_delete_confirmation_for_selected` (`:391`, pi `session-selector.ts:394-403`), non-empty query → forwarded to the search `Input` and re-filtered (pi `:590-600` @v0.84.4). Resolved ahead of the search-Input fallthrough (step 6), so the modifier no longer disappears. Pinned by `tui068_*` (4 in `session_selector.rs`, 1 in `tests/keymap.rs`), all RED before. **Residual (low, new):** pi's `startDeleteConfirmationForSelectedSession` refuses the CURRENT session (`session-selector.ts:398-401`, `Cannot delete the currently active session`); neither cyrup delete path carries that guard. |
 | TUI-069 | **FIXED 2026-08-14** | parity-bug | S | ~~`/hotkeys` printed `Shift+Tab/Shift+Shift+Tab/Shift+Tab` for `app.thinking.cycle`, whose middle entry is not a chord and does not round-trip through `Key::parse`~~ |
 | TUI-070 | **FIXED 2026-08-14** | parity-bug | S | ~~The page keys rendered as `Pageup` / `Pagedown` where pi renders `PageUp` / `PageDown`; masked inside `/tree` by the `pgup`/`pgdn` rewrite~~ |
 | TUI-071 | low | port-divergence | S | Three platform-conditional upstream defaults are bound unconditionally: `app.clipboard.pasteImage` (both `ctrl+v` and `alt+v` everywhere), `app.suspend` (no win32 gate), `app.tree.foldOrUp`/`unfoldOrDown` (key order fixed at alt-first) — **filed 2026-08-14**; none carries the `CYRUP-DELTA` cite a forced difference requires — **re-verified 2026-09-04 for the `pasteImage` clause, unchanged: `keymap.rs:704-709` still binds `ctrl+v`/`alt+v` unconditionally on every platform (an explanatory comment was added, but no platform gate); the `app.suspend`/`foldOrUp` clauses were not independently re-checked.** |
@@ -2084,7 +2084,47 @@ The conversation is still in the transcript and still in the session file, but t
 **Verify** — editor test: with `{"tui.input.copy": "ctrl+q"}` merged, Ctrl+Q is not consumed by the editor and reaches the global keymap; without the rebind, nothing changes.
 
 
-## TUI-068 — `app.session.deleteNoninvasive` is unbound **and** unbindable: Ctrl+Backspace does nothing in `/resume`
+## ~~TUI-068~~ — ~~`app.session.deleteNoninvasive` is unbound **and** unbindable: Ctrl+Backspace does nothing in `/resume`~~ **CLOSED 2026-09-04**
+
+> ## CLOSED 2026-09-04 — `eacd771a` — `crates/cyrup-tui/src/{keymap.rs,session_selector.rs}`
+>
+> **What landed.** `SessionAction::DeleteNoninvasive` (`crates/cyrup-tui/src/keymap.rs:1199`), the
+> `"app.session.deleteNoninvasive"` arm in `SessionAction::from_id` (`:1211`) — so `merge_entries` no
+> longer skips the id — and the default binding `ctrl+backspace` in `SessionKeymap::default()` (`:1240`),
+> upstream's `core/keybindings.ts:177-180` @v0.84.4 (`:151-154` @v0.83.0, identical). The handler arm sits
+> in `SessionSelector::handle` step 4, the `app.session.*` table (`crates/cyrup-tui/src/session_selector.rs:1017`),
+> and is therefore resolved **before** the search-`Input` fallthrough in step 6 that used to swallow the
+> modifier. It is the port of `session-selector.ts:590-600` @v0.84.4: with a non-empty query the event is
+> handed to `Input::handle_key` (pi's `this.searchInput.handleInput(keyData)`) and, if the input edited,
+> the highlight resets to the top (pi's `filterSessions`); with an empty query it calls
+> `start_delete_confirmation_for_selected` (`:391`), the shared port of
+> `startDeleteConfirmationForSelectedSession` (`session-selector.ts:394-403`) that `app.session.delete`
+> now also uses. The hint row is unchanged: pi's `hint2Parts` (`:171-179`) does not name the alias.
+> `docs/guide/reference/keybindings.md:146` gains the `/resume` row.
+>
+> **Tests** (all RED against the pre-commit code, GREEN after): `session_selector::tests::`
+> `tui068_ctrl_backspace_with_an_empty_query_arms_the_delete_confirmation` (arms, and Enter then deletes
+> `/s/a.jsonl`), `tui068_ctrl_backspace_with_a_query_forwards_to_the_input_and_keeps_the_list` (`Redraw`,
+> not the old `Ignored`; no confirmation; filter intact), `tui068_ctrl_backspace_with_a_query_honours_an_editor_rebind`
+> (`tui.editor.deleteWordBackward` bound to the chord edits the query and re-filters; the now-empty query
+> then arms on the next press), `tui068_delete_noninvasive_is_rebindable_from_json`
+> (`{"app.session.deleteNoninvasive": "ctrl+k"}` moves it, no `KeybindingIssue`), and
+> `tests::keymap::tui068_session_delete_noninvasive_resolves_and_defaults_to_ctrl_backspace` (a compile
+> failure before: the variant did not exist). Full crate: 1368 passed.
+>
+> **Design.** No new type (DESIGN-GUIDANCE applied): the empty/non-empty branch is a runtime property of the
+> live search box, and the outcome already has its domain state (`confirming_delete`) and enum
+> (`SelectorOutcome`). A typestate or a forward-outcome enum was rejected as ceremony pi's `void` return
+> gives nothing to consume.
+>
+> **Residual — low, new, not this row.** pi's `startDeleteConfirmationForSelectedSession` refuses the
+> **current** session (`session-selector.ts:398-401` @v0.84.4: `onError("Cannot delete the currently active
+> session")` when `isCurrentSessionPath`); neither cyrup delete path (`Ctrl+D` or `Ctrl+Backspace`) carries
+> that guard, so the live session's file can be trashed from `/resume`. `SessionSelector` already holds
+> `current_path`, so the guard is a one-line check plus the error status.
+>
+> Original item text, for the record:
+
 
 **Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
 
