@@ -324,20 +324,21 @@ impl SubagentExecutor {
         write_foreground_output_artifacts(&art_paths, &art_cfg, run_id.as_str(), &result);
 
         // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes to
-        // `<cwd>/.cyrup-subagent-scratch/attempt-<n>.jsonl` is this run's persisted, observable child
+        // `<attempt_scratch_dir(cwd)>/attempt-<n>.jsonl` (SUBA-072: `<temp_root_dir>/scratch/
+        // <cwd_key>`, never under the project tree) is this run's persisted, observable child
         // record and MUST survive the orchestrator, exactly as it does on every other spawn path in
         // this crate (the tool single/parallel/chain fan-outs and the background hop-2 runner all
         // leave it in place — it is the single observation channel the crate's integration tests read
         // back, e.g. `tool_parallel_chain_integration`'s `/run [model=…]` tee check and
         // `companions_wiring_proof`). This mirrors pi, which likewise never deletes its persisted
         // child NDJSON stream — pi only cleans the *transient* per-spawn prompt/task-overflow dir it
-        // creates under `os.tmpdir()` (`pi-subagents/src/runs/shared/pi-args.ts:143-158` build it,
-        // `:233-236` `cleanupTempDir` removes it, invoked from
-        // `pi-subagents/src/runs/foreground/execution.ts:1109`), a dir that lives OUTSIDE the working
-        // tree and never holds the event stream. An earlier revision erroneously `remove_dir_all`'d
-        // the whole `.cyrup-subagent-scratch` dir here, which silently discarded that tee the moment a
-        // foreground `/run` completed — defeating the tee's own stated purpose and diverging from
-        // every sibling path — so no such deletion is performed.
+        // creates under `os.tmpdir()` (`pi-subagents/src/runs/shared/pi-args.ts:787-855` @v0.64.0
+        // build it, `:1052-1059` `cleanupTempDir` removes it, invoked from
+        // `pi-subagents/src/runs/foreground/execution.ts:491`/`:560`/`:602`/`:635`/`:1387`/`:1426`),
+        // a dir that lives OUTSIDE the working tree and never holds the event stream. An earlier
+        // revision erroneously `remove_dir_all`'d the whole scratch dir here, which silently
+        // discarded that tee the moment a foreground `/run` completed — defeating the tee's own
+        // stated purpose and diverging from every sibling path — so no such deletion is performed.
 
         Ok((result, run_id))
     }

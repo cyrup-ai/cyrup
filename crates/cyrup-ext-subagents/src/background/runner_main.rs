@@ -4301,7 +4301,7 @@ mod tests {
             result.error
         );
         assert!(
-            !dir.path().join(".cyrup-subagent-scratch").exists(),
+            !crate::background::attempt_scratch_dir(dir.path()).exists(),
             "an unresolved-agent rejection must happen before run_sync's spawn-scratch dir is ever \
              created — proving no placeholder child was ever spawned"
         );

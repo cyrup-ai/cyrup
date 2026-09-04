@@ -391,7 +391,7 @@ async fn a_zero_activity_child_exit_relaunches_the_same_model_then_reports_exhau
     assert_ne!(result.exit_code, 0, "{result:?}");
 
     // Four LAUNCHES means four real child processes, each with its own NDJSON tee artifact.
-    let scratch = dir.path().join(".cyrup-subagent-scratch");
+    let scratch = cyrup_ext_subagents::background::attempt_scratch_dir(dir.path());
     for index in 0..expected_launches {
         assert!(
             scratch.join(format!("attempt-{index}.jsonl")).exists(),
@@ -426,8 +426,7 @@ async fn a_child_that_produced_output_before_failing_is_not_relaunched() {
         "this is not a startup failure and must not be reported as one: {error}"
     );
     assert!(
-        !dir.path()
-            .join(".cyrup-subagent-scratch")
+        !cyrup_ext_subagents::background::attempt_scratch_dir(dir.path())
             .join("attempt-1.jsonl")
             .exists(),
         "no second child may be spawned"

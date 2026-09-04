@@ -192,11 +192,12 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     }
 }
 
+/// The per-attempt raw-stdout tee `exec::run_sync` wrote for the child that ran in `child_cwd` —
+/// `<attempt_scratch_dir(child_cwd)>/attempt-0.jsonl` (SUBA-072: under the crate's run-scratch
+/// root, keyed by cwd, never under the project tree).
 fn read_attempt_tee(child_cwd: &Path) -> String {
     std::fs::read_to_string(
-        child_cwd
-            .join(".cyrup-subagent-scratch")
-            .join("attempt-0.jsonl"),
+        cyrup_ext_subagents::background::attempt_scratch_dir(child_cwd).join("attempt-0.jsonl"),
     )
     .unwrap_or_default()
 }

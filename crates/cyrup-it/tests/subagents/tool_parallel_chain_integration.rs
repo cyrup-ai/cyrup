@@ -8,7 +8,7 @@
 //! subprocesses — the scripted-NDJSON `cyrup-subagent-fixture` binary (arch-SA §11) — via
 //! `CYRUP_SUBAGENT_BINARY` (R-SA-045 tier 1). The single observation channel is the per-attempt
 //! raw-stdout tee `exec::run_sync` writes for every spawned child
-//! (`<child_cwd>/.cyrup-subagent-scratch/attempt-0.jsonl`), which — with the fixture's `echo_argv`
+//! (`<attempt_scratch_dir(child_cwd)>/attempt-0.jsonl`), which — with the fixture's `echo_argv`
 //! — records exactly what argv (task text, `--model <id>`) each real child received.
 //!
 //! Gated on the `test-fixtures` Cargo feature, matching every other fixture-dependent integration
@@ -99,9 +99,8 @@ fn write_fixture_persona(cwd: &Path, local_name: &str) {
 /// The per-attempt raw-stdout tee for the (first, here only) spawn attempt of a child that ran in
 /// `child_cwd` — holds every raw NDJSON line the real child emitted, incl. `echo_argv` lines.
 fn read_attempt_tee(child_cwd: &Path) -> String {
-    let path = child_cwd
-        .join(".cyrup-subagent-scratch")
-        .join("attempt-0.jsonl");
+    let path =
+        cyrup_ext_subagents::background::attempt_scratch_dir(child_cwd).join("attempt-0.jsonl");
     std::fs::read_to_string(&path).unwrap_or_default()
 }
 
@@ -261,7 +260,7 @@ async fn tool_parallel_count_multiplies_fan_out_into_that_many_real_children() {
 
 /// Two parallel tasks resolving their `output` to the same path is rejected with pi's exact message
 /// BEFORE any child is spawned (`findDuplicateParallelOutputPath`) — proven by the absence of any
-/// tee (no `.cyrup-subagent-scratch` was ever created).
+/// tee (no spawn-scratch directory was ever created for this cwd).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_parallel_rejects_duplicate_output_paths_before_any_spawn() {
     let work_dir = tempfile::tempdir().expect("real tempdir");
@@ -294,7 +293,7 @@ async fn tool_parallel_rejects_duplicate_output_paths_before_any_spawn() {
         "the rejection must be pi's duplicate-output message: {err}"
     );
     assert!(
-        !work_dir.path().join(".cyrup-subagent-scratch").exists(),
+        !cyrup_ext_subagents::background::attempt_scratch_dir(work_dir.path()).exists(),
         "no child may have been spawned before the duplicate-path rejection"
     );
 }

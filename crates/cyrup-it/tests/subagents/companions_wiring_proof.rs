@@ -187,11 +187,12 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     }
 }
 
+/// The per-attempt raw-stdout tee `exec::run_sync` wrote for the child that ran in `child_cwd` —
+/// `<attempt_scratch_dir(child_cwd)>/attempt-0.jsonl` (SUBA-072: under the crate's run-scratch
+/// root, keyed by cwd, never under the project tree).
 fn read_attempt_tee(child_cwd: &Path) -> String {
     std::fs::read_to_string(
-        child_cwd
-            .join(".cyrup-subagent-scratch")
-            .join("attempt-0.jsonl"),
+        cyrup_ext_subagents::background::attempt_scratch_dir(child_cwd).join("attempt-0.jsonl"),
     )
     .unwrap_or_default()
 }
@@ -205,7 +206,7 @@ async fn parent_session_anchor_is_emitted_into_the_real_child_subprocess_env() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     // The fixture echoes back each requested env var it observes as one NDJSON line into its stdout
-    // (which run_sync tees to `.cyrup-subagent-scratch/attempt-0.jsonl`). Alongside the parent-session
+    // (which run_sync tees to `<attempt_scratch_dir(cwd)>/attempt-0.jsonl`). Alongside the parent-session
     // anchor, request the five child-INTERCOM-BRIDGE vars so this proves the SAME production spawn
     // overlay (`build_attempt_spawn_plan`) activates the child intercom bridge in a REAL subprocess.
     let script = serde_json::json!({

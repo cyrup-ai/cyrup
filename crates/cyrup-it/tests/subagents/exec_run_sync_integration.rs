@@ -462,7 +462,7 @@ async fn run_sync_rejects_a_blocked_depth_without_spawning_the_real_fixture_chil
     // directory (the first filesystem side effect ANY spawn attempt, real or fixture, would ever
     // create) must never have been created.
     assert!(
-        !dir.path().join(".cyrup-subagent-scratch").exists(),
+        !cyrup_ext_subagents::background::attempt_scratch_dir(dir.path()).exists(),
         "the depth guard must reject before the spawn-scratch directory is ever created, i.e. \
          before any child process attempt"
     );

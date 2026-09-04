@@ -536,7 +536,7 @@ mod tests {
             Ok(_) => panic!("an unknown agent in /chain must be rejected before running"),
         }
         assert!(
-            !dir.path().join(".cyrup-subagent-scratch").exists(),
+            !crate::background::attempt_scratch_dir(dir.path()).exists(),
             "upfront rejection must happen before any child (and its scratch dir) is created"
         );
     }

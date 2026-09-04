@@ -734,7 +734,8 @@ struct LadderSetup {
     resolved_skill_names: Option<Vec<String>>,
     /// The output file's pre-ladder state (R-SA-031).
     output_snapshot: Option<crate::exec::output::OutputFileSnapshot>,
-    /// This run's private scratch directory.
+    /// This run's private scratch directory — [`crate::background::attempt_scratch_dir`]
+    /// (`<run_scratch>/scratch/<cwd_key>`), never a path under the project `cwd` (SUBA-072).
     scratch_dir: PathBuf,
     /// The structured-output capture runtime, RAII-scoped (SUBA-S01).
     structured_guard: Option<crate::exec::structured::StructuredOutputCleanupGuard>,
@@ -807,7 +808,14 @@ async fn prepare_ladder(
     // snapshot_output_file`'s own doc note for why re-snapshotting per attempt is unnecessary).
     let output_snapshot = snapshot_output_file(opts.output_path.as_deref());
 
-    let scratch_dir = opts.cwd.join(".cyrup-subagent-scratch");
+    // SUBA-072: the per-attempt raw-stdout tee and the structured-output capture file live under
+    // the crate's ONE run-scratch root, keyed by `cwd` — `<temp_root_dir>/scratch/<cwd_key>` —
+    // beside the async/results/artifacts/chain-runs trees, NOT under `opts.cwd` itself. This was
+    // the single call site in the crate that wrote run scratch into the project's working tree;
+    // pi has no such path: every per-spawn scratch file it creates is `os.tmpdir()`-rooted
+    // (`runs/shared/pi-args.ts:787`, `:802`, `:826`, `:841`, `:855` @v0.64.0) and every persisted
+    // run tree hangs off `TEMP_ROOT_DIR` (`shared/types.ts:2689-2695` @v0.64.0).
+    let scratch_dir = crate::background::attempt_scratch_dir(&opts.cwd);
     if let Err(err) = std::fs::create_dir_all(&scratch_dir) {
         return Err(Box::new(pre_spawn_failure(
             agent,
@@ -1792,7 +1800,7 @@ mod tests {
         // scratch-directory creation (the very first filesystem side effect any subsequent spawn
         // attempt would need) must never have run at all.
         assert!(
-            !dir.path().join(".cyrup-subagent-scratch").exists(),
+            !crate::background::attempt_scratch_dir(dir.path()).exists(),
             "the depth guard must reject before the spawn-scratch directory is ever created"
         );
     }
@@ -1813,7 +1821,7 @@ mod tests {
         let result = run_sync(&agent, "do something", &opts).await;
 
         assert_eq!(result.exit_code, 1);
-        assert!(!dir.path().join(".cyrup-subagent-scratch").exists());
+        assert!(!crate::background::attempt_scratch_dir(dir.path()).exists());
     }
 
     #[tokio::test]
@@ -1867,7 +1875,48 @@ mod tests {
                 .contains("output path")
         );
         // No scratch dir should have been created since this fails before any spawn setup.
-        assert!(!dir.path().join(".cyrup-subagent-scratch").exists());
+        assert!(!crate::background::attempt_scratch_dir(dir.path()).exists());
+    }
+
+    /// SUBA-072: `prepare_ladder` makes the run's scratch directory under the crate's run-scratch
+    /// root, keyed by `cwd` — and leaves NOTHING behind in the project working tree. Before the
+    /// fix this was `<cwd>/.cyrup-subagent-scratch`, the one run-scratch path in the crate rooted
+    /// in the project; pi's per-spawn scratch is `os.tmpdir()`-rooted
+    /// (`runs/shared/pi-args.ts:787` @v0.64.0).
+    #[tokio::test]
+    async fn prepare_ladder_makes_the_scratch_dir_under_the_run_scratch_root_not_the_project_tree()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+
+        let setup = prepare_ladder(&agent, "task", &opts)
+            .await
+            .unwrap_or_else(|failure| panic!("prepare_ladder must succeed: {failure:?}"));
+
+        let expected = crate::background::attempt_scratch_dir(dir.path());
+        assert_eq!(setup.scratch_dir, expected);
+        assert!(
+            setup.scratch_dir.exists(),
+            "the scratch dir is created by prepare_ladder"
+        );
+        assert!(
+            !setup.scratch_dir.starts_with(dir.path()),
+            "the scratch dir must not be under the project cwd: {:?}",
+            setup.scratch_dir
+        );
+        assert!(
+            !dir.path().join(".cyrup-subagent-scratch").exists(),
+            "no `.cyrup-subagent-scratch` may be written into the project working tree"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "prepare_ladder must leave the project working tree untouched"
+        );
+        // This test's cwd key is unique to its TempDir, so the leaf it created is its own to
+        // remove; production never sweeps this tree (the tee is the run's persisted record).
+        let _ = std::fs::remove_dir_all(&setup.scratch_dir);
     }
 
     #[tokio::test]

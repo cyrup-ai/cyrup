@@ -184,18 +184,17 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
         "the _input.md artifact must contain the task the child was given; got: {input_body:?}"
     );
 
-    // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes under `.cyrup-subagent-scratch`
+    // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes under `attempt_scratch_dir(cwd)`
+    // (SUBA-072: `<temp_root_dir>/scratch/<cwd_key>`, never under the project tree)
     // is this run's persisted, observable child record and survives the orchestrator — exactly as
     // it does on every other spawn path in this crate (the tool single/parallel/chain fan-outs and
     // the background hop-2 runner all leave it in place; it is the observation channel
     // `tool_parallel_chain_integration`/`companions_wiring_proof` read back). It is NOT swept by the
     // foreground orchestrator: mirroring pi, which never deletes its persisted child NDJSON stream
-    // and only cleans the transient `os.tmpdir()` prompt/task-overflow dir (`runs/shared/pi-args.ts:233-236`
-    // `cleanupTempDir`, `execution.ts:1109`) that lives outside the working tree.
+    // and only cleans the transient `os.tmpdir()` prompt/task-overflow dir (`runs/shared/pi-args.ts:1052-1059`
+    // `cleanupTempDir` @v0.64.0, `execution.ts:491`) that lives outside the working tree.
     let tee = std::fs::read_to_string(
-        work_dir
-            .path()
-            .join(".cyrup-subagent-scratch")
+        cyrup_ext_subagents::background::attempt_scratch_dir(work_dir.path())
             .join("attempt-0.jsonl"),
     )
     .unwrap_or_default();
@@ -203,5 +202,12 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
         !tee.is_empty(),
         "the per-attempt raw-stdout tee is this run's persisted child record and must survive the \
          foreground orchestrator (it must not be swept away with the scratch dir)"
+    );
+    // SUBA-072: and that record lives under the crate's run-scratch root — the project working
+    // tree gets NO `.cyrup-subagent-scratch/` (the pre-fix location, pi's `os.tmpdir()`-rooted
+    // per-spawn scratch never touches the project: `runs/shared/pi-args.ts:787` @v0.64.0).
+    assert!(
+        !work_dir.path().join(".cyrup-subagent-scratch").exists(),
+        "a real subagent run must leave no scratch directory in the project working tree"
     );
 }

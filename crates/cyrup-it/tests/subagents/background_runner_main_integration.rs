@@ -1052,7 +1052,7 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
 /// environment) must reach a terminal `Failed` state carrying a depth-exceeded error, with the
 /// scripted fixture NEVER actually invoked — proven three independent ways: (1) the terminal
 /// `ResultFile`'s error text names the depth guard, not a subprocess/exit-code failure; (2) the
-/// run's own `.cyrup-subagent-scratch` directory (`exec::run_sync`'s first filesystem side effect
+/// run's own spawn-scratch directory (`exec::run_sync`'s first filesystem side effect
 /// on ANY spawn attempt, real or not) was never created; (3) a distinctive marker string the
 /// fixture script would have emitted to stdout if it had EVER actually run appears nowhere in the
 /// terminal result.
@@ -1171,10 +1171,9 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
     );
 
     // Proof 2: `exec::run_sync`'s scratch directory (the first filesystem side effect ANY spawn
-    // attempt — real or fixture — would create) must never have been created anywhere under this
-    // run's own cwd.
+    // attempt — real or fixture — would create) must never have been created for this run's cwd.
     assert!(
-        !dir.path().join(".cyrup-subagent-scratch").exists(),
+        !cyrup_ext_subagents::background::attempt_scratch_dir(dir.path()).exists(),
         "no spawn-scratch directory may exist: the depth guard must reject before run_inner ever \
          reaches exec::run_sync for any step"
     );
@@ -1606,7 +1605,7 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
 
     let script = serde_json::json!({
         // Echo the child's real argv into its stdout stream, which `exec::run_sync` tees to
-        // `<cwd>/.cyrup-subagent-scratch/attempt-0.jsonl` (R-SA-058) — the crate's own standing
+        // `<attempt_scratch_dir(cwd)>/attempt-0.jsonl` (R-SA-058) — the crate's own standing
         // observation channel for "what argv did the child actually receive".
         "echo_argv": true,
         "steps": [
@@ -1712,8 +1711,10 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
          ahead of `--session-dir`), at {}",
         session_dir.display()
     );
-    let tee = std::fs::read_to_string(dir.path().join(".cyrup-subagent-scratch/attempt-0.jsonl"))
-        .expect("the R-SA-058 raw-stdout tee must exist");
+    let tee = std::fs::read_to_string(
+        cyrup_ext_subagents::background::attempt_scratch_dir(dir.path()).join("attempt-0.jsonl"),
+    )
+    .expect("the R-SA-058 raw-stdout tee must exist");
     assert!(
         tee.contains("--session-dir"),
         "the child's real argv must carry `--session-dir`: {tee}"

@@ -1201,6 +1201,18 @@ const ASYNC_SUBDIR: &str = "async";
 /// for the same reason as [`ASYNC_SUBDIR`].
 const RESULTS_SUBDIR: &str = "results";
 
+/// Path segment, under [`temp_root_dir`], holding the per-`cwd` directory `exec::run_sync` tees
+/// each spawn attempt's raw child stdout into (`attempt-<n>.jsonl`) and parks a run's
+/// structured-output capture file in. A third sibling of [`ASYNC_SUBDIR`]/[`RESULTS_SUBDIR`]
+/// (and of `crate::artifacts`' `artifacts`/`chain-runs` leaves) under the ONE run-scratch root.
+///
+/// SUBA-072: this tree used to be `<cwd>/.cyrup-subagent-scratch` — the only run-scratch path in
+/// the crate rooted in the PROJECT working tree. pi never writes per-spawn scratch there: every
+/// per-spawn file it creates goes under `os.tmpdir()` (`runs/shared/pi-args.ts:787`, `:802`,
+/// `:826`, `:841`, `:855` @v0.64.0, `fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"))`),
+/// and every persisted run tree hangs off `TEMP_ROOT_DIR` (`shared/types.ts:2689-2695` @v0.64.0).
+const SCRATCH_SUBDIR: &str = "scratch";
+
 /// One segment of a temp-scope id, with every character outside `[A-Za-z0-9._-]` collapsed to a
 /// single `-` and leading/trailing `-` stripped; an empty result becomes `"unknown"`.
 ///
@@ -1438,6 +1450,33 @@ pub fn run_artifact_roots_in(roots: &crate::paths::Roots, cwd: &Path) -> RunArti
         async_root: scratch.join(ASYNC_SUBDIR).join(&key),
         results_dir: scratch.join(RESULTS_SUBDIR).join(&key),
     }
+}
+
+/// The per-`cwd` directory `exec::run_sync` writes its per-attempt raw-stdout tee
+/// (`attempt-<n>.jsonl`) and structured-output capture file into:
+/// `<temp_root_dir>/scratch/<cwd_key>`.
+///
+/// SUBA-072: resolved from the SAME run-scratch root and keyed by the SAME [`cwd_key`] as the
+/// async/results roots ([`run_artifact_roots`]) and the artifacts/chain-runs roots
+/// ([`crate::artifacts`]), so a project's every run-scratch tree lives together under one
+/// per-`cwd` scope — never under the project's own working tree. With `CYRUP_HOME` unset (its
+/// only production state) that is `<os-temp>/cyrup-subagents-<scope>/scratch/<cwd_key>`, pi's
+/// `TEMP_ROOT_DIR` shape (`shared/types.ts:2689-2691` @v0.64.0); pi's own per-spawn scratch is
+/// likewise `os.tmpdir()`-rooted (`runs/shared/pi-args.ts:787` @v0.64.0).
+///
+/// `pub` because it is the crate's stated observation channel: the integration tests in
+/// `cyrup-it` read the tee back from exactly this path.
+#[must_use]
+pub fn attempt_scratch_dir(cwd: &Path) -> PathBuf {
+    attempt_scratch_dir_in(&crate::paths::Roots::from_env(), cwd)
+}
+
+/// [`attempt_scratch_dir`] against already-resolved roots — the pure core, hanging off
+/// [`crate::paths::Roots::run_scratch`] exactly as [`run_artifact_roots_in`] does. Pure path
+/// arithmetic; creation is the caller's job (`exec::run_sync` does it once per run).
+#[must_use]
+pub fn attempt_scratch_dir_in(roots: &crate::paths::Roots, cwd: &Path) -> PathBuf {
+    roots.run_scratch().join(SCRATCH_SUBDIR).join(cwd_key(cwd))
 }
 
 /// Reconstruct the SIBLING results-dir for an `async_root` produced by [`run_artifact_roots`],
@@ -3409,7 +3448,8 @@ mod tests {
         {
             let dot_cyrup = PathBuf::from(home).join(".cyrup");
             let derived = run_artifact_roots(Path::new("/some/project"));
-            for path in [&derived.async_root, &derived.results_dir] {
+            let scratch = attempt_scratch_dir(Path::new("/some/project"));
+            for path in [&derived.async_root, &derived.results_dir, &scratch] {
                 assert!(
                     !path.starts_with(&dot_cyrup),
                     "with no CYRUP_HOME sandbox, run scratch must never resolve into the real \
@@ -3424,6 +3464,45 @@ mod tests {
             os_temp,
         );
         assert_eq!(sandbox, PathBuf::from("/sandbox/.cyrup/subagents"));
+    }
+
+    /// SUBA-072: the per-attempt scratch dir is a THIRD sibling under the one run-scratch root —
+    /// `<run_scratch>/scratch/<cwd_key>` — keyed exactly like the async/results roots, and never
+    /// anywhere under the project `cwd` it is keyed by. Proven through the pure core against
+    /// sandboxed roots so an ambient `CYRUP_HOME` cannot make it vacuous.
+    #[test]
+    fn attempt_scratch_dir_is_a_cwd_keyed_leaf_of_the_run_scratch_root_never_the_project_tree() {
+        let roots = crate::paths::Roots::sandboxed(Path::new("/sandbox"));
+        let cwd = Path::new("/some/project");
+        let scratch = attempt_scratch_dir_in(&roots, cwd);
+
+        assert_eq!(
+            scratch,
+            PathBuf::from("/sandbox/.cyrup/subagents")
+                .join("scratch")
+                .join(cwd_key(cwd)),
+            "the scratch dir hangs off Roots::run_scratch under a `scratch` leaf keyed by cwd_key"
+        );
+        assert!(
+            !scratch.starts_with(cwd),
+            "the scratch dir must never be under the project working tree, got {scratch:?}"
+        );
+        let siblings = run_artifact_roots_in(&roots, cwd);
+        assert_eq!(
+            scratch.parent().and_then(Path::parent),
+            siblings.async_root.parent().and_then(Path::parent),
+            "scratch/async/results are siblings under the SAME root"
+        );
+        assert_eq!(
+            scratch.file_name(),
+            siblings.async_root.file_name(),
+            "and share the SAME per-cwd key"
+        );
+        // Two projects never share a scratch tree.
+        assert_ne!(
+            scratch,
+            attempt_scratch_dir_in(&roots, Path::new("/another/project"))
+        );
     }
 
     /// `sanitizeTempScopeSegment` (`shared/types.ts:1807-1812` @v0.43.0):

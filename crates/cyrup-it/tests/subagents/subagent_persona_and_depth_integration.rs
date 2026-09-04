@@ -5,7 +5,7 @@
 //! `tests/background_runner_main_integration.rs`).
 //!
 //! The single observation channel both tiers rely on is the per-attempt raw-stdout **tee**
-//! `exec::run_sync` writes for every spawned child (`<cwd>/.cyrup-subagent-scratch/attempt-0.jsonl`,
+//! `exec::run_sync` writes for every spawned child (`<attempt_scratch_dir(cwd)>/attempt-0.jsonl`,
 //! R-SA-058): `consume_stdout` tees EVERY raw line — including the fixture's `echo_argv`/`echo_env`
 //! NDJSON lines — so a test can read back exactly what argv and env the real child actually
 //! received, which is what makes the persona's system prompt / tool allowlist (T0.1) and the child's
@@ -75,7 +75,7 @@ fn message_end_line(text: &str) -> String {
 /// attempt of a step whose child ran in `cwd`. The tee holds every raw NDJSON line the real child
 /// emitted, including the fixture's `echo_argv`/`echo_env` lines.
 fn read_attempt_tee(cwd: &Path) -> String {
-    let path = cwd.join(".cyrup-subagent-scratch").join("attempt-0.jsonl");
+    let path = cyrup_ext_subagents::background::attempt_scratch_dir(cwd).join("attempt-0.jsonl");
     std::fs::read_to_string(&path).unwrap_or_default()
 }
 
@@ -815,7 +815,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
          {result_file:?}"
     );
     assert!(
-        !dir.path().join(".cyrup-subagent-scratch").exists(),
+        !cyrup_ext_subagents::background::attempt_scratch_dir(dir.path()).exists(),
         "no spawn-scratch dir may exist: the guard must reject before any step reaches run_sync's \
          spawn setup"
     );
