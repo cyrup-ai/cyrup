@@ -109,6 +109,7 @@ corrections are applied and recorded at the item.
 | ~~SUBA-088~~ | ~~medium~~ **CLOSED 2026-09-04** | M | config / discovery / model ladder | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; two citation corrections and one impact correction) **and ported at `ba24e5e5`**: `subagents.defaultProvider` + per-agent `agentOverrides.<name>.defaultProvider` parse with upstream's messages, `AgentDefinition::model_provider` stamped per `applySubagentDefaultModel`, the ladder takes `agent.model_provider ?? parent-session provider` and QUALIFIES a bare id to `provider/id` on the child's `--model`, the `models` report resolves per agent. Residuals (low): v0.64.0's `providerOverrides` and the discovery-cache provider key are not ported; a qualified id the provider does not offer fails in the child rather than at the parent |
 | ~~SUBA-089~~ | ~~medium~~ **CLOSED 2026-09-04** | S | model-fallback ladder (foreground + background) | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.47.1, v0.57.0 and v0.64.0; confirmed exactly as filed, one correction: the filing's "retryable patterns present and correct" missed that the same upstream commit added the `connection` + whitespace + `error`/`reset`/`closed`/`aborted` pattern) **and ported at `cde2ddfc`**: `is_retryable_model_failure_attempt` is the ladder's sole retry gate — `tool_count > 0` never re-dispatches, the two empty-output sentinels, the no-activity clause, and per-message `errorMessage` corroboration over the new `AttemptSignal::message_errors`; the connection pattern lands with it. Residual (low): cyrup never emits the v0.64.0 terminal-stopReason sentinel it now recognises |
 | ~~SUBA-090~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | S | background completion notify / `display` | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.43.0, v0.57.0 and v0.64.0; confirmed exactly as filed — predicate verbatim at all three tags, `scheduleOrigin` clause the only tag-to-tag change) **and ported at `79ee7eff`**: `completion_notice_display(ClassifiedOutcome)` is pi's `notify.ts:402` predicate reduced to its one cyrup-reachable clause (`status !== "completed"`), `format_completion_message` computes `display` from the same `classify_outcome` that picks the header word, the false "Always `true`" doc is gone, `trigger_turn` stays `true` (no `triggerTurn:false` input exists). **Residual (medium, area 08/03 seam, not this crate):** on the trigger-turn path `session-svc inject.rs:125-160` drops `display` (`AgentMessage::Custom` has no such field) so the hidden notice still renders on screen; the grouped `formatGroupedCompletion` form stays with `SUBA-017` |
+| ~~SUBA-091~~ | ~~medium~~ **CLOSED 2026-09-04** | S | fleet inspector / transcript containment | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0 plus the upstream landing commit `9ceb5650`; confirmed exactly as filed, line drift only) **and ported at `681f6255`**: `FleetState::trusted_session_roots` is pi's `state.trustedSessionRoots` (`index.ts:895-898`: `defaultSessionDir` tilde-expanded + resolved, then the parent's subagent session root, deduped), seeded by `SubagentExecutor::fleet_state` through the pure `paths::trusted_session_roots`, and `async_detail` passes `unique_paths(state.trusted_session_roots)` where the literal `&[]` was, so the session-JSONL tail renders in the detail pane; the containment gate is unchanged. Residuals (low): pi's `trustedSessionFiles`/`trustedSessionFileRoot` rung and `trackedJob?.sessionRoot` are not carried; `subagent status`'s cyrup-original root triple differs from pi's `trustedSessionRootsForStatus` |
 | ~~SUBA-092~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / agent schema | `excludeTools:`/`allowNestedSubagents:` ported at `247ff97b` — frontmatter, settings-override, serializer, and the spawn-plan tool subtraction / nested-fanout grant. v0.64.0's cross-field custom-override precedence change (`31562d76`) is a recorded residual, not this row |
 
 > **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
@@ -189,8 +190,9 @@ corrections are applied and recorded at the item.
 >   from the base commit's own files). Every implementer hit it and reverted the churn by hand.
 >   Repo-level decision, ownerless.
 
-Carried-but-unverified (`## Carried — NOT adversarially verified`): **one row, medium** —
-`SUBA-091`. (The three highs that sat here,
+Carried-but-unverified (`## Carried — NOT adversarially verified`): **no rows remain** — the last,
+`SUBA-091`, was promoted, confirmed and CLOSED on 2026-09-04 at `681f6255` — see `## ~~SUBA-091~~`.
+(The three highs that sat here,
 `SUBA-082`/`SUBA-084`/`SUBA-086`, were promoted and closed on 2026-09-04 — see the blockquote
 above; `SUBA-087` was promoted, confirmed and PARTIALLY CLOSED on 2026-09-04 at `2d9d0d0a` — see
 `## ~~SUBA-087~~`; `SUBA-088` was promoted, confirmed and CLOSED on 2026-09-04 at `ba24e5e5` — see
@@ -198,10 +200,10 @@ above; `SUBA-087` was promoted, confirmed and PARTIALLY CLOSED on 2026-09-04 at 
 `## ~~SUBA-089~~`; `SUBA-090` was promoted, confirmed and PARTIALLY CLOSED on 2026-09-04 at
 `79ee7eff` — see `## ~~SUBA-090~~`.) All were re-checked port-side at cyrup HEAD `2571969` this
 pass: every zero-hit grep this file recorded for them still returns zero hits — none of the 210
-commits since baseline `4fb5e40` touched any of these symbols/behaviours. The one remaining is left exactly as filed,
-still held to the lower evidence standard the section header states (upstream line numbers not
-re-verified) — no pass has yet re-read `git show v0.57.0:<path>` for any of them, only the cyrup
-side.
+commits since baseline `4fb5e40` touched any of these symbols/behaviours. Each was then held to
+the confirmed bar (upstream re-read with `git show` at the named tags) BEFORE its port landed, so
+the section's lower evidence standard no longer applies to any live row; the section is kept as a
+record with one-line pointers.
 Refuted: `SUBA-080`.
 
 ---
@@ -1930,13 +1932,169 @@ alone and in the `background::` group. Directory-order dependence, not this row.
 
 ---
 
+## ~~SUBA-091~~ — ~~medium~~ **CLOSED 2026-09-04** — The fleet inspector passes an EMPTY trusted-root list to the transcript reader, so the session-transcript fallback always refuses
+
+> **PROMOTED OUT OF `## Carried — NOT adversarially verified`, CONFIRMED EXACTLY AS FILED, AND
+> CLOSED 2026-09-04 — landing commit `681f6255` (code), parent `6e9da1b0`; this row written in a
+> separate docs commit after the implementer's own row edit was lost.** Upstream re-read with `git
+> show` at v0.57.0 and v0.64.0, and the upstream landing commit `9ceb5650` (`fix: pass trusted
+> session roots to fleet transcripts (#1174)`, 2026-08-15, first tag v0.51.0 — inside the filed
+> v0.47.1..v0.57.0 window) read as a diff. Every filed upstream shape resolves: the `asyncDetail(item,
+> state)` call is byte-identical at `v0.57.0:src/tui/fleet.ts:544-554` and
+> `v0.64.0:src/tui/fleet.ts:550-560` (`sessionRoots:` at `:551` / `:557`); before `9ceb5650` it was
+> `formatAsyncRunTranscript(status, item.run.asyncDir, { index: item.index, lines: TRANSCRIPT_LINES })`
+> — the shape the port still had. **No correction to the filing; line drift only:** the port call
+> had moved from the filed `fleet.rs:842-848` to `:884-890` under the workspace rustfmt pass, and the
+> containment gate from `fleet_view.rs:143-161` to `:163-177` (`read_session_transcript_tail`
+> `:618-632` → `:685-701`). **Port-side at `6e9da1b0`, before the change:** `tui/fleet.rs:889` `&[]`
+> as the `session_roots` argument, no `[CYRUP-DELTA]` note; `rg 'trusted_session_roots|
+> trusted_session_file' crates/cyrup-ext-subagents/src` → 0; `FleetState` (`tui/fleet_state.rs:
+> 438-474`) had no roots field and `AsyncRunView` (`:372-390`) no `session_root`; `detail_lines(item,
+> error)` (`:931`) and its one caller (`:1901`) were the only route into `async_detail`. **One
+> refinement to the filed fix, not to the finding:** the filing proposed reusing `status.rs`'s
+> `transcript_session_roots` resolver; that triple is `[async root, project subagents dir, temp
+> artifacts dir]` — artifact directories pi's fleet does NOT trust — so the port seeds pi's own
+> `state.trustedSessionRoots` composition and the status path's differing triple is residual (3).
+> Severity `medium` stands; effort S was exact. Port target v0.64.0.
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed (2026-09-04, both tags + upstream landing commit)
+**Subsystem** fleet inspector / transcript containment
+**Window** v0.47.1..v0.57.0 · `9ceb5650 (#1174)`, first tag v0.51.0
+
+**upstream (v0.64.0)** — `src/tui/fleet.ts:550-560`:
+```ts
+function asyncDetail(item: Extract<FleetItem, { kind: "async" }>, state: SubagentState): string[] {
+	const status = readStatus(item.run.asyncDir);
+	if (status) {
+		const trackedJob = state.fleetJobs?.get(item.runId) ?? state.asyncJobs.get(item.runId);
+		const lines = formatAsyncRunTranscript(status, item.run.asyncDir, {
+			index: item.index,
+			lines: TRANSCRIPT_LINES,
+			sessionRoots: uniquePaths([...(state.trustedSessionRoots ?? []), trackedJob?.sessionRoot]),
+			trustedSessionFiles: [item.step?.sessionFile ?? item.run.sessionFile].filter((value): value is string => Boolean(value)),
+			trustedSessionFileRoot: state.trustedSessionFileRoot,
+		}).split("\n");
+```
+`:606-617` `detailLines(item, error, state)` (`v0.57.0:600-611`) threads `state` into the async arm only; `:629-631`
+`uniquePaths` (`path.resolve` + `Set`). `src/extension/index.ts:447` `trustedSessionRoots: []` at
+state construction, re-seeded on every session start at `:895-898`:
+```ts
+state.trustedSessionRoots = [...new Set([
+	...(config.defaultSessionDir ? [path.resolve(expandTilde(config.defaultSessionDir))] : []),
+	...(state.parentSessionFile ? [getSubagentSessionRoot(state.parentSessionFile)] : []),
+])];
+```
+`:283-290` `getSubagentSessionRoot(parentSessionFile)` = `path.join(path.dirname(parent),
+path.basename(parent, ".jsonl"))` when a parent exists (else a `mkdtempSync` temp dir — a branch
+`:897`'s guard never reaches); `:894` `trustedSessionFileRoot = parentSessionFile ?
+path.join(getAgentDir(), "sessions") : undefined`. Consumer: `src/runs/background/fleet-view.ts:252`
+`readSessionTranscriptTail(sessionFile, maxLines, trustedRoots, trustedFiles = [], trustedFileRoot?)`
+→ `readContainedTextTail(.., trustedRoots, "session", ..)`, whose gate at `:135` is
+`trustedRoots.length === 0 && (!trustedFileRoot || trustedFiles.length === 0)` → `Refusing to read
+session transcript path without a trusted root: …`; the two call sites `:542` (per-step) and `:573`
+(run-level) pass `options.sessionRoots ?? []`. `trackedJob.sessionRoot` is
+`getSubagentSessionRoot(parentSessionFile)` at spawn (`src/runs/foreground/subagent-executor.ts:
+1687,1941,2043`), recorded in `status.json` (`async-status.ts:416`) and the tracker
+(`async-job-tracker.ts:171`). Test: `test/unit/fleet.test.ts:1028` "passes current-session trusted
+roots to async session transcript fallback" (added by `9ceb5650`). **v0.57.0 → v0.64.0:** no change
+to the call or the seeding; the `fleet.ts` lines above are the same lines re-numbered (+6).
+
+**cyrup (at `681f6255`, == HEAD)** — `crates/cyrup-ext-subagents/src/tui/fleet_state.rs:452-459`
+`FleetState::trusted_session_roots: Vec<PathBuf>` (pi `state.trustedSessionRoots`; the doc cites
+`index.ts:447`/`:895-898`). `src/extension/executor/paths.rs:150-162` `subagent_session_root(parent)`
+(`index.ts:283-290`, present-parent branch only — the `mkdtemp` branch is unreachable from a
+trusted-root seed and the doc says so) and `:180-195` `trusted_session_roots(default_session_dir,
+parent_session_file)` (`index.ts:895-898`: `expand_tilde` + `resolve_against_process_cwd` (`:204`)
+= Node's `path.resolve`, an empty configured value is pi's falsy `defaultSessionDir`, the parent rung
+deduped against the first — pure, no I/O). `src/extension/executor/status.rs:246-249`
+`SubagentExecutor::fleet_state` seeds the field from the config snapshot's `default_session_dir` and
+the live `HostServices::session_file()` (the snapshot is now taken once, `:234`, where it was taken
+twice). `src/tui/fleet.rs:894-899` `async_detail(item, run, step_index, state)` passes
+`&unique_paths(state.trusted_session_roots …)` (`:909-916`) where the literal `&[]` was; `:960-964`
+`detail_lines(item, error, state)` (pi `:606-617`) and its caller `SubagentFleetComponent` at
+`:1934-1938` pass `&self.state`; the doc at `:877-892` carries the `[CYRUP-DELTA]` note for the
+unported `trustedSessionFiles`/`trustedSessionFileRoot` rung (residual 1). `unique_paths`
+(`:1036-1047`) is pi's `uniquePaths`. The containment gate itself is unchanged:
+`src/background/fleet_view.rs:163-177` `read_contained_text_tail` still refuses an empty root list
+and any file outside every root; `:685-701` `read_session_transcript_tail`; `:817` / `:909-918`
+`format_async_run_transcript`'s third rung. (Two in-code citations are off, doc-only, not changed by this row: `fleet.rs:877` cites
+`asyncDetail` as `fleet.ts:551-585` — its first line is `:550`; `fleet.rs:957` cites `detailLines` as
+`fleet.ts:588-599` @v0.64.0 — it is `:606-617` (`:588` is inside `externalDetail`).)
+
+**Design decision (recorded per DESIGN-GUIDANCE, in the commit body):** no new type — the roots are
+a plain `Vec<PathBuf>` like the sibling `TranscriptTarget::trusted_roots` (`fleet.rs:1032`) and the
+existing `session_roots: &[PathBuf]` parameter; the invariant (absolute, deduplicated, pi's order) is
+produced by one pure seeding function kept out of the executor's I/O, which is where pi computes it
+(`index.ts:895-898`). Rejected: (a) unioning `SubagentExecutor::transcript_session_roots`'s
+cyrup-original triple into the fleet roots — artifact directories, not session roots, and pi's fleet
+does not trust them; (b) adding `session_root` to `AsyncRunView`/`TrackedJob` to mirror
+`trackedJob?.sessionRoot` — cyrup's `RunStatus` records no session root (`rg session_root
+src/background` → 0), and for a run of the current session pi's value IS the parent rung the state
+already lists (`subagent-executor.ts:1687`), so the union would add nothing (the restored-run case
+is residual 2); (c) copying the roots onto `FleetSnapshot` — the component already owns `state`, and
+pi threads `state` through `detailLines`.
+
+**Tests (RED established by the implementer by restoring the `&[]` argument with everything else in
+place — both fleet tests fail with the `without a trusted root` refusal; GREEN with the real
+argument; the other four fail pre-fix by construction, the symbols did not exist; this ledger pass
+re-ran the six by name at `681f6255`: 6/6 pass):**
+`tui::fleet::tests::async_detail_reads_the_session_transcript_tail_inside_a_trusted_session_root`
+(pi's `fleet.test.ts:1028` case: a run recording only a session JSONL under a trusted root renders
+`assistant: TRUSTED SESSION FALLBACK` under `Session transcript tail from <file>` with neither
+`without a trusted root` nor `Session read failed`),
+`…::async_detail_still_refuses_a_session_file_outside_every_trusted_root` (a file outside every
+root → `Warnings:` + `Session read failed for … outside trusted roots` + `(no transcript lines
+available yet)`, contents never leaked; an empty root list → `without a trusted root`, pi's `[]`
+default at `index.ts:447`);
+`extension::executor::paths::tests::subagent_session_root_is_the_parents_dir_joined_with_its_jsonl_less_basename`,
+`…::trusted_session_roots_are_pis_two_rungs_in_pis_order`,
+`…::trusted_session_roots_expand_tilde_resolve_relative_dedupe_and_start_empty`;
+`extension::executor::status::tests::fleet_state_seeds_trusted_session_roots_from_the_configured_default_session_dir`.
+Checks at `681f6255`: `cargo fmt --all -- --check`, `cargo clippy -p cyrup-ext-subagents
+--all-targets -- -D warnings` — clean (both re-run by this ledger pass); the landing commit
+additionally reports `RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-ext-subagents --no-deps` clean
+and `cargo nextest run -p cyrup-ext-subagents --no-fail-fast` 2723/2724, the one failure
+`SUBA-087`'s pre-existing ordering flake (`SUBA-090` residual 3), untouched file, passes alone.
+
+**Falsification** — with `subagents.defaultSessionDir` configured and a background run whose
+`status.json` records a `sessionFile` under it but has no `output-<i>.log` and an empty
+`recentOutput`, opening the run in the fleet inspector must show `Session transcript tail from
+<file>` followed by the JSONL tail and no `Warnings:` block; the same run with its session file
+outside every trusted root must show `Session read failed for … outside trusted roots` and never
+its contents. Either failing reopens the row.
+
+**Residuals — recorded, not closed by this row.** (1) **low — the `trustedSessionFiles` /
+`trustedSessionFileRoot` rung** (`fleet.ts:558-559`; `fleet-view.ts:252`, gate `:135`; seeded at
+`index.ts:894`, v0.57.0+): pi additionally permits the run's own recorded `sessionFile` when it sits
+under `<agentDir>/sessions`, even with `trustedSessionRoots` empty. `format_async_run_transcript`
+has no such parameters and `read_contained_text_tail`'s gate is roots-only, so a session file
+recorded directly under the Pi sessions base (not under a subagent session root or
+`defaultSessionDir`) is refused where pi reads it. (2) **low — `trackedJob?.sessionRoot`**
+(`fleet.ts:557`; `status.json` `sessionRoot`, `async-status.ts:416`): a run restored from a
+PREVIOUS parent session carries that parent's subagent session root in pi and is trusted through the
+tracker; cyrup's `RunStatus` and `TrackedJob` record no session root, so only the current parent's
+rung is trusted. (3) **low — `subagent status view:transcript` root composition**
+(`status.rs:413-425` `transcript_session_roots` = `[async root, project subagents dir, temp
+artifacts dir]`, cyrup-original) differs from pi's `trustedSessionRootsForStatus`
+(`subagent-executor.ts:576-581` = `defaultSessionDir` + the parent's subagent session root — the
+same pair the fleet now uses): the two cyrup consumers trust different roots. A separate fidelity
+question for the status path, flagged by the verifier. (4) **note, not a gap:** the parent-session
+rung is seeded for parity, but at HEAD no cyrup child writes under it — `foreground.rs:640-647`
+(`[CYRUP-DELTA]`) runs a child with neither an explicit `sessionDir` nor a configured
+`default_session_dir` under `--no-session` — so the configured-directory rung is the one the tests
+exercise. (5) **ledger tooling, for the final ledger agent:**
+`docs/gap-analysis/scripts/count_open_items.py:379` still hand-enumerates `carried_medium =
+["SUBA-087", …, "SUBA-091"]`; all five are now table rows and would count twice.
+
+---
+
 ## Carried — NOT adversarially verified
 
 > **2026-09-04: three of the eight rows this section was written for — `SUBA-082`, `SUBA-084`,
 > `SUBA-086` — were held to the confirmed bar, confirmed, ported and CLOSED; each now has a full
 > section in the confirmed set above (in id order) and only a pointer remains here; `SUBA-087`,
-> `SUBA-088`, `SUBA-089` and `SUBA-090` followed the same day. The one below is unchanged and still
-> carried at this section's lower standard.**
+> `SUBA-088`, `SUBA-089`, `SUBA-090` and — last — `SUBA-091` (`681f6255`) followed the same day.
+> Nothing is carried at this section's lower standard any more; the pointers below are the record.**
 
 > **READ THIS BEFORE ACTING ON ANYTHING IN THIS SECTION.** The refutation pass for this batch was
 > capped at twelve items. The eight items below were produced by the same analyst lenses as the
@@ -1965,36 +2123,7 @@ alone and in the `background::` group. Directory-order dependence, not this row.
 
 ### ~~SUBA-090~~ — **PROMOTED AND PARTIALLY CLOSED 2026-09-04** — see `## ~~SUBA-090~~` in the confirmed set above (landing commit `79ee7eff`)
 
-### SUBA-091 — The fleet inspector passes an EMPTY trusted-root list to the transcript reader, so the session-transcript fallback always refuses
-
-**Severity** medium (as filed) · **Effort** S · **Window** v0.47.1..v0.57.0 · `9ceb5650 (#1174)`
-
-*Upstream, as filed (unverified):* `src/tui/fleet.ts`'s `asyncDetail(item, state)` calls
-`formatAsyncRunTranscript(status, item.run.asyncDir, { index, lines: TRANSCRIPT_LINES, sessionRoots: uniquePaths([...(state.trustedSessionRoots ?? []), trackedJob?.sessionRoot]), trustedSessionFiles: [...], trustedSessionFileRoot: state.trustedSessionFileRoot })`.
-`sessionRoots` is exactly what `readSessionTranscriptTail` confines its read to. Landed as
-`9ceb5650 fix: pass trusted session roots to fleet transcripts (#1174)`; before it the call omitted
-`sessionRoots`, which is the state the port is still in.
-
-*Port (re-verified at HEAD):* `crates/cyrup-ext-subagents/src/tui/fleet.rs:842-848` —
-`format_async_run_transcript(&run.status, &run.paths, step_index, Some(TRANSCRIPT_LINES as i64), &[])`
-— the final `session_roots` argument is **a literal empty slice**, with no `[CYRUP-DELTA]` note in
-`fleet.rs` justifying it. `src/background/fleet_view.rs:143-161 read_contained_text_tail` opens with
-`if trusted_roots.is_empty() { return TextTail::failed(path, format!("Refusing to read {label} transcript path without a trusted root: {}", path.display())); }`,
-and `read_session_transcript_tail` (`:618-632`) turns that into a `Warnings:` line.
-`grep -rn 'trusted_session_roots\|trusted_session_file' --include=*.rs` → 0, so no plumbed equivalent
-exists on the fleet side — **but the resolver already exists for the other consumer**:
-`src/extension/executor/status.rs:389-396 transcript_session_roots(cwd)` builds
-`[default_async_root, project_subagents_dir, temp_artifacts_dir]` and passes it at `:359`.
-
-*Behaviour gap:* when a background run has no readable output log — its `output-*.log` is missing, or
-the run only ever recorded a session file — upstream falls back to the child's session-JSONL tail and
-shows it in the fleet inspector's detail pane. The port instead emits a `Warnings:` block saying it
-refuses to read the path for lack of a trusted root, then shows
-`(no transcript output captured yet)` — on a run whose transcript is on disk and which the port's own
-`subagent status` path reads fine.
-
-*Relation:* new. Same file as `SUBA-080` (refuted) but a different defect — argument value, not
-missing sanitization. The fix is one call-site change reusing `status.rs:389`'s existing resolver.
+### ~~SUBA-091~~ — **PROMOTED AND CLOSED 2026-09-04** — see `## ~~SUBA-091~~` in the confirmed set above (landing commit `681f6255`)
 
 ---
 
@@ -2162,7 +2291,8 @@ define `safeTranscriptLines` and apply it at four sites; `run-status.ts` applies
   → 0 hits — i.e. the neutralization is not a duplicated in-crate copy, it is the host's.
 
 **Verdict:** a different shape achieving the same observable behaviour. Not a gap. Note that
-`SUBA-091` is a *different* defect in the same function and remains open.
+`SUBA-091` was a *different* defect in the same function; it was confirmed and CLOSED at `681f6255` on
+2026-09-04 (see `## ~~SUBA-091~~`).
 
 ---
 
