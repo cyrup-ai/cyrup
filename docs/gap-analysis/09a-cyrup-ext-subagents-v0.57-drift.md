@@ -1552,7 +1552,9 @@ as upstream accepted it.
 ## ~~SUBA-088~~ — ~~medium~~ **CLOSED 2026-09-04** — `subagents.defaultProvider` and per-agent `modelProvider` are unported, and the foreground launch path passes no preferred provider into candidate resolution at all
 
 > **PROMOTED OUT OF `## Carried — NOT adversarially verified`, CONFIRMED WITH THREE CORRECTIONS,
-> AND CLOSED 2026-09-04 — landing commit `ba24e5e5` (code), on top of `615bbb1d`.** Upstream re-read
+> AND CLOSED 2026-09-04 — landing commit `ba24e5e5` (code), parent `16edcde2`; port-side evidence
+> measured at `615bbb1d`, and neither intervening commit (`c02f1f30`, `16edcde2`) touches
+> `crates/cyrup-ext-subagents`.** Upstream re-read
 > with `git show` at BOTH tags. The five type fields and `applySubagentDefaultModel` are exactly as
 > filed at v0.57.0 (`agents.ts:86,116,132,177,1155-1168`). **Two citation errors:** the filed
 > `v0.57.0:agents.ts:997-1004` and `:1045-1051` land in the `toolBudget` override parse and the head of
