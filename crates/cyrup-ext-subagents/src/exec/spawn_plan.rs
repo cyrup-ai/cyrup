@@ -3283,7 +3283,10 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert_eq!(
-            crate::exec::tool_budget::decode_tool_budget_env(Some(&encoded)),
+            crate::exec::tool_budget::decode_tool_budget_env(
+                Some(&encoded),
+                crate::exec::tool_budget::HardMinimum::One,
+            ),
             Ok(Some(budget)),
             "the child must receive the SAME validated budget; overlay was {:?}",
             plan.spec.env_overlay
@@ -3544,7 +3547,8 @@ mod tests {
                 plan.spec
                     .env_overlay
                     .get(crate::exec::tool_budget::TOOL_BUDGET_ENV)
-                    .map(String::as_str)
+                    .map(String::as_str),
+                crate::exec::tool_budget::HardMinimum::One,
             ),
             Ok(Some(budget)),
             "G89: a background/chain/parallel child must receive the SAME validated tool budget; \

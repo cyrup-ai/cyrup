@@ -28,6 +28,48 @@ pub const DEFAULT_TOOL_BUDGET_BLOCK: [&str; 4] = ["read", "grep", "find", "ls"];
 /// `CYRUP_SUBAGENT_*` rename.
 pub const TOOL_BUDGET_ENV: &str = "CYRUP_SUBAGENT_TOOL_BUDGET";
 
+/// pi `TOOL_BUDGET_ZERO_AUTH_ENV` (`tool-budget.ts:5`, `PI_SUBAGENT_TOOL_BUDGET_ZERO_AUTH`, added
+/// at v0.36.0) under the same rename: the parent's authorisation for a `hard: 0` budget — "this
+/// child may make no tool calls at all" — which is otherwise rejected on decode exactly as any
+/// other `hard < 1`. Written `"1"` or not at all (`pi-args.ts:1032` @v0.64.0), read child-side by
+/// [`HardMinimum::from_env`] (`subagent-prompt-runtime.ts:693`).
+///
+/// No `PI_` read alias, matching its sibling [`TOOL_BUDGET_ENV`] in this module: both are written
+/// by THIS crate's parent into the child env, never expected from an operator's shell.
+pub const TOOL_BUDGET_ZERO_AUTH_ENV: &str = "CYRUP_SUBAGENT_TOOL_BUDGET_ZERO_AUTH";
+
+/// pi's `options.minimumHard?: 0 | 1` on `validateToolBudgetConfig` (`tool-budget.ts:16, 21`):
+/// the lowest `hard` a budget may declare. Upstream's type admits exactly these two values, so the
+/// Rust side is a two-variant enum rather than an integer that would accept `7`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HardMinimum {
+    /// The default: a budget must allow at least one tool call.
+    #[default]
+    One,
+    /// Authorised by [`TOOL_BUDGET_ZERO_AUTH_ENV`]: a `hard: 0` budget is legal and blocks the
+    /// child's FIRST call to any blocked tool.
+    Zero,
+}
+
+impl HardMinimum {
+    /// pi `{ allowZero: process.env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" }`
+    /// (`subagent-prompt-runtime.ts:693`) — exact string equality, no trim, as upstream.
+    #[must_use]
+    pub fn from_env(get: &dyn Fn(&str) -> Option<String>) -> Self {
+        match get(TOOL_BUDGET_ZERO_AUTH_ENV).as_deref() {
+            Some("1") => Self::Zero,
+            _ => Self::One,
+        }
+    }
+
+    const fn floor(self) -> u32 {
+        match self {
+            Self::One => 1,
+            Self::Zero => 0,
+        }
+    }
+}
+
 /// pi `normalizeToolBudgetBlock` (`tool-budget.ts:7-11`): `"*"` passes through; an omitted list
 /// becomes the default block list; an explicit list is trimmed, emptied-out entries dropped, and
 /// de-duplicated with FIRST-occurrence order preserved (JS `new Set(...)` iteration order).
@@ -70,6 +112,21 @@ pub fn validate_tool_budget_config(
     raw: Option<&serde_json::Value>,
     label: &str,
 ) -> Result<Option<ResolvedToolBudget>, String> {
+    validate_tool_budget_config_with(raw, label, HardMinimum::One)
+}
+
+/// [`validate_tool_budget_config`] with pi's `options.minimumHard` made explicit
+/// (`tool-budget.ts:13-24`): the `hard` floor is `minimum`, and the rejection message interpolates
+/// it (`${label}.hard must be an integer >= ${minimumHard}.`) exactly as upstream.
+///
+/// # Errors
+/// As [`validate_tool_budget_config`], with the `hard` floor lowered to `0` under
+/// [`HardMinimum::Zero`].
+pub fn validate_tool_budget_config_with(
+    raw: Option<&serde_json::Value>,
+    label: &str,
+    minimum: HardMinimum,
+) -> Result<Option<ResolvedToolBudget>, String> {
     let Some(raw) = raw else {
         return Ok(None);
     };
@@ -79,12 +136,13 @@ pub fn validate_tool_budget_config(
         ));
     };
 
+    let floor = minimum.floor();
     let hard = match obj.get("hard") {
         Some(v) => match as_positive_integer(v) {
-            Some(n) if n >= 1 => n,
-            _ => return Err(format!("{label}.hard must be an integer >= 1.")),
+            Some(n) if n >= floor => n,
+            _ => return Err(format!("{label}.hard must be an integer >= {floor}.")),
         },
-        None => return Err(format!("{label}.hard must be an integer >= 1.")),
+        None => return Err(format!("{label}.hard must be an integer >= {floor}.")),
     };
 
     let soft = match obj.get("soft") {
@@ -202,7 +260,10 @@ pub fn encode_tool_budget_env(budget: Option<&ResolvedToolBudget>) -> Option<Str
     budget.and_then(|b| serde_json::to_string(b).ok())
 }
 
-/// pi `decodeToolBudgetEnv` (`tool-budget.ts:74-80`): parse and re-validate the env payload.
+/// pi `decodeToolBudgetEnv(value, { allowZero })` (`tool-budget.ts:74-80`): parse and re-validate
+/// the env payload, with `minimum` standing for upstream's `allowZero ? { minimumHard: 0 } :
+/// undefined` — the caller states the authorisation at the call site rather than this function
+/// reading the env for it.
 ///
 /// A blank/absent value is `Ok(None)`. Unlike pi (which lets `JSON.parse` throw), a MALFORMED
 /// payload is reported through the same `Err(String)` channel as a semantically-invalid one — the
@@ -210,14 +271,17 @@ pub fn encode_tool_budget_env(budget: Option<&ResolvedToolBudget>) -> Option<Str
 ///
 /// # Errors
 /// Returns the validation message when the payload is not JSON or fails
-/// [`validate_tool_budget_config`].
-pub fn decode_tool_budget_env(value: Option<&str>) -> Result<Option<ResolvedToolBudget>, String> {
+/// [`validate_tool_budget_config_with`].
+pub fn decode_tool_budget_env(
+    value: Option<&str>,
+    minimum: HardMinimum,
+) -> Result<Option<ResolvedToolBudget>, String> {
     let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
     let parsed: serde_json::Value = serde_json::from_str(value)
         .map_err(|err| format!("{TOOL_BUDGET_ENV} is not valid JSON: {err}"))?;
-    validate_tool_budget_config(Some(&parsed), TOOL_BUDGET_ENV)
+    validate_tool_budget_config_with(Some(&parsed), TOOL_BUDGET_ENV, minimum)
 }
 
 #[cfg(test)]
@@ -380,10 +444,16 @@ mod tests {
         .expect("valid")
         .expect("some");
         let encoded = encode_tool_budget_env(Some(&budget)).expect("encodes");
-        assert_eq!(decode_tool_budget_env(Some(&encoded)), Ok(Some(budget)));
+        assert_eq!(
+            decode_tool_budget_env(Some(&encoded), HardMinimum::One),
+            Ok(Some(budget))
+        );
         assert_eq!(encode_tool_budget_env(None), None);
-        assert_eq!(decode_tool_budget_env(None), Ok(None));
-        assert_eq!(decode_tool_budget_env(Some("   ")), Ok(None));
+        assert_eq!(decode_tool_budget_env(None, HardMinimum::One), Ok(None));
+        assert_eq!(
+            decode_tool_budget_env(Some("   "), HardMinimum::One),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -394,15 +464,80 @@ mod tests {
                 .expect("some");
         let encoded = encode_tool_budget_env(Some(&budget)).expect("encodes");
         assert!(encoded.contains("\"block\":\"*\""), "encoded: {encoded}");
-        assert_eq!(decode_tool_budget_env(Some(&encoded)), Ok(Some(budget)));
+        assert_eq!(
+            decode_tool_budget_env(Some(&encoded), HardMinimum::One),
+            Ok(Some(budget))
+        );
     }
 
     #[test]
     fn a_malformed_env_payload_is_an_error_not_a_panic() {
-        assert!(decode_tool_budget_env(Some("{not json")).is_err());
+        assert!(decode_tool_budget_env(Some("{not json"), HardMinimum::One).is_err());
         assert_eq!(
-            decode_tool_budget_env(Some("{\"hard\": 0}")),
+            decode_tool_budget_env(Some("{\"hard\": 0}"), HardMinimum::One),
             Err(format!("{TOOL_BUDGET_ENV}.hard must be an integer >= 1."))
         );
+    }
+
+    /// CFG-067 / pi `validateToolBudgetConfig(raw, label, { minimumHard: 0 })`
+    /// (`tool-budget.ts:16-24` @v0.64.0): the SAME `hard: 0` payload is rejected by default and
+    /// accepted once the parent authorised zero — and the floor is interpolated into the message.
+    /// Before this port `decode_tool_budget_env` had no authorisation input at all, so a zero
+    /// budget was indistinguishable from a malformed one (the assertion just above was the only
+    /// behaviour).
+    #[test]
+    fn a_zero_hard_budget_is_rejected_unless_the_parent_authorised_it() {
+        let zero = v("{\"hard\": 0}");
+        assert_eq!(
+            validate_tool_budget_config_with(Some(&zero), "toolBudget", HardMinimum::One),
+            Err("toolBudget.hard must be an integer >= 1.".to_string())
+        );
+        let accepted =
+            validate_tool_budget_config_with(Some(&zero), "toolBudget", HardMinimum::Zero)
+                .expect("authorised zero is valid")
+                .expect("some");
+        assert_eq!(accepted.hard, 0);
+        assert_eq!(
+            decode_tool_budget_env(Some("{\"hard\": 0}"), HardMinimum::Zero),
+            Ok(Some(accepted))
+        );
+        // A negative `hard` is still rejected under the lowered floor, with the floor in the text.
+        assert_eq!(
+            validate_tool_budget_config_with(
+                Some(&v("{\"hard\": -1}")),
+                "toolBudget",
+                HardMinimum::Zero
+            ),
+            Err("toolBudget.hard must be an integer >= 0.".to_string())
+        );
+    }
+
+    /// pi `process.env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1"` (`subagent-prompt-runtime.ts:693`):
+    /// exact equality — `"true"`, `" 1"` and unset all leave the floor at one.
+    #[test]
+    fn zero_authorisation_requires_the_exact_string_one() {
+        let with = |value: Option<&'static str>| {
+            HardMinimum::from_env(&move |key| {
+                (key == TOOL_BUDGET_ZERO_AUTH_ENV)
+                    .then(|| value.map(str::to_string))
+                    .flatten()
+            })
+        };
+        assert_eq!(with(Some("1")), HardMinimum::Zero);
+        assert_eq!(with(Some("true")), HardMinimum::One);
+        assert_eq!(with(Some(" 1")), HardMinimum::One);
+        assert_eq!(with(None), HardMinimum::One);
+    }
+
+    /// An authorised zero budget means "no tool calls at all" for the blocked tools: the FIRST
+    /// browsing call is refused (`nextToolCount 1 > hard 0`, `tool-budget.ts:57-60`), while a
+    /// non-blocked tool still passes under the default block list.
+    #[test]
+    fn a_zero_budget_blocks_the_first_browsing_call() {
+        let budget = decode_tool_budget_env(Some("{\"hard\": 0}"), HardMinimum::Zero)
+            .expect("valid")
+            .expect("some");
+        assert!(should_block_tool_for_budget(&budget, "read", 1));
+        assert!(!should_block_tool_for_budget(&budget, "bash", 1));
     }
 }

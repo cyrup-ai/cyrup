@@ -2215,13 +2215,17 @@ pub fn prompt_runtime_from_env(
             ))
         });
 
-    // pi `:263`: `registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV]))`.
+    // pi `:693` @v0.64.0: `registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV],
+    // { allowZero: process.env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" }))` — CFG-067: the zero-budget
+    // authorisation is read from the same env the budget arrives in, so a `hard: 0` payload is
+    // honoured only when the parent said so and rejected (below) otherwise.
     // A malformed payload is dropped rather than propagated: pi lets `decodeToolBudgetEnv` throw out
     // of module init, which here would take down a child whose budget the parent already validated.
     // The parent is the only writer of this var, so a malformed value means the environment was
     // tampered with mid-flight — running unbudgeted beats an unexplained child crash.
     let tool_budget = match crate::exec::tool_budget::decode_tool_budget_env(
         get(crate::exec::tool_budget::TOOL_BUDGET_ENV).as_deref(),
+        crate::exec::tool_budget::HardMinimum::from_env(get),
     ) {
         Ok(budget) => budget,
         Err(message) => {
@@ -2493,6 +2497,53 @@ mod tool_budget_runtime_tests {
             ext.on_event(&call(3, "read"), &ctx).await,
             HookOutcome::Block { .. }
         ));
+    }
+
+    /// CFG-067 / pi `subagent-prompt-runtime.ts:693` @v0.64.0: `decodeToolBudgetEnv(env, {
+    /// allowZero: env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" })`. THE USER ACTION end to end: the
+    /// parent ships `{"hard": 0}` — "this child may make no browsing calls at all" — and the
+    /// authorisation flag; the child's very first `read` is refused. Without the flag the same
+    /// payload is the malformed-budget case and the child runs unbudgeted (upstream's decode
+    /// throws; this crate's documented policy drops the budget instead). Before this port the
+    /// flag was not read anywhere, so the authorised branch could not be reached.
+    #[tokio::test]
+    async fn a_zero_budget_is_honoured_only_with_the_parents_authorisation() {
+        let encoded = "{\"hard\":0}".to_string();
+        let authorised = {
+            let encoded = encoded.clone();
+            prompt_runtime_extension_from(&move |key| {
+                if key == crate::exec::tool_budget::TOOL_BUDGET_ENV {
+                    Some(encoded.clone())
+                } else if key == crate::exec::tool_budget::TOOL_BUDGET_ZERO_AUTH_ENV {
+                    Some("1".to_string())
+                } else {
+                    None
+                }
+            })
+            .expect("an authorised zero budget builds the child runtime")
+        };
+        let ctx = ctx();
+        match authorised.on_event(&call(1, "read"), &ctx).await {
+            HookOutcome::Block { reason, .. } => assert!(
+                reason
+                    .unwrap_or_default()
+                    .starts_with("Tool budget hard limit reached after 1 tool call (hard 0)."),
+            ),
+            other => panic!("the first browsing call must be refused under hard 0: {other:?}"),
+        }
+
+        let unauthorised = prompt_runtime_extension_from(&move |key| {
+            (key == crate::exec::tool_budget::TOOL_BUDGET_ENV).then(|| encoded.clone())
+        });
+        if let Some(ext) = unauthorised {
+            assert!(
+                matches!(
+                    ext.on_event(&call(1, "read"), &ctx).await,
+                    HookOutcome::Noop
+                ),
+                "an unauthorised zero budget is dropped, never enforced"
+            );
+        }
     }
 
     /// No budget in the env => no `tool_call` subscription and no interference at all.
