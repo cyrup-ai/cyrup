@@ -655,6 +655,26 @@ async fn run() -> anyhow::Result<i32> {
             Some(dirs.cwd.clone()),
             update_policy,
         );
+        // TUI-037 — pi's `autoTrustOnReloadCwd` (`main.ts:701-704` @v0.84.4):
+        //
+        // ```ts
+        // const autoTrustOnReloadCwd =
+        //     parsed.projectTrustOverride === undefined && !hasTrustRequiringProjectResources(sessionCwd)
+        //         ? sessionCwd
+        //         : undefined;
+        // ```
+        //
+        // Armed only when trust was never DECIDED — no `--approve`/`--no-approve`, and nothing in
+        // the cwd for the builder to gate (`decide_trust` step 2 granted it implicitly). `/reload`
+        // persists that grant once the project grows `.cyrup/` resources, so the next launch does
+        // not prompt for a decision the user already lived under. Read off the built session so
+        // the cwd/home pair is the one the builder's own scan used.
+        let auto_trust_on_reload_cwd = {
+            let services = session.services();
+            (cli.trust_override().is_none()
+                && !cyrup::has_trust_requiring_project_resources(&services.cwd, &services.home))
+            .then(|| services.cwd.clone())
+        };
         let result = interactive::run_interactive(
             runtime.clone(),
             session.clone(),
@@ -670,6 +690,7 @@ async fn run() -> anyhow::Result<i32> {
                 cyrup::TuiMode::Regular => cyrup_config::settings::TuiMode::Regular,
                 cyrup::TuiMode::Fullscreen => cyrup_config::settings::TuiMode::Fullscreen,
             }),
+            auto_trust_on_reload_cwd,
         )
         .await;
         // Quit is a normal exit here too: Pi disposes the runtime on every host teardown path

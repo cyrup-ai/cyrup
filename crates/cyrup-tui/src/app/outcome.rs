@@ -95,6 +95,13 @@ pub struct LifecycleEffects {
     /// `/reload` rebuilds the keymaps from this agent dir. Runs AFTER the session reload, which is
     /// Pi's order (`interactive-mode.ts:5386`, session reload then `this.keybindings.reload()`).
     pub reload_keybindings_in: Option<PathBuf>,
+    /// TUI-037 — pi's `showWarning("Could not save project trust after reload: …")`
+    /// (`interactive-mode.ts:4938-4940` @v0.84.4), already framed `Warning: …`. Carried here
+    /// rather than pushed by the `/reload` arm because cyrup's implicit-trust save runs BEFORE the
+    /// rebuild (`app/reload_trust.rs`), and the swap's `rebind_session` resets the transcript —
+    /// a warning pushed there would be wiped before the user saw it. Surfaced after the swap, which
+    /// is where pi shows it.
+    pub warning: Option<String>,
 }
 
 /// What a spawned session-lifecycle op hands back (TUI-092 §5b.2).

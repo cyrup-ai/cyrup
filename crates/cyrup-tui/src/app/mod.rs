@@ -54,6 +54,7 @@ mod layout;
 mod login;
 mod mode_switch;
 mod outcome;
+mod reload_trust;
 #[path = "render.rs"]
 mod render_impl;
 mod run;
@@ -119,6 +120,7 @@ pub use share::{ShareMsg, gist_id_from_url, share_viewer_url, share_viewer_url_f
 pub(crate) use crossterm::resolve_external_editor;
 #[cfg(test)]
 pub(crate) use crossterm::run_editor_over_file;
+pub use reload_trust::{ImplicitTrustReload, implicit_trust_after_reload};
 pub use render_impl::render;
 pub(crate) use render_impl::{env_rows, fallback_columns, is_extension_command};
 pub use state::{ActiveSelector, AppState, ShortcutSpec, SwapCaption};

@@ -269,21 +269,46 @@ impl<B: Backend> App<B> {
                 // reload FIRST, then `this.keybindings.reload()` — is preserved exactly.
                 Some(rt) => {
                     let agent_dir = session.services().agent_dir.clone();
+                    // TUI-037 — pi's `maybeSaveImplicitProjectTrustAfterReload()`
+                    // (`interactive-mode.ts:5995` @v0.84.4): persist a trust that was granted
+                    // implicitly at boot once the project has grown trust-requiring resources.
+                    // Run BEFORE the rebuild is dispatched, not after it as pi does — cyrup's
+                    // reload re-decides trust from the store (see `app/reload_trust.rs`'s
+                    // ordering note), so the write has to land where the rebuilt session reads it.
+                    let (saved_implicit_project_trust, trust_warning) =
+                        match self.maybe_save_implicit_project_trust(session).await {
+                            Ok(saved) => (saved, None),
+                            // pi's `catch` (`:4938-4940`): the reload proceeds, the status keeps
+                            // its plain variant, and `showWarning` frames the message
+                            // (`Warning: …`, `:4264-4266`). Surfaced post-swap via the effect.
+                            Err(e) => (
+                                false,
+                                Some(format!(
+                                    "Warning: Could not save project trust after reload: {e}"
+                                )),
+                            ),
+                        };
                     // TUI-025 — Pi's own sentence, `interactive-mode.ts:5418-5423` @v0.83.0.
                     // cyrup's `"reloaded resources"` said nothing about WHAT was reloaded, and the
                     // `/` menu's own help string for the command was a second, different wording.
-                    // The `; saved project trust` variant is TUI-037's — it needs the implicit-trust
-                    // write, which lives in `crates/cyrup`.
+                    // The `; saved project trust` variant is `interactive-mode.ts:6000-6003`
+                    // @v0.84.4, selected by the boolean above (TUI-037).
                     self.state.pending_swap_status = Some(SwapCaption::Status(
-                        "Reloaded keybindings, extensions, skills, prompts, themes, and \
-                         context files"
-                            .into(),
+                        if saved_implicit_project_trust {
+                            "Reloaded keybindings, extensions, skills, prompts, themes, and \
+                             context files; saved project trust"
+                        } else {
+                            "Reloaded keybindings, extensions, skills, prompts, themes, and \
+                             context files"
+                        }
+                        .into(),
                     ));
                     let rt = Arc::clone(rt);
                     self.dispatch_lifecycle(async move {
                         LifecycleOutcome(match rt.reload(None).await {
                             Ok(()) => Ok(LifecycleEffects {
                                 reload_keybindings_in: Some(agent_dir),
+                                warning: trust_warning,
                                 ..LifecycleEffects::default()
                             }),
                             Err(e) => Err(format!("reload error: {e}")),

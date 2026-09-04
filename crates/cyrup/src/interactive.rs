@@ -204,6 +204,10 @@ pub async fn run_interactive(
     // the `tuiMode` SETTING decides — the precedence ADR-0005 §B-14 fixes and `cli/enums.rs`
     // documents: the flag wins when given, else the setting, else `regular`.
     tui_mode: Option<cyrup_config::settings::TuiMode>,
+    // TUI-037 — pi's `InteractiveModeOptions.autoTrustOnReloadCwd` (`interactive-mode.ts:344`
+    // @v0.84.4), computed at the composition root (`main.ts:701-704`) and handed in here exactly
+    // as `migratedProviders` is: the session cwd when its trust was granted implicitly at boot.
+    auto_trust_on_reload_cwd: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     // Boot the render theme from `settings.theme` + the terminal background/color-depth (feature #4:
     // the `ThemeController`), instead of the hardwired dark boot the audit flagged (theme.rs #4). An
@@ -337,6 +341,9 @@ pub async fn run_interactive(
     // `Vec<String>`, so the description an extension registered was dropped one call from the
     // renderer and `/hotkeys` printed the key id as its own label.
     app.set_extension_shortcuts(session.services().ext_host.shortcut_specs());
+    // TUI-037 — arm the implicit-trust save `/reload` performs (pi stores the option at
+    // `interactive-mode.ts:572` @v0.84.4; the consumer is `App::maybe_save_implicit_project_trust`).
+    app.set_auto_trust_on_reload_cwd(auto_trust_on_reload_cwd);
 
     // Theme hot-reload (feature #1; Pi `ThemeWatcher`, theme.ts watch path): when the active theme
     // resolves to an on-disk file, watch it so `/theme` edits repaint live. The watcher must outlive
