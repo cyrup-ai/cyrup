@@ -587,6 +587,10 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
             output_truncated: false,
             control_events: Vec::new(),
             progress: None,
+            // A reconciled placeholder describes a run cyrup could not read back, not a foreign
+            // process it observed.
+            runner: None,
+            external_process: None,
         })
         .collect()
 }
@@ -624,6 +628,8 @@ fn placeholder_result(
         output_truncated: false,
         control_events: Vec::new(),
         progress: None,
+        runner: None,
+        external_process: None,
     }
 }
 

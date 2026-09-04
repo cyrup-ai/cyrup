@@ -810,7 +810,7 @@ mod tests {
             tool_budget: None,
             runner: Some(crate::runner::AgentRunnerConfig::ExternalCli(
                 crate::runner::ExternalCliRunner {
-                    adapter: Some("claude-code".to_string()),
+                    adapter: Some(crate::runner::contract::AdapterId::ClaudeCode),
                     command: "claude".to_string(),
                     args: Vec::new(),
                     prompt_delivery_stdin: false,
@@ -854,7 +854,7 @@ mod tests {
             tool_budget: None,
             runner: Some(crate::runner::AgentRunnerConfig::ExternalCli(
                 crate::runner::ExternalCliRunner {
-                    adapter: Some("claude-code".to_string()),
+                    adapter: Some(crate::runner::contract::AdapterId::ClaudeCode),
                     command: "claude".to_string(),
                     args: Vec::new(),
                     prompt_delivery_stdin: false,

@@ -2771,6 +2771,8 @@ mod tests {
             output_truncated: false,
             control_events: Vec::new(),
             progress: None,
+            runner: None,
+            external_process: None,
         };
         let mut bad = ok.clone();
         bad.agent = "writer".to_string();

@@ -1,11 +1,12 @@
-//! SUBA-074 stage 1 — the agent `runner:` frontmatter schema: parse, validate, and the refusal that
-//! keeps a non-`pi` runner from silently launching as a full-capability native child.
+//! SUBA-074 — the agent `runner:` frontmatter schema: parse, validate, and (via [`dispatch`])
+//! decide how a declared runner actually runs.
 //!
 //! Upstream: `parseAgentRunnerFrontmatter` / `validateExternalRunnerProfile`
-//! (`pi-subagents/src/agents/agents.ts:1803`/`:1864` @v0.57.0) plus the two contract validators in
-//! [`contract`]. Actually EXECUTING a non-`pi` runner is stage 2 (`external-cli-runner.ts` and the
-//! six code-owned adapters); until it lands, [`AgentRunnerConfig::refusal_reason`] is what stands
-//! between a declared external profile and a native child with the full builtin tool surface.
+//! (`pi-subagents/src/agents/agents.ts:1843`/`:1904` @v0.64.0) plus the contract validators in
+//! [`contract`]. **Stage 2** added [`dispatch`] — the exhaustive three-way decision that replaced
+//! stage 1's `Option<String>` refusal — [`status`], the runner/receipt descriptors, and
+//! [`crate::exec::external_cli`], which actually executes the foreign process. `codex-exec`,
+//! `cursor-agent` and the whole `external-job` protocol are still refused there, by name.
 //!
 //! ## Two serializations, deliberately
 //!
@@ -21,10 +22,12 @@
 //! byte-stably through a management rewrite. Do not replace either with the other.
 
 pub mod contract;
+pub mod dispatch;
+pub mod status;
 
 use serde_json::Value;
 
-use contract::ExternalCliCapabilityNarrowing;
+use contract::{AdapterId, ExternalCliCapabilityNarrowing};
 
 /// `AgentRunnerConfig` (`shared/types.ts:1403` @v0.57.0).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -42,9 +45,11 @@ pub enum AgentRunnerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalCliRunner {
-    /// One of [`contract::CODE_OWNED_ADAPTER_IDS`], or `None` for the generic adapter.
+    /// One of the six code-owned [`AdapterId`]s, or `None` for the generic adapter. Typed rather
+    /// than a `String` so every derivation from it — the safety receipt, the prompt-delivery mode,
+    /// the launch resolver — is an exhaustive `match` (see [`contract::AdapterId`]'s own doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adapter: Option<String>,
+    pub adapter: Option<AdapterId>,
     /// Non-empty, trimmed.
     pub command: String,
     /// Empty when omitted. Never non-empty alongside `adapter` (the adapter owns its argv).
@@ -82,40 +87,10 @@ impl AgentRunnerConfig {
     /// The adapter id to hand [`contract::validate_code_owned_profile_runner`] — `Some` only for an
     /// `external-cli` runner that names one.
     #[must_use]
-    pub fn code_owned_adapter(&self) -> Option<&str> {
+    pub fn code_owned_adapter(&self) -> Option<AdapterId> {
         match self {
-            Self::ExternalCli(cli) => cli.adapter.as_deref(),
+            Self::ExternalCli(cli) => cli.adapter,
             _ => None,
-        }
-    }
-
-    /// **Stage-1 gate.** `Some(reason)` when this crate cannot honour the declared runner, so the
-    /// launch must be REFUSED rather than silently downgraded to a native child.
-    ///
-    /// `None` for [`Self::Pi`] — which is the native child, and therefore always honourable.
-    ///
-    /// [CYRUP-DELTA] upstream has no equivalent: it implements every runner type, so it never
-    /// refuses one. This refusal is a deliberate, temporary cyrup-only state that exists precisely
-    /// because the execution half is stage 2 — the alternative is the present silent widening. It
-    /// is deleted, not relaxed, when stage 2 lands.
-    #[must_use]
-    pub fn refusal_reason(&self) -> Option<String> {
-        match self {
-            Self::Pi => None,
-            Self::ExternalCli(cli) => Some(format!(
-                "Agent runner.type='external-cli'{} is declared but not yet supported by cyrup \
-                 (SUBA-074 stage 2). Refusing to launch rather than running this profile as a \
-                 full-capability native child.",
-                cli.adapter
-                    .as_deref()
-                    .map_or_else(String::new, |a| format!(" (adapter '{a}')")),
-            )),
-            Self::ExternalJob(job) => Some(format!(
-                "Agent runner.type='external-job' (provider '{}') is declared but not yet \
-                 supported by cyrup (SUBA-074 stage 2). Refusing to launch rather than running \
-                 this profile as a full-capability native child.",
-                job.provider,
-            )),
         }
     }
 }
@@ -145,8 +120,8 @@ pub fn runner_to_json_string(runner: &AgentRunnerConfig) -> String {
     match runner {
         AgentRunnerConfig::Pi => {}
         AgentRunnerConfig::ExternalCli(cli) => {
-            if let Some(adapter) = &cli.adapter {
-                push("adapter", &Value::String(adapter.clone()));
+            if let Some(adapter) = cli.adapter {
+                push("adapter", &Value::String(adapter.wire().to_string()));
             }
             push("command", &Value::String(cli.command.clone()));
             if !cli.args.is_empty() {
@@ -159,12 +134,17 @@ pub fn runner_to_json_string(runner: &AgentRunnerConfig) -> String {
                 push("promptDelivery", &Value::String("stdin".to_string()));
             }
             if let Some(capabilities) = &cli.capabilities {
+                // Emitted in upstream's own capability order (`Capability::ALL`), which a
+                // `BTreeSet<Capability>` iterates by construction. [CYRUP-DELTA] an author who
+                // wrote the keys in some other order gets them back in upstream's; the previous
+                // `BTreeMap<String, bool>` shape re-ordered them ALPHABETICALLY, so this is
+                // strictly closer to the block upstream itself would emit.
                 push(
                     "capabilities",
                     &Value::Object(
                         capabilities
                             .iter()
-                            .map(|(key, value)| (key.clone(), Value::Bool(*value)))
+                            .map(|capability| (capability.wire().to_string(), Value::Bool(false)))
                             .collect(),
                     ),
                 );
@@ -180,15 +160,22 @@ pub fn runner_to_json_string(runner: &AgentRunnerConfig) -> String {
     format!("{{{}}}", fields.join(","))
 }
 
-/// The fourteen Pi-only frontmatter keys an external profile may not declare
-/// (`agents.ts:1866-1867`). Order is upstream's and reaches the user in the refusal.
-const PI_ONLY_FIELDS: [&str; 14] = [
+/// The seventeen Pi-only frontmatter keys an external profile may not declare
+/// (`agents.ts:1906` @v0.64.0). Order is upstream's and reaches the user in the refusal.
+///
+/// Tag-to-tag: v0.57.0 listed FOURTEEN. `excludeTools`, `allowNestedSubagents` and `mutationTools`
+/// were added after this crate's stage-1 port, and each is a real Pi-only field an external profile
+/// must not be allowed to declare (cyrup ships the first two under SUBA-092).
+const PI_ONLY_FIELDS: [&str; 17] = [
     "tools",
+    "excludeTools",
+    "allowNestedSubagents",
     "model",
     "fallbackModels",
     "thinking",
     "extensions",
     "subagentOnlyExtensions",
+    "mutationTools",
     "maxSubagentDepth",
     "completionGuard",
     "skills",
@@ -332,13 +319,12 @@ pub fn parse_agent_runner_frontmatter(
             let adapter = match object.get("adapter") {
                 None => None,
                 Some(value) => {
-                    let id = value.as_str().unwrap_or_default();
-                    if !contract::is_code_owned_adapter_id(id) {
+                    let Ok(id) = AdapterId::try_from(value.as_str().unwrap_or_default()) else {
                         return Err(format!(
                             "Agent '{agent_name}' external-cli runner adapter must be {}.",
                             contract::CODE_OWNED_ADAPTER_LABEL
                         ));
-                    }
+                    };
                     // Upstream orders this AFTER the id check, so a bad id reports the id problem.
                     if !args.is_empty() {
                         return Err(format!(
@@ -346,7 +332,7 @@ pub fn parse_agent_runner_frontmatter(
                              supported."
                         ));
                     }
-                    Some(id.to_string())
+                    Some(id)
                 }
             };
             let prompt_delivery_stdin = match object.get("promptDelivery") {
@@ -498,7 +484,11 @@ mod tests {
         let AgentRunnerConfig::ExternalCli(cli) = ok.unwrap() else {
             panic!("expected an external-cli runner");
         };
-        assert_eq!(cli.capabilities.unwrap().get("steer"), Some(&false));
+        assert!(
+            cli.capabilities
+                .unwrap()
+                .contains(&contract::Capability::Steer)
+        );
     }
 
     /// `external-job` requires an already-TRIMMED provider — upstream rejects `" x "` rather than
@@ -546,7 +536,10 @@ mod tests {
         );
         // The adapter itself may claim its own name; an unrelated name is unaffected.
         assert_eq!(
-            contract::validate_code_owned_profile_runner(&["claude-code"], Some("claude-code")),
+            contract::validate_code_owned_profile_runner(
+                &["claude-code"],
+                Some(AdapterId::ClaudeCode)
+            ),
             None
         );
         assert_eq!(
@@ -590,31 +583,30 @@ mod tests {
         assert!(validate_external_runner_profile("worker", None, |_| true).is_ok());
     }
 
-    /// The stage-1 gate: `pi` is honourable, every other runner refuses the launch rather than
-    /// silently downgrading to a full-capability native child.
+    /// SUBA-074 stage 2 rewrote the stage-1 gate: "which runners are honourable" is no longer an
+    /// `Option<String>` on this type but the exhaustive [`dispatch::RunnerDispatch`], so the check
+    /// lives with the decision. See `runner::dispatch`'s own tests for the eight
+    /// `(type, adapter)` outcomes; what this one still pins is that the PARSED shape carries the
+    /// adapter identity the dispatcher matches on.
     #[test]
-    fn only_a_pi_runner_is_honourable_today() {
-        assert_eq!(AgentRunnerConfig::Pi.refusal_reason(), None);
+    fn a_parsed_external_cli_runner_carries_the_adapter_identity_dispatch_matches_on() {
+        let parsed = parse_agent_runner_frontmatter(
+            Some(r#"{"type":"external-cli","adapter":"claude-code","command":"claude"}"#),
+            "worker",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.code_owned_adapter(), Some(AdapterId::ClaudeCode));
+        assert_eq!(parsed.type_str(), "external-cli");
 
-        let cli = AgentRunnerConfig::ExternalCli(ExternalCliRunner {
-            adapter: Some("claude-code".to_string()),
-            command: "claude".to_string(),
-            args: Vec::new(),
-            prompt_delivery_stdin: false,
-            capabilities: None,
-        });
-        let reason = cli.refusal_reason().expect("external-cli must refuse");
-        assert!(reason.contains("runner.type='external-cli'"), "{reason}");
-        assert!(reason.contains("adapter 'claude-code'"), "{reason}");
-        assert!(reason.contains("full-capability native child"), "{reason}");
-
-        let job = AgentRunnerConfig::ExternalJob(ExternalJobRunner {
-            provider: "acme".to_string(),
-            options: None,
-        });
-        let reason = job.refusal_reason().expect("external-job must refuse");
-        assert!(reason.contains("runner.type='external-job'"), "{reason}");
-        assert!(reason.contains("provider 'acme'"), "{reason}");
+        let generic = parse_agent_runner_frontmatter(
+            Some(r#"{"type":"external-cli","command":"my-cli"}"#),
+            "worker",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(generic.code_owned_adapter(), None);
+        assert_eq!(AgentRunnerConfig::Pi.code_owned_adapter(), None);
     }
 
     /// The frontmatter writer omits absent optionals exactly as upstream's spread does, so an

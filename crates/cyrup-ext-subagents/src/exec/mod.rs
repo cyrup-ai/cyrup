@@ -71,6 +71,7 @@ pub mod attempt_runner;
 /// progress/output/acceptance state until the attempt settles (the per-attempt drive-loop third of
 /// the former "SubagentSpawner" section).
 pub mod drive_attempt;
+pub mod external_cli;
 
 /// The live per-attempt progress fold (R-SA-027/028): [`AgentProgress`], [`ProgressSnapshotInput`].
 pub mod progress;
@@ -316,12 +317,27 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // Without this, an agent declaring an external profile — which upstream FORBIDS from declaring
     // `tools:`, so it declares none, which this crate reads as "no allowlist restriction" — spawns
     // as a native child with the full builtin tool surface.
-    if let Some(reason) = agent
-        .runner
-        .as_ref()
-        .and_then(crate::runner::AgentRunnerConfig::refusal_reason)
-    {
-        return pre_spawn_failure(agent, task, reason);
+    //
+    // SUBA-074 stage 2 made this an EXHAUSTIVE three-way decision rather than an
+    // `Option<String>` refusal, because "did not refuse" must never be what selects the native
+    // child: see [`crate::runner::dispatch`] for the failure mode that shape permits once any
+    // adapter is supported. Upstream resolves NO model for an external runner at all
+    // (`api/preflight.ts:322-343` @v0.64.0), so the external arm returns from here rather than
+    // entering the ladder below.
+    let launch_ctx = crate::exec::external_cli::ExternalCliLaunchContext {
+        cwd: opts.cwd.clone(),
+        scratch_dir: crate::background::attempt_scratch_dir(&opts.cwd),
+        step_index: opts.child_index.unwrap_or(0),
+        command_prefix_args: Vec::new(),
+    };
+    match crate::runner::dispatch::resolve_runner_dispatch(agent.runner.as_ref(), &launch_ctx) {
+        crate::runner::dispatch::RunnerDispatch::Refused(reason) => {
+            return pre_spawn_failure(agent, task, reason);
+        }
+        crate::runner::dispatch::RunnerDispatch::ExternalCli(launch) => {
+            return crate::exec::external_cli::run_external_cli(agent, task, opts, *launch).await;
+        }
+        crate::runner::dispatch::RunnerDispatch::NativePi => {}
     }
 
     // Step 1 (R-SA-025): fail fast before any subprocess spawns.
@@ -538,6 +554,10 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         // pi `result.controlEvents = allControlEvents.length ? allControlEvents : undefined`
         // (`execution.ts:1260`) — an empty Vec is this crate's `undefined` (it serializes away).
         control_events: control.into_events(),
+        // SUBA-074: this is the NATIVE pi child's completion path, which by construction never ran
+        // an external profile — [`crate::runner::dispatch`] returns before the ladder for those.
+        runner: None,
+        external_process: None,
     }
 }
 
@@ -702,7 +722,7 @@ fn resolve_terminal_usage_budget(
 ///
 /// SUBA-021: no usage budget on this path (see the field doc) — nothing was spent because
 /// nothing was spawned.
-fn pre_spawn_failure(agent: &AgentConfig, task: &str, error: String) -> SingleResult {
+pub(crate) fn pre_spawn_failure(agent: &AgentConfig, task: &str, error: String) -> SingleResult {
     SingleResult {
         usage_budget: None,
         turn_budget: None,
@@ -729,6 +749,8 @@ fn pre_spawn_failure(agent: &AgentConfig, task: &str, error: String) -> SingleRe
         output_truncated: false,
         control_events: Vec::new(),
         progress: None,
+        runner: None,
+        external_process: None,
     }
 }
 
@@ -1003,7 +1025,7 @@ fn apply_terminal_preamble(
 /// Returns the possibly-replaced delivered output, the FULL (untruncated) copy of it the
 /// saved-output reference measures its byte/line counts over, and the concrete saved path; any
 /// handoff error is folded into `error`.
-fn resolve_saved_output(
+pub(crate) fn resolve_saved_output(
     opts: &RunOptions,
     exit_code: i32,
     mut final_output: Option<String>,
@@ -1281,7 +1303,7 @@ impl GateState {
 /// The delivered-output tail: strip acceptance-report fences, apply R-SA-042 truncation, then
 /// append (or, in `file-only` mode, substitute) the saved-output reference message. All three
 /// steps are skipped for a detached result (R-SA-037).
-fn finalize_delivered_output(
+pub(crate) fn finalize_delivered_output(
     mut final_output: Option<String>,
     full_output_for_reference: Option<String>,
     saved_output_path: Option<&PathBuf>,
@@ -1773,20 +1795,21 @@ mod tests {
         );
     }
 
-    // ---- SUBA-074: an unsupported runner refuses the RUN, before the model ladder ----
+    // ---- SUBA-074: an external runner never becomes a native child ----
 
-    /// A declared `external-cli` profile must refuse the launch outright rather than spawn a
-    /// full-capability native child. The refusal is a property of the RUN, so it fires ONCE,
-    /// before any model is attempted — not once per candidate in the fallback ladder.
+    /// A DEFERRED adapter (`codex-exec`, `cursor-agent`) and the whole `external-job` protocol must
+    /// still refuse the launch outright rather than spawn a full-capability native child. The
+    /// refusal is a property of the RUN, so it fires ONCE, before any model is attempted — not once
+    /// per candidate in the fallback ladder.
     #[tokio::test]
-    async fn run_sync_refuses_an_unsupported_runner_once_before_any_model_attempt() {
+    async fn run_sync_refuses_a_deferred_adapter_once_before_any_model_attempt() {
         use crate::runner::{AgentRunnerConfig, ExternalCliRunner};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = sample_agent_config("m1", &["m2", "m3"]);
         agent.runner = Some(AgentRunnerConfig::ExternalCli(ExternalCliRunner {
-            adapter: Some("claude-code".to_string()),
-            command: "claude".to_string(),
+            adapter: Some(crate::runner::contract::AdapterId::CodexExec),
+            command: "codex".to_string(),
             args: Vec::new(),
             prompt_delivery_stdin: false,
             capabilities: None,
@@ -1797,16 +1820,88 @@ mod tests {
 
         assert_eq!(
             result.exit_code, 1,
-            "an unsupported runner must fail the run: {result:?}"
+            "a deferred adapter must fail the run: {result:?}"
         );
         let error = result.error.as_deref().unwrap_or_default();
         assert!(error.contains("runner.type='external-cli'"), "{error}");
+        assert!(error.contains("adapter 'codex-exec'"), "{error}");
         assert!(error.contains("full-capability native child"), "{error}");
         assert!(
             result.attempted_models.is_empty(),
             "the refusal precedes the ladder, so NO model may be attempted; got {:?}",
             result.attempted_models
         );
+    }
+
+    /// SUBA-074 stage 2, end to end: a GENERIC `external-cli` profile actually reaches the foreign
+    /// process, its stdout becomes the run's output, and NO cyrup child is spawned.
+    ///
+    /// This is upstream's in-baseline runner (`v0.43.0:src/runs/shared/external-cli-runner.ts`) and
+    /// it needs no vendor CLI, which is why it is the path driven here. Before stage 2 the run was
+    /// refused at the gate above, so this test could not pass; after it the run must ALSO resolve no
+    /// model at all (`api/preflight.ts:322-343`).
+    #[tokio::test]
+    async fn run_sync_executes_a_generic_external_cli_profile_and_resolves_no_model() {
+        use crate::runner::{AgentRunnerConfig, ExternalCliRunner};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("echo-prompt.sh");
+        std::fs::write(&script, "#!/bin/sh\ncat\n").expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let mut agent = sample_agent_config("m1", &["m2"]);
+        agent.system_prompt_body = "be brief".to_string();
+        agent.runner = Some(AgentRunnerConfig::ExternalCli(ExternalCliRunner {
+            adapter: None,
+            command: script.display().to_string(),
+            args: Vec::new(),
+            prompt_delivery_stdin: false,
+            capabilities: None,
+        }));
+        let opts = base_opts(dir.path(), &["m1", "m2"]);
+
+        let result = run_sync(&agent, "say hello", &opts).await;
+
+        assert_eq!(result.exit_code, 0, "{result:?}");
+        assert_eq!(result.error, None, "{result:?}");
+        // The foreign process echoed its stdin, so the delivered output IS the prompt framing
+        // `buildExternalCliPrompt` built (`external-cli-runner.ts:26-28`).
+        let output = result.final_output.as_deref().unwrap_or_default();
+        assert!(
+            output.starts_with("<System instructions>\nbe brief"),
+            "{output}"
+        );
+        assert!(output.contains("<Task>\nsay hello"), "{output}");
+
+        // Upstream resolves NO model for an external runner.
+        assert_eq!(result.model, None, "{result:?}");
+        assert!(result.attempted_models.is_empty(), "{result:?}");
+        assert!(result.model_attempts.is_empty(), "{result:?}");
+
+        // The receipt names the generic adapter and the two bounded stream logs.
+        let runner = result
+            .runner
+            .as_ref()
+            .expect("an external run publishes its runner");
+        assert_eq!(runner.adapter.id.wire(), "external-cli");
+        assert_eq!(runner.prompt_delivery, "stdin");
+        assert!(
+            runner.safety.is_none(),
+            "the generic adapter declares no sandbox"
+        );
+        let process = result
+            .external_process
+            .as_ref()
+            .expect("an external run publishes its process receipt");
+        assert!(process.pid.is_some(), "{process:?}");
+        assert_eq!(process.exit_code, Some(0));
+        assert!(process.stdout_path.ends_with(".stdout.log"), "{process:?}");
+        assert!(!process.stdout_truncated);
     }
 
     /// `runner: {"type":"pi"}` is the native child, so it is indistinguishable from declaring no

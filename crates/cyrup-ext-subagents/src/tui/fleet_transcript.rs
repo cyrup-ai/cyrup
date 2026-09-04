@@ -1677,6 +1677,8 @@ mod tests {
             output_truncated: false,
             control_events: Vec::new(),
             progress: None,
+            runner: None,
+            external_process: None,
         };
 
         // Exactly the bytes `extension.rs:4926` / `background/runner_main.rs:2612` write.

@@ -2783,6 +2783,12 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
         // orchestrator, which reads them off the terminal `ResultFile`.
         control_events: result.control_events.clone(),
         progress: None,
+        // SUBA-074: `StepResult` carries no external-runner receipt, so an ASYNC external run's
+        // `runner`/`externalProcess` do not survive this projection. Recorded as a residual on the
+        // item rather than papered over — the run itself executes identically on both paths; only
+        // the receipt fields are absent from the async `ResultFile`.
+        runner: None,
+        external_process: None,
     }
 }
 
@@ -2823,6 +2829,9 @@ fn imported_root_to_single_result(
         output_truncated: false,
         control_events: Vec::new(),
         progress: None,
+        // An imported async ROOT is a cyrup run, never a foreign process.
+        runner: None,
+        external_process: None,
     }
 }
 
@@ -4345,6 +4354,8 @@ async fn finish_run(
             output_truncated: false,
             control_events: Vec::new(),
             progress: None,
+            runner: None,
+            external_process: None,
         });
     }
 
@@ -5351,6 +5362,8 @@ mod tests {
                 output_truncated: false,
                 control_events: Vec::new(),
                 progress: None,
+                runner: None,
+                external_process: None,
             }],
             dir.path().to_path_buf(),
             None,
@@ -5897,6 +5910,8 @@ mod tests {
             output_truncated: false,
             control_events: Vec::new(),
             progress: None,
+            runner: None,
+            external_process: None,
         };
         let mut results = vec![
             settled(
@@ -6011,6 +6026,8 @@ mod tests {
                 output_truncated: false,
                 control_events: Vec::new(),
                 progress: None,
+                runner: None,
+                external_process: None,
             }],
         };
         write_atomic_json(&target_paths.result, &target_result)

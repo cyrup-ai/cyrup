@@ -176,4 +176,20 @@ pub struct SingleResult {
     /// pi caller reads for a SINGLE run — one snapshot rather than a one-element array.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<crate::tui::events::LiveProgressSnapshot>,
+    /// SUBA-074 — pi `SingleResult.runner?: ExternalCliRunnerStatus` (`shared/types.ts:1725`,
+    /// assigned by the external-CLI branch at `subagent-runner.ts:1563`): the external profile this
+    /// run actually executed under — its adapter, its argv, its sandbox block and its capability
+    /// envelope.
+    ///
+    /// `None` for every native pi child, and omitted from the wire when `None`, so a
+    /// `status.json`/result file written before this field existed still round-trips (the same
+    /// optional-on-the-wire discipline `saved_output_path`/`control_events` follow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<crate::runner::status::ExternalCliRunnerStatus>,
+    /// SUBA-074 — pi `SingleResult.externalProcess?: ExternalProcessStatus`
+    /// (`shared/types.ts:1772`, assigned at `subagent-runner.ts:1564`): what the foreign process
+    /// did — pid, timings, exit code and signal, and the two bounded stream logs with their true
+    /// byte totals and truncation flags. Same optional-on-the-wire discipline as [`Self::runner`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_process: Option<crate::runner::status::ExternalProcessStatus>,
 }
