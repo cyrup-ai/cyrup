@@ -626,3 +626,46 @@ fn rpc_response_round_trips_through_the_new_deserialize() {
     assert!(!failed.success);
     assert_eq!(failed.error.as_deref(), Some("nope"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// SEAM-116 — `clearQueue` (pi `rpc-client.ts:226-229` @v0.84.4)
+// ---------------------------------------------------------------------------------------------
+
+/// Pi's `clearQueue()` sends a bare `{ type: "clear_queue" }` and returns `getData(response)` —
+/// the `{ steering, followUp }` object the host built from `session.clearQueue()`. The client
+/// writes no other key, and the reply lands typed with the wire's camelCase `followUp` read into
+/// `follow_up`.
+#[tokio::test]
+async fn clear_queue_sends_a_bare_command_and_returns_the_typed_steering_follow_up_pair() {
+    let (client, mut host) = connect();
+
+    let call = tokio::spawn(async move {
+        let cleared = client.clear_queue().await.expect("clear_queue");
+        (cleared, client)
+    });
+
+    let command = host.next_command().await;
+    assert_eq!(command["type"], json!("clear_queue"));
+    let keys: Vec<&String> = command.as_object().expect("object").keys().collect();
+    assert_eq!(
+        keys.len(),
+        2,
+        "only `type` + `id` go on the wire: {command}"
+    );
+    assert!(command.get("id").is_some(), "{command}");
+
+    host.respond_ok(
+        &command["id"],
+        "clear_queue",
+        json!({"steering": ["Change direction"], "followUp": ["Summarize when finished"]}),
+    )
+    .await;
+
+    let (cleared, client) = call.await.expect("join");
+    assert_eq!(cleared.steering, vec!["Change direction".to_string()]);
+    assert_eq!(
+        cleared.follow_up,
+        vec!["Summarize when finished".to_string()]
+    );
+    assert_eq!(client.pending_count(), 0);
+}

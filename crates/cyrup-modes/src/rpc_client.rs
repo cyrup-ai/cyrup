@@ -93,7 +93,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::rpc::types::RpcResponse;
+use crate::rpc::types::{ClearedQueue, RpcResponse};
 
 // ---------------------------------------------------------------------------------------------
 // Constants — pi's literals
@@ -715,6 +715,14 @@ impl RpcClient {
     /// pi `abort` (`:218`).
     pub async fn abort(&self) -> Result<(), RpcClientError> {
         self.send(command("abort", [], None)).await.map(|_| ())
+    }
+
+    /// pi `clearQueue` (`rpc-client.ts:226-229` **@v0.84.4** — the verb does not exist at the
+    /// v0.83.0 baseline the rest of this surface cites; SEAM-116): drain the steering + follow-up
+    /// queues and get their text back, so it can be restored into the editor before an `abort`.
+    pub async fn clear_queue(&self) -> Result<ClearedQueue, RpcClientError> {
+        let data = self.data(command("clear_queue", [], None)).await?;
+        Ok(serde_json::from_value(data)?)
     }
 
     /// pi `newSession` (`:227`) — `{ cancelled }` when an extension vetoed the new session.

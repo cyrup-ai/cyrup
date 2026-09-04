@@ -74,6 +74,11 @@ pub enum SessionCommand {
     },
     /// Interrupt the active run (idempotent).
     Abort,
+    /// Drain both message queues and return their text (`rpc-types.ts:26` **@v0.84.4**, reply
+    /// `{steering, followUp}` at `:124-128`; absent at the ported v0.83.0 baseline — SEAM-116).
+    /// Pi's documented use (`docs/rpc.md:137-158` @v0.84.4): send it BEFORE `abort`, then restore
+    /// the returned text in the client editor — interactive Esc over the wire.
+    ClearQueue,
     /// Start a fresh session in the same cwd, optionally recording a `parentSession`.
     NewSession {
         #[serde(default, rename = "parentSession")]
@@ -181,6 +186,25 @@ pub enum SessionCommand {
     /// Any unrecognized `type` (R-00-009). Detected in [`dispatch`](super::dispatch); never reaches [`handle`](super::handle).
     #[serde(other)]
     Unknown,
+}
+
+/// What `clear_queue` drained — pi's `{ steering: string[]; followUp: string[] }`
+/// (`rpc-types.ts:124-128` @v0.84.4; SEAM-116), the text a client restores into its editor before
+/// sending `abort` (`docs/rpc.md:137-158` @v0.84.4).
+///
+/// One type for both directions, like [`RpcResponse`] — pi shares `rpc-types.ts` between
+/// `rpc-mode.ts` and `rpc-client.ts`: the host serializes it as the `data` of its `clear_queue`
+/// reply and [`RpcClient::clear_queue`](crate::RpcClient::clear_queue) deserializes the same struct
+/// back, so the two key names cannot drift apart. A named pair rather than
+/// `(Vec<String>, Vec<String>)`: the halves have the same type, so a positional tuple lets a caller
+/// restore them into the editor in the wrong order without a compile error.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearedQueue {
+    /// The steering messages that were pending, in queue order (wire key `steering`).
+    pub steering: Vec<String>,
+    /// The follow-up messages that were pending, in queue order (wire key `followUp`).
+    pub follow_up: Vec<String>,
 }
 
 /// A correlated reply to a [`SessionCommand`] (arch-11 §3.5).

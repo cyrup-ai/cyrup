@@ -42,7 +42,7 @@ pub use json::run_json;
 pub use json_event::{JsonAgentSessionEvent, is_upstream_wire_event, to_json_event};
 pub use print::{PrintOptions, run_print};
 pub use raw_stdout::{RAW_STDOUT_RETRY_DELAY_MS, flush_raw_stdout, write_raw_stdout};
-pub use rpc::{QueueModeArg, RpcOut, RpcResponse, SessionCommand, run_rpc};
+pub use rpc::{ClearedQueue, QueueModeArg, RpcOut, RpcResponse, SessionCommand, run_rpc};
 pub use rpc_client::{
     DEFAULT_CLI_PATH, DEFAULT_IDLE_TIMEOUT_MS, EventSubscription, ForkMessage, ModelInfo,
     REQUEST_TIMEOUT_MS, RpcClient, RpcClientError, RpcClientOptions, event_type,

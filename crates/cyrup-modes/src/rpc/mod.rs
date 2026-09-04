@@ -43,7 +43,7 @@ pub(crate) mod types;
 
 use jsonl::{read_lines, write_out};
 use types::queue_mode_str;
-pub use types::{QueueModeArg, RpcOut, RpcResponse, SessionCommand};
+pub use types::{ClearedQueue, QueueModeArg, RpcOut, RpcResponse, SessionCommand};
 
 // ---------------------------------------------------------------------------------------------
 // Extension dialogs + run-loop support
@@ -944,6 +944,24 @@ async fn handle(
             // (independently confirmed: no first-party Pi call site does this either). A dialog left
             // open here settles only via a genuine `extension_ui_response` or its own `timeout_ms`.
             RpcResponse::ok("abort", raw_id.clone(), None)
+        }
+        SessionCommand::ClearQueue => {
+            // SEAM-116: Pi is `return success(id, "clear_queue", session.clearQueue())`
+            // (rpc-mode.ts:433-435 @v0.84.4), and `clearQueue()` (agent-session.ts:1588-1596)
+            // snapshots both queues, empties them, emits `queue_update` and returns
+            // `{ steering, followUp }`. `drain_queue` is that method: both mirrors are taken under
+            // their guards in ONE pass, so a `steer`/`follow_up` racing this verb lands wholly in
+            // the reply or wholly in the queue, never both and never neither. Like `abort`, this
+            // owns no `in_flight` bookkeeping and dispatches concurrently.
+            let (steering, follow_up) = session.drain_queue().await;
+            let id = raw_id.clone();
+            match serde_json::to_value(ClearedQueue {
+                steering,
+                follow_up,
+            }) {
+                Ok(data) => RpcResponse::ok("clear_queue", id, Some(data)),
+                Err(e) => RpcResponse::err("clear_queue", id, e.to_string()),
+            }
         }
         SessionCommand::NewSession { parent_session } => {
             let id = raw_id.clone();
