@@ -6,30 +6,25 @@ A coding agent in Rust, inspired by the [Pi](https://github.com/earendil-works/p
 It takes Pi's design — a minimal core, everything-is-an-extension, an agent that can extend itself —
 and rebuilds it on a Rust backbone with WebAssembly extensions.
 
-> **Status:** not a released product. 21 crates, ~700k lines of Rust. The agent loop, provider
-> layer, tool set, session tree, TUI, extension host, all four run modes and the Flux development
-> pipeline are real and wired end to end — and so are the two subsystems this README last listed as
-> unfinished. The **MCP client** now serves real tool calls against real servers, over stdio and over
-> OAuth-protected HTTP, with sampling, elicitation and a JSON-RPC wire tracer. The **alternate-screen
-> TUI** (`--tui-mode fullscreen`) is built to [ADR-0005](docs/adr/ADR-0005-alt-screen-tui-mode.md)
-> rather than printing a fallback notice. Both gates are green: **8,255 unit tests** (8 skipped)
-> and **486 integration tests**, no failures. Behavioural equivalence work is tracked openly in
-> [`docs/gap-analysis/`](docs/gap-analysis/README.md) — **133 open items across the area files,
-> down from 237 at the last published reconciliation**, with the two `critical` rows and the method
-> question behind them described under [Coverage and known gaps](#coverage-and-known-gaps). The full
-> user guide is in [`docs/guide/`](docs/guide/introduction.md) — see
-> [Documentation](#documentation) below.
+> **Status:** not a released product. 21 crates, ~786k lines of Rust. The agent loop, provider
+> layer, tool set, session tree, TUI, extension host, all four run modes, the MCP client and the
+> Flux development pipeline are real and wired end to end. Both gates are green: **8,710 workspace
+> tests** (9 skipped) and **492 integration tests**, no failures. Behavioural equivalence work is
+> tracked openly in [`docs/gap-analysis/`](docs/gap-analysis/README.md) — **103 open items across
+> the area files, no `critical` rows, and exactly one row above `medium`**, described under
+> [Coverage and known gaps](#coverage-and-known-gaps). The full user guide is in
+> [`docs/guide/`](docs/guide/introduction.md) — see [Documentation](#documentation) below.
 
 ## Inspired by, not transliterated from
 
-cyrup follows Pi's behaviour closely and cites it obsessively — there are **22,289 citations** in
+cyrup follows Pi's behaviour closely and cites it obsessively — there are **23,901 citations** in
 the source pointing at the exact upstream `.ts` file and line a given Rust item mirrors. That index
 is how equivalence gets audited: `grep -rn "agent-loop.ts:226" crates` finds the code that answers
 for it.
 
 But Rust is not TypeScript, and pretending otherwise produces bugs rather than fidelity. Where the
 languages genuinely differ, cyrup ports the *behaviour* and records the mechanism difference in a
-`CYRUP-DELTA` comment naming the upstream line and the reason — there are **454** of them. Real
+`CYRUP-DELTA` comment naming the upstream line and the reason — there are **506** of them. Real
 examples from the codebase:
 
 - A JavaScript `async` function always settles. A Rust future can be dropped at any `.await`, so
@@ -107,7 +102,7 @@ Dependencies point downward only. `cyrup-core` depends on nothing in-workspace, 
 | Crate | Role |
 |-------|------|
 | `cyrup-core` | shared substrate: ids, `Content`/`Message`, `EventStream<T>`, `CancelToken`, the `Tool` trait |
-| `cyrup-provider` | vendor-neutral LLM layer — 35 built-in chat providers, 10 wire APIs, auth, streaming, catalogs, images |
+| `cyrup-provider` | vendor-neutral LLM layer — 39 built-in providers over 10 wire APIs, 35 embedded catalogs, auth, streaming, images |
 | `cyrup-agent` | the turn loop: tool execution, hooks, steering and follow-up queues, abort |
 | `cyrup-tools` | built-in tools (`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls`) over an `FsOps`/`ProcOps` seam |
 | `cyrup-session` | JSONL session tree, compaction, system-prompt and context assembly |
@@ -153,25 +148,30 @@ The guide has **no MCP chapter yet** — the client shipped ahead of its documen
 ## Build
 
 ```sh
+cargo fmt --all -- --check              # the workspace is rustfmt-clean under the pinned toolchain
 cargo check --workspace --all-targets   # type-check everything, including tests
 cargo clippy --workspace --all-targets -- -D warnings  # REQUIRED — the no-panic policy only fires here
 cargo clippy -p cyrup-ext-sdk --target wasm32-wasip2   # the guest SDK — --workspace does not reach it
 cargo clippy -p cyrup-it --features it                 # the gated harness — likewise
-cargo nextest run --workspace           # the everyday gate: 8,255 tests (8 skipped)
+cargo nextest run --workspace           # the everyday gate: 8,710 tests (9 skipped)
 cargo run -p xtask -- feature-matrix    # non-default feature combos + RUNS the gated cyrup-it seam suite (--fast skips it)
 cargo doc --workspace --no-deps --bins  # rustdoc links are denied, not warned — `--bins` or the binary is skipped
 ```
+
+`cargo fmt` is new to this list and worth one sentence. The workspace was never rustfmt-clean:
+a check run reported 14,889 hunks across 1,216 files, and no `rustfmt.toml` setting recovered the
+hand-applied style, so the default-config reflow was applied wholesale. It is clean now, under
+`rust-toolchain.toml`'s pinned stable; keep it that way rather than re-litigating the style.
 
 `cargo clippy` is not optional. The no-panic policy is expressed as `[workspace.lints.clippy]`
 denials, and **clippy tool lints do not fire under `cargo build` or `cargo test`.** There is no CI
 in this repository, so nothing runs these for you.
 
-**All three clippy surfaces are at zero findings** as of `769ec3d`, so the workspace-wide
-`-- -D warnings` form now passes rather than failing on arrival — the previous edition of this README
-had to scope the deny flag to `cyrup-agent` alone because everything else carried warnings. Keep it
-that way; the three lines above are three surfaces, not one repeated, because `--workspace` reaches
-neither `cyrup-ext-sdk` (it compiles to `wasm32-wasip2`) nor `cyrup-it` (it is behind
-`required-features`).
+**All three clippy surfaces are at zero findings**, re-verified on the current `main` together with
+`cargo doc` and both test gates, so the workspace-wide `-- -D warnings` form passes rather than
+failing on arrival. Keep it that way; the three lines above are three surfaces, not one repeated,
+because `--workspace` reaches neither `cyrup-ext-sdk` (it compiles to `wasm32-wasip2`) nor
+`cyrup-it` (it is behind `required-features`).
 
 That cleanup is worth one paragraph of its own, because the *first* survey of this undercounted by a
 factor of more than two. Deny-level lints (`unwrap_used`, `indexing_slicing`) are hard errors, so a
@@ -203,26 +203,36 @@ a real MCP server child process — live in one gated harness crate:
 
 ```sh
 cargo build -p cyrup-ext-sdk --target wasm32-wasip2
-cargo nextest run -p cyrup-it --features it        # 486 tests across 8 binaries
+cargo nextest run -p cyrup-it --features it        # 492 tests across 9 binaries
 ```
 
 `cyrup-it` is behind `required-features = ["it"]`, so the everyday gate never builds it. Its
 `build.rs` resolves the fixture binaries and the WASM component **once** via
-`cargo build --message-format json-render-diagnostics`. It carries **eight** targets — one per seam
-(`subagents`, `intercom`, `ext`, `permission`, `mcp`, `session_svc`, `bin`, `misc`) — rather than one
-for the workspace, so a `process::exit`, an abort or a segfault in one seam cannot take the others
-down with no report. The `mcp` target is the newest: MCP's whole contract is what it puts into a live
+`cargo build --message-format json-render-diagnostics`. It carries **nine** targets — one per seam
+(`subagents`, `verify_redaction`, `intercom`, `ext`, `permission`, `mcp`, `session_svc`, `bin`,
+`misc`) — rather than one for the workspace, so a `process::exit`, an abort or a segfault in one seam
+cannot take the others down with no report. The `mcp` target's contract is what MCP puts into a live
 session's tool registry, so its proof has to be an assembled `AgentSession` rather than a double.
 
-Nine integration binaries remain in-crate under `crates/*/tests/`, and each is there because it needs
-a process of its own: it mutates the process environment (`cyrup-tools/tests/bash_env_scrub.rs`,
+Set `CYRUP_IT_BIN_DIR` to a directory of pre-built binaries (`cargo build -p cyrup --features faux
+--bin cyrup`, plus each fixture crate's `--features test-fixtures --bins`) and `build.rs` skips its
+nested second link entirely. On a constrained disk that is the difference between the suite running
+and the nested build failing with `No space left on device`.
+
+**A `cargo check` on this crate is not a run of it.** The batch that closed 25 parity rows edited
+about 30 files here and type-checked them only; running the suite afterwards found two stale
+fixtures that had been green in nobody's report. Run it before trusting a seam.
+
+Sixteen integration binaries remain in-crate under `crates/*/tests/`, and each is there because it
+needs a process of its own: it mutates the process environment (`cyrup-tools/tests/bash_env_scrub.rs`,
 `cyrup/tests/first_time_setup.rs`), spawns the shipped `cyrup` binary
 (`cyrup/tests/bootstrap_http_proxy.rs`, `cyrup/tests/export_dispatch_order.rs`), or pins a
-whole-crate wiring proof next to the crate it proves.
+whole-crate wiring proof next to the crate it proves — the six `cyrup-flux/tests/flux_00*` binaries
+are the newest of those.
 
 This layout is deliberate and was earned. The suite previously had 310 integration binaries under
 `crates/*/tests/` — and because Cargo makes every such file its own binary and process, a full run
-took hours to execute roughly two minutes of assertions. It is now 9 in-crate binaries plus 8 gated
+took hours to execute roughly two minutes of assertions. It is now 16 in-crate binaries plus 9 gated
 `cyrup-it` targets.
 
 Two conventions worth knowing:
@@ -236,90 +246,82 @@ Two conventions worth knowing:
 ## Coverage and known gaps
 
 Tracked honestly and in the open, so nobody mistakes an unported feature for a bug. The full ledger
-is [`docs/gap-analysis/`](docs/gap-analysis/README.md), with the execution order in
-[`docs/PARITY-PLAN.md`](docs/PARITY-PLAN.md) and the decisions in [`docs/adr/`](docs/adr/README.md).
+is [`docs/gap-analysis/`](docs/gap-analysis/README.md), with the decisions in
+[`docs/adr/`](docs/adr/README.md). ([`docs/PARITY-PLAN.md`](docs/PARITY-PLAN.md) is the older
+execution plan and now lags the ledger; the ranked view lives in
+[`00-residual-ledger.md`](docs/gap-analysis/00-residual-ledger.md).)
 
-Three things about that ledger are worth stating up front. It is largely a **static** analysis —
-items are evidenced by reading both sources, not by running anything — its own measured error rate is
-about **12%** (of roughly 465 rows worked, ~56 turned out not to match the code at HEAD), and it
-**lags the code**. Treat every entry as a lead to verify, not a fact. Items that *have* been observed
-against a running binary are marked in [`REPRO-LOG.md`](docs/gap-analysis/REPRO-LOG.md).
+Two things about that ledger are worth stating up front. It is largely a **static** analysis — items
+are evidenced by reading both sources, not by running anything — and it **lags the code**. Its own
+measured error rate has run near 12%, and the two most recent closure batches were consistent with
+that: of the rows worked, two were refuted outright and one closed as a duplicate of an already-fixed
+row. Treat every entry as a lead to verify, not a fact. Items that *have* been observed against a
+running binary are marked in [`REPRO-LOG.md`](docs/gap-analysis/REPRO-LOG.md).
 
-**The count, recounted at this commit.** The ledger's own prose asks for a mechanical recount rather
-than an adjusted one, because four successive editions rested on a counting rule a second reader
-could not reproduce. Counting the thirteen `## Open items` tables — one per area file, areas 01–12 plus
-14 — by a rule stated so a second reader can re-run it (a row is closed if its ID is struck through
-or its severity or kind cell carries `CLOSED`/`FIXED`/`REFUTED`; `tracker` rows are excluded;
-everything else is open at its stated severity) gives:
+**The count.** It is no longer counted by hand. `docs/gap-analysis/scripts/count_open_items.py` walks
+every area file's `## Open items` table by a rule a second reader can re-run, and both cross-cutting
+files are regenerated from its output:
 
 | | rows | closed | open | critical | high | medium | low |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| areas 01–12 + 14 | **639** | **499 (78%)** | **133** | 2 | 3 | 49 | 79 |
+| areas 01–12, 14 and the `09a` supplement | **667** | **564 (85%)** | **103** | 0 | 1 | 28 | 74 |
 
-That is down from the last published reconciliation (237 open, 2026-08-14) and from the correction
-that superseded it (2026-08-19). Two caveats on the table above, both in the direction of the ledger
-overstating what is open:
-
-- **At least one open row is already closed in the code.** `PROV-068` (`high`) was closed as
-  *refuted* in `24b6ffe`, with the reasoning left in-source at
-  `crates/cyrup-provider/src/providers/together.rs:275-281`; its row was never struck. That is the
-  general shape of the lag, not an isolated slip.
-- **The `09a` drift file is outside the table.** `docs/gap-analysis/09a-*` opened the
-  `pi-subagents` v0.47.1 → v0.57.0 window with 11 confirmed items plus 8 carried-unverified, and
-  keeps them in its own summary table rather than area 09's. Six of the confirmed eleven have since
-  had code land against them (`bf8b0f9`, `c94a360`), and none of those closures is reflected here.
+Two structural fixes came with that script. The `09a` `pi-subagents` drift supplement is now counted
+in the same total instead of keeping its own summary table outside it, and the script's own
+hand-maintained carry-over list — which had been double-counting five rows — was emptied.
 
 Currently open, in brief:
 
-- **The above-medium set is three live rows** — `PERM-034` ("Allow Always" does not stick),
-  `critical`, plus `TUI-091` (reasoning blocks never render) and `SEAM-113` (`/model` does not
-  survive into the next session), both `high`. **`SEAM-112` was the fourth and CLOSED 2026-08-29**
-  (`/resume` yielded a broken session whose bash calls repeated endlessly): a `Length` stop cleared
-  the overflow-recovery latch on `message_end`, immediately before the post-run compaction check
-  read it, so the one-shot brake was unreachable and compact-and-retry re-drove the interrupted turn
-  without bound. The table above counts five because `PROV-068`'s row was never struck.
-  **Every one of them was filed from live use rather than from reading**, and that is the ledger's
-  most useful finding about itself: nine reading sweeps and a nine-surface enumeration produced an
-  above-medium set of wire-and-wiring defects a careful reader can see, while four days of actually
-  running the binary produced three rows rated `critical` on arrival that no reading pass had a row
-  for. **The above-medium set is what a static method is structurally worst at populating**, and the
-  counter is hours in a real terminal, not a better sweep.
-- **MCP is built and working, and its parity port is still in flight.** A model can call a real
-  server's tools end to end over stdio and over OAuth-protected HTTP; sampling, elicitation and the
-  JSON-RPC wire tracer all run, and the `mcp` seam has its own gated integration target.
-  `docs/gap-analysis/13*` enumerates the port as **436 units** against `pi-mcp-adapter` v2.26.1 — four
-  upstream surfaces are cut by owner decision, which removes ~14% of the package — and last published
-  a census on 2026-08-21: 212 implemented, 100 partial, 98 missing, 27 not-applicable, so 198
-  carrying open work. **That census predates the wave of work that made the crate function** and has
-  not been re-derived; the live figure is the source itself, where **12 distinct `TODO(MCP-NNN)` ids
-  remain** against their unit. The 13\* series is excluded from the counts above, because it tracks
-  a port in flight rather than a gap in a shipped crate.
-- Three of pi's built-in providers — `qwen-token-plan`, `qwen-token-plan-cn`, `radius` — are not
-  registered (`PROV-014`, partially closed: the `pi-messages` wire API half is done, the provider
-  half is not). A guard test asserts their absence so a half-finished provider cannot silently
-  answer requests it cannot serve.
-- **`cyrup-flux` is the newest surface and the least audited.** It got its first area file
-  ([`14-cyrup-flux.md`](docs/gap-analysis/14-cyrup-flux.md)) only in the 2026-08-19 batch — 7 rows,
-  none closed — so every figure in the ledger that predates it has the wrong denominator, not just
-  the wrong numerator.
+- **The set above `medium` is one row.** `SUBA-074` stage 2: an agent's `runner:` frontmatter can
+  name an external CLI to run the child under, and that adapter protocol is unported, so the
+  frontmatter is refused rather than honoured. Effort L, and it needs the protocol designed before
+  anyone ports it. Every row the previous edition of this README named above `medium` is now closed:
+  `PERM-034` refuted (the behaviour is upstream's own, and is now pinned by a test rather than filed
+  as a bug), `PROV-068` refuted, `SEAM-112` fixed, `SEAM-113` closed as stale against pi's current
+  opt-in persist contract, and `TUI-091` closed on a real-terminal observation showing that reasoning
+  blocks do render.
+- **Every other open row is `medium` or `low`.** The 28 mediums cluster in `cyrup-ext`'s renderer
+  and shortcut surfaces (5), pi-core drift not yet routed to an owning area (5), and the config,
+  TUI and subagent files (4, 4 and 3); the rest are spread one or two to an area. A representative
+  one: six `pi-subagents` environment variables still have no `CYRUP_` counterpart, because the
+  subsystems they configure — a per-tool child timeout, a run fan-out budget — do not exist here yet.
+- **MCP works, and its parity port is still in flight.** A model calls a real server's tools end to
+  end over stdio and over OAuth-protected HTTP; sampling, elicitation and the JSON-RPC wire tracer
+  all run, and the `mcp` seam has its own gated integration target. `docs/gap-analysis/13*` enumerates
+  the port as **437 units** against `pi-mcp-adapter` — four upstream surfaces are cut by owner
+  decision, which removes about 14% of the package — and last published a census of 212 implemented,
+  100 partial, 98 missing, 27 not-applicable. **That census predates the wave of work that made the
+  crate function**, and the clone has since moved from v2.26.1 to v2.32.1, so it needs re-deriving;
+  the live figure is the source itself, where **9 distinct `TODO(MCP-NNN)` ids remain**. Area 13 is
+  counted separately above because it plans code that does not exist yet rather than measuring drift
+  in code that does. **That separation is a counting rule and nothing more** — earlier editions of
+  this README and of the ledger said another team owned area 13, which was never true, and the claim
+  has been retracted in both.
 - **`CYRUP-DELTA` markers are not self-authorising, and a sweep found that some had been used that
   way.** An audit of `cyrup-tools`' deltas against pi turned 31 of them into an explicit triage
-  backlog (`.flux/todo/parity-gaps/`, filed in `878d181`): each had been an agent-authored "out of
-  scope" note or delta marker that nobody had signed off, and each now has to be closed, explicitly
-  accepted, or done. A delta is a record of a decision — it is not the decision.
+  backlog (`.flux/todo/parity-gaps/`): each had been an agent-authored "out of scope" note that
+  nobody had signed off, and each now has to be closed, explicitly accepted, or done. A delta is a
+  record of a decision — it is not the decision.
 - Every upstream has moved past the baseline cyrup ported. Diff the ported baseline against upstream
   `HEAD` before treating a difference as a defect.
 
-Two things the previous edition of this README listed as open are **done**:
+Several things this README previously listed as open are **done**:
 
+- **Both `qwen-token-plan` variants and `radius` are registered**, along with the
+  `qwen-token-plan-individual` provider pi added later. The guard test that used to assert their
+  absence now asserts their presence. Their model catalogs are still resolved dynamically rather than
+  embedded, which is the open half of `PROV-014`.
+- **`cyrup-flux` is no longer the unaudited surface.** It went from zero tests at 1,513 lines to 37
+  tests whose every expectation is the upstream Python's own output, which caught six real defects;
+  its bundled prompt tree is now embedded at build time rather than resolved through the build
+  machine's source path, so an installed binary can find its own templates.
 - **Alternate-screen/fullscreen TUI mode ships.** `--tui-mode fullscreen` is an alternate-screen
   renderer with mouse capture, a scrollbar, text selection, image support and semantic-prompt
-  navigation — `crates/cyrup-tui/src/altscreen/`, built to [ADR-0005](docs/adr/ADR-0005-alt-screen-tui-mode.md)
-  B-1…B-14 in `dbcf59a`, with the session-erasure and four dead behaviours fixed in `b31f7c4`. It no
-  longer prints a fallback notice.
-- **The `cyrup-tui` ⇄ pi port audit backlog is empty.** All 26 audited gaps are in `.flux/done/`
-  (`f8eeef3`). The three provider-catalog highs that headlined the previous edition
-  (`PROV-054`/`055`/`056`) closed together on 2026-08-15, as did `SESS-040` and `PROV-047`.
+  navigation, built to [ADR-0005](docs/adr/ADR-0005-alt-screen-tui-mode.md). It no longer prints a
+  fallback notice.
+- **The `cyrup-tui` ⇄ pi port audit backlog is empty**, and the `pi-subagents` drift supplement's
+  carried-but-unverified section is now empty too: every row in it was re-read against the upstream
+  tag and either ported or closed.
 
 ## Upstreams
 
@@ -327,24 +329,28 @@ cyrup tracks six upstream projects — five TypeScript, one Python. The core is
 [`earendil-works/pi`](https://github.com/earendil-works/pi); four optional subsystems follow
 standalone Pi extensions, since Pi core deliberately ships no permission system and no MCP client of
 its own. **Flux is the sixth and the odd one out**: it follows `code_puppy_core_plugins`, which is
-Python, and it went unrecorded here — and in the gap ledger's own counts — until
-[`14-cyrup-flux.md`](docs/gap-analysis/14-cyrup-flux.md) opened in the 2026-08-19 batch. The
-`git show <tag>:<path>` rule below applies to it unchanged; only the language differs.
+Python. The `git show <tag>:<path>` rule below applies to it unchanged; only the language differs.
 
-| upstream | followed by | ported baseline | drift window measured to | notes |
+| upstream | followed by | ported baseline | latest tag | notes |
 |---|---|---|---|---|
-| `earendil-works/pi` | most crates | v0.83.0 | v0.84.1 | window = 627 files, +52 291 / −17 556; filed as area 12 + drift rows in areas 01–08 |
-| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | ~v0.43.0 *(inferred — the crate records no version string)* | **v0.57.0** | the v0.47.1 → v0.57.0 window (168 files, +21 385 / −7 307) was opened in `09a` and is partly closed |
-| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.7.1 | v0.8.0 | **caught up** — every v0.7.1 → v0.8.0 behavioural change is ported |
-| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.9.2 | v0.10.1 | v0.9.2 → v0.10.1 closed; **v0.10.1 → v0.12.0 is unopened**, filed as `ICOM-054`…`058` |
-| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.26.1 *(retargeted from v2.25.0 on 2026-08-20)* | v2.26.1 | port in flight — 437 units in `docs/gap-analysis/13*` |
-| `code_puppy_core_plugins` *(Python)* | `cyrup-flux` | v0.0.6 | v0.0.6 | first audited 2026-08-19; also needs `code_puppy` core itself (v0.0.720) for `FLUX-002` |
+| `earendil-works/pi` | most crates | v0.83.0 | **v0.84.4** | window = 775 files, +68 885 / −20 827; filed as area 12 + drift rows in areas 01–08 |
+| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | ~v0.43.0 *(inferred — the crate records no version string)* | **v0.64.0** | the largest window of the six; opened in `09a`, and its carried-unverified section is now empty |
+| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.7.1 | **v0.8.0** | **caught up** — every v0.7.1 → v0.8.0 behavioural change is ported. Upstream has since moved into the `gotgenes/pi-packages` monorepo |
+| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.9.2 | **v0.13.0** | the full v0.9.2 → v0.13.0 window is swept; `ICOM-054`/`055` remain open from it |
+| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.26.1 | **v2.32.1** | port in flight — 437 units in `docs/gap-analysis/13*`, whose census predates both the working crate and this tag |
+| `code_puppy_core_plugins` *(Python)* | `cyrup-flux` | v0.0.6 | **v0.0.40** | the *ported surface* (`flux_bootstrap/`) is byte-identical across all 34 intervening tags, so the version gap is not a behaviour gap |
 
-The "measured to" column moves without warning; re-measure it with `git tag --sort=-v:refname`
-against a real clone rather than trusting this table — the intercom row above is what happens when
-you don't, since it read v0.10.1 as "latest" for two weeks after v0.12.0 shipped. The window between
-the columns is measured and filed, not ignored — [`ADR-0006`](docs/adr/ADR-0006-upstream-chase-cadence.md)
-records it per upstream and says where the resulting items live.
+Clone all six under `./tmp/` (gitignored) before working a ledger row; the area files cite them as
+`git -C tmp/<repo> show <tag>:<path>`, and a working tree's line numbers will mislead you.
+[`docs/gap-analysis/README.md`](docs/gap-analysis/README.md)'s Baselines table carries the exact
+commits each pass measured against.
+
+Re-measure the "latest tag" column rather than trusting it — `git ls-remote --tags` against a real
+clone. This table has been wrong in both directions before: it read `pi-intercom` v0.10.1 as latest
+for two weeks after v0.12.0 shipped, and it recorded a `pi-intercom` baseline of v0.7.0 for months
+when the real one was v0.9.2, which quietly reclassified in-baseline port bugs as version lag. The
+cadence and where the resulting items live are recorded in
+[`ADR-0006`](docs/adr/ADR-0006-upstream-chase-cadence.md).
 
 Each is the reference implementation of its own behaviour, and that is a working rule here rather
 than a courtesy: where cyrup and an upstream disagree, the upstream is correct by definition and
