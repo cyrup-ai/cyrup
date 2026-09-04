@@ -9,7 +9,8 @@
 > medium (`SUBA-074` stage 2)**. The blockquote below it is the sixth edition's, kept as written.
 >
 > **CENSUS REFRESH 2026-09-04, cyrup HEAD `2571969`.** Every area file (01–12, excluding area 13
-> which the MCP team owns, plus the `09a` v0.57-drift supplement and `14-cyrup-flux.md`) was
+> — counted separately for the structural reason in `README.md`, NOT because another team owns it;
+> that earlier claim was wrong — plus the `09a` v0.57-drift supplement and `14-cyrup-flux.md`) was
 > independently re-audited this pass against cyrup HEAD `2571969` (baseline `4fb5e40`, 210 commits)
 > and each upstream's real current tag, personally read on both sides per this ledger's evidence
 > rule — not taken from any commit message. **This refresh regenerates §0's census and §0a's
@@ -264,8 +265,9 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 > code commit is `5990e86`. The counting rule is the third edition's, and it was validated by
 > re-running it against the same twelve files at commit `e5c6933`, where it reproduces
 > **503 / 349 / 35 / 145 = 0/2/61/82** exactly. **`13-cyrup-mcp.md`, `13a`–`13i` and
-> `MCP-PORT-METHODOLOGY.md` are owned by another team and are excluded from every figure in this
-> file** — as they always have been, though it was never written down.
+> `MCP-PORT-METHODOLOGY.md` are excluded from every figure in this file** — as they always have been,
+> though it was never written down. *(Corrected 2026-09-04: the original sentence said "owned by another
+> team"; no such team exists. The exclusion is a counting rule, not an ownership boundary.)*
 >
 > **The ninth pass was not a sweep. It enumerated nine finite pi SURFACES mechanically and diffed
 > both directions: 191 findings — 67 missing in cyrup, 66 cyrup-original, 58 differing in shape —

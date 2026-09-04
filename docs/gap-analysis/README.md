@@ -85,8 +85,10 @@ load-bearing**: the twelve measure drift in code that exists, while area 13 spec
 not exist yet, so a forward-looking port unit and a backward-looking defect cannot be added together
 into anything a planner can act on. **The exclusion runs both ways: nothing in `README.md`,
 `00-residual-ledger.md` or `PARITY-GAPS.md` speaks for `13-cyrup-mcp.md`, `13a`–`13i` or
-`MCP-PORT-METHODOLOGY.md`, which another team owns — and those files' own tables are the authority
-for their unit inventory and its status.**
+`MCP-PORT-METHODOLOGY.md` — and those files' own tables are the authority for their unit inventory
+and its status.** *Correction 2026-09-04: earlier editions said another team owned area 13. That was
+never true — every upstream port, the MCP adapter included, is this repository's own work and is
+schedulable from this directory. The count separation above stands on the structural reason only.*
 
 | file | area |
 |---|---|
@@ -171,7 +173,7 @@ a deletion — `SEAM-035`…`SEAM-046` never existed, and area 08 records the ch
 | `pi-permission-system/` | `9affcc9` — **re-checked this pass, unchanged from the prior record** | **v0.7.1** | **v0.8.0** — **re-checked this pass, unchanged from the prior record** | 28 files, +4 023 / −1 851 (re-measured identical to the prior record) |
 | `pi-intercom/` | `199279a` | **v0.9.2** — *not v0.7.0; every prior doc had this wrong* | **v0.13.0** | true window `v0.9.2..v0.13.0` = 26 files, +4 701 / −976 |
 | `code_puppy_core_plugins/` | `8c6f852` | **v0.0.6** — *not recorded anywhere in `crates/cyrup-flux`; see `FLUX-007`* | **v0.0.40** | 139 files, +11 071 / −3 822 across the whole repo — but the ported surface is unchanged: `git diff --stat v0.0.6..v0.0.40 -- code_puppy_core_plugins/flux_bootstrap/ tests/test_flux_bootstrap.py` is empty, byte-identical across all 34 intervening tags. Ported surface is `flux_bootstrap/` — 18 bundled commands, 4 `_docs` files, 3 renderer scripts. cyrup ships 15 templates + 3 native renderers = the same 18 |
-| `pi-mcp-adapter/` | `6ba7d36` = `v2.32.1-3-g6ba7d36` — **clone re-pulled 2026-09-04; area 13 NOT re-audited against it** (the MCP team owns area 13; its files were not opened this pass). *Superseded: `14c0e6c` = `v2.25.0-4-g14c0e6c`.* | **not ported** — area 13 is the plan | **v2.32.1** *(was v2.25.0; the `v2.25.0..v2.32.1` window is unmeasured here)* | 203 paths / 164 `.ts` at the tag, ~24 200 lines; drift to HEAD is 17 files, +543 / −69 |
+| `pi-mcp-adapter/` | `6ba7d36` = `v2.32.1-3-g6ba7d36` — **clone re-pulled 2026-09-04; area 13 NOT re-audited against it** (its files were not opened this pass; the prior "MCP team owns area 13" note was wrong — area 13 is in scope and is scheduled from this directory like every other area). *Superseded: `14c0e6c` = `v2.25.0-4-g14c0e6c`.* | **not ported** — area 13 is the plan | **v2.32.1** *(was v2.25.0; the `v2.25.0..v2.32.1` window is unmeasured here)* | 203 paths / 164 `.ts` at the tag, ~24 200 lines; drift to HEAD is 17 files, +543 / −69 |
 
 **Read upstream with `git -C <repo> show <tag>:<path>`, never from a working tree.** Clone-HEAD line
 numbers and file existence both mislead; items have named files that never existed at any tag.

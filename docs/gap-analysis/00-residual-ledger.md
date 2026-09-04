@@ -74,7 +74,8 @@ toolchain (no `rustfmt.toml`); every implementer hit it — a repo-level decisio
 
 - Did not re-walk any medium/low row in any area; the 49/75 are exactly the sixth edition's.
 - Did not re-audit area 13: `tmp/pi-mcp-adapter` was re-pulled to **v2.32.1** (`README.md` Baselines
-  records the new HEAD) but the MCP team owns that area; its files were not opened.
+  records the new HEAD); its files were not opened. *Correction: this edition said the MCP team owns
+  that area. No such team exists — area 13 is this repository's work and belongs in the next batch.*
 - Did not file the six leads above as rows — each needs both sides read on the confirmed bar first.
 
 ---
@@ -391,8 +392,10 @@ claim at `:1070-1071` that it *"does not retrofit every one of this file's other
 > edition's `e5c6933` figures are still reproducible from git and are used as this edition's baseline.
 >
 > **SCOPE EXCLUSION, stated so the numbers stay interpretable: `13-cyrup-mcp.md`, `13a`–`13i` and
-> `MCP-PORT-METHODOLOGY.md` are owned by another team and are excluded from every count in this
-> file.** They always have been — "the twelve `## Open items` tables" has meant areas 01–12 since the
+> `MCP-PORT-METHODOLOGY.md` are excluded from every count in this file.** *(Corrected 2026-09-04: the
+> original text said they were "owned by another team"; that was false. The exclusion is structural — a
+> forward-looking port plan cannot be summed with backward-looking defects — not an ownership boundary,
+> and area 13 is schedulable work.)* They always have been — "the twelve `## Open items` tables" has meant areas 01–12 since the
 > first edition — but it was never written down, and a reader who counts the directory gets a
 > different answer. No figure in this edition, and no figure in `PARITY-GAPS.md` or `README.md`,
 > includes an MCP row.
