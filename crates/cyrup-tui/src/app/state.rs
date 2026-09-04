@@ -226,6 +226,13 @@ pub struct AppState {
     /// project grows `.cyrup/` resources and disarms it. `None` when trust was decided explicitly
     /// (a flag, a saved entry, the prompt) or already persisted.
     pub auto_trust_on_reload_cwd: Option<PathBuf>,
+    /// TUI-N02 — pi's `this.options.verbose` (`interactive-mode.ts:1702` @v0.84.4), the `--verbose`
+    /// flag that overrides `quietStartup` for the loaded-resources listing. Held on the App because
+    /// the panel is emitted from TWO places, not one: the boot path in the binary and the
+    /// `session_swapped` arm in this crate ([`App::push_session_loaded_resources`]), which is where
+    /// `/reload`'s re-emit lands. Armed by the host through [`App::set_verbose_startup`]; `false`
+    /// (pi's own default for an absent flag) until it is.
+    pub verbose_startup: bool,
     /// Committed lines already emitted to native scrollback via `Terminal::insert_before`
     /// (R-ARCH-TUI-003). Test/inspection only — OFF in production builds (TUI-092 F1).
     #[cfg(any(test, feature = "scrollback-accumulator"))]
@@ -476,6 +483,7 @@ impl AppState {
             cache_miss_check_pending: false,
             pending_swap_status: None,
             auto_trust_on_reload_cwd: None,
+            verbose_startup: false,
             #[cfg(any(test, feature = "scrollback-accumulator"))]
             scrollback: Vec::new(),
             extension_shortcuts: Vec::new(),

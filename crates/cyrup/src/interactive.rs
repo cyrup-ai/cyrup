@@ -85,111 +85,6 @@ pub async fn run_interactive_benchmark() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Assemble Pi's startup panel input from the live session (TUI-006). The listing halves come from
-/// the session's own resource snapshot / context store / extension host; the diagnostics half comes
-/// from `AgentSessionServices::startup_diagnostics`, which the builder now retains instead of
-/// discarding (`showLoadedResources`, interactive-mode.ts:1519-1690).
-fn build_startup_report(session: &AgentSession, verbose: bool) -> cyrup_tui::StartupReport {
-    use cyrup_resources::ResourceKind;
-    let services = session.services();
-    let home = Some(services.home.as_path());
-    let snapshot = services.context.snapshot();
-    cyrup_tui::StartupReport {
-        verbose,
-        quiet_startup: services.settings.effective().quiet_startup(),
-        // Pi's `[Context]` list is the system-prompt source + appended prompts + the `AGENTS.md`
-        // chain, in load order (`:1551-1555`, `{sort: false}`).
-        // `formatContextPath` (interactive-mode.ts:1334-1343) tries the CWD-RELATIVE form FIRST
-        // and only falls back to display formatting:
-        //
-        //     const relativePath = getCwdRelativePath(absolutePath, cwd);
-        //     if (relativePath !== undefined) { return relativePath; }
-        //     return this.formatDisplayPath(absolutePath);
-        //
-        // Only the fallback leg was ported, so a project `AGENTS.md` INSIDE the cwd listed as
-        // `~/…` or as a full absolute path where pi lists it `AGENTS.md`.
-        // `cyrup_tools::path::cwd_relative_path` is the `getCwdRelativePath` port; it already
-        // existed and simply was not reached from here.
-        context_files: snapshot
-            .context_files
-            .iter()
-            .map(|f| {
-                // Returned RAW, not posix-normalised: `formatContextPath` hands back
-                // `relativePath` as-is. The `.split(sep).join("/")` fold belongs to
-                // `formatPathRelativeToCwdOrAbsolute` (`utils/paths.ts:119-122`), a different
-                // function that this call site does not use.
-                cyrup_tools::path::cwd_relative_path(&f.path, &services.cwd).map_or_else(
-                    || cyrup_tui::display_path(&f.path, home),
-                    |rel| rel.display().to_string(),
-                )
-            })
-            .collect(),
-        skills: services
-            .resources
-            .skills
-            .all()
-            .iter()
-            .map(|s| s.name.clone())
-            .collect(),
-        // Prompt templates list as their slash command (Pi `/${template.name}`, `:1596`).
-        prompts: services
-            .resources
-            .prompts
-            .all()
-            .iter()
-            .map(|p| format!("/{}", p.name))
-            .collect(),
-        extensions: services
-            .ext_host
-            .loaded_ids()
-            .iter()
-            .map(|id| id.to_string())
-            .collect(),
-        // Built-ins are excluded — Pi lists only themes with a `sourcePath` (`:1615`).
-        themes: services
-            .resources
-            .themes
-            .all()
-            .iter()
-            .filter(|t| t.origin_path.is_some())
-            .map(|t| t.data.name.clone())
-            .collect(),
-        skill_diagnostics: cyrup_tui::resource_diagnostics(
-            &services.startup_diagnostics.resources,
-            ResourceKind::Skill,
-            home,
-        ),
-        prompt_diagnostics: cyrup_tui::resource_diagnostics(
-            &services.startup_diagnostics.resources,
-            ResourceKind::Prompt,
-            home,
-        ),
-        // The whole extension vector, Pi-faithfully (`:1660-1665` maps every recorded error into the
-        // block). In practice only the NON-fatal entries — the project-trust skips — are reachable
-        // here: a genuine load failure is reported and exits 1 at `report_runtime_diagnostics`, well
-        // before this panel is built, exactly as Pi's `main.ts:843-849` precedes `InteractiveMode`.
-        // EXT-039 — the shortcut-resolution warnings join the load failures in the ONE
-        // `[Extension issues]` block, appended last, exactly as upstream folds
-        // `getShortcutDiagnostics()` in after the command diagnostics
-        // (`interactive-mode.ts:1884-1886` @v0.84.4). They exist only once
-        // `App::install_extension_shortcuts` has run, which the caller does before building this
-        // report.
-        extension_diagnostics: {
-            let mut diags =
-                cyrup_tui::extension_diagnostics(&services.startup_diagnostics.extensions, home);
-            diags.extend(cyrup_tui::shortcut_diagnostics(
-                &services.ext_host.shortcut_diagnostics(),
-            ));
-            diags
-        },
-        theme_diagnostics: cyrup_tui::resource_diagnostics(
-            &services.startup_diagnostics.resources,
-            ResourceKind::Theme,
-            home,
-        ),
-    }
-}
-
 /// The interactive front-end: build the TUI over a real `CrosstermBackend<Stdout>`, seed any initial
 /// prompt, and run the event loop against the live session. Restores the terminal on exit.
 // The interactive entry point wires eight independently-owned collaborators; bundling them
@@ -357,7 +252,7 @@ pub async fn run_interactive(
     // `extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig())`
     // (`modes/interactive/interactive-mode.ts:2079` @v0.84.4): a shortcut on a reserved key is
     // dropped with a warning instead of being installed dead, and the warnings land in the
-    // `[Extension issues]` panel `build_startup_report` builds below (`:1884-1886`).
+    // `[Extension issues]` panel `StartupReport::from_session` builds below (`:1884-1886`).
     app.install_extension_shortcuts(&session.services().ext_host);
     // TUI-037 — arm the implicit-trust save `/reload` performs (pi stores the option at
     // `interactive-mode.ts:572` @v0.84.4; the consumer is `App::maybe_save_implicit_project_trust`).
@@ -377,7 +272,14 @@ pub async fn run_interactive(
     // interactive-mode.ts:1480-1690, invoked with `showDiagnosticsWhenQuiet: true` at `:1769`).
     // Pushed BEFORE the replay + the first prompt so it heads the scrollback, and before the
     // reader thread starts. `quietStartup` hides the inventory; it never hides a load failure.
-    app.push_loaded_resources(&build_startup_report(&session, verbose));
+    // TUI-N02 — `StartupReport::from_session` used to be this module's private
+    // `build_startup_report`. It moved into `cyrup-tui` when the panel gained its SECOND call site:
+    // upstream emits it from every session rebind and again from `/reload`
+    // (`interactive-mode.ts:1982`, `:5991-5994` @v0.84.4), and that second site is the run loop's
+    // `session_swapped` arm, which lives in that crate. `set_verbose_startup` arms the
+    // `options.verbose` half of `showListing` for it (`:1702`).
+    app.set_verbose_startup(verbose);
+    app.push_session_loaded_resources(&session);
 
     // Pi's startup-warning block (interactive-mode.ts:871-885 @v0.83.0), in pi's order. Both lines
     // go in the TRANSCRIPT, not on stderr, because that is the only place a first-run user will
