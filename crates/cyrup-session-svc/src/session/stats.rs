@@ -124,7 +124,9 @@ impl AgentSession {
 
     /// `true` when this branch's occupied-token count can be trusted — i.e. there is no compaction
     /// on the branch, or an assistant has responded since the latest one (Pi
-    /// `getContextUsage`'s `hasPostCompactionUsage` scan, agent-session.ts:3181-3193).
+    /// `getContextUsage`'s `hasPostCompactionUsage` scan, agent-session.ts:3181-3193 @v0.83.0,
+    /// `:3390-3403` @v0.84.4). Branch isolation is pinned by `tests/context_usage_branch.rs`
+    /// (SEAM-115).
     ///
     /// Scans backwards from the branch tail to the compaction boundary, matching Pi's loop
     /// direction, and accepts the first assistant that neither aborted nor errored and whose usage
@@ -173,7 +175,7 @@ impl AgentSession {
     }
 
     /// Context-window occupancy from the last assistant turn (Pi `getContextUsage`,
-    /// agent-session.ts:3164-3208 @v0.83.0).
+    /// agent-session.ts:3164-3208 @v0.83.0; byte-identical at `:3375-3413` @v0.84.4).
     ///
     /// Answers from a **reverse walk of the active branch's entries** — Pi's own
     /// `sessionManager.getBranch()` shape (`:3174`) — never from a rebuilt message list. The
@@ -238,7 +240,8 @@ impl AgentSession {
         let stats = self.session_stats().await;
         let messages = self.messages().await;
         // ONE producer for occupancy, as upstream has: Pi's `getSessionStats` does not re-derive it
-        // either, it returns `contextUsage: this.getContextUsage()` (agent-session.ts:3170).
+        // either, it returns `contextUsage: this.getContextUsage()` (agent-session.ts:3160
+        // @v0.83.0, `:3371` @v0.84.4). Pinned by `tests/context_usage_branch.rs` (SEAM-115).
         // Deriving it inline here duplicated the pre-F4 windowed-build scan, so it disagreed with
         // `GetContextUsage` whenever a compaction's kept window held no assistant while an earlier
         // pre-compaction assistant existed — including every unresolvable-v1 `first_kept_entry_id`

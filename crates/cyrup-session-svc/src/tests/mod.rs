@@ -13,6 +13,7 @@ mod build_containment_and_flag_diagnostics;
 mod cmdhint01_argument_hint;
 mod compact_refusals;
 mod compaction_tokens_after;
+mod context_usage_branch;
 mod control_ops;
 mod ctx_state_and_abort;
 mod custom_tool_render;
