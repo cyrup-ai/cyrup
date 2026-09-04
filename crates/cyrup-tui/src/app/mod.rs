@@ -81,8 +81,8 @@ pub(crate) use event_extract::{
 };
 pub(crate) use extension_render_impl::custom_entry_type;
 pub use extension_render_impl::{
-    extension_render, extension_render_entry, extension_render_message,
-    should_honor_extension_shutdown,
+    extension_render, extension_render_entry, extension_render_message, extension_render_tool_call,
+    extension_render_tool_result, should_honor_extension_shutdown,
 };
 #[cfg(test)]
 pub(crate) use input_reader::{

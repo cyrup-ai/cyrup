@@ -34,6 +34,7 @@ use cyrup_ext::{
     NativeExtension,
 };
 use cyrup_session_svc::AgentSessionEvent;
+use cyrup_session_svc::agent_message::AgentMessage as SessionMessage;
 use ratatui::backend::TestBackend;
 use serde_json::{Value, json};
 
@@ -589,6 +590,189 @@ async fn each_replayed_custom_message_gets_its_own_renderer_output() {
         sizes[0] < sizes[1],
         "each got ITS OWN payload, in order: {sizes:?}\n{sb}"
     );
+}
+
+// =============================================================================================
+// EXT-041 — the replayed TOOL surface. Upstream's replay walk constructs a `ToolExecutionComponent`
+// for EVERY replayed `toolCall` and hands it `this.getRegisteredToolDefinition(content.name)`
+// (`interactive-mode.ts:3729-3741` @v0.84.4), files it under `content.id` (`:3760`) and resolves
+// the `toolResult` back to it by `toolCallId` (`:3770-3775`) — the same component, with the same
+// renderer preference (`tool-execution.ts:84-101`), that the live path builds. cyrup's replay walk
+// resolved a renderer only for custom MESSAGES and passed `None` into both tool slots, so a
+// `/resume` drew every extension-rendered tool row with the built-in framing.
+//
+// Same `RendererExt` as the live tests above: it claims the built-in `bash`, and both renderers
+// DERIVE from the payload so the "built-in did not also draw" assertions cannot be satisfied by an
+// echo.
+// =============================================================================================
+
+/// A replayed assistant tool call for a tool an extension claimed draws the EXTENSION's call
+/// header, and its replayed result draws the EXTENSION's result body — not the built-in `$ …`
+/// header and output block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_tool_call_and_result_still_reach_their_registered_renderer() {
+    let host = host_with_renderer().await;
+    let mut app = app();
+
+    app.replay_session_with_extensions(
+        &[
+            replay_assistant_call(
+                "call-1",
+                "bash",
+                json!({ "command": "echo secret-builtin-marker" }),
+            ),
+            replay_tool_result("call-1", "bash", "builtin-output-marker"),
+        ],
+        &host,
+    )
+    .await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(
+        sb.contains("EXTCALL[bash] payload-bytes="),
+        "the replayed CALL went through the registered `renderCall` (`:3729-3741`):\n{sb}"
+    );
+    assert!(
+        !sb.contains("$ echo secret-builtin-marker"),
+        "the built-in bash header did NOT also draw:\n{sb}"
+    );
+    assert!(
+        sb.contains("EXTRESULT[bash] payload-bytes="),
+        "the replayed RESULT went through the registered `renderResult` (`:3770-3775`):\n{sb}"
+    );
+    assert!(
+        !sb.contains("builtin-output-marker"),
+        "the built-in result body did NOT also draw:\n{sb}"
+    );
+}
+
+/// MIRROR 1 — a replayed tool NO extension claimed keeps its built-in rendering, exactly as the
+/// live path does (`an_unclaimed_tool_keeps_its_builtin_rendering`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_unclaimed_tool_keeps_its_builtin_rendering() {
+    let host = host_with_renderer().await;
+    let mut app = app();
+
+    app.replay_session_with_extensions(
+        &[
+            replay_assistant_call(
+                "call-2",
+                "read",
+                json!({ "path": "src/main.rs", "offset": 10, "limit": 5 }),
+            ),
+            replay_tool_result("call-2", "read", "fn main() {}"),
+        ],
+        &host,
+    )
+    .await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(
+        sb.contains("read src/main.rs:10-14"),
+        "the built-in read header drew on replay:\n{sb}"
+    );
+    assert!(
+        !sb.contains("EXTCALL") && !sb.contains("EXTRESULT"),
+        "no renderer was consulted for an unclaimed tool:\n{sb}"
+    );
+}
+
+/// MIRROR 2 — the rendered texts are routed by TOOL-CALL ID, never by name or arrival order
+/// (`renderedPendingTools.get(message.toolCallId)`, `:3770`). Two calls of the same claimed tool
+/// in one turn: `call-a` has the SMALL arguments and the LARGE result, `call-b` the reverse, and
+/// the results are replayed in the OPPOSITE order to the calls. The renderer reports the byte
+/// count it was handed, so each row must show its own call's numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_replayed_tool_row_gets_the_output_of_its_own_call() {
+    let host = host_with_renderer().await;
+    let mut app = app();
+
+    let small = json!({ "command": "a" });
+    let large = json!({ "command": "a considerably longer command line than the first" });
+    let mut turn = replay_assistant_call("call-a", "bash", small);
+    if let SessionMessage::Core(cyrup_core::Message::Assistant(m)) = &mut turn {
+        m.content.push(replay_tool_call("call-b", "bash", large));
+    }
+    app.replay_session_with_extensions(
+        &[
+            turn,
+            replay_tool_result("call-b", "bash", "short"),
+            replay_tool_result(
+                "call-a",
+                "bash",
+                "a much longer result body than the other call produced",
+            ),
+        ],
+        &host,
+    )
+    .await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    let sizes = |label: &str| -> Vec<usize> {
+        sb.lines()
+            .filter(|l| l.contains(label))
+            .filter_map(|l| l.split("payload-bytes=").nth(1))
+            .filter_map(|n| n.trim().parse::<usize>().ok())
+            .collect()
+    };
+    let calls = sizes("EXTCALL[bash]");
+    let results = sizes("EXTRESULT[bash]");
+    assert_eq!(calls.len(), 2, "both calls rendered:\n{sb}");
+    assert_eq!(results.len(), 2, "both results rendered:\n{sb}");
+    assert!(
+        calls[0] < calls[1],
+        "call rows sit in CALL order with their own arguments: {calls:?}\n{sb}"
+    );
+    assert!(
+        results[0] > results[1],
+        "each result landed on the row of ITS call id, not in arrival order: {results:?}\n{sb}"
+    );
+}
+
+/// A persisted assistant turn carrying one tool call — the `toolCall` content block the replay
+/// walk iterates (`for (const content of message.content) if (content.type === "toolCall")`,
+/// `:3727-3728`).
+fn replay_assistant_call(id: &str, name: &str, args: Value) -> SessionMessage {
+    use cyrup_core::{ApiId, AssistantMessage, Message, ProviderId, StopReason};
+    let mut msg = AssistantMessage::errored(
+        ProviderId::from("anthropic"),
+        "claude-opus-4",
+        Some(ApiId::from("anthropic-messages")),
+        StopReason::Stop,
+        String::new(),
+    );
+    msg.error_message = None;
+    msg.content = vec![replay_tool_call(id, name, args)];
+    SessionMessage::Core(Message::Assistant(msg))
+}
+
+fn replay_tool_call(id: &str, name: &str, args: Value) -> cyrup_core::Content {
+    cyrup_core::Content::ToolCall(cyrup_core::ToolCall {
+        id: ToolCallId::from(id),
+        name: name.to_string(),
+        arguments: args.as_object().cloned().unwrap_or_default().into(),
+        thought_signature: None,
+    })
+}
+
+/// The persisted `toolResult` message the walk matches back to its call by `toolCallId`.
+fn replay_tool_result(id: &str, name: &str, body: &str) -> SessionMessage {
+    SessionMessage::Core(cyrup_core::Message::ToolResult {
+        tool_call_id: ToolCallId::from(id),
+        tool_name: name.to_string(),
+        content: vec![cyrup_core::Content::Text {
+            text: body.into(),
+            text_signature: None,
+        }],
+        is_error: false,
+        details: None,
+        timestamp: 0,
+        usage: None,
+        added_tool_names: Vec::new(),
+    })
 }
 
 // =============================================================================================

@@ -75,22 +75,14 @@ pub async fn extension_render(
             };
             Which::Message(kind, message)
         }
+        // The tool half is shared with the REPLAY walk (EXT-041), which has a persisted
+        // `toolCall`/`toolResult` in hand rather than an event — same lookup, same collapse.
         AgentSessionEvent::ToolExecutionStart {
             tool_name, args, ..
-        } => {
-            if !ext_host.has_tool_renderer(tool_name) {
-                return Rendered::None;
-            }
-            Which::ToolCall(tool_name.clone(), args.clone())
-        }
+        } => return extension_render_tool_call(ext_host, tool_name, args).await,
         AgentSessionEvent::ToolExecutionEnd {
             tool_name, result, ..
-        } => {
-            if !ext_host.has_tool_renderer(tool_name) {
-                return Rendered::None;
-            }
-            Which::ToolResult(tool_name.clone(), result.clone())
-        }
+        } => return extension_render_tool_result(ext_host, tool_name, result).await,
         _ => return Rendered::None,
     };
     // A FAULTING renderer collapses to `None` here on purpose: both of this function's surfaces
@@ -102,6 +94,63 @@ pub async fn extension_render(
     // A FAULT collapses to `None` here on purpose (see above); a LIVE component passes through.
     match run_renderer(ext_host, which).await {
         Rendered::Failed(_) => Rendered::None,
+        other => other,
+    }
+}
+
+/// Ask the extension that claimed `tool_name` to render a TOOL CALL from its raw arguments — the
+/// tool half of [`extension_render`], callable WITHOUT an event so the `--resume` replay walk can
+/// reach it from a persisted `toolCall` block (EXT-041).
+///
+/// Pi's replay constructs a `ToolExecutionComponent` for every replayed `toolCall` and hands it
+/// `this.getRegisteredToolDefinition(content.name)` (`modes/interactive/interactive-mode.ts:3729-3741`
+/// @v0.84.4) — the same constructor, with the same definition, the live `tool_execution_start`
+/// arm uses (`:3340-3351`) — so the component prefers the extension's `renderCall` over the
+/// built-in on both paths alike (`components/tool-execution.ts:84-92`). Same cheap sync
+/// `has_tool_renderer` pre-check and the same spawn + bounded wait as [`extension_render`].
+///
+/// A FAULT collapses to [`crate::transcript::Rendered::None`]: `tool-execution.ts:290-294` catches
+/// the renderer's throw and draws `createCallFallback()`, i.e. the built-in shell.
+pub async fn extension_render_tool_call(
+    ext_host: &Arc<cyrup_ext::ExtensionHost>,
+    tool_name: &str,
+    call: &serde_json::Value,
+) -> crate::transcript::Rendered {
+    if !ext_host.has_tool_renderer(tool_name) {
+        return crate::transcript::Rendered::None;
+    }
+    match run_renderer(
+        ext_host,
+        Which::ToolCall(tool_name.to_string(), call.clone()),
+    )
+    .await
+    {
+        crate::transcript::Rendered::Failed(_) => crate::transcript::Rendered::None,
+        other => other,
+    }
+}
+
+/// [`extension_render_tool_call`]'s result-side twin — Pi `renderResult`, resolved by the same
+/// component on both the live path (`component.updateResult({...event.result, isError})` in the
+/// `tool_execution_end` arm, `interactive-mode.ts:3373` @v0.84.4) and the replay
+/// (`renderedPendingTools.get(message.toolCallId)` → `component.updateResult(message)`,
+/// `:3770-3775`). Same pre-check, same bounded wait, same fault collapse
+/// (`tool-execution.ts:316-321` falls back to `createResultFallback()`).
+pub async fn extension_render_tool_result(
+    ext_host: &Arc<cyrup_ext::ExtensionHost>,
+    tool_name: &str,
+    result: &serde_json::Value,
+) -> crate::transcript::Rendered {
+    if !ext_host.has_tool_renderer(tool_name) {
+        return crate::transcript::Rendered::None;
+    }
+    match run_renderer(
+        ext_host,
+        Which::ToolResult(tool_name.to_string(), result.clone()),
+    )
+    .await
+    {
+        crate::transcript::Rendered::Failed(_) => crate::transcript::Rendered::None,
         other => other,
     }
 }
