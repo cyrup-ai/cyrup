@@ -35,7 +35,7 @@ use cyrup_ext::{
 ///   (`Keymap`, `EditorKeymap`, `SelectKeymap`, `AutocompleteKeymap`, `ModelsKeymap`,
 ///   `SessionKeymap`, `TreeKeymap`, `AltScreenKeymap`) — pinned by
 ///   `tests/flux_004_status_shortcut.rs` against the real tables, not a copied list;
-/// * pi v0.84.4's only `ctrl+alt` default is `ctrl+alt+]` (`tui.editor.jumpBack`,
+/// * pi v0.84.4's only `ctrl+alt` default is `ctrl+alt+]` (`tui.editor.jumpBackward`,
 ///   `packages/tui/src/keybindings.ts:110-112`), so a later port of a pi default cannot collide
 ///   either. `ctrl+shift+f` was rejected for exactly that reason: it is pi's
 ///   `tui.altScreen.search` (`:192-195`; `core/keybindings.ts:88-91`, where the Windows profile

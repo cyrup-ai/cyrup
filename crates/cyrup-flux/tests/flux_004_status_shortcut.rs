@@ -106,7 +106,7 @@ fn the_status_shortcut_is_bound_by_no_default_keymap() {
 }
 
 /// The registry-side rule that WOULD have flagged the old chord had the host called it (pi
-/// `getShortcuts` rule 3, `extensions/runner.ts:522-528` @v0.83.0 — warn, extension wins):
+/// `getShortcuts` rule 3, `extensions/runner.ts:517-522` @v0.83.0 — warn, extension wins):
 /// resolved against `tui.editor.cursorRight`'s pi/cyrup default keys, the chord must produce no
 /// diagnostic. This is the check EXT-039's residual will wire live; until then it runs here.
 #[test]

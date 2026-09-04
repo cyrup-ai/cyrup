@@ -24,6 +24,7 @@
 )]
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -430,10 +431,44 @@ async fn an_unwritable_managed_root_is_reported_and_the_session_survives() {
 
 #[test]
 fn a_subagent_child_still_gets_no_flux_extension() {
-    // The pre-existing child gate is untouched by the constructor change.
-    assert!(cyrup_flux::flux_extension_for_env(Path::new("/agent")).is_some());
+    // The pre-existing child gate is untouched by the constructor change. It is pinned through
+    // the injected-environment seam (edition-2024 `set_var` is unsafe; the crate forbids unsafe):
+    // `CYRUP_SUBAGENT_CHILD=1` is the one `None`.
+    let agent = Path::new("/agent");
+    let child = |key: &str| (key == "CYRUP_SUBAGENT_CHILD").then(|| OsString::from("1"));
+    assert!(
+        cyrup_flux::flux_extension_for_env_from(agent, &child).is_none(),
+        "a subagent child must not get the flux extension"
+    );
+    // Unset, blank, `0` or `true` is a top-level process: the extension on the managed root.
+    for value in [None, Some(""), Some("0"), Some("true")] {
+        let env = |key: &str| {
+            (key == "CYRUP_SUBAGENT_CHILD")
+                .then(|| value.map(OsString::from))
+                .flatten()
+        };
+        let ext = cyrup_flux::flux_extension_for_env_from(agent, &env)
+            .unwrap_or_else(|| panic!("CYRUP_SUBAGENT_CHILD={value:?} is not a child"));
+        assert_eq!(
+            ext.bundled_root(),
+            &BundledRoot::Managed(managed_root(agent)),
+            "CYRUP_SUBAGENT_CHILD={value:?}"
+        );
+    }
+    // The vendored override travels through the same environment as the gate.
+    let vendored = |key: &str| {
+        (key == BUNDLED_RESOURCES_DIR_ENV_VAR).then(|| OsString::from("/vendored/flux"))
+    };
     assert_eq!(
-        cyrup_flux::flux_extension(Path::new("/agent")).bundled_root(),
-        &BundledRoot::Managed(managed_root(Path::new("/agent")))
+        cyrup_flux::flux_extension_for_env_from(agent, &vendored)
+            .expect("not a child")
+            .bundled_root(),
+        &BundledRoot::Vendored(PathBuf::from("/vendored/flux"))
+    );
+    // And the process-environment shell: this test process is not a child.
+    assert!(cyrup_flux::flux_extension_for_env(agent).is_some());
+    assert_eq!(
+        cyrup_flux::flux_extension(agent).bundled_root(),
+        &BundledRoot::Managed(managed_root(agent))
     );
 }

@@ -33,6 +33,7 @@ pub mod render_status;
 pub mod resources;
 pub mod state;
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -70,8 +71,22 @@ pub fn flux_extension_with_root(root: resources::BundledRoot) -> Arc<extension::
 /// running).
 #[must_use]
 pub fn flux_extension_for_env(agent_dir: &Path) -> Option<Arc<extension::FluxExtension>> {
-    if std::env::var(SUBAGENT_CHILD_ENV).ok().as_deref() == Some("1") {
+    flux_extension_for_env_from(agent_dir, &|key| std::env::var_os(key))
+}
+
+/// [`flux_extension_for_env`] with the environment supplied — the child gate as a pure rule, the
+/// same closure-shaped seam as [`resources::BundledRoot::resolve_from`] (which the bundled root is
+/// resolved through here too), so a test pins the `None` branch without `set_var` (unsafe in
+/// edition 2024; this crate forbids `unsafe`).
+#[must_use]
+pub fn flux_extension_for_env_from(
+    agent_dir: &Path,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<Arc<extension::FluxExtension>> {
+    if env(SUBAGENT_CHILD_ENV).is_some_and(|v| v == "1") {
         return None;
     }
-    Some(flux_extension(agent_dir))
+    Some(flux_extension_with_root(
+        resources::BundledRoot::resolve_from(agent_dir, env),
+    ))
 }
