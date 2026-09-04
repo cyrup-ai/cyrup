@@ -440,7 +440,7 @@ pub(crate) fn map_event(ev: Event) -> Option<InputEvent> {
         ev,
         crate::native_modifiers::host_platform(),
         term_program.as_deref(),
-        |k| crate::native_modifiers::is_native_modifier_pressed(k),
+        crate::native_modifiers::is_native_modifier_pressed,
     )
 }
 
