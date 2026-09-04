@@ -137,7 +137,7 @@ The `aug`, `exec`, and `qa` commands support **both single-task and multi-task**
 ## Key Design Principles
 
 - **Task files are the source of truth** - never modify them during `exec` or `qa`; only `qa` can edit/delete them
-- **No tests, no benchmarks** - explicitly excluded; they are handled separately (/flux/tests)
+- **Tests are in scope** - each task names the tests that pin its behaviour; /flux/tests runs the suite afterwards. Benchmarks only for performance-scoped tasks
 - **No git commands** during `exec`/`qa` - other agents may be working concurrently
 - **Steps always propose the next step** - each command ends by suggesting what to run next with the right arguments
 - **task-file path and extension is inferred** - when passing a task-file as argument, the name with no suffix is sufficient

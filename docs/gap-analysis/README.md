@@ -297,7 +297,7 @@ Work with no area file to hold it. It is real work and it blocks or corrupts the
 | residual | what is unwalked | extraction |
 |---|---|---|
 | env vars — reverse direction | the `CYRUP_SUBAGENT_*` / `CYRUP_INTERCOM_*` names have never been walked back to pi-subagents / pi-intercom, so `CFG-074`'s confirmed cyrup-originals **may not be all of them** | `grep -rhoE '"(CYRUP\|PI)_[A-Z0-9_]+"' crates/ \| sort -u` against each sibling upstream at its tag |
-| env vars — pi-mcp-adapter | extracted, **never diffed** | **routed to the MCP team's files, not to this directory** |
+| env vars — pi-mcp-adapter | extracted, **never diffed** | **belongs to area 13, which is this repository's own work (there is no "MCP team") — diff it when area 13 is next audited** |
 | extension API — citations | the non-`types.ts` citations (`agent-session.ts`, `tui.ts`, `event-bus.ts`, `exec.ts`, `agent/types.ts`, `project-trust.ts`, `tool-definition-wrapper.ts`) were spot-checked, not resolved | the citation-lint test `EXT-072` and `EXT-073` both specify — resolve every `<file>:N` against the checked-out tag and assert the cited line contains the cited symbol. **Land the guard, not just the rewrite** |
 | RPC — payload shapes | commands, events, envelopes and `RpcSessionState` are 1:1; the **response DATA shapes behind the commands** were checked only where a finding was suspected | extract each `case "<cmd>"` return object from `rpc-mode.ts` at the ported tag vs each arm of `crates/cyrup-modes/src/rpc.rs` |
 | providers — request bodies | the compat matrix is exhaustive; **request-body fields beyond compat** are not | per wire API, diff the assembled request object against `crates/cyrup-provider/src/api/*.rs` |

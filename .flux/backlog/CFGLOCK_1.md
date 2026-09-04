@@ -274,10 +274,10 @@ editing.
 
 ## No tests
 
-Another team owns tests. **Do not write any test code.** The eight existing tests are the
+Tests are in scope (the earlier "another team owns tests" line was wrong). Add a test for any behaviour this task changes; the eight existing tests are the
 regression net and must pass **unmodified** — if one stops compiling, the extraction changed an API
 it should not have. Fix the extraction, never the test.
 
 ## No benchmarks
 
-Another team owns benchmarks. **Do not write any benchmark code.**
+No benchmarks: this task is not performance-scoped.

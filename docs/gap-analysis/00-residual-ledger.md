@@ -616,7 +616,9 @@ future pass re-runs rather than re-walks:
    `MCP_DIRECT_TOOLS`, the five `MCP_HASH_*`, `MCP_OAUTH_DIR`, `MCP_OAUTH_CALLBACK_PORT`,
    `MCP_UI_DEBUG`, `MCP_UI_VIEWER`, `NPM_CONFIG_CACHE`, the five `PI_MCP_ADAPTER_*`,
    `PI_PACKAGE_DIR`; spot-checks show ten of those return zero hits in `crates/`. **Routed, not
-   filed — that surface belongs to the MCP team's files, which this reconciliation may not touch.**
+   filed — that surface belongs to area 13's files.** *(Corrected 2026-09-04: this originally said
+   "the MCP team's files, which this reconciliation may not touch"; there is no such team and area 13
+   is schedulable work.)*
    (b) The **cyrup→pi-subagents direction is only partly walked**: ~110 `CYRUP_SUBAGENT_*` /
    `CYRUP_INTERCOM_*` names were not all walked back, so `CFG-074`'s nine confirmed cyrup-originals
    in that family **may not be all of them**. (c) ~110 of cyrup's 233 names come from the three

@@ -173,10 +173,10 @@ Match each file's existing async-test convention; do not introduce a new one.
 
 ## No tests
 
-Another team owns tests. **Do not write any new test code.** The `.await` and `#[tokio::test]`
+Tests are in scope (the earlier "another team owns tests" line was wrong). Add tests for any behaviour this task changes. The `.await` and `#[tokio::test]`
 migration above is mechanical and in scope; anything requiring a logic change is not — stop and
 flag it.
 
 ## No benchmarks
 
-Another team owns benchmarks. **Do not write any benchmark code.**
+No benchmarks: this task is not performance-scoped.

@@ -74,7 +74,7 @@ difference costs behaviour, the entry says so and stays on the list as work.**
 | `pi-permission-system` | ported baseline **v0.7.1** → latest **v0.8.0** (HEAD `9affcc9`) · delta 28 files, +4 023 / −1 851 — **re-checked 2026-09-04, unchanged from every prior edition's figure** |
 | `pi-intercom` | ported baseline **v0.9.2** *(prior docs said v0.7.0 — wrong, see §1d)* → latest **v0.13.0** (HEAD `199279a`, re-measured 2026-09-04, superseding the `v0.12.0` figure recorded 2026-08-27) · true window `v0.9.2..v0.13.0` = 26 files, +4 701 / −976 |
 | `code_puppy_core_plugins` | ported baseline **v0.0.6** *(not recorded in-crate; see `FLUX-007`)* → latest **v0.0.40** (HEAD `8c6f852`) · 139 files, +11 071 / −3 822 across the whole repo, but the *ported* surface (`flux_bootstrap/`) is byte-identical `v0.0.6..v0.0.40` — area 14's own re-derivation this pass |
-| `pi-mcp-adapter` | **out of scope for this file** — area 13, owned by the MCP team; not re-measured here |
+| `pi-mcp-adapter` | **counted separately** — area 13 (this repository's own work; the earlier "owned by the MCP team" note was wrong); not re-measured here, and the `v2.25.0..v2.32.1` window is the next area-13 audit's input |
 
 Read upstream with `git -C <repo> show <tag>:<path>`, never from a working tree — clone-HEAD line
 numbers and file existence both mislead. §7 says how much of this was first-hand.
