@@ -865,8 +865,12 @@ the second copy was written.
 > `branch.rs::generate_branch_summary_with_instructions` (`"Branch summarization"`), and — a fourth
 > site this item did not name — `crates/cyrup-session-svc/src/session/forking.rs::generate_branch_summary_with_instructions`,
 > the copy `navigate_tree` actually runs for `/tree`, which carried the same
-> `Stop | Length | ToolUse => Ok` arm. `rg -n 'StopReason::Length' crates/cyrup-session crates/cyrup-session-svc/src/session`
-> now hits only the gate and the unrelated auto-compaction retry predicate.
+> `Stop | Length | ToolUse => Ok` arm. `rg -n 'StopReason::Length' crates/cyrup-session/src/compaction crates/cyrup-session-svc/src/session/forking.rs crates/cyrup-session-svc/src/session/auto_compaction.rs`
+> now hits only the gate (`summarize.rs:62`, and its doc comment at `:29`) and the unrelated
+> auto-compaction retry predicate (`auto_compaction.rs:421`). Widening the second path to the whole
+> `crates/cyrup-session-svc/src/session` tree adds one more production hit, `run.rs:310` —
+> `on_assistant_message_end`'s overflow-recovery reset — which is not a summarization site, plus
+> test fixtures under `crates/cyrup-session/src/tests/` (`compaction.rs:3570`, `:3634`; `sessions.rs:514`).
 >
 > **Correction to the filing:** the upstream change is first tagged at **v0.84.4**, not v0.84.2.
 > `git -C tmp/pi log -S getSummarizationFailure -- packages/coding-agent/src/core/compaction/` gives one
