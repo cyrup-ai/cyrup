@@ -10,7 +10,10 @@
 //! 2. [`is_retryable_model_failure`] — R-SA-039's fixed retryable-failure pattern classifier
 //!    (rate limits, auth errors, 5xx, cold-start, empty response, etc.), a verbatim 1:1 port of
 //!    pi-subagents' `RETRYABLE_MODEL_FAILURE_PATTERNS`/`isRetryableModelFailure`
-//!    (`pi-subagents/src/runs/shared/model-fallback.ts:278-329`).
+//!    (`pi-subagents/src/runs/shared/model-fallback.ts:278-329`), and its per-ATTEMPT wrapper
+//!    [`is_retryable_model_failure_attempt`] (`isRetryableModelFailureAttempt`,
+//!    `model-fallback.ts:530-537` @v0.64.0, SUBA-089), which additionally refuses to re-dispatch
+//!    an attempt that already ran tools or whose recorded messages do not corroborate the error.
 //! 3. [`run_fallback_ladder`] — the attempt loop itself (R-SA-035/036/037/039/040), which drives
 //!    a caller-supplied single-attempt runner across the candidate ladder built by (1),
 //!    consulting (2) only after a **distinct, prior** timeout check (R-SA-036's load-bearing
@@ -465,6 +468,11 @@ enum RetryPattern {
     /// Case-insensitive `first\s*second`: `first`, then zero or more whitespace, then `second`
     /// (pi `/rate\s*limit/i`).
     OptionalWsBetween(&'static str, &'static str),
+    /// Case-insensitive `first\s+(?:a|b|c)`: `first`, then AT LEAST one whitespace character,
+    /// then any of the alternatives (pi `/connection\s+(?:error|reset|closed|aborted)/i`, added
+    /// by `d8d1408d` inside v0.47.1..v0.57.0 — SUBA-089). Distinct from
+    /// [`Self::OptionalWsBetween`]: `connectionreset` is NOT a match.
+    WsThenAny(&'static str, &'static [&'static str]),
     /// Case-insensitive `first(?:middle)?second`: `first`, then an optional literal `middle`, then
     /// `second` (pi `/temporar(?:ily)? unavailable/i` → first=`temporar`, middle=`ily`,
     /// second=` unavailable`; pi `/timed? out/i` → first=`time`, middle=`d`, second=` out`).
@@ -495,6 +503,11 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     RetryPattern::Contains("overloaded"),
     RetryPattern::Contains("service unavailable"),
     RetryPattern::OptionalWordBetween("temporar", "ily", " unavailable"), // /temporar(?:ily)? unavailable/i
+    // SUBA-089 (`d8d1408d`, v0.57.0 `model-fallback.ts:428`; v0.64.0 `:496`): a dropped provider
+    // connection is a provider failure. The same commit narrowed the ladder gate to
+    // `isRetryableModelFailureAttempt` so this broader text never re-runs a child that already
+    // did work — the two halves ship together.
+    RetryPattern::WsThenAny("connection", &["error", "reset", "closed", "aborted"]), // /connection\s+(?:error|reset|closed|aborted)/i
     RetryPattern::Contains("connection refused"),
     RetryPattern::Contains("fetch failed"),
     RetryPattern::Contains("network error"),
@@ -590,6 +603,23 @@ fn line_matches(line: &str, pattern: &RetryPattern) -> bool {
                         .starts_with(second)
                 {
                     return true;
+                }
+                search = start + 1;
+            }
+            false
+        }
+        RetryPattern::WsThenAny(first, alternatives) => {
+            let mut search = 0;
+            while let Some(rel) = line.get(search..).and_then(|s| s.find(first)) {
+                let start = search + rel;
+                if let Some(rest) = line.get(start + first.len()..) {
+                    let after_ws = rest.trim_start_matches(char::is_whitespace);
+                    // `\s+`: the whitespace run must be non-empty.
+                    if after_ws.len() < rest.len()
+                        && alternatives.iter().any(|alt| after_ws.starts_with(alt))
+                    {
+                        return true;
+                    }
                 }
                 search = start + 1;
             }
@@ -720,6 +750,78 @@ pub fn is_retryable_model_failure(error: Option<&str>) -> bool {
             .iter()
             .any(|p| line_matches(line, p))
     })
+}
+
+/// The prefix/suffix of pi's second empty-output sentinel — `Subagent produced no output after
+/// terminal assistant stopReason "<reason>".` (`formatEmptyTerminalAssistantResponseError`,
+/// `shared/utils.ts:472` @v0.64.0). Cyrup's own empty-output diagnosis emits only the cold-start
+/// form ([`crate::exec::output::EMPTY_OUTPUT_ERROR`]); this form is recognised so the predicate
+/// matches upstream's `/^Subagent produced no output after terminal assistant stopReason
+/// "[^"]+"\.$/` (`model-fallback.ts:533` @v0.64.0) the day cyrup produces it too.
+const EMPTY_OUTPUT_AFTER_STOP_REASON_PREFIX: &str =
+    "Subagent produced no output after terminal assistant stopReason \"";
+const EMPTY_OUTPUT_AFTER_STOP_REASON_SUFFIX: &str = "\".";
+
+/// `model-fallback.ts:533` @v0.64.0 — is `error` one of the two empty-output sentinels? Exact and
+/// untrimmed, like upstream's `===` and its anchored regex (`[^"]+` is any non-empty run of
+/// non-quote characters, newlines included; `$` is end of input).
+fn is_empty_output_sentinel(error: &str) -> bool {
+    if error == crate::exec::output::EMPTY_OUTPUT_ERROR {
+        return true;
+    }
+    error
+        .strip_prefix(EMPTY_OUTPUT_AFTER_STOP_REASON_PREFIX)
+        .and_then(|rest| rest.strip_suffix(EMPTY_OUTPUT_AFTER_STOP_REASON_SUFFIX))
+        .is_some_and(|stop_reason| !stop_reason.is_empty() && !stop_reason.contains('"'))
+}
+
+/// SUBA-089 — the per-ATTEMPT retry decision the ladder actually gates on
+/// (`isRetryableModelFailureAttempt({error, messages, toolCount})`, `model-fallback.ts:530-537`
+/// @v0.64.0; introduced by `d8d1408d` inside v0.47.1..v0.57.0, where the gate had been the bare
+/// [`is_retryable_model_failure`], `v0.47.1:execution.ts:1633`). Clause for clause, in upstream's
+/// order:
+///
+/// 1. `!isRetryableModelFailure(error)` → `false` — the text is not a model/provider failure.
+/// 2. `toolCount > 0` → `false` — the child already ran tools. **This is the load-bearing half**:
+///    a child that made ten edits and then hit `connection reset` must NOT be re-run from scratch
+///    on the next model, duplicating its side effects and its token spend.
+/// 3. The error is one of the two empty-output sentinels → `true` regardless of messages (a
+///    cold-start/empty response is retryable even when the transcript holds an assistant turn).
+/// 4. `toolCount === 0 && messages.length === 0` → `true` — nothing ran; the error can only be
+///    the provider's.
+/// 5. Otherwise `true` only if some recorded message's own `errorMessage` (trimmed) equals the
+///    error (trimmed): the transcript corroborates that the provider failed. Raw process stderr
+///    that merely *reads* retryable after real activity (upstream's test case, `test/unit/
+///    model-fallback.test.ts:342` @v0.64.0) stops the ladder.
+///
+/// Pure over the signal ([`AttemptSignal::error`], [`StartupEvidence::tool_count`],
+/// [`StartupEvidence::message_count`], [`AttemptSignal::message_errors`]); the ladder's
+/// timeout/detach/success/startup arms run before it, exactly as before (see
+/// [`run_fallback_ladder`]).
+#[must_use]
+pub fn is_retryable_model_failure_attempt(signal: &AttemptSignal) -> bool {
+    let error = signal.error.as_deref();
+    if !is_retryable_model_failure(error) {
+        return false;
+    }
+    let Some(error) = error else {
+        return false;
+    };
+    if signal.startup.tool_count > 0 {
+        return false;
+    }
+    if is_empty_output_sentinel(error) {
+        return true;
+    }
+    if signal.startup.tool_count == 0 && signal.startup.message_count == 0 {
+        return true;
+    }
+    let error = error.trim();
+    !error.is_empty()
+        && signal
+            .message_errors
+            .iter()
+            .any(|message_error| message_error.trim() == error)
 }
 
 /// Format the "prior attempt failed" note appended into the next attempt's initial
@@ -858,6 +960,18 @@ pub struct AttemptSignal {
     /// blocking. **Do not fabricate a synthetic trigger** from output-text heuristics — the trigger
     /// is a real `contact_supervisor` blocking-ask event on the child's own wire.
     pub detached: bool,
+    /// SUBA-089 — the `errorMessage` of every message the child emitted this attempt, in order
+    /// (pi `messageError(message)` over `result.messages`/`run.messages`, `model-fallback.ts:524-528`
+    /// @v0.64.0; every `message_end` message regardless of role, `execution.ts:1122,1190`). Read
+    /// by [`is_retryable_model_failure_attempt`]'s last clause: a retryable-looking error that the
+    /// child's own transcript never reported is raw process stderr after real activity, and is
+    /// NOT re-dispatched on another model.
+    ///
+    /// Deliberately on the signal rather than in [`StartupEvidence`]: that struct's contract is
+    /// "every field is a reason NOT to relaunch", and this list is the opposite — corroborating
+    /// evidence FOR advancing the ladder. Empty when no message carried one (pi's `messages?.some`
+    /// over an empty list is `false`).
+    pub message_errors: Vec<String>,
     /// Everything [`is_retryable_subagent_startup_failure`] needs beyond the fields above, to tell
     /// "the child never started" apart from "the child started and failed". See
     /// [`StartupEvidence`].
@@ -1150,8 +1264,12 @@ pub struct FallbackOutcome<A> {
 ///    the loop (R-SA-039: "If the error is retryable AND this is not the last candidate AND the
 ///    failure was not a timeout, the orchestrator MUST proceed to the next candidate model...
 ///    otherwise the ladder MUST stop"). Only past this point is
-///    [`is_retryable_model_failure`] ever actually consulted, and only for an attempt that has
-///    already been confirmed to be neither a timeout nor a detach.
+///    [`is_retryable_model_failure_attempt`] ever actually consulted, and only for an attempt
+///    that has already been confirmed to be neither a timeout nor a detach. SUBA-089: it is the
+///    per-attempt form, not the bare text classifier — an attempt that already ran tools, or
+///    whose transcript does not corroborate a retryable-looking error, stops the ladder here
+///    (pi `execution.ts:2144,2151` and `background/subagent-runner.ts:2090,2097` @v0.64.0; cyrup's
+///    background runner reaches this same loop through `exec::run_sync`).
 /// 4. Otherwise (retryable, not the last candidate, not a timeout, not a detach): format an
 ///    attempt note (R-SA-039) for the next iteration and continue the ladder.
 ///
@@ -1325,8 +1443,9 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
             }
 
             // Only reached for a non-timeout, non-detached, non-last-candidate failure: NOW (and
-            // only now) is the retryable-pattern classifier consulted (R-SA-039).
-            if !is_retryable_model_failure(signal.error.as_deref()) {
+            // only now) is the retryable-pattern classifier consulted (R-SA-039) — in its
+            // per-attempt form (SUBA-089), so a child that already ran tools is never re-run.
+            if !is_retryable_model_failure_attempt(&signal) {
                 last_signal = Some(signal);
                 last_attempt = Some(attempt);
                 break 'ladder;
@@ -1907,6 +2026,10 @@ mod tests {
             "overloaded",
             "503 Service Unavailable",
             "temporarily unavailable",
+            // `d8d1408d` / `test/unit/model-fallback.test.ts:203-205` @v0.64.0 (SUBA-089)
+            "Connection error",
+            "APIConnectionError: Connection closed.",
+            "Connection reset by peer",
             "connection refused",
             "fetch failed",
             "network error",
@@ -2133,6 +2256,7 @@ mod tests {
             usage,
             timed_out: false,
             detached: false,
+            message_errors: Vec::new(),
             startup: StartupEvidence::default(),
         }
     }
@@ -2145,6 +2269,7 @@ mod tests {
             usage,
             timed_out: false,
             detached: false,
+            message_errors: Vec::new(),
             startup: StartupEvidence::default(),
         }
     }
@@ -2157,6 +2282,7 @@ mod tests {
             usage,
             timed_out: true,
             detached: false,
+            message_errors: Vec::new(),
             startup: StartupEvidence::default(),
         }
     }
@@ -2169,6 +2295,7 @@ mod tests {
             usage,
             timed_out: false,
             detached: true,
+            message_errors: Vec::new(),
             startup: StartupEvidence::default(),
         }
     }
@@ -2728,6 +2855,7 @@ mod tests {
             usage: Usage::default(),
             timed_out: false,
             detached: false,
+            message_errors: Vec::new(),
             startup: StartupEvidence {
                 duration_ms: Some(40),
                 error_is_placeholder: true,
@@ -2859,5 +2987,223 @@ mod tests {
             "[startup-retry] m1 exited before model or tool activity (attempt 1/4). Retrying the \
              same model in 250ms."
         );
+    }
+
+    /// SUBA-089 — `/connection\s+(?:error|reset|closed|aborted)/i` (`d8d1408d`): `\s+` needs at
+    /// least one whitespace character, any amount is fine, and the alternative must follow the
+    /// run directly; `connection refused` stays its own separate pattern.
+    #[test]
+    fn a_dropped_provider_connection_is_retryable_but_only_across_real_whitespace() {
+        for msg in [
+            "connection   aborted",
+            "Provider: CONNECTION\tCLOSED unexpectedly",
+            "first connection ok, second connection error",
+        ] {
+            assert!(is_retryable_model_failure(Some(msg)), "{msg}");
+        }
+        for msg in [
+            "connectionreset",
+            "connection was reset",
+            "the connection is fine",
+        ] {
+            assert!(!is_retryable_model_failure(Some(msg)), "{msg}");
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-089: is_retryable_model_failure_attempt (pi `isRetryableModelFailureAttempt`,
+    // `model-fallback.ts:530-537` @v0.64.0) — the per-attempt gate the ladder consults
+    // ---------------------------------------------------------------------------------------
+
+    /// A failed attempt with explicit activity evidence — the four inputs the upstream predicate
+    /// reads (`{error, messages, toolCount}`; `messages.length` and each `errorMessage`).
+    fn attempt_signal(
+        error: &str,
+        message_count: usize,
+        tool_count: u32,
+        message_errors: &[&str],
+    ) -> AttemptSignal {
+        let mut signal = failed_signal(error, Usage::default());
+        signal.startup.message_count = message_count;
+        signal.startup.tool_count = tool_count;
+        signal.message_errors = message_errors.iter().map(|s| (*s).to_string()).collect();
+        signal
+    }
+
+    /// Upstream's own four cases, verbatim (`test/unit/model-fallback.test.ts:342-345` @v0.64.0,
+    /// "does not retry raw process stderr after child activity").
+    #[test]
+    fn attempt_predicate_matches_upstreams_stderr_after_activity_cases() {
+        let error = "APIConnectionError: Connection closed.";
+        // :342 — a message ran but none reported this error: raw stderr after activity, stop.
+        assert!(!is_retryable_model_failure_attempt(&attempt_signal(
+            error,
+            1,
+            0,
+            &[]
+        )));
+        // :343 — the transcript corroborates the error: advance.
+        assert!(is_retryable_model_failure_attempt(&attempt_signal(
+            error,
+            1,
+            0,
+            &[error]
+        )));
+        // :344 — nothing ran at all: advance.
+        assert!(is_retryable_model_failure_attempt(&attempt_signal(
+            error,
+            0,
+            0,
+            &[]
+        )));
+        // :345 — corroborated, but a tool already ran: stop.
+        assert!(!is_retryable_model_failure_attempt(&attempt_signal(
+            error,
+            1,
+            1,
+            &[error]
+        )));
+    }
+
+    /// `:532` — `toolCount > 0` refuses BEFORE either sentinel or the no-activity clause can say
+    /// yes: even the cold-start sentinel does not re-dispatch a child that ran a tool.
+    #[test]
+    fn attempt_predicate_never_advances_once_a_tool_ran() {
+        for error in [
+            crate::exec::output::EMPTY_OUTPUT_ERROR,
+            "Subagent produced no output after terminal assistant stopReason \"length\".",
+            "429 rate limit",
+            "connection reset by peer",
+        ] {
+            assert!(
+                !is_retryable_model_failure_attempt(&attempt_signal(error, 0, 3, &[error])),
+                "{error}"
+            );
+        }
+    }
+
+    /// `:533` — both empty-output sentinels advance even when the transcript holds messages
+    /// that never reported them (the v0.64.0 form is the second regex; the v0.57.0 gate knew
+    /// only the first literal).
+    #[test]
+    fn attempt_predicate_empty_output_sentinels_advance_despite_messages() {
+        assert!(is_retryable_model_failure_attempt(&attempt_signal(
+            crate::exec::output::EMPTY_OUTPUT_ERROR,
+            2,
+            0,
+            &[]
+        )));
+        assert!(is_retryable_model_failure_attempt(&attempt_signal(
+            "Subagent produced no output after terminal assistant stopReason \"length\".",
+            2,
+            0,
+            &[]
+        )));
+        // The regex is anchored and exact: no trailing period, an empty reason, or a quote
+        // inside the reason is not the sentinel — and with messages present and no
+        // corroborating `errorMessage`, such a string stops the ladder.
+        for not_sentinel in [
+            "Subagent produced no output after terminal assistant stopReason \"length\"",
+            "Subagent produced no output after terminal assistant stopReason \"\".",
+            "Subagent produced no output after terminal assistant stopReason \"a\"b\".",
+            " Subagent produced no output (possible model cold-start or empty response).",
+        ] {
+            assert!(
+                !is_retryable_model_failure_attempt(&attempt_signal(not_sentinel, 2, 0, &[])),
+                "{not_sentinel}"
+            );
+        }
+    }
+
+    /// `:535-536` — the correlation clause trims both sides and ignores role/order; a different
+    /// `errorMessage` does not corroborate.
+    #[test]
+    fn attempt_predicate_correlates_a_trimmed_message_error_message() {
+        assert!(is_retryable_model_failure_attempt(&attempt_signal(
+            "  overloaded  ",
+            3,
+            0,
+            &["unrelated", "overloaded\n"]
+        )));
+        assert!(!is_retryable_model_failure_attempt(&attempt_signal(
+            "overloaded",
+            3,
+            0,
+            &["service unavailable"]
+        )));
+    }
+
+    /// `:531` — a non-retryable text is refused before any activity evidence is read, and an
+    /// absent error is never retryable (pi `isRetryableModelFailure(undefined) === false`).
+    #[test]
+    fn attempt_predicate_still_requires_a_retryable_text() {
+        assert!(!is_retryable_model_failure_attempt(&attempt_signal(
+            "assertion failed: expected 2, got 3",
+            0,
+            0,
+            &[]
+        )));
+        let mut absent = failed_signal("x", Usage::default());
+        absent.error = None;
+        assert!(!is_retryable_model_failure_attempt(&absent));
+    }
+
+    /// The behaviour gap SUBA-089 filed: a child that ran ten mutating tool calls and then hit a
+    /// transient provider error must NOT be re-run from scratch on the next model. RED before the
+    /// port — the ladder gated on the bare text classifier and advanced to `b`.
+    #[tokio::test]
+    async fn retryable_error_after_tools_ran_does_not_advance_the_ladder() {
+        let candidates = vec![model("a"), model("b")];
+        let mut failed = failed_signal("connection reset by peer", usage(10, 0, 0.0));
+        failed.startup.tool_count = 10;
+        failed.startup.message_count = 12;
+        failed.message_errors = vec!["connection reset by peer".to_string()];
+        let mut runner = ScriptedRunner::new(vec![
+            (failed, "attempt-a"),
+            (ok_signal(usage(1, 1, 0.0)), "attempt-b"), // must never be reached
+        ]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+
+        assert_eq!(outcome.attempted_models, vec![model("a")]);
+        assert_eq!(
+            runner.calls.len(),
+            1,
+            "a half-completed mutating run must not be re-dispatched on the next model"
+        );
+        let last = outcome.last_signal.expect("some outcome");
+        assert!(!last.success);
+        assert_eq!(last.error.as_deref(), Some("connection reset by peer"));
+    }
+
+    /// The other side of the same gate: a retryable-looking error the child's transcript never
+    /// reported (raw stderr after an assistant turn) also stops the ladder, while the corroborated
+    /// form still advances — so the port is the narrowed v0.64.0 gate, not a blanket refusal.
+    #[tokio::test]
+    async fn uncorroborated_retryable_text_after_messages_stops_but_corroborated_advances() {
+        let candidates = vec![model("a"), model("b")];
+
+        let mut uncorroborated =
+            failed_signal("APIConnectionError: Connection closed.", usage(1, 0, 0.0));
+        uncorroborated.startup.message_count = 1;
+        let mut runner = ScriptedRunner::new(vec![
+            (uncorroborated, "attempt-a"),
+            (ok_signal(usage(1, 1, 0.0)), "attempt-b"),
+        ]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        assert_eq!(outcome.attempted_models, vec![model("a")]);
+        assert_eq!(runner.calls.len(), 1);
+
+        let mut corroborated =
+            failed_signal("APIConnectionError: Connection closed.", usage(1, 0, 0.0));
+        corroborated.startup.message_count = 1;
+        corroborated.message_errors = vec!["APIConnectionError: Connection closed.".to_string()];
+        let mut runner = ScriptedRunner::new(vec![
+            (corroborated, "attempt-a"),
+            (ok_signal(usage(1, 1, 0.0)), "attempt-b"),
+        ]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        assert_eq!(outcome.attempted_models, vec![model("a"), model("b")]);
+        assert_eq!(runner.calls.len(), 2);
+        assert!(outcome.last_signal.expect("some outcome").success);
     }
 }

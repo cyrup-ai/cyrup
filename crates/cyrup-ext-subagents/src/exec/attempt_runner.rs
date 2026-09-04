@@ -18,7 +18,7 @@ use crate::exec::fallback::{
 };
 use crate::exec::output::{
     EMPTY_OUTPUT_ERROR, INTERRUPTED_FINAL_OUTPUT, detect_subagent_error, extract_final_output,
-    trailing_assistant_error,
+    message_error_messages, trailing_assistant_error,
 };
 use crate::exec::progress::AgentProgress;
 use crate::exec::spawn_plan::{build_attempt_spawn_plan_with_read_requirement, build_task_text};
@@ -184,6 +184,11 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 // NDJSON showed a blocking `contact_supervisor` ask (surfaced via `spawn_clarify`),
                 // which bypasses acceptance/completion-guard/truncation and stops the ladder.
                 detached: outcome.detached,
+                // SUBA-089: pi `isRetryableModelFailureAttempt({..., messages: result.messages})`
+                // (`execution.ts:2144` @v0.64.0) — every `message_end`'s `errorMessage`, so the
+                // ladder can tell a provider failure the child reported from raw stderr after
+                // real activity.
+                message_errors: message_error_messages(&progress.message_end_events),
                 startup: build_startup_evidence(
                     &progress,
                     &outcome,
@@ -552,6 +557,7 @@ fn attempt_setup_failure(
             usage: Usage::default(),
             timed_out: false,
             detached: false,
+            message_errors: Vec::new(), // nothing ran, so no message ever carried one
             startup: StartupEvidence::default(),
         },
         AttemptRecord {
@@ -582,6 +588,7 @@ fn interrupted_attempt(
             usage: progress.usage.clone(),
             timed_out: false,
             detached: outcome.detached,
+            message_errors: message_error_messages(&progress.message_end_events),
             startup: StartupEvidence::default(),
         },
         AttemptRecord {
@@ -614,6 +621,7 @@ fn timed_out_attempt(
             usage: progress.usage.clone(),
             timed_out: true,
             detached: outcome.detached,
+            message_errors: message_error_messages(&progress.message_end_events),
             startup: StartupEvidence::default(),
         },
         AttemptRecord {

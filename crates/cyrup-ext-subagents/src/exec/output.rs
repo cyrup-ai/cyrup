@@ -740,6 +740,27 @@ pub fn message_end_has_error_message(event: &SubagentEvent) -> bool {
         .is_some_and(|s| !s.is_empty())
 }
 
+/// SUBA-089 — the `errorMessage` of every `message_end` message in `events`, in order, for
+/// [`crate::exec::fallback::AttemptSignal::message_errors`]. pi's `messageError(message)`
+/// (`runs/shared/model-fallback.ts:524-528` @v0.64.0) reads the field off ANY message object
+/// regardless of role and keeps any string, untrimmed — the trim happens at comparison time in
+/// `isRetryableModelFailureAttempt` — so this does the same: no role filter, no trimming, no
+/// empty-string filter (an empty `errorMessage` can never equal a non-empty error there anyway).
+/// Non-string values are skipped, like `typeof value === "string"`.
+#[must_use]
+pub fn message_error_messages(events: &[SubagentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SubagentEvent::MessageEnd { message } => message
+                .get("errorMessage")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
 // ============================================================================================
 // R-SA-024/025/031: File-only output-path handoff
 // ============================================================================================
@@ -1866,6 +1887,47 @@ mod tests {
             }),
         };
         assert!(!message_end_has_error_message(&empty_error));
+    }
+
+    /// SUBA-089 — `message_error_messages` mirrors pi's `messageError` over `result.messages`:
+    /// every `message_end` regardless of role, raw (untrimmed, empty kept), non-strings and
+    /// non-message events skipped, order preserved.
+    #[test]
+    fn message_error_messages_collects_every_message_end_error_message_untrimmed() {
+        let events = vec![
+            message_end("assistant", &["thinking"]),
+            message_end_with_error("x", "  overloaded \n"),
+            SubagentEvent::MessageEnd {
+                message: serde_json::json!({
+                    "role": "toolResult", "content": [], "errorMessage": "tool boom"
+                }),
+            },
+            SubagentEvent::MessageEnd {
+                message: serde_json::json!({
+                    "role": "assistant", "content": [], "errorMessage": 42
+                }),
+            },
+            SubagentEvent::MessageEnd {
+                message: serde_json::json!({
+                    "role": "assistant", "content": [], "errorMessage": ""
+                }),
+            },
+            SubagentEvent::ToolExecutionEnd {
+                tool_call_id: "c1".into(),
+                tool_name: "bash".to_string(),
+                result: serde_json::json!({"errorMessage": "not a message"}),
+                is_error: true,
+            },
+        ];
+        assert_eq!(
+            message_error_messages(&events),
+            vec![
+                "  overloaded \n".to_string(),
+                "tool boom".to_string(),
+                String::new()
+            ]
+        );
+        assert!(message_error_messages(&[]).is_empty());
     }
 
     // ---- OutputCap / truncate_output: UTF-8 boundary safety ----
