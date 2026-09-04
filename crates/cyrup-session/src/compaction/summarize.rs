@@ -25,6 +25,78 @@ use crate::compaction::serialize::serialize_conversation;
 /// throws.
 pub const PENDING_SUMMARY: &str = "summarization stream ended without a stop reason";
 
+/// Diagnostic for a summarization that stopped at the model's output token cap
+/// ([`StopReason::Length`]). Pi's `getSummarizationFailure` text minus its `${label} failed: `
+/// prefix, which [`CompactionError::Summarization`]'s `Display` supplies
+/// (`v0.84.4 coding-agent/src/core/compaction/compaction.ts:549-551`).
+pub const INCOMPLETE_SUMMARY: &str = "generation hit the token cap and the summary is incomplete";
+
+/// The acceptance gate every summarization response passes through before its text may become a
+/// session checkpoint. Pure: a decision over the settled response, no I/O — the four call sites
+/// (this module's [`generate_summary`] and [`generate_turn_prefix_summary`], the branch site in
+/// `compaction::branch`, and the session service's `/tree` copy of it) share this one function
+/// instead of four hand-copied `match`es, which is how they had drifted from pi in the first place.
+///
+/// Pi v0.84.4 `getSummarizationFailure` (`coding-agent/src/core/compaction/compaction.ts:541-553`):
+/// an `error` stop AND a `length` stop are failures — "A length stop contains partial text and
+/// must not become a session checkpoint" — followed by the `toolCall` block check every pi call
+/// site runs immediately after it (`compaction.ts:715-721`, `:1000-1006`;
+/// `branch-summarization.ts:357-363`). Both landed in `97fa14e39` ("reject truncated compaction
+/// summaries", #7048), first tagged at v0.84.4; at v0.84.1 every site tested
+/// `stopReason === "error"` alone (`compaction.ts:679`, `:961`). The tool-call test is on the
+/// content blocks, not the stop reason: a `toolUse` stop with no tool-call block passes, exactly
+/// as it does in pi.
+///
+/// `label` is pi's per-site label — `"Summarization"`, `"Turn prefix summarization"`,
+/// `"Branch summarization"` — and names the site in the tool-call refusal.
+pub fn check_summarization_response(
+    resp: &AssistantMessage,
+    label: &str,
+) -> Result<(), CompactionError> {
+    match resp.stop_reason {
+        StopReason::Error => {
+            return Err(CompactionError::Summarization(
+                resp.error_message.clone().unwrap_or_default(),
+            ));
+        }
+        StopReason::Length => {
+            return Err(CompactionError::Summarization(
+                INCOMPLETE_SUMMARY.to_string(),
+            ));
+        }
+        StopReason::Aborted => return Err(CompactionError::Aborted),
+        // An unsettled response is NOT a summary. A catch-all here would accept a `Pending`
+        // message's partial text as a finished summary and compact the transcript against it —
+        // silently losing history to a truncated stream. `Deferred` is grouped here for the same
+        // reason and NOT with the success arm: a deferred turn is a receipt whose `content` is `[]`
+        // (`v0.84.1 ai/src/providers/faux.ts:293-296`), so accepting it would compact the
+        // transcript against an EMPTY summary. Pi's own gate special-cases only `"aborted"`,
+        // `"error"` and (since v0.84.4) `"length"` and would take the empty text — but it can never
+        // reach that state either: compaction never sets `SimpleStreamOptions.deferred`
+        // (`v0.84.1 ai/src/types.ts:307`) and every real provider throws for deferred
+        // (`v0.84.1 ai/src/models.ts:714,728`). Unreachable on both sides, so this is a strictly
+        // safer spelling of the same behaviour.
+        StopReason::Pending | StopReason::Deferred => {
+            return Err(CompactionError::Summarization(
+                resp.error_message
+                    .clone()
+                    .unwrap_or_else(|| PENDING_SUMMARY.to_string()),
+            ));
+        }
+        StopReason::Stop | StopReason::ToolUse => {}
+    }
+    if resp
+        .content
+        .iter()
+        .any(|c| matches!(c, Content::ToolCall(_)))
+    {
+        return Err(CompactionError::Summarization(format!(
+            "{label} attempted to call a tool"
+        )));
+    }
+    Ok(())
+}
+
 /// System prompt steering the model to summarize rather than continue (R-05-012). Byte-1:1 with Pi
 /// `SUMMARIZATION_SYSTEM_PROMPT` (`utils.ts:168-170`).
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task \
@@ -391,31 +463,13 @@ pub async fn generate_summary<S: Summarizer>(
         thinking: summarization_reasoning(model, thinking),
     };
     let resp = summarizer.complete(req, cancel).await?;
-    match resp.stop_reason {
-        StopReason::Error => Err(CompactionError::Summarization(
-            resp.error_message.unwrap_or_default(),
-        )),
-        StopReason::Aborted => Err(CompactionError::Aborted),
-        // An unsettled response is NOT a summary. The `_ =>` this replaces would have accepted a
-        // `Pending` message's partial text as a finished summary and compacted the transcript
-        // against it — silently losing history to a truncated stream. `Deferred` is grouped here
-        // for the same reason and NOT with the success arm: a deferred turn is a receipt whose
-        // `content` is `[]` (`v0.84.1 ai/src/providers/faux.ts:293-296`), so accepting it would compact
-        // the transcript against an EMPTY summary. Pi's own compaction only special-cases
-        // `"aborted"`/`"error"` (`v0.84.1 agent/src/harness/compaction/compaction.ts:578,581` and
-        // `:832,835`) and would take the empty text — but it can never reach that state either:
-        // compaction never sets `SimpleStreamOptions.deferred` (`v0.84.1 ai/src/types.ts:307`) and
-        // every real provider throws for deferred (`v0.84.1 ai/src/models.ts:714,728`). Unreachable
-        // on both sides, so this is a strictly safer spelling of the same behaviour.
-        StopReason::Pending | StopReason::Deferred => Err(CompactionError::Summarization(
-            resp.error_message
-                .unwrap_or_else(|| PENDING_SUMMARY.to_string()),
-        )),
-        StopReason::Stop | StopReason::Length | StopReason::ToolUse => Ok(SummaryOutput {
-            text: join_text(&resp.content),
-            usage: resp.usage,
-        }),
-    }
+    // Pi `getSummarizationFailure(response, "Summarization")` + the toolCall check
+    // (`v0.84.4 compaction.ts:715-721`).
+    check_summarization_response(&resp, "Summarization")?;
+    Ok(SummaryOutput {
+        text: join_text(&resp.content),
+        usage: resp.usage,
+    })
 }
 
 /// Generate the turn-prefix summary for a split turn (R-05-006). `msgs` are RAW
@@ -445,31 +499,13 @@ pub async fn generate_turn_prefix_summary<S: Summarizer>(
         thinking: summarization_reasoning(model, thinking),
     };
     let resp = summarizer.complete(req, cancel).await?;
-    match resp.stop_reason {
-        StopReason::Error => Err(CompactionError::Summarization(
-            resp.error_message.unwrap_or_default(),
-        )),
-        StopReason::Aborted => Err(CompactionError::Aborted),
-        // An unsettled response is NOT a summary. The `_ =>` this replaces would have accepted a
-        // `Pending` message's partial text as a finished summary and compacted the transcript
-        // against it — silently losing history to a truncated stream. `Deferred` is grouped here
-        // for the same reason and NOT with the success arm: a deferred turn is a receipt whose
-        // `content` is `[]` (`v0.84.1 ai/src/providers/faux.ts:293-296`), so accepting it would compact
-        // the transcript against an EMPTY summary. Pi's own compaction only special-cases
-        // `"aborted"`/`"error"` (`v0.84.1 agent/src/harness/compaction/compaction.ts:578,581` and
-        // `:832,835`) and would take the empty text — but it can never reach that state either:
-        // compaction never sets `SimpleStreamOptions.deferred` (`v0.84.1 ai/src/types.ts:307`) and
-        // every real provider throws for deferred (`v0.84.1 ai/src/models.ts:714,728`). Unreachable
-        // on both sides, so this is a strictly safer spelling of the same behaviour.
-        StopReason::Pending | StopReason::Deferred => Err(CompactionError::Summarization(
-            resp.error_message
-                .unwrap_or_else(|| PENDING_SUMMARY.to_string()),
-        )),
-        StopReason::Stop | StopReason::Length | StopReason::ToolUse => Ok(SummaryOutput {
-            text: join_text(&resp.content),
-            usage: resp.usage,
-        }),
-    }
+    // Pi `getSummarizationFailure(response, "Turn prefix summarization")` + the toolCall check
+    // (`v0.84.4 compaction.ts:1000-1006`).
+    check_summarization_response(&resp, "Turn prefix summarization")?;
+    Ok(SummaryOutput {
+        text: join_text(&resp.content),
+        usage: resp.usage,
+    })
 }
 
 /// The default compaction summary (history + optional turn-prefix), with machine file blocks

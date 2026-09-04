@@ -3479,3 +3479,196 @@ async fn sess042_cancel_before_append_writes_nothing_on_every_summary_source() {
     );
     assert_eq!(m.entries().len(), before);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// SESS-049: pi v0.84.4 rejects a token-capped (`length`) summarization and one that emitted a
+// tool call — `getSummarizationFailure` (compaction.ts:541-553) plus the `toolCall` block check at
+// every call site (compaction.ts:715-721, :1000-1006; branch-summarization.ts:357-363), landed in
+// `97fa14e39` (#7048). At v0.84.1 every site tested `stopReason === "error"` alone.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Replays one canned response — content and stop reason fixed — for every summarization call.
+struct ScriptedSummarizer {
+    content: Vec<Content>,
+    stop_reason: StopReason,
+}
+
+impl Summarizer for ScriptedSummarizer {
+    async fn complete(
+        &self,
+        _req: SummarizationRequest<'_>,
+        _cancel: CancelToken,
+    ) -> Result<AssistantMessage, CompactionError> {
+        Ok(faux_assistant_message(
+            self.content.clone(),
+            self.stop_reason,
+        ))
+    }
+}
+
+/// A non-empty branch preparation, so `generate_branch_summary_with_instructions` reaches the
+/// model call instead of the "nothing to summarize" short-circuit.
+fn sess049_branch_prep() -> branch::BranchPreparation {
+    branch::BranchPreparation {
+        messages: vec![user("q1"), assistant("a1")],
+        file_ops: crate::compaction::FileOps::default(),
+    }
+}
+
+/// Runs the same scripted summarizer through all three cyrup call sites and returns their errors
+/// in (history, turn-prefix, branch) order — each site MUST refuse the response.
+async fn sess049_errors_at_all_three_sites(
+    summarizer: &ScriptedSummarizer,
+) -> [CompactionError; 3] {
+    let msgs = vec![
+        AgentMessage::Core(user("q1")),
+        AgentMessage::Core(assistant("a1")),
+    ];
+    let history = crate::compaction::generate_summary(
+        summarizer,
+        &msgs,
+        &faux_model(),
+        1000,
+        None,
+        None,
+        ModelThinkingLevel::Off,
+        CancelToken::new(),
+    )
+    .await
+    .expect_err("generate_summary must refuse the response");
+    let prefix = crate::compaction::generate_turn_prefix_summary(
+        summarizer,
+        &msgs,
+        &faux_model(),
+        1000,
+        ModelThinkingLevel::Off,
+        CancelToken::new(),
+    )
+    .await
+    .expect_err("generate_turn_prefix_summary must refuse the response");
+    let branch = branch::generate_branch_summary_with_instructions(
+        summarizer,
+        &sess049_branch_prep(),
+        &faux_model(),
+        None,
+        false,
+        CancelToken::new(),
+    )
+    .await
+    .expect_err("generate_branch_summary_with_instructions must refuse the response");
+    [history, prefix, branch]
+}
+
+/// A `length` stop carries text cut off at the token cap. Compaction REPLACES the messages it
+/// summarizes, so persisting that text would make a mid-sentence fragment the permanent record.
+/// pi: "A length stop contains partial text and must not become a session checkpoint".
+#[tokio::test]
+async fn a_token_capped_summarization_is_rejected_at_all_three_call_sites() {
+    let partial = "## Goal\nThe user wants to refactor the";
+    let summarizer = ScriptedSummarizer {
+        content: vec![faux_text(partial)],
+        stop_reason: StopReason::Length,
+    };
+    for err in sess049_errors_at_all_three_sites(&summarizer).await {
+        let CompactionError::Summarization(msg) = &err else {
+            panic!("expected a summarization failure, got {err:?}");
+        };
+        assert_eq!(
+            msg, "generation hit the token cap and the summary is incomplete",
+            "pi's `getSummarizationFailure` text for a length stop"
+        );
+        assert!(
+            !err.to_string().contains("refactor"),
+            "the partial text must not leak out as if it were the summary: {err}"
+        );
+    }
+}
+
+/// The summarization request carries no tools, so a tool-call block means the model ignored the
+/// prompt; pi refuses rather than summarizing against the surrounding text.
+#[tokio::test]
+async fn a_summarization_that_emits_a_tool_call_is_rejected_at_all_three_call_sites() {
+    let tool_call = Content::ToolCall(ToolCall {
+        id: ToolCallId::from("tc-sess049"),
+        name: "read".to_string(),
+        arguments: json!({ "path": "/x" })
+            .as_object()
+            .cloned()
+            .expect("object")
+            .into(),
+        thought_signature: None,
+    });
+    let summarizer = ScriptedSummarizer {
+        content: vec![faux_text("Let me look at that file first."), tool_call],
+        stop_reason: StopReason::ToolUse,
+    };
+    let errs = sess049_errors_at_all_three_sites(&summarizer).await;
+    let expected = [
+        "Summarization attempted to call a tool",
+        "Turn prefix summarization attempted to call a tool",
+        "Branch summarization attempted to call a tool",
+    ];
+    for (err, want) in errs.iter().zip(expected) {
+        let CompactionError::Summarization(msg) = err else {
+            panic!("expected a summarization failure, got {err:?}");
+        };
+        assert_eq!(msg, want, "pi's per-site label is preserved");
+    }
+}
+
+/// The gate itself, pinned against pi's `getSummarizationFailure` + toolCall check: what it
+/// refuses, what it still accepts, and that the tool-call test is on the CONTENT BLOCKS
+/// (`response.content.some(block => block.type === "toolCall")`), not on the stop reason.
+#[test]
+fn check_summarization_response_pins_pi_s_acceptance_rules() {
+    use crate::compaction::check_summarization_response;
+
+    let ok = faux_assistant_message(vec![faux_text("## Goal\nDone.")], StopReason::Stop);
+    assert!(check_summarization_response(&ok, "Summarization").is_ok());
+
+    // A `toolUse` stop with NO tool-call block passes: pi never inspects `stopReason` for this.
+    let tool_use_no_block =
+        faux_assistant_message(vec![faux_text("## Goal\nDone.")], StopReason::ToolUse);
+    assert!(check_summarization_response(&tool_use_no_block, "Summarization").is_ok());
+
+    let capped = faux_assistant_message(vec![faux_text("## Go")], StopReason::Length);
+    let err = check_summarization_response(&capped, "Summarization")
+        .expect_err("a length stop is a failure");
+    assert_eq!(
+        err.to_string(),
+        "summarization failed: generation hit the token cap and the summary is incomplete"
+    );
+
+    // A `stop` that still carries a tool-call block is refused by the block check alone.
+    let with_call = faux_assistant_message(
+        vec![
+            faux_text("x"),
+            Content::ToolCall(ToolCall {
+                id: ToolCallId::from("tc-1"),
+                name: "bash".to_string(),
+                arguments: json!({}).as_object().cloned().expect("object").into(),
+                thought_signature: None,
+            }),
+        ],
+        StopReason::Stop,
+    );
+    let err = check_summarization_response(&with_call, "Branch summarization")
+        .expect_err("a tool-call block is a failure");
+    assert_eq!(
+        err.to_string(),
+        "summarization failed: Branch summarization attempted to call a tool"
+    );
+
+    // The pre-existing arms are unchanged: `error` keeps its message, `aborted` maps to `Aborted`.
+    let mut errored = faux_assistant_message(vec![], StopReason::Error);
+    errored.error_message = Some("http 400".to_string());
+    assert!(matches!(
+        check_summarization_response(&errored, "Summarization"),
+        Err(CompactionError::Summarization(m)) if m == "http 400"
+    ));
+    let aborted = faux_assistant_message(vec![], StopReason::Aborted);
+    assert!(matches!(
+        check_summarization_response(&aborted, "Summarization"),
+        Err(CompactionError::Aborted)
+    ));
+}

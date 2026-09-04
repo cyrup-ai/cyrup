@@ -42,11 +42,11 @@ pub use prepare::{CompactionPreparation, prepare_compaction};
 pub use serialize::serialize_conversation;
 pub use settings::{BranchSummarySettings, CompactionSettings};
 pub use summarize::{
-    DefaultCompaction, PENDING_SUMMARY, ProviderSummarizer, SUMMARIZATION_PROMPT,
-    SUMMARIZATION_SYSTEM_PROMPT, SummarizationRequest, Summarizer, SummaryOutput,
-    TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT, combine_usage, compact_default,
-    complete_summarization, generate_summary, generate_turn_prefix_summary,
-    summarization_reasoning,
+    DefaultCompaction, INCOMPLETE_SUMMARY, PENDING_SUMMARY, ProviderSummarizer,
+    SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, SummarizationRequest, Summarizer,
+    SummaryOutput, TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
+    check_summarization_response, combine_usage, compact_default, complete_summarization,
+    generate_summary, generate_turn_prefix_summary, summarization_reasoning,
 };
 pub use tokens::{
     ContextUsageEstimate, TokenCache, context_tokens_from_usage, estimate_context_tokens,

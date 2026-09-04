@@ -398,8 +398,8 @@ impl AgentSession {
     ) -> Result<BranchSummaryOutput, cyrup_session::compaction::CompactionError> {
         use cyrup_session::compaction::{
             BRANCH_SUMMARY_EMPTY_PLACEHOLDER, BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT,
-            SUMMARIZATION_SYSTEM_PROMPT, SummarizationRequest, Summarizer, format_file_operations,
-            serialize_conversation,
+            SUMMARIZATION_SYSTEM_PROMPT, SummarizationRequest, Summarizer,
+            check_summarization_response, format_file_operations, serialize_conversation,
         };
         // Pi short-circuits BEFORE the model call when there is nothing to summarize
         // (branch-summarization.ts:309-311).
@@ -451,47 +451,31 @@ impl AgentSession {
         drop(summarizer);
         let _ = retry_pump.await;
         let resp = resp?;
-        match resp.stop_reason {
-            cyrup_core::StopReason::Error => {
-                Err(cyrup_session::compaction::CompactionError::Summarization(
-                    resp.error_message.unwrap_or_default(),
-                ))
-            }
-            cyrup_core::StopReason::Aborted => {
-                Err(cyrup_session::compaction::CompactionError::Aborted)
-            }
-            // An unsettled response is NOT a summary — same guard, and the same `Deferred`
-            // rationale, as `cyrup_session::compaction::{summarize,branch}`.
-            cyrup_core::StopReason::Pending | cyrup_core::StopReason::Deferred => {
-                Err(cyrup_session::compaction::CompactionError::Summarization(
-                    resp.error_message
-                        .unwrap_or_else(|| cyrup_session::compaction::PENDING_SUMMARY.to_string()),
-                ))
-            }
-            cyrup_core::StopReason::Stop
-            | cyrup_core::StopReason::Length
-            | cyrup_core::StopReason::ToolUse => {
-                let body = resp
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        Content::Text { text, .. } => Some(text.to_string()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let (read, modified) = prep.file_ops.compute_lists();
-                Ok(BranchSummaryOutput {
-                    text: format!(
-                        "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
-                        format_file_operations(&read, &modified)
-                    ),
-                    // The branch-summary call's token spend is persisted on the entry (Pi
-                    // `BranchSummaryResult.usage`, `branch-summarization.ts:372`).
-                    usage: Some(resp.usage),
-                })
-            }
-        }
+        // The shared acceptance gate — pi `getSummarizationFailure(response, "Branch
+        // summarization")` + the toolCall check (`v0.84.4 branch-summarization.ts:357-363`), with
+        // the `aborted` short-circuit at `:354-356` as its `Aborted` arm. One function for all four
+        // cyrup call sites, so this copy cannot drift from `cyrup_session::compaction::branch`
+        // again (SESS-049: the four hand-copied matches had all kept accepting a `length` stop).
+        check_summarization_response(&resp, "Branch summarization")?;
+        let body = resp
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text, .. } => Some(text.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (read, modified) = prep.file_ops.compute_lists();
+        Ok(BranchSummaryOutput {
+            text: format!(
+                "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
+                format_file_operations(&read, &modified)
+            ),
+            // The branch-summary call's token spend is persisted on the entry (Pi
+            // `BranchSummaryResult.usage`, `branch-summarization.ts:372`).
+            usage: Some(resp.usage),
+        })
     }
 
     /// Republish `CYRUP_SESSION_ID` / `CYRUP_SESSION_FILE` from the LIVE manager for the next `bash`

@@ -6,7 +6,9 @@ use cyrup_core::{CancelToken, EntryId, Message};
 use crate::compaction::error::CompactionError;
 use crate::compaction::files::{FileOps, format_file_operations};
 use crate::compaction::serialize::serialize_conversation;
-use crate::compaction::summarize::{SUMMARIZATION_SYSTEM_PROMPT, SummarizationRequest, Summarizer};
+use crate::compaction::summarize::{
+    SUMMARIZATION_SYSTEM_PROMPT, SummarizationRequest, Summarizer, check_summarization_response,
+};
 use crate::compaction::tokens::{
     estimate_agent_message, estimate_custom_message_content, estimate_summary_text,
 };
@@ -317,39 +319,25 @@ pub async fn generate_branch_summary_with_instructions<S: Summarizer>(
         thinking: ModelThinkingLevel::Off,
     };
     let resp = summarizer.complete(req, cancel).await?;
-    match resp.stop_reason {
-        cyrup_core::StopReason::Error => Err(CompactionError::Summarization(
-            resp.error_message.unwrap_or_default(),
-        )),
-        cyrup_core::StopReason::Aborted => Err(CompactionError::Aborted),
-        // An unsettled response is NOT a summary — see the same guard, and the `Deferred`
-        // rationale, in `summarize.rs`.
-        cyrup_core::StopReason::Pending | cyrup_core::StopReason::Deferred => {
-            Err(CompactionError::Summarization(
-                resp.error_message
-                    .unwrap_or_else(|| crate::compaction::summarize::PENDING_SUMMARY.to_string()),
-            ))
-        }
-        cyrup_core::StopReason::Stop
-        | cyrup_core::StopReason::Length
-        | cyrup_core::StopReason::ToolUse => {
-            let body = resp
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let (read, modified) = prep.file_ops.compute_lists();
-            Ok(BranchSummaryOutput {
-                text: format!(
-                    "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
-                    format_file_operations(&read, &modified)
-                ),
-                usage: Some(resp.usage),
-            })
-        }
-    }
+    // Pi `getSummarizationFailure(response, "Branch summarization")` + the toolCall check
+    // (`v0.84.4 branch-summarization.ts:357-363`); the `aborted` short-circuit pi runs just before
+    // them (`:354-356`) is the gate's `Aborted` arm.
+    check_summarization_response(&resp, "Branch summarization")?;
+    let body = resp
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (read, modified) = prep.file_ops.compute_lists();
+    Ok(BranchSummaryOutput {
+        text: format!(
+            "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
+            format_file_operations(&read, &modified)
+        ),
+        usage: Some(resp.usage),
+    })
 }

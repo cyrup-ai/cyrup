@@ -505,3 +505,74 @@ async fn branch_summarization_does_not_hold_the_manager_lock() {
         "the summary still lands once the gate opens"
     );
 }
+
+// ================================ SESS-049: navigate_tree refuses a token-capped branch summary ==
+
+/// The `/tree` op's branch summarizer is this crate's own copy of
+/// `generate_branch_summary_with_instructions` (`session/forking.rs`), so the pi v0.84.4
+/// `getSummarizationFailure` rule (branch-summarization.ts:357-363) has to hold HERE too: a
+/// `length` stop is an error, nothing is appended, and the partial text never becomes an entry.
+#[tokio::test]
+async fn navigate_tree_refuses_a_token_capped_branch_summary() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("a1")],
+            StopReason::Stop,
+        )),
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("a2")],
+            StopReason::Stop,
+        )),
+        // The branch summarizer hits its output cap mid-sentence.
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("## Goal\nThe user wanted to")],
+            StopReason::Length,
+        )),
+    ]);
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
+
+    let _ = session.prompt("first").await.unwrap();
+    session.wait_for_idle().await;
+    let _ = session.prompt("second").await.unwrap();
+    session.wait_for_idle().await;
+
+    let anchors = session.user_messages_for_forking().await;
+    let u1: EntryId = anchors[0].entry_id.clone();
+    let err = session
+        .navigate_tree(
+            u1,
+            NavigateTreeOptions {
+                summarize: true,
+                custom_instructions: None,
+                replace_instructions: false,
+                label: None,
+            },
+        )
+        .await
+        .expect_err("a token-capped branch summary is refused, not persisted");
+    assert!(
+        matches!(
+            &err,
+            crate::SessionServiceError::Compaction(
+                cyrup_session::compaction::CompactionError::Summarization(m)
+            ) if m == "generation hit the token cap and the summary is incomplete"
+        ),
+        "got {err:?}"
+    );
+
+    let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl");
+    assert!(
+        !jsonl.contains("branch_summary"),
+        "no branch summary entry may be persisted from a partial summary"
+    );
+    assert!(
+        !jsonl.contains("The user wanted to"),
+        "the partial text must not reach the session file"
+    );
+}
