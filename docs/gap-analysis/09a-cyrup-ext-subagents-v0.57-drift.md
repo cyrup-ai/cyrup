@@ -105,6 +105,7 @@ corrections are applied and recorded at the item.
 | ~~SUBA-084~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / runtime registry | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0) **and ported at `dee8b9d0`**: `RuntimeAgentRegistry`, `AgentSource::Runtime` at source rank 4, the three collision checks, merge inside `run_discovery`, clear on `SessionShutdown`, public `register_agent`. Effort was M, not the filed L; the v0.64.0 event bridge is a recorded residual |
 | ~~SUBA-085~~ | ~~high~~ **CLOSED 2026-09-04** | S | missions | `mission.resolve-decision` ported at `5e3aa1c8` — the seventh verb, the store transition, and upstream's open-decision status gate; the goal driver moves past a resolved decision, pinned by test |
 | ~~SUBA-086~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / diagnostics | **Promoted out of `## Carried` 2026-09-04** (both sides read; three corrections to the filed text recorded in the section) **and ported at `275c1f85`**: `AgentDiscoveryDiagnostic`, `parse_agent_file_checked`, `find_blocking_agent_diagnostic`, rendered by `list`/`get`/`models`/doctor and enforced at both delegation seams |
+| ~~SUBA-087~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | M | background control / child-scoped stop | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0; one filing error corrected) **and ported at `2d9d0d0a`**: `childId` on the tool, `control/stop-requests/` queue with `targetIndex`/`childId`, `child_identity`/`child_stop` modules, the runner stops ONE step and keeps the run alive with pi's events and texts. Residual: a `ParallelGroup`/`DynamicGroup`'s members are one step to cyrup's status, so a `tasks[]` fan-out's members are not individually addressable |
 | ~~SUBA-092~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / agent schema | `excludeTools:`/`allowNestedSubagents:` ported at `247ff97b` — frontmatter, settings-override, serializer, and the spawn-plan tool subtraction / nested-fanout grant. v0.64.0's cross-field custom-override precedence change (`31562d76`) is a recorded residual, not this row |
 
 > **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
@@ -185,14 +186,16 @@ corrections are applied and recorded at the item.
 >   from the base commit's own files). Every implementer hit it and reverted the churn by hand.
 >   Repo-level decision, ownerless.
 
-Carried-but-unverified (`## Carried — NOT adversarially verified`): **five rows, all medium** —
-`SUBA-087`, `SUBA-088`, `SUBA-089`, `SUBA-090`, `SUBA-091`. (The three highs that sat here,
+Carried-but-unverified (`## Carried — NOT adversarially verified`): **four rows, all medium** —
+`SUBA-088`, `SUBA-089`, `SUBA-090`, `SUBA-091`. (The three highs that sat here,
 `SUBA-082`/`SUBA-084`/`SUBA-086`, were promoted and closed on 2026-09-04 — see the blockquote
-above.) All five were re-checked port-side at cyrup HEAD `2571969` this pass: every zero-hit grep
-this file recorded for them still returns zero hits — none of the 210 commits since baseline
-`4fb5e40` touched any of these symbols/behaviours. Left exactly as filed, still held to the lower
-evidence standard the section header states (upstream line numbers not re-verified) — no pass has
-yet re-read `git show v0.57.0:<path>` for any of the five, only the cyrup side.
+above; `SUBA-087` was promoted, confirmed and PARTIALLY CLOSED on 2026-09-04 at `2d9d0d0a` — see
+`## ~~SUBA-087~~`.) All were re-checked port-side at cyrup HEAD `2571969` this pass: every zero-hit
+grep this file recorded for them still returns zero hits — none of the 210 commits since baseline
+`4fb5e40` touched any of these symbols/behaviours. The four remaining are left exactly as filed,
+still held to the lower evidence standard the section header states (upstream line numbers not
+re-verified) — no pass has yet re-read `git show v0.57.0:<path>` for any of them, only the cyrup
+side.
 Refuted: `SUBA-080`.
 
 ---
@@ -1387,6 +1390,163 @@ pre-existing.
 
 ---
 
+## ~~SUBA-087~~ — ~~medium~~ **PARTIALLY CLOSED 2026-09-04** — Child-scoped stop (`childId`) is unported: `stop` can only terminate an entire async run and its whole descendant subtree
+
+> **PROMOTED OUT OF `## Carried — NOT adversarially verified`, CONFIRMED WITH ONE CORRECTION, AND
+> PARTIALLY CLOSED 2026-09-04 — landing commit `2d9d0d0a` (code), on top of `53fe416b`.**
+> Upstream re-read with `git show` at BOTH tags. The filing's shapes are accurate; its one filing
+> error is the directory of `async-stop-action.ts` — it is `src/runs/foreground/`, not
+> `runs/background/` (content and range `:24-86` exact at both tags, byte-identical between them).
+> `child-identity.ts` is 36 lines at v0.57.0 and 51 at v0.64.0: the only tag-to-tag difference is
+> the `includeNested` option (`:27,34-42`), whose sole consumer is `slash/slash-commands.ts:1110`
+> (cyrup's `/subagents-stop` takes no `childId`) — not ported. `subagent-runner.ts`'s ranges moved
+> (`:2837-2887` as filed → `:2955-3031` at v0.64.0) and v0.64.0 additionally emits
+> `subagent.child-status` (`:2956-2974`, shape `shared/types.ts:2299-2315`), which IS ported.
+> Port-side at `53fe416b`, before the change: `rg 'childId|child_id|target_index|stop-requests|
+> stop_requested|step\.stop' crates/cyrup-ext-subagents/src` found only steer's `target_index`,
+> the workflow-graph node ids and one test name — nothing on the stop path, exactly as filed.
+> Severity `medium` stands; effort M was exact. Port target v0.64.0.
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed (2026-09-04, both tags)
+**Subsystem** background control / child-scoped stop
+**Window** v0.47.1..v0.57.0 · `31a230cb (#1373)`, `de594cfd (#1375)`
+
+**upstream (v0.64.0)** — `src/runs/shared/child-identity.ts:16-18` `asyncStatusChildIdentity` =
+`step.workflowKey ?? step.runId ?? \`step:${index}\``; `:20-22` candidates (non-empty, de-duplicated);
+`:24-47` `resolveAsyncStatusChild` → exactly-one match resolves, else `not_found` (`Child '<id>' was
+not found under async run '<run>'.`, `:46`) / `ambiguous` (`Child '<id>' is ambiguous under async run
+'<run>'.`, `:45`); `:49-51` `isStoppableAsyncStatusStep` = `pending|running`.
+`src/runs/foreground/async-stop-action.ts:24-86` `stopAsyncRun(state, runId, kill, location,
+childId)`: reconcile (`:33`), running|queued gate (`:41-47`), resolve (`:48-58`), stoppable gate with
+`Child '${childId}' in async run '${status.runId}' is ${child.step.status}; stop only supports pending
+or running children.` (`:59-65`), `deliverStopRequest({… targetIndex: child?.index, childId: child?.id
+?? childId})` (`:68`), receipt `Stop requested for child ${child.id} in async run ${asyncId}.` (`:75`).
+`src/runs/background/control-channel.ts:54-61` `StopRequest{type,ts,source,reason,targetIndex,childId}`;
+`:98` `STOP_REQUESTS_DIR = "stop-requests"`; `:175-184` `assertChildIndex` (0..=1 000 000) and
+`validStopChildId` (non-blank, ≤256 chars, no CR/LF); `:190-192` `<ts padStart 13>-<uuid>.json`;
+`:297-310` `requestAsyncStop` (throws `stop childId must be a non-empty string without newlines and at
+most 256 characters.`); `:553-567` `parseStopRequest` drops invalid targeting; `:569-620`
+`consumeStopRequestFile`/`Payloads` (queue files name-sorted, then legacy `stop.json`, result sorted
+by `ts`); `:642-653` `deliverStopRequest`; `:690` every drained request → `onStop`.
+`src/runs/background/subagent-runner.ts:2595-2596` `activeChildStops`/`childStopRequests`; `:2955-3031`
+`childStopTargetId`, `appendChildStatusEvent` (`subagent.child-status`, `version:1`, `reason:"user"`,
+`source:"async"`), `markChildStopRequested` (pending|running gate, `stopRequested`/`stopRequestedAt`,
+`subagent.step.stop_requested`), `markChildStopped` (`stopped`, `error = stopMessage`, `exitCode 1`,
+`subagent.step.stopped`), `stopChildStep` (`targetIndex === undefined` → `stopRunner`; refused →
+`subagent.step.stop_failed` `Child is not pending or running.`; live → `stop()`; pending →
+`subagent.step.stop_queued`); `:3048-3055` `registerStepStop` fires at once when a request is already
+recorded; `:3182-3190` `stoppedStepResult`; `:3842` `step.stopped = true` on `stopRunner`;
+`:4219-4222,4335-4342` precedence `stopped → timedOut → childStopped → interrupted` and the
+`subagent.step.stopped` + terminal child-status on settle; `:4937-4941` sequential skip
+(`childStopResult`, `flatIndex++; continue`). `src/extension/schemas.ts:306` `childId:
+Type.Optional(Type.String({minLength:1, maxLength:256, description:"Stable child identity for
+child-scoped stop requests."}))`; `src/runs/foreground/subagent-executor.ts:303,6163,6184` threading;
+`src/shared/types.ts:1882-1883,1904` the three step fields.
+
+**cyrup (at `2d9d0d0a`)** — NEW `crates/cyrup-ext-subagents/src/background/child_identity.rs`:
+`identity_from_parts` (`:93`, the rung order pinned by test — cyrup's `StepStatus` has no
+`workflowKey`/`runId`, so every real identity is the positional `step:<index>` over
+`RunStatus::steps`, the same index space steer's `target_index`, the transcript `index` and
+`output-<i>.log` use), `candidates_from_parts` (`:108`), `resolve_async_status_child` (`:146`) →
+`AsyncStatusChildResolution::{Resolved, NotFound(msg), Ambiguous(msg)}` (`:61`) with upstream's two
+sentences, `is_stoppable_step_state` (`:195`). NEW `background/child_stop.rs`: `ChildStopRegistry`
+(`:54`; pi's two maps — `record`/`recorded`/`is_requested`, `register_active` fires at once when
+already requested (`:111`), `cancel_active` (`:136`)), pure `mark_child_stop_requested` (`:172` →
+`ChildStopMarking::{Requested{child_id,agent,was_pending}, NotStoppable}`), `mark_child_stopped`
+(`:217`, idempotent, `stopRequestedAt` precedence recorded → step → now), `child_status_event`
+(`:279`). `background/mod.rs:762-773` `StepStatus.stop_requested`/`stop_requested_at`/`stopped`
+(serde default, skipped when unset). `background/control.rs:624` `StopRequest` +
+`target_index`/`child_id`, `for_child` (`:671`), `is_child_scoped` (`:686`);
+`MAX_STOP_TARGET_INDEX`/`MAX_STOP_CHILD_ID_LENGTH` (`:693,697`); `is_valid_stop_child_id` /
+`validate_stop_child_id` (`:702,715`, upstream's sentence); `stop_requests_dir` (`:744`) with
+`stop_request_path` kept as the read-only legacy path (`:753`); `stop_request_file_name` (`:760`);
+`StopOutcome::{Requested, ChildRequested{child_id}, NotStoppable, ChildUnresolved(String),
+ChildNotStoppable{run_id,state}}` (`:773`); `stop(…, child_id)` (`:826`: reconcile → running|queued
+→ resolve → stoppable gate → targeted request, upstream's order); `deliver_stop_request` (`:939`,
+now queue-backed), `deliver_child_stop_request` (`:955`), `request_async_stop` (`:976`, both
+validators); `parse_stop_request` (`:1706`); `pending_stop_request_paths`/`has_pending_stop_request`
+/`peek_stop_requests` (`:1752-1767`); `check_stop_inbox_now` (`:1795`) and `consume_stop_request`
+(`:1854`) now see ONLY whole-run requests, `consume_child_stop_requests` (`:1868`) drains the targeted
+ones (queue files name-sorted + legacy file, sorted by `ts`, forged/invalid files consumed and
+dropped). `background/runner_main.rs:1282` `ControlFlags::child_stops`; `:1472` the pending-target
+skip (`skip_child_stopped_step`, `:2397`, pi `:4937-4941`); `:1489` per-step handle
+`interrupt_cancel.child_token()` registered BEFORE `mark_step_running`, cleared at `:1538`; `:2753`
+`ExecSingleStepExecutor::child_stops` read back at `:3216` as the child's `RunOptions::interrupt`;
+`:2077` `MidFlightVerb::{RunStop, RunTimeout, ChildStop, Interrupt}` in pi's precedence inside
+`settle_step_result` (`:2098`) — a child-stopped step ends `Stopped` with `STOP_MESSAGE`, the
+promoted stopped `SingleResult`, `subagent.step.stopped` + child-status `stopped`
+(`append_child_stopped_events`, `:2453`), and the loop ADVANCES (cyrup's loop already advances past
+a failed step; upstream's `exitCode !== 0 → break` chain rule is pre-existing drift, not this row);
+`:2372` `mark_remaining_stopped` now stamps `step.stopped`; `:1772-1779` terminal child-status for
+recorded children on a whole-run stop; `:3747` the watcher routes child-scoped requests before the
+run-wide probes; `route_child_stop_requests` (`:3964`, pi `stopChildStep`: derive identity, gate,
+record, `stop_requested` + child-status `stopping`, cancel the live handle else `stop_queued`, or
+`stop_failed`). `extension/tool/params.rs:102` `child_id`; `extension/tool/schema.rs:360` `childId`
+(bounds + description verbatim); `extension/tool/routing.rs:1397` threads it;
+`extension/executor/control.rs:140-145` `control_stop(…, child_id)` rendering the three new outcomes
+with upstream's texts (`:223-240`); `host/slash.rs`, `tui/fleet_overlay.rs`, `executor/notices.rs`
+callers pass `None`.
+
+**Design decisions (recorded in the commit body)** — domain enums for the expected outcomes
+(`AsyncStatusChildResolution`, the three new `StopOutcome` variants, `ChildStopMarking`) rather than
+`Result<_, String>`/bool+Option; functional-core status transitions in `child_stop.rs` with the
+watcher/loop as the shell; the per-step stop handle as a CHILD token of the run-wide interrupt token
+held in a shared registry (no `SingleStepExecutor` signature change, run-wide verbs still cancel
+through the parent); `childId` validated at the write boundary and dropped on read rather than
+newtyped, so the tool boundary answers with upstream's sentence instead of a serde error.
+
+**Verify (each fails at `53fe416b` by construction — every test names a symbol absent there — and
+passes at `2d9d0d0a`; crate 2696/2696 via `cargo nextest run -p cyrup-ext-subagents`)** —
+`child_identity.rs` `identity_falls_back_workflow_key_then_run_id_then_position`,
+`candidates_keep_rung_order_and_dedupe`, `resolves_a_positional_child_with_its_state_and_agent`,
+`an_unknown_child_reports_upstreams_not_found_sentence`, `ambiguity_is_reported_with_upstreams_sentence`,
+`only_pending_and_running_children_are_stoppable`; `child_stop.rs`
+`mark_child_stop_requested_gates_on_pending_or_running`, `mark_child_stopped_stamps_the_step_and_is_idempotent`,
+`registry_applies_a_queued_request_at_registration_and_cancels_live_ones`, `child_status_event_has_pis_shape`;
+`control.rs` `stop_child_id_is_validated_with_upstreams_message`,
+`stop_requests_are_queued_per_file_drained_oldest_first_and_split_by_scope`,
+`stop_with_a_child_id_resolves_gates_and_targets_the_request` (+ the pre-existing stop tests moved to
+the queue); `routing_tests.rs` `stop_with_child_id_reaches_control_stop_and_writes_a_targeted_request`,
+`stop_refuses_a_child_that_is_not_pending_or_running_with_upstreams_text` (verbatim sentence),
+`stop_reports_an_unknown_child_with_upstreams_not_found_text`; `runner_main.rs`
+`child_scoped_stop_requests_are_routed_to_one_step_and_never_the_whole_run`; `schema.rs` `childId`
+bounds. `crates/cyrup-it/tests/subagents/background_runner_main_integration.rs` (gated,
+`cargo nextest run -p cyrup-it --features it --test subagents`)
+`a_child_scoped_stop_stops_one_chain_step_and_the_next_step_still_completes` (step 0 torn down
+mid-sleep, step 1 completes with its own output, run `Failed` not `Stopped`, events
+`stop_requested` → child-status `stopping` → `step.stopped` → child-status `stopped`, no
+`run.stopped`) and `a_child_scoped_stop_for_a_pending_step_is_queued_and_skips_it_when_reached`
+(`stop_queued`, step never started, `durationMs: 0`). The `it`-gated pair could not be executed
+in this session's shared tree — the `cyrup-it` build.rs nested `it-bins` build hit ENOSPC on every
+attempt (disk shared by nine concurrent tracks; crate-level tests and clippy are green) — a
+maintainer must run them once before treating the cyrup-it half as verified.
+
+**Falsification** — `subagent({action:"stop", id, childId:"step:1"})` against a running chain must
+answer `Stop requested for child step:1 in async run <id>.`, write ONE file under
+`control/stop-requests/` carrying `targetIndex: 1, childId: "step:1"`, and leave `status.json`
+`state: running`; the same call against a `complete` child must answer the verbatim refusal and
+write nothing; a plain `stop` must still end the run `Stopped`. Any of those failing reopens the row.
+
+**Residuals — recorded, not closed by this row.** (1) **medium — the filing's headline scenario is
+not delivered:** a `ParallelGroup`/`DynamicGroup` is ONE entry in `RunStatus::steps`
+(`runner_main.rs:1153-1164`) and its members reach `parallel_groups` only after the group settles
+(`record_step_outcome`, `:2347-2382`), so a `tasks[]` fan-out's members have no live per-child
+status to resolve against and `step:0` stops the WHOLE group. Upstream flattens members into
+`steps[]` (one `flatIndex` each). Closing it means live per-member status entries (the telemetry
+pump, steer targeting, the transcript index and `output-<i>.log` all key on the same top-level
+index), which is a status-model change beyond this row; the identity scheme here already follows
+upstream's flat index once that lands. (2) `includeNested` / the slash `childId` form
+(`slash-commands.ts:1110`) and the RPC `stop` surface (`extension/rpc.ts:561-687`) are cyrup-absent
+surfaces. (3) The foreground executor registers no child stops (no control inbox). (4) cyrup's
+chain loop advances past a child-stopped step exactly as it advances past a failed one; upstream
+breaks the chain on any non-zero step (`subagent-runner.ts:5267`) — pre-existing drift on the
+failure path, unchanged here. (5) The whole-run `stop` request is now queue-backed; an OLDER parent
+writing the legacy `control/stop.json` is still honoured (read on every drain), but a NEWER parent
+stopping an older runner is not (that runner reads only `stop.json`) — a one-release skew accepted
+as upstream accepted it.
+
+---
+
 ## Carried — NOT adversarially verified
 
 > **2026-09-04: three of the eight rows this section was written for — `SUBA-082`, `SUBA-084`,
@@ -1413,41 +1573,7 @@ pre-existing.
 
 ### ~~SUBA-086~~ — **PROMOTED AND CLOSED 2026-09-04** — see `## ~~SUBA-086~~` in the confirmed set above (landing commit `275c1f85`)
 
-### SUBA-087 — Child-scoped stop (`childId`) is unported: `stop` can only terminate an entire async run and its whole descendant subtree
-
-**Severity** medium (as filed) · **Effort** M · **Window** v0.47.1..v0.57.0 · `31a230cb (#1373)`, `de594cfd (#1375)`
-
-*Upstream, as filed (unverified):* `src/runs/shared/child-identity.ts` (36 lines, new in the window) —
-`asyncStatusChildIdentity(step, index)` = `step.workflowKey ?? step.runId ?? \`step:${index}\`` (the
-`step:${index}` fallback is the NON-workflow case), `resolveAsyncStatusChild` returning
-`{ok:false, code:"not_found"|"ambiguous"}`, `isStoppableAsyncStatusStep` restricted to
-`pending`/`running`. `schemas.ts:278` advertises `childId`; `control-channel.ts:53-60` adds
-`targetIndex?: number; childId?: string` to `StopRequest` plus a per-child `control/stop-requests/`
-directory drained newest-last; `async-stop-action.ts:24-86` refuses a non-stoppable child with
-``Child '<id>' in async run '<run>' is <status>; stop only supports pending or running children.``;
-`subagent-runner.ts:2837-2887` flips only that step and emits
-`subagent.step.stop_requested`/`stop_queued`/`stopped`.
-
-*Port (re-verified at HEAD):* `grep -rn 'childId' crates/cyrup-ext-subagents/` → **0 hits** (the 27
-`child_id` hits are unrelated test fixtures in `src/registration/cost.rs`).
-`src/background/control.rs:624-651` `pub struct StopRequest { kind, ts, source, reason }` — no
-`target_index`, no `child_id` — while the sibling `SteerRequest` at `:821-874` **does** carry
-`pub target_index: Option<usize>`, so the per-child targeting machinery exists and stop simply does
-not use it. `stop(async_root, results_dir, run_id_token, source, reason)` (`:691`) takes no child
-argument; `grep -rn 'stop-requests\|stop_requests'` → 0 (the port has only the single
-`control/stop.json`). `src/extension/tool/params.rs` has no `child_id` field and no
-`deny_unknown_fields`, so a `childId` sent by an upstream-shaped caller is **silently discarded** by
-serde and the stop proceeds against the whole run.
-
-*Behaviour gap:* with a 5-wide fan-out running and one child gone bad, upstream stops that one and the
-four healthy siblings run to completion. cyrup cannot express it: the entire run and its whole
-descendant subtree are terminally stopped, and stopped runs are explicitly non-resumable, so the
-siblings' partial work is lost.
-
-*Relation:* deliberately **NOT** folded into `VL-S2` (`workflowScript`) despite the commit's title —
-upstream's identity scheme falls back to `step:${index}` precisely for the non-workflow case, and the
-port already has `RunStatus.steps` with per-step state plus per-child steer targeting, so this is
-portable today with no workflow runtime. Three lenses filed it independently; merged.
+### ~~SUBA-087~~ — **PROMOTED AND PARTIALLY CLOSED 2026-09-04** — see `## ~~SUBA-087~~` in the confirmed set above (landing commit `2d9d0d0a`)
 
 ### SUBA-088 — `subagents.defaultProvider` and per-agent `modelProvider` are unported, and the foreground launch path passes no preferred provider into candidate resolution at all
 
