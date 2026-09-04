@@ -93,7 +93,7 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
 /// (including the mid-run `appended` step consumed from disk) — mirroring the orchestrator's own
 /// eager, up-front persona resolution.
 fn all_personas() -> BTreeMap<String, ResolvedAgentPersona> {
-    ["worker", "first", "only", "appended"]
+    ["worker", "first", "second", "only", "appended"]
         .into_iter()
         .map(|name| (name.to_string(), fixture_persona(name)))
         .collect()

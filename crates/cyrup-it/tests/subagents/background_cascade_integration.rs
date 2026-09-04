@@ -511,14 +511,27 @@ async fn a_delivered_stop_request_stops_the_run_and_cascades_to_descendants() {
         "no subagent.run.stopped event in:\n{events}"
     );
 
-    // 4. The cascade: the descendant gets a STOP with pi's own `ancestor-stop` source.
-    let descendant_inbox = harness.descendant_dir.join("control").join("stop.json");
-    assert!(
-        descendant_inbox.exists(),
-        "the live async descendant at {} received no stop",
+    // 4. The cascade: the descendant gets a STOP with pi's own `ancestor-stop` source. Since
+    //    SUBA-087 a stop request is its OWN file under `control/stop-requests/` (pi
+    //    `requestAsyncStop`, `runs/background/control-channel.ts:297-310` @v0.64.0); the legacy
+    //    single `control/stop.json` is read by the drains but no longer written by anything.
+    let descendant_inbox =
+        cyrup_ext_subagents::background::control::stop_requests_dir(&harness.descendant_dir);
+    let mut delivered_files: Vec<PathBuf> = match std::fs::read_dir(&descendant_inbox) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    assert_eq!(
+        delivered_files.len(),
+        1,
+        "the live async descendant at {} received exactly one stop; found {delivered_files:?}",
         harness.descendant_dir.display()
     );
-    let delivered: StopRequest = read_json(&descendant_inbox).await;
+    let delivered: StopRequest = read_json(&delivered_files.remove(0)).await;
     assert_eq!(delivered.kind, "stop");
     assert_eq!(delivered.source, "ancestor-stop");
     for downgrade in ["interrupt.json", "timeout.json"] {
