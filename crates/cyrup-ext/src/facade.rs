@@ -18,6 +18,7 @@ use crate::loader::LoadExtensionsResult;
 use crate::manifest::{Capabilities, HOST_WORLD};
 use crate::native::{ExtMode, HostCtx, InitApi, NativeExtension, NativeHandle};
 use crate::registry::{CommandDescriptor, ExtensionRegistry};
+use crate::render::RenderOptions;
 use crate::subscriber::ExtSubscriber;
 use cyrup_agent::{EventSubscriber, Hooks};
 use cyrup_core::{CancelToken, Content, ExtensionId, Message, Tool};
@@ -1125,8 +1126,13 @@ impl ExtensionHost {
     /// This is the missing link EXT-006 was about: `ToolDescriptor.has_renderer` was recorded and
     /// `LiveExtension::render_call` existed, but nothing could get from a tool NAME to the guest
     /// that renders it, so both were dead outside a unit test.
-    pub async fn render_tool_call(&self, tool_name: &str, call: &Value) -> Option<Value> {
-        self.render_tool_call_outcome(tool_name, call)
+    pub async fn render_tool_call(
+        &self,
+        tool_name: &str,
+        call: &Value,
+        opts: &RenderOptions,
+    ) -> Option<Value> {
+        self.render_tool_call_outcome(tool_name, call, opts)
             .await
             .into_option()
     }
@@ -1160,7 +1166,12 @@ impl ExtensionHost {
     /// [`Self::native_tool_renderers`] for why the SDK tier is consulted FIRST): the tool's own
     /// `render_call`, then the extension that registered a renderer for this name. `None` from
     /// both leaves the caller to draw the built-in shell.
-    pub async fn render_tool_call_outcome(&self, tool_name: &str, call: &Value) -> RenderOutcome {
+    pub async fn render_tool_call_outcome(
+        &self,
+        tool_name: &str,
+        call: &Value,
+        opts: &RenderOptions,
+    ) -> RenderOutcome {
         if let Some(tool) = self.native_tool_renderer(tool_name)
             && let Some(text) = tool.render_call(call)
         {
@@ -1169,14 +1180,19 @@ impl ExtensionHost {
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
-        self.render_via(&owner, tool_name, call, RenderKind::Call)
+        self.render_via(&owner, tool_name, call, RenderKind::Call, opts)
             .await
     }
 
     /// Render a TOOL RESULT through the tool's registered renderer (Pi `renderResult`,
     /// extensions/types.ts:492-497). See [`Self::render_tool_call`].
-    pub async fn render_tool_result(&self, tool_name: &str, result: &Value) -> Option<Value> {
-        self.render_tool_result_outcome(tool_name, result)
+    pub async fn render_tool_result(
+        &self,
+        tool_name: &str,
+        result: &Value,
+        opts: &RenderOptions,
+    ) -> Option<Value> {
+        self.render_tool_result_outcome(tool_name, result, opts)
             .await
             .into_option()
     }
@@ -1187,6 +1203,7 @@ impl ExtensionHost {
         &self,
         tool_name: &str,
         result: &Value,
+        opts: &RenderOptions,
     ) -> RenderOutcome {
         if let Some(tool) = self.native_tool_renderer(tool_name)
             && let Some(text) = tool.render_result(result)
@@ -1196,7 +1213,7 @@ impl ExtensionHost {
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
-        self.render_via(&owner, tool_name, result, RenderKind::Result)
+        self.render_via(&owner, tool_name, result, RenderKind::Result, opts)
             .await
     }
 
@@ -1210,8 +1227,13 @@ impl ExtensionHost {
     /// pair of guest exports (`render-call`/`render-result`, keyed by an opaque `custom-type`), so
     /// both surfaces route through them; the two are kept apart by their REGISTRY tables
     /// (`tool_renderer_owner` vs `message_renderer_owner`), not by the wire shape.
-    pub async fn render_message_call(&self, custom_type: &str, message: &Value) -> Option<Value> {
-        self.render_message_call_outcome(custom_type, message)
+    pub async fn render_message_call(
+        &self,
+        custom_type: &str,
+        message: &Value,
+        opts: &RenderOptions,
+    ) -> Option<Value> {
+        self.render_message_call_outcome(custom_type, message, opts)
             .await
             .into_option()
     }
@@ -1227,6 +1249,7 @@ impl ExtensionHost {
         &self,
         custom_type: &str,
         message: &Value,
+        opts: &RenderOptions,
     ) -> RenderOutcome {
         let Some(owner) = self
             .registry
@@ -1236,13 +1259,18 @@ impl ExtensionHost {
         else {
             return RenderOutcome::None;
         };
-        self.render_via(&owner, custom_type, message, RenderKind::Call)
+        self.render_via(&owner, custom_type, message, RenderKind::Call, opts)
             .await
     }
 
     /// The result-side companion of [`Self::render_message_call`].
-    pub async fn render_message_result(&self, custom_type: &str, message: &Value) -> Option<Value> {
-        self.render_message_result_outcome(custom_type, message)
+    pub async fn render_message_result(
+        &self,
+        custom_type: &str,
+        message: &Value,
+        opts: &RenderOptions,
+    ) -> Option<Value> {
+        self.render_message_result_outcome(custom_type, message, opts)
             .await
             .into_option()
     }
@@ -1253,6 +1281,7 @@ impl ExtensionHost {
         &self,
         custom_type: &str,
         message: &Value,
+        opts: &RenderOptions,
     ) -> RenderOutcome {
         let Some(owner) = self
             .registry
@@ -1262,7 +1291,7 @@ impl ExtensionHost {
         else {
             return RenderOutcome::None;
         };
-        self.render_via(&owner, custom_type, message, RenderKind::Result)
+        self.render_via(&owner, custom_type, message, RenderKind::Result, opts)
             .await
     }
 
@@ -1291,7 +1320,12 @@ impl ExtensionHost {
     /// therefore travels over `render-call`. Adding a fourth export would break every already-built
     /// guest component for no behavioural gain. A NATIVE owner has no such constraint and gets its
     /// own [`crate::NativeExtension::render_entry`] hook.
-    pub async fn render_entry(&self, custom_type: &str, entry: &Value) -> RenderOutcome {
+    pub async fn render_entry(
+        &self,
+        custom_type: &str,
+        entry: &Value,
+        opts: &RenderOptions,
+    ) -> RenderOutcome {
         let Some(owner) = self
             .registry
             .entry_renderer_owner(custom_type)
@@ -1300,7 +1334,7 @@ impl ExtensionHost {
         else {
             return RenderOutcome::None;
         };
-        self.render_via(&owner, custom_type, entry, RenderKind::Entry)
+        self.render_via(&owner, custom_type, entry, RenderKind::Entry, opts)
             .await
     }
 
@@ -1481,6 +1515,7 @@ impl ExtensionHost {
         key: &str,
         payload: &Value,
         kind: RenderKind,
+        opts: &RenderOptions,
     ) -> RenderOutcome {
         if let Some(native) = self.native.read().ok().and_then(|g| g.get(owner).cloned()) {
             // A panicking native renderer must degrade gracefully, never take the frame down with
@@ -1490,6 +1525,13 @@ impl ExtensionHost {
             // The LIVE-component tier is consulted first, exactly as the native tool-renderer fast
             // tier is consulted before this dispatch. `None` falls through to the string hooks
             // below — upstream's `return undefined` for a payload it cannot draw from.
+            //
+            // EXT-006 — the native string hooks receive `opts` through the `*_under` methods,
+            // whose default delegates to the two-argument form. That is what keeps the widening
+            // ADDITIVE: an extension whose output does not vary with expansion or theme keeps its
+            // existing `render_call`, and one that does overrides `render_call_under`. A native
+            // renderer that wants the terminal WIDTH too has the richer
+            // [`crate::RenderedComponent`] tier consulted just above, re-rendered per frame.
             let live = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 native.render_live(key, payload)
             }));
@@ -1506,9 +1548,9 @@ impl ExtensionHost {
                 }
             }
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match kind {
-                RenderKind::Call => native.render_call(key, payload),
-                RenderKind::Result => native.render_result(key, payload),
-                RenderKind::Entry => native.render_entry(key, payload),
+                RenderKind::Call => native.render_call_under(key, payload, opts),
+                RenderKind::Result => native.render_result_under(key, payload, opts),
+                RenderKind::Entry => native.render_entry_under(key, payload, opts),
             }));
             return match rendered {
                 Ok(v) => RenderOutcome::from_option(v),
@@ -1523,7 +1565,7 @@ impl ExtensionHost {
                 }
             };
         }
-        self.render_via_guest(owner, key, payload, kind).await
+        self.render_via_guest(owner, key, payload, kind, opts).await
     }
 
     #[cfg(feature = "wasm-host")]
@@ -1533,6 +1575,7 @@ impl ExtensionHost {
         key: &str,
         payload: &Value,
         kind: RenderKind,
+        opts: &RenderOptions,
     ) -> RenderOutcome {
         let Some(ext) = self.live.read().ok().and_then(|g| g.get(owner).cloned()) else {
             // The owner is recorded but has no live instance (unloaded mid-render, or a native-only
@@ -1542,8 +1585,8 @@ impl ExtensionHost {
         // CYRUP-DELTA: an ENTRY rides the `render-call` export — see [`Self::render_entry`] for why
         // the world deliberately has no fourth renderer export.
         let out = match kind {
-            RenderKind::Call | RenderKind::Entry => ext.render_call(key, payload).await,
-            RenderKind::Result => ext.render_result(key, payload).await,
+            RenderKind::Call | RenderKind::Entry => ext.render_call(key, payload, opts).await,
+            RenderKind::Result => ext.render_result(key, payload, opts).await,
         };
         match out {
             Ok(v) => RenderOutcome::from_option(v),
@@ -1569,6 +1612,7 @@ impl ExtensionHost {
         _key: &str,
         _payload: &Value,
         _kind: RenderKind,
+        _opts: &RenderOptions,
     ) -> RenderOutcome {
         RenderOutcome::None
     }

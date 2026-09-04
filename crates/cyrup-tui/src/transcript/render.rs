@@ -209,7 +209,7 @@ pub(crate) fn entry_lines(
             // the block (Pi hands the resolved renderer to `CustomMessageComponent` in place of the
             // default framing, interactive-mode.ts:3324-3336). Emitted verbatim — the renderer
             // already owns the presentation, so no `[label]` bracket is added.
-            Rendered::Text(text) => {
+            Rendered::Text(rendered) => {
                 // `CustomMessageComponent` adds its `Spacer(1)` in the CONSTRUCTOR
                 // (`custom-message.ts:33`), before `rebuild()` chooses between the custom renderer
                 // (`:79`) and the default box (`:88`), so both arms carry the leading blank.
@@ -220,7 +220,7 @@ pub(crate) fn entry_lines(
                 // whatever the extension had chosen — the one thing `renderShell: "self"`/a custom
                 // renderer exists to prevent. Rows go out unstyled so the terminal default (and any
                 // styling the renderer expressed) survives.
-                out.extend(text.split('\n').map(|l| Line::raw(l.to_string())));
+                out.extend(rendered.text.split('\n').map(|l| Line::raw(l.to_string())));
                 out
             }
             // The component is re-rendered on EVERY frame at the LIVE width, theme and expansion —

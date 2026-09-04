@@ -630,7 +630,9 @@ fn x11_extension_rendered_message_is_not_forced_dim() {
     let entry = Entry::Custom {
         label: "demo".to_string(),
         body: "ignored".to_string(),
-        rendered: Rendered::Text("Hello from the extension".to_string()),
+        rendered: Rendered::Text(crate::transcript::RenderedText::frozen(
+            "Hello from the extension",
+        )),
     };
     let lines = entry_lines(&entry, &theme, 60, 1, ImageOpts::default());
     let r = row(&lines, "Hello from the extension");

@@ -390,17 +390,67 @@ pub struct RegisteredShortcut {
     pub handler: Box<dyn ShortcutExec>,
 }
 
-// --- message renderers (Pi `renderCall`/`renderResult`, types.ts:489-497; R-08-020) ---
+// --- message renderers (Pi `renderCall`/`renderResult`, types.ts:491-498 @v0.84.4; R-08-020) ---
+
+/// The `(options, theme)` half of every upstream renderer signature (EXT-006) — the guest mirror of
+/// `cyrup_ext::RenderOptions`, which is what the host serializes into the export's `opts-json`.
+///
+/// cyrup routes all three of pi's renderer surfaces through ONE export pair, so this is the union
+/// of pi's three option bags (`pi/packages/coding-agent/src/core/extensions/types.ts` @v0.84.4):
+/// `MessageRenderOptions { expanded, outputPad }` `:1195-1199`, `EntryRenderOptions { expanded }`
+/// `:1209-1211`, `ToolRenderResultOptions { expanded, isPartial }` `:413-418`. A surface for which
+/// a field has no meaning leaves it at its default.
+///
+/// Both halves are LIVE: the host re-invokes the renderer whenever they move, so a renderer that
+/// branches on [`Self::expanded`] really does redraw when the user presses the expand key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// `options.expanded` — the live `app.tools.expand` flag.
+    pub expanded: bool,
+    /// `MessageRenderOptions.outputPad` — the horizontal padding the `outputPad` setting configures.
+    pub output_pad: u32,
+    /// `ToolRenderResultOptions.isPartial` — whether the result being drawn is still streaming.
+    pub is_partial: bool,
+    /// The NAME of the active theme. Pi passes the whole `Theme` object; an object cannot cross the
+    /// component boundary, so a guest that needs the PALETTE calls `ui.theme_get_json()` (EXT-066).
+    /// `None` when the host has no display (an RPC host, a test).
+    pub theme: Option<String>,
+}
+
+impl RenderOptions {
+    /// Parse the host's `opts-json`. Absent or malformed fields take their defaults rather than
+    /// failing — a renderer must still draw when it cannot be told the options, which is exactly
+    /// what upstream does for a renderer that never reads its `options` argument.
+    pub fn from_json(v: &Value) -> Self {
+        Self {
+            expanded: v.get("expanded").and_then(Value::as_bool).unwrap_or(false),
+            output_pad: v
+                .get("outputPad")
+                .and_then(Value::as_u64)
+                .and_then(|w| u32::try_from(w).ok())
+                .unwrap_or(0),
+            is_partial: v.get("isPartial").and_then(Value::as_bool).unwrap_or(false),
+            theme: v
+                .get("theme")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        }
+    }
+}
 
 /// A custom message renderer the guest registers for a `custom_type`. Each method returns a
 /// serialized widget tree (`Value`), or `None` to fall back to the runtime's default renderer.
+///
+/// EXT-006 — `opts` is upstream's `(options, theme)` pair and is a LIVE input: the host re-invokes
+/// the renderer when the expansion or the theme changes, so branching on it is how a renderer
+/// draws a collapsed and an expanded form.
 pub trait MessageRenderer: 'static {
     /// Render the CALL row as a widget tree, or `None` (the default) to leave it to the runtime.
-    fn render_call(&self, _call: &Value, _ctx: &Ctx) -> Option<Value> {
+    fn render_call(&self, _call: &Value, _opts: &RenderOptions, _ctx: &Ctx) -> Option<Value> {
         None
     }
     /// Render the RESULT row as a widget tree, or `None` (the default) to leave it to the runtime.
-    fn render_result(&self, _result: &Value, _ctx: &Ctx) -> Option<Value> {
+    fn render_result(&self, _result: &Value, _opts: &RenderOptions, _ctx: &Ctx) -> Option<Value> {
         None
     }
 }
@@ -1496,20 +1546,30 @@ impl ExtensionApi {
     /// A custom-ENTRY renderer is searched too, and LAST: the message table is the one the host
     /// routes tool rows and custom messages through, and it must keep winning a key it already
     /// claims. An entry-only type falls through to the entry table.
-    pub fn render_call(&self, custom_type: &str, call: &Value) -> Option<Value> {
+    pub fn render_call(
+        &self,
+        custom_type: &str,
+        call: &Value,
+        opts: &RenderOptions,
+    ) -> Option<Value> {
         self.renderers
             .iter()
             .chain(self.entry_renderers.iter())
             .find(|r| r.custom_type == custom_type)
-            .and_then(|r| r.renderer.render_call(call, &Ctx::new()))
+            .and_then(|r| r.renderer.render_call(call, opts, &Ctx::new()))
     }
 
     /// Render a tool result via a registered renderer for `custom_type` (Pi `renderResult`).
-    pub fn render_result(&self, custom_type: &str, result: &Value) -> Option<Value> {
+    pub fn render_result(
+        &self,
+        custom_type: &str,
+        result: &Value,
+        opts: &RenderOptions,
+    ) -> Option<Value> {
         self.renderers
             .iter()
             .find(|r| r.custom_type == custom_type)
-            .and_then(|r| r.renderer.render_result(result, &Ctx::new()))
+            .and_then(|r| r.renderer.render_result(result, opts, &Ctx::new()))
     }
 
     // --- provider OAuth + streamSimple callbacks (pi `ProviderConfig`, types.ts:1427-1464 @v0.83.0

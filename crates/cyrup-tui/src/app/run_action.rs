@@ -216,6 +216,16 @@ impl App<InlineBackend<Stdout>> {
             }
             AppAction::Redraw | AppAction::None => {}
         }
+        // EXT-006 — the display inputs an extension renderer runs under (`options.expanded`, the
+        // `outputPad` setting, the active theme) are LIVE upstream, because pi re-invokes the
+        // renderer from the draw path (`core/extensions/types.ts:1213-1217` @v0.84.4). Every action
+        // that can move one of them ends here: `Ctrl+O` (`Action::ToolsExpand` ->
+        // `set_tools_expanded`), a `/theme` or `/settings` command, a selector, and an extension
+        // shortcut. One call site rather than a hook on each, for the same reason
+        // `publish_extension_readbacks` has one: an arm added later cannot forget it. The pass is a
+        // comparison per already-resident row and returns immediately when nothing moved.
+        let ext_host = ctx.session.services().ext_host.clone();
+        self.refresh_extension_renders(&ext_host).await;
         Ok(RunFlow::Continue)
     }
 

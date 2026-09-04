@@ -1,4 +1,4 @@
-// cyrup:ext@0.8.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.9.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
@@ -49,6 +49,14 @@
 // records it as "would not have required a bump on its own". The two statements contradicted each
 // other; `manifest.rs` is the correct one (EXT-061 re-derived it against `check_world`).
 //
+// 0.8 -> 0.9 is the renderer display-options batch, and it is an EXPORT re-signing:
+// `events.render-call` and `events.render-result` each gained a third parameter, `opts-json`,
+// carrying the `(options, theme)` half of every upstream renderer signature (EXT-006;
+// `MessageRenderer` `extensions/types.ts:1213-1217` @v0.84.4, `EntryRenderer` `:1219-1223`,
+// `ToolDefinition.renderCall`/`renderResult` `:491-498`). A 0.8 guest exports the two-parameter
+// shape and would die inside wasmtime on the link; `check_world` turns that into a typed
+// `ExtError::WorldVersion` instead. No import moved in this batch.
+//
 // ADDED WITHOUT A BUMP, same batch, same rule: `ctx-state.get-system-prompt-options` (EXT-061), the
 // last unaccounted-for member of pi's extension API surface. Recorded here because "additive import,
 // no bump" is the ONE case where the world file changes and the version does not, so a reader
@@ -60,7 +68,7 @@
 // then dies in wasmtime on the missing import, and NO version bump can change that, because the
 // bump moves the host's floor rather than its ceiling. Bumping for an additive import therefore buys
 // nothing and costs every already-built guest at the old minor.
-package cyrup:ext@0.8.0;
+package cyrup:ext@0.9.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -282,8 +290,34 @@ interface events {
   // `cyrup_ext_sdk::widget` constructs exactly these. Anything else — an unknown tag, a missing
   // tag, a tree nested deeper than 16 — is drawn as pretty-printed JSON rather than dropped, so a
   // mistyped node is visible instead of blank.
-  render-call:   func(custom-type: string, call-json: string) -> option<string>;
-  render-result: func(custom-type: string, result-json: string) -> option<string>;
+  //
+  // `opts-json` is the `(options, theme)` half of upstream's renderer signature (EXT-006). Every
+  // pi renderer takes it and pi re-invokes the renderer from the DRAW path, so both halves are
+  // LIVE inputs rather than ingest-time constants; cyrup's host re-invokes this export whenever
+  // they move (`cyrup_tui::App::refresh_extension_renders`). The bag is the UNION of pi's three,
+  // because cyrup routes all three surfaces through this one export pair:
+  //
+  //   {"expanded": bool,        // all three: `MessageRenderOptions.expanded` (`types.ts:1196`
+  //                             // @v0.84.4), `EntryRenderOptions.expanded` (`:1210`),
+  //                             // `ToolRenderResultOptions.expanded` (`:415`)
+  //    "outputPad": number,     // `MessageRenderOptions.outputPad` (`:1198`) — the horizontal
+  //                             // padding the outputPad setting configures
+  //    "isPartial": bool,       // `ToolRenderResultOptions.isPartial` (`:417`)
+  //    "theme": string|null}    // see below
+  //
+  // TAG-TO-TAG: at the ported baseline v0.83.0 the MESSAGE surface took `EntryRenderOptions`
+  // too — `MessageRenderOptions` and its `outputPad` are a post-baseline addition, carried here
+  // because ADR-0006 makes the LATEST tag the parity target.
+  //
+  // [CYRUP-DELTA] `theme` is the theme's NAME, not the `Theme` object pi passes: an object cannot
+  // cross the component boundary. A guest that needs the PALETTE reads it with the
+  // `ui.theme-get-json` import, which was added for exactly this and returns the ACTIVE theme
+  // (EXT-066). The name is what changes when the user switches themes, so it is the value a
+  // renderer's staleness is decided by. `null` = the caller has no display (an RPC host, a test).
+  // A NATIVE renderer is under no such constraint and gets the real thing
+  // (`cyrup_ext::RenderCtx.theme`, a `&dyn RenderTheme`).
+  render-call:   func(custom-type: string, call-json: string, opts-json: string) -> option<string>;
+  render-result: func(custom-type: string, result-json: string, opts-json: string) -> option<string>;
 
   // --- markdown transformation (EXT-019; pi `MarkdownTransformer`,
   // `extensions/types.ts:1147-1153` @v0.84.1 — a POST-BASELINE addition, absent at v0.83.0) ---

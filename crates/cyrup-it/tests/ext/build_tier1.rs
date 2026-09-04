@@ -108,7 +108,7 @@ async fn tier1_cargo_build_emits_a_component_that_caches_and_instantiates() {
     // instantiated the bytes the PRODUCTION Tier-1 loop returns until this assertion.
     // ---------------------------------------------------------------------------------------
     assert_eq!(
-        HOST_WORLD, "cyrup:ext@0.8",
+        HOST_WORLD, "cyrup:ext@0.9",
         "the world this artifact is being linked against"
     );
 

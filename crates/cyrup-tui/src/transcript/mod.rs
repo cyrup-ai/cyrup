@@ -69,7 +69,10 @@ mod view;
 mod tests;
 
 pub use content::{ParsedSkillBlock, content_text, parse_skill_block, thinking_text};
-pub use entry::{CompactionCostKind, Entry, Rendered, ToolRun};
+pub use entry::{
+    CompactionCostKind, Entry, RenderSource, RenderSurface, Rendered, RenderedText, ToolRun,
+};
+pub(crate) use entry::{RenderSlot, StaleRender};
 pub use images::{DEFAULT_IMAGE_WIDTH_CELLS, ResultImage};
 pub use message::HIDDEN_THINKING_LABEL;
 

@@ -46,7 +46,7 @@ pub(crate) fn tool_lines(
         // extension that registered only `renderCall` with no body at all, and what sent every
         // defined-but-unrendered tool through `formatToolExecution`.
         match &run.rendered_call {
-            Some(call) => render_extension_call(call, theme, &mut block),
+            Some(call) => render_extension_call(&call.text, theme, &mut block),
             None => match builtin {
                 Some(kind) => render_builtin_call(kind, run, expanded, theme, images, &mut block),
                 // `createCallFallback()` (`:137-139`, selected at `:281-283`).
@@ -54,7 +54,7 @@ pub(crate) fn tool_lines(
             },
         }
         match &run.rendered_result {
-            Some(result) => render_extension_result(result, run, expanded, theme, &mut block),
+            Some(result) => render_extension_result(&result.text, run, expanded, theme, &mut block),
             None => match builtin {
                 Some(kind) => render_builtin_result(kind, run, expanded, theme, images, &mut block),
                 // `createResultFallback()` (`:141-155`, selected at `:298-304`). Upstream reaches

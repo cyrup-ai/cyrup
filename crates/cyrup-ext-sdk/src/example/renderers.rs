@@ -3,7 +3,7 @@
 //! `demo_echo`) and two entry renderers (`demo_card`, which draws, and `demo_boom`, which
 //! deliberately faults).
 
-use crate::{ExtensionApi, MessageRenderer};
+use crate::{ExtensionApi, MessageRenderer, RenderOptions};
 use serde_json::Value;
 
 /// A trivial custom renderer for the demo's `custom_type` (Pi `renderCall`/`renderResult`).
@@ -14,10 +14,15 @@ use serde_json::Value;
 /// else, so a typo here is a JSON blob in the user's transcript.
 struct DemoRenderer;
 impl MessageRenderer for DemoRenderer {
-    fn render_call(&self, call: &Value, _ctx: &crate::Ctx) -> Option<Value> {
+    fn render_call(&self, call: &Value, _opts: &RenderOptions, _ctx: &crate::Ctx) -> Option<Value> {
         Some(crate::widget::text(format!("demo call: {call}")))
     }
-    fn render_result(&self, result: &Value, _ctx: &crate::Ctx) -> Option<Value> {
+    fn render_result(
+        &self,
+        result: &Value,
+        _opts: &RenderOptions,
+        _ctx: &crate::Ctx,
+    ) -> Option<Value> {
         Some(crate::widget::text(format!("demo result: {result}")))
     }
 }
@@ -31,16 +36,28 @@ impl MessageRenderer for DemoRenderer {
 /// single-`Text` case.
 struct DemoToolRenderer;
 impl MessageRenderer for DemoToolRenderer {
-    fn render_call(&self, call: &Value, _ctx: &crate::Ctx) -> Option<Value> {
+    fn render_call(&self, call: &Value, _opts: &RenderOptions, _ctx: &crate::Ctx) -> Option<Value> {
         Some(crate::widget::stack([
             crate::widget::text(format!("guest-rendered echo call: {call}")),
             crate::widget::text("(drawn by the demo extension)"),
         ]))
     }
-    fn render_result(&self, result: &Value, _ctx: &crate::Ctx) -> Option<Value> {
-        Some(crate::widget::text(format!(
-            "guest-rendered echo result: {result}"
-        )))
+    /// EXT-006 — the RESULT side branches on `opts.expanded`, which is what a pi renderer does
+    /// (`ToolRenderResultOptions.expanded`, `extensions/types.ts:415` @v0.84.4) and what the
+    /// collapsed/expanded forms of every built-in tool row are. It is also the fixture that proves
+    /// the host re-invokes the renderer on a toggle rather than serving frozen text: the two forms
+    /// differ, so a stale render is visible.
+    fn render_result(
+        &self,
+        result: &Value,
+        opts: &RenderOptions,
+        _ctx: &crate::Ctx,
+    ) -> Option<Value> {
+        Some(crate::widget::text(if opts.expanded {
+            format!("guest-rendered echo result (expanded): {result}")
+        } else {
+            "guest-rendered echo result (collapsed)".to_string()
+        }))
     }
 }
 
@@ -49,9 +66,14 @@ impl MessageRenderer for DemoToolRenderer {
 /// crosses the boundary on `render-call`, so the renderer only implements that half.
 struct DemoEntryRenderer;
 impl MessageRenderer for DemoEntryRenderer {
-    fn render_call(&self, entry: &Value, _ctx: &crate::Ctx) -> Option<Value> {
+    /// The theme half of EXT-006's fixture: pi hands every renderer the live `Theme` and cyrup
+    /// hands it the theme's NAME (an object cannot cross the component boundary — a guest that
+    /// needs the palette calls `ui.theme_get_json()`, EXT-066). Naming it in the output is what
+    /// lets a test see that a `/theme` switch re-invoked the renderer.
+    fn render_call(&self, entry: &Value, opts: &RenderOptions, _ctx: &crate::Ctx) -> Option<Value> {
+        let theme = opts.theme.as_deref().unwrap_or("none");
         Some(crate::widget::text(format!(
-            "guest-rendered entry card: {entry}"
+            "guest-rendered entry card [{theme}]: {entry}"
         )))
     }
 }
@@ -65,7 +87,12 @@ impl MessageRenderer for DemoEntryRenderer {
 /// identical either way.
 struct FaultingEntryRenderer;
 impl MessageRenderer for FaultingEntryRenderer {
-    fn render_call(&self, _entry: &Value, _ctx: &crate::Ctx) -> Option<Value> {
+    fn render_call(
+        &self,
+        _entry: &Value,
+        _opts: &RenderOptions,
+        _ctx: &crate::Ctx,
+    ) -> Option<Value> {
         unreachable!("demo_boom: this entry renderer always faults (X15 fixture)")
     }
 }

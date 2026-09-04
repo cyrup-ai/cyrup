@@ -67,8 +67,8 @@ mod tests;
 pub use api::{
     ArgCompleter, CommandExec, ContentBlock, ExtensionApi, MarkdownTransformContext,
     MarkdownTransformer, MessageRenderer, Outcome, RawOutcome, RegisteredCommand,
-    RegisteredRenderer, RegisteredShortcut, RegisteredTool, ShortcutExec, TerminalInputHandler,
-    TerminalInputResult, ToolExec, ToolOutput,
+    RegisteredRenderer, RegisteredShortcut, RegisteredTool, RenderOptions, ShortcutExec,
+    TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput,
 };
 pub use autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
@@ -101,8 +101,8 @@ pub mod prelude {
     pub use crate::api::{
         ArgCompleter, CommandExec, ContentBlock, ExtensionApi, MarkdownTransformContext,
         MarkdownTransformer, MessageRenderer, Outcome, RawOutcome, RegisteredCommand,
-        RegisteredRenderer, RegisteredShortcut, RegisteredTool, ShortcutExec, TerminalInputHandler,
-        TerminalInputResult, ToolExec, ToolOutput,
+        RegisteredRenderer, RegisteredShortcut, RegisteredTool, RenderOptions, ShortcutExec,
+        TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput,
     };
     pub use crate::autocomplete::{
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,

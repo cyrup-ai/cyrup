@@ -688,6 +688,50 @@ pub trait NativeExtension: Send + Sync {
         None
     }
 
+    /// [`Self::render_call`] with the display inputs upstream passes every renderer (EXT-006;
+    /// `ToolDefinition.renderCall(args, theme, context)`, `extensions/types.ts:491` @v0.84.4, and
+    /// `MessageRenderer = (message, options, theme)`, `:1213-1217`).
+    ///
+    /// Defaults to [`Self::render_call`], which is the whole point: a renderer whose output does
+    /// not vary with the expand toggle or the theme implements the two-argument form and is done.
+    /// Override THIS one to branch on `opts` — the host re-invokes it whenever the options move
+    /// (`cyrup_tui::App::refresh_extension_renders`), so the branch is live, not frozen.
+    ///
+    /// The richer alternative is [`Self::render_live`], which is re-rendered per FRAME with the
+    /// terminal width as well; this hook exists for a renderer that wants the options without
+    /// owning a component.
+    fn render_call_under(
+        &self,
+        key: &str,
+        call: &serde_json::Value,
+        _opts: &crate::RenderOptions,
+    ) -> Option<serde_json::Value> {
+        self.render_call(key, call)
+    }
+
+    /// The result-side companion of [`Self::render_call_under`] (Pi `renderResult(result, options,
+    /// theme, context)`, `extensions/types.ts:493-498` @v0.84.4 — the ONE upstream renderer whose
+    /// options bag also carries `isPartial`).
+    fn render_result_under(
+        &self,
+        key: &str,
+        result: &serde_json::Value,
+        _opts: &crate::RenderOptions,
+    ) -> Option<serde_json::Value> {
+        self.render_result(key, result)
+    }
+
+    /// The entry-side companion of [`Self::render_call_under`] (Pi `EntryRenderer = (entry,
+    /// options: EntryRenderOptions, theme)`, `extensions/types.ts:1219-1223` @v0.84.4).
+    fn render_entry_under(
+        &self,
+        custom_type: &str,
+        entry: &serde_json::Value,
+        _opts: &crate::RenderOptions,
+    ) -> Option<serde_json::Value> {
+        self.render_entry(custom_type, entry)
+    }
+
     /// Transform transcript markdown before the host renders it (EXT-019; pi
     /// `MarkdownTransformer = (markdown, context) => string`, `extensions/types.ts:1153` @v0.84.1
     /// — a POST-BASELINE addition, absent at v0.83.0). Called only when [`Self::init`] declared one

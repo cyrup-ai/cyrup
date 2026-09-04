@@ -56,7 +56,11 @@ impl<B: Backend> App<B> {
         ev: AgentSessionEvent,
         ext_host: &Arc<cyrup_ext::ExtensionHost>,
     ) {
-        let rendered = extension_render(ext_host, &ev).await;
+        // EXT-006 — the display inputs the renderer runs under, read from the LIVE view. They are
+        // recorded on the result (`run_renderer`), so a later toggle or theme switch can tell that
+        // this text is stale and ask for it again.
+        let opts = self.render_options();
+        let rendered = extension_render(ext_host, &ev, &opts).await;
         // X15 — the custom-ENTRY renderer is a SECOND, disjoint lookup (Pi keeps
         // `messageRenderers` and `entryRenderers` as separate maps, types.ts:1703-1704, and
         // `addCustomEntryToChat` resolves the entry one at `interactive-mode.ts:3432`). It rides in
@@ -64,7 +68,7 @@ impl<B: Backend> App<B> {
         let entry = match &ev {
             AgentSessionEvent::EntryAppended { entry } => {
                 let custom_type = custom_entry_type(entry);
-                extension_render_entry(ext_host, &custom_type, entry).await
+                extension_render_entry(ext_host, &custom_type, entry, &opts).await
             }
             _ => crate::transcript::Rendered::None,
         };
@@ -75,6 +79,74 @@ impl<B: Backend> App<B> {
         self.ingest_event_rendered_owned(ev, rendered, entry);
         self.apply_markdown_transformers(ext_host, first_pending)
             .await;
+    }
+
+    /// The display inputs a renderer runs under RIGHT NOW (EXT-006) — the `(options, theme)` half
+    /// of every upstream renderer signature, read live off the view.
+    ///
+    /// * `expanded` — `this.toolOutputExpanded`, which `setToolsExpanded` re-broadcasts to every
+    ///   child on every toggle (`modes/interactive/interactive-mode.ts:4032-4048` @v0.84.4) and
+    ///   `:3437` seeds into a freshly added `CustomEntryComponent`;
+    /// * `output_pad` — `MessageRenderOptions.outputPad` (`extensions/types.ts:1198` @v0.84.4), the
+    ///   `outputPad` setting, which `/settings` can move mid-session;
+    /// * `theme` — the ACTIVE theme's name. See [`cyrup_ext::RenderOptions`] for why a name and not
+    ///   the palette.
+    ///
+    /// `is_partial` is left `false` here because it is a property of a tool ROW, not of the frame;
+    /// [`crate::transcript::TranscriptView::stale_extension_renders`] overrides it per row.
+    pub(crate) fn render_options(&self) -> cyrup_ext::RenderOptions {
+        cyrup_ext::RenderOptions::new(
+            self.state.transcript.tool_expanded(),
+            u32::try_from(self.state.transcript.output_pad()).unwrap_or(u32::MAX),
+            Some(self.state.theme.name.clone()),
+        )
+    }
+
+    /// Re-invoke every extension renderer whose output was produced under display inputs that no
+    /// longer hold (EXT-006) — the toggle/theme half of the item.
+    ///
+    /// # Why this exists at all
+    /// Upstream re-invokes a renderer from the DRAW path: `MessageRenderer = (message, options,
+    /// theme) => Component | undefined` (`core/extensions/types.ts:1213-1217` @v0.84.4) is called
+    /// per paint, so `Ctrl+O` and a `/theme` switch reach a component that was pushed under the old
+    /// values. cyrup's draw path is sync (`App::draw` cannot `await`) and a guest renderer is an
+    /// async wasm call, so the render is done once off the event path and its text written into the
+    /// transcript. Without this pass that text was BAKED: every built-in row around it responded to
+    /// the toggle and the extension's row did not.
+    ///
+    /// Same seam, and the same reason, as [`Self::apply_markdown_transformers`]: the decision is a
+    /// pure comparison the view makes ([`crate::transcript::TranscriptView::stale_extension_renders`]);
+    /// this is only the shell that awaits the guest and writes the answer back.
+    ///
+    /// # Scope
+    /// Rows that are still addressable — the active tool runs and the committed-but-unflushed
+    /// entries. A row already flushed to native scrollback (R-ARCH-TUI-003) cannot be repainted by
+    /// anyone, which is the same boundary `set_pending_markdown` works within.
+    pub(crate) async fn refresh_extension_renders(
+        &mut self,
+        ext_host: &Arc<cyrup_ext::ExtensionHost>,
+    ) {
+        let live = self.render_options();
+        // Snapshotted rather than borrowed: each render is awaited, and a borrow into the
+        // transcript cannot straddle that await while `self` is also the receiver.
+        let stale = self.state.transcript.stale_extension_renders(&live);
+        for item in stale {
+            let rendered = super::extension_render_impl::run_renderer(
+                ext_host,
+                item.next.surface,
+                item.next.key.clone(),
+                item.next.payload.clone(),
+                &item.next.under,
+            )
+            .await;
+            // Only a fresh TEXT replaces the old one. A renderer that now answers `None` (or
+            // faults, or wedges) leaves the previous text in place rather than blanking a row that
+            // was drawing a moment ago — upstream's components keep their last child until a
+            // rebuild produces a new one (`custom-message.ts:66-81`).
+            if let crate::transcript::Rendered::Text(text) = rendered {
+                self.state.transcript.set_extension_render(item.slot, text);
+            }
+        }
     }
 
     /// Run the extension-registered markdown transformers over everything the fold just put on
@@ -221,6 +293,10 @@ impl<B: Backend> App<B> {
                 .insert(tool_name.clone(), definition.render_kind);
         }
         self.ingest_event_with_extensions_owned(ev, &ext_host).await;
+        // EXT-006 — the events arm's half of the same seam `dispatch_run_action` ends with: an
+        // extension handler can move the display inputs from an EVENT (`ui.set-tools-expanded`,
+        // `ui.theme-set`), which never passes through the input arm.
+        self.refresh_extension_renders(&ext_host).await;
         // TUI-031 — `flushCompactionQueue` (`interactive-mode.ts:4036-4110` @v0.83.0), the last
         // statement of pi's `compaction_end` arm. Runs here because it needs the session; the sync
         // `ingest_event` half only raises the flag.

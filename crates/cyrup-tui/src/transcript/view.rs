@@ -312,6 +312,132 @@ impl TranscriptView {
             })
     }
 
+    /// Every extension-rendered row whose text was produced under display inputs that no longer
+    /// hold (EXT-006).
+    ///
+    /// # Why staleness is DERIVED here rather than flagged by whoever toggles
+    /// Upstream re-invokes a renderer from the draw path, so `options.expanded` and `theme` are
+    /// live inputs (`MessageRenderer = (message, options, theme) => Component`,
+    /// `pi/packages/coding-agent/src/core/extensions/types.ts:1213-1217` @v0.84.4). cyrup's draw
+    /// path is sync and a guest renderer is an async wasm call, so the text is a SNAPSHOT — and
+    /// every snapshot carries the inputs it was taken under ([`RenderSource::under`]). Comparing
+    /// those against `live` is the whole staleness test: nothing has to remember to invalidate, a
+    /// new renderer surface joins by being rendered, and a session with no extension renderer pays
+    /// one walk of already-resident rows.
+    ///
+    /// `live.is_partial` is overridden per tool RESULT from the run's own `done` flag, because
+    /// upstream's `ToolRenderResultOptions.isPartial` (`types.ts:417`) is a property of the row,
+    /// not of the frame.
+    pub(crate) fn stale_extension_renders(
+        &self,
+        live: &cyrup_ext::RenderOptions,
+    ) -> Vec<StaleRender> {
+        let mut out = Vec::new();
+        let consider = |slot: RenderSlot,
+                        rendered: Option<&RenderedText>,
+                        want: &cyrup_ext::RenderOptions,
+                        out: &mut Vec<StaleRender>| {
+            let Some(source) = rendered.and_then(RenderedText::source) else {
+                return;
+            };
+            if &source.under == want {
+                return;
+            }
+            out.push(StaleRender {
+                slot,
+                next: RenderSource {
+                    under: want.clone(),
+                    ..source.clone()
+                },
+            });
+        };
+        for (i, entry) in self.pending.iter().enumerate() {
+            match entry {
+                Entry::Custom { rendered, .. } => {
+                    let text = match rendered {
+                        Rendered::Text(t) => Some(t),
+                        _ => None,
+                    };
+                    consider(RenderSlot::PendingCustom(i), text, live, &mut out);
+                }
+                Entry::Tool(run) => {
+                    consider(
+                        RenderSlot::PendingToolCall(i),
+                        run.rendered_call.as_ref(),
+                        live,
+                        &mut out,
+                    );
+                    let want = live.clone().partial(!run.done);
+                    consider(
+                        RenderSlot::PendingToolResult(i),
+                        run.rendered_result.as_ref(),
+                        &want,
+                        &mut out,
+                    );
+                }
+                _ => {}
+            }
+        }
+        for (i, run) in self.active_tools.iter().enumerate() {
+            consider(
+                RenderSlot::ActiveToolCall(i),
+                run.rendered_call.as_ref(),
+                live,
+                &mut out,
+            );
+            let want = live.clone().partial(!run.done);
+            consider(
+                RenderSlot::ActiveToolResult(i),
+                run.rendered_result.as_ref(),
+                &want,
+                &mut out,
+            );
+        }
+        out
+    }
+
+    /// Write a freshly re-rendered row back into the slot [`Self::stale_extension_renders`] named.
+    ///
+    /// A slot that has since been filled by another variant, or drained to scrollback, is a silent
+    /// no-op — the walk and the write straddle an `await` on the guest, so the row can legitimately
+    /// have moved, and the alternative is an index panic the workspace lints forbid.
+    pub(crate) fn set_extension_render(&mut self, slot: RenderSlot, text: RenderedText) {
+        match slot {
+            RenderSlot::PendingCustom(i) => {
+                if let Some(Entry::Custom { rendered, .. }) = self.pending.get_mut(i) {
+                    *rendered = Rendered::Text(text);
+                } else {
+                    return;
+                }
+            }
+            RenderSlot::PendingToolCall(i) => {
+                if let Some(Entry::Tool(run)) = self.pending.get_mut(i) {
+                    run.rendered_call = Some(text);
+                } else {
+                    return;
+                }
+            }
+            RenderSlot::PendingToolResult(i) => {
+                if let Some(Entry::Tool(run)) = self.pending.get_mut(i) {
+                    run.rendered_result = Some(text);
+                } else {
+                    return;
+                }
+            }
+            RenderSlot::ActiveToolCall(i) => match self.active_tools.get_mut(i) {
+                Some(run) => run.rendered_call = Some(text),
+                None => return,
+            },
+            RenderSlot::ActiveToolResult(i) => match self.active_tools.get_mut(i) {
+                Some(run) => run.rendered_result = Some(text),
+                None => return,
+            },
+        }
+        // `render_generation` contract (see the field's docs in `transcript/mod.rs`): every `&mut
+        // self` mutator that changes what `lines()` emits bumps it.
+        self.bump_render_generation();
+    }
+
     /// Replace the markdown body of the pending entry at `index` with a transformer's output.
     ///
     /// Rewritten IN PLACE rather than kept beside the source, because these three bodies are

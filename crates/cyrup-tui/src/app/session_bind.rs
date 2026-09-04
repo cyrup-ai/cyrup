@@ -193,6 +193,11 @@ impl<B: Backend> App<B> {
         use cyrup_session_svc::agent_message::AgentMessage;
         use serde_json::Value;
         let mut rendered = ReplayRenders::default();
+        // EXT-006 — the display inputs every renderer in this walk is invoked under, read ONCE
+        // here from the live view rather than defaulted, so a replay lands in the same expansion
+        // and theme the live turn would have. They are recorded on each render, so the first
+        // toggle after the replay re-invokes exactly as it does for a live row.
+        let opts = self.render_options();
         // MESSAGE-relative, matching the walk below: `rendered.messages` is keyed by the index a
         // message has among messages, not among items, so an interleaved notice cannot shift a
         // custom message's renderer onto its neighbour.
@@ -207,7 +212,8 @@ impl<B: Backend> App<B> {
                     // Carried WHOLE. `has_content()` is the "did a renderer claim this" question
                     // the old `if let Some(text)` was asking, and it stays true for a LIVE
                     // component, which `Rendered::into_text()` would have dropped.
-                    let r = extension_render_message(ext_host, &c.custom_type, &payload).await;
+                    let r =
+                        extension_render_message(ext_host, &c.custom_type, &payload, &opts).await;
                     if r.has_content() {
                         rendered.messages.insert(i, r);
                     }
@@ -231,9 +237,10 @@ impl<B: Backend> App<B> {
                         let args = Value::Object((*call.arguments).clone());
                         // A tool ROW is a string surface (see the live fold): `into_text` flattens
                         // exactly as `events_fold.rs` does, and a fault already collapsed to `None`.
-                        if let Some(text) = extension_render_tool_call(ext_host, &call.name, &args)
-                            .await
-                            .into_text()
+                        if let Some(text) =
+                            extension_render_tool_call(ext_host, &call.name, &args, &opts)
+                                .await
+                                .into_text()
                         {
                             rendered
                                 .tool_calls
@@ -253,9 +260,10 @@ impl<B: Backend> App<B> {
                     // (`tool-execution.ts:307-308`: `{ content: this.result.content, details:
                     // this.result.details }`).
                     let result = tool_result_payload(content, details.as_ref());
-                    if let Some(text) = extension_render_tool_result(ext_host, tool_name, &result)
-                        .await
-                        .into_text()
+                    if let Some(text) =
+                        extension_render_tool_result(ext_host, tool_name, &result, &opts)
+                            .await
+                            .into_text()
                     {
                         rendered
                             .tool_results
@@ -544,9 +552,9 @@ struct ReplayRenders {
     /// MESSAGE index → the custom-message renderer's output (X11 / EXT-006).
     messages: std::collections::HashMap<usize, crate::transcript::Rendered>,
     /// Tool-call id → the extension's `renderCall` text (EXT-041).
-    tool_calls: std::collections::HashMap<String, String>,
+    tool_calls: std::collections::HashMap<String, crate::transcript::RenderedText>,
     /// Tool-call id → the extension's `renderResult` text (EXT-041).
-    tool_results: std::collections::HashMap<String, String>,
+    tool_results: std::collections::HashMap<String, crate::transcript::RenderedText>,
 }
 
 /// The `{content, details}` value a persisted `toolResult` message presents to a `renderResult`

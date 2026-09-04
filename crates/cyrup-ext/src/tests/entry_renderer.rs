@@ -76,6 +76,12 @@ impl NativeExtension for EntryExt {
     }
 }
 
+/// The display inputs a renderer is invoked under (EXT-006). These tests are about the OUTCOME
+/// three-state, not about the options, so they all use the defaults.
+fn opts() -> crate::RenderOptions {
+    crate::RenderOptions::default()
+}
+
 async fn host() -> ExtensionHost {
     let host = ExtensionHost::new(cfg());
     host.load_native(Arc::new(EntryExt))
@@ -119,7 +125,7 @@ async fn the_entry_renderer_table_is_disjoint_from_the_message_renderer_table() 
 #[tokio::test]
 async fn a_rendering_entry_renderer_reports_its_output() {
     let host = host().await;
-    let out = host.render_entry("card", &json!({ "n": 1 })).await;
+    let out = host.render_entry("card", &json!({ "n": 1 }), &opts()).await;
     match out {
         RenderOutcome::Rendered(v) => {
             assert!(
@@ -137,7 +143,7 @@ async fn a_rendering_entry_renderer_reports_its_output() {
 #[tokio::test]
 async fn a_panicking_entry_renderer_reports_failed_and_keeps_the_message() {
     let host = host().await;
-    let out = host.render_entry("boom", &json!({})).await;
+    let out = host.render_entry("boom", &json!({}), &opts()).await;
     assert_eq!(
         out.failure(),
         Some("entry renderer exploded"),
@@ -155,7 +161,7 @@ async fn a_panicking_entry_renderer_reports_failed_and_keeps_the_message() {
 async fn no_renderer_and_a_renderer_that_draws_nothing_are_both_none_never_failed() {
     let host = host().await;
 
-    let unclaimed = host.render_entry("nobody", &json!({})).await;
+    let unclaimed = host.render_entry("nobody", &json!({}), &opts()).await;
     assert_eq!(
         unclaimed,
         RenderOutcome::None,
@@ -163,7 +169,7 @@ async fn no_renderer_and_a_renderer_that_draws_nothing_are_both_none_never_faile
     );
     assert_eq!(unclaimed.failure(), None, "absence is not a fault");
 
-    let opted_out = host.render_entry("quiet", &json!({})).await;
+    let opted_out = host.render_entry("quiet", &json!({}), &opts()).await;
     assert_eq!(
         opted_out,
         RenderOutcome::None,
@@ -181,12 +187,13 @@ async fn the_message_surface_still_collapses_a_fault_but_the_outcome_form_expose
     let host = host().await;
 
     assert_eq!(
-        host.render_message_call("msg_boom", &json!({})).await,
+        host.render_message_call("msg_boom", &json!({}), &opts())
+            .await,
         None,
         "`custom-message.ts:82-84` falls through to the default box"
     );
     assert_eq!(
-        host.render_message_call_outcome("msg_boom", &json!({}))
+        host.render_message_call_outcome("msg_boom", &json!({}), &opts())
             .await
             .failure(),
         Some("message renderer exploded"),
@@ -194,7 +201,7 @@ async fn the_message_surface_still_collapses_a_fault_but_the_outcome_form_expose
     );
     // …and "no renderer at all" is still a different value from "the renderer threw".
     assert_eq!(
-        host.render_message_call_outcome("unclaimed", &json!({}))
+        host.render_message_call_outcome("unclaimed", &json!({}), &opts())
             .await,
         RenderOutcome::None
     );
@@ -207,14 +214,15 @@ async fn a_faulting_renderer_is_contained_and_the_host_keeps_rendering() {
     let host = host().await;
     for _ in 0..3 {
         assert!(
-            host.render_entry("boom", &json!({}))
+            host.render_entry("boom", &json!({}), &opts())
                 .await
                 .failure()
                 .is_some()
         );
     }
     assert!(matches!(
-        host.render_entry("card", &json!({ "after": true })).await,
+        host.render_entry("card", &json!({ "after": true }), &opts())
+            .await,
         RenderOutcome::Rendered(_)
     ));
 }

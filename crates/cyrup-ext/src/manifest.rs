@@ -235,7 +235,14 @@ impl Capabilities {
 ///   host's FLOOR, not its ceiling. So bumping here would refuse every already-built 0.8 guest and
 ///   prevent nothing. The ABI fingerprint (`build/abi.rs`), not the version, is what stops a STALE
 ///   cached artifact being served across this edit.
-pub const HOST_WORLD: &str = "cyrup:ext@0.8";
+/// - 0.8 -> 0.9: EXPORT RE-SIGNING — `events.render-call` and `events.render-result` each gained a
+///   third parameter, `opts-json`, carrying the `(options, theme)` half of upstream's renderer
+///   signature (EXT-006; `MessageRenderer` `extensions/types.ts:1213-1217` @v0.84.4,
+///   `EntryRenderer` `:1219-1223`, `ToolDefinition.renderCall`/`renderResult` `:491-498`). This is
+///   the direction the gate DOES defend: a 0.8 guest exports the two-parameter shape, so without
+///   the bump it would pass [`ExtensionManifest::check_world`] and then die inside wasmtime on an
+///   opaque link error — the `f777e44` failure mode, verbatim. Nothing else moved in this batch.
+pub const HOST_WORLD: &str = "cyrup:ext@0.9";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

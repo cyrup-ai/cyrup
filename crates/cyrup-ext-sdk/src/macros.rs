@@ -87,14 +87,16 @@ macro_rules! export_extension {
                 fn render_call(
                     custom_type: ::std::string::String,
                     call_json: ::std::string::String,
+                    opts_json: ::std::string::String,
                 ) -> ::core::option::Option<::std::string::String> {
-                    $crate::guest::render_call(custom_type, call_json)
+                    $crate::guest::render_call(custom_type, call_json, opts_json)
                 }
                 fn render_result(
                     custom_type: ::std::string::String,
                     result_json: ::std::string::String,
+                    opts_json: ::std::string::String,
                 ) -> ::core::option::Option<::std::string::String> {
-                    $crate::guest::render_result(custom_type, result_json)
+                    $crate::guest::render_result(custom_type, result_json, opts_json)
                 }
                 fn transform_markdown(
                     markdown: ::std::string::String,

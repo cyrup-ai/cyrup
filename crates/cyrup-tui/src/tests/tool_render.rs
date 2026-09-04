@@ -415,7 +415,7 @@ fn a_self_rendered_extension_row_has_no_shell() {
         "ext_tool",
         Some("c1".into()),
         json!({}),
-        Some("EXT-OWN-FRAME".into()),
+        Some(crate::transcript::RenderedText::frozen("EXT-OWN-FRAME")),
         Some(ToolRenderKind::SelfRendered),
     );
     let (col, bgs) = row_bgs(&mut view, 60, 6, "EXT-OWN-FRAME");
@@ -435,7 +435,7 @@ fn a_default_extension_row_keeps_the_shell() {
         "ext_tool",
         Some("c1".into()),
         json!({}),
-        Some("EXT-OWN-FRAME".into()),
+        Some(crate::transcript::RenderedText::frozen("EXT-OWN-FRAME")),
         Some(ToolRenderKind::Default),
     );
     let (col, bgs) = row_bgs(&mut view, 60, 6, "EXT-OWN-FRAME");

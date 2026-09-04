@@ -305,23 +305,38 @@ pub fn completions(name: String, prefix: String) -> Vec<String> {
 }
 
 /// `render-call` export body (Pi `renderCall`).
-pub fn render_call(custom_type: String, call_json: String) -> Option<String> {
+///
+/// EXT-006 — `opts_json` is upstream's `(options, theme)` pair; see
+/// [`crate::api::RenderOptions`]. Malformed JSON parses to the defaults rather than skipping the
+/// render, for the same reason the payload does: a renderer that cannot be told the options must
+/// still draw.
+pub fn render_call(custom_type: String, call_json: String, opts_json: String) -> Option<String> {
     let call = serde_json::from_str(&call_json).unwrap_or(Value::Null);
+    let opts = crate::api::RenderOptions::from_json(
+        &serde_json::from_str(&opts_json).unwrap_or(Value::Null),
+    );
     API.with(|c| {
         c.borrow()
             .as_ref()
-            .and_then(|api| api.render_call(&custom_type, &call))
+            .and_then(|api| api.render_call(&custom_type, &call, &opts))
             .map(|v| v.to_string())
     })
 }
 
-/// `render-result` export body (Pi `renderResult`).
-pub fn render_result(custom_type: String, result_json: String) -> Option<String> {
+/// `render-result` export body (Pi `renderResult`). See [`render_call`] for `opts_json`.
+pub fn render_result(
+    custom_type: String,
+    result_json: String,
+    opts_json: String,
+) -> Option<String> {
     let result = serde_json::from_str(&result_json).unwrap_or(Value::Null);
+    let opts = crate::api::RenderOptions::from_json(
+        &serde_json::from_str(&opts_json).unwrap_or(Value::Null),
+    );
     API.with(|c| {
         c.borrow()
             .as_ref()
-            .and_then(|api| api.render_result(&custom_type, &result))
+            .and_then(|api| api.render_result(&custom_type, &result, &opts))
             .map(|v| v.to_string())
     })
 }

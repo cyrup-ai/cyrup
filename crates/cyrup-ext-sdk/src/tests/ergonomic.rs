@@ -154,24 +154,107 @@ fn static_completions_fall_back_when_no_dynamic_completer() {
 fn message_renderer_renders_call_and_result() {
     struct R;
     impl MessageRenderer for R {
-        fn render_call(&self, call: &serde_json::Value, _c: &Ctx) -> Option<serde_json::Value> {
+        fn render_call(
+            &self,
+            call: &serde_json::Value,
+            _o: &crate::RenderOptions,
+            _c: &Ctx,
+        ) -> Option<serde_json::Value> {
             Some(json!({ "kind": "call", "echo": call.clone() }))
         }
-        fn render_result(&self, _r: &serde_json::Value, _c: &Ctx) -> Option<serde_json::Value> {
+        fn render_result(
+            &self,
+            _r: &serde_json::Value,
+            _o: &crate::RenderOptions,
+            _c: &Ctx,
+        ) -> Option<serde_json::Value> {
             Some(json!({ "kind": "result" }))
         }
     }
     let mut api = ExtensionApi::new();
     api.register_message_renderer("demo", R);
-    let call = api.render_call("demo", &json!({ "a": 1 })).unwrap();
+    let opts = crate::RenderOptions::default();
+    let call = api.render_call("demo", &json!({ "a": 1 }), &opts).unwrap();
     assert_eq!(call["kind"], json!("call"));
     assert_eq!(call["echo"]["a"], json!(1));
     assert_eq!(
-        api.render_result("demo", &json!({})).unwrap()["kind"],
+        api.render_result("demo", &json!({}), &opts).unwrap()["kind"],
         json!("result")
     );
     // an unregistered type returns None (default renderer).
-    assert!(api.render_call("other", &json!({})).is_none());
+    assert!(api.render_call("other", &json!({}), &opts).is_none());
+}
+
+/// EXT-006 — the `(options, theme)` half of upstream's renderer signature reaches the renderer, and
+/// a renderer that branches on it produces different output for different options. Upstream:
+/// `MessageRenderer = (message, options, theme) => Component | undefined`
+/// (`pi/packages/coding-agent/src/core/extensions/types.ts:1213-1217` @v0.84.4).
+#[test]
+fn a_renderer_sees_the_display_options_and_the_theme_name() {
+    struct R;
+    impl MessageRenderer for R {
+        fn render_call(
+            &self,
+            _call: &serde_json::Value,
+            opts: &crate::RenderOptions,
+            _c: &Ctx,
+        ) -> Option<serde_json::Value> {
+            Some(json!({
+                "expanded": opts.expanded,
+                "outputPad": opts.output_pad,
+                "isPartial": opts.is_partial,
+                "theme": opts.theme.clone(),
+            }))
+        }
+    }
+    let mut api = ExtensionApi::new();
+    api.register_message_renderer("demo", R);
+
+    let collapsed = crate::RenderOptions::default();
+    let out = api.render_call("demo", &json!({}), &collapsed).unwrap();
+    assert_eq!(out["expanded"], json!(false));
+    assert_eq!(out["theme"], json!(null));
+
+    let expanded = crate::RenderOptions {
+        expanded: true,
+        output_pad: 2,
+        is_partial: true,
+        theme: Some("dark".to_string()),
+    };
+    let out = api.render_call("demo", &json!({}), &expanded).unwrap();
+    assert_eq!(out["expanded"], json!(true));
+    assert_eq!(out["outputPad"], json!(2));
+    assert_eq!(out["isPartial"], json!(true));
+    assert_eq!(out["theme"], json!("dark"));
+}
+
+/// The host's `opts-json` parses into the guest mirror, and an absent or malformed bag takes the
+/// defaults rather than skipping the render — see [`crate::RenderOptions::from_json`].
+#[test]
+fn the_hosts_opts_json_parses_into_the_guest_mirror() {
+    let parsed = crate::RenderOptions::from_json(&json!({
+        "expanded": true,
+        "outputPad": 3,
+        "isPartial": true,
+        "theme": "solarized",
+    }));
+    assert_eq!(
+        parsed,
+        crate::RenderOptions {
+            expanded: true,
+            output_pad: 3,
+            is_partial: true,
+            theme: Some("solarized".to_string()),
+        }
+    );
+    assert_eq!(
+        crate::RenderOptions::from_json(&json!({})),
+        crate::RenderOptions::default()
+    );
+    assert_eq!(
+        crate::RenderOptions::from_json(&serde_json::Value::Null),
+        crate::RenderOptions::default()
+    );
 }
 
 #[test]

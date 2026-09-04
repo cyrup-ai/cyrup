@@ -144,6 +144,7 @@ pub mod manifest;
 pub mod native;
 pub mod provider;
 pub mod registry;
+pub mod render;
 pub mod subscriber;
 pub mod wrapper;
 
@@ -204,6 +205,7 @@ pub use registry::{
     CommandDescriptor, ExecModeWire, ExtensionConflict, ExtensionProvenance, ExtensionRegistry,
     ResolvedCommand, ToolDescriptor,
 };
+pub use render::RenderOptions;
 pub use subscriber::ExtSubscriber;
 pub use wrapper::{ActiveToolNames, RegisteredTool, wrap_registered_tool};
 

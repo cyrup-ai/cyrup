@@ -1756,23 +1756,30 @@ impl LiveExtension {
         }
     }
 
-    /// Render a tool call via a guest-registered message renderer (Pi `renderCall`, types.ts:489).
-    /// Returns the serialized widget tree, or `None` to fall back to the default renderer.
+    /// Render a tool call via a guest-registered message renderer (Pi `renderCall`,
+    /// `extensions/types.ts:491` @v0.84.4). Returns the serialized widget tree, or `None` to fall
+    /// back to the default renderer.
+    ///
+    /// `opts` is the `(options, theme)` half of every upstream renderer signature and is a LIVE
+    /// input, not an ingest-time constant (EXT-006) — see [`crate::RenderOptions`].
     pub async fn render_call(
         &self,
         custom_type: &str,
         call: &Value,
+        opts: &crate::RenderOptions,
     ) -> Result<Option<Value>, ExtError> {
-        self.render(custom_type, call, true).await
+        self.render(custom_type, call, opts, true).await
     }
 
-    /// Render a tool result via a guest-registered renderer (Pi `renderResult`, types.ts:492).
+    /// Render a tool result via a guest-registered renderer (Pi `renderResult`,
+    /// `extensions/types.ts:493-498` @v0.84.4). See [`Self::render_call`].
     pub async fn render_result(
         &self,
         custom_type: &str,
         result: &Value,
+        opts: &crate::RenderOptions,
     ) -> Result<Option<Value>, ExtError> {
-        self.render(custom_type, result, false).await
+        self.render(custom_type, result, opts, false).await
     }
 
     /// Transform transcript markdown through this guest's registered transformer (EXT-019; pi
@@ -2003,6 +2010,7 @@ impl LiveExtension {
         &self,
         custom_type: &str,
         payload: &Value,
+        opts: &crate::RenderOptions,
         is_call: bool,
     ) -> Result<Option<Value>, ExtError> {
         let mut guard = self.inner.lock().await;
@@ -2011,12 +2019,13 @@ impl LiveExtension {
         self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Event);
         let payload_s = payload.to_string();
+        let opts_s = opts.to_json();
         let api = inner.instance.cyrup_ext_events();
         let res = if is_call {
-            api.call_render_call(&mut inner.store, custom_type, &payload_s)
+            api.call_render_call(&mut inner.store, custom_type, &payload_s, &opts_s)
                 .await
         } else {
-            api.call_render_result(&mut inner.store, custom_type, &payload_s)
+            api.call_render_result(&mut inner.store, custom_type, &payload_s, &opts_s)
                 .await
         };
         match res {

@@ -126,6 +126,7 @@ async fn a_registered_message_renderer_draws_the_custom_message() {
             kind: "demo".into(),
             payload: json!("plain fallback body"),
             details: None,
+            display: true,
             timestamp: None,
         },
     };
@@ -155,6 +156,7 @@ async fn an_unclaimed_custom_type_keeps_the_default_framing() {
             kind: "nobody-renders-this".into(),
             payload: json!("plain fallback body"),
             details: None,
+            display: true,
             timestamp: None,
         },
     };
@@ -343,6 +345,7 @@ async fn a_widget_tree_draws_as_rows_not_as_json() {
             kind: "demo".into(),
             payload: json!("plain fallback body"),
             details: None,
+            display: true,
             timestamp: None,
         },
     };
@@ -423,6 +426,7 @@ async fn an_unknown_widget_tag_is_still_visible() {
             kind: "demo".into(),
             payload: json!("plain fallback body"),
             details: None,
+            display: true,
             timestamp: None,
         },
     };
@@ -960,6 +964,7 @@ async fn a_faulting_message_renderer_still_falls_through_to_the_default_box() {
             kind: "demo".into(),
             payload: json!("plain fallback body"),
             details: None,
+            display: true,
             timestamp: None,
         },
     };
@@ -975,5 +980,244 @@ async fn a_faulting_message_renderer_still_falls_through_to_the_default_box() {
         !sb.contains("renderer failed"),
         "the failure box belongs to the ENTRY surface ONLY; drawing it here would be a \
          divergence from `custom-message.ts:82-84`:\n{sb}"
+    );
+}
+
+// =============================================================================================
+// EXT-006 — DISPLAY OPTIONS AND THEME, and the RE-INVOCATION when either moves.
+//
+// Upstream every renderer signature is `(payload, options, theme)` and pi calls it from the DRAW
+// path, so `options.expanded` and the active `Theme` are LIVE inputs:
+//
+//   `MessageRenderer = (message: CustomMessage<T>, options: MessageRenderOptions, theme: Theme)
+//        => Component | undefined`   — `core/extensions/types.ts:1213-1217` @v0.84.4
+//   `EntryRenderer   = (entry, options: EntryRenderOptions, theme)`  — `:1219-1223`
+//   `renderResult(result, options: ToolRenderResultOptions, theme, context)` — `:493-498`
+//
+// and `setToolsExpanded` re-broadcasts the flag to every child on every toggle
+// (`modes/interactive/interactive-mode.ts:4032-4048`).
+//
+// cyrup passed NEITHER, and computed the render exactly once at ingest, so an extension's row was
+// frozen in the state it was first drawn in while every built-in row around it responded to
+// `Ctrl+O` and to a theme switch.
+// =============================================================================================
+
+/// A renderer whose output DEPENDS on the display inputs — the only kind that can tell a frozen
+/// render from a live one.
+struct OptionsAwareExt;
+
+#[async_trait::async_trait]
+impl NativeExtension for OptionsAwareExt {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("options-aware")
+    }
+
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.register_tool_renderer("bash");
+        Ok(())
+    }
+
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+
+    fn render_call_under(
+        &self,
+        key: &str,
+        _call: &Value,
+        opts: &cyrup_ext::RenderOptions,
+    ) -> Option<Value> {
+        Some(Value::String(format!(
+            "EXTCALL[{key}] expanded={} theme={} pad={}",
+            opts.expanded,
+            opts.theme.as_deref().unwrap_or("none"),
+            opts.output_pad,
+        )))
+    }
+
+    fn render_result_under(
+        &self,
+        key: &str,
+        _result: &Value,
+        opts: &cyrup_ext::RenderOptions,
+    ) -> Option<Value> {
+        Some(Value::String(format!(
+            "EXTRESULT[{key}] expanded={}",
+            opts.expanded
+        )))
+    }
+}
+
+/// Start a `bash` run so there is a LIVE, still-addressable extension-rendered row to toggle.
+async fn app_with_live_tool_row(host: &Arc<ExtensionHost>) -> App<TestBackend> {
+    let mut app = app();
+    let start = AgentSessionEvent::ToolExecutionStart {
+        tool_call_id: ToolCallId::from("call-opts"),
+        tool_name: "bash".into(),
+        args: json!({ "command": "echo hi" }),
+    };
+    app.ingest_event_with_extensions(&start, host).await;
+    app.draw().unwrap();
+    app
+}
+
+/// The renderer is handed the display options at all — `expanded`, the theme NAME and the
+/// `outputPad` setting reach it on the very first render.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renderer_receives_the_display_options_and_the_theme() {
+    let host = host_with(Arc::new(OptionsAwareExt)).await;
+    let app = app_with_live_tool_row(&host).await;
+
+    let live = buffer_text(&app);
+    assert!(
+        live.contains("EXTCALL[bash] expanded=false theme=dark pad=1"),
+        "the renderer saw the live options and theme name:\n{live}"
+    );
+}
+
+/// THE REGRESSION, expansion half. `Ctrl+O` moves `toolOutputExpanded`; upstream re-broadcasts it
+/// to every child (`interactive-mode.ts:4032-4048`) and every renderer is called again from the
+/// draw path. The extension's row must move with it, not stay frozen at `expanded=false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toggling_expansion_re_invokes_the_renderer_with_the_new_options() {
+    let host = host_with(Arc::new(OptionsAwareExt)).await;
+    let mut app = app_with_live_tool_row(&host).await;
+    assert!(buffer_text(&app).contains("expanded=false"));
+
+    app.set_tools_expanded(true);
+    app.refresh_extension_renders(&host).await;
+    app.draw().unwrap();
+
+    let live = buffer_text(&app);
+    assert!(
+        live.contains("EXTCALL[bash] expanded=true"),
+        "the toggle re-invoked the renderer with the new options:\n{live}"
+    );
+    assert!(
+        !live.contains("expanded=false"),
+        "the frozen render was REPLACED, not drawn beside the new one:\n{live}"
+    );
+}
+
+/// THE REGRESSION, theme half. Upstream passes the live `Theme` to every renderer, so a `/theme`
+/// switch re-draws an extension's row in the new palette; cyrup passes the theme's NAME and must
+/// re-invoke on the same event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switching_the_theme_re_invokes_the_renderer() {
+    let host = host_with(Arc::new(OptionsAwareExt)).await;
+    let mut app = app_with_live_tool_row(&host).await;
+    assert!(buffer_text(&app).contains("theme=dark"));
+
+    app.set_theme(UiTheme::light());
+    app.refresh_extension_renders(&host).await;
+    app.draw().unwrap();
+
+    let live = buffer_text(&app);
+    assert!(
+        live.contains("EXTCALL[bash] expanded=false theme=light"),
+        "the theme switch re-invoked the renderer:\n{live}"
+    );
+}
+
+/// The pass must be a no-op when nothing moved: the refresh runs after EVERY run-loop action, so a
+/// renderer that would answer identically must not be paid for again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unchanged_frame_does_not_re_invoke_anything() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingExt(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl NativeExtension for CountingExt {
+        fn id(&self) -> ExtensionId {
+            ExtensionId::from("counting")
+        }
+        async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+            api.register_tool_renderer("bash");
+            Ok(())
+        }
+        async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+            HookOutcome::Noop
+        }
+        fn render_call(&self, key: &str, _call: &Value) -> Option<Value> {
+            let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            Some(Value::String(format!("EXTCALL[{key}] n={n}")))
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let host = host_with(Arc::new(CountingExt(Arc::clone(&calls)))).await;
+    let mut app = app_with_live_tool_row(&host).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the ingest render");
+
+    app.refresh_extension_renders(&host).await;
+    app.refresh_extension_renders(&host).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "nothing moved, so nothing was re-rendered"
+    );
+
+    app.set_tools_expanded(true);
+    app.refresh_extension_renders(&host).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the toggle moved the options exactly once"
+    );
+}
+
+/// The staleness decision itself is a pure comparison the view makes — the reason nothing has to
+/// remember to invalidate. Asserted directly so the rule is pinned independently of the App shell.
+#[test]
+fn staleness_is_derived_from_the_options_the_text_was_produced_under() {
+    use crate::transcript::{RenderSource, RenderSurface, RenderedText, TranscriptView};
+
+    let under = cyrup_ext::RenderOptions::new(false, 1, Some("dark".into()));
+    let mut view = TranscriptView::default();
+    view.push_tool_start_rendered(
+        "bash",
+        Some("c1".into()),
+        json!({}),
+        Some(RenderedText::new(
+            "drawn",
+            RenderSource {
+                surface: RenderSurface::ToolCall,
+                key: "bash".into(),
+                payload: json!({}),
+                under: under.clone(),
+            },
+        )),
+    );
+
+    assert!(
+        view.stale_extension_renders(&under).is_empty(),
+        "the same options are not stale"
+    );
+    for moved in [
+        cyrup_ext::RenderOptions::new(true, 1, Some("dark".into())),
+        cyrup_ext::RenderOptions::new(false, 2, Some("dark".into())),
+        cyrup_ext::RenderOptions::new(false, 1, Some("light".into())),
+    ] {
+        let stale = view.stale_extension_renders(&moved);
+        assert_eq!(stale.len(), 1, "moving any input makes the row stale");
+        assert_eq!(
+            stale[0].next.under, moved,
+            "the re-invocation carries the LIVE options, not the stale ones"
+        );
+    }
+
+    // A render with no re-invocation path never refreshes.
+    let mut frozen = TranscriptView::default();
+    frozen.push_tool_start_rendered(
+        "bash",
+        Some("c2".into()),
+        json!({}),
+        Some(RenderedText::frozen("drawn")),
+    );
+    assert!(
+        frozen
+            .stale_extension_renders(&cyrup_ext::RenderOptions::default())
+            .is_empty()
     );
 }
