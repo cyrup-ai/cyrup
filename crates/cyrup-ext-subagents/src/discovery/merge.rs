@@ -211,7 +211,10 @@ pub fn apply_overrides(
             AgentSource::User | AgentSource::Project => apply_custom_agent(agent, settings),
             // Package-sourced agents are not exposed for settings-based override in pi's own source
             // contract (only Builtin full-replace and User/Project fill-unset-only) — left untouched.
-            AgentSource::Package => {}
+            // SUBA-084: a Runtime agent never enters this map at all (`mergeRuntimeAgents` appends
+            // AFTER discovery's override application, `runtime-agent-registry.ts:428` @v0.64.0), so
+            // the arm exists only for totality and applies nothing.
+            AgentSource::Package | AgentSource::Runtime => {}
         }
     }
 
@@ -1044,6 +1047,15 @@ mod tests {
         assert!(AgentSource::Project.precedence_rank() < AgentSource::User.precedence_rank());
         assert!(AgentSource::User.precedence_rank() < AgentSource::Package.precedence_rank());
         assert!(AgentSource::Package.precedence_rank() < AgentSource::Builtin.precedence_rank());
+        // SUBA-084: the fifth variant never enters `merge_tiers` (runtime agents are merged
+        // afterwards by `runtime_registry::merge_runtime_agents`, which fails closed on a
+        // collision); its rank only keeps the "lower wins" contract total, pinned here so an
+        // enum extension cannot silently re-rank it into the four-tier merge.
+        assert_eq!(
+            AgentSource::Runtime.precedence_rank(),
+            AgentSource::Project.precedence_rank()
+        );
+        assert!(!AgentSource::Runtime.is_writable());
     }
 
     // -----------------------------------------------------------------------------------------

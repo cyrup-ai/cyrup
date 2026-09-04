@@ -13,7 +13,6 @@ use crate::registration::prompt_workflows;
 use crate::registration::slash_commands::{self, SlashCommandName};
 use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 use crate::spawn::depth::resolve_effective_depth;
-use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::format_slash_run_completion;
 use crate::extension::executor::requests::{
     BackgroundSingleRequest, ForegroundRunRequest, GraphRunOutcome, SingleRunOverrides,
@@ -27,7 +26,7 @@ use crate::extension::tool::task_items::count_graph_requested_spawns;
 impl SubagentsExtension {
     /// The single shared dispatch body [`cyrup_ext::NativeExtension::execute_command`] calls into
     /// (R-SA-130). Parses `args` via the real, already-built parsers in
-    /// [`crate::registration::slash_commands`], then routes to [`SubagentExecutor`] exactly as
+    /// [`crate::registration::slash_commands`], then routes to [`crate::extension::SubagentExecutor`] exactly as
     /// the tool itself does for `/run`; the remaining commands route to their own
     /// already-implemented subsystem entry points (`registration::doctor`/`cost`/`profiles`).
     /// pi `showFleet(ctx)` (`slash/slash-commands.ts:633-649`) — the `/subagents-fleet` handler at
@@ -35,7 +34,7 @@ impl SubagentsExtension {
     ///
     /// Three outcomes, upstream's own:
     /// 1. **No UI** → `runSlashSubagent(pi, ctx, { action: "status", view: "fleet" })` (`:635-638`),
-    ///    which is exactly [`SubagentExecutor::control_status_view`]'s `view: "fleet"` form — the
+    ///    which is exactly [`crate::extension::SubagentExecutor::control_status_view`]'s `view: "fleet"` form — the
     ///    same text surface this command rendered unconditionally at the v0.34.0 baseline.
     /// 2. **Already open** → `ctx.ui.notify("Subagent fleet inspector is already open.", "info")`
     ///    (`:639-642`).
@@ -61,7 +60,7 @@ impl SubagentsExtension {
     /// `showFleet`'s first statement, `state.lastUiContext = ctx` (`:634`), has no counterpart:
     /// upstream stashes the live `ExtensionContext` so a LATER, context-less caller can still reach
     /// a UI. cyrup's equivalent already exists and is bound elsewhere — the P-1 `host_services`
-    /// slot ([`SubagentExecutor::set_host_services`]), which the session builder binds once before
+    /// slot ([`crate::extension::SubagentExecutor::set_host_services`]), which the session builder binds once before
     /// `init` and which every surface in this file reads.
     async fn show_fleet(&self, cwd: &Path, has_ui: bool) -> Result<String, SubagentError> {
         use std::sync::atomic::Ordering;
@@ -319,7 +318,7 @@ impl SubagentsExtension {
         // `executor.execute` the tool does, so the agent's own `async:`/`timeoutMs:`
         // frontmatter defaults apply here identically. cyrup's `/run` is an independent
         // entry point, so it has to apply them itself — see
-        // [`SubagentExecutor::single_agent_launch_defaults`] for why the resolution is
+        // [`crate::extension::SubagentExecutor::single_agent_launch_defaults`] for why the resolution is
         // shared rather than duplicated.
         //
         // Fill-unset-only, and `/run`'s "unset" is precise: the surface parses no
@@ -335,7 +334,7 @@ impl SubagentsExtension {
         // launch default is applied on the `subagent` TOOL's `route_single`; wiring `/run`'s
         // override surface is the same separate unit that note already names.
         let (default_async, default_timeout_ms, _default_turn_budget, _default_acceptance) =
-            SubagentExecutor::single_agent_launch_defaults(
+            self.executor.single_agent_launch_defaults(
                 cwd,
                 &parsed.agent,
                 &self.executor.config_snapshot().await.roots,
@@ -893,7 +892,7 @@ impl SubagentsExtension {
     /// fork-context (R-SA-137's eager whole-batch rule) — an omitted call-site `context` defers to
     /// each step's agent's own `default_context`, and each forking step gets its OWN per-index branch
     /// (R-SA-138: a sibling step's own explicit choice is never overridden) — then either walk the
-    /// graph to completion in the foreground or hand it to [`SubagentExecutor::spawn_background_steps`].
+    /// graph to completion in the foreground or hand it to [`crate::extension::SubagentExecutor::spawn_background_steps`].
     pub(crate) async fn run_or_background_chain(
         &self,
         cwd: &Path,

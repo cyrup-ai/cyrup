@@ -41,7 +41,7 @@ impl SubagentExecutor {
         // Discovery block below, never a fabricated zero-count success — so the `Result` is
         // propagated all the way to `build_doctor_report`, never collapsed here.
         let discovery_result: Result<crate::discovery::AgentDiscoveryResult, String> =
-            match Self::discovery_config(cwd, &roots) {
+            match self.discovery_config(cwd, &roots) {
                 Ok(discovery_config) => crate::discovery::discover_agents_all(&discovery_config)
                     .map_err(|err| err.to_string()),
                 Err(err) => Err(err.to_string()),
@@ -195,7 +195,8 @@ impl SubagentExecutor {
         // not claim to reach the models report. Threading it means making this surface async,
         // which is its own change.
         let env_roots = crate::paths::Roots::from_env();
-        let cfg = Self::discovery_config(cwd, &env_roots)
+        let cfg = self
+            .discovery_config(cwd, &env_roots)
             .or_else(|_| Self::discovery_dirs_config(cwd, &env_roots))
             .unwrap_or_default();
         let default_model_scope = resolve_default_model_scope(&cfg.override_settings);

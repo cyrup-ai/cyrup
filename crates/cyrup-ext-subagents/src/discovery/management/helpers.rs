@@ -80,6 +80,9 @@ pub(crate) fn source_str(source: AgentSource) -> &'static str {
         AgentSource::Package => "package",
         AgentSource::User => "user",
         AgentSource::Project => "project",
+        // SUBA-084 — the `- <name> (runtime, …)` list label (`agent-management.ts:849` @v0.64.0
+        // `["runtime", "Runtime agents"]`; `runtime-agent-registration.test.ts:229`).
+        AgentSource::Runtime => "runtime",
     }
 }
 

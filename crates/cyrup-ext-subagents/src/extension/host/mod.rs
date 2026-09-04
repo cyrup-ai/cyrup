@@ -315,6 +315,27 @@ impl SubagentsExtension {
         &self.executor
     }
 
+    /// SUBA-084 — pi's public `registerAgent` (`src/api/agents.ts:2` @v0.64.0, the re-export of
+    /// `registerRuntimeAgent`): define an agent IN-PROCESS for this extension's session. The
+    /// returned handle's `dispose()` removes it again; a `SessionShutdown` clears every runtime
+    /// agent (`clearRuntimeAgentsForPi`, `extension/index.ts:971`). Delegates to
+    /// [`SubagentExecutor::register_agent`] — the registry is executor-owned so every discovery
+    /// the tool, the slash commands and the management actions run sees the same agents.
+    ///
+    /// # Errors
+    ///
+    /// See [`SubagentExecutor::register_agent`].
+    pub fn register_agent(
+        &self,
+        name: &str,
+        definition: &crate::discovery::runtime_registry::RuntimeAgentDefinition,
+    ) -> Result<
+        crate::discovery::runtime_registry::RuntimeAgentRegistration,
+        crate::error::SubagentError,
+    > {
+        self.executor.register_agent(name, definition)
+    }
+
     /// Construct the same [`SubagentTool`] `init` registers with the host, bound to this
     /// extension's own executor and cwd — exposed so an integration test (or a future non-`InitApi`
     /// caller) can drive the real `cyrup_core::Tool::execute` dispatch (the `tasks[]`/`chain[]`

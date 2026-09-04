@@ -264,6 +264,7 @@ fn build_four_scope_fixture() -> FourScopeFixture {
         project_agent_dirs: vec![project_dir],
         project_chain_dirs: Vec::new(),
         override_settings,
+        runtime_agents: Vec::new(),
     };
 
     FourScopeFixture { _root: root, cfg }

@@ -14,7 +14,6 @@ use crate::fork_context::{ContextMode, ContextRequest};
 use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec, StepResult};
 use crate::spawn::depth::resolve_effective_depth;
 use crate::watchdog::register_main::{watchdog_config_dirs, watchdog_model_info};
-use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::async_launch_details;
 use crate::extension::executor::requests::{
     BackgroundSingleRequest, ForegroundRunRequest, GraphRunOutcome, SingleRunOverrides,
@@ -45,7 +44,7 @@ use crate::extension::tool::text::unknown_subagent_action_message;
 /// travel as one struct because passing them positionally would put the helper over clippy's
 /// argument ceiling.
 struct SingleBackgroundDispatch<'a> {
-    /// This call's params, already carrying [`SubagentExecutor::single_agent_launch_defaults`]'
+    /// This call's params, already carrying [`crate::extension::SubagentExecutor::single_agent_launch_defaults`]'
     /// `async:` fallback (the rebind that decided this branch was taken at all).
     p: &'a SubagentToolParams,
     cwd: &'a Path,
@@ -66,7 +65,7 @@ impl SubagentTool {
     /// "none"`). Discovery failures degrade to an empty list rather than propagating — this string
     /// is diagnostic-only context on an already-erroring path, never itself the primary failure.
     pub(crate) async fn discovered_agent_names_joined(&self, cwd: &Path) -> String {
-        let names: Vec<String> = SubagentExecutor::discovery_config(cwd, &self.executor.config_snapshot().await.roots)
+        let names: Vec<String> = self.executor.discovery_config(cwd, &self.executor.config_snapshot().await.roots)
             .and_then(|cfg| discover_agents(&cfg, None))
             .map(|result| result.agents.into_iter().map(|a| a.name).collect())
             .unwrap_or_default();
@@ -112,7 +111,7 @@ impl SubagentTool {
         // discovery and surfaces the real error (a malformed `settings.json` MUST abort, R-SA-009,
         // and it will — one call later, with its own message). Degrading to "no canonicalization"
         // keeps this step from turning one error into two different ones.
-        let Ok(agents) = SubagentExecutor::discovery_config(cwd, &self.executor.config_snapshot().await.roots)
+        let Ok(agents) = self.executor.discovery_config(cwd, &self.executor.config_snapshot().await.roots)
             // Same scope the mode arms resolve under (pi canonicalizes against the very
             // `discoverAgents(effectiveCwd, scope)` result the executor then uses,
             // `subagent-executor.ts:4921-4923`), so an alias can never resolve here to an agent the
@@ -248,7 +247,7 @@ impl SubagentTool {
     }
 
     /// SINGLE mode (`{agent, task?}`) — the fully-wired shape (func-SA §5.2). Resolves the persona
-    /// through real discovery and drives [`SubagentExecutor::run_foreground`]/[`crate::extension::SubagentExecutor::spawn_background`]
+    /// through real discovery and drives [`crate::extension::SubagentExecutor::run_foreground`]/[`crate::extension::SubagentExecutor::spawn_background`]
     /// (`async: true`), each a genuine child OS process. `context` selects fork/fresh (an omitted
     /// value is `Fresh` in this tier); `model` is the per-call override.
     ///
@@ -311,11 +310,11 @@ impl SubagentTool {
         //    explicit-policy path and never touches chain/parallel steps.
         //
         // G98: the RESOLUTION now lives on the executor
-        // ([`SubagentExecutor::single_agent_launch_defaults`]) so the `/run` slash surface — an
+        // ([`crate::extension::SubagentExecutor::single_agent_launch_defaults`]) so the `/run` slash surface — an
         // independent entry point that never reaches this dispatcher — applies the same defaults.
         // Only the fill-unset-only APPLICATION rules stay here, where the "was it supplied?"
         // question can actually be asked of this call's params.
-        let launch_defaults = SubagentExecutor::single_agent_launch_defaults(
+        let launch_defaults = self.executor.single_agent_launch_defaults(
             cwd,
             agent,
             &self.executor.config_snapshot().await.roots,
@@ -496,7 +495,7 @@ impl SubagentTool {
     }
 
     /// [`Self::route_single`]'s background branch: hand the call to
-    /// [`SubagentExecutor::spawn_background`] and return pi's async-started receipt.
+    /// [`crate::extension::SubagentExecutor::spawn_background`] and return pi's async-started receipt.
     ///
     /// SUBA-N03 — there is NO foreground-only refusal on this branch any more, because
     /// every one of the nine advertised SINGLE-mode params now genuinely reaches hop 2.
@@ -815,7 +814,7 @@ impl SubagentTool {
     }
 
     /// Management/control action dispatch (pi: a present `action` puts the tool in management mode).
-    /// `doctor`/`models` (read-only) are wired to [`SubagentExecutor::run_doctor`]/`run_models_report`;
+    /// `doctor`/`models` (read-only) are wired to [`crate::extension::SubagentExecutor::run_doctor`]/`run_models_report`;
     /// the CRUD (`list`/`get`/`create`/`update`/`delete`, C3) routes to [`Self::route_management_action`]
     /// (the real [`crate::discovery::management`] handlers) and the background-control
     /// (`status`/`interrupt`/`resume`/`append-step`, C5) routes to [`Self::route_control_action`]
@@ -1182,7 +1181,7 @@ impl SubagentTool {
                 "Action '{action}' is not available from child-safe subagent fanout mode."
             )));
         }
-        let cfg = SubagentExecutor::discovery_config(cwd, &self.executor.config_snapshot().await.roots).map_err(|e| ToolError::new(e.to_string()))?;
+        let cfg = self.executor.discovery_config(cwd, &self.executor.config_snapshot().await.roots).map_err(|e| ToolError::new(e.to_string()))?;
         // The live parent session model (pi `ctx.model`), so a `models` action routed through the
         // management layer renders the real inherited model rather than `(unavailable)`. Bound to a
         // local so the borrowed `&str` in `ManagementRequest` outlives the call.
@@ -1244,7 +1243,7 @@ impl SubagentTool {
     /// Tier-1 dispatch arm (C5): route `status`/`interrupt`/`resume`/`append-step` to the
     /// [`crate::background::control`] primitives + the [`crate::background::run_status`] report shape
     /// (including the no-id "list active runs" form) — pi `subagent-executor.ts:2845-2912` +
-    /// `run-status.ts:101-273`. Each arm delegates to the matching [`SubagentExecutor`] method (the
+    /// `run-status.ts:101-273`. Each arm delegates to the matching [`crate::extension::SubagentExecutor`] method (the
     /// SAME shared executor the slash commands route through, R-SA-130); a rendered report/list is
     /// returned as tool content, a user-facing failure (not-found, wrong-mode, no-transcript, …) as
     /// a [`ToolError`] (cyrup's error-result channel, since [`ToolResult`] carries no `isError`
@@ -1424,7 +1423,7 @@ impl SubagentTool {
     /// tool's top-level PARALLEL shape (`tasks[]` + `concurrency`/`worktree`, per-task
     /// `count`/`output`/`outputMode`/`reads`/`model`) into a single [`RunnerStep::ParallelGroup`]
     /// and route it through the SAME shared plan-execution path
-    /// ([`SubagentExecutor::run_or_background_graph`]) the slash commands use — so each task's REAL
+    /// ([`crate::extension::SubagentExecutor::run_or_background_graph`]) the slash commands use — so each task's REAL
     /// persona (T0.1/C13) is resolved and dispatched through the faithful
     /// [`crate::spawn::parallel::run_bounded`] worker pool over real child processes.
     ///
@@ -1599,7 +1598,7 @@ impl SubagentTool {
     /// Tier-1 dispatch arm (chain via tool): translate `chain[]` into a `Vec<RunnerStep>`
     /// (sequential steps + inline static parallel groups, each group's per-task `count` expanded via
     /// pi's `expandChainParallelCounts`) and route it through the SAME
-    /// [`SubagentExecutor::run_or_background_graph`] path the slash commands use. Dynamic fanout
+    /// [`crate::extension::SubagentExecutor::run_or_background_graph`] path the slash commands use. Dynamic fanout
     /// (`expand`/`collect`) is Tier-4 territory (C16) and is rejected with a clear message rather
     /// than silently mis-parsed.
     pub(crate) async fn route_chain_mode(

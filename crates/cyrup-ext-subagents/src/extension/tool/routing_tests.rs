@@ -12,6 +12,7 @@
 use super::*;
 use cyrup_core::Tool;
 use crate::background::control;
+use crate::extension::SubagentExecutor;
 use crate::extension::testsupport::arm_scoped_missions;
 use crate::extension::testsupport::dispatch_tool;
 use crate::extension::testsupport::scoped_missions;

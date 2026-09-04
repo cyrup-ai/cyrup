@@ -146,6 +146,12 @@ pub struct SubagentExecutor {
     /// P-1 `host_services` slot is bound (pi's `pi.sendMessage`), else the stderr
     /// [`crate::tui::notices::LoggingControlNoticeSink`] degradation.
     control_notice_sink_override: Option<Arc<dyn crate::tui::notices::ControlNoticeSink>>,
+    /// SUBA-084 — this executor's partition of pi's runtime agent registry
+    /// (`runtime-agent-registry.ts:71-74` @v0.64.0 keys records on the owning `ExtensionAPI`;
+    /// here the owner IS the executor). Read into every [`Self::discovery_config`] so a registered
+    /// agent reaches each discovery consumer; cleared by [`Self::teardown_session`]
+    /// (`clearRuntimeAgentsForPi`, `extension/index.ts:971`).
+    runtime_agents: Arc<crate::discovery::runtime_registry::RuntimeAgentRegistry>,
 }
 
 impl Default for SubagentExecutor {
@@ -174,7 +180,41 @@ impl SubagentExecutor {
             parent_model_memory: std::sync::Mutex::new(ParentModelMemory::default()),
             notices: Arc::new(AsyncMutex::new(crate::tui::notices::ControlNoticeState::new())),
             control_notice_sink_override: None,
+            runtime_agents: Arc::new(
+                crate::discovery::runtime_registry::RuntimeAgentRegistry::new(),
+            ),
         }
+    }
+
+    /// SUBA-084 — pi's public `registerAgent({ pi, name, definition })` (`src/api/agents.ts:2`
+    /// re-exporting `registerRuntimeAgent`, `runtime-agent-registry.ts:371-398` @v0.64.0): define
+    /// an agent in-process, with no file and no settings write. It is visible to the very next
+    /// discovery (tool routing, `/run`, chains, the management `list`) and stays until the
+    /// returned handle's `dispose()` or this session's teardown. See
+    /// [`crate::discovery::runtime_registry`] for the validation and collision contract.
+    ///
+    /// # Errors
+    ///
+    /// Every upstream refusal (name/definition validation, a reserved code-owned selection name,
+    /// a builtin or runtime identity collision, the 200-per-owner cap) as
+    /// [`crate::error::SubagentError::Management`] with upstream's text.
+    pub fn register_agent(
+        &self,
+        name: &str,
+        definition: &crate::discovery::runtime_registry::RuntimeAgentDefinition,
+    ) -> Result<
+        crate::discovery::runtime_registry::RuntimeAgentRegistration,
+        crate::error::SubagentError,
+    > {
+        self.runtime_agents.register(name, definition)
+    }
+
+    /// SUBA-084 — this executor's runtime agent registry (the `pi`-keyed partition of
+    /// `runtime-agent-registry.ts:71-74`), for a caller that needs `list()`/`clear()` or the
+    /// untyped `register_value` path directly.
+    #[must_use]
+    pub fn runtime_agents(&self) -> &Arc<crate::discovery::runtime_registry::RuntimeAgentRegistry> {
+        &self.runtime_agents
     }
 
     /// Construct an executor whose background-completion notifications (C6) are delivered to

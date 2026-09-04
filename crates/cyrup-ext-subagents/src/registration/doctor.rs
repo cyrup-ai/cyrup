@@ -924,6 +924,10 @@ impl SourceCounts {
             AgentSource::Package => self.package += 1,
             AgentSource::User => self.user += 1,
             AgentSource::Project => self.project += 1,
+            // SUBA-084: pi's `formatSourceCounts` (doctor.ts:89-91 @v0.64.0) still renders only
+            // the four on-disk tiers and its `total` (`:148`) sums only those, so a runtime agent
+            // is neither counted nor listed here.
+            AgentSource::Runtime => {}
         }
     }
 

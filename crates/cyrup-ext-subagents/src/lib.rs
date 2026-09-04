@@ -75,3 +75,13 @@ pub use background::control::{
 };
 pub use background::parent_anchor::{clear_parent_session_anchor, publish_parent_session_anchor};
 pub use exec::{AGENT_NAME_ENV_VAR, PARENT_SESSION_ENV_VAR};
+
+// SUBA-084 — pi `src/api/agents.ts:2,12` @v0.64.0 re-exports the runtime agent registration
+// surface (`registerAgent` + its `RuntimeAgentDefinition`/`RuntimeAgentRegistration` types) at
+// the package's public API root. The entry point itself is a method
+// (`extension::SubagentsExtension::register_agent` / `SubagentExecutor::register_agent`) because
+// the registry is owned per extension instance rather than process-global; the types an embedder
+// needs to call it are re-exported here so it never has to spell the module path.
+pub use discovery::runtime_registry::{
+    RuntimeAgentDefinition, RuntimeAgentRegistration, RuntimeAgentRegistry, RuntimeThinking,
+};

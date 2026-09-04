@@ -22,8 +22,14 @@ use super::render::{format_agent_detail, format_chain_detail, format_model_sourc
 use super::{ManagementOutcome, ManagementRequest, BUILTIN_AGENT_NAMES};
 use crate::error::SubagentError;
 
+/// Builtin/Package agents are visible under every list scope; SUBA-084 adds Runtime to that set —
+/// pi `effectiveAgentsForScope` (`agent-management.ts:132-141` @v0.64.0) merges the runtime agents
+/// into the scope-narrowed list unconditionally (`mergeRuntimeAgents(owner, { agents },
+/// allAgents(d))`), so a `user`/`project` listing still shows them.
 fn agent_in_list_scope(source: AgentSource, scope: Option<AgentSource>) -> bool {
-    scope.is_none() || matches!(source, AgentSource::Builtin | AgentSource::Package) || Some(source) == scope
+    scope.is_none()
+        || matches!(source, AgentSource::Builtin | AgentSource::Package | AgentSource::Runtime)
+        || Some(source) == scope
 }
 
 fn chain_in_list_scope(source: AgentSource, scope: Option<AgentSource>) -> bool {

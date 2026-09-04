@@ -453,7 +453,7 @@ impl SubagentExecutor {
         name: &str,
         roots: &crate::paths::Roots,
     ) -> Result<crate::discovery::types::ChainDefinition, SubagentError> {
-        let cfg = Self::discovery_config(cwd, roots)?;
+        let cfg = self.discovery_config(cwd, roots)?;
         let result = discover_agents(&cfg, None)?;
         // Cross-scope run precedence Project > User > Package > Builtin (pi `discoverSavedChains`
         // last-wins map, slash-commands.ts:172-177 @v0.34.0) — NOT a naive first-match, which incorrectly let a

@@ -74,6 +74,7 @@ pub mod chains;
 pub mod management;
 pub mod skills;
 pub mod merge;
+pub mod runtime_registry;
 pub mod settings_write;
 
 use std::path::{Path, PathBuf};
@@ -445,13 +446,15 @@ fn effective_agent_match<'a>(matches: &[&'a AgentDefinition]) -> Option<&'a Agen
     Some(best)
 }
 
-/// pi's `sourceRank` map (`agents.ts:504`).
+/// pi's `sourceRank` map (`agents.ts:504` @v0.43.0; `:687` @v0.64.0 adds `["runtime", 4]` —
+/// SUBA-084: a runtime agent outranks every on-disk tier in same-name resolution).
 fn source_rank(source: AgentSource) -> u8 {
     match source {
         AgentSource::Builtin => 0,
         AgentSource::Package => 1,
         AgentSource::User => 2,
         AgentSource::Project => 3,
+        AgentSource::Runtime => 4,
     }
 }
 
@@ -588,6 +591,17 @@ pub struct AgentDiscoveryConfig {
     /// problem to have already surfaced via [`read_subagent_settings_file`] /
     /// [`load_layered_override_settings`] before constructing a valid config.
     pub override_settings: LayeredOverrideSettings,
+    /// SUBA-084 — the in-process runtime agents (pi `listRuntimeAgentConfigs(pi)`,
+    /// `runtime-agent-registry.ts:404-406` @v0.64.0), already validated and stamped
+    /// [`AgentSource::Runtime`] by [`runtime_registry::RuntimeAgentRegistry::register`]. The
+    /// caller (normally `SubagentExecutor::discovery_config`) copies the executor-owned
+    /// registry's current list in here so [`run_discovery`] can merge it — the ONE seam every
+    /// discovery consumer shares, which is what makes a runtime agent reach tool routing, chains,
+    /// nested control, the management `list`, and `/subagents-doctor` alike (upstream wires
+    /// `mergeRuntimeAgents` into each of those separately: `extension/index.ts:528-546`,
+    /// `slash/slash-commands.ts:120-130`, `agents/agent-management.ts:132-141`). Empty (the
+    /// default) means no runtime agents and no extra work.
+    pub runtime_agents: Vec<AgentDefinition>,
 }
 
 impl AgentDiscoveryConfig {
@@ -1335,6 +1349,28 @@ fn run_discovery(
     // convention.
     agents.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // SUBA-084 — pi `discoverAgentsForRuntime` (`extension/index.ts:528-546` @v0.64.0): only
+    // when runtime agents exist (`listRuntimeAgentConfigs(pi).length === 0` short-circuits to
+    // plain discovery), re-snapshot EVERY on-disk tier at `Both` scope — `configuredAgents =
+    // [...all.builtin, ...all.package, ...all.user, ...all.project]` regardless of the requested
+    // `scope` — and merge the runtime agents against that full set, so a configured agent hidden
+    // by scope narrowing (or shadowed by a higher tier) still blocks a colliding runtime agent
+    // (`runtime-agent-registration.test.ts:331-366`). Runtime agents are APPENDED after the
+    // merged, sorted result (`runtime-agent-registry.ts:428`), never ranked into it. Upstream's
+    // `maxThinking` re-stamp (`:540-545`) has no counterpart here: cyrup carries the ceiling on
+    // the RESULT (`max_thinking` below, SUBA-078), not on each agent.
+    if !cfg.runtime_agents.is_empty() {
+        let all = scan_agent_tiers_scoped(cfg, AgentReadScope::Both);
+        let mut configured: Vec<AgentDefinition> = Vec::with_capacity(
+            all.builtin.len() + all.package.len() + all.user.len() + all.project.len(),
+        );
+        configured.extend(all.builtin);
+        configured.extend(all.package);
+        configured.extend(all.user);
+        configured.extend(all.project);
+        runtime_registry::merge_runtime_agents(&cfg.runtime_agents, &mut agents, &configured)?;
+    }
+
     let mut chain_scopes: Vec<(PathBuf, AgentSource)> = Vec::new();
     // Package-scope chain scopes first (R-SA-020, chains-share-agents-dir), so a package-provided
     // chain is discovered at `AgentSource::Package` scope; per R-SA-015 chains are never merged
@@ -1459,6 +1495,10 @@ fn chain_run_precedence(source: AgentSource) -> u8 {
         AgentSource::Package => 1,
         AgentSource::User => 2,
         AgentSource::Project => 3,
+        // SUBA-084: no chain is ever runtime-sourced (the registry defines agents only), so
+        // this arm is unreachable in practice; it follows `agents.ts:687`'s ordering for
+        // totality.
+        AgentSource::Runtime => 4,
     }
 }
 

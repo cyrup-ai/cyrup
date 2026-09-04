@@ -67,6 +67,7 @@ fn cfg_from_disk(base: &Path) -> AgentDiscoveryConfig {
     )
     .expect("settings load");
     AgentDiscoveryConfig {
+        runtime_agents: Vec::new(),
         builtin_agents_dir: Some(builtin_dir(base)),
         installed_packages: InstalledPackages { packages: Vec::new() },
         trusted_project: true,

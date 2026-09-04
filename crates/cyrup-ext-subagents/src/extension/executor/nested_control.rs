@@ -149,6 +149,7 @@ impl SubagentExecutor {
     /// agent.defaultAcceptance !== undefined ? { acceptance: agent.defaultAcceptance } : {}`).
     #[must_use]
     pub(crate) fn single_agent_launch_defaults(
+        &self,
         cwd: &Path,
         agent: &str,
         roots: &crate::paths::Roots,
@@ -158,7 +159,7 @@ impl SubagentExecutor {
         Option<crate::exec::turn_budget::ResolvedTurnBudget>,
         Option<serde_json::Value>,
     ) {
-        SubagentExecutor::discovery_config(cwd, roots)
+        self.discovery_config(cwd, roots)
             .and_then(|cfg| discover_agents(&cfg, None))
             .ok()
             .and_then(|result| {

@@ -40,6 +40,15 @@ use crate::fork_context::ContextMode;
 /// (R-SA-001). Only `User`/`Project` are writable via management actions (R-SA-014) — a
 /// create/update/delete/rename targeting a `Builtin`- or `Package`-sourced agent MUST fail with
 /// a read-only error (enforced in `management.rs`, not here).
+///
+/// SUBA-084 — `Runtime` is pi's fifth `AgentSource` (`agents.ts:30` @v0.64.0: `"builtin" |
+/// "package" | "user" | "project" | "runtime"`): an agent registered IN-PROCESS through
+/// [`crate::discovery::runtime_registry::RuntimeAgentRegistry`], with `file_path` `runtime:<name>`
+/// and no file behind it. It takes NO part in the four-tier precedence merge — a runtime agent
+/// whose name or alias collides with any configured agent FAILS discovery closed
+/// (`runtime-agent-registry.ts:408-421`) instead of shadowing or being shadowed — and is
+/// appended after the merged result (`:428`). Where a name-resolution rank IS consulted
+/// (`effectiveAgentMatch`'s `sourceRank`, `agents.ts:687`), runtime outranks project.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentSource {
@@ -47,6 +56,7 @@ pub enum AgentSource {
     Package,
     User,
     Project,
+    Runtime,
 }
 
 impl AgentSource {
@@ -55,9 +65,14 @@ impl AgentSource {
     /// `cyrup_resources::scope::ResourceScope::precedence_rank` (an explicit method rather than a
     /// derived `Ord`) without reusing that enum's 9-variant, symmetric-precedence semantics
     /// (R-SA-021; see module doc above).
+    ///
+    /// `Runtime` shares `Project`'s rank 0 only so the "lower wins" contract stays total over the
+    /// enum; `merge.rs` never sees a `Runtime` agent (they are merged AFTER the four tiers by
+    /// `runtime_registry::merge_runtime_agents`, which fails closed on a collision rather than
+    /// ranking one). See [`AgentSource`]'s own doc.
     pub fn precedence_rank(self) -> u8 {
         match self {
-            AgentSource::Project => 0,
+            AgentSource::Project | AgentSource::Runtime => 0,
             AgentSource::User => 1,
             AgentSource::Package => 2,
             AgentSource::Builtin => 3,

@@ -111,6 +111,28 @@ impl SubagentExecutor {
     /// `subagents.*` field — the malformed-settings MUST-abort contract this crate's discovery
     /// callers rely on.
     pub(crate) fn discovery_config(
+        &self,
+        cwd: &Path,
+        roots: &crate::paths::Roots,
+    ) -> Result<AgentDiscoveryConfig, SubagentError> {
+        let mut cfg = Self::discovery_config_on_disk(cwd, roots)?;
+        // SUBA-084 — pi `discoverAgentsForRuntime` (`extension/index.ts:528-546` @v0.64.0) folds
+        // `listRuntimeAgentConfigs(pi)` into every discovery; cyrup hands the executor's registry
+        // snapshot to `run_discovery` through the config so EVERY consumer of this config —
+        // tool routing, chains, nested control, the management `list`, the doctor — sees the
+        // same runtime agents without each wiring its own merge.
+        cfg.runtime_agents = self.runtime_agents().list();
+        Ok(cfg)
+    }
+
+    /// [`Self::discovery_config`] MINUS the runtime agent registry: the directory/package topology
+    /// plus the `subagents.*` settings layer, which is everything a settings-only reader
+    /// ([`Self::resolve_model_scope`]) needs and all an executor-less caller can build.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::discovery_config`].
+    pub(crate) fn discovery_config_on_disk(
         cwd: &Path,
         roots: &crate::paths::Roots,
     ) -> Result<AgentDiscoveryConfig, SubagentError> {
@@ -181,7 +203,7 @@ impl SubagentExecutor {
         scope: AgentReadScope,
         roots: &crate::paths::Roots,
     ) -> Result<(AgentDefinition, Option<ModelScopeConfig>, Option<String>), SubagentError> {
-        let cfg = Self::discovery_config(cwd, roots)?;
+        let cfg = self.discovery_config(cwd, roots)?;
         let result = discover_agents(&cfg, Some(scope))?;
         let model_scope = result.model_scope.clone();
         let max_thinking = result.max_thinking.clone();
@@ -221,7 +243,7 @@ impl SubagentExecutor {
         cwd: &Path,
         roots: &crate::paths::Roots,
     ) -> Result<Option<ModelScopeConfig>, SubagentError> {
-        Ok(Self::discovery_config(cwd, roots)?.override_settings.model_scope())
+        Ok(Self::discovery_config_on_disk(cwd, roots)?.override_settings.model_scope())
     }
 
     /// Plan-time persona map (T0.1's C13 root-cause seam): resolve every DISTINCT agent named across

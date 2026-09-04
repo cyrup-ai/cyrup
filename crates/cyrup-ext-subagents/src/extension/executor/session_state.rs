@@ -207,6 +207,10 @@ impl SubagentExecutor {
         self.stop_completion_watcher().await;
         self.tracker.stop_and_clear().await;
         self.clear_parent_session_anchor();
+        // SUBA-084 — pi `clearRuntimeAgentsForPi(pi)` in the runtime cleanup
+        // (`extension/index.ts:971` @v0.64.0): a rebuilt session never inherits the previous
+        // session's in-process agents; outstanding registration handles become no-ops.
+        self.runtime_agents().clear();
     }
 }
 
