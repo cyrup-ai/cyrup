@@ -5,6 +5,99 @@ next work item**.
 
 ---
 
+# RECONCILED 2026-09-04 (sixth edition) — a full re-audit of all fourteen files, `09a` merged into this table for the first time, and the count is now a committed script rather than a hand-count
+
+> **Read this block before planning.** cyrup HEAD **`2571969`**, branch `claude/gap-analysis-refresh`
+> — 210 commits ahead of the `4fb5e40` baseline every area file (01–12, `09a`, 14) was independently
+> re-audited against this pass, each with both sides personally re-read (the Rust at HEAD, the
+> upstream at its named tag via `git show`, never a working tree), per `README.md`'s evidence rule.
+> Everything below this block is the fifth edition and earlier.
+>
+> This edition is built directly from **`PARITY-GAPS.md`'s §0 and §0a**, which for the first time are
+> produced by a committed script (`scripts/count_open_items.py`) rather than derived by hand — the
+> fourth edition's own complaint, three editions ago, that "a prose rule two readers implement
+> differently cannot validate an edition" is answered by this, not by a better prose rule. Running the
+> script myself against the fourteen files' current `## Open items` tables reproduces §0's table
+> exactly (132 open = 0/8/49/75, 8 above-medium) — see the run recorded in the sanity-check section
+> below. **Do not duplicate §0's by-area census here**; `00` ranks, `PARITY-GAPS.md` classifies by gap
+> class and carries the counts, and copying a count into a second file is exactly the drift this
+> directory has paid for before (area 12 was 50% false-positive on exactly this failure — see the
+> fourth edition's note below).
+
+## The above-medium set: still eight rows, zero critical — but SIX of the eight are new to this table
+
+**Of the fifth edition's three high-severity survivors, one closed this pass.** `PROV-068` (area 01)
+was refuted and closed 2026-09-04 — re-read at the ported tag `v0.83.0` itself, not a later citation:
+`mapped === null` really does mean UNSUPPORTED on both sides (`packages/ai/src/models.ts:668`;
+`crates/cyrup-provider/src/collection.rs::get_supported_thinking_levels`); the item's own live-use
+report (a two-rung Kimi K2.6 ladder) turns out to be pi's own catalog data
+(`packages/ai/test/together-models.test.ts:24` @v0.83.0), not a cyrup bug. `TUI-091` and `SEAM-113`
+remain open, both re-confirmed directly against area 07 and area 08's current rows, not carried
+forward on trust.
+
+**The other six rows are new to THIS TABLE, not new to the backlog.**
+[`09a-cyrup-ext-subagents-v0.57-drift.md`](09a-cyrup-ext-subagents-v0.57-drift.md) is a same-tier
+supplement to area 09 (`README.md`'s Contents table), and no prior edition of this table — not the
+fourth, not the fifth — ever drew from its severities. `PARITY-GAPS.md` §0a folded it in for the first
+time this pass; this edition does the same. Nine of `09a`'s own confirmed-schedulable items closed
+outright this pass (see area 09/09a's summary), which is why only six of its rows still clear `high`.
+
+| id | area | sev | why it is above medium |
+|---|---|---|---|
+| `TUI-091` | 07 | high | Reasoning blocks never render although every layer — provider through renderer — is wired and correct. Live-use report 2026-08-15; its last named live-render candidate is REFUTED, by execution through two harnesses including a pty-equivalent, so the row is relocated into the live event fold (`app/events_fold.rs:121-125`). Needs three named projections instrumented in a real terminal, not more static tracing. **Not re-touched 2026-09-04** — this pass had no pty available; left exactly as written, per this file's own rule that no `TUI-*`/live item closes on a static read. |
+| `SEAM-113` | 08 | high | A model chosen with `/model` does not survive into the next session — it reverts to the catalog/settings default. **Evidence substantially expanded 2026-09-04, not just re-confirmed**: `82f40d3` (2026-08-28) landed pi's LATER opt-in Ctrl+S persist contract — a new `ConfirmSelectionAsDefault` path (`crates/cyrup-tui/src/app/execute_misc.rs:416-462`) that writes the settings default only when the user explicitly presses Ctrl+S — instead of the unconditional persist inside `apply_model_change` (`crates/cyrup-session-svc/src/session/model.rs:473-539`) this ledger settled on 2026-08-19 as the actual fix site. Plain `Enter` in the picker and typed `/model <pattern>` both still resolve through `apply_model_change` with no settings write, so the originally reported symptom is unchanged. Stays open, unreduced, at high. |
+| `SUBA-074` | 09a | high | Agent `runner:` frontmatter is ignored entirely, so a sandboxed foreign-CLI profile runs as a full-capability native child. **Stage 1 (the refusal path) CLOSED 2026-09-04** — `AgentRunnerConfig::refusal_reason`, called before the model ladder in `exec/mod.rs` Step 0b, refuses the run with pi's own message. **Stage 2 (the external-runner adapter protocol itself) is the open residual under this same id** — confirmed still absent. |
+| `SUBA-085` | 09a | high | `mission.resolve-decision` unported: a mission decision is write-once and permanently open, so the goal driver proposes the same next action forever. Re-verified open 2026-09-04 — `resolve_decision`/`ResolveDecision` is 0 hits anywhere in `crates/`, and `MissionUpdateInput` has no such field. |
+| `SUBA-092` | 09a | high | **New 2026-09-04.** Agent-level `excludeTools:`/`allowNestedSubagents:` (frontmatter and settings-override) are entirely unported — a declared per-agent tool exclusion has no effect, and a nested-subagent grant can only ever come from an explicit `tools:` allowlist. Both sides personally read at `pi-subagents` v0.62.0, inside the v0.57.0..v0.64.0 window that sits past `09a`'s own original v0.57.0 scope. |
+| `SUBA-082` | 09a | high | Agent `acceptanceRole:`/`acceptance:` frontmatter is not in the schema, so the acceptance classifier is driven purely by an agent-name regex. *(Carried, NOT adversarially verified — `09a`'s own lower evidence bar for this section: the port-side zero-hit grep was re-run and still returns zero at HEAD, but the upstream line numbers were not re-read, this pass or the original filing.)* |
+| `SUBA-084` | 09a | high | Runtime agent registration is entirely absent — no `registerAgent` API, no `runtime` source tier, no runtime/configured collision checks. *(Carried, NOT adversarially verified — same caveat as `SUBA-082`.)* |
+| `SUBA-086` | 09a | high | Per-agent parse diagnostics are absent: a malformed agent file is silently degraded to defaults instead of being reported by name and blocking that one agent. *(Carried, NOT adversarially verified — same caveat as `SUBA-082`.)* |
+
+**Read `09a`'s own `## Summary — confirmed items` table and its `## Carried — NOT adversarially
+verified` section before scheduling any of the three carried rows.** They are held to a lower evidence
+bar than the other five by `09a`'s own header (port-side re-checked, upstream not re-read), and this
+table does not launder that difference away — it is stated in each row above rather than left implicit.
+
+**Six of the eight rows are effort M or smaller per their area files; none is blocked on a decision**
+the way several prior above-medium rows were (`PB-7`'s npm channel, `PB-19`'s Windows question). The
+two live-use rows (`TUI-091`, `SEAM-113`) are held to this directory's highest evidence bar — no
+`TUI-*`/live item is done until it has been observed in a real terminal — while the six `09a` rows are
+static-read findings at a named tag, three of them at `09a`'s own lower "carried" standard.
+
+## Closures verified this edition, area by area — not taken from any area summary's prose alone
+
+Every closure named below was independently re-checked against the cited area file's current row
+before being treated as fact here, per the "refute closures rather than confirm them" rule:
+
+- **`PROV-068`** (01) — closed, see above.
+- **`SEAM-112`, `PERM-034`, `TUI-092`** — all three closed **before** this pass (2026-08-29 /
+  2026-08-20) and re-confirmed unchanged by their owning areas' 2026-09-04 re-audits (area 08, area
+  10, area 07 respectively); no new evidence this edition, carried forward correctly.
+- **`CFG-021`, `DRIFT-022`** (fullscreen/alt-screen TUI mode) — both closed 2026-09-04 in areas 05 and
+  12, on the same shipped code (`crates/cyrup-tui/src/altscreen/`, `crates/cyrup-config/src/settings/`).
+  Neither was ever above-medium, but both directly answer `PARITY-GAPS.md` §6 OQ-8, which is now
+  marked ANSWERED there.
+- A further **~50 rows closed across areas 01, 02, 03, 04, 05, 06, 07, 09a, 11, 12** this pass (see
+  each area's own summary and `PARITY-GAPS.md` §0's per-area table) — none of them were above-medium
+  before this edition, so none change the ranked table; they are not re-listed here to avoid the exact
+  duplicate-census drift this file's own fourth edition documents at length below.
+
+## What this edition explicitly did NOT do
+
+- **Did not re-derive the full by-area open-item census** (crit/high/medium/low per file). That table
+  now lives in `PARITY-GAPS.md` §0, is script-derived, and was independently re-run against the
+  fourteen files by this pass to confirm it (132 open = 0/8/49/75 — matches exactly). Duplicating it
+  here would create a second hand-maintained copy of a number a script already owns.
+- **Did not re-walk any area file's medium/low rows for ranking purposes.** The above-medium table is
+  the whole of this edition's ranked content, per this file's own stated purpose ("picking the next
+  work item") — everything at medium or below is read from the owning area file directly, not from
+  this ledger.
+- **Did not touch `README.md`'s "carries no counts, no record of past passes" note.** The Baselines
+  table there is data (upstream tags, HEAD SHAs), refreshed separately; this file's own historical
+  editions below remain the only place a running pass-count lives, unchanged.
+
+---
+
 # RECONCILED 2026-08-19 (fifth edition) — the above-medium set turned over COMPLETELY, two criticals are open, and `crates/cyrup-tui/src/app.rs` no longer exists
 
 > **Read this block before planning. It does not recount the backlog — it corrects the two things a

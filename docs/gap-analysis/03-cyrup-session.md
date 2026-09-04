@@ -228,12 +228,53 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 > **`SESS-043` was the one genuinely open item and is now closed**, together with an unfiled divergence found on its path: the agent→LLM boundary was pi's BASE `defaultConvertToLlm`, not the coding agent's `convertToLlm`, so an extension `custom` message reached the model only *after* a compaction had flattened it. See the row.
 >
 > **The four remaining low rows are residuals owned by other areas** — `SESS-013` (collapse cyrup-tui's `find_git_paths` copy, area 07), `SESS-027` (`cyrup-core/src/message.rs` doc comments, area 01), `SESS-036` (`cyrup-config/src/env.rs:171`, area 05) and `SESS-S05` (the cyrup-tui producer + `formatLabelTimestamp` render, area 07). **`cyrup-session` itself has no open rows left.**
+>
+> **RE-AUDITED 2026-09-04 — counted set: 0 critical, 0 high, 1 medium, 3 low = 4**, plus the
+> `SESS-038` tracker. Ran `git log 4fb5e40..HEAD -- crates/cyrup-session` (8 commits) and re-read
+> both sides of every open row and the tracker; ran the `v0.84.1..v0.84.4` diff-stat skim this area's
+> task scope names, since this file's own version-lag sweep only ever covered `v0.83.0..v0.84.1`.
+>
+> **Two of the four residuals above were already closed before `4fb5e40`, and this file simply never
+> caught up.** `SESS-013`'s residual (the duplicate `find_git_paths` copy) and `SESS-036`'s residual
+> (the `env.rs:171` canonicalize) both landed in commits — `380c713` and `e5c6933` — that predate this
+> ledger's own recorded baseline; neither closure was reflected here until now. Both are **closed in
+> full below**, with the collapsed/deleted code quoted. **`SESS-027` stays open**, re-verified at HEAD
+> with its citation moved (`cyrup-core/src/message.rs` was split into `message/*.rs` in `5b3d37e`,
+> also pre-baseline): its Fix is now half-landed — the three function-level docs were corrected, but
+> the enum-level doc naming the same three functions was not, and still asserts the disproved claim.
+> **`SESS-S05` stays open**, re-verified unchanged at HEAD with citations refreshed for two unrelated
+> file splits (`manager.rs` → `manager/*.rs`, and ~120 lines added to `tree_selector.rs` by an
+> unrelated `/tree` copy+paging feature) that predate `4fb5e40`.
+>
+> **Two items newly filed from the `v0.84.1..v0.84.4` skim, both from the compaction module this
+> area's other sweeps already covered exhaustively at `v0.83.0..v0.84.1`.** `SESS-049` (medium): pi
+> v0.84.2 added a check rejecting a token-capped (`Length`-stop) or tool-call-bearing summarization
+> response as a valid finished summary, across all three of its summary-producing functions; cyrup's
+> three matching call sites still accept both, unchanged since this file's own v0.83.0 port. `SESS-050`
+> (low): pi v0.84.2 added a `session_compact_failed` extension event (the failure/abort sibling of the
+> already-ported `session_compact`); cyrup has no counterpart at any of the five call sites upstream
+> fires it from. Both read on both sides; see their own sections for citations.
+>
+> **`SESS-038` re-checked, unchanged.** No crate under `crates/` implements a session backend other
+> than the JSONL `DiskStore`/`MemStore` pair; `rg -ni sqlite crates/cyrup-session crates/cyrup-session-svc`
+> still returns nothing. The scope decision is still outstanding.
+>
+> **Left untouched, and why.** The `v0.84.1..v0.84.4` diff-stat skim also showed `agent-session.ts`
+> (446 changed lines) and `skills.ts` (92 changed lines) as substantially reworked. `agent-session.ts`
+> was skimmed, not read in full — `SESS-050` is one confirmed finding out of that diff, not a claim
+> the rest is clean; the remainder (a reworked auto-compaction trigger branch for "no usage data at
+> all", among other things) is unaudited and left for a future pass. `skills.ts`'s `loadSkillFromFile`
+> rework (a new `isDeclaredSkill`/non-`SKILL.md` distinction) was read but is **out of scope for this
+> file**: skill-file loading and validation live in `crates/cyrup-resources` (area 05), not
+> `crates/cyrup-session` — this file's own skills surface is only the prompt-injection wording
+> (`skills_inject.rs`, SESS-003/024, both closed and unaffected). Not filed here; flagged so area 05
+> knows the surface moved.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | ~~SESS-040~~ | ~~high~~ **CLOSED 2026-08-15 — REFUTED** | not-ported | M | Compaction cannot be cancelled from the shipped binary; the indicator advertises a dead key — **REFUTED, CLOSED 2026-08-15**: batch B — **REFUTED at HEAD (`68bbd39`); the dispatch site landed in `380c713` and the row was already false when sweep 2 re-counted it.** `rg -n AbortCompaction crates/` now returns FIVE lines, not two: the enum variant (`cyrup-tui/src/app/action.rs:35`), the **dispatch** at `app/input.rs:143-145` (cited `app.rs:2340-2343` when this row was written, pre-split; `40821ed` has since moved it — re-derive, do not carry) — `Action::Interrupt` tests `branch_summary_in_flight`, then `self.state.compacting`, and returns `AppAction::AbortCompaction` ahead of the four-branch chain — the routing at `app/run_action.rs:53-55` (`ctx.session.abort_compaction()`), and two assertions in `cyrup-tui/src/tests/escape_chain.rs:233,244`. The comment just above it cites `interactive-mode.ts:3080-3086`, **re-derived at v0.83.0 and exact**: `case "compaction_start"` is `:3075-3087` with the rebind at `:3080-3083` and `compaction_end` restoring at `:3089+`. `state.compacting` is armed and cleared on the `CompactionStart`/`CompactionEnd` arms (grep, do not carry a line), so the rebind's window matches upstream's, and `escape_chain.rs` asserts BOTH edges (Escape after `CompactionEnd` no longer returns `AbortCompaction`). The Verify's second half — TUI-055, the band actually reaching the screen — is also satisfied: `cyrup-tui/src/tests/compaction_status.rs` pins the live-measured cause (`/compact` must not be awaited on the run loop's `select!` task) and asserts the band renders `Compacting context... (escape to cancel)` mid-compaction and clears at `compaction_end`. **This was the backlog's #1 ranked item and one of its two open highs; it is a bookkeeping phantom, not work.** |
 | ~~SESS-007~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Session file whose first physical line is blank fails to open — **CLOSED 2026-08-14**: sweep 1 — and CORRECT the item's Fix: "make `NotASession` a soft-empty return per pi" is WRONG. pi's `_setSessionFile` THROWS `Session file is not a valid pi session: <path>` for a non-empty file whose parsed entries are empty or whose first entry is not a session header (session-manager.ts:900-906); only a missing or zero-length file is a soft new session. Only the first-parsed-entry half was a real defect. |
-| SESS-013 | ~~medium~~ low — **PARTIALLY CLOSED 2026-08-14** | not-ported | M | AGENTS.md loaded twice in a nested git linked worktree — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — cyrup-session half landed and re-verified at HEAD in sweep 2: `prompt/context_files.rs:170-201` `find_shadowed_context_file` ports both load-bearing guards and the `isShadowed` gate at `:147-152`, backed by the new `crates/cyrup-session/src/git_paths.rs`. **RESIDUAL (severity lowered medium → low: the parity defect is closed, what remains is a duplicate-code hazard): collapse the cyrup-tui copy of `find_git_paths` onto `cyrup_session::git_paths`.** |
+| ~~SESS-013~~ | ~~low~~ **CLOSED 2026-09-04** | not-ported | M | AGENTS.md loaded twice in a nested git linked worktree — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — cyrup-session half landed and re-verified at HEAD in sweep 2: `prompt/context_files.rs:170-201` `find_shadowed_context_file` ports both load-bearing guards and the `isShadowed` gate at `:147-152`, backed by the new `crates/cyrup-session/src/git_paths.rs`. **RESIDUAL CLOSED 2026-09-04**: the duplicate-code hazard is gone. `crates/cyrup-tui/src/footer_data.rs:54` is now `pub use cyrup_session_svc::{find_git_paths, GitPaths};` — its doc comment at `:41-47` states "This module used to carry a byte-for-byte second copy of the struct, the `path.resolve` helper and the whole upward `.git` walk" — and `crates/cyrup-session-svc/src/lib.rs:119-122` re-exports `cyrup_session::git_paths::find_git_paths` with a comment naming SESS-013 by id: "the ONE `findGitPaths` … re-exported so `cyrup-tui`'s footer reads the shared definition instead of carrying a second copy of the same walk." One definition (`cyrup-session/src/git_paths.rs`), one re-export chain, `rg -n "fn find_git_paths"` returns exactly one definition workspace-wide. This landed in `380c713`, i.e. before this ledger's own `4fb5e40` baseline — the row was simply never updated to match the code. **SESS-013 is now closed in full.** |
 | ~~SESS-016~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Explicitly EMPTY selected-tools list still emits skills and tool guidelines — **CLOSED 2026-08-14**: sweep 1 + 2 — cyrup-session half in sweep 1; area 08 closed the handoff in sweep 2. Two of the three named call sites were already `Some(...)`; the third, `builder.rs` `rebuild_base.selected_tools`, was `Some(Vec::new())` — which under the new `Option` semantics READS as "the caller restricted the agent to zero tools" (suppressing skills and every tool guideline) — and is now `None`, with a comment recording that it is overwritten by every `PromptRebuilder::rebuild` and so unobservable, but must not read as the restricted case. |
 | ~~SESS-017~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | `run_branch_summary` records `fromId` as the OLD leaf — **CLOSED 2026-08-14**: sweep 1 — `Compactor::run_branch_summary` routes through `SessionManager::branch_with_summary`; cyrup no longer has two contradicting branch-summary implementations. |
 | ~~SESS-018~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `custom_message` null content renders `"null"`; missing `display` drops the entry — **CLOSED 2026-08-14**: sweep 1. |
@@ -251,20 +292,22 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 | ~~SESS-019~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | Footer `Current date` line plus extra newline; `project_context` wording drift — **CLOSED 2026-08-14**: sweep 1 — BOTH halves. Half (a)'s framing corrected: it is NOT an upstream-drift decision to co-ordinate with DRIFT-016/DRIFT-035 — `git grep 'Current date' v0.83.0 -- packages/coding-agent/src` returns nothing, so the removal predates cyrup's own ported baseline and carrying it was a stale port. The Verify sentence "the prompt/tests.rs `Current date:` assertions are NOT test-defects" is struck — they were, and they are replaced. |
 | ~~SESS-025~~ | ~~low~~ **CLOSED 2026-08-14 — REFUTED** | stale-port | S | `reserve_tokens` doc and two test names assert the pre-SESS-006 rule — **REFUTED, CLOSED 2026-08-14**: sweep 1 + 2 — the doc + citation + one-rename half landed; the second stale-test-name claim is **REFUTED** (`tests/parity.rs:122 fn gap5_cut_point_validity_excludes_settings_and_summaries` is about cut-point validity, does not mention `reserve_tokens` or a budget, and was correctly left alone). Sweep 2 completed the citation sweep sweep 1 claimed: three stale cites survived in `crates/cyrup-session/src/tests/compaction.rs` and were re-resolved by opening the file at the tag, not by shifting — `:546` `branch-summarization.ts:315` → `:195-241`; `:888` `agent-session.ts:2844` → `:3038` (that offset matched NEITHER tag — an inherited citation); `:2199` `branch-summarization.ts:315` → `:312`. No production change owed. |
 | ~~SESS-026~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `serialize_conversation` omits `[Assistant]: ` for an empty text block — **CLOSED 2026-08-14**: sweep 1. |
-| SESS-027 | low | stale-port | S | Content-deserializer docs promise validation their bodies removed — **2026-08-14, still open**: sweep 2 — unchanged (documentation-only, `cyrup-core/src/message.rs`). Note it is the SAME mechanism class as the newly-filed SESS-045 — pi's TypeScript field types are compile-time only and its readers re-validate by hand — which strengthens the case for fixing it. |
+| SESS-027 | low | stale-port | S | Content-deserializer docs promise validation their bodies removed — **2026-08-14, still open**: sweep 2 — unchanged (documentation-only, `cyrup-core/src/message.rs`). Note it is the SAME mechanism class as the newly-filed SESS-045 — pi's TypeScript field types are compile-time only and its readers re-validate by hand — which strengthens the case for fixing it. **2026-09-04: RE-VERIFIED, still open, citation updated.** `cyrup-core/src/message.rs` no longer exists — `5b3d37e` (before this ledger's `4fb5e40` baseline) split it into `cyrup-core/src/message/{content,assistant,conversation}.rs`. The fix is now HALF landed: the three fn-level docs on `de_user_content`/`de_tool_result_content`/`de_assistant_content` (`message/content.rs:136-138`, `:149-151`, `:165-167`) were rewritten in `380c713` to say "READ-TOLERANT, not validating" and cite this item by id — that half of the Fix is done and should not be re-derived. But the **enum-level doc this item's Fix also named** (the old `:634-641` field doc, now the `Content` enum's own top-of-file doc at `message/content.rs:6-13`) was NOT touched and still asserts the disproved claim verbatim: "cyrup … enforces Pi's per-role unions at the wire boundary with validating deserializers … a payload carrying an `Image` in an assistant turn — or a `ToolCall`/`Thinking` in a user/tool-result turn — is REJECTED on deserialize, exactly as Pi's typed unions reject it." That sentence now contradicts the three function docs immediately below it in the same file, which is a narrower but still-live instance of exactly the defect this item names. Left open; only the citation and the residual scope changed. |
 | ~~SESS-029~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `estimate_tokens` applies one content-chars function to every role — **CLOSED 2026-08-14**: sweep 1. |
 | ~~SESS-030~~ | ~~low~~ **CLOSED 2026-08-14 — REFUTED** | not-ported | S | `CompactionResult` omits pi's `usage` — **REFUTED, CLOSED 2026-08-14**: sweep 1 — **REFUTED at HEAD.** `cyrup-session-svc/src/state.rs`'s `CompactionResult` carries `usage: Option<Usage>` and `estimated_tokens_after`, with a doc block citing compaction.ts:93 and SEAM-034; area 08's duplicate was fixed. Do not double-count with SEAM-034. |
 | ~~SESS-033~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | `inputs_fingerprint` omits `disable_model_invocation`, has no caller, doc claims otherwise — **CLOSED 2026-08-14**: sweep 1 — the third suggestion (reconsider `inp.today.hash`) was taken: `today` is no longer hashed, because SESS-019 removed the only thing it affected. |
 | ~~SESS-034~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | M | Before-tree seam has no channel for customInstructions / replaceInstructions / label — **CLOSED 2026-08-14**: sweep 1 — the alternative fix was taken (widen `BeforeTreeDecision`, add `generate_branch_summary_with_instructions`) rather than the collapse, because the collapse target lives in cyrup-session-svc. `label` handling was included — the item's Fix mentions the field but its Verify does not test it. |
-| SESS-036 | low — **PARTIALLY CLOSED 2026-08-14** | parity-bug | S | Context-file ancestor walk canonicalizes cwd where pi uses `path.resolve` — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — the redundant `canonicalize` is gone from `context_files.rs` and the ancestor walk is lexical like pi's `path.resolve`; a realpath helper survives only where pi keeps one, in `find_shadowed_context_file`. **RESIDUAL: the `cyrup-config/src/env.rs:171` normalization decision — area 05.** |
+| ~~SESS-036~~ | ~~low~~ **CLOSED 2026-09-04** | parity-bug | S | Context-file ancestor walk canonicalizes cwd where pi uses `path.resolve` — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — the redundant `canonicalize` is gone from `context_files.rs` and the ancestor walk is lexical like pi's `path.resolve`; a realpath helper survives only where pi keeps one, in `find_shadowed_context_file`. **RESIDUAL CLOSED 2026-09-04**: `crates/cyrup-config/src/env.rs` no longer canonicalizes the runtime cwd at all. The `cwd` binding (`ConfigDirs` construction, `env.rs:274-289`) is `std::env::current_dir()` verbatim for the no-`--cwd` case — pi's `main.ts:534` `const cwd = process.cwd();` — and `crate::paths::resolve_path_from_base` (lexical, pi's `resolvePath`) for an explicit `--cwd`; neither branch calls `std::fs::canonicalize`. A 23-line in-source comment at `env.rs:251-273`, headed "SESS-036's residual", records the removal and walks through why the R-07-013 justification for the old call did not hold, plus the Windows extended-length-path (`\\?\`) hazard the old call was silently introducing. This landed in `e5c6933`, also before this ledger's `4fb5e40` baseline. **SESS-036 is now closed in full.** |
 | ~~SESS-043~~ | ~~low~~ **CLOSED 2026-08-15** | parity-bug | M | Agent transcript re-seeded from the flattened context, not pi's raw one — **CLOSED 2026-08-15**: batch B — confirmed open at HEAD first (`cyrup_agent::AgentMessage` had four arms and all three sites folded `ctx.messages` through `core_message_to_agent`), then fixed. **The widening took the shape pi's own layering dictates, not three new concrete variants.** pi's BASE union is `type AgentMessage = Message \| CustomAgentMessages[keyof CustomAgentMessages]` over an **empty** `interface CustomAgentMessages` (`packages/agent/src/types.ts:310-319` @v0.83.0), which the coding agent fills by declaration merging with four roles (`coding-agent/src/core/messages.ts:68-77`). cyrup-agent is that base package and depends on `cyrup-core`/`cyrup-provider` only — `BashExecutionMessage` & co. live one layer UP in `cyrup-session` — so re-declaring them here would have inverted the dependency and created a second copy to drift. Instead `AgentMessage::App { role, payload }` holds the pi wire object verbatim (`custom` keeps its existing typed arm, since extensions construct it directly), with a hand-written `Deserialize` that routes exactly `APP_MESSAGE_ROLES` and still **errors** on any other unknown role. The three sites — `session.rs` manual compaction, `navigate_tree`, auto compaction — now seed from `build_context_raw()` (pi `:1875` / `:3068` / `:2156`, **re-derived at v0.83.0 by grepping `this.agent.state.messages = `**, all three exact). **Second half, and the reason it was more than three one-line edits:** the LLM boundary had only pi's BASE `defaultConvertToLlm`, so anything merged that entered the transcript would have vanished from the request. `cyrup-session-svc/src/hooks.rs` now carries `coding_agent_convert_to_llm` — pi's `convertToLlm` (`messages.ts:148-195`), the function `sdk.ts:301` hands the Agent — and `PolicyHooks::convert_to_llm` wraps it for `blockImages` exactly as `convertToLlmWithBlockImages` does (`sdk.ts:256-289`). That also fixes a divergence the item did not name: `PolicyHooks` delegated to the extension seam, which does not override the hook, so a `custom` message was DROPPED from the request while the same message rendered into it after any compaction (because `build_context()` had already flattened it) — pi has one function and no extension seam on it. Red-before test `compaction_reseeds_the_transcript_from_pi_s_raw_context` (`cyrup-session-svc/src/tests/agent_transcript_raw_seed.rs`); the two `App`-mapping tests are labelled in-file as coverage, not proof, because the variant is new. **FOLLOW-UP DEFECT FOUND IN ADVERSARIAL REVIEW OF THIS CHANGE, AND FIXED IN THE SAME BATCH (2026-08-15).** Making the boundary the coding-agent `convertToLlm` reached the `Custom` arm for the first time — the BASE `default_convert_to_llm` had dropped every `Custom` — and that arm went straight to `custom_to_message`, whose catch-all STRINGIFIES its input. But `kind` is overloaded on that arm: `record_bash_result` (`cyrup-session-svc/src/session.rs`) appends a **live** `!` execution as `Custom { kind: "bashExecution", payload: <the whole BashExecutionMessage body> }`, exactly as the session file does (`append_custom_message("bashExecution", …)`, which reloads as `Raw::BashExecution`). So SESS-043 as first landed (a) injected the raw JSON wire object into the request as a user turn instead of pi's `bashExecutionToText`, and (b) **ignored `excludeFromContext`** — a `!!` command's output reached the model on the live turn, where before this change it was dropped. pi returns `undefined` for exactly that message (`messages.ts:152-156` @v0.83.0). Fixed by routing a `kind` in `APP_MESSAGE_ROLES` through the same `push_llm` the `App` arm uses, so the live and post-compaction renderings of one execution cannot disagree; `app_role_payload` in `hooks.rs`. Red-before and **mutation-verified** by `a_live_bash_execution_renders_like_a_reseeded_one_and_honours_exclude_from_context`. Also corrected: `AgentMessage::App`'s doc claimed the payload "round-trips byte-faithfully" — it does not, `serde_json::Map` is a `BTreeMap` without `preserve_order`, so key order is sorted on parse and pi's declaration order cannot be restored; the variant is safe only because it never reaches the session file or the extension payload, both of which serialize `cyrup_session`'s manual `SerializeMap`. The round-trip test asserted the byte claim and FAILED in the gate. **Blast radius measured, not estimated: 3 exhaustive matches workspace-wide** (`cyrup-agent/src/tests/agent_loop.rs`, `cyrup-session-svc/src/event.rs`, `.../tests/integration.rs`); `cargo clippy --workspace --all-targets` is clean. |
 | ~~SESS-044~~ | ~~low~~ **CLOSED 2026-08-14 — REFUTED** | parity-bug | S | `encode_cwd` strips every leading path separator where pi strips exactly one — **REFUTED, CLOSED 2026-08-14**: sweep 1 + 2 — sweep 1 fixed `cyrup_session::encode_cwd` and RAISED the residual to a live hazard because `crates/cyrup/src/migrations.rs` still stripped all leading separators, so the two encoders DISAGREED. Sweep 2 verified that is gone: `crates/cyrup/src/migrations.rs:144-152` calls the canonical `cyrup_session::layout::encode_cwd` with a SESS-044 comment recording why the private duplicate was deleted (its global `trim_start_matches` disagreed with pi's anchored, non-global first `replace`, migrations.ts:112). There is now one encoder. |
-| SESS-S05 | low — **PARTIALLY CLOSED 2026-08-14** | not-ported | S | `TreeNode` drops pi's `labelTimestamp`; the `t` toggle switches an always-empty column of the wrong shape — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — piece (1) of three is done: `cyrup_session::TreeNode.label_timestamp` exists (`manager.rs:39`), `SessionManager::label_timestamp()` is public (`:621-622`) and populated at `:668`; the 19-line comment at `cyrup-tui/src/app/tree_nav.rs:25-43` conceding there is no producer is STALE. **RESIDUAL: pieces (2) the cyrup-tui producer and (3) the inline render + `formatLabelTimestamp` port — area 07.** |
+| SESS-S05 | low — **PARTIALLY CLOSED 2026-08-14** | not-ported | S | `TreeNode` drops pi's `labelTimestamp`; the `t` toggle switches an always-empty column of the wrong shape — **PARTIALLY CLOSED 2026-08-14**: sweep 1 — piece (1) of three is done: `cyrup_session::TreeNode.label_timestamp` exists (`manager/tree.rs:21`), `SessionManager::label_timestamp()` is public (`manager/tree.rs:48-52`); the 19-line comment at `cyrup-tui/src/app/tree_nav.rs:25-43` conceding there is no producer is STILL STALE. **RESIDUAL, RE-VERIFIED 2026-09-04 — still open, unchanged: `app/tree_nav.rs:44` still hardcodes `time_label: None` and `tree_selector.rs:867` still renders the timestamp as a right-aligned trailing column, not pi's inline composition; `formatLabelTimestamp` still has no cyrup counterpart. Pieces (2) the cyrup-tui producer and (3) the inline render + `formatLabelTimestamp` port — area 07.** (`manager.rs` was decomposed into `manager/*.rs` in `2f929a3`, before this ledger's `4fb5e40` baseline — citations above updated to match; nothing about the item's status changed.) |
 | SESS-038 | *(tracker)* | upstream-drift | L | `packages/session-backends/sqlite-node` (new at v0.84.1) has no cyrup counterpart — scope decision, not counted |
 | SESS-045 | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2). Highest-value find of that pass, and a textbook JS→Rust mechanism gap.** `header.rs` declared `timestamp: String` and `cwd: String` as plain required fields, so serde rejected the whole line for a header missing either: `manager::load` returned `SessionError::NotASession` (a hard CLI error) and `listing::header_candidate` demoted the line to "not a session", erasing the file from `list_in_dir`, `newest_session` and every picker. pi's identical-looking `interface SessionHeader` (session-manager.ts:32-39) is **compile-time only**: its two runtime header validators test `type` and `id` and nothing else (:548-552, :566), and every consumer re-checks the rest by hand and tolerates a miss — `getSessionHeaderCwd` is `typeof cwd === "string" ? cwd : undefined` (:625-628) folded through `?? process.cwd()` at :1546, and `buildSessionInfo` is `typeof header.cwd === "string" ? header.cwd : ""` (:739) and `typeof header.timestamp === "string" ? new Date(...) : NaN` (:742) with the NaN arm falling back to `stats.mtime` (:743-748). Fixed with `#[serde(default, deserialize_with = "de_string_or_empty")]` on both, mapping absent/null/non-string to `""` — exactly what pi's ternaries produce. `id` stays required: `SessionId` is `#[serde(transparent)]` over `Arc<str>`, so a non-string id fails here exactly as it fails at :552/:566. **Same class as SESS-001/SESS-027, one layer up in the file — which is an argument for finally fixing SESS-027.** |
 | SESS-046 | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2), and STRIKE the matching bullet from `## Coverage → Rejected, with reason`** — the entry reading "Sort-order divergence in computeFileLists … judged below the filing bar; **not confirmed unreachable**, so it is a candidate" is resolved: it was real. pi's `computeFileLists` sorts with a bare `Array.prototype.sort()`, which ECMA-262 defines as UTF-16 code-unit order; cyrup collected out of a `BTreeSet<String>`, i.e. UTF-8 byte order. These are DIFFERENT relations — UTF-16 encodes a supplementary-plane code point as a surrogate pair starting at 0xD800, below every code point in U+E000..=U+FFFF, while UTF-8 sorts it above — so a path with an emoji next to a path with a private-use / CJK-compatibility character lands in the opposite order. Not an internal detail: the lists are joined into the `<read-files>`/`<modified-files>` blocks that `format_file_operations` appends to every persisted compaction and branch summary, and that text is fed back into the next summarization prompt. Fixed with a documented `utf16_cmp` in `compaction/files.rs`. |
 | SESS-047 | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2), and STRIKE the matching bullet from `## Coverage → Rejected, with reason`** ("`compute_max_tokens_frac` applies a `.max(1)` floor pi does not have … Only reachable with `reserve_tokens == 0`. Not filed.") **and CORRECT its reachability claim**: it also fires at `reserve_tokens == 1` for both fractions (floor(0.8·1)=0, floor(0.5·1)=0), and `CompactionSettings.reserve_tokens` is a plain deserialized `u32` with no minimum, so a settings file reaches it. pi is `Math.min(Math.floor(frac * reserveTokens), maxTokens > 0 ? maxTokens : Infinity)` at compaction.ts:637-640 and :937-940, with no lower bound. Clamp removed. |
 | SESS-048 | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2), found by the migrate.rs blind-spot walk.** `convert_first_kept_index` matched on `Value::as_u64`, so it returned EARLY for a NEGATIVE or FRACTIONAL index and left the dead v1 `firstKeptEntryIndex` key on the entry — which the migration rewrite then PERSISTED into the file. pi's guard is `typeof comp.firstKeptEntryIndex === "number"`, true for both shapes, and the `delete` inside it runs for every one of them (session-manager.ts:245-255). Second half of the same gap: `entries[comp.firstKeptEntryIndex]` is a JS property access, so the index is stringified — `String(2.0) === "2"` and pi RESOLVES a fractional-but-integral index to the same element, where cyrup resolved nothing. Now reads the value as `f64`, resolves only when non-negative and integral, and always strips the key. **CORRECTS THE SESS-015 RECORD:** the refuter's note that `convert_first_kept_index` is "behaviourally equivalent … for idx 0, out-of-range, forward-reference, negative and float indices" is right about the id assignment and WRONG about the field deletion for the negative and float cases. |
+| SESS-049 | medium | upstream-drift | S | **NEW 2026-09-04, from the `v0.84.1..v0.84.4` delta.** All three cyrup summarization call sites (`summarize.rs::generate_summary`, `::generate_turn_prefix_summary`, `branch.rs::generate_branch_summary_with_instructions`) still treat a token-cap (`StopReason::Length`) response, and one carrying a tool-call block, as a complete summary — matching pi v0.84.1, which this file's own comments cite. pi v0.84.2 added `getSummarizationFailure` (rejects `Length` too) and a toolCall check to all three of its matching functions; cyrup never picked it up. See the item. |
+| SESS-050 | low | not-ported | M | **NEW 2026-09-04, from the same delta.** pi v0.84.2 added the `session_compact_failed` extension event (fired from 5 call sites on a failed/cancelled compaction, manual and auto); cyrup ported the success sibling `session_compact` but has no counterpart for the failure event anywhere in `HostEvent` or its dispatch sites. See the item. |
 
 ## SESS-040 — Compaction cannot be cancelled from the shipped binary: the Escape rebind was never ported, `AbortCompaction` has zero callers, and the indicator advertises "(esc to cancel)"
 
@@ -329,6 +372,15 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 **Verify** — Fixture session prefixed with `"\n"`; assert `load` succeeds, `read_header` and `scan_file` agree, and that a genuinely malformed first line yields empty rather than an error.
 
 ## SESS-013 — AGENTS.md loaded twice in a nested git linked worktree (no `findShadowedContextFile`)
+
+> **CLOSED IN FULL 2026-09-04.** The parity defect below closed in sweep 1 (2026-08-14) — see the
+> `## Open items` row. The residual left open after that — a duplicate `find_git_paths` copy in
+> `cyrup-tui` that could drift from the fixed `cyrup-session` copy — is also gone: `380c713` (before
+> this ledger's `4fb5e40` baseline) collapsed `cyrup-tui/src/footer_data.rs`'s copy onto
+> `pub use cyrup_session_svc::{find_git_paths, GitPaths}` (`footer_data.rs:54`), itself
+> `pub use cyrup_session::git_paths::{find_git_paths, ...}` (`cyrup-session-svc/src/lib.rs:122`).
+> `rg -n "fn find_git_paths" crates/` returns exactly one definition workspace-wide. The body below
+> is the pre-closure record; kept for the parity-defect evidence.
 
 **Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high (line refs exact both sides)
 
@@ -582,6 +634,21 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 
 ## SESS-027 — Three `cyrup-core` content deserializers' docs promise per-role validation their bodies removed
 
+> **RE-VERIFIED 2026-09-04 — STILL OPEN, narrower than filed, citations moved.**
+> `cyrup-core/src/message.rs` no longer exists: `5b3d37e` (before this ledger's `4fb5e40` baseline)
+> split it into `cyrup-core/src/message/{content,assistant,conversation,...}.rs`. In the same window
+> (`380c713`, also pre-baseline) the three FUNCTION-level docs this item names WERE rewritten —
+> `message/content.rs:136-138` (`de_user_content`), `:149-151` (`de_tool_result_content`), `:165-167`
+> (`de_assistant_content`) now each read "READ-TOLERANT, not validating" and cite this item by id. Do
+> not re-file that half. But the fourth doc the Fix also named — the old `:634-641` "field doc",
+> which is the `Content` enum's own top-of-file doc block, now `message/content.rs:6-13` — was NOT
+> touched, and still asserts the disproved claim verbatim: cyrup "enforces Pi's per-role unions at
+> the wire boundary with validating deserializers … a payload carrying an `Image` in an assistant
+> turn — or a `ToolCall`/`Thinking` in a user/tool-result turn — is REJECTED on deserialize, exactly
+> as Pi's typed unions reject it." That sentence now directly contradicts the three function docs
+> immediately below it in the same file. Left open on that one remaining doc block; body below is
+> the pre-split record.
+
 **Kind** stale-port · **Severity** low · **Effort** S · **Confidence** high (all doc/body pairs read)
 
 **cyrup** — `cyrup/crates/cyrup-core/src/message.rs:741-744` documents `de_user_content` as "validating the array to `Text|Image` only … a `Thinking`/`ToolCall` block is rejected" while its own body comment at `:756-758` says "with no role-union rejection". The same contradiction holds for `de_tool_result_content` (doc `:766-767` vs body `:773-775`) and `de_assistant_content` (doc `:778-780` vs its body). The field doc at `:634-641` repeats the false claim.
@@ -651,6 +718,18 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 **Verify** — Script a before-tree hook returning custom instructions and assert the recording summarizer saw a prompt containing "Additional focus:"; with `replace_instructions`, assert the prompt is the custom text alone.
 
 ## SESS-036 — Context-file ancestor walk canonicalizes the cwd where pi uses `path.resolve`
+
+> **CLOSED IN FULL 2026-09-04.** The `context_files.rs:124` half closed in sweep 1 (2026-08-14) — see
+> the `## Open items` row. The residual this item's Fix routed to `cyrup-config/src/env.rs:171` (the
+> real, no-op-on-unix canonicalize the refuter caveat below identifies) is also gone: `e5c6933`
+> (before this ledger's `4fb5e40` baseline) deleted that `std::fs::canonicalize` call entirely.
+> `env.rs`'s `cwd` binding is now `std::env::current_dir()` verbatim (pi's `process.cwd()`,
+> `main.ts:534`) with no `--cwd`, or `crate::paths::resolve_path_from_base` (lexical, pi's
+> `resolvePath`) with one — matching the refuter's own diagnosis of what pi does. A 23-line comment
+> at `env.rs:251-273`, headed "SESS-036's residual", records the removal and the Windows
+> extended-length-path (`\\?\`) hazard the deleted call was quietly introducing. The body below is
+> the pre-closure record; kept for the mechanism evidence (the refuter caveat especially, since it is
+> the correction that made this a `low` and not the originally-filed `medium`).
 
 **Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** medium (code difference certain; blast radius inferred, and the auditor's mechanism was wrong — see below)
 
@@ -770,6 +849,111 @@ for `//net/x` (`---net-x--`) and `\\srv\share` (`---srv-share--`), and add an as
 input — a property test over generated paths is cheap here and would have caught the divergence when
 the second copy was written.
 
+## SESS-049 — All three summarization call sites treat a token-cap (`Length`) stop, and a tool-call block, as a valid finished summary; pi v0.84.2+ rejects both
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** high (both sides read; three cyrup call sites, three matching pi call sites)
+
+> **New 2026-09-04, from the `v0.84.1..v0.84.4` delta this area's task scope names.** This area's own
+> baseline table (top of file) measured only `v0.83.0..v0.84.1`, over which `core/compaction/*` was
+> byte-unchanged; the sweeps that closed most of this file's backlog were run against that same
+> window. `v0.84.1..v0.84.4` is unaudited by any prior pass and is NOT byte-unchanged: `compaction.ts`
+> alone carries **101 changed lines**, of which this is the behavioural half.
+
+**cyrup** — Three call sites, all still grouping `Length`/`ToolUse` with the success arm exactly as
+pi did at v0.84.1 (the tag this file's own in-source comments cite for this shape):
+`cyrup/crates/cyrup-session/src/compaction/summarize.rs::generate_summary` (match at `:385-407`),
+`::generate_turn_prefix_summary` (match at `:436-458`), and
+`cyrup/crates/cyrup-session/src/compaction/branch.rs::generate_branch_summary_with_instructions`
+(match at `:295-308`). Each does
+`StopReason::Stop | StopReason::Length | StopReason::ToolUse => Ok(...)`, so a summarization response
+that hit the model's token cap mid-sentence, or that emitted a tool-call block (the summarization
+request carries no `tools`, so this needs a model ignoring that), is accepted as a **complete**
+summary and persisted.
+
+**upstream** — `pi/packages/coding-agent/src/core/compaction/compaction.ts` (v0.84.4)
+`getSummarizationFailure` (`:541-553`, new function, doc: "A length stop contains partial text and
+must not become a session checkpoint"): `stopReason === "error"` OR `stopReason === "length"` now
+both fail. Called at `:715-721` (`generateSummaryWithUsage`, cyrup's `generate_summary`) and
+`:1000-1006` (`generateTurnPrefixSummary`, cyrup's `generate_turn_prefix_summary`), each immediately
+followed by `if (response.content.some((block) => block.type === "toolCall")) throw new Error(...)`.
+`pi/packages/coding-agent/src/core/compaction/branch-summarization.ts` (v0.84.4) picked up the same
+pair in the same release: `generateBranchSummary` now calls `getSummarizationFailure(response,
+"Branch summarization")` and the same toolCall check in place of the old bare
+`stopReason === "error"` test. `git -C tmp/pi diff v0.84.1..v0.84.4 --
+packages/coding-agent/src/core/compaction/{compaction,branch-summarization}.ts` shows both changes;
+`v0.83.0..v0.84.1` over the same paths is empty, so this is genuinely new since this file's own
+version-lag sweep, not something the prior passes could have caught.
+
+**Impact** — Compaction's whole purpose is to become the ONLY remaining record of everything it
+summarizes — the raw messages are gone once it lands. If the summarization call hits `max_tokens`
+(plausible: `compute_max_tokens_frac` budgets a fraction of `reserve_tokens`, and SESS-047 already
+found that budget can be driven arbitrarily small), cyrup silently persists a mid-sentence-truncated
+summary as that permanent record, where pi now refuses and surfaces an error the caller can retry or
+surface to the user. Silent wrong output on the exact path compaction exists to protect. Rated
+`medium`, not higher, because it requires the token cap to actually bind — bounded but plausible, not
+a hypothetical.
+
+**Fix** — Add a `StopReason::Length` arm distinct from `Stop`/`ToolUse` at all three match sites
+(`summarize.rs:385-407`, `:436-458`, `branch.rs:295-308`), returning `CompactionError::Summarization`
+with text mirroring pi's `"{label} failed: generation hit the token cap and the summary is
+incomplete"`. Separately, after each successful match, add pi's `content.some(toolCall)` check and
+error mirroring `"{label} attempted to call a tool"`.
+
+**Verify** — Stub a `Summarizer`/branch summarizer returning `stop_reason: Length` with partial text;
+assert `generate_summary`, `generate_turn_prefix_summary` and
+`generate_branch_summary_with_instructions` all return `Err`, not the partial text. Repeat with a
+response whose `content` includes a `Content::ToolCall` block alongside text.
+
+## SESS-050 — No cyrup counterpart to pi's `session_compact_failed` extension event; extensions see compaction succeed but never see it fail or abort
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** high (both sides read; grep confirms zero cyrup occurrences)
+
+> **New 2026-09-04, from the same `v0.84.1..v0.84.4` delta as SESS-049.** `agent-session.ts` carries
+> **446 changed lines** across that window (`git -C tmp/pi diff --stat v0.84.1..v0.84.4 --
+> packages/coding-agent/src/core/agent-session.ts`); this is one confirmed, scoped finding out of
+> that diff, not a claim the whole file was read line-by-line — the rest is unaudited and should not
+> be assumed clean.
+
+**cyrup** — `session_compact` (pi's SUCCESS event) is ported and working: `HostEvent::SessionCompact`
+(`crates/cyrup-ext/src/event.rs:151`) is dispatched at
+`cyrup-session-svc/src/session/compaction.rs:270-283` (manual) and
+`cyrup-session-svc/src/session/auto_compaction.rs:352-366` (auto), both inside the success arm only.
+Neither file's failure/cancellation arms — `compaction.rs`'s `Ok(None)` (cancelled, `:296-306`) and
+`Err(e)` (failed/aborted, `:307-321`) branches, and `auto_compaction.rs`'s matching arms — call any
+extension-facing dispatch; they only fan out the internal `AgentSessionEvent::CompactionEnd`, which
+extensions cannot subscribe to. `rg -n "SessionCompactFailed" crates/` and `rg -n
+"session_compact_failed" crates/` both return nothing workspace-wide; `HostEvent`
+(`cyrup-ext/src/event.rs:284`) has no such variant.
+
+**upstream** — `pi/packages/coding-agent/src/core/extensions/types.ts` (v0.84.4) `:616-628`
+`interface SessionCompactFailedEvent { type: "session_compact_failed"; reason: "manual" | "threshold"
+| "overflow"; errorMessage?: string; aborted: boolean; willRetry: boolean; fromExtension: boolean }` —
+the sibling of the already-ported `SessionCompactEvent` (`:606-614`), added in this window (absent at
+v0.84.1: `git -C tmp/pi show v0.84.1:packages/coding-agent/src/core/extensions/types.ts | grep -c
+SessionCompactFailedEvent` is 0). `agent-session.ts` `_emitSessionCompactFailed` (`:605-608`) gates
+on `this._extensionRunner.hasHandlers("session_compact_failed")` and is called from **five** sites
+covering manual compaction failure (`:2077`), and the threshold/overflow/retry auto-compaction
+failure arms (`:2178`, `:2286`, `:2341`, `:2412`).
+
+**Impact** — An extension that wants to react to a failed or cancelled compaction — log it, retry
+with different settings, warn the user through its own UI — has no event to subscribe to; it only
+ever sees `session_compact` on success, so from an extension's point of view a failed compaction is
+indistinguishable from "nothing happened." SDK-surface gap, no TUI-visible consequence, which is why
+this stays `low` despite covering five call sites upstream — same shape and severity as the already-
+closed SESS-030 (`CompactionResult` omitting `usage`) before it was fixed.
+
+**Fix** — Add a `SessionCompactFailed` variant to `HostEvent` (`cyrup-ext/src/event.rs`) and the WIT
+world it mirrors, then dispatch it from the `Ok(None)` and `Err(e)` arms of
+`cyrup-session-svc/src/session/compaction.rs` (manual) and the matching arms of
+`auto_compaction.rs` (auto), carrying `reason`/`error_message`/`aborted`/`will_retry`/`from_extension`
+— the same fields `AgentSessionEvent::CompactionEnd` already computes at each of those sites, so no
+new data needs deriving, only a second dispatch alongside the existing `fanout_emit`.
+
+**Verify** — Script an extension registering a `session_compact_failed` handler, force a compaction
+to fail (stub summarizer returning `StopReason::Error`) and to be cancelled, and assert the handler
+fires once per case with the right `aborted`/`reason` fields; assert it does NOT fire on a successful
+compaction (that stays exclusively `session_compact`'s job).
+
 ## Coverage
 
 **Read first-hand at cyrup HEAD `04c1ba2`** (repo HEAD `a9000b1`, docs-only; tree clean). Nothing was
@@ -777,6 +961,30 @@ executed — no cargo, no npm, no test run. Every `closed` verdict is a read of 
 at HEAD against the corresponding pi function opened **in full**, by two independent passes (an
 auditor and a refuter instructed to default to rejection). A test cited as evidence is evidence of
 intent, not of passing.
+
+**Re-audit pass 2026-09-04 — cyrup HEAD `2571969`, task baseline `4fb5e40` (8 commits touch
+`crates/cyrup-session` in between; `git log --oneline 4fb5e40..HEAD -- crates/cyrup-session`).**
+Every currently-open row and the `SESS-038` tracker were re-read against HEAD before touching
+anything, per the standing instruction to confirm at HEAD rather than trust a commit message or task
+file. Two closures (`SESS-013`, `SESS-036`) found code that had ALREADY landed before `4fb5e40` —
+this file's own record had simply never caught up to it, which is the same failure mode
+`SESS-037`/`SESS-041`/`SESS-042` hit in the 2026-08-14 sweep (a truncated handoff, not a missing
+fix). `SESS-027` and `SESS-S05` were re-verified still-open with citations repaired across three
+unrelated file splits that landed in the same pre-baseline window (`manager.rs` → `manager/*.rs`,
+`message.rs` → `message/*.rs`, and `tree_selector.rs`'s unrelated growth) — none of the splits
+changed any item's substance. New this pass: `git -C tmp/pi diff --stat v0.84.1..v0.84.4` over this
+area's paths (this file's own version-lag sweep only ever ran `v0.83.0..v0.84.1`) surfaced two
+confirmed findings, `SESS-049` and `SESS-050`, out of a much larger diff (`agent-session.ts` alone is
+446 changed lines) that was skimmed, not exhaustively read — see the note above the `## Open items`
+table for what was left unaudited and why. Files re-read this pass, beyond the sections already
+cited per-item: `crates/cyrup-session/src/manager/{mod,tree,lifecycle}.rs`,
+`crates/cyrup-core/src/message/{content,assistant,conversation}.rs`,
+`crates/cyrup-config/src/env.rs` (the `ConfigDirs` constructor in full),
+`crates/cyrup-tui/src/{footer_data,tree_selector}.rs`, `crates/cyrup-session-svc/src/lib.rs`,
+`crates/cyrup-session-svc/src/session/{compaction,auto_compaction,types}.rs`,
+`crates/cyrup-session/src/compaction/{summarize,branch}.rs`, `crates/cyrup-ext/src/event.rs`; at pi
+v0.84.4: `core/{compaction/compaction,compaction/branch-summarization,system-prompt,extensions/types}.ts`
+and a scoped read of `agent-session.ts` around every `_emitSessionCompactFailed` call site.
 
 **Repair pass 2026-08-12 — what it covered, what it rejected, what is still blind.**
 
@@ -986,15 +1194,24 @@ table above). One remains open: `SESS-S05`, whose body follows.
 > (pi's `showLabelTimestamps = false`, `tree-selector.ts:116`). What remains is structural — see
 > **cyrup** below.
 
+> **RE-VERIFIED 2026-09-04 — still open, still the same two gaps, citations refreshed.**
+> `cyrup-session/src/manager.rs` was decomposed into `manager/*.rs` in `2f929a3`, and
+> `cyrup-tui/src/tree_selector.rs` gained ~120 lines in `dd69fea` (unrelated `/tree` copy+paging
+> work); both landed before this ledger's `4fb5e40` baseline, so the line numbers below are updated
+> to match current HEAD, but nothing about the item's status changed: `app/tree_nav.rs:44` still
+> hardcodes `time_label: None`, and `tree_selector.rs`'s render is still a right-aligned column, not
+> pi's inline composition.
+
 **cyrup** — Data half open: `cyrup-tui/src/app/tree_nav.rs:44` sets `time_label: None` under a
 19-line comment (`:25-43`) conceding that `cyrup_session::TreeNode` still has no timestamp field,
 even though `SessionManager::labels` holds `(label, ts)` and `label()` discards the second element.
 **That concession is itself STALE at HEAD** — piece (1) of the Fix landed: `TreeNode` is
-`manager.rs:30-40` and carries `pub label_timestamp: Option<String>` at `:39`,
-`SessionManager::label_timestamp()` is public at `:621-622`, `labels: HashMap<EntryId, (String,
-String)>` is `:51`, and `build_node` populates the field at `:668`. **So the producer this paragraph
-blames the data layer for is now a one-line read in THIS crate**, and the comment at
-`app/tree_nav.rs:36-43` is the stale half. Render shape also open: `tree_selector.rs:738-752` emits
+`manager/tree.rs:10-22` and carries `pub label_timestamp: Option<String>` at `:21`,
+`SessionManager::label_timestamp()` is public at `:48-52`, `labels: HashMap<EntryId, (String,
+String)>` is the struct field at `manager/mod.rs:51`, and `build_node` (`manager/tree.rs:79-98`)
+populates the field at `:96`. **So the producer this paragraph blames the data layer for is a
+one-line read in THIS crate**, and the comment at `app/tree_nav.rs:36-43` is the stale half. Render
+shape also open: `tree_selector.rs:838-877` (the gate at `:862-867`, the padding at `:871-877`) emits
 the timestamp as a **right-aligned trailing column** (`pad = width − (left_len + right_width + 1)`, then
 a padded span). `formatLabelTimestamp`'s three formats have no cyrup counterpart anywhere.
 
@@ -1012,13 +1229,13 @@ in position and format.
 
 **Fix** — Three pieces, in order: ~~(1) add `label_timestamp: Option<String>` to
 `cyrup_session::TreeNode` and populate it from `labels` at the build site~~ **— DONE, sweep 1
-(`manager.rs:39`, populated at `:668`)**;
+(`manager/tree.rs:21`, populated at `:96`)**;
 (2) produce it at `app/tree_nav.rs:44` from `TreeNode::label_timestamp`, which `tree_node_from_dag`
-does not currently receive — it reads `SessionDagNode` (`cyrup-session-svc/src/session.rs:147-166`),
-whose only `timestamp` is the ENTRY's (`:165`), so the label timestamp has to reach the DAG
-projection first; (3) rewrite `tree_selector.rs:738-752` to compose inline after the label rather
-than as a right column, and port `formatLabelTimestamp`'s three-branch format from
-`tree-selector.ts:854-878`.
+does not currently receive — it reads `SessionDagNode` (`cyrup-session-svc/src/session/types.rs:84-103`,
+moved from `session.rs` by the crate's `session/` decomposition), whose only `timestamp` is the
+ENTRY's (`:101-102`), so the label timestamp has to reach the DAG projection first; (3) rewrite
+`tree_selector.rs:838-877` to compose inline after the label rather than as a right column, and port
+`formatLabelTimestamp`'s three-branch format from `tree-selector.ts:854-878`.
 
 **Verify** — Render a tree with a label applied at a known timestamp and byte-compare the row
 against a pi capture — position and format, not merely the presence of a non-empty string.
