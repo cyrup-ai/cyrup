@@ -1,6 +1,19 @@
 # SUBA-072 — `.cyrup-subagent-scratch/` is written into the PROJECT working tree instead of the scoped `~/.cyrup` (or OS temp) root
 
-> **Status** — OPEN. **Kind** `port-bug` · **Severity** medium · **Effort** S.
+> **Status** — ~~OPEN~~ **CLOSED 2026-09-04, cyrup `7791b26a`.** **Kind** `port-bug` · **Severity** medium · **Effort** S.
+> Landed exactly as §3 prescribes, with the resolution given a name: `crate::background::attempt_scratch_dir(cwd)`
+> (`background/mod.rs:1470`; pure core `attempt_scratch_dir_in(&Roots, cwd)` at `:1478`, leaf
+> `SCRATCH_SUBDIR = "scratch"` at `:1214`) → `<Roots::run_scratch>/scratch/<cwd_key>`; the one call
+> site is `exec/mod.rs:818` (`prepare_ladder`). Upstream anchors re-read at **v0.64.0** (ADR-0006
+> parity target; the v0.43.0 anchors below remain correct for the baseline): per-spawn scratch
+> `mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"))` at `src/runs/shared/pi-args.ts:787`/`:802`/
+> `:826`/`:841`/`:855`, `cleanupTempDir` at `:1052-1059`, `TEMP_ROOT_DIR` at `src/shared/types.ts:2689-2691`
+> (v0.64.0 adds a `PI_SUBAGENTS_TEMP_ROOT` override at `:2688` — CFG-067's item, not this one).
+> Pinned by `exec::tests::prepare_ladder_makes_the_scratch_dir_under_the_run_scratch_root_not_the_project_tree`
+> (red against the pre-fix call site) and `background::tests::attempt_scratch_dir_is_a_cwd_keyed_leaf_of_the_run_scratch_root_never_the_project_tree`;
+> the §3 consumer list was still short by three (`child_protocol_stream_integration`,
+> `background_runner_main_integration`, intercom `child_bridge_activation`) — all eight `cyrup-it`
+> readers now go through the public resolver. Residual: `.gitignore:20` is dead and can go.
 > Filed 2026-08-18 from a real project checkout: `git status` on `cyrup/` itself showed
 > `.cyrup-subagent-scratch/` and `.cyrup-subagents/` as untracked directories after ordinary
 > `/flux/*` subagent-tool use in this very repo.
