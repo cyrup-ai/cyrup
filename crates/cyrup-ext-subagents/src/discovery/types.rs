@@ -541,11 +541,12 @@ pub struct AgentOverrideInfo {
 /// §4.1). Every field below is exactly one field of pi's `BuiltinAgentOverrideConfig`
 /// (`agents.ts:80-103`), under the same JSON key.
 ///
-/// **This is NOT the complete set.** pi declares 22 override keys; the 18 fields below model 18 of
-/// them, and 4 are unmodeled. An earlier revision of this doc claimed field-for-field completeness —
-/// it was wrong, and the claim is retracted rather than softened, because "pi has no others" is
-/// exactly the sentence that stops a reader from checking. Keep the arithmetic here honest: a wrong
-/// census misleads in the same way the completeness claim did.
+/// **This is NOT the complete set.** pi declares 22 override keys at v0.43.0; the fields below model
+/// 18 of them, plus the two keys pi added in v0.62.0 (`excludeTools`/`allowNestedSubagents`,
+/// SUBA-092), and 4 are unmodeled. An earlier revision of this doc claimed field-for-field
+/// completeness — it was wrong, and the claim is retracted rather than softened, because "pi has no
+/// others" is exactly the sentence that stops a reader from checking. Keep the arithmetic here
+/// honest: a wrong census misleads in the same way the completeness claim did.
 ///
 /// THREE of the four are unmodeled because this crate's [`AgentDefinition`] has no field for them to
 /// land in, and modeling them anyway would produce a settings key that parses and is then silently
@@ -656,6 +657,21 @@ pub struct AgentOverrideConfig {
     /// why `false` and `"inherit"` must not be collapsed.
     #[serde(skip_serializing_if = "ToolsOverrideField::is_unset")]
     pub tools: ToolsOverrideField,
+    /// SUBA-092 — pi `excludeTools?: string[] | false` (`agents.ts:104` @v0.64.0), parsed upstream
+    /// by `parseOverrideStringArrayOrFalse` (`agents.ts:1097`): an array of strings (trimmed,
+    /// empties dropped) or a JSON `false` to clear. Lands in [`AgentDefinition::exclude_tools`];
+    /// a clear is pi's `delete next.excludeTools` (`agents.ts:1404`), i.e. `None`. The trim/drop
+    /// normalization is applied where the list is consumed
+    /// ([`crate::exec::build_attempt_spawn_plan`], mirroring `pi-args.ts:502`), so the raw
+    /// settings value is carried here verbatim like `skills`/`extensions` are.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub exclude_tools: OverrideField<Vec<String>>,
+    /// SUBA-092 — pi `allowNestedSubagents?: boolean` (`agents.ts:105` @v0.64.0; parsed at
+    /// `agents.ts:1099-1102`, applied at `:1405`). A plain boolean toggle with NO `| false` clear
+    /// form — as with `inheritSkills`, `OverrideField<bool>`'s `Value` arm accepts `false`, so a
+    /// JSON `false` is a real `Value(false)` and [`OverrideField::ExplicitClear`] is unreachable.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub allow_nested_subagents: OverrideField<bool>,
     /// pi `extensions?: string[] | false` (`agents.ts:99`) — the extension allowlist. Lands in
     /// [`AgentDefinition::extensions`], where `None` means "all extensions visible" and
     /// `Some(vec![])` means "none"; a clear restores `None`, matching pi's `delete next.extensions`
@@ -704,6 +720,8 @@ impl AgentOverrideConfig {
             || self.system_prompt.is_present()
             || self.skills.is_present()
             || self.tools.is_present()
+            || self.exclude_tools.is_present()
+            || self.allow_nested_subagents.is_present()
             || self.extensions.is_present()
             || self.subagent_only_extensions.is_present()
             || self.completion_guard.is_present()
@@ -965,6 +983,26 @@ pub struct AgentDefinition {
     /// tools; `Some(populated)` = exactly this allowlist. Distinct from `extensions` below, which
     /// has an independently-meaningful `None`/empty/populated tri-state (func-SA §4.1).
     pub tools: Option<Vec<ToolRef>>,
+    /// SUBA-092 — pi `AgentConfig.excludeTools?: string[]` (`agents.ts:140` @v0.64.0), from the
+    /// `excludeTools:` frontmatter key (`agents.ts:1988`, `parseFrontmatterList`) or a settings
+    /// override ([`AgentOverrideConfig::exclude_tools`]). A SUBTRACTIVE per-agent tool constraint,
+    /// applied at spawn time AFTER [`Self::tools`] and any capability ceiling have produced the
+    /// declared builtin set (`runs/shared/pi-args.ts:502-504` `effectiveDeclaredBuiltinTools`) —
+    /// so it narrows an explicit `tools:` allowlist AND, for an agent that declared no `tools:` at
+    /// all, the ambient set (emitted to the child as `--exclude-tools`, `pi-args.ts:776-777`).
+    ///
+    /// `None` = the key was absent (pi's `undefined`); `Some(list)` = whatever the list parser
+    /// produced, entries untrimmed and undeduplicated here — `pi-args.ts:502` trims, drops empties
+    /// and de-duplicates at the consumer, and so does [`crate::exec::build_attempt_spawn_plan`].
+    pub exclude_tools: Option<Vec<String>>,
+    /// SUBA-092 — pi `AgentConfig.allowNestedSubagents?: boolean` (`agents.ts:141` @v0.64.0), from
+    /// the `allowNestedSubagents:` frontmatter key (strictly `true`/`false`, `agents.ts:2061-2066`)
+    /// or a settings override. An INDEPENDENT grant of nested delegation for an agent that declares
+    /// no explicit `tools:` allowlist naming `subagent`: `pi-args.ts:505-509`'s `fanoutAuthorized`
+    /// is `effectiveDeclaredBuiltinTools.includes("subagent") || (allowNestedSubagents === true &&
+    /// !excludedToolSet.has("subagent") && (!allowedToolSet || allowedToolSet.has("subagent")))`.
+    /// `None`/`Some(false)` both mean "no independent grant" (only `=== true` counts upstream).
+    pub allow_nested_subagents: Option<bool>,
     /// `None` = all extensions visible; `Some(vec![])` = none; `Some(populated)` = allowlist
     /// (func-SA §4.1).
     pub extensions: Option<Vec<String>>,
@@ -1334,6 +1372,8 @@ mod tests {
             description: "reviews things".to_string(),
             aliases: Vec::new(),
             tools,
+            exclude_tools: None,
+            allow_nested_subagents: None,
             extensions: None,
             extensions_from_default: false,
             subagent_only_extensions: Vec::new(),

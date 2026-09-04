@@ -80,6 +80,12 @@ const KNOWN_FIELDS: &[&str] = &[
     "alias",
     "aliases",
     "tools",
+    // SUBA-092 — both entered `KNOWN_FIELDS` with pi's per-agent tool exclusions
+    // (`agent-serializer.ts:12-13` @v0.62.0, unchanged at v0.64.0; `allowNestedSubagents` was
+    // already there, `excludeTools` arrived with `b26da18e`). Same rule as every key above: known
+    // here AND emitted by `management::serialize_agent`, or the first management rewrite deletes it.
+    "excludeTools",
+    "allowNestedSubagents",
     "model",
     "fallbackModels",
     "thinking",
@@ -793,6 +799,13 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
     // emits `--no-tools` only for the explicit-but-empty case.
     let tools = parse_frontmatter_list(parsed.get("tools")).map(parse_tool_refs);
 
+    // SUBA-092 `excludeTools:` — pi `agents.ts:1988` @v0.64.0:
+    // `const excludeTools = parseFrontmatterList(frontmatter.excludeTools)`, carried onto the agent
+    // exactly when the key was present (`:2110`, `...(excludeTools !== undefined ? { excludeTools }
+    // : {})`). No validation beyond the list grammar; trimming/dedup happen at the consumer
+    // (`pi-args.ts:502`), which is where [`crate::exec::build_attempt_spawn_plan`] does them too.
+    let exclude_tools = parse_frontmatter_list(parsed.get("excludeTools"));
+
     let default_reads = parse_frontmatter_list(parsed.get("defaultReads"))
         .filter(|v| !v.is_empty())
         .map(|v| v.into_iter().map(PathBuf::from).collect::<Vec<_>>());
@@ -1037,6 +1050,25 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         }
     };
 
+    // SUBA-092 `allowNestedSubagents:` — pi `agents.ts:2061-2066` @v0.64.0: strictly `"true"`/
+    // `"false"`, anything else THROWS upstream (`Agent '<name>' has invalid allowNestedSubagents
+    // frontmatter; expected true or false.`). Same `[CYRUP-DELTA]` as `async` directly above: a
+    // per-file skip + warn instead of aborting the whole directory scan. NOT `parse_bool_field`,
+    // whose lenient grammar would silently accept spellings upstream rejects.
+    let allow_nested_subagents = match parsed.get("allowNestedSubagents") {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(_) => {
+            tracing::warn!(
+                agent = %local_name,
+                path = %file_path.display(),
+                "Agent '{local_name}' has invalid allowNestedSubagents frontmatter; expected true or false. — skipping this agent file"
+            );
+            return None;
+        }
+    };
+
     // `timeoutMs:` — pi `agents.ts:1547-1554`: `Number.isInteger(parsed) && parsed > 0`, else error.
     let default_timeout_ms = match parsed.get("timeoutMs") {
         None => None,
@@ -1080,6 +1112,8 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         description,
         aliases,
         tools,
+        exclude_tools,
+        allow_nested_subagents,
         extensions,
         extensions_from_default: false,
         subagent_only_extensions,
@@ -2103,5 +2137,62 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(def.description, "Reviews Rust changes for correctness and style.");
+    }
+
+
+    /// SUBA-092 — `excludeTools:` (pi `agents.ts:1988` @v0.64.0, `parseFrontmatterList`) and
+    /// `allowNestedSubagents:` (`agents.ts:2061-2066`, strictly `true`/`false`) parse onto the
+    /// definition and, being `KNOWN_FIELDS` (`agent-serializer.ts:12-13`), are never demoted to
+    /// `extra_fields` — the pre-fix behaviour, under which a declared exclusion did nothing at all.
+    #[test]
+    fn exclude_tools_and_allow_nested_subagents_parse_onto_the_definition_and_are_never_demoted() {
+        let content = "---\nname: worker\ndescription: W\nexcludeTools: bash, write\n\
+                       allowNestedSubagents: true\n---\n\nbody\n";
+        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(
+            def.exclude_tools,
+            Some(vec!["bash".to_string(), "write".to_string()]),
+            "excludeTools must parse as a comma list like tools:"
+        );
+        assert_eq!(def.allow_nested_subagents, Some(true));
+        assert!(
+            !def.extra_fields.contains_key("excludeTools")
+                && !def.extra_fields.contains_key("allowNestedSubagents"),
+            "a KNOWN_FIELDS key must never be demoted to extra_fields; got {:?}",
+            def.extra_fields
+        );
+        assert!(def.present_fields.contains("excludeTools"));
+        assert!(def.present_fields.contains("allowNestedSubagents"));
+
+        // Block-list syntax is the same grammar `tools:` uses (pi's shared `parseFrontmatterList`).
+        let block = "---\nname: worker\ndescription: W\nexcludeTools:\n  - bash\n  - edit\n---\n\nbody\n";
+        let def = parse_agent_file(block, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(def.exclude_tools, Some(vec!["bash".to_string(), "edit".to_string()]));
+
+        // An explicit `false` is carried as `Some(false)`, distinct from the key being absent.
+        let off = "---\nname: worker\ndescription: W\nallowNestedSubagents: false\n---\n\nbody\n";
+        let def = parse_agent_file(off, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(def.allow_nested_subagents, Some(false));
+
+        // Absent keys: `None` on both, exactly pi's `undefined`.
+        let plain = "---\nname: worker\ndescription: W\n---\n\nbody\n";
+        let def = parse_agent_file(plain, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(def.exclude_tools, None);
+        assert_eq!(def.allow_nested_subagents, None);
+    }
+
+    /// SUBA-092 — pi THROWS on any `allowNestedSubagents` value other than the literal `true`/`false`
+    /// (`agents.ts:2065`); this crate's per-file `[CYRUP-DELTA]` skips the file instead, exactly as
+    /// it does for `async:`. The lenient `parse_bool_field` grammar (`yes`/`1`/…) must NOT apply.
+    #[test]
+    fn an_invalid_allow_nested_subagents_value_skips_the_agent_file() {
+        for bad in ["yes", "1", "TRUE", "maybe"] {
+            let content =
+                format!("---\nname: worker\ndescription: W\nallowNestedSubagents: {bad}\n---\n\nbody\n");
+            assert!(
+                parse_agent_file(&content, AgentSource::Project, Path::new("/w.md")).is_none(),
+                "allowNestedSubagents: {bad} must skip the file, not parse leniently"
+            );
+        }
     }
 }

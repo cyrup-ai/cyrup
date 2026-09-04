@@ -683,6 +683,35 @@ fn resolve_child_tools(
         ceiling_allowed_tools.cloned().unwrap_or_default()
     };
 
+    // SUBA-092 / pi `runs/shared/pi-args.ts:502-504` @v0.64.0:
+    //
+    //   const excludeTools = [...new Set((input.excludeTools ?? []).map((tool) => tool.trim()).filter(Boolean))];
+    //   const excludedToolSet = new Set(excludeTools);
+    //   const effectiveDeclaredBuiltinTools = declaredBuiltinTools.filter((tool) => !excludedToolSet.has(tool));
+    //
+    // The agent's own `excludeTools` is trimmed, de-duplicated (first-seen order) and SUBTRACTED
+    // from the declared builtin set AFTER the ceiling filter above and BEFORE `fanout_authorized`
+    // and the `--tools` CSV read it — so it narrows an explicit `tools:` allowlist, the ceiling's
+    // own `allowedTools` set, and (via `--exclude-tools` below) the ambient set of an agent that
+    // declared no `tools:` at all. Pre-fix, `excludeTools:` was demoted to `extra_fields` and a
+    // declared exclusion had no effect whatsoever.
+    let exclude_tools: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        agent
+            .exclude_tools
+            .iter()
+            .map(|tool| tool.trim())
+            .filter(|tool| !tool.is_empty())
+            .filter(|tool| seen.insert(tool.to_string()))
+            .map(str::to_string)
+            .collect()
+    };
+    let is_excluded = |tool: &str| exclude_tools.iter().any(|excluded| excluded == tool);
+    let effective_builtin_tools: Vec<String> = effective_builtin_tools
+        .into_iter()
+        .filter(|tool| !is_excluded(tool))
+        .collect();
+
     // pi `runs/shared/pi-args.ts:194`: `const fanoutAuthorized = declaredBuiltinTools.includes("subagent")` —
     // a persona is granted NESTED delegation exactly when the CEILING-FILTERED declared builtin set
     // (`effective_builtin_tools` above, SUBA-072) includes the `subagent` tool — NOT the raw
@@ -697,9 +726,29 @@ fn resolve_child_tools(
     // [`crate::extension::resolve_registration_mode`]: authorized → `ChildSafe` (the restricted,
     // mutation-blocked `subagent` tool, pi `extension/fanout-child.ts:132`), unauthorized → the
     // child registers no subagent surface at all and cannot delegate.
+    //
+    // SUBA-092 / pi `pi-args.ts:505-509` @v0.64.0 — the full expression is now
+    //
+    //   effectiveDeclaredBuiltinTools.includes("subagent") || (
+    //     input.allowNestedSubagents === true &&
+    //     !excludedToolSet.has("subagent") &&
+    //     (!allowedToolSet || allowedToolSet.has("subagent")))
+    //
+    // i.e. `allowNestedSubagents: true` is an INDEPENDENT grant for an agent that never named
+    // `subagent` in a `tools:` allowlist — the only way such an agent could ever delegate before
+    // this landed — but it is still subordinate to both subtractive bounds: the agent's own
+    // `excludeTools` and a ceiling whose `allowedTools` omits `subagent` each veto it. And because
+    // the first disjunct reads the EXCLUSION-filtered list, `excludeTools: [subagent]` now revokes
+    // the grant an explicit `tools: [subagent]` would otherwise confer.
+    let subagent_within_ceiling = ceiling_allowed_tools
+        .as_ref()
+        .is_none_or(|allowed| allowed.iter().any(|tool| tool == crate::extension::TOOL_NAME));
     let fanout_authorized = effective_builtin_tools
         .iter()
-        .any(|tool| tool == crate::extension::TOOL_NAME);
+        .any(|tool| tool == crate::extension::TOOL_NAME)
+        || (agent.allow_nested_subagents == Some(true)
+            && !is_excluded(crate::extension::TOOL_NAME)
+            && subagent_within_ceiling);
 
     // G103 / pi `runs/shared/pi-args.ts:389-393,549-555` @v0.43.0. `explicitToolAllowlist` is
     // `input.tools !== undefined || mcpDirectTools.length > 0 || <ceiling>` — i.e. "did anything
@@ -749,6 +798,10 @@ fn resolve_child_tools(
             if let Some(allowed) = ceiling_allowed_tools.as_ref() {
                 effective_mcp_tools.retain(|tool| allowed.contains(tool));
             }
+            // SUBA-092 / pi `pi-args.ts:478`: `.filter((selection) => !excludedToolSet.has(
+            // selection.name))` — a resolved direct-MCP name is subject to the same exclusion as
+            // a builtin.
+            effective_mcp_tools.retain(|tool| !is_excluded(tool));
             allowlist.extend(effective_mcp_tools.iter().cloned());
         }
         if allowlist.is_empty() {
@@ -771,6 +824,14 @@ fn resolve_child_tools(
         if !allowlist.is_empty() {
             required_child_tools = Some(allowlist);
         }
+    } else if !exclude_tools.is_empty() {
+        // SUBA-092 / pi `pi-args.ts:776-777` @v0.64.0: `else if (toolPlan.excludeTools.length > 0)
+        // args.push("--exclude-tools", toolPlan.excludeTools.join(","))` — nothing pinned an
+        // allowlist, so the child keeps its ambient tool set MINUS these names. `--exclude-tools`
+        // is the same pi CLI denylist flag cyrup's own binary accepts (`crates/cyrup/src/cli/
+        // args.rs`), applied by `cyrup-session-svc/src/builder.rs::select_active_tools`.
+        args.push("--exclude-tools".to_string());
+        args.push(exclude_tools.join(","));
     }
 
     ResolvedChildTools {
@@ -4958,4 +5019,196 @@ mod tests {
         );
     }
 
+
+    /// SUBA-092 / pi `runs/shared/pi-args.ts:502-504,776-777` @v0.64.0 — an agent that declared
+    /// NO `tools:` keeps its ambient tool set minus `excludeTools`, delivered to the child as
+    /// `--exclude-tools <csv>` (never `--tools`); the list is trimmed and de-duplicated first.
+    /// Pre-fix the key was inert and the child got the full ambient set.
+    #[test]
+    fn exclude_tools_on_an_agent_with_no_allowlist_reaches_the_child_as_exclude_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.exclude_tools =
+            vec![" bash ".to_string(), "bash".to_string(), String::new(), "write".to_string()];
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(
+            !argv.iter().any(|a| a == "--tools" || a == "--no-tools"),
+            "no allowlist was pinned; argv {argv:?}"
+        );
+        let idx = argv.iter().position(|a| a == "--exclude-tools").expect("--exclude-tools present");
+        assert_eq!(
+            argv.get(idx + 1).map(String::as_str),
+            Some("bash,write"),
+            "trimmed + deduplicated; argv {argv:?}"
+        );
+        assert!(
+            !plan.spec.env_overlay.contains_key(crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS),
+            "an exclusion is not an allowlist, so no required-tools contract is written"
+        );
+    }
+
+    /// `pi-args.ts:504` — with an explicit `tools:`, `excludeTools` SUBTRACTS from the declared
+    /// builtins before `--tools` is emitted: `tools: [bash, edit]` + `excludeTools: [bash]` pins
+    /// `--tools edit`, and no `--exclude-tools` flag is added on this arm (`:770-777`'s `else if`).
+    #[test]
+    fn exclude_tools_subtracts_from_an_explicit_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.tools = Some(vec![
+            ToolRef::Builtin("bash".to_string()),
+            ToolRef::Builtin("edit".to_string()),
+        ]);
+        agent.exclude_tools = vec!["bash".to_string()];
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
+        assert_eq!(argv.get(idx + 1).map(String::as_str), Some("edit"), "argv {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--exclude-tools"),
+            "the allowlist arm never emits the denylist flag; argv {argv:?}"
+        );
+        assert_eq!(
+            plan.spec
+                .env_overlay
+                .get(crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS)
+                .map(String::as_str),
+            Some(r#"["edit"]"#),
+            "requiredChildTools reads the exclusion-filtered list too (`pi-args.ts:565`)"
+        );
+
+        // Excluding everything the agent declared yields `--no-tools`, exactly as `tools: []` does.
+        agent.exclude_tools = vec!["bash".to_string(), "edit".to_string()];
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(argv.iter().any(|a| a == "--no-tools"), "argv {argv:?}");
+    }
+
+    /// SUBA-092 / pi `pi-args.ts:505-509` — `allowNestedSubagents: true` is an INDEPENDENT fanout
+    /// grant for an agent with no `tools:` allowlist at all; unset or `false` grants nothing (the
+    /// pre-fix state, where only an explicit `tools: [subagent]` could ever authorize delegation).
+    #[test]
+    fn allow_nested_subagents_grants_fanout_without_an_explicit_tools_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let fanout = |agent: &AgentConfig| {
+            let plan = build_attempt_spawn_plan(
+                agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+            )
+            .expect("plan builds");
+            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV).cloned()
+        };
+
+        let mut agent = sample_agent_config("m1", &[]);
+        assert_eq!(fanout(&agent), Some("0".to_string()), "unset: no grant");
+        agent.allow_nested_subagents = Some(false);
+        assert_eq!(fanout(&agent), Some("0".to_string()), "false: no grant");
+        agent.allow_nested_subagents = Some(true);
+        assert_eq!(fanout(&agent), Some("1".to_string()), "true: independent grant, no tools: needed");
+
+        // The grant does not pin an allowlist: the child still keeps its ambient tool set.
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(!argv.iter().any(|a| a == "--tools" || a == "--no-tools"), "argv {argv:?}");
+
+        // Still a real (restricted) fanout child at the seam that reads the flag.
+        let is_one = |name: &str| plan.spec.env_overlay.get(name).map(String::as_str) == Some("1");
+        let mode = crate::extension::resolve_registration_mode(
+            is_one(crate::spawn::nested_events::CHILD_ENV),
+            is_one(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+        );
+        assert_eq!(mode, Some(crate::extension::RegistrationMode::ChildSafe));
+    }
+
+    /// `pi-args.ts:505-509`, the vetoes: `excludeTools: [subagent]` revokes BOTH routes to fanout —
+    /// the explicit `tools: [subagent]` declaration (the first disjunct reads the exclusion-filtered
+    /// list) and the `allowNestedSubagents` grant (`!excludedToolSet.has("subagent")`).
+    #[test]
+    fn excluding_the_subagent_tool_revokes_fanout_from_both_the_allowlist_and_the_nested_grant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let fanout = |agent: &AgentConfig| {
+            let plan = build_attempt_spawn_plan(
+                agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+            )
+            .expect("plan builds");
+            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV).cloned()
+        };
+
+        let mut declared = sample_agent_config("m1", &[]);
+        declared.tools = Some(vec![
+            ToolRef::Builtin("read".to_string()),
+            ToolRef::Builtin(crate::extension::TOOL_NAME.to_string()),
+        ]);
+        assert_eq!(fanout(&declared), Some("1".to_string()), "sanity: declared subagent grants");
+        declared.exclude_tools = vec![crate::extension::TOOL_NAME.to_string()];
+        assert_eq!(
+            fanout(&declared),
+            Some("0".to_string()),
+            "excludeTools: [subagent] revokes the declared grant"
+        );
+
+        let mut granted = sample_agent_config("m1", &[]);
+        granted.allow_nested_subagents = Some(true);
+        granted.exclude_tools = vec![crate::extension::TOOL_NAME.to_string()];
+        assert_eq!(
+            fanout(&granted),
+            Some("0".to_string()),
+            "excludeTools: [subagent] vetoes allowNestedSubagents"
+        );
+    }
+
+    /// `pi-args.ts:508` — `(!allowedToolSet || allowedToolSet.has("subagent"))`: the
+    /// `allowNestedSubagents` grant is subordinate to a capability ceiling whose `allowedTools`
+    /// omits `subagent`, and survives one that includes it.
+    #[test]
+    fn allow_nested_subagents_is_vetoed_by_a_ceiling_that_omits_the_subagent_tool() {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.allow_nested_subagents = Some(true);
+
+        let fanout_under = |session: &str, allowed: &[&str]| {
+            let mut opts = base_opts(dir.path(), &["m1"]);
+            opts.parent_session_id = Some(session.to_string());
+            let _handle = cc::register_capability_ceiling(
+                session,
+                "org-policy",
+                &serde_json::json!({ "allowedTools": allowed }),
+            )
+            .expect("registers");
+            let plan = build_attempt_spawn_plan(
+                &agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None,
+            )
+            .expect("plan builds");
+            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV).cloned()
+        };
+
+        assert_eq!(
+            fanout_under("spawn-plan-suba092-ceiling-veto", &["read"]),
+            Some("0".to_string()),
+            "a ceiling omitting `subagent` vetoes the nested grant"
+        );
+        assert_eq!(
+            fanout_under("spawn-plan-suba092-ceiling-allow", &["read", crate::extension::TOOL_NAME]),
+            Some("1".to_string()),
+            "a ceiling that includes `subagent` leaves the grant standing"
+        );
+    }
 }

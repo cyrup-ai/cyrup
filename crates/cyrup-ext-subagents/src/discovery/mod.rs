@@ -2049,6 +2049,8 @@ mod tests {
                     "systemPrompt": "be terse",
                     "skills": ["tdd"],
                     "tools": "inherit",
+                    "excludeTools": ["bash"],
+                    "allowNestedSubagents": true,
                     "extensions": ["./ext/a.ts"],
                     "subagentOnlyExtensions": ["./ext/child.ts"],
                     "completionGuard": false,
@@ -2089,6 +2091,27 @@ mod tests {
             types::ToolsOverrideField::Inherit,
             "`tools: \"inherit\"` must LOAD (it used to abort the whole read) and be its own state"
         );
+        // SUBA-092 (`agents.ts:104-105` @v0.64.0): both keys used to be silently dropped — the
+        // struct had no slot to deserialize them into.
+        assert_eq!(reviewer.exclude_tools, OverrideField::Value(vec!["bash".to_string()]));
+        assert_eq!(reviewer.allow_nested_subagents, OverrideField::Value(true));
+    }
+
+    /// SUBA-092 — `excludeTools: false` is pi's explicit clear (`parseOverrideStringArrayOrFalse`,
+    /// `agents.ts:921-926` @v0.64.0), and `allowNestedSubagents: false` is a real `Value(false)`
+    /// (a plain boolean with no clear form), never a clear.
+    #[test]
+    fn parse_subagent_settings_reads_the_suba092_false_shapes() {
+        let raw = serde_json::json!({
+            "agentOverrides": {
+                "reviewer": { "excludeTools": false, "allowNestedSubagents": false }
+            }
+        });
+        let settings = parse_subagent_settings(Some(&raw)).expect("loads");
+        let reviewer = settings.overrides.get("reviewer").expect("reviewer override");
+        assert_eq!(reviewer.exclude_tools, OverrideField::ExplicitClear);
+        assert_eq!(reviewer.allow_nested_subagents, OverrideField::Value(false));
+        assert!(!reviewer.is_empty());
     }
 
     /// The `false` explicit-clear shape of the four clearable SUBA-081 keys, and the `false`

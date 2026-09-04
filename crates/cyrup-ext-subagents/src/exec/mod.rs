@@ -1376,6 +1376,8 @@ pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinitio
         extensions: None,
         extensions_from_default: false,
         subagent_only_extensions: Vec::new(),
+        exclude_tools: None,
+        allow_nested_subagents: None,
         model: agent.model.clone(),
         fallback_models: agent.fallback_models.clone(),
         thinking: None,

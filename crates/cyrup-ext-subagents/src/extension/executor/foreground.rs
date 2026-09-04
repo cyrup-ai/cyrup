@@ -1030,6 +1030,8 @@ mod tests {
             extensions: None,
             extensions_from_default: false,
             subagent_only_extensions: Vec::new(),
+            exclude_tools: None,
+            allow_nested_subagents: None,
             model: model.map(ModelId::from),
             fallback_models: fallbacks.iter().map(|m| ModelId::from(*m)).collect(),
             thinking: None,

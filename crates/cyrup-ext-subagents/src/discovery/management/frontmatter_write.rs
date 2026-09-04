@@ -85,6 +85,30 @@ pub(crate) fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&Ha
         lines.push(format!("tools: {}", tools_value.as_deref().unwrap_or("")));
     }
 
+    // SUBA-092 excludeTools (`agent-serializer.ts:74-75` @v0.64.0): `joinComma(config.excludeTools)`
+    // — `undefined` for an absent OR empty list — emitted when truthy or under preserve. Same
+    // silent-deletion trap as `toolBudget`/`turnBudget` below: the key is in `KNOWN_FIELDS`, so
+    // without this arm the first management rewrite would delete an author's exclusion list.
+    let exclude_tools_value = def
+        .exclude_tools
+        .as_ref()
+        .filter(|list| !list.is_empty())
+        .map(|list| list.join(", "));
+    if exclude_tools_value.is_some() || preserve(&["excludeTools"]) {
+        lines.push(format!("excludeTools: {}", exclude_tools_value.as_deref().unwrap_or("")));
+    }
+    // SUBA-092 allowNestedSubagents (`agent-serializer.ts:76-78` @v0.64.0): emitted only when
+    // `=== true` or under preserve, and under preserve an unset value is written as an EMPTY value
+    // (never as `false`) while an explicit `false` is written back as `false`.
+    if def.allow_nested_subagents == Some(true) || preserve(&["allowNestedSubagents"]) {
+        let value = match def.allow_nested_subagents {
+            None => "",
+            Some(true) => "true",
+            Some(false) => "false",
+        };
+        lines.push(format!("allowNestedSubagents: {value}"));
+    }
+
     if def.model.is_some() || preserve(&["model"]) {
         let model_str = def.model.as_ref().map(ToString::to_string).unwrap_or_default();
         lines.push(format!("model: {model_str}"));
@@ -764,5 +788,72 @@ mod tests {
         // An agent with no aliases emits no line at all on a CREATE (pi's `if (aliasesValue || ...)`).
         def.aliases.clear();
         assert!(!serialize_agent(&def, None).contains("aliases:"));
+    }
+
+
+    /// SUBA-092 — the same silent-deletion trap as `toolBudget`/`turnBudget` above, for the two keys
+    /// `b26da18e` added to `KNOWN_FIELDS` (`agent-serializer.ts:12-13,74-78` @v0.64.0). Both halves
+    /// are asserted: the emit arms, and the round-trip back through the parser.
+    #[test]
+    fn serialize_agent_round_trips_exclude_tools_and_allow_nested_subagents() {
+        use crate::discovery::frontmatter::parse_agent_file;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "worker".to_string();
+        def.name = "worker".to_string();
+        def.description = "Works".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.exclude_tools = Some(vec!["bash".to_string(), "write".to_string()]);
+        def.allow_nested_subagents = Some(true);
+
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains("\nexcludeTools: bash, write\n"),
+            "excludeTools must be emitted as a comma list:\n{serialized}"
+        );
+        assert!(
+            serialized.contains("\nallowNestedSubagents: true\n"),
+            "allowNestedSubagents: true must be emitted:\n{serialized}"
+        );
+
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(reparsed.exclude_tools, def.exclude_tools, "excludeTools lost on round trip");
+        assert_eq!(reparsed.allow_nested_subagents, Some(true), "allowNestedSubagents lost on round trip");
+        assert!(!reparsed.extra_fields.contains_key("excludeTools"));
+        assert!(!reparsed.extra_fields.contains_key("allowNestedSubagents"));
+    }
+
+    /// `agent-serializer.ts:74-78` @v0.64.0, the non-truthy arms: an empty/absent `excludeTools` and
+    /// an unset or `false` `allowNestedSubagents` are NOT emitted on a fresh serialize; under
+    /// preserve, an absent value is written as an EMPTY value and an explicit `false` as `false`.
+    #[test]
+    fn serialize_agent_emits_the_two_suba092_keys_only_when_truthy_or_preserved() {
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.exclude_tools = Some(Vec::new());
+        def.allow_nested_subagents = Some(false);
+        let fresh = serialize_agent(&def, None);
+        assert!(
+            !fresh.contains("excludeTools") && !fresh.contains("allowNestedSubagents"),
+            "neither key is truthy, so neither is emitted on a create:\n{fresh}"
+        );
+
+        let preserve: HashSet<String> = ["excludeTools", "allowNestedSubagents"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let preserved = serialize_agent(&def, Some(&preserve));
+        assert!(preserved.contains("\nexcludeTools: \n"), "empty value under preserve:\n{preserved}");
+        assert!(
+            preserved.contains("\nallowNestedSubagents: false\n"),
+            "an explicit false is written back as false under preserve:\n{preserved}"
+        );
+
+        def.allow_nested_subagents = None;
+        let preserved = serialize_agent(&def, Some(&preserve));
+        assert!(
+            preserved.contains("\nallowNestedSubagents: \n"),
+            "an UNSET value under preserve is an empty value, never `false`:\n{preserved}"
+        );
     }
 }

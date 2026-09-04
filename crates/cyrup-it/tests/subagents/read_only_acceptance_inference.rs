@@ -94,6 +94,8 @@ fn agent_config(name: &str) -> AgentConfig {
         tools: None,
         extensions: None,
         subagent_only_extensions: Vec::new(),
+        exclude_tools: Vec::new(),
+        allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
         inherit_skills: true,

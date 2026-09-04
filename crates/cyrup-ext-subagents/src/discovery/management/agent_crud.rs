@@ -249,6 +249,11 @@ fn build_definition(
         description: description.to_string(),
         aliases: fields.aliases.clone().unwrap_or_default(),
         tools: fields.tools.clone().unwrap_or(None),
+        // SUBA-092: no management input field exists for either yet (upstream's `agentUpdate`
+        // handler accepts `config.excludeTools`, `agent-management.ts:487-497` @v0.64.0 — not
+        // ported here), so a CREATED agent declares neither.
+        exclude_tools: None,
+        allow_nested_subagents: None,
         extensions: fields.extensions.clone().unwrap_or(None),
         extensions_from_default: false,
         subagent_only_extensions: fields.subagent_only_extensions.clone().unwrap_or_default(),
@@ -307,6 +312,10 @@ fn merge_fields(
         description: description.to_string(),
         aliases: fields.aliases.clone().unwrap_or_else(|| existing.aliases.clone()),
         tools: fields.tools.clone().unwrap_or_else(|| existing.tools.clone()),
+        // SUBA-092: preserved verbatim across an update so a management rewrite never strips an
+        // author's exclusion list or nested-delegation grant (`agent-management.ts:321,323`).
+        exclude_tools: existing.exclude_tools.clone(),
+        allow_nested_subagents: existing.allow_nested_subagents,
         extensions: fields
             .extensions
             .clone()

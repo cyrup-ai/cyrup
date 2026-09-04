@@ -457,6 +457,18 @@ fn apply_builtin_override(
     );
     apply_field_full_replace(&mut agent.skills, &delta.skills, Vec::new(), |v| v.clone());
     apply_tools_override(&mut agent.tools, &delta.tools);
+    // SUBA-092 / pi `agents.ts:1404` @v0.64.0: `excludeTools`/`false` -> `delete next.excludeTools`
+    // (`None`), else a copy of the override's list. `:1405`: `allowNestedSubagents` is a plain
+    // boolean assignment (no clear form reachable — see the field doc).
+    apply_field_full_replace(&mut agent.exclude_tools, &delta.exclude_tools, None, |v| {
+        Some(v.clone())
+    });
+    apply_field_full_replace(
+        &mut agent.allow_nested_subagents,
+        &delta.allow_nested_subagents,
+        None,
+        |v| Some(*v),
+    );
     // pi `extensions`/`false` -> `delete next.extensions` (agents.ts:1282). `None` here means "all
     // extensions visible", which is the opposite of `Some(vec![])` ("none") — so, unlike `tools`,
     // the clear value IS `None`.
@@ -735,6 +747,28 @@ fn apply_custom_override(
         apply_tools_override(&mut agent.tools, &delta.tools);
         applied_any = true;
     }
+    // SUBA-092 / pi `agents.ts:1547-1552` @v0.62.0: `fill("excludeTools", ["excludeTools"],
+    // override.excludeTools === false ? undefined : [...])` and `fill("allowNestedSubagents",
+    // ["allowNestedSubagents"], ...)` — the same frontmatter-presence gate as every fill above.
+    // (At v0.64.0 `31562d76` collapsed `applyCustomAgentOverride` into `applyBuiltinOverride` for
+    // EVERY field, so the gate no longer exists upstream for any key; that is a cross-field
+    // precedence change to R-SA-010 and is tracked separately, not folded into this item.)
+    applied_any |= apply_field_fill_unset(
+        &mut agent.exclude_tools,
+        &["excludeTools"],
+        &agent.present_fields,
+        &delta.exclude_tools,
+        None,
+        |v| Some(v.clone()),
+    );
+    applied_any |= apply_field_fill_unset(
+        &mut agent.allow_nested_subagents,
+        &["allowNestedSubagents"],
+        &agent.present_fields,
+        &delta.allow_nested_subagents,
+        None,
+        |v| Some(*v),
+    );
     applied_any |= apply_field_fill_unset(
         &mut agent.extensions,
         &["extensions"],
@@ -888,6 +922,8 @@ mod tests {
             extensions: None,
             extensions_from_default: false,
             subagent_only_extensions: Vec::new(),
+            exclude_tools: None,
+            allow_nested_subagents: None,
             model: None,
             fallback_models: Vec::new(),
             thinking: None,
@@ -1479,6 +1515,8 @@ mod tests {
                 system_prompt: OverrideField::Value("should not apply".to_string()),
                 skills: OverrideField::Value(vec!["tdd".to_string()]),
                 tools: ToolsOverrideField::Value(vec![ToolRef::Builtin("read".to_string())]),
+                exclude_tools: OverrideField::Value(vec!["bash".to_string()]),
+                allow_nested_subagents: OverrideField::Value(true),
                 subagent_only_extensions: OverrideField::Value(vec![
                     "./tools/child-review.ts".to_string(),
                 ]),
@@ -1497,6 +1535,9 @@ mod tests {
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         let updated = merged.get("reviewer").expect("present");
         assert_eq!(updated.model, Some("openai/gpt-5".into()));
+        // SUBA-092: the two v0.62.0 keys fill like every other absent-on-disk field.
+        assert_eq!(updated.exclude_tools, Some(vec!["bash".to_string()]));
+        assert_eq!(updated.allow_nested_subagents, Some(true));
         assert_eq!(updated.fallback_models, vec!["anthropic/claude-sonnet-4".into()]);
         assert_eq!(updated.thinking, Some("medium".to_string()));
         assert_eq!(updated.system_prompt_mode, SystemPromptMode::Append);
@@ -2245,5 +2286,105 @@ mod tests {
             path: None,
             mode: None,
         };
+    }
+
+
+    /// SUBA-092 — the builtin arm (`agents.ts:1404-1405` @v0.64.0): an override's `excludeTools`
+    /// replaces the agent's own unconditionally, a JSON `false` deletes it (`None`, never `[]`),
+    /// and `allowNestedSubagents` is a plain boolean assignment.
+    #[test]
+    fn builtin_override_applies_and_clears_exclude_tools_and_allow_nested_subagents() {
+        let mut merged = HashMap::new();
+        let mut a = agent("delegate", AgentSource::Builtin, "/builtin/delegate.md");
+        a.exclude_tools = Some(vec!["write".to_string()]);
+        a.present_fields.insert("excludeTools".to_string());
+        a.allow_nested_subagents = Some(false);
+        a.present_fields.insert("allowNestedSubagents".to_string());
+        merged.insert("delegate".to_string(), a);
+
+        let settings = user_scope(settings_with_override(
+            "delegate",
+            AgentOverrideConfig {
+                exclude_tools: OverrideField::Value(vec!["bash".to_string()]),
+                allow_nested_subagents: OverrideField::Value(true),
+                ..Default::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("delegate").expect("present");
+        assert_eq!(
+            updated.exclude_tools,
+            Some(vec!["bash".to_string()]),
+            "builtin branch overwrites even a field present on disk"
+        );
+        assert_eq!(updated.allow_nested_subagents, Some(true));
+        assert!(updated.override_info.is_some());
+
+        // `excludeTools: false` -> `delete next.excludeTools`.
+        let settings = user_scope(settings_with_override(
+            "delegate",
+            AgentOverrideConfig {
+                exclude_tools: OverrideField::ExplicitClear,
+                ..Default::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(merged.get("delegate").expect("present").exclude_tools, None);
+    }
+
+    /// SUBA-092 — the custom arm (`agents.ts:1547-1552` @v0.62.0, `fill(...)`): both fields obey
+    /// the frontmatter-presence gate every other custom fill obeys — an `excludeTools:` or
+    /// `allowNestedSubagents:` key present on disk blocks the override for THAT field only.
+    #[test]
+    fn custom_override_fills_exclude_tools_and_allow_nested_subagents_only_when_absent_on_disk() {
+        let mut merged = HashMap::new();
+        let mut a = agent_with_present(
+            "reviewer",
+            AgentSource::Project,
+            "/proj/reviewer.md",
+            &["excludeTools"],
+        );
+        a.exclude_tools = Some(vec!["write".to_string()]);
+        merged.insert("reviewer".to_string(), a);
+
+        let settings = project_scope(settings_with_override(
+            "reviewer",
+            AgentOverrideConfig {
+                exclude_tools: OverrideField::Value(vec!["bash".to_string()]),
+                allow_nested_subagents: OverrideField::Value(true),
+                ..Default::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("reviewer").expect("present");
+        assert_eq!(
+            updated.exclude_tools,
+            Some(vec!["write".to_string()]),
+            "present-on-disk excludeTools must block the override"
+        );
+        assert_eq!(
+            updated.allow_nested_subagents,
+            Some(true),
+            "absent-on-disk allowNestedSubagents must accept the override"
+        );
+        assert!(updated.override_info.is_some(), "one field applied, so provenance is recorded");
+
+        // Neither key on disk: both fill, and a `false` clear on excludeTools yields `None`.
+        let mut merged = HashMap::new();
+        let mut a = agent("reviewer", AgentSource::User, "/user/reviewer.md");
+        a.exclude_tools = Some(vec!["write".to_string()]);
+        merged.insert("reviewer".to_string(), a);
+        let settings = user_scope(settings_with_override(
+            "reviewer",
+            AgentOverrideConfig {
+                exclude_tools: OverrideField::ExplicitClear,
+                allow_nested_subagents: OverrideField::Value(false),
+                ..Default::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("reviewer").expect("present");
+        assert_eq!(updated.exclude_tools, None);
+        assert_eq!(updated.allow_nested_subagents, Some(false));
     }
 }

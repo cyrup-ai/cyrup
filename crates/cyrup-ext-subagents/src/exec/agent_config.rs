@@ -46,6 +46,16 @@ pub struct AgentConfig {
     pub system_prompt_mode: SystemPromptMode,
     pub system_prompt_body: String,
     pub tools: Option<Vec<ToolRef>>,
+    /// SUBA-092 — the agent's `excludeTools` (pi `ResolvePiLaunchToolPlanInput.excludeTools`,
+    /// `runs/shared/pi-args.ts:301` @v0.64.0), flattened from
+    /// [`AgentDefinition::exclude_tools`]'s `Option` exactly as pi's `input.excludeTools ?? []`
+    /// (`:502`) does. Subtracted from the child's declared builtin set and direct-MCP names at
+    /// spawn time, or emitted as `--exclude-tools` when nothing pins an allowlist.
+    pub exclude_tools: Vec<String>,
+    /// SUBA-092 — pi `ResolvePiLaunchToolPlanInput.allowNestedSubagents` (`pi-args.ts:302`): the
+    /// independent nested-delegation grant folded into `fanoutAuthorized` (`:505-509`). Only
+    /// `Some(true)` counts (`input.allowNestedSubagents === true`).
+    pub allow_nested_subagents: Option<bool>,
     /// Extension-allowlist tri-state (func-SA §4.1 `AgentDefinition::extensions`): `Some(list)`
     /// emits `--no-extensions` plus an explicit `--extension` for each entry (discovery off, exact
     /// allowlist); `None` leaves the child's own extension discovery on (pi `runs/shared/pi-args.ts:128-137`).
@@ -117,6 +127,8 @@ impl AgentConfig {
             system_prompt_mode: agent.system_prompt_mode,
             system_prompt_body: agent.system_prompt_body.clone(),
             tools: agent.tools.clone(),
+            exclude_tools: agent.exclude_tools.clone().unwrap_or_default(),
+            allow_nested_subagents: agent.allow_nested_subagents,
             extensions: agent.extensions.clone(),
             subagent_only_extensions: agent.subagent_only_extensions.clone(),
             output: agent.output.clone(),
@@ -173,6 +185,16 @@ pub struct ResolvedAgentPersona {
     pub system_prompt_mode: SystemPromptMode,
     pub system_prompt_body: String,
     pub tools: Option<Vec<ToolRef>>,
+    /// SUBA-092 — the agent's own `excludeTools`, carried so a chain/parallel/background step
+    /// subtracts the SAME tools the single-run path does (pi threads `agentConfig.excludeTools`
+    /// into every launch, `runs/background/async-execution.ts:948,1011,1741` @v0.64.0).
+    /// `#[serde(default)]` keeps the runner-config hand-off backward compatible.
+    #[serde(default)]
+    pub exclude_tools: Vec<String>,
+    /// SUBA-092 — the agent's own `allowNestedSubagents` grant, carried for the same reason
+    /// (`async-execution.ts:949,1012,1742`). `#[serde(default)]` keeps the hand-off compatible.
+    #[serde(default)]
+    pub allow_nested_subagents: Option<bool>,
     /// The agent's own extension allowlist tri-state, carried so a chain/parallel/background step
     /// threads `--no-extensions`/`--extension` identically to the single-run path (T4 inherit
     /// flags). `#[serde(default)]` keeps the runner-config hand-off backward compatible.
@@ -250,6 +272,8 @@ impl ResolvedAgentPersona {
             system_prompt_mode: agent.system_prompt_mode,
             system_prompt_body: agent.system_prompt_body.clone(),
             tools: agent.tools.clone(),
+            exclude_tools: agent.exclude_tools.clone().unwrap_or_default(),
+            allow_nested_subagents: agent.allow_nested_subagents,
             extensions: agent.extensions.clone(),
             subagent_only_extensions: agent.subagent_only_extensions.clone(),
             output: agent.output.clone(),
@@ -279,6 +303,8 @@ impl ResolvedAgentPersona {
             system_prompt_mode: self.system_prompt_mode,
             system_prompt_body: self.system_prompt_body.clone(),
             tools: self.tools.clone(),
+            exclude_tools: self.exclude_tools.clone(),
+            allow_nested_subagents: self.allow_nested_subagents,
             extensions: self.extensions.clone(),
             subagent_only_extensions: self.subagent_only_extensions.clone(),
             output: self.output.clone(),
@@ -717,6 +743,8 @@ mod tests {
             system_prompt_mode: SystemPromptMode::Append,
             system_prompt_body: "You are the REVIEWER persona.".to_string(),
             tools: Some(vec![ToolRef::Builtin("read".to_string())]),
+            exclude_tools: vec!["bash".to_string()],
+            allow_nested_subagents: Some(true),
             extensions: Some(vec!["./allowed-ext.ts".to_string()]),
             subagent_only_extensions: vec!["./child-tool.ts".to_string()],
             output: None,
@@ -754,6 +782,8 @@ mod tests {
             system_prompt_mode: SystemPromptMode::Append,
             system_prompt_body: "You are the REVIEWER persona.".to_string(),
             tools: Some(vec![ToolRef::Builtin("read".to_string())]),
+            exclude_tools: vec!["bash".to_string()],
+            allow_nested_subagents: Some(true),
             extensions: Some(vec!["./allowed-ext.ts".to_string()]),
             subagent_only_extensions: vec!["./child-tool.ts".to_string()],
             output: None,
