@@ -111,7 +111,7 @@ corrections are applied and recorded at the item.
 | ~~SUBA-090~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | S | background completion notify / `display` | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.43.0, v0.57.0 and v0.64.0; confirmed exactly as filed — predicate verbatim at all three tags, `scheduleOrigin` clause the only tag-to-tag change) **and ported at `79ee7eff`**: `completion_notice_display(ClassifiedOutcome)` is pi's `notify.ts:402` predicate reduced to its one cyrup-reachable clause (`status !== "completed"`), `format_completion_message` computes `display` from the same `classify_outcome` that picks the header word, the false "Always `true`" doc is gone, `trigger_turn` stays `true` (no `triggerTurn:false` input exists). **Residual (medium, area 08/03 seam, not this crate):** on the trigger-turn path `session-svc inject.rs:125-160` drops `display` (`AgentMessage::Custom` has no such field) so the hidden notice still renders on screen — **filed as `SUBA-094` (medium)**; the grouped `formatGroupedCompletion` form stays with `SUBA-017` |
 | ~~SUBA-091~~ | ~~medium~~ **CLOSED 2026-09-04** | S | fleet inspector / transcript containment | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0 plus the upstream landing commit `9ceb5650`; confirmed exactly as filed, line drift only) **and ported at `681f6255`**: `FleetState::trusted_session_roots` is pi's `state.trustedSessionRoots` (`index.ts:895-898`: `defaultSessionDir` tilde-expanded + resolved, then the parent's subagent session root, deduped), seeded by `SubagentExecutor::fleet_state` through the pure `paths::trusted_session_roots`, and `async_detail` passes `unique_paths(state.trusted_session_roots)` where the literal `&[]` was, so the session-JSONL tail renders in the detail pane; the containment gate is unchanged. Residuals (low): pi's `trustedSessionFiles`/`trustedSessionFileRoot` rung and `trackedJob?.sessionRoot` are not carried; `subagent status`'s cyrup-original root triple differs from pi's `trustedSessionRootsForStatus` |
 | ~~SUBA-092~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / agent schema | `excludeTools:`/`allowNestedSubagents:` ported at `247ff97b` — frontmatter, settings-override, serializer, and the spawn-plan tool subtraction / nested-fanout grant. v0.64.0's cross-field custom-override precedence change (`31562d76`) is a recorded residual, not this row |
-| SUBA-093 | medium | M | background status model / child-scoped stop | `SUBA-087`'s residual, filed as its own item 2026-09-04: a `ParallelGroup`/`DynamicGroup` is ONE entry in `RunStatus::steps`, so a `tasks[]` fan-out's members have no live per-child status and a child-scoped `stop` can only stop the whole group; upstream flattens members into `steps[]` (`flatIndex`) |
+| ~~SUBA-093~~ | ~~medium~~ **CLOSED 2026-09-04** | M | background status model / child-scoped stop | `SUBA-087`'s residual, filed as its own item 2026-09-04 **and ported at `07f2df0d`**: `background/flat_index.rs` is pi's declaration-time flatten, so a `ParallelGroup` publishes one `RunStatus::steps` entry PER MEMBER named by its own agent; `ChainRunContext::step_slot` (`StepSlot::{Exclusive,Shared}`) carries pi's per-member `ctx.flatIndex` through the telemetry fold, `child_index`, the steer paths, the artifact index and the per-child stop handle, which `ExecSingleStepExecutor::run_single` now registers per DISPATCH. `subagent({action:"stop", id, childId:"step:1"})` against a 3-task fan-out stops member 1 alone. Residuals (low): a `DynamicGroup` keeps one shared slot (upstream's runtime splice, `:4155`, is not ported); group members go `Running` at group dispatch rather than per worker claim |
 | SUBA-094 | medium | M | completion notify / session-svc inject seam | `SUBA-090`'s residual, filed as its own item 2026-09-04 — **FIX SITE `crates/cyrup-session-svc` + `crates/cyrup-agent` (areas 08/03)**: `inject_message` drops `display` on the trigger-turn path (`AgentMessage::Custom` has no such field), so a `display: false` completion notice still renders |
 
 > **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
@@ -1553,8 +1553,10 @@ answer `Stop requested for child step:1 in async run <id>.`, write ONE file unde
 `state: running`; the same call against a `complete` child must answer the verbatim refusal and
 write nothing; a plain `stop` must still end the run `Stopped`. Any of those failing reopens the row.
 
-**Residuals — recorded, not closed by this row.** (1) **medium — the filing's headline scenario is
-not delivered — FILED AS `SUBA-093` 2026-09-04 (review fix `6cf2cb9f`):** a `ParallelGroup`/`DynamicGroup`
+**Residuals — recorded, not closed by this row.** (1) ~~**medium — the filing's headline scenario is
+not delivered**~~ — **FILED AS `SUBA-093` 2026-09-04 (review fix `6cf2cb9f`) AND CLOSED THERE
+2026-09-04 at `07f2df0d`**, which flattens a `ParallelGroup`'s members into `RunStatus::steps` and
+registers a stop handle per DISPATCH; the text below is the residual as filed: a `ParallelGroup`/`DynamicGroup`
 is ONE entry in `RunStatus::steps` (`pending_step_status_for`, `runner_main.rs:1159-1170` at HEAD)
 and its members reach `parallel_groups` only after the group settles (`record_step_outcome`,
 `:2550-2602`), so a `tasks[]` fan-out's members have no live per-child status to resolve against
@@ -2300,7 +2302,12 @@ from area 09's `SUBA-006`/`SUBA-014`, which are about the *existing* `tools:` al
 
 ---
 
-## SUBA-093 — A child-scoped `stop` cannot address a `ParallelGroup`/`DynamicGroup` member: cyrup's status model has ONE step per group, upstream flattens members into `steps[]`
+## ~~SUBA-093~~ — ~~medium~~ **CLOSED 2026-09-04** — A child-scoped `stop` could not address a `ParallelGroup` member: cyrup's status model had ONE step per group, upstream flattens members into `steps[]`
+
+> **CLOSED 2026-09-04 — landing commit `07f2df0d`** (code), on top of `71447a19`. Both sides read
+> for this pass: cyrup at HEAD, `nicobailon/pi-subagents` at **v0.64.0** (the ADR-0006 parity
+> target) via `git show`. The filing was accurate in every particular and is reproduced below with
+> the port-side half rewritten to what now exists.
 
 > **Filed 2026-09-04 from `SUBA-087`'s residual (1)** (review fix `6cf2cb9f`), so the residual is a
 > counted row rather than prose inside a closed one. It is the filing's headline scenario for
@@ -2308,35 +2315,124 @@ from area 09's `SUBA-006`/`SUBA-014`, which are about the *existing* `tools:` al
 > in that row landed.
 
 **Kind** port limitation (status model) · **Severity** medium · **Effort** M · **Confidence** confirmed
-(both sides read for `SUBA-087` at v0.57.0 and v0.64.0; cyrup re-read at HEAD).
+(both sides read for `SUBA-087` at v0.57.0 and v0.64.0; cyrup re-read at HEAD; re-verified at
+v0.64.0 for this closure)
 
-**cyrup** — `crates/cyrup-ext-subagents/src/background/runner_main.rs` `pending_step_status_for`
-(`:1159-1170`): a `RunnerStep::ParallelGroup` becomes ONE `StepStatus` labelled
-`<parallel:N tasks>`; its members' per-child detail reaches `RunStatus::parallel_groups` only when
-the group settles (`record_step_outcome`, `:2550-2602`). `background/child_identity.rs` resolves a
-`childId` against `RunStatus::steps` by index/agent/workflow key, so `step:<i>` for a group index
-targets the group's single entry and `route_child_stop_requests` (`runner_main.rs`) fires the ONE
-stop handle registered for that top-level index — the whole group is torn down. The telemetry pump,
-steer targeting, the transcript index and `output-<i>.log` all key on the same top-level index.
+**cyrup (before, at `71447a19`)** — `crates/cyrup-ext-subagents/src/background/runner_main.rs`
+`pending_step_status_for`: a `RunnerStep::ParallelGroup` became ONE `StepStatus` labelled
+`<parallel:N tasks>`; its members' per-child detail reached `RunStatus::parallel_groups` only when
+the group settled (`record_step_outcome`). `background/child_identity.rs` resolves a `childId`
+against `RunStatus::steps` by index/agent/workflow key, so `step:<i>` for a group index targeted the
+group's single entry and `route_child_stop_requests` fired the ONE stop handle registered for that
+top-level index — the whole group was torn down. The telemetry pump, steer targeting, the child's
+intercom presence label, the artifact quadruple and `output-<i>.log` all keyed on the same top-level
+index, published once per group into an `Arc<AtomicUsize>` (`current_flat_index`) that every
+concurrently-running member read the same value from.
 
 **upstream** — `src/runs/background/subagent-runner.ts` @v0.64.0: every member of a parallel group
-is its own flat step (`flatIndex` on the step context, `:1294`; used as the `stepIndex`/`childIndex`
-of every event and file it produces, `:1472-1508`, `:1709`, `:1746`, `:1762`, `:1829`), so
-`markChildStopRequested` (`:2979-2991`) and `stopChildStep` (`:3015-3031`) address one member and
-`registerStepStop` fires only that member's handle.
+is its own flat step. `:2612-2652` is the declaration-time flatten (`flatStepCount`, one
+`initialStatusSteps.push` per `step.parallel` task, `agent: task.agent`); `:1294` `flatIndex` on the
+step context, spread per member at each dispatch site (`:4245` parallel, `:4640` dynamic, `:5017`
+sequential); the flat index is the `stepIndex`/`childIndex` of every event and file a step produces
+(`:1472-1508`, `:1709`, `:1746`, `:1762`, `:1829`), the `output-${fi}.log` and steer paths
+(`:4243-4257`), and the key of `registerStepStop` (`:4268`, `:3048-3055`) and the
+`childStopRequests.has(fi)` gate (`:4221`). `markChildStopRequested` (`:2979-2991`) and
+`stopChildStep` (`:3015-3031`) therefore address one member, and a member torn down by its own stop
+records `exitCode: 1` (`:4286-4295`), not the paused-success an interrupt yields.
 
-**Impact** — the one scenario the `SUBA-087` filing led with is still not deliverable: a parent that
-wants ONE member of a fan-out gone must stop the whole group (or the run).
+**Fix (landed)** — `07f2df0d`:
+* NEW `crates/cyrup-ext-subagents/src/background/flat_index.rs` — the flatten as PURE functions
+  (no I/O, no clock, no status handle): `flat_step_width` (a `ParallelGroup` is as wide as its
+  member list, everything else is 1), `flat_base`, `flat_range`, `flat_total`, and
+  `pending_step_statuses_for`, which yields one `Pending` `StepStatus` per member named by that
+  member's OWN agent. Its module docs state the two index spaces the crate now distinguishes.
+* `background/runner_main.rs` — `publish_initial_status` and `append_steps` build the flat list;
+  `run_inner` derives `flat_range(&steps, cursor)` once per iteration and keys `mark_step_running`
+  (over the whole block), `current_step`, the `subagent.step.*` `stepIndex`, the loop-top queued-stop
+  skip (only for a step that occupies exactly one slot — pi's sequential branch), the
+  `mark_remaining_{paused,timed_out,stopped}` sweeps and `settle_step_result` on it.
+  `record_step_outcome` takes a slot RANGE and folds a group's per-child outcomes onto the members'
+  own entries; `settle_step_result` marks each child-stopped member `Stopped` (pi's
+  `markChildStopped`) with `subagent.step.stopped` + terminal `subagent.child-status`, and the run
+  stays alive.
+* `ExecSingleStepExecutor` — the `current_flat_index` atomic is GONE. Every per-child surface reads
+  `ctx.step_slot` instead, which fixes the telemetry tag, `RunOptions::child_index`, the steer
+  inbox/ack/capability paths, the artifact index and the stop-handle lookup in one substitution.
+  `run_single` registers and clears its own stop token per DISPATCH (pi's `registerStop` at each of
+  its three dispatch sites), refuses to spawn when a stop is already queued against its slot (pi
+  `:4221`), and returns pi's stopped result (`exitCode: 1`) for a child it stopped — without which a
+  stopped member came back as an interrupt's paused-success, its group's aggregate stayed
+  successful, and the RUN ended `Complete` (observed, then fixed, during this port).
+* `spawn/chain_graph.rs` — `ChainRunContext::step_slot`, and `dispatch_group` re-stamps it per
+  fanned-out child (pi's `{...ctx, flatIndex: fi}`).
 
-**Fix** — live per-member status entries: flatten group members into `RunStatus::steps` at
-declaration (one entry per member with a group tag), key the pump/steer/transcript/output-log paths
-on the flat index, and register each member's stop handle under it. The identity scheme in
-`child_identity.rs` already follows upstream's flat index once that lands. Status-model change with
-consumers in `tui/` and `cyrup-it`; not a one-row edit.
+**Design decisions (recorded in the commit body)** — the invariant encoded is "which flat slot does
+this dispatch own, and does it own it ALONE", as the domain enum `StepSlot::{Exclusive(usize),
+Shared(usize)}` on the per-dispatch context, with `GroupSlotLayout::{PerMember, SharedSlot}` deciding
+the mapping at the one place a group fans out. `StepSlot::exclusive_index()` is the only way to
+obtain an index for a per-child stop handle and returns `None` for a shared slot, so two live
+siblings can never be registered under one index — the failure mode that would make a stop kill the
+wrong child; `index()` stays available for the accumulating surfaces (event `stepIndex`,
+`output-<i>.log`, telemetry fold) that tolerate sharing. Rejected: a `FlatStepIndex` newtype (the two
+index spaces coexist in exactly ONE function, and the newtype would have to cross
+`ChildStopRegistry`, the JSON event payloads, `child_identity`'s `step:<i>` parse and the
+TUI/`cyrup-it` readers to buy a check `flat_range` already makes structural); a bare
+`flat_index: usize` + `exclusive: bool` pair (the bool is droppable at a call site and silently means
+"safe"); an extra `run_single` parameter (a wider trait change for information the context already
+carries, and further from upstream). Migration cost: one new `ChainRunContext` field (5 construction
+sites, 3 in tests), `record_step_outcome` takes a `&Range<usize>`, and
+`ParallelGroupStatus::group_step_index` now means the group's flat BASE — read only by
+`runner_main`'s own sweeps, which moved with it. `status.json`'s `steps` array is longer for a
+parallel run, which is what upstream writes; `chain_step_count` still counts top-level steps.
 
-**Verify** — `subagent({action:"stop", id, childId:"step:1"})` against a running 3-task `tasks[]`
-group must tear down member 1 only, the other two completing with their own outputs; today the
-call resolves the group entry and stops all three.
+**Verify (each fails before, passes after; crate 2734/2734, `cyrup-it` 493/493)** — unit:
+`flat_index.rs` `a_parallel_group_is_as_wide_as_its_member_list_and_every_other_shape_is_one`,
+`flat_base_accumulates_group_widths_ahead_of_the_cursor`,
+`a_base_past_the_end_is_the_append_position_and_its_range_is_empty`,
+`a_parallel_group_publishes_one_pending_entry_per_member_named_by_its_own_agent`,
+`a_dynamic_group_and_a_single_step_each_publish_exactly_one_entry`; `chain_graph.rs`
+`every_parallel_group_member_is_dispatched_under_its_own_exclusive_flat_slot` (group base 4 →
+`Exclusive(4/5/6)`), `dynamic_group_members_share_one_slot_and_it_is_marked_shared`;
+`runner_main.rs` `a_parallel_groups_member_outcomes_land_on_their_own_flat_status_entries`,
+`a_single_step_records_on_its_own_slot_and_flat_bases_skip_a_groups_width`. Integration:
+`crates/cyrup-it/tests/subagents/background_runner_main_integration.rs`
+`a_child_scoped_stop_kills_one_fan_out_member_and_its_siblings_still_complete` (real 3-member
+fan-out, real child processes via the scripted fixture, `childId: "step:1"` delivered 300ms in).
+Every unit test fails before by construction (the symbols did not exist). The integration test was
+additionally run against a SIMULATED pre-change tree (parallel width forced back to 1 and
+`GroupSlotLayout::SharedSlot` for a parallel group) and fails there with
+`steps: ["<parallel:3 tasks>"]`, run state `Complete` and `recent_output: ["DONE","DONE","DONE"]` —
+the stop had no observable effect at all. After: `["first","second","only"]`, member 1 `Stopped`
+with `stop_requested`/`stop_requested_at`/`stopped` and the stop message, members 0 and 2 `Complete`
+with their own `DONE`, events `subagent.step.stop_requested`(stepIndex 1, childId `step:1`, agent
+`second`) → child-status `stopping` → `subagent.step.stopped` → child-status `stopped`, no
+`subagent.run.stopped`, run `Failed`.
+
+**Falsification** — `subagent({action:"stop", id, childId:"step:1"})` against a running 3-task
+`tasks[]` group must tear down member 1 only, the other two completing with their own outputs, and
+`status.json` must carry three `steps` entries named by their own agents. Any of those failing
+reopens the row.
+
+**Residuals — recorded, not closed by this row.** (1) **low — the DYNAMIC half.** A
+`RunnerStep::DynamicGroup` still occupies ONE flat slot, which is also what upstream DECLARES for it
+(`subagent-runner.ts:2656-2670`, a single `expand:<agent>` placeholder); upstream then SPLICES that
+entry into one-per-materialized-item at expansion time (`:4155`, shifting every later group's
+`start` and every later workflow node's `flatIndex`), and cyrup does not, because a dynamic group's
+width is unknown until dispatch and the splice would move the flat base of every later step mid-run.
+Its members are marked `StepSlot::Shared`, which keeps them out of the per-child stop registry
+rather than letting them corrupt each other's handles, so a dynamic fan-out remains addressable only
+as a whole. (2) **low — `Running` granularity `[CYRUP-DELTA]`.** Every member of a group is marked
+`Running` when the GROUP is dispatched, where pi marks each member as its own worker claims it
+(`:4236-4238`); cyrup's fan-out happens behind `chain_graph::walk_chain`, which reports no per-member
+start. Nothing keys on the distinction — `is_stoppable_step_state` accepts `Pending` and `Running`
+alike, and `route_child_stop_requests` finds the live handle either way — but under a concurrency
+limit a member can read `Running` slightly before its worker claims a permit. (3) **low — the
+dynamic placeholder's label** stays cyrup's `<dynamic:<collect>>` rather than upstream's
+`expand:<agent>` (`:2659`); a rename with no behavioural content, deliberately not taken. (4) The
+one-`SingleResult`-per-top-level-step shape of `ResultFile::results` is unchanged: a group still
+contributes its aggregate, where upstream contributes one entry per member. The RUN's terminal state
+now agrees with upstream (a stopped member fails the aggregate), but a `ResultFile` reader still sees
+one collapsed record for the group — pre-existing, and out of this row's scope.
 
 ---
 
