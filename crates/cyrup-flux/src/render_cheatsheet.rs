@@ -18,8 +18,11 @@ type Pipeline = (String, String, Vec<String>);
 /// Match a `## PIPELINE <letter>:` heading line, mirroring
 /// `PIPELINE_HEADING = re.compile(r"^##\s+PIPELINE\s+([A-Za-z0-9]+)\s*:")`. Returns the
 /// upper-cased letter on a match. Implemented with `.get()` range slicing only (no raw
-/// indexing), so it can never panic on a non-ASCII heading.
-fn match_pipeline_heading(line: &str) -> Option<String> {
+/// indexing), so it can never panic on a non-ASCII heading. `\s` is approximated by
+/// `char::is_whitespace` (Unicode `White_Space`), which agrees with Python's `str.isspace()`
+/// on every character a heading line can plausibly carry (space, tab, NBSP).
+#[must_use]
+pub fn match_pipeline_heading(line: &str) -> Option<String> {
     let after_hashes = line.strip_prefix("##")?;
     let after_hashes_trimmed = after_hashes.trim_start();
     if after_hashes_trimmed.len() == after_hashes.len() {
@@ -48,7 +51,8 @@ fn match_pipeline_heading(line: &str) -> Option<String> {
 /// Collapse a run of leading slashes immediately followed by `flux/` down to the single-slash
 /// namespaced form, mirroring `SLASH_CMD = re.compile(r"/+flux/")` /
 /// `SLASH_CMD.sub("/flux/", line)`. Implemented with `.get()` only (no raw indexing).
-fn strip_slashes(line: &str) -> String {
+#[must_use]
+pub fn strip_slashes(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     loop {
@@ -203,10 +207,19 @@ pub fn parse_arg(args: &str) -> Result<Option<String>, String> {
 }
 
 /// Render the cheatsheet for an already-validated filter (`None` = all pipelines stacked).
-/// Mirrors the Python's own empty-state lines exactly.
+/// Mirrors the Python's own empty-state lines exactly. Reads the compiled-in `_docs/pipeline.md`;
+/// [`render_doc`] is the same renderer over a caller-supplied document.
 #[must_use]
 pub fn render(filter: Option<&str>) -> String {
-    let mut pipelines = parse_pipelines(PIPELINE_MD);
+    render_doc(PIPELINE_MD, filter)
+}
+
+/// [`render`] over an explicit `pipeline.md` text — the Python's `--docs DIR` seam
+/// (`flux_cheatsheet.py:186`, `:212-213`, `:227-243`), so the parse and the layout can be pinned
+/// against a fixed document rather than whatever the vendored doc says today.
+#[must_use]
+pub fn render_doc(md_text: &str, filter: Option<&str>) -> String {
+    let mut pipelines = parse_pipelines(md_text);
     if let Some(want) = filter {
         pipelines.retain(|(letter, _, _)| letter == want);
         if pipelines.is_empty() {

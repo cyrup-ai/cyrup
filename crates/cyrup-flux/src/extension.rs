@@ -141,9 +141,11 @@ impl NativeExtension for FluxExtension {
             "flux/cheatsheet" => match crate::render_cheatsheet::parse_arg(args) {
                 Ok(filter) => Ok(Some(crate::render_cheatsheet::render(filter.as_deref()))),
                 Err(bad) => {
+                    // `flux_cheatsheet.py:207-209` prints the raw argument as Python `repr`
+                    // (`{selected_pipeline!r}`): single quotes, which `{bad:?}` would not give.
                     if let Some(hs) = self.host_services.get() {
                         hs.notify(
-                            &format!("invalid pipeline: {bad:?} (choose from A, B, C, D)"),
+                            &format!("invalid pipeline: '{bad}' (choose from A, B, C, D)"),
                             cyrup_ext::host::NotifyKind::Error,
                         );
                     }

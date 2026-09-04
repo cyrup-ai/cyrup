@@ -10,6 +10,7 @@
 //! frontmatter-less file yields an empty map, never an error.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Replace every maximal run of non-ASCII-alphanumeric characters with a single `-` (Python
@@ -45,32 +46,54 @@ const FLUX_ROOT_ENV_VAR: &str = "FLUX_ROOT";
 /// `FLUX_ROOT="${FLUX_ROOT:-$HOME/.flux}"; FLUX_DIR=$(... | tr -cs 'a-zA-Z0-9' '-');
 /// FLUX_BASE="$FLUX_ROOT/$FLUX_DIR"` exactly. The Python script's `--base` flag has no cyrup
 /// analog: the native commands take section args only.
+///
+/// The process-environment shell over [`derive_base_from`].
 #[must_use]
 pub fn derive_base() -> PathBuf {
-    let root: PathBuf = match std::env::var_os(FLUX_ROOT_ENV_VAR) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    derive_base_from(&|key| std::env::var_os(key), &cwd)
+}
+
+/// [`derive_base`] with its two inputs supplied — the environment lookup and the working
+/// directory — so the rule is testable without touching the process environment (the
+/// `crate::resources::BundledRoot::resolve_from` shape). The rule, in precedence order:
+/// a non-empty `FLUX_ROOT` is the root as-is; else `$HOME/.flux`; else the relative `.flux`
+/// (`flux_status.py:89-93` @v0.0.40 has only the `Path.home() / ".flux"` arm — `FLUX_ROOT` is the
+/// prompts' own `${FLUX_ROOT:-$HOME/.flux}`, and the no-`HOME` fallback is cyrup's, where the
+/// Python would raise). The leaf is [`flatten_cwd`] of `cwd`'s display form.
+#[must_use]
+pub fn derive_base_from(env: &dyn Fn(&str) -> Option<OsString>, cwd: &Path) -> PathBuf {
+    let root: PathBuf = match env(FLUX_ROOT_ENV_VAR) {
         Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => match std::env::var_os("HOME") {
+        _ => match env("HOME") {
             Some(home) => PathBuf::from(home).join(".flux"),
             None => PathBuf::from(".flux"),
         },
     };
-    let cwd = std::env::current_dir().unwrap_or_default();
     let cwd_str = cwd.display().to_string();
     root.join(flatten_cwd(&cwd_str))
 }
 
 /// Read the leading `--- ... ---` block into a flat map. Tolerates a missing file, a file with no
 /// frontmatter, and malformed lines — all yield an empty (or partial) map, never an error.
+///
+/// `flux_status.py:96-112` @v0.0.40, tolerance for tolerance: the read is
+/// `errors="replace"` (`:100`) — an undecodable byte becomes U+FFFD and parsing CONTINUES, so a
+/// stray Latin-1 byte mangles one value instead of emptying the map (FLUX-006; `read_to_string`
+/// refused the whole file) — and the line split is `str.splitlines()` (`:105`), whose boundaries
+/// are more than `\n` (`splitlines` below): a lone-`\r` file or a `\r` after a value parses the
+/// same in both harnesses.
 #[must_use]
 pub fn parse_frontmatter(path: &Path) -> BTreeMap<String, String> {
     let mut data = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(bytes) = std::fs::read(path) else {
         return data;
     };
+    let text = String::from_utf8_lossy(&bytes);
     if !text.starts_with("---") {
         return data;
     }
-    let mut lines = text.lines();
+    let mut lines = splitlines(&text).into_iter();
     lines.next(); // the opening `---`
     for line in lines {
         if line.trim() == "---" {
@@ -81,6 +104,44 @@ pub fn parse_frontmatter(path: &Path) -> BTreeMap<String, String> {
         }
     }
     data
+}
+
+/// Python's `str.splitlines()` without `keepends`: a line ends at `\n`, `\r`, `\r\n`, `\x0b`,
+/// `\x0c`, `\x1c`, `\x1d`, `\x1e`, U+0085, U+2028 or U+2029 (the Python docs' boundary table),
+/// `\r\n` counting once, and a terminal boundary produces no trailing empty line. `str::lines`
+/// knows only `\n` (and strips a `\r` before it), which is why it cannot stand in.
+fn splitlines(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut iter = text.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
+        let is_boundary = matches!(
+            ch,
+            '\n' | '\r'
+                | '\u{0b}'
+                | '\u{0c}'
+                | '\u{1c}'
+                | '\u{1d}'
+                | '\u{1e}'
+                | '\u{85}'
+                | '\u{2028}'
+                | '\u{2029}'
+        );
+        if !is_boundary {
+            continue;
+        }
+        out.push(text.get(start..idx).unwrap_or_default());
+        let mut next_start = idx + ch.len_utf8();
+        if ch == '\r' && iter.peek().is_some_and(|&(_, c)| c == '\n') {
+            iter.next();
+            next_start += 1;
+        }
+        start = next_start;
+    }
+    if start < text.len() {
+        out.push(text.get(start..).unwrap_or_default());
+    }
+    out
 }
 
 /// `(file_stem, stage, status)` for every `todo/*.md`, sorted by filename. `stage`/`status`

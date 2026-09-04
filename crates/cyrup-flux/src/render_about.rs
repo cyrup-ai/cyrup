@@ -13,13 +13,16 @@ const ABOUT_MD: &str = include_str!("../resources/prompts/flux/_docs/about.md");
 
 /// `SLASH_CMD_RE = re.compile(r"(?<![:\w/])//(?=\w)")` has no direct Rust `regex` equivalent
 /// (this crate carries no `regex` dependency) — implemented as the direct character predicate the
-/// lookbehind encodes: rewrite `//` to `/` only when the following character is `[A-Za-z0-9_]`
-/// and the preceding character is ABSENT or is none of `:`, `/`, or `[A-Za-z0-9_]`. This is why
-/// `https://example.com//path` is untouched (preceded by `:`, then by `/`) while `//flux/about`
-/// becomes `/flux/about` (preceded by nothing, or by whitespace/punctuation).
-fn normalize_slash_cmd(body: &str) -> String {
+/// lookbehind encodes: rewrite `//` to `/` only when the following character is a word
+/// character and the preceding character is ABSENT or is none of `:`, `/`, or a word character.
+/// `\w` in a Python `str` pattern is UNICODE — `str.isalnum()` plus `_` — so `is_word` is
+/// `char::is_alphanumeric`, not the ASCII class: `//é` rewrites and `é//x` does not, exactly as
+/// upstream. This is why `https://example.com//path` is untouched (preceded by `:`, then by `/`)
+/// while `//flux/about` becomes `/flux/about` (preceded by nothing, or by whitespace/punctuation).
+#[must_use]
+pub fn normalize_slash_cmd(body: &str) -> String {
     fn is_word(c: char) -> bool {
-        c.is_ascii_alphanumeric() || c == '_'
+        c.is_alphanumeric() || c == '_'
     }
     let chars: Vec<char> = body.chars().collect();
     let n = chars.len();

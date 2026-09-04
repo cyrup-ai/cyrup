@@ -87,7 +87,14 @@ impl FluxStatusOverlay {
     /// ([`state::derive_base`]) and construct the overlay.
     #[must_use]
     pub fn new() -> Self {
-        let base = state::derive_base();
+        Self::with_base(state::derive_base())
+    }
+
+    /// [`Self::new`] over an explicit flux base directory — the seam a test uses to point the
+    /// overlay at a scratch tree instead of `~/.flux/<flattened-cwd>/`; `tick` re-collects from
+    /// the same directory.
+    #[must_use]
+    pub fn with_base(base: PathBuf) -> Self {
         let snapshot = Snapshot::collect(&base);
         Self { base, snapshot }
     }
@@ -327,21 +334,20 @@ impl InteractiveOverlay for FluxStatusOverlay {
                     fg: Some(OverlayColor::Cyan),
                     ..OverlaySpan::default()
                 }];
+                // `flux_status.py:267` `row.rstrip()` (the plain panel's `trim_end`): the dot
+                // is the row's last glyph, so the columns after it — and the dot's own
+                // right-padding — are never emitted. Same text as `/flux/status`, span-for-span.
                 for col in state::SEVERITIES {
                     let w = sev_col_width(col);
                     if col == sev {
-                        let mut text = String::from("\u{25CF}");
-                        for _ in 0..w.saturating_sub(1) {
-                            text.push(' ');
-                        }
                         spans.push(OverlaySpan {
-                            text,
+                            text: "\u{25CF}".to_string(),
                             fg: Some(severity_color(&sev)),
                             ..OverlaySpan::default()
                         });
-                    } else {
-                        spans.push(OverlaySpan::raw(" ".repeat(w)));
+                        break;
                     }
+                    spans.push(OverlaySpan::raw(" ".repeat(w)));
                 }
                 lines.push(OverlayLine::new(spans));
             }
