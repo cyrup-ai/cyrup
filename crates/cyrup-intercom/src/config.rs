@@ -8,7 +8,8 @@
 
 use std::path::Path;
 
-use crate::identity::ENV_INTERCOM_ASK_TIMEOUT_MS;
+use crate::identity::{ENV_INTERCOM_ASK_TIMEOUT_MS, ENV_INTERCOM_SCOPE_ID};
+use crate::transport::protocol::ScopeId;
 
 /// `DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000` (`config.ts:5`) — an ask may wait as long as a human
 /// takes (10 minutes) before it is pruned.
@@ -222,10 +223,60 @@ pub fn ask_timeout_ms_from(env: impl Fn(&str) -> Option<String>) -> Result<u64, 
     }
 }
 
+/// `getIntercomScopeId()` (`v0.13.0 config.ts:21-24`):
+///
+/// ```text
+/// const scopeId = env[INTERCOM_SCOPE_ID_ENV]?.trim();
+/// return scopeId ? scopeId : undefined;
+/// ```
+///
+/// Trimmed; blank is UNSCOPED, not an error — unlike [`ask_timeout_ms`], a scope has no malformed
+/// *shape* to reject. Fatality for a bad scope lives on the BROKER side, where a non-string
+/// `scopeId` on the register frame is a protocol error (`normalizeScopeId`,
+/// `v0.13.0 broker/broker.ts:133-142`).
+///
+/// Deliberately **not** an [`IntercomConfig`] key: upstream reads it from the environment only,
+/// because `config.json` is machine-global and a scope stored there would apply to every session on
+/// the box.
+#[must_use]
+pub fn intercom_scope_id() -> Option<ScopeId> {
+    intercom_scope_id_from(|k| std::env::var(k).ok())
+}
+
+/// The pure core of [`intercom_scope_id`] — the same `_from(env)` seam
+/// [`ask_timeout_ms_from`] uses, and upstream's own (`env: NodeJS.ProcessEnv = process.env`,
+/// `v0.13.0 config.ts:21`).
+#[must_use]
+pub fn intercom_scope_id_from(env: impl Fn(&str) -> Option<String>) -> Option<ScopeId> {
+    env(ENV_INTERCOM_SCOPE_ID)
+        .as_deref()
+        .and_then(ScopeId::parse)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// ICOM-055 — `getIntercomScopeId` (`v0.13.0 config.ts:21-24`). Unset and whitespace-only are
+    /// the SAME answer (unscoped); a value is trimmed. Nothing here can fail: a bad scope is the
+    /// broker's problem, not the resolver's.
+    #[test]
+    fn intercom_scope_id_trims_and_treats_blank_as_unscoped() {
+        let of = |v: Option<&str>| {
+            intercom_scope_id_from(|k| {
+                assert_eq!(k, ENV_INTERCOM_SCOPE_ID);
+                v.map(str::to_string)
+            })
+        };
+        assert_eq!(of(None), None);
+        assert_eq!(of(Some("")), None);
+        assert_eq!(of(Some("  \t ")), None);
+        assert_eq!(
+            of(Some("  alpha  ")).as_ref().map(ScopeId::as_str),
+            Some("alpha")
+        );
+    }
 
     #[test]
     fn defaults_when_no_keys_present() {

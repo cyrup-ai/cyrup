@@ -15,7 +15,7 @@ use crate::transport::protocol::{
 
 use super::frame::{FrameResult, send_msg};
 use super::receipts::MessageReceiptRoute;
-use super::routing::{AskEdge, find_session_ids};
+use super::routing::{AskEdge, SessionKey, find_session_keys};
 use super::state::BrokerState;
 
 impl BrokerState {
@@ -24,10 +24,10 @@ impl BrokerState {
         conn_id: u64,
         self_tx: &UnboundedSender<Vec<u8>>,
         value: &serde_json::Value,
-        session_id: &Option<String>,
+        session_key: &Option<SessionKey>,
         now: u64,
     ) -> FrameResult {
-        let Some(current_id) = session_id.clone() else {
+        let Some(current_key) = session_key.clone() else {
             return FrameResult::protocol_error();
         };
         let message_val = value.get("message");
@@ -54,6 +54,31 @@ impl BrokerState {
             }
         };
 
+        // ICOM-055 — `const fromSession = this.sessions.get(currentKey); if (!fromSession || …)`
+        // (`v0.13.0 broker/broker.ts:614-618`), MOVED AHEAD of target resolution because the
+        // sender's SCOPE is the input to every lookup below. Upstream moved it for the same reason
+        // and deleted its two later copies; this port's two copies were `handle_send`'s (after
+        // target resolution) and `handle_send_to_disconnected`'s, byte-identical apart from the
+        // borrow. The only observable reordering is that a send from a superseded socket is now
+        // refused `Sender session not found` before the multi-target and no-target arms can answer
+        // — which is upstream's own order.
+        let Some(from) = self
+            .sessions
+            .get(&current_key)
+            .filter(|s| s.conn_id == conn_id)
+        else {
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id: message.id.clone(),
+                    reason: "Sender session not found".to_string(),
+                },
+            );
+            return FrameResult::cont();
+        };
+        let from_info = from.info.clone();
+        let scope = from.key.scope.clone();
+
         self.prune_ask_edges(now);
         // `this.pruneMessageReceiptRoutes(brokerReceivedAt)` (`v0.10.1 broker/broker.ts:502`).
         self.prune_message_receipt_routes(now);
@@ -63,12 +88,14 @@ impl BrokerState {
             .and_then(|rt| self.ask_edges.get(rt).cloned());
 
         // Join-ordered, matching `findSessions`' `Array.from(this.sessions.values()/.entries())`
-        // (`broker.ts:586-594`).
-        let entries: Vec<(String, Option<String>)> = self
+        // (`v0.13.0 broker/broker.ts:1247-1262`) — and SCOPE-FILTERED in all three tiers, so a
+        // peer in another scope falls out of this ladder, falls out of the disconnected ladder
+        // below, and lands on the same `Session not found` a never-seen name gets.
+        let entries: Vec<(SessionKey, Option<String>)> = self
             .sessions_in_order()
-            .map(|(_, s)| (s.info.id.clone(), s.info.name.clone()))
+            .map(|(key, s)| (key.clone(), s.info.name.clone()))
             .collect();
-        let targets = find_session_ids(&entries, &to);
+        let targets = find_session_keys(&entries, &to, scope.as_ref());
 
         if targets.len() > 1 {
             send_msg(
@@ -82,15 +109,15 @@ impl BrokerState {
             );
             return FrameResult::cont();
         }
-        let Some(target_id) = targets.first().cloned() else {
+        let Some(target_key) = targets.first().cloned() else {
             // No LIVE target — fall through to the mailbox ladder
             // (`v0.10.1 broker/broker.ts:596-673`).
             return self.handle_send_to_disconnected(
-                conn_id,
                 self_tx,
                 &to,
                 &message,
-                &current_id,
+                &current_key,
+                from_info,
                 reply_edge.as_ref(),
                 now,
             );
@@ -107,22 +134,8 @@ impl BrokerState {
             );
             return FrameResult::cont();
         }
-        // The sender's own session must still own this socket (broker.ts:442-450).
-        let Some(from_info) = self
-            .sessions
-            .get(&current_id)
-            .filter(|s| s.conn_id == conn_id)
-            .map(|s| s.info.clone())
-        else {
-            send_msg(
-                self_tx,
-                &BrokerMessage::DeliveryFailed {
-                    message_id: message.id.clone(),
-                    reason: "Sender session not found".to_string(),
-                },
-            );
-            return FrameResult::cont();
-        };
+        // (The sender's own session was proved to still own this socket above,
+        // `v0.13.0 broker/broker.ts:614-618`.)
         // `if (message.supersedes)` (`v0.10.1 broker/broker.ts:522-533`): a supersede is only legal
         // against a message THIS sender previously got delivered to THIS receiver, which is exactly
         // what `messageReceiptRoutes` records. Without the table every supersede was accepted and
@@ -132,7 +145,7 @@ impl BrokerState {
             let route_ok = self
                 .message_receipt_routes
                 .get(superseded)
-                .is_some_and(|route| route.from == current_id && route.to == target_id);
+                .is_some_and(|route| route.from == current_key && route.to == target_key);
             if !route_ok {
                 send_msg(self_tx, &BrokerMessage::DeliveryFailed {
                     message_id: message.id.clone(),
@@ -145,7 +158,7 @@ impl BrokerState {
         }
         // A reply edge must point exactly current←target (broker.ts:452-459).
         if let Some(edge) = &reply_edge
-            && (edge.to != current_id || edge.from != target_id)
+            && (edge.to != current_key || edge.from != target_key)
         {
             send_msg(
                 self_tx,
@@ -162,7 +175,7 @@ impl BrokerState {
             // back toward the sender (ignoring the edge this reply, if any, targets).
             let reply_to = message.reply_to.clone();
             let reverse = self.ask_edges.iter().any(|(mid, edge)| {
-                Some(mid) != reply_to.as_ref() && edge.from == target_id && edge.to == current_id
+                Some(mid) != reply_to.as_ref() && edge.from == target_key && edge.to == current_key
             });
             if reverse {
                 send_msg(self_tx, &BrokerMessage::DeliveryFailed {
@@ -174,8 +187,8 @@ impl BrokerState {
             self.ask_edges.insert(
                 message.id.clone(),
                 AskEdge {
-                    from: current_id.clone(),
-                    to: target_id.clone(),
+                    from: current_key.clone(),
+                    to: target_key.clone(),
                     created_at: now,
                 },
             );
@@ -191,7 +204,7 @@ impl BrokerState {
         let mut delivered = message.clone();
         delivered.broker_received_at = Some(now.into());
         delivered.broker_delivered_at = Some(now_ms().into());
-        if let Some(target) = self.sessions.get(&target_id) {
+        if let Some(target) = self.sessions.get(&target_key) {
             // The `message_control{action:"supersede"}` notice precedes the replacement message
             // (`v0.10.1 broker/broker.ts:558-571`), so a receiver that has not yet surfaced the
             // superseded message can drop it before the new one lands.
@@ -228,8 +241,8 @@ impl BrokerState {
         self.message_receipt_routes.insert(
             message.id.clone(),
             MessageReceiptRoute {
-                from: current_id.clone(),
-                to: target_id.clone(),
+                from: current_key.clone(),
+                to: target_key.clone(),
                 created_at: now,
             },
         );
@@ -253,15 +266,18 @@ impl BrokerState {
     #[allow(clippy::too_many_arguments)]
     fn handle_send_to_disconnected(
         &mut self,
-        conn_id: u64,
         self_tx: &UnboundedSender<Vec<u8>>,
         to: &str,
         message: &Message,
-        current_id: &str,
+        current_key: &SessionKey,
+        from_info: crate::transport::protocol::SessionInfo,
         reply_edge: Option<&AskEdge>,
         now: u64,
     ) -> FrameResult {
-        let disconnected = self.find_disconnected_session_ids(to, now);
+        // `this.findDisconnectedSessions(clientMessage.to, fromSession.scopeId)`
+        // (`v0.13.0 broker/broker.ts:731`) — the mailbox ladder is scoped exactly as the live one
+        // is, so a scoped peer cannot even reach another scope's PARKED identity.
+        let disconnected = self.find_disconnected_session_keys(to, current_key.scope.as_ref(), now);
         let target_info = match disconnected.as_slice() {
             [only] => self.disconnected_sessions.get(only).map(|s| s.info.clone()),
             [] => {
@@ -309,22 +325,8 @@ impl BrokerState {
             );
             return FrameResult::cont();
         }
-        // `:605-613`
-        let Some(from_info) = self
-            .sessions
-            .get(current_id)
-            .filter(|s| s.conn_id == conn_id)
-            .map(|s| s.info.clone())
-        else {
-            send_msg(
-                self_tx,
-                &BrokerMessage::DeliveryFailed {
-                    message_id: message.id.clone(),
-                    reason: "Sender session not found".to_string(),
-                },
-            );
-            return FrameResult::cont();
-        };
+        // (`:605-613`'s sender lookup is hoisted into `handle_send`, as upstream hoisted its own
+        // at `v0.13.0 broker/broker.ts:614-618`.)
         // `:615-622`
         if message.supersedes.is_some() {
             send_msg(
@@ -338,7 +340,7 @@ impl BrokerState {
         }
         // `:623-630`
         if let Some(edge) = reply_edge
-            && (edge.to != current_id || edge.from != target.id)
+            && (edge.to != *current_key || edge.from.id != target.id)
         {
             send_msg(
                 self_tx,
@@ -365,12 +367,16 @@ impl BrokerState {
         }
 
         // `:640-655`
-        match self.find_unique_live_session_for_disconnected_session(&target, current_id) {
-            Some(live_id) => {
+        match self.find_unique_live_session_for_disconnected_session(
+            current_key.scope.as_ref(),
+            &target,
+            current_key,
+        ) {
+            Some(live_key) => {
                 let mut delivered = message.clone();
                 delivered.broker_received_at = Some(now.into());
                 delivered.broker_delivered_at = Some(now_ms().into());
-                if let Some(live) = self.sessions.get(&live_id) {
+                if let Some(live) = self.sessions.get(&live_key) {
                     send_msg(
                         &live.tx,
                         &BrokerMessage::Message {
@@ -382,13 +388,20 @@ impl BrokerState {
                 self.message_receipt_routes.insert(
                     message.id.clone(),
                     MessageReceiptRoute {
-                        from: current_id.to_string(),
-                        to: live_id,
+                        from: current_key.clone(),
+                        to: live_key,
                         created_at: now,
                     },
                 );
             }
-            None => self.queue_mailbox_message(from_info, target, message, now),
+            None => self.queue_mailbox_message(
+                current_key.clone(),
+                from_info,
+                SessionKey::new(current_key.scope.clone(), target.id.clone()),
+                target,
+                message,
+                now,
+            ),
         }
         // `:656-658`
         if let Some(rt) = &message.reply_to {
@@ -407,17 +420,16 @@ impl BrokerState {
         &mut self,
         conn_id: u64,
         value: &serde_json::Value,
-        session_id: &Option<String>,
+        session_key: &Option<SessionKey>,
     ) -> FrameResult {
-        let Some(current_id) = session_id.clone() else {
+        let Some(current_key) = session_key.clone() else {
             return FrameResult::protocol_error();
         };
         let Some(message_id) = value.get("messageId").and_then(|v| v.as_str()) else {
             return FrameResult::protocol_error();
         };
-        let owns_socket = self.sessions.get(&current_id).map(|s| s.conn_id) == Some(conn_id);
-        let owns_edge =
-            self.ask_edges.get(message_id).map(|e| e.from.as_str()) == Some(current_id.as_str());
+        let owns_socket = self.sessions.get(&current_key).map(|s| s.conn_id) == Some(conn_id);
+        let owns_edge = self.ask_edges.get(message_id).map(|e| &e.from) == Some(&current_key);
         if owns_socket && owns_edge {
             self.ask_edges.remove(message_id);
         }
@@ -448,8 +460,8 @@ mod tests {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let mut sid = None;
             let mut peer_sid = None;
-            register(&mut state, 1, &mut sid, "s1");
-            register(&mut state, 2, &mut peer_sid, "s2");
+            register(&mut state, 1, &mut sid, "s1", None);
+            register(&mut state, 2, &mut peer_sid, "s2", None);
             // s2 leaves; the broker remembers it for its mailbox.
             state.on_connection_closed(2, &peer_sid, 1_500);
             while rx.try_recv().is_ok() {}
@@ -487,7 +499,7 @@ mod tests {
             let mut state = make_state();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let mut sid = None;
-            register(&mut state, 1, &mut sid, "s1");
+            register(&mut state, 1, &mut sid, "s1", None);
             while rx.try_recv().is_ok() {}
             state.handle_frame(
                 1,

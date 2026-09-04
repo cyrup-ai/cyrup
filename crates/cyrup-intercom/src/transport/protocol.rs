@@ -849,6 +849,69 @@ pub struct SessionRegistration {
     pub extra: UnknownFields,
 }
 
+/// An intercom routing scope — the broker's opaque isolation boundary (`scopeId`,
+/// `v0.13.0 types.ts:107`), resolved from `CYRUP_INTERCOM_SCOPE_ID` by
+/// [`crate::config::intercom_scope_id`] and carried on the `register` frame only.
+///
+/// **Parsed, never validated after the fact.** The inner string is private and the only
+/// constructor is [`ScopeId::parse`], which is `normalizeScopeId`'s trim
+/// (`v0.13.0 broker/broker.ts:140-141`) and `getIntercomScopeId`'s `?.trim()` truthiness test
+/// (`v0.13.0 config.ts:22-23`) in one place. That makes two states unrepresentable rather than
+/// merely unlikely: an UNTRIMMED scope, which would silently split one intended boundary in two
+/// (`"a"` and `" a"` are different map keys), and a BLANK scope, which would be an isolation class
+/// no unscoped session could reach — the exact inverse of the opt-in guarantee, since upstream's
+/// `trimmed ? trimmed : undefined` makes whitespace-only mean *unscoped*.
+///
+/// `Option<ScopeId>` is therefore the whole domain: `None` is the unscoped class every session
+/// registers into today, and `sameScope` (`:144-146`, a plain `===` over `string | undefined`) is
+/// the derived `PartialEq`.
+///
+/// There is deliberately no `Deserialize`: a wire value reaches this type only through
+/// [`scope_id_field`], which applies the same parse.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[serde(transparent)]
+pub struct ScopeId(String);
+
+impl ScopeId {
+    /// `normalizeScopeId`'s non-fatal half (`v0.13.0 broker/broker.ts:140-141`) and the whole of
+    /// `getIntercomScopeId` (`v0.13.0 config.ts:21-24`): trim, and treat the empty result as
+    /// UNSCOPED rather than as an error.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(Self(trimmed.to_string()))
+        }
+    }
+
+    /// The normalized scope string, as it appears on the register frame.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `normalizeScopeId(value)` (`v0.13.0 broker/broker.ts:133-142`) as a serde field deserializer,
+/// for [`ClientMessage::Register`]'s `scopeId`.
+///
+/// All three of upstream's arms, in upstream's order: an ABSENT key is `undefined` → unscoped
+/// (supplied by `#[serde(default)]`, so this function never runs for it); a PRESENT-but-not-a-string
+/// value — an explicit `null` included, since `typeof null !== "string"` — is a `throw`, i.e. a
+/// decode error, because a malformed scope must never silently degrade to "global"; and a
+/// whitespace-only string trims to unscoped and is *not* fatal.
+///
+/// # Errors
+/// Propagates serde's error for a present value that is not a string.
+fn scope_id_field<'de, D>(deserializer: D) -> Result<Option<ScopeId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(ScopeId::parse(&raw))
+}
+
 /// Client → broker messages (`v0.9.2 types.ts:77-101`).
 ///
 /// The full v0.9.2 tag set is modelled even where cyrup neither sends nor acts on a tag, because
@@ -887,6 +950,28 @@ pub enum ClientMessage {
             skip_serializing_if = "Option::is_none"
         )]
         state_id: Option<String>,
+        /// The broker routing scope this session registers into (`scopeId`,
+        /// `v0.13.0 types.ts:107`, filled in from `CYRUP_INTERCOM_SCOPE_ID` by
+        /// [`crate::transport::client::IntercomClient::connect_target`], mirroring
+        /// `...(scopeId ? { scopeId } : {})` at `v0.13.0 broker/client.ts:286-292`).
+        ///
+        /// **Absent — never null, never blank — for an unscoped session**, which is what keeps an
+        /// unscoped register frame byte-identical to the pre-scope one and therefore keeps a
+        /// scope-aware broker wire-compatible with an older client and vice versa. Normalized on
+        /// the way in by [`scope_id_field`], this crate's `normalizeScopeId`
+        /// (`v0.13.0 broker/broker.ts:133-142`).
+        ///
+        /// The broker does not enforce anything through THIS field: it reads raw
+        /// `serde_json::Value` frames and never deserializes a `ClientMessage` (see
+        /// `broker/js.rs`), so the enforcement copy lives at the register handler. This variant is
+        /// the crate's statement of the wire shape, and the `skip_serializing_if` is what the write
+        /// path depends on.
+        #[serde(
+            default,
+            deserialize_with = "scope_id_field",
+            skip_serializing_if = "Option::is_none"
+        )]
+        scope_id: Option<ScopeId>,
     },
     /// Unregister this session (`v0.9.2 types.ts:79`).
     Unregister,
@@ -1245,6 +1330,7 @@ mod tests {
             },
             session_id: Some("sess-1".to_string()),
             state_id: None,
+            scope_id: None,
         };
         let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "register");
@@ -1253,6 +1339,84 @@ mod tests {
         assert_eq!(v["session"]["lastActivity"], 2);
         // state_id omitted when None.
         assert!(v.get("stateId").is_none());
+        // ICOM-055 — and `scopeId` likewise, which is half of the opt-in guarantee: an unscoped
+        // register frame must be byte-identical to the pre-scope one
+        // (`...(scopeId ? { scopeId } : {})`, `v0.13.0 broker/client.ts:291`).
+        assert!(v.get("scopeId").is_none());
+    }
+
+    /// ICOM-055 — `normalizeScopeId` (`v0.13.0 broker/broker.ts:133-142`) as this crate's
+    /// [`scope_id_field`], on the one path that actually deserializes a `ClientMessage`.
+    ///
+    /// Three arms, upstream's: absent is unscoped, whitespace-only trims TO unscoped without being
+    /// fatal, and a present non-string (an explicit `null` included, since
+    /// `typeof null !== "string"`) is a decode error — upstream's `throw`, which the broker turns
+    /// into `socket.destroy`. A malformed scope must never quietly become "global".
+    #[test]
+    fn register_scope_id_is_normalized_and_a_non_string_is_a_decode_error() {
+        let base = serde_json::json!({
+            "type": "register",
+            "session": { "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
+        });
+        let with = |scope: serde_json::Value| {
+            let mut v = base.clone();
+            v["scopeId"] = scope;
+            serde_json::from_value::<ClientMessage>(v)
+        };
+        // Extracted rather than matched-with-a-panic: this module's test block allows
+        // `unwrap`/`expect` but the crate denies `panic!` everywhere (arch-00 §8).
+        let scope_of = |msg: ClientMessage| match msg {
+            ClientMessage::Register { scope_id, .. } => Some(scope_id),
+            _ => None,
+        };
+        assert_eq!(
+            scope_of(serde_json::from_value::<ClientMessage>(base.clone()).unwrap())
+                .expect("a register frame"),
+            None,
+            "an absent scopeId is unscoped"
+        );
+        assert_eq!(
+            scope_of(with(serde_json::json!("  alpha  ")).unwrap())
+                .expect("a register frame")
+                .as_ref()
+                .map(ScopeId::as_str),
+            Some("alpha"),
+            "a present scopeId is trimmed"
+        );
+        assert_eq!(
+            scope_of(with(serde_json::json!("   ")).unwrap()).expect("a register frame"),
+            None,
+            "a whitespace-only scopeId is unscoped, NOT an error"
+        );
+        assert!(with(serde_json::json!(7)).is_err(), "a number is fatal");
+        assert!(
+            with(serde_json::json!(null)).is_err(),
+            "an explicit null is fatal"
+        );
+    }
+
+    /// ICOM-055 — a scoped register frame carries the trimmed scope and nothing else changes.
+    #[test]
+    fn a_scoped_register_frame_carries_the_normalized_scope() {
+        let msg = ClientMessage::Register {
+            session: SessionRegistration {
+                runtime_fallback_alias: None,
+                name: None,
+                cwd: "/w".to_string(),
+                model: "m".to_string(),
+                pid: 1u64.into(),
+                started_at: 0u64.into(),
+                last_activity: 0u64.into(),
+                status: None,
+                tmux_pane: None,
+                extra: UnknownFields::default(),
+            },
+            session_id: None,
+            state_id: None,
+            scope_id: ScopeId::parse(" alpha "),
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["scopeId"], "alpha");
     }
 
     #[test]

@@ -17,14 +17,15 @@ use crate::transport::protocol::{
 };
 
 use super::frame::{FrameResult, send_msg};
+use super::routing::SessionKey;
 use super::state::BrokerState;
 
 /// `interface MessageReceiptRoute` (`v0.10.1 broker/broker.ts:80-84`) — where a delivered message
 /// went, so a receipt from the receiver can be forwarded back to its original sender and so the
 /// sender can `cancel`/`supersede` it.
 pub(super) struct MessageReceiptRoute {
-    pub(super) from: String,
-    pub(super) to: String,
+    pub(super) from: SessionKey,
+    pub(super) to: SessionKey,
     pub(super) created_at: u64,
 }
 
@@ -39,10 +40,10 @@ impl BrokerState {
         &mut self,
         conn_id: u64,
         value: &serde_json::Value,
-        session_id: &Option<String>,
+        session_key: &Option<SessionKey>,
         now: u64,
     ) -> FrameResult {
-        let Some(current_id) = session_id.as_deref() else {
+        let Some(current_key) = session_key.as_ref() else {
             return FrameResult::protocol_error();
         };
         let Some(receipt_val) = value.get("receipt") else {
@@ -56,16 +57,16 @@ impl BrokerState {
         let route_from = self
             .message_receipt_routes
             .get(&receipt.message_id)
-            .filter(|route| route.to == current_id)
+            .filter(|route| route.to == *current_key)
             .map(|route| route.from.clone());
         let receiver_info = self
             .sessions
-            .get(current_id)
+            .get(current_key)
             .filter(|s| s.conn_id == conn_id)
             .map(|s| s.info.clone());
-        if let Some(from_id) = route_from
+        if let Some(from_key) = route_from
             && let Some(from) = receiver_info
-            && let Some(sender) = self.sessions.get(&from_id)
+            && let Some(sender) = self.sessions.get(&from_key)
         {
             send_msg(&sender.tx, &BrokerMessage::MessageReceipt { from, receipt });
         }
@@ -88,10 +89,10 @@ impl BrokerState {
         conn_id: u64,
         self_tx: &UnboundedSender<Vec<u8>>,
         value: &serde_json::Value,
-        session_id: &Option<String>,
+        session_key: &Option<SessionKey>,
         now: u64,
     ) -> FrameResult {
-        let Some(current_id) = session_id.clone() else {
+        let Some(current_key) = session_key.clone() else {
             return FrameResult::protocol_error();
         };
         let Some(message_id) = value
@@ -105,7 +106,7 @@ impl BrokerState {
         self.prune_mailbox_messages(now);
         let sender_info = self
             .sessions
-            .get(&current_id)
+            .get(&current_key)
             .filter(|s| s.conn_id == conn_id)
             .map(|s| s.info.clone());
 
@@ -114,7 +115,7 @@ impl BrokerState {
         let queued_index = self
             .mailbox_messages
             .iter()
-            .position(|entry| entry.message.id == message_id && entry.from.id == current_id);
+            .position(|entry| entry.message.id == message_id && entry.from_key == current_key);
         if let Some(index) = queued_index
             && sender_info.is_some()
         {
@@ -122,7 +123,7 @@ impl BrokerState {
             if self
                 .ask_edges
                 .get(&message_id)
-                .is_some_and(|edge| edge.from == current_id)
+                .is_some_and(|edge| edge.from == current_key)
             {
                 self.ask_edges.remove(&message_id);
             }
@@ -132,7 +133,7 @@ impl BrokerState {
 
         let route = self.message_receipt_routes.get(&message_id);
         let receiver_tx = route
-            .filter(|route| route.from == current_id)
+            .filter(|route| route.from == current_key)
             .and_then(|route| self.sessions.get(&route.to))
             .map(|receiver| receiver.tx.clone());
         let (Some(from), Some(receiver_tx)) = (sender_info, receiver_tx) else {
@@ -162,7 +163,7 @@ impl BrokerState {
         if self
             .ask_edges
             .get(&message_id)
-            .is_some_and(|edge| edge.from == current_id)
+            .is_some_and(|edge| edge.from == current_key)
         {
             self.ask_edges.remove(&message_id);
         }

@@ -393,14 +393,18 @@ impl IntercomClient {
             target,
             registration,
             session_id,
+            // `const scopeId = getIntercomScopeId();` (`v0.13.0 broker/client.ts:286`) — resolved
+            // inside `connect`, exactly where `LivenessConfig::from_env` already is.
+            crate::config::intercom_scope_id(),
             LivenessConfig::from_env(),
         )
         .await
     }
 
-    /// [`Self::connect_target`] with an explicit liveness schedule instead of the env-resolved one
-    /// (`v0.10.1 broker/client.ts:47-55`). Exists because this crate is `#![forbid(unsafe_code)]`,
-    /// so a test cannot `set_var` to shorten the 30 s heartbeat.
+    /// [`Self::connect_target`] with an explicit routing scope and liveness schedule instead of the
+    /// env-resolved ones (`v0.10.1 broker/client.ts:47-55`, `v0.13.0 broker/client.ts:286`). Exists
+    /// because this crate is `#![forbid(unsafe_code)]`, so a test cannot `set_var` to shorten the
+    /// 30 s heartbeat or to register into a scope.
     ///
     /// # Errors
     /// As [`Self::connect_target`].
@@ -408,6 +412,7 @@ impl IntercomClient {
         target: &BrokerConnectTarget,
         registration: SessionRegistration,
         session_id: Option<String>,
+        scope_id: Option<crate::transport::protocol::ScopeId>,
         liveness: LivenessConfig,
     ) -> Result<Self> {
         let state_id = target.state_id().map(str::to_string);
@@ -438,10 +443,14 @@ impl IntercomClient {
         *guard(&inner.read_abort) = Some(read_handle.abort_handle());
 
         // Register immediately; the OS/tokio buffers the write until connected (client.ts:276-282).
+        // `...(scopeId ? { scopeId } : {})` (`v0.13.0 broker/client.ts:291`): the spread is
+        // conditional, so an unscoped client emits exactly the frame it emitted before scopes
+        // existed. `skip_serializing_if = "Option::is_none"` on the variant is what reproduces it.
         let register = ClientMessage::Register {
             session: registration,
             session_id,
             state_id,
+            scope_id,
         };
         if !inner.send_frame(encode_json(&register)?) {
             return Err(IntercomError::Client(
@@ -1203,6 +1212,7 @@ mod tests {
         let client = IntercomClient::connect_target_with_liveness(
             &BrokerConnectTarget::Socket(socket_path.clone()),
             registration(),
+            None,
             None,
             LivenessConfig {
                 interval: Duration::from_millis(20),

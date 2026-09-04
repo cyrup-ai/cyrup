@@ -11,6 +11,7 @@ use crate::transport::protocol::BrokerMessage;
 
 use super::frame::FrameResult;
 use super::limits::PRESENCE_HEARTBEAT_MS;
+use super::routing::SessionKey;
 use super::state::BrokerState;
 
 impl BrokerState {
@@ -18,10 +19,10 @@ impl BrokerState {
         &mut self,
         conn_id: u64,
         value: &serde_json::Value,
-        session_id: &Option<String>,
+        session_key: &Option<SessionKey>,
         now: u64,
     ) -> FrameResult {
-        let Some(current_id) = session_id.clone() else {
+        let Some(current_key) = session_key.clone() else {
             return FrameResult::protocol_error();
         };
         // OWNERSHIP FIRST. Every `throw new Error("Invalid presence …")` upstream is nested INSIDE
@@ -32,7 +33,7 @@ impl BrokerState {
         // a live path, not a theoretical one.
         let Some(session) = self
             .sessions
-            .get_mut(&current_id)
+            .get_mut(&current_key)
             .filter(|s| s.conn_id == conn_id)
         else {
             return FrameResult::cont();
@@ -111,9 +112,12 @@ impl BrokerState {
         if should_broadcast {
             session.last_presence_broadcast_at = now;
             let info = session.info.clone();
+            // `this.broadcast({ type: "presence_update", session: session.info }, currentKey,
+            // session.scopeId)` (`v0.13.0 broker/broker.ts:957`).
             self.broadcast(
                 &BrokerMessage::PresenceUpdate { session: info },
-                Some(&current_id),
+                Some(&current_key),
+                current_key.scope.as_ref(),
             );
         }
         FrameResult::cont()
@@ -328,7 +332,7 @@ mod tests {
         assert_eq!(
             state
                 .sessions
-                .get("s1")
+                .get(&SessionKey::unscoped("s1".to_string()))
                 .and_then(|s| s.info.runtime_fallback_alias),
             Some(true),
             "register must carry the flag onto the stored SessionInfo"
@@ -350,7 +354,7 @@ mod tests {
         assert_eq!(
             state
                 .sessions
-                .get("s1")
+                .get(&SessionKey::unscoped("s1".to_string()))
                 .and_then(|s| s.info.runtime_fallback_alias),
             Some(false)
         );

@@ -37,6 +37,22 @@ pub const ENV_INTERCOM_LIVENESS_TIMEOUT_MS: &str = "CYRUP_INTERCOM_LIVENESS_TIME
 /// downward for a child to read back as its supervisor's id, this one is *read* by a session as its
 /// own restart-stable registration id.
 pub const ENV_INTERCOM_STABLE_ID: &str = "CYRUP_INTERCOM_STABLE_ID";
+/// `CYRUP_INTERCOM_SCOPE_ID` (pi `INTERCOM_SCOPE_ID_ENV = "PI_INTERCOM_SCOPE_ID"`,
+/// `v0.13.0 config.ts:6`), resolved by [`crate::config::intercom_scope_id`]
+/// (`getIntercomScopeId`, `v0.13.0 config.ts:21-24`) and carried on the register frame
+/// (`v0.13.0 broker/client.ts:286-292`).
+///
+/// The broker's OPAQUE routing boundary, and the third distinct meaning in this file's session
+/// trio: [`ENV_INTERCOM_SESSION_ID`] is published DOWNWARD for a child to read back as its
+/// supervisor's id, [`ENV_INTERCOM_STABLE_ID`] is read by a session as its own restart-stable
+/// registration id, and this one is read by a session as the ISOLATION CLASS its id lives in. A
+/// session id is unique only within one scope; two scopes may hold the same id and they are two
+/// different sessions.
+///
+/// Opt-in: absent (or whitespace-only) means unscoped, which is the scope every session registers
+/// into today. Deliberately never read from `config.json` — that file is machine-global, so a scope
+/// stored there would apply to every session on the machine and erase the boundary it draws.
+pub const ENV_INTERCOM_SCOPE_ID: &str = "CYRUP_INTERCOM_SCOPE_ID";
 /// `HERDR_BIN` — NOT `CYRUP_HERDR_BIN`. Same rule as [`ENV_TMUX_PANE`]: the `CYRUP_` prefix applies
 /// to pi's OWN variables, and this one belongs to the Herdr vendor, read verbatim by upstream at
 /// `v0.12.0 project-agent.ts:68` (`options.bin ?? process.env.HERDR_BIN ?? "herdr"`). A user who has

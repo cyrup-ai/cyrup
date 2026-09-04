@@ -55,6 +55,8 @@ mod session;
 mod state;
 
 #[cfg(test)]
+mod scoped;
+#[cfg(test)]
 mod test_support;
 
 pub use lifecycle::run;

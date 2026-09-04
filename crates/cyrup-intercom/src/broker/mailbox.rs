@@ -9,7 +9,7 @@
 //! bookkeeping. Nothing here calls a frame handler — `state`, `session`, `send` and `receipts` all
 //! call inward, never the reverse — so `mailbox` is a leaf of the handler layer.
 
-use crate::transport::protocol::{BrokerMessage, Message, SessionInfo, now_ms};
+use crate::transport::protocol::{BrokerMessage, Message, ScopeId, SessionInfo, now_ms};
 
 use super::frame::send_msg;
 use super::js::js_truthy_alias;
@@ -17,13 +17,16 @@ use super::limits::{
     DISCONNECTED_SESSION_RETENTION_MS, MAILBOX_MESSAGE_RETENTION_MS, MAX_MAILBOX_MESSAGES,
 };
 use super::receipts::MessageReceiptRoute;
-use super::routing::find_session_ids;
+use super::routing::{SessionKey, find_session_keys};
 use super::state::BrokerState;
 
 /// `interface DisconnectedSession` (`v0.10.1 broker/broker.ts:85-88`) — the last-known
 /// [`SessionInfo`] of a session that has left, kept for
 /// [`DISCONNECTED_SESSION_RETENTION_MS`] so a `send` naming it can still be routed to its mailbox.
 pub(super) struct DisconnectedSession {
+    /// `key` / `scopeId` (`v0.13.0 broker/broker.ts:117-118`) — the departed session's composite
+    /// key, so its SCOPE survives the disconnect and a cross-scope `send` cannot reach its mailbox.
+    pub(super) key: SessionKey,
     pub(super) info: SessionInfo,
     pub(super) disconnected_at: u64,
 }
@@ -32,7 +35,13 @@ pub(super) struct DisconnectedSession {
 /// disconnected target, redelivered by [`BrokerState::flush_mailbox_for_session`] when that
 /// identity registers again.
 pub(super) struct MailboxMessage {
+    /// `fromKey` / `fromScopeId` (`v0.13.0 broker/broker.ts:123-124`).
+    pub(super) from_key: SessionKey,
     pub(super) from: SessionInfo,
+    /// `targetKey` / `targetScopeId` (`v0.13.0 broker/broker.ts:126-127`). BOTH ends are stored
+    /// because [`BrokerState::flush_mailbox_for_session`] compares them independently
+    /// (`:1120` against the flushing session, `:1126` inside the sender-identity guard).
+    pub(super) target_key: SessionKey,
     pub(super) target: SessionInfo,
     pub(super) message: Message,
     pub(super) queued_at: u64,
@@ -44,10 +53,16 @@ impl BrokerState {
     /// pi stores a COPY (`{ ...info }`) because the live `ConnectedSession.info` it was read from
     /// keeps being mutated by presence frames; the Rust `SessionInfo` is moved/cloned in, so the
     /// same isolation is structural here.
-    pub(super) fn remember_disconnected_session(&mut self, info: SessionInfo, now: u64) {
+    pub(super) fn remember_disconnected_session(
+        &mut self,
+        key: SessionKey,
+        info: SessionInfo,
+        now: u64,
+    ) {
         self.disconnected_sessions.insert(
-            info.id.clone(),
+            key.clone(),
             DisconnectedSession {
+                key,
                 info,
                 disconnected_at: now,
             },
@@ -91,9 +106,12 @@ impl BrokerState {
     /// The `while (length >= MAX)` head-eviction is pi's, including that it drops the OLDEST entry
     /// rather than refusing the new one, and that each eviction takes the same ask-edge and
     /// receipt-route cleanup an expiry does.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn queue_mailbox_message(
         &mut self,
+        from_key: SessionKey,
         from: SessionInfo,
+        target_key: SessionKey,
         target: SessionInfo,
         message: &Message,
         broker_received_at: u64,
@@ -111,7 +129,9 @@ impl BrokerState {
         let mut parked = message.clone();
         parked.broker_received_at = Some(broker_received_at.into());
         self.mailbox_messages.push(MailboxMessage {
+            from_key,
             from,
+            target_key,
             target,
             message: parked,
             queued_at: broker_received_at,
@@ -134,10 +154,16 @@ impl BrokerState {
     /// well as `undefined`, and `info.runtimeFallbackAlias` is falsy when the flag is `false`.
     /// [`js_truthy_alias`] and the `is_empty` filter reproduce that, so an empty name can never
     /// become a mailbox identity every unnamed session shares.
+    ///
+    /// ICOM-055 — `sameScope(session.scopeId, sessionInfo.scopeId)` is the FIRST conjunct of the
+    /// filter (`v0.13.0 broker/broker.ts:1305`), ahead of the alias/name/cwd tests: mailbox
+    /// identity is name + cwd **within one scope**, so a same-named session in the same directory
+    /// but a different scope can never inherit another scope's parked mail.
     pub(super) fn find_live_sessions_sharing_mailbox_identity(
         &self,
+        scope: Option<&ScopeId>,
         info: &SessionInfo,
-    ) -> Vec<String> {
+    ) -> Vec<SessionKey> {
         let Some(lower_name) = info
             .name
             .as_deref()
@@ -150,13 +176,14 @@ impl BrokerState {
             return Vec::new();
         }
         self.sessions_in_order()
-            .filter(|(_, s)| {
-                !js_truthy_alias(s.info.runtime_fallback_alias)
+            .filter(|(key, s)| {
+                key.in_scope(scope)
+                    && !js_truthy_alias(s.info.runtime_fallback_alias)
                     && s.info.name.as_deref().map(str::to_lowercase).as_deref()
                         == Some(lower_name.as_str())
                     && crate::cwd::same_cwd(&s.info.cwd, &info.cwd)
             })
-            .map(|(id, _)| id.clone())
+            .map(|(key, _)| key.clone())
             .collect()
     }
 
@@ -165,13 +192,14 @@ impl BrokerState {
     /// (so a session that renamed itself onto a peer's identity cannot receive its own mail).
     pub(super) fn find_unique_live_session_for_disconnected_session(
         &self,
+        scope: Option<&ScopeId>,
         info: &SessionInfo,
-        sender_id: &str,
-    ) -> Option<String> {
-        let matches: Vec<String> = self
-            .find_live_sessions_sharing_mailbox_identity(info)
+        sender_key: &SessionKey,
+    ) -> Option<SessionKey> {
+        let matches: Vec<SessionKey> = self
+            .find_live_sessions_sharing_mailbox_identity(scope, info)
             .into_iter()
-            .filter(|id| id != sender_id)
+            .filter(|key| key != sender_key)
             .collect();
         match matches.as_slice() {
             [only] => Some(only.clone()),
@@ -181,18 +209,19 @@ impl BrokerState {
 
     /// `findDisconnectedSessions` (`v0.10.1 broker/broker.ts:1010-1024`) — the same exact-id →
     /// exact-name → id-prefix ladder `findSessions` uses, over the disconnected map.
-    pub(super) fn find_disconnected_session_ids(
+    pub(super) fn find_disconnected_session_keys(
         &mut self,
         name_or_id: &str,
+        scope: Option<&ScopeId>,
         now: u64,
-    ) -> Vec<String> {
+    ) -> Vec<SessionKey> {
         self.prune_disconnected_sessions(now);
-        let entries: Vec<(String, Option<String>)> = self
+        let entries: Vec<(SessionKey, Option<String>)> = self
             .disconnected_sessions
             .values()
-            .map(|s| (s.info.id.clone(), s.info.name.clone()))
+            .map(|s| (s.key.clone(), s.info.name.clone()))
             .collect();
-        find_session_ids(&entries, name_or_id)
+        find_session_keys(&entries, name_or_id, scope)
     }
 
     /// `flushMailboxForSession` (`v0.10.1 broker/broker.ts:908-953`), called from `register` once
@@ -202,20 +231,21 @@ impl BrokerState {
     /// the UNIQUE live holder of its mailbox identity — by target name+cwd; and never by an entry
     /// this very identity SENT (`matchesSenderIdentity`), which is what stops a relaunched sender
     /// from swallowing the mail it queued for a peer of the same name in the same directory.
-    pub(super) fn flush_mailbox_for_session(&mut self, session_id: &str, now: u64) {
+    pub(super) fn flush_mailbox_for_session(&mut self, session_key: &SessionKey, now: u64) {
         self.prune_mailbox_messages(now);
-        let Some(session) = self.sessions.get(session_id) else {
+        let Some(session) = self.sessions.get(session_key) else {
             return;
         };
         let info = session.info.clone();
         let tx = session.tx.clone();
+        let scope = session_key.scope.clone();
         let session_name = info
             .name
             .as_deref()
             .map(str::to_lowercase)
             .filter(|n| !n.is_empty());
         let unique_mailbox_identity = self
-            .find_live_sessions_sharing_mailbox_identity(&info)
+            .find_live_sessions_sharing_mailbox_identity(scope.as_ref(), &info)
             .len()
             == 1;
 
@@ -225,24 +255,35 @@ impl BrokerState {
                 let Some(entry) = self.mailbox_messages.get(index) else {
                     break;
                 };
-                let matches_id = entry.target.id == info.id;
-                let matches_sender_identity = session_name.as_deref().is_some_and(|name| {
-                    entry.from.name.as_deref().map(str::to_lowercase).as_deref() == Some(name)
-                        && crate::cwd::same_cwd(&entry.from.cwd, &info.cwd)
-                });
-                let matches_unique_name = unique_mailbox_identity
-                    && session_name.as_deref().is_some_and(|name| {
-                        !matches_sender_identity
-                            && entry
-                                .target
-                                .name
-                                .as_deref()
-                                .map(str::to_lowercase)
-                                .as_deref()
+                // ICOM-055 — `if (!sameScope(entry.targetScopeId, session.scopeId)) continue;`
+                // (`v0.13.0 broker/broker.ts:1120-1123`), BEFORE the id match, in upstream's own
+                // order. Mail parked for one scope is invisible to every other.
+                if !entry.target_key.in_scope(scope.as_ref()) {
+                    (false, false)
+                } else {
+                    let matches_id = entry.target_key == *session_key;
+                    // `sameScope(entry.fromScopeId, session.scopeId)` is the SECOND conjunct of
+                    // `matchesSenderIdentity` (`:1126`), immediately after the name truthiness test.
+                    let matches_sender_identity = session_name.as_deref().is_some_and(|name| {
+                        entry.from_key.in_scope(scope.as_ref())
+                            && entry.from.name.as_deref().map(str::to_lowercase).as_deref()
                                 == Some(name)
-                            && crate::cwd::same_cwd(&entry.target.cwd, &info.cwd)
+                            && crate::cwd::same_cwd(&entry.from.cwd, &info.cwd)
                     });
-                (matches_id, matches_unique_name)
+                    let matches_unique_name = unique_mailbox_identity
+                        && session_name.as_deref().is_some_and(|name| {
+                            !matches_sender_identity
+                                && entry
+                                    .target
+                                    .name
+                                    .as_deref()
+                                    .map(str::to_lowercase)
+                                    .as_deref()
+                                    == Some(name)
+                                && crate::cwd::same_cwd(&entry.target.cwd, &info.cwd)
+                        });
+                    (matches_id, matches_unique_name)
+                }
             };
             if !matches_id && !matches_unique_name {
                 index += 1;
@@ -255,9 +296,9 @@ impl BrokerState {
             // edge. This is the one place an ask edge is MUTATED rather than created or dropped,
             // and it is why a disconnect must NOT clear the edges (see `on_connection_closed`).
             if let Some(edge) = self.ask_edges.get_mut(&entry.message.id)
-                && edge.to == entry.target.id
+                && edge.to == entry.target_key
             {
-                edge.to.clone_from(&info.id);
+                edge.to.clone_from(session_key);
             }
             let mut delivered = entry.message.clone();
             delivered.broker_delivered_at = Some(now_ms().into());
@@ -271,8 +312,8 @@ impl BrokerState {
             self.message_receipt_routes.insert(
                 entry.message.id.clone(),
                 MessageReceiptRoute {
-                    from: entry.from.id.clone(),
-                    to: info.id.clone(),
+                    from: entry.from_key.clone(),
+                    to: session_key.clone(),
                     created_at: entry
                         .message
                         .broker_received_at
@@ -352,8 +393,11 @@ mod tests {
         );
         // The flush records where the message went, so a receipt can be routed home (`:945-952`).
         assert_eq!(
-            state.message_receipt_routes.get("m1").map(|r| r.to.clone()),
-            Some("b".into())
+            state
+                .message_receipt_routes
+                .get("m1")
+                .map(|r| r.to.id.clone()),
+            Some("b".to_string())
         );
     }
     /// `flushMailboxForSession`'s `matchesUniqueName` arm (`:919-931`) and the identity guard it
@@ -475,8 +519,11 @@ mod tests {
             "the relaunched session receives it: {got:?}"
         );
         assert_eq!(
-            state.message_receipt_routes.get("m1").map(|r| r.to.clone()),
-            Some("b-new".into())
+            state
+                .message_receipt_routes
+                .get("m1")
+                .map(|r| r.to.id.clone()),
+            Some("b-new".to_string())
         );
     }
     /// `MAX_MAILBOX_MESSAGES` head-eviction (`:892-898`): the cap drops the OLDEST parked entry, so
