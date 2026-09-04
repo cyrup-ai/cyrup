@@ -207,16 +207,18 @@ impl<B: Backend> App<B> {
         let usage_may_have_moved = context_usage_may_have_moved(&ev);
         // Pi resolves `getToolDefinition(toolName)` per tool-execution component — the registry is
         // handed to the render context at `interactive-mode.ts:3413` and read as
-        // `hasRendererDefinition()` at `tool-execution.ts:103-105`. cyrup's fold is sync and holds
-        // no session, so the one lock-guarded registry lookup is hoisted here, the same place (and
-        // for the same reason) `refresh_context_usage` is. Memoized in
-        // [`AppState::known_tool_definitions`] so a repeated tool never re-locks, and read BEFORE
-        // the fold consumes `ev`.
+        // `hasRendererDefinition()` at `tool-execution.ts:103-105` and as `getRenderShell()` at
+        // `:108-116` (EXT-024). cyrup's fold is sync and holds no session, so the one lock-guarded
+        // registry lookup is hoisted here, the same place (and for the same reason)
+        // `refresh_context_usage` is. Memoized in [`AppState::known_tool_definitions`] so a
+        // repeated tool never re-locks, and read BEFORE the fold consumes `ev`.
         if let AgentSessionEvent::ToolExecutionStart { tool_name, .. } = &ev
-            && !self.state.known_tool_definitions.contains(tool_name)
-            && session.tool_definition(tool_name).is_some()
+            && !self.state.known_tool_definitions.contains_key(tool_name)
+            && let Some(definition) = session.tool_definition(tool_name)
         {
-            self.state.known_tool_definitions.insert(tool_name.clone());
+            self.state
+                .known_tool_definitions
+                .insert(tool_name.clone(), definition.render_kind);
         }
         self.ingest_event_with_extensions_owned(ev, &ext_host).await;
         // TUI-031 — `flushCompactionQueue` (`interactive-mode.ts:4036-4110` @v0.83.0), the last

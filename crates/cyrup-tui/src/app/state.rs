@@ -218,6 +218,14 @@ pub struct AppState {
     /// command handlers (`/new`/`/resume`/`/fork`/`/reload`/`/import`); consumed by
     /// [`App::rebind_session`] once the generation bump fires and the new session is installed.
     pub pending_swap_status: Option<SwapCaption>,
+    /// TUI-037 — pi's `autoTrustOnReloadCwd` (`interactive-mode.ts:550` @v0.84.4): the session
+    /// cwd whose trust was granted IMPLICITLY at boot (no `--approve`/`--no-approve`, no
+    /// trust-requiring resources to gate), armed by the host through
+    /// [`App::set_auto_trust_on_reload_cwd`] and consumed by
+    /// [`App::maybe_save_implicit_project_trust`] on `/reload`, which persists the grant once the
+    /// project grows `.cyrup/` resources and disarms it. `None` when trust was decided explicitly
+    /// (a flag, a saved entry, the prompt) or already persisted.
+    pub auto_trust_on_reload_cwd: Option<PathBuf>,
     /// Committed lines already emitted to native scrollback via `Terminal::insert_before`
     /// (R-ARCH-TUI-003). Test/inspection only — OFF in production builds (TUI-092 F1).
     #[cfg(any(test, feature = "scrollback-accumulator"))]
@@ -359,10 +367,13 @@ pub struct AppState {
     /// settled `/login` or `/logout` (each of which ends in `footer.invalidate()`,
     /// `interactive-mode.ts:5449`, `:5475`). See [`App::refresh_auth_snapshot`].
     pub(super) oauth_credential_providers: std::collections::BTreeSet<String>,
-    /// Tool names the live session knows a DEFINITION for — Pi's `getToolDefinition(name)` registry
-    /// (`agent-session.ts:806`, built over the builtins plus every registered/custom tool), which
-    /// `ToolExecutionComponent.hasRendererDefinition()` reads (`tool-execution.ts:103-105`) to
-    /// choose between the two per-side fallbacks and the unbounded `formatToolExecution`.
+    /// Tool names the live session knows a DEFINITION for, each with that definition's
+    /// `renderShell` — Pi's `getToolDefinition(name)` registry (`agent-session.ts:806`, built over
+    /// the builtins plus every registered/custom tool), which `ToolExecutionComponent` reads twice:
+    /// `hasRendererDefinition()` (`tool-execution.ts:103-105`) to choose between the two per-side
+    /// fallbacks and the unbounded `formatToolExecution`, and `getRenderShell()` (`:108-116`) to
+    /// choose between the tinted `Box(1, 1)` shell and the tool's own framing (EXT-024). One
+    /// lookup answers both, so the memo is a map from the name to the shell rather than a set.
     ///
     /// Cached here for the same reason [`Self::oauth_credential_providers`] is: the answer is
     /// needed by the **sync** fold ([`App::ingest_event_rendered_owned`]), which holds no session.
@@ -370,7 +381,8 @@ pub struct AppState {
     /// [`App::ingest_session_event_owned`], which resolves that one name off the live registry, and
     /// a session bind/swap, which reloads the whole set ([`App::refresh_known_tool_definitions`])
     /// so the `/resume` replay walk can answer for calls it never saw start.
-    pub(super) known_tool_definitions: std::collections::HashSet<String>,
+    pub(super) known_tool_definitions:
+        std::collections::HashMap<String, cyrup_core::ToolRenderKind>,
     /// The `(command, argument)` pair [`App::refresh_extension_completions`] last asked an
     /// extension command's own completer about (`getArgumentCompletions`,
     /// `interactive-mode.ts:753` @v0.84.3). `None` whenever the cursor is not inside such an
@@ -456,6 +468,7 @@ impl AppState {
             show_cache_miss_notices: false,
             cache_miss_check_pending: false,
             pending_swap_status: None,
+            auto_trust_on_reload_cwd: None,
             #[cfg(any(test, feature = "scrollback-accumulator"))]
             scrollback: Vec::new(),
             extension_shortcuts: Vec::new(),
@@ -490,7 +503,7 @@ impl AppState {
             pending_login_prompt: None,
             login_cancel: None,
             oauth_credential_providers: std::collections::BTreeSet::new(),
-            known_tool_definitions: std::collections::HashSet::new(),
+            known_tool_definitions: std::collections::HashMap::new(),
             extension_completion_query: None,
         }
     }

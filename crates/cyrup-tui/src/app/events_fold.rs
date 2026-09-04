@@ -182,12 +182,13 @@ impl<B: Backend> App<B> {
                 // tool name.
                 // EXT-006: an extension that declared a renderer for THIS tool supplies the call
                 // header; `None` keeps the built-in per-tool dispatch.
-                // `hasRendererDefinition()` (tool-execution.ts:103-105) — resolved off the live
-                // `getToolDefinition` registry one frame up, in
-                // [`Self::ingest_session_event_owned`], because this fold holds no session. It is
-                // what decides whether an unrendered tool draws as a bold name + ten-line preview
-                // or as `formatToolExecution`'s full argument dump.
-                let has_definition = self.state.known_tool_definitions.contains(&tool_name);
+                // `hasRendererDefinition()` (tool-execution.ts:103-105) and `getRenderShell()`
+                // (`:108-116`) — resolved off the live `getToolDefinition` registry one frame up,
+                // in [`Self::ingest_session_event_owned`], because this fold holds no session. The
+                // first decides whether an unrendered tool draws as a bold name + ten-line preview
+                // or as `formatToolExecution`'s full argument dump; the second whether the block
+                // gets the tinted `Box(1, 1)` shell or the tool's own framing (EXT-024).
+                let definition = self.state.known_tool_definitions.get(&tool_name).copied();
                 self.state.transcript.push_tool_start_defined(
                     tool_name,
                     Some(tool_call_id.as_str().to_string()),
@@ -195,7 +196,7 @@ impl<B: Backend> App<B> {
                     // A tool ROW is a string surface: it has no live-component tier, so the
                     // outcome is flattened here rather than carried.
                     rendered.clone().into_text(),
-                    has_definition,
+                    definition,
                 );
                 if let Some(preview) = preview {
                     self.state

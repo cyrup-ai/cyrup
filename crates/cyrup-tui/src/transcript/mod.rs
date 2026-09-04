@@ -34,7 +34,7 @@
 //! `markdown.ts:284`, …), which name a line in a pinned external tag of the TypeScript this crate
 //! ports and stay verbatim.
 
-use cyrup_core::Content;
+use cyrup_core::{Content, ToolRenderKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -90,7 +90,7 @@ use tool_args::{
     more_lines_hint, push_search_path, read_line_range, str_arg, tool_path_span,
 };
 use tool_builtin::{
-    builtin_kind, edit_header_preview, render_builtin_call, render_builtin_result,
+    Builtin, builtin_kind, edit_header_preview, render_builtin_call, render_builtin_result,
     render_call_fallback, render_extension_call, render_extension_result, render_generic,
     render_result_fallback,
 };

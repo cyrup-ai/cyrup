@@ -26,6 +26,19 @@ pub struct ToolInfo {
     pub prompt_snippet: Option<String>,
     /// Whether the tool is in the currently-active set (model-visible this turn).
     pub active: bool,
+    /// The definition's `renderShell` (pi `ToolDefinition.renderShell?: "default" | "self"`,
+    /// `extensions/types.ts:467` @v0.84.4), read off [`Tool::render_kind`] — what
+    /// `ToolExecutionComponent.getRenderShell()` resolves from `session.getToolDefinition(name)`
+    /// (`modes/interactive/components/tool-execution.ts:108-116`, definition handed in at
+    /// `interactive-mode.ts:2067-2069`) to decide whether the row gets the tinted `Box(1, 1)` shell
+    /// or the tool's own framing (EXT-024).
+    ///
+    /// `#[serde(skip)]`: pi's serialized `ToolInfo` is exactly `{name, description, parameters,
+    /// promptSnippet?, active?}` (`agent-session.ts:790-799`) and the guest-facing `getAllTools`
+    /// shape is pinned separately (EXT-038); this field is for the host's own renderer, not the
+    /// wire.
+    #[serde(skip)]
+    pub render_kind: cyrup_core::ToolRenderKind,
 }
 
 /// Captures the stable system-prompt inputs so the base prompt can be rebuilt when the active tool
@@ -207,6 +220,7 @@ impl DynamicToolState {
             parameters: t.parameters().clone(),
             prompt_snippet: t.prompt_snippet().map(str::to_string),
             active: self.active.iter().any(|n| n == t.name()),
+            render_kind: t.render_kind(),
         }
     }
 

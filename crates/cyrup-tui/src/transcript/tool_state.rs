@@ -26,24 +26,25 @@ impl TranscriptView {
         args: Value,
         rendered: Option<String>,
     ) {
-        self.push_tool_start_defined(name, call_id, args, rendered, false);
+        self.push_tool_start_defined(name, call_id, args, rendered, None);
     }
 
-    /// [`Self::push_tool_start_rendered`] plus the has-a-DEFINITION answer for this tool name — Pi
-    /// `hasRendererDefinition()` (tool-execution.ts:103-105), see [`ToolRun::has_definition`].
+    /// [`Self::push_tool_start_rendered`] plus what the definition registry answered for this tool
+    /// name — Pi `hasRendererDefinition()` (tool-execution.ts:103-105) and `getRenderShell()`
+    /// (`:108-116`) in one value, see [`ToolRun::definition`].
     ///
-    /// The two forms above default it to `false`, which is the shape-preserving value for a caller
-    /// with no registry in hand: an unknown name keeps drawing through `formatToolExecution`. Every
-    /// production path has the session — [`crate::App::ingest_session_event_owned`] resolves it off
-    /// the live `getToolDefinition` registry per tool start, and the `/resume` replay walk reads the
-    /// set that same bind cached.
+    /// The two forms above default it to `None`, which is the shape-preserving value for a caller
+    /// with no registry in hand: an unknown name keeps drawing through `formatToolExecution`, and
+    /// a known one keeps its shell. Every production path has the session —
+    /// [`crate::App::ingest_session_event_owned`] resolves it off the live `getToolDefinition`
+    /// registry per tool start, and the `/resume` replay walk reads the map that same bind cached.
     pub fn push_tool_start_defined(
         &mut self,
         name: impl Into<String>,
         call_id: Option<String>,
         args: Value,
         rendered: Option<String>,
-        has_definition: bool,
+        definition: Option<ToolRenderKind>,
     ) {
         self.bump_render_generation();
         self.active_tools.push(ToolRun {
@@ -57,7 +58,7 @@ impl TranscriptView {
             duration_ms: None,
             rendered_call: rendered,
             rendered_result: None,
-            has_definition,
+            definition,
             preview: None,
             images: Vec::new(),
         });
@@ -182,10 +183,10 @@ impl TranscriptView {
                 duration_ms: None,
                 rendered_call: None,
                 rendered_result: rendered,
-                // A result whose START was missed carries no registry answer; `false` keeps the
+                // A result whose START was missed carries no registry answer; `None` keeps the
                 // pre-existing `formatToolExecution` shape for an unknown name, and a built-in name
                 // is dispatched by the built-in table regardless.
-                has_definition: false,
+                definition: None,
                 preview: None,
                 images,
             });

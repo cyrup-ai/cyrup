@@ -531,7 +531,7 @@ pub(super) enum Builtin {
 }
 
 /// The built-in definition table (see [`Builtin`]). `None` = the name is not a built-in, so
-/// whether anything at all is known about it is [`ToolRun::has_definition`]'s question.
+/// whether anything at all is known about it is [`ToolRun::definition`]'s question.
 pub(super) fn builtin_kind(name: &str) -> Option<Builtin> {
     match name {
         "read" => Some(Builtin::Read),

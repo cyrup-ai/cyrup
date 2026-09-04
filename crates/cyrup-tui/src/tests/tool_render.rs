@@ -10,9 +10,11 @@
 )]
 
 use crate::{Component, TranscriptView, UiTheme};
+use cyrup_core::ToolRenderKind;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use serde_json::json;
 
 fn render(view: &mut TranscriptView, w: u16, h: u16) -> String {
@@ -369,4 +371,99 @@ fn commit_moves_live_tools_to_scrollback() {
         "committed tools leave the live set"
     );
     assert_eq!(view.pending().len(), 1, "committed as a scrollback entry");
+}
+
+// ------------------------------------------------------------------- EXT-024: renderShell ----
+//
+// `getRenderShell()` (`tool-execution.ts:108-116` @v0.84.4) — the second tier of its `??` chain
+// and the shell branch of `render()` (`:237-259`), at the transcript seam. The end-to-end half
+// (a real session registry feeding the memo) is `tests/tool_render_shell.rs`.
+
+/// The cell backgrounds of the first row carrying `needle`, with the needle's column.
+fn row_bgs(view: &mut TranscriptView, w: u16, h: u16, needle: &str) -> (usize, Vec<Color>) {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    let theme = UiTheme::dark();
+    term.draw(|f| view.render(f, Rect::new(0, 0, w, h), &theme))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+    for y in 0..h {
+        let mut text = String::new();
+        let mut bgs = Vec::new();
+        for x in 0..w {
+            let cell = buf.cell((x, y)).unwrap();
+            text.push_str(cell.symbol());
+            bgs.push(cell.bg);
+        }
+        if let Some(col) = text.find(needle) {
+            return (col, bgs);
+        }
+    }
+    panic!("no row carries {needle:?}");
+}
+
+fn pending_bg() -> Color {
+    UiTheme::dark().backgrounds().tool_pending.unwrap()
+}
+
+/// A defined tool declaring `"self"` whose call an EXTENSION renders: the extension's text goes
+/// out bare — column 0, no `toolPendingBg` — because the self container is a `Container`, not
+/// the `Box(1, 1, bgFn)` (`:73-76`, `:275-277`).
+#[test]
+fn a_self_rendered_extension_row_has_no_shell() {
+    let mut view = TranscriptView::new();
+    view.push_tool_start_defined(
+        "ext_tool",
+        Some("c1".into()),
+        json!({}),
+        Some("EXT-OWN-FRAME".into()),
+        Some(ToolRenderKind::SelfRendered),
+    );
+    let (col, bgs) = row_bgs(&mut view, 60, 6, "EXT-OWN-FRAME");
+    assert_eq!(col, 0, "no Box paddingX on a self-rendered row");
+    assert!(
+        !bgs.contains(&pending_bg()),
+        "no state tint on a self-rendered row"
+    );
+}
+
+/// The same row under `"default"` keeps the padded, tinted shell — the branch is the declared
+/// shell, not the presence of an extension renderer.
+#[test]
+fn a_default_extension_row_keeps_the_shell() {
+    let mut view = TranscriptView::new();
+    view.push_tool_start_defined(
+        "ext_tool",
+        Some("c1".into()),
+        json!({}),
+        Some("EXT-OWN-FRAME".into()),
+        Some(ToolRenderKind::Default),
+    );
+    let (col, bgs) = row_bgs(&mut view, 60, 6, "EXT-OWN-FRAME");
+    assert_eq!(col, 1, "Box(1, 1): one column of padding");
+    assert!(
+        bgs.iter().all(|bg| *bg == pending_bg()),
+        "toolPendingBg across the row"
+    );
+}
+
+/// The second tier — `builtInToolDefinition.renderShell` — answers when no registry was asked:
+/// the id-less constructor's `edit` still draws inside its own `EditCallRenderComponent` box
+/// (`edit.ts:281`, a `Box(1, 1)` filled by `getEditHeaderBg`), so the pre-EXT-024 rows are
+/// byte-identical, and a `read` through the same constructor keeps the default shell.
+#[test]
+fn the_builtin_tier_answers_the_shell_for_a_legacy_push() {
+    let mut view = TranscriptView::new();
+    view.push_tool_start("edit", json!({ "path": "a.txt" }));
+    let (col, bgs) = row_bgs(&mut view, 60, 6, "edit a.txt");
+    assert_eq!(col, 1, "edit's own Box(1, 1) pads the header by one column");
+    assert!(
+        bgs.iter().all(|bg| *bg == pending_bg()),
+        "no preview yet, not settled: getEditHeaderBg is toolPendingBg (edit.ts:272)"
+    );
+
+    let mut view = TranscriptView::new();
+    view.push_tool_start("read", json!({ "path": "a.txt" }));
+    let (col, bgs) = row_bgs(&mut view, 60, 6, "read a.txt");
+    assert_eq!(col, 1);
+    assert!(bgs.iter().all(|bg| *bg == pending_bg()));
 }

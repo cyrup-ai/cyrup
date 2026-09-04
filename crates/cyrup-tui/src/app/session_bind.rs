@@ -151,8 +151,13 @@ impl<B: Backend> App<B> {
     /// per-tool-start lookup there cannot answer for them and they would all fall back to
     /// `formatToolExecution`'s full argument dump.
     pub fn refresh_known_tool_definitions(&mut self, session: &Arc<AgentSession>) {
-        self.state.known_tool_definitions =
-            session.all_tools().into_iter().map(|t| t.name).collect();
+        // The definition's `renderShell` rides along (EXT-024): `getRenderShell()` reads it off the
+        // same `getToolDefinition(name)` answer (`tool-execution.ts:108-116`).
+        self.state.known_tool_definitions = session
+            .all_tools()
+            .into_iter()
+            .map(|t| (t.name, t.render_kind))
+            .collect();
     }
 
     /// [`Self::replay_session`], first resolving each displayed `custom` message's registered
@@ -357,11 +362,12 @@ impl<B: Backend> App<B> {
                         // interactive-mode.ts:3473) so the `toolResult` below resolves to the exact
                         // call that produced it — two `read`s in one turn are indistinguishable by
                         // name.
-                        // `hasRendererDefinition()` (tool-execution.ts:103-105) for a replayed
-                        // call: the bind refreshed the whole registry into
-                        // [`AppState::known_tool_definitions`] just above, which is the only place
-                        // this walk can ask — it holds messages, not a session.
-                        let has_definition = self.state.known_tool_definitions.contains(&call.name);
+                        // `hasRendererDefinition()` (tool-execution.ts:103-105) and
+                        // `getRenderShell()` (`:108-116`) for a replayed call: the bind refreshed
+                        // the whole registry into [`AppState::known_tool_definitions`] just above,
+                        // which is the only place this walk can ask — it holds messages, not a
+                        // session.
+                        let definition = self.state.known_tool_definitions.get(&call.name).copied();
                         self.state.transcript.push_tool_start_defined(
                             call.name.clone(),
                             Some(call.id.as_str().to_string()),
@@ -370,7 +376,7 @@ impl<B: Backend> App<B> {
                             // above; `None` keeps the built-in per-tool dispatch, as on the live
                             // path.
                             rendered.tool_calls.get(call.id.as_str()).cloned(),
-                            has_definition,
+                            definition,
                         );
                     }
                     if let Some(notice) = stop_reason_notice(m) {
