@@ -55,6 +55,36 @@ core code-puppy, not in the plugin, and `FLUX-002` turns on that fact.
 > because the crate has no tests at all (`FLUX-003`), so there is nothing to read a green result off
 > either.
 
+> **Re-audited 2026-09-04, cyrup HEAD `2571969`** (210 commits ahead of `4fb5e40`).
+> `git log --oneline 4fb5e40..HEAD -- crates/cyrup-flux` returns exactly **one** commit, `254bb48`,
+> and its only touch on this crate is two rustdoc intra-doc-link fixes in doc comments
+> (`ask_tool.rs`, `overlay.rs`) — no behavior changed. **`FLUX-001` through `FLUX-006` were each
+> re-read against the code cited above and are unchanged: still open, same severity, same cited
+> lines.** Re-confirmed this pass: `bundled_dir()` still resolves through `CARGO_MANIFEST_DIR` with
+> no loud-failure path (`FLUX-001`); the four multi-task templates still name `subagent`
+> unconditionally with no availability fallback (`FLUX-002`); `grep -rn '#\[cfg(test)\]\|#\[test\]'
+> crates/cyrup-flux/` is still **0** (`FLUX-003`); `resolve_shortcuts` still has no production caller
+> (`FLUX-004`); the four `_docs`/`reference` pairs are still byte-identical with no test
+> (`FLUX-005`); `state.rs`'s `parse_frontmatter` still uses `read_to_string` (UTF-8-strict), not
+> `read` + `from_utf8_lossy` (`FLUX-006`).
+>
+> **`FLUX-007` is substantially revised below.** Both upstreams named in this file's own header are
+> now cloned in this workspace — `tmp/code_puppy_core_plugins` (HEAD `8c6f852`, latest tag now
+> **v0.0.40**, up from the recorded baseline `v0.0.6`) and `tmp/code_puppy` (HEAD `38f74d4`, latest
+> tag now **v0.0.819**, up from the recorded baseline `v0.0.720`) — neither was available in this
+> workspace as of the first pass. A diff-stat sweep of the ported surface across that gap found
+> **zero content drift**: `git -C tmp/code_puppy_core_plugins diff --stat v0.0.6 v0.0.40 --
+> code_puppy_core_plugins/flux_bootstrap/ tests/test_flux_bootstrap.py` is empty —
+> `flux_bootstrap/` is byte-identical at both tags despite 34 tags of distance, so **no new
+> version-lag item is filed from that range; do not re-file one without re-running this diff.**
+> `code_puppy`'s `tools/__init__.py` and `tools/subagent_invocation.py` — the two files `FLUX-002`
+> cites — DID change between `v0.0.720` and `v0.0.819` (+170/−42 combined), but `invoke_agent` is
+> still registered in `TOOL_REGISTRY` unchanged at the CITED tag `v0.0.720` (confirmed by re-reading
+> it), so `FLUX-002`'s citation still holds exactly as written. The `v0.0.720..v0.0.819` range itself
+> was read only far enough to confirm that one fact and is otherwise unswept — see Blind spots below;
+> nothing in the diff (a Codex-patch tool-selection rewrite and a subagent recursion-guard refactor,
+> neither touching Flux) looked close enough to `FLUX-002` to file with confidence.
+
 ## Status table (every item from every prior pass)
 
 **There are no prior passes.** This section is declared, and empty, per the item format
@@ -93,7 +123,7 @@ in areas 07 and 08.
 | FLUX-004 | **medium** | cyrup-original | S | `ctrl+f` silently takes the editor's `tui.editor.cursorRight` away from the user, with no diagnostic and no rebind path — the first LIVE instance of `EXT-039`'s open residual |
 | FLUX-005 | low | cyrup-original | S | The four `_docs/*.md` reference files are byte-identical duplicates of `skills/flux/reference/*.md` with no sync mechanism, and one of them is additionally compiled into `/flux/cheatsheet` |
 | FLUX-006 | low | parity-bug | S | `parse_frontmatter` is UTF-8-strict where the Python is `errors="replace"`, so one bad byte turns a task file's whole frontmatter into an empty map instead of a parsed one |
-| FLUX-007 | low | tooling | S | The crate records no upstream baseline version, and every upstream and task citation it carries points into gitignored `tmp/` or at spec task files that do not exist — so no claim in this area is re-derivable by anyone else |
+| FLUX-007 | low | tooling | S | The crate still records no upstream baseline version in-source, and its four `tmp/code-puppy` doc-comment links still resolve nowhere — confirmed this pass to be wrong on two axes (directory name and a missing path segment) even now that both upstreams are cloned in-workspace — and 13 `FLUX_NN`/`§5.6` citations still point at spec files that do not exist |
 
 ---
 
@@ -382,54 +412,76 @@ changes; `str::lines()` and `split_once(':')` operate on the `Cow` unchanged.
 invalid byte `0xFF` must return a two-key map, not an empty one. Listed as item (2) of `FLUX-003`'s
 minimum set.
 
-## FLUX-007 — Nothing in the crate records which upstream it was ported from, and every citation it carries is unresolvable off this machine
+## FLUX-007 — Nothing in the crate records which upstream it was ported from, and its citations still resolve nowhere even now that both upstreams are cloned in this workspace
 
 **Kind** tooling · **Severity** low · **Effort** S · **Confidence** confirmed
-**cyrup** — Three compounding defects in the crate's evidence trail. **(1) No baseline version.**
-`grep -rn 'v0\.0\.' crates/cyrup-flux/src/` returns **0**; `Cargo.toml` names the upstream only in
-prose ("port of code-puppy flux") with no repository and no tag; `lib.rs:1-4` says "ported from
-code-puppy's `flux_bootstrap` plugin" with no version. This is the same defect area 09 records
-against `cyrup-ext-subagents` — "the crate still records no version string; v0.43.0 is the
-`PARITY-GAPS.md` inference" (`09-cyrup-ext-subagents.md:4-6`) — except here there is not even an
-inference on file, because no gap-analysis file mentioned the crate until this one. **(2) Every
-upstream citation points into gitignored `tmp/`.** Four source doc-comments cite
-`../../../tmp/code-puppy/flux_bootstrap/...` (`state.rs:2`, `render_status.rs:2`,
-`render_cheatsheet.rs:2`, `render_about.rs:2`) and `spec/flux.md` cites `../tmp/code-puppy/` **21**
-times. `.gitignore:7` is `tmp/` and `git ls-files tmp/` returns **zero tracked files**, so all 25
-links resolve on this checkout and nowhere else. **(3) Thirteen citations point at spec task files
-that do not exist.** The crate cites `FLUX_01`×2, `FLUX_06`×1, `FLUX_07`×3, `FLUX_08`×1, `FLUX_09`×4,
-`FLUX_10`×2 — e.g. `resources.rs` "port doc §3.4.1 Fact 7", `extension.rs:130` "FLUX_01 Fact 4",
-`render_about.rs:7` "FLUX_08 SUBTASK 1" — and `spec/flux/` contains **only `README.md`**; all twelve
-`FLUX_NN.md` files its task table links (`spec/flux/README.md:56-69`) are absent. A fourth, smaller
-instance: `state.rs:8` and `spec/flux.md:672` both cite "§5.6", and `spec/flux.md` has no §5.6 — §5 is
-"Gaps, risks, decisions" at `:852` and has no numbered subsections.
-**upstream** — n/a; this is a cyrup bookkeeping defect. The correct baseline, established by this
-pass and pinned here so it need not be re-derived: **`code_puppy_core_plugins` tag `v0.0.6`** (repo
-HEAD `8de5184`, and `v0.0.6` is also the latest tag, so there is no version lag to sweep yet) for the
-plugin, and **`code_puppy` tag `v0.0.720`** for the core tools the templates depend on.
+**REVISED 2026-09-04** — re-derived against `tmp/code_puppy_core_plugins` and `tmp/code_puppy`,
+neither of which was in this workspace when the row below was first filed (2026-08-19). The premise
+that made this "unresolvable off this machine" no longer holds — both repos are now clonable
+coordinates any holder of this workspace can fetch, the same as every other upstream in this
+directory — but **the three underlying cyrup-side defects are unchanged**, so the item stays open.
+**cyrup** — Three compounding defects in the crate's evidence trail, each re-confirmed at HEAD
+`2571969` this pass. **(1) No baseline version.** `grep -rn 'v0\.0\.' crates/cyrup-flux/src/
+Cargo.toml` still returns **0**; `Cargo.toml` and `lib.rs:1-4` still name the upstream only in prose
+("port of code-puppy flux", "ported from code-puppy's `flux_bootstrap` plugin"), no repository, no
+tag. Same defect class area 09 records against `cyrup-ext-subagents`, except here there is still not
+even an inference on file. **(2) The four upstream doc-comment links are wrong, and now precisely so.**
+`state.rs:2`, `render_status.rs:2`, `render_cheatsheet.rs:2` and `render_about.rs:2` all cite
+`../../../tmp/code-puppy/flux_bootstrap/bundled/scripts/<f>.py`. Now that the real clone exists, that
+path is confirmed wrong on **two independent axes**: the clone directory is `tmp/code_puppy_core_plugins`
+(underscored, not `tmp/code-puppy`), and inside it the plugin package is one level deeper than the
+comment assumes — the real path is
+`tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/<f>.py` (the repo
+name and the top-level Python package share a name, and the comment's three `../` + `code-puppy/`
+skips that package segment entirely). So the citation was never resolvable, at any point, on any
+machine — not even the original author's, unless a differently-shaped checkout existed. `spec/flux.md`
+still cites `../tmp/code-puppy/` **21** times, same wrong shape. **(3) Thirteen citations still point
+at spec task files that do not exist.** Recounted this pass: `FLUX_01`×2, `FLUX_06`×1, `FLUX_07`×3,
+`FLUX_08`×1, `FLUX_09`×4, `FLUX_10`×2 = 13, unchanged from the first pass — `extension.rs`,
+`overlay.rs`, `render_about.rs`, `render_cheatsheet.rs`, `resources.rs` and `state.rs` all still carry
+them, and `spec/flux/` still contains **only `README.md`**; all twelve `FLUX_NN.md` files its task
+table links (`spec/flux/README.md:56-69`) are still absent. The "§5.6" instance is also unchanged:
+`state.rs:8` and `spec/flux.md:672` both still cite it, and `spec/flux.md` still has no §5.6 heading.
+**upstream** — n/a for the defect itself; this remains a cyrup bookkeeping problem, not a parity one.
+**Baseline now independently re-derivable, and re-derived this pass:** `code_puppy_core_plugins`
+ported baseline **`v0.0.6`** (repo now cloned at `tmp/code_puppy_core_plugins`, HEAD `8c6f852`,
+**latest tag is now `v0.0.40`** — real tag-distance now exists where the first pass correctly recorded
+none). `git -C tmp/code_puppy_core_plugins diff --stat v0.0.6 v0.0.40 --
+code_puppy_core_plugins/flux_bootstrap/ tests/test_flux_bootstrap.py` is **empty** — the entire ported
+surface is byte-identical across all 34 intervening tags, so the new tag-distance carries **zero**
+content lag; nothing here should be filed as a version-lag item without re-running that diff first.
+`code_puppy` ported baseline **`v0.0.720`**, **latest tag now `v0.0.819`** (repo cloned at
+`tmp/code_puppy`, HEAD `38f74d4`). `TOOL_REGISTRY["invoke_agent"]` (`FLUX-002`'s citation) is
+unchanged at the cited tag `v0.0.720`, re-confirmed by direct read this pass; the `v0.0.720..v0.0.819`
+range is otherwise unswept for this area (see Blind spots).
 **Impact** — The directory's central rule is that upstream claims are settled with `git show
 <tag>:<path>` and never from a working tree (`README.md`'s hard rules; `09-cyrup-ext-subagents.md:5-8`
-restates it). This crate makes that impossible for anyone but the author: there is no tag to show, no
-repository named, and the paths that ARE named are untracked. That is the exact hazard
-`README.md`'s Caveats section flags about unverifiable in-source references — and it is not
-theoretical here, because it already produced a wrong belief this pass had to correct by hand: the
-"Wibey" attribution in `overlay.rs:1-2` reads as an unexplainable internal name until you read
-`flux_status.py:4-6` @v0.0.6, where it turns out to be **upstream's own wording** ("This is the
-code-puppy equivalent of Wibey's native `ui-mode: flux-status` renderer"), inherited faithfully. **Do
-not re-derive that as a leak.**
-**Fix** — Three small edits. (a) Record the baseline in the crate the way the other ported crates
-should: a `//!` line in `lib.rs` naming
-`mpfaffenberger/code_puppy_core_plugins @ v0.0.6` and `code_puppy @ v0.0.720`, so a drift sweep has a
-tag to diff against. (b) Re-point the four `tmp/code-puppy` doc links at `git show
-v0.0.6:code_puppy_core_plugins/flux_bootstrap/bundled/scripts/<f>.py` invocations, or delete the link
-syntax and keep the path as prose — a link that resolves for one person is worse than no link,
-because it renders as verified. (c) Either restore `spec/flux/FLUX_01.md`…`FLUX_12.md` or rewrite the
-13 in-source `FLUX_NN` citations to point at `spec/flux.md` sections that exist, and fix the two "§5.6"
-references. **This is the row that gates re-auditing every other row in this file**, which is why it
-is filed despite being bookkeeping.
-**Verify** — `grep -rn 'tmp/code-puppy' crates/cyrup-flux/ spec/flux.md` returns 0, `grep -rnE
-'FLUX_[0-9]+' crates/cyrup-flux/src/` resolves to files that exist, and `lib.rs` names a tag that
-`git -C <code_puppy_core_plugins> rev-parse` accepts.
+restates it). **That is now achievable for this area** — both repos are cloned in `tmp/` and their
+tags confirmed — which retires the "impossible for anyone but the author" half of the original
+Impact. What is NOT retired: the crate's own source still cites nothing a reader can resolve without
+first independently discovering the correct clone shape, so a reader who trusts the doc comments as
+written is still led to a path that does not exist. `README.md`'s Caveats section flags exactly this
+hazard, and it already produced one wrong belief this pass had to correct by hand: the "Wibey"
+attribution in `overlay.rs:1-2` reads as an unexplainable internal name until `flux_status.py:4-6`
+@v0.0.6 is read directly, where it turns out to be upstream's own wording. **Do not re-derive that as
+a leak.**
+**Fix** — Three small edits, one now more precisely specified than before. (a) Record the baseline in
+the crate: a `//!` line in `lib.rs` naming `code_puppy_core_plugins @ v0.0.6` and `code_puppy @
+v0.0.720`. (b) Re-point the four doc-comment links at the REAL path —
+`../../../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/<f>.py`
+— or, better, drop the link syntax entirely and cite `git show
+v0.0.6:code_puppy_core_plugins/flux_bootstrap/bundled/scripts/<f>.py` in prose, which is what a
+citation that must survive a `git show`-only reading rule should look like; a link that renders as
+resolvable but silently is not is worse than plain prose. (c) Either restore
+`spec/flux/FLUX_01.md`…`FLUX_12.md` or rewrite the 13 in-source `FLUX_NN` citations to point at
+`spec/flux.md` sections that exist, and fix the two "§5.6" references. **This is still the row that
+gates re-auditing every other row in this file**, which is why it stays filed despite being
+bookkeeping.
+**Verify** — `grep -rn 'tmp/code-puppy' crates/cyrup-flux/ spec/flux.md` returns 0; a corrected link
+resolves with `git -C tmp/code_puppy_core_plugins show v0.0.6:<path>` from the exact path the comment
+names; `grep -rnE 'FLUX_[0-9]+' crates/cyrup-flux/src/` resolves to files that exist; and `lib.rs`
+names tags that `git -C tmp/code_puppy_core_plugins rev-parse v0.0.6` and `git -C tmp/code_puppy
+rev-parse v0.0.720` both accept.
 
 ## Coverage
 
@@ -469,6 +521,22 @@ From `code_puppy` @`v0.0.720` (`/Users/davidmaple/cyrup.ai/code_puppy`, HEAD `75
 `code_puppy/tools/__init__.py:36-40` (`TOOL_REGISTRY`) and
 `code_puppy/tools/subagent_invocation.py:650`/`:696`. From pi @`v0.83.0`, for `FLUX-004`'s upstream
 half only: `packages/tui/src/keybindings.ts:54-70`.
+
+### Re-audited 2026-09-04 — what was actually re-read
+
+`crates/cyrup-flux/src/*.rs` in full again (all nine files), diffed mentally against the first pass's
+quotes — unchanged. `crates/cyrup/src/main.rs` symbols for the subagent opt-in gate (grep-confirmed
+present, same shape). `crates/cyrup-ext/src/registry.rs` / `facade.rs` `resolve_shortcuts` callers
+(grep-confirmed still test-only). The four `_docs`/`reference` pairs (`diff -q`, still byte-identical).
+`git -C tmp/code_puppy_core_plugins show v0.0.6:code_puppy_core_plugins` (tree listing, confirms
+`flux_bootstrap/` at the expected shape) and `v0.0.40` (same 29-file listing, confirming no added or
+removed files); `git -C tmp/code_puppy_core_plugins diff --stat v0.0.6 v0.0.40 --
+code_puppy_core_plugins/flux_bootstrap/ tests/test_flux_bootstrap.py` (empty). `git -C tmp/code_puppy
+show v0.0.720:code_puppy/tools/__init__.py` (re-confirms `invoke_agent`/`TOOL_REGISTRY` unchanged from
+the first-pass quote) and `git -C tmp/code_puppy diff --stat v0.0.720 v0.0.819` (324 files,
++35128/−24793 workspace-wide; only `tools/__init__.py` and `tools/subagent_invocation.py` read in
+detail, both unrelated to Flux — a Codex-patch tool-selection rewrite and a subagent recursion-guard
+refactor). `git log --oneline 4fb5e40..HEAD -- crates/cyrup-flux` (one commit, doc-comment-only).
 
 ### Surface-driven sweeps run (diffed as sets, not spot-checked)
 
@@ -543,12 +611,16 @@ half only: `packages/tui/src/keybindings.ts:54-70`.
 - **`README.md` and `00-residual-ledger.md` need three edits this file cannot make**, since neither is
   in this area's partition: (a) a `[14-cyrup-flux.md]` row in the Contents table
   (`README.md:227-240`) with the totals re-derived; (b) a `code_puppy_core_plugins/` row in
-  `## Baselines measured against` (`README.md:384-391`) — HEAD `8de5184`, ported baseline and latest
-  tag both `v0.0.6`, plus `code_puppy` @`v0.0.720`; (c) `README.md:3-4`, which says cyrup is measured
-  against "four TypeScript upstreams" — code-puppy is the fifth ported upstream and the first that is
-  not TypeScript, which changes the scope of the `git show <tag>:<path>` hard rule. The open counts in
-  `00-residual-ledger.md` and `PARITY-GAPS.md` move by **+7** and should be re-derived from the
-  tables, not adjusted arithmetically.
+  `## Baselines measured against` (`README.md:384-391`) — **updated this pass**: HEAD `8c6f852`
+  (was `8de5184`), ported baseline `v0.0.6`, **latest tag now `v0.0.40`** (was recorded as `v0.0.6`
+  with "no version lag to sweep yet" — that statement is now false as a tag-distance claim, though
+  the diff-stat sweep above found the content delta is still empty), plus `code_puppy` HEAD `38f74d4`,
+  ported baseline `v0.0.720`, **latest tag now `v0.0.819`** (was recorded with no latest-tag column
+  entry); (c) `README.md:3-4`, which says cyrup is measured against "four TypeScript upstreams" —
+  code-puppy is the fifth ported upstream and the first that is not TypeScript, which changes the
+  scope of the `git show <tag>:<path>` hard rule. The open counts in `00-residual-ledger.md` and
+  `PARITY-GAPS.md` are unchanged by this pass (**+7**, same as before — nothing closed) and should
+  still be re-derived from the tables, not adjusted arithmetically.
 
 ### Blind spots — read this before the next pass
 
@@ -585,3 +657,17 @@ half only: `packages/tui/src/keybindings.ts:54-70`.
    the docs" now applies here: `grep -rnE 'FLUX-[0-9]{3}' crates/cyrup-flux/` should start returning
    hits as these rows get fix comments, and `FLUX_NN`/`§5.6`-style dangling citations
    (`FLUX-007`) must not be allowed to accumulate alongside them.
+7. **`code_puppy`'s `v0.0.720..v0.0.819` range (324 files, +35128/−24793) is unswept beyond the two
+   files `FLUX-002` already cites.** This pass read only enough of `tools/__init__.py` and
+   `tools/subagent_invocation.py` to re-confirm `invoke_agent`'s registration is unchanged at the
+   CITED tag `v0.0.720` — it did not read forward to `v0.0.819` for new tools, renamed tools, or
+   subagent-behavior changes that might bear on `FLUX-002` or on tool names the 15 templates assume.
+   The two files' `v0.0.720..v0.0.819` diff itself (a Codex-patch tool-selection rewrite and a
+   subagent recursion-guard refactor) was skimmed and neither hunk looked Flux-relevant, but it was
+   not read closely enough to file or refute anything from it — left open rather than guessed at.
+   Whoever next re-audits this area should read that range in full before trusting `FLUX-002`'s
+   severity against current upstream, not just against the recorded baseline tag.
+8. **`flux_bootstrap/`'s zero-diff finding (`v0.0.6..v0.0.40`) covers only that directory and
+   `tests/test_flux_bootstrap.py`, not `code_puppy_core_plugins` as a whole.** No claim is made here
+   about drift elsewhere in that repo (other plugins, shared install machinery `flux_bootstrap`
+   might come to depend on) — out of scope for this area regardless.

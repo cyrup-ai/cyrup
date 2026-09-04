@@ -253,6 +253,30 @@ Newly filed: **24**. Refuted and recorded: **1**.
 > that file also clears `.cyrup-subagents/` (missions/artifacts) of any suspicion — that one is a
 > correct, faithful port of pi-subagents' own project-scoped `.pi-subagents` default, not a bug.
 
+> **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline for this pass `4fb5e40`, 210 commits
+> ahead; combined 09/09a pass — see `09a-cyrup-ext-subagents-v0.57-drift.md` for that file's own
+> closures this pass, nine confirmed and one partial). `git log --oneline 4fb5e40..HEAD -- crates/cyrup-ext-subagents`
+> lists 25 non-merge commits; the ones that touch this area's own open items (as opposed to 09a's)
+> are refactor/decomposition work (`extension.rs` → `extension/`, `exec/mod.rs` split into six files,
+> `exec/acceptance.rs` split) that moves code without changing behaviour. **Every currently-open row
+> in this file (`SUBA-005` tracker aside) was re-checked against the code at HEAD — by reading the
+> actual current implementation, not by trusting that "nothing mentions it" — and none closed.**
+> Specifically re-verified unchanged, each by grep-for-the-behaviour plus a read of the relevant
+> function: `SUBA-016` (`schedule.*` still not in `SUBAGENT_ACTIONS`; the `DESTRUCTIVE_MANAGEMENT_ACTIONS`
+> list carries the string `"schedule.delete"` but that is SUBA-065's verbatim did-you-mean table, not
+> a dispatched verb — do not mistake it for progress), `SUBA-017`, `SUBA-022`, `SUBA-023`'s residual
+> (`process_terminal`/`session_lease` still zero-hit), `SUBA-024`'s residual (`chain_graph.rs:1900`'s
+> own comment still states "this crate has no agent-contract concept at all yet"), `SUBA-026`,
+> `SUBA-049`'s `steeringRecovery` residual, `SUBA-054`'s async-cwd residual (still an explicit blocker
+> comment in `background/runner_main.rs`, not a silent default), `SUBA-056`, `SUBA-061` (all four keys
+> still zero-hit), `SUBA-063`, `SUBA-070` (`interactive` is parsed at `discovery/types.rs:1020` and
+> `discovery/frontmatter.rs:847` but `grep -rn '\.interactive\b' src/exec/ src/extension/ src/spawn/`
+> is still 0 — no consumer), and this file's own `SUBA-072` (`exec/mod.rs:757` is still
+> `opts.cwd.join(".cyrup-subagent-scratch")`, byte-identical to the citation in
+> `bugs/SUBA-072-scratch-dir-project-scope.md`). **One cross-file update**: `SUBA-085` in
+> `09a-cyrup-ext-subagents-v0.57-drift.md` (filed and left open this pass) discharges
+> `mission.resolve-decision` from `SUBA-005`'s unowned-verb list below — noted at that tracker row.
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | ~~SUBA-014~~ | ~~**high**~~ **CLOSED 2026-08-14** | not-ported | S | `requireReadTool` unported — a skill-carrying agent can be told to `read` a skill it has no `read` tool for — **CLOSED 2026-08-14**: sweep 1 — the seam is now `exec::build_attempt_spawn_plan_with_read_requirement`; the 7-arg `build_attempt_spawn_plan` survives as pi's `requireReadTool: undefined` form so no external caller broke. |
@@ -345,7 +369,7 @@ other items own. A planner should not pick one up; the next audit pass maintains
 
 | ID | Kind | Owner of the actual work | Note |
 |---|---|---|---|
-| SUBA-005 | tracking | the subsystem items it indexes (SUBA-016, SUBA-046, SUBA-055, SUBA-057, VL-S6, VL-S13) plus seven still-unowned verbs | 27-vs-50/53 management-verb census. Its own Fix says "this item is the ledger, not the work". What it owes is (a) owners for `worktree.discard`, `approve-checkpoint`, `reject-checkpoint`, `project.open`/`project.status`/`project.close`, `mission.resolve-decision`, and (b) a completeness assertion pinning the enum against a checked-in copy of upstream's array. |
+| SUBA-005 | tracking | the subsystem items it indexes (SUBA-016, SUBA-046, SUBA-055, SUBA-057, VL-S6, VL-S13, and now SUBA-085 in `09a`) plus two still-unowned verbs | **Counts re-derived 2026-09-04 against cyrup HEAD `2571969` and upstream `v0.57.0`** (independently counted, not copied from `09a`'s own re-measurement, which agrees): cyrup's `SUBAGENT_ACTIONS` (`crates/cyrup-ext-subagents/src/extension/tool/text.rs:187-230`) advertises **30** verbs against upstream's **52** (`git show v0.57.0:src/shared/types.ts:2397`) — **23 unadvertised**: `debug.run`, `inspector.{close,open,status}`, `mission.resolve-decision`, `project.{close,open,status}`, `refine`, `refine.rollback`, `refine.show`, `schedule.{create,delete,history,list,pause,resume,run,run-due,show}`, `validate`, `worktree.discard`. **`append-step` is cyrup-only** — upstream deleted it from the array between v0.47.1 and v0.57.0 (commit `7ece6f35`, per `09a`'s "Already tracked" table), so it advertises a verb upstream no longer has; not a defect, just stale relative to the old 27-vs-50 framing. Of the 23, all but two now have a named owner: `schedule.*` (9) → `SUBA-016`; `refine`/`refine.show`/`refine.rollback` → `VL-S13`+`VL-S11`; the six `inspector.*`/`project.*` verbs → `VL-S6`+`PB-8`; `worktree.discard` → `SUBA-024`/`VL-S10`/`SUBA-064`; **`mission.resolve-decision` → `SUBA-085`, filed and left open in `09a-cyrup-ext-subagents-v0.57-drift.md` this pass.** The original "seven unowned verbs" framing is stale in two more ways: `approve-checkpoint` and `reject-checkpoint` no longer exist at v0.57.0 either (same commit), so they were dropped from cyrup's list along with upstream's rather than being a residual gap. **Genuinely unowned as of this pass: `debug.run` and `validate`** — neither is named by any open item in area 09 or 09a; `debug.run` is on `09a`'s own "cut at the twenty-item cap" list (confirmed absent, filed next pass) but has no id yet. What this tracker still owes: (a) an owner for `debug.run` and `validate`, and (b) the completeness assertion pinning the enum against a checked-in copy of upstream's array, unchanged from the original filing. |
 
 ---
 

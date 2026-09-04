@@ -91,25 +91,78 @@ corrections are applied and recorded at the item.
 
 | ID | Sev | Eff | Subsystem | Title |
 |---|---|---|---|---|
-| SUBA-072 | critical | M | foreground exec / tool allowlisting | Capability ceiling's `allowedTools` and `denyExtensions` axes are resolved and propagated but never applied to the child |
-| SUBA-073 | medium | M | config / permissions / frontmatter | Subagent permission policy never reaches a spawned child; `permission:` frontmatter is accepted and inert |
-| SUBA-074 | high | L | external runners / agent schema | `runner:` frontmatter is ignored entirely, so a sandboxed foreign-CLI profile runs as a full-capability native child |
-| SUBA-075 | high | M | fork context / thinking | Forked child sessions are not sanitized: signed/redacted Anthropic thinking blocks inherited, no thinking-off override |
-| SUBA-076 | high | S | acceptance / evidence scoring | Evidence checks are scored binary where upstream is tri-state, producing two spurious acceptance rejections |
-| SUBA-077 | high | S | foreground exec / deadlines | A foreground run with no explicit timeout has NO wall-clock deadline, and there is no global `timeoutMs` |
-| SUBA-078 | high | M | discovery settings / thinking | `subagents.maxThinking` ceiling entirely absent — no parse, no bound, no enforcement, no env propagation |
-| SUBA-079 | high | S | fork context / launch policy | `defaultContext: fork` hard-fails when the parent is unpersisted where upstream falls back to fresh; no config rung; no `context:"profile"` |
-| SUBA-081 | high | M | discovery / settings overrides | Ten `agentOverrides` fields never apply, and a legal `tools: "inherit"` fails the settings load |
-| SUBA-083 | high | S | config / launch mode | `asyncByDefault` default is inverted, making the documented `asyncByDefault:false` opt-out a no-op |
-| SUBA-085 | high | S | missions | `mission.resolve-decision` unported: a decision is write-once and permanently open, wedging the goal driver |
+| ~~SUBA-072~~ | ~~critical~~ **CLOSED 2026-09-04** | M | foreground exec / tool allowlisting | Capability ceiling's `allowedTools` and `denyExtensions` axes are resolved and propagated but never applied to the child |
+| ~~SUBA-073~~ | ~~medium~~ **CLOSED 2026-09-04** | M | config / permissions / frontmatter | Subagent permission policy never reaches a spawned child; `permission:` frontmatter is accepted and inert |
+| SUBA-074 | high — **stage 1 CLOSED 2026-09-04, stage 2 open** | L | external runners / agent schema | `runner:` frontmatter is ignored entirely, so a sandboxed foreign-CLI profile runs as a full-capability native child |
+| ~~SUBA-075~~ | ~~high~~ **CLOSED 2026-09-04** | M | fork context / thinking | Forked child sessions are not sanitized: signed/redacted Anthropic thinking blocks inherited, no thinking-off override |
+| ~~SUBA-076~~ | ~~high~~ **CLOSED 2026-09-04** | S | acceptance / evidence scoring | Evidence checks are scored binary where upstream is tri-state, producing two spurious acceptance rejections |
+| ~~SUBA-077~~ | ~~high~~ **CLOSED 2026-09-04** | S | foreground exec / deadlines | A foreground run with no explicit timeout has NO wall-clock deadline, and there is no global `timeoutMs` |
+| ~~SUBA-078~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery settings / thinking | `subagents.maxThinking` ceiling entirely absent — no parse, no bound, no enforcement, no env propagation |
+| ~~SUBA-079~~ | ~~high~~ **CLOSED 2026-09-04** | S | fork context / launch policy | `defaultContext: fork` hard-fails when the parent is unpersisted where upstream falls back to fresh; no config rung; no `context:"profile"` |
+| ~~SUBA-081~~ | ~~high~~ **PARTIALLY CLOSED 2026-09-04** | M | discovery / settings overrides | Ten `agentOverrides` fields never apply, and a legal `tools: "inherit"` fails the settings load — 6 of 10 landed, 4 fields remain |
+| ~~SUBA-083~~ | ~~high~~ **CLOSED 2026-09-04** | S | config / launch mode | `asyncByDefault` default is inverted, making the documented `asyncByDefault:false` opt-out a no-op |
+| SUBA-085 | high | S | missions | `mission.resolve-decision` unported: a decision is write-once and permanently open, wedging the goal driver — **re-verified open 2026-09-04** |
+| SUBA-092 | high | M | discovery / agent schema | **NEW 2026-09-04** — `excludeTools:`/`allowNestedSubagents:` (frontmatter + settings-override) unported; a declared tool exclusion has no effect. Window v0.57.0..v0.62.0, outside this file's original v0.57.0 scope |
+
+> **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
+> eleven items counted "confirmed, schedulable" above, **nine are now closed and one is
+> partially closed** — all nine landed in two commits, `bf8b0f9` (SUBA-072/073/074-stage1/075/076)
+> and `c94a360` (SUBA-077), plus `SUBA-078`/`SUBA-079`/`SUBA-083` whose landing commits were not
+> individually identified (the workspace history around them was squashed/rebased — `git log -S` on
+> their defining symbols lands on `3f9380f`, a commit whose own subject is unrelated, so treat the
+> commit attribution as approximate; the CODE was read directly and is not in question).
+> Every closure above was verified by reading the actual current code (function bodies, call sites,
+> tests) — not by trusting the commit message — per this ledger's evidence rule. Only `SUBA-074`
+> (stage 2 residual) and `SUBA-085` remain open and fully unchanged from this file's original filing;
+> both were re-confirmed absent by the same greps this file used originally, re-run at HEAD.
+> **The `## Already tracked` and `## Corpus health` sections below are UNCHANGED and not re-audited
+> this pass** — several of their cross-references (e.g. "`SUBA-021`/`VL-S1` says … no ceiling
+> concept" in Corpus health §3) describe area 09's evidence as of the original filing and are now
+> further stale in the direction this closure record already fixes; a maintainer reconciling area 09
+> and 09a together should re-derive them rather than trust the prose as still current.
+>
+> **One new item filed this pass, from the window past this file's own scope**: upstream moved from
+> v0.57.0 (this file's tag) to **v0.64.0** since the original filing. Per the task brief's
+> conservative-skim instruction, `git -C tmp/pi-subagents diff --stat v0.57.0..v0.64.0` was skimmed
+> (141 files, +14684/−3625, dominated by the still-out-of-scope `workflowScript`/watchdog
+> subsystems) rather than re-swept item-by-item, and exactly one high-confidence, both-sides-read
+> defect was filed: **`SUBA-092`** (agent-level `excludeTools:`/`allowNestedSubagents:`, window
+> v0.57.0..v0.62.0). The rest of the window was NOT exhaustively walked — treat it as unaudited, not
+> as clean.
 
 Carried-but-unverified (`## Carried — NOT adversarially verified`): `SUBA-082`, `SUBA-084`,
-`SUBA-086` (high); `SUBA-087`, `SUBA-088`, `SUBA-089`, `SUBA-090`, `SUBA-091` (medium).
+`SUBA-086` (high); `SUBA-087`, `SUBA-088`, `SUBA-089`, `SUBA-090`, `SUBA-091` (medium). **All eight
+re-checked port-side at cyrup HEAD `2571969` this pass (2026-09-04): every zero-hit grep this file
+recorded for them still returns zero hits at HEAD — none of the 210 commits since baseline `4fb5e40`
+touched any of these eight symbols/behaviours.** Left exactly as filed, still held to the lower
+evidence standard the section header states (upstream line numbers not re-verified) — this pass did
+not re-read `git show v0.57.0:<path>` for any of the eight, only the cyrup side.
 Refuted: `SUBA-080`.
 
 ---
 
-## SUBA-072 — The capability ceiling's `allowedTools` and `denyExtensions` axes are resolved, intersected and propagated but never applied to the spawned child
+## ~~SUBA-072~~ — ~~critical~~ **CLOSED 2026-09-04** — The capability ceiling's `allowedTools` and `denyExtensions` axes are resolved, intersected and propagated but never applied to the spawned child
+
+> **CLOSED 2026-09-04, cyrup HEAD `2571969`** (re-audit against baseline `4fb5e40`, area 09/09a pass).
+> Landed by `bf8b0f9 feat(subagents): close five v0.57.0 parity gaps in cyrup-ext-subagents`
+> (2026-08-27) — verified by reading the current code, not the commit message.
+> `crates/cyrup-ext-subagents/src/exec/spawn_plan.rs::build_attempt_spawn_plan` now resolves
+> `capability_ceiling` at `:325` (`preflight_capability_ceiling`) and threads
+> `ceiling_allowed_tools`/`ceiling_deny_extensions` through both the tool-allowlist block and the
+> extension block: `explicit_tool_allowlist = agent.tools.is_some() || ceiling_allowed_tools.is_some()`
+> (`:731`, matching `pi-args.ts:473-476`'s `allowedToolSet !== undefined` test — this is the exact
+> fix this item's own Fix line asked for), the declared/undeclared arms both intersect against
+> `ceiling_allowed_tools` (`:667-683`), and `ceiling_deny_extensions` empties the extension paths and
+> MCP selections and forces the no-extensions equivalent (`:792-814`, `:1075-1077`). The stale
+> in-source claim this item quoted ("cyrup has no capability ceiling … `allowedToolSet` is permanently
+> `undefined`") is gone from the current file. 11 tests at `spawn_plan.rs:1544-1780` cover both axes
+> including the item's own Verify recipe (`the_capability_ceilings_allowed_tools_axis_gates_both_the_declared_and_undeclared_arms`,
+> `a_capability_ceilings_deny_extensions_axis_strips_all_extension_paths_and_forces_no_extensions`,
+> `a_capability_ceiling_excluding_read_fails_the_launch_when_read_is_required`).
+>
+> **Also revises `SUBA-021` / `PARITY-GAPS VL-S1`** exactly as this item's own "Relation to corpus"
+> instructed: `SUBA-021` (area 09) is already closed there citing the ceiling landing in sweep 10;
+> this closure record supersedes its residual claim of non-application.
 
 **Kind** parity-bug · **Severity** critical · **Effort** M · **Confidence** confirmed
 **Subsystem** foreground execution / tool allowlisting (`exec/spawn_plan.rs`)
@@ -170,7 +223,19 @@ raise `SUBA-021` to `critical` and rewrite its body, or supersede it with this r
 
 ---
 
-## SUBA-073 — Subagent permission policy never reaches a spawned child: `config.permissions` and agent `permission:`/`permissions:` frontmatter are accepted and inert
+## ~~SUBA-073~~ — ~~medium~~ **CLOSED 2026-09-04** — Subagent permission policy never reaches a spawned child: `config.permissions` and agent `permission:`/`permissions:` frontmatter are accepted and inert
+
+> **CLOSED 2026-09-04, cyrup HEAD `2571969`.** Landed by `bf8b0f9` (same commit as `SUBA-072`),
+> verified by reading the current code. `crates/cyrup-ext-subagents/src/exec/permissions.rs` now
+> exists (`validate_permission_rules`/`validate_permission_config`/`resolve_permission_rules`/
+> `encode_permission_rules`), its output is written into the child env at
+> `exec/spawn_plan.rs:1270-1292` under `permission_arbiter::PERMISSION_POLICY_ENV`, and
+> `discovery/frontmatter.rs` now lists both `"permission"` and `"permissions"` in `KNOWN_FIELDS`
+> (`:121-122`) with upstream's mutual-exclusion error reproduced verbatim at `:939` ("cannot declare
+> both permission and permissions frontmatter"). Test coverage at `spawn_plan.rs:3138-3170` asserts
+> the env key is present when a policy resolves and absent when none does. This closes the item's
+> whole Verify recipe (policy reaches env; mutual-exclusion error; frontmatter round-trips as a real
+> field rather than `extra_fields`).
 
 **Kind** not-ported · **Severity** medium *(corrected down from `critical` as filed — see the note below; `high` is defensible)* · **Effort** M · **Confidence** confirmed
 **Subsystem** config / permissions / discovery frontmatter
@@ -247,6 +312,25 @@ the env write in `exec/spawn_plan.rs`.
 
 ## SUBA-074 — Agent `runner:` frontmatter is ignored entirely, so a profile upstream runs as a sandboxed read-only foreign CLI runs in cyrup as a full-capability native child
 
+> **STAGE 1 CLOSED 2026-09-04, cyrup HEAD `2571969`.** Landed by `bf8b0f9` (same commit as
+> `SUBA-072`/`SUBA-073`), verified by reading the current code — this is exactly the item's own Fix
+> stage (1): "stop the silent widening." `discovery/frontmatter.rs` adds `"runner"` to `KNOWN_FIELDS`
+> (`:126`) and parses it into `AgentDefinition::runner`; `parseAgentRunnerFrontmatter`'s Pi-only-field
+> guard is ported at `:1001-1012` (rejects `tools`/`permission`/etc. alongside a non-`pi` runner) and
+> `validateCodeOwnedProfileRunner` at `:990-1020`. **The refusal is live on the production launch
+> path, not only tested**: `exec/mod.rs::run_sync`'s Step 0b (`:287-303`) calls
+> `agent.runner.as_ref().and_then(AgentRunnerConfig::refusal_reason)` **before** the model-fallback
+> ladder and fails the run with pi's message via `pre_spawn_failure`, with a same-file test asserting
+> a `pi` runner never hits it (`exec/mod.rs:1602-1614`). `runner::AgentRunnerConfig::refusal_reason`
+> (`src/runner/mod.rs:102-120`) names both `external-cli` and `external-job` and cites
+> "SUBA-074 stage 2" in its own refusal text. **Stage 2 — the three adapters
+> (`claude-code-adapter.ts`/`codex-exec-adapter.ts`/`cursor-agent-adapter.ts`), the capability
+> contract, preflight and the external-job protocol — is UNCHANGED and remains open under this same
+> ID**, since no separate ID was ever filed for it (checked: no `.flux` task or ledger row names a
+> stage-2-specific ID). Re-scope this item's own Kind/Severity/Effort to stage 2 only next time it is
+> picked up — stage 1's `L` effort is spent; what remains is genuinely the adapter/protocol work the
+> original Fix called out as separable.
+
 **Kind** not-ported · **Severity** high · **Effort** L · **Confidence** confirmed
 **Subsystem** external runners / agent definition schema
 **Window** in-baseline (≤ v0.43.0) for the `runner:` key and generic external-cli dispatch; **v0.47.1..v0.57.0** for the adapter ids, capability contract, preflight, hardened runner and the entire external-job protocol.
@@ -320,7 +404,16 @@ half was never ported either**, so this is not pure window lag.
 
 ---
 
-## SUBA-075 — Forked child sessions are not sanitized: signed and redacted Anthropic thinking blocks are inherited verbatim and no thinking-off override is applied to the branch
+## ~~SUBA-075~~ — ~~high~~ **CLOSED 2026-09-04** — Forked child sessions are not sanitized: signed and redacted Anthropic thinking blocks are inherited verbatim and no thinking-off override is applied to the branch
+
+> **CLOSED 2026-09-04, cyrup HEAD `2571969`.** Landed by `bf8b0f9`, verified by reading the current
+> code. `crates/cyrup-ext-subagents/src/fork_context.rs` now carries
+> `forked_child_requires_thinking_off` (`:266`), `sanitize_unsafe_thinking_blocks` (`:371`) and
+> `append_thinking_off_entry` (`:418`) — `grep -ci thinking fork_context.rs` is no longer 0. The
+> `replace_existing` third parameter this item's Fix asked for is on `apply_thinking_suffix`
+> (`exec/spawn_plan.rs:130-153`), with a test (`:4540`) pinning that a `:7b`-suffixed id is not
+> mistaken for a thinking-level suffix. The rewrite echoes untouched JSONL lines verbatim per the
+> commit's own stated reason (no `preserve_order` on this crate's `serde_json`).
 
 **Kind** not-ported · **Severity** high · **Effort** M · **Confidence** confirmed
 **Subsystem** fork context / thinking level
@@ -379,7 +472,15 @@ v0.43.0 range; at v0.57.0 `applyThinkingSuffix` has moved.
 
 ---
 
-## SUBA-076 — Acceptance evidence checks are scored binary where upstream is tri-state, so an honest `changedFiles: []` and an omitted `noStagedFiles` each produce a spurious acceptance REJECTION
+## ~~SUBA-076~~ — ~~high~~ **CLOSED 2026-09-04** — Acceptance evidence checks are scored binary where upstream is tri-state, so an honest `changedFiles: []` and an omitted `noStagedFiles` each produce a spurious acceptance REJECTION
+
+> **CLOSED 2026-09-04, cyrup HEAD `2571969`.** Landed by `bf8b0f9`, verified by reading the current
+> code. `crates/cyrup-ext-subagents/src/exec/acceptance/model/checks.rs:27`
+> (`report_evidence_status`) now returns `RuntimeCheckStatus::NotApplicable` for `Some([])`, matching
+> upstream's tri-state; `run_structural_checks`' `NoStagedFiles` arm (`:65`) is a report-derived
+> `continue` when the child said nothing, deferring to the parent's own `git status` check in the same
+> list, exactly as this item's Fix asked for. Module doc at `checks.rs:2-3` cites
+> `reportEvidenceStatus`/`checkNoStagedFiles`/`runStructuralChecks` by name.
 
 **Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed
 **Subsystem** acceptance / evidence scoring
@@ -441,7 +542,23 @@ fix together.
 
 ---
 
-## SUBA-077 — A foreground subagent run with no explicit timeout has NO wall-clock deadline, and there is no global `config.timeoutMs`
+## ~~SUBA-077~~ — ~~high~~ **CLOSED 2026-09-04** — A foreground subagent run with no explicit timeout has NO wall-clock deadline, and there is no global `config.timeoutMs`
+
+> **CLOSED 2026-09-04, cyrup HEAD `2571969`.** Landed by
+> `c94a360 feat(subagents): give foreground runs a wall-clock deadline and a global timeoutMs`
+> (2026-08-28), verified by reading the current code.
+> `crates/cyrup-ext-subagents/src/extension/tool/params.rs::resolve_foreground_timeout` (`:330`) now
+> resolves `explicit .or(agent_default) .or(config_default) .or(Some(DEFAULT_FOREGROUND_TIMEOUT_MS))`
+> (the `1_800_000` constant pinned by a same-file test asserting it against pi's 30-minute default,
+> `:659`), and `registration/mod.rs` carries `timeout_ms` on `SubagentExtensionConfig`, RAW rather
+> than typed per the commit's own stated reason (upstream degrades an invalid value rather than
+> erroring the whole config). The commit's own message records that it additionally fixed **two
+> surfaces `SUBA-077`'s own filing had not named** — the `/run` slash command and the top-level
+> parallel path, the latter of which had been hard-coding `None` and so dropping an explicit
+> call-site `timeoutMs` outright. Also **discharges the contradiction `SUBA-077`'s own "Relation to
+> corpus" flagged**: area 09's `SUBA-051` Fix line said "do not apply it to foreground runs, which
+> already have their own default" — that was false before this closure and is moot now that the
+> foreground path has a real default of its own.
 
 **Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed
 **Subsystem** foreground execution / deadlines
@@ -500,7 +617,19 @@ config key) differs from `SUBA-051`'s (`background` step construction).
 
 ---
 
-## SUBA-078 — `subagents.maxThinking` ceiling is entirely absent — no settings parse, no per-agent bound, no enforcement, no env propagation to nested children
+## ~~SUBA-078~~ — ~~high~~ **CLOSED 2026-09-04** — `subagents.maxThinking` ceiling is entirely absent — no settings parse, no per-agent bound, no enforcement, no env propagation to nested children
+
+> **CLOSED 2026-09-04, cyrup HEAD `2571969`** (`feat(subagents): port the subagents.maxThinking
+> reasoning ceiling`, folded into the workspace history under commit `3f9380f`'s range), verified by
+> reading the current code. `crates/cyrup-ext-subagents/src/exec/thinking_ceiling.rs` exists and is
+> consumed, not merely present: `exec/spawn_plan.rs` resolves `inherited_thinking_ceiling` and
+> `intersect_thinking_ceilings` at `:386-396` (asserted with `assert_thinking_within_ceiling` before
+> the spawn plan is built) and again at `:1321-1330` where the resolved ceiling is written into the
+> child env under `THINKING_CEILING_ENV`, so it crosses the re-exec boundary and can only tighten
+> going down (`intersect` takes the lowest, matching upstream's monotonic contract). `exec/mod.rs:53-54`
+> documents the module by ID. A same-file test (`spawn_plan.rs:4463`,
+> `the_thinking_ceiling_crosses_the_spawn_boundary_only_when_one_is_set`) covers the env-propagation
+> half of this item's own Verify.
 
 **Kind** not-ported · **Severity** high · **Effort** M · **Confidence** confirmed
 **Subsystem** discovery settings / thinking level
@@ -558,7 +687,20 @@ one subsystem.
 
 ---
 
-## SUBA-079 — An agent's `defaultContext: fork` hard-fails the launch when the parent session is not yet persisted, where upstream falls back to fresh — plus no config `defaultSubagentContext` rung and no `context: "profile"`
+## ~~SUBA-079~~ — ~~high~~ **CLOSED 2026-09-04** — An agent's `defaultContext: fork` hard-fails the launch when the parent session is not yet persisted, where upstream falls back to fresh — plus no config `defaultSubagentContext` rung and no `context: "profile"`
+
+> **CLOSED 2026-09-04, cyrup HEAD `2571969`**, verified by reading the current code — all three
+> sub-claims land. **(1)** `fork_context.rs::can_prefer_fork_from_snapshot` (`:109`) and the instance
+> method `ForkContextHandle::can_prefer_fork` (`:544`) test availability (persisted file + leaf id)
+> before an *inherited* preference downgrades to fresh, with `resolve_effective_context` (`:172-188`)
+> taking a `can_prefer_fork: bool` and keeping the strict path for an *explicit* call-site `Fork`
+> separately — exactly the split this item's Fix asked for, tested at `:842-852`. **(2)**
+> `registration/mod.rs::default_subagent_context` (`:377-381`, `Option<serde_json::Value>`, RAW like
+> `timeout_ms`) feeds `fork_context::resolve_default_subagent_context` (`:205`), tested at
+> `fork_context.rs:860-876` including upstream's invalid-value error. **(3)** the schema enum is
+> `["fresh", "fork", "profile"]` (`extension/tool/schema.rs:401`, pinned at `:743`), and the
+> `Profile` policy branch's refusal — `context: "profile" requires agent '<name>' to declare
+> defaultContext.` — is live at `fork_context.rs:165-180`, tested at `:803`.
 
 **Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed
 **Subsystem** fork context / launch context policy
@@ -627,7 +769,29 @@ shared-config-lens candidates, which are the same function.
 
 ---
 
-## SUBA-081 — Ten settings-override fields never apply, and a legal upstream `tools: "inherit"` fails the settings load instead of being applied
+## ~~SUBA-081~~ — ~~high~~ **PARTIALLY CLOSED 2026-09-04** — Ten settings-override fields never apply, and a legal upstream `tools: "inherit"` fails the settings load instead of being applied
+
+> **PARTIALLY CLOSED 2026-09-04, cyrup HEAD `2571969`** (`.flux` records: `SUBA-081` moved to `done/`
+> after QA — verified against the actual code, not the task record). **6 of the 10 landed.**
+> `discovery/types.rs::AgentOverrideConfig` grew from 13 to 18 fields, adding `description` (`:608`,
+> applied in `merge.rs:406-408` — deliberately NOT clearable, matching upstream's plain-string shape),
+> `output` (`:613`, via `apply_output_override`), `default_reads` (`:617`), `extensions` (confirmed at
+> `merge.rs` past the `tools` override block) and `tool_budget`. **`tools: "inherit"` is fixed
+> properly, not merely un-crashed**: `ToolsOverrideField` (`types.rs:444-483`) is now a real 3-way enum
+> (`Unset`/`ExplicitClear`/`Inherit`/`Value`) rather than the old `OverrideField`'s 2-way
+> `Deserialize`, with the module doc at `:424-440` explaining why collapsing `"inherit"` into the clear
+> sentinel would have inverted a security boundary. The false completeness claim this item's evidence
+> quoted (`types.rs:411-414`, *"a field-for-field port … pi has no others"*) is deleted, replaced with
+> an accurate per-field upstream citation list — the item's own Fix instruction "delete the
+> completeness claim" is done.
+>
+> **Residual — 4 fields still not on the struct**, confirmed absent by the same grep this item used:
+> `acceptance_role`, `output_mode`, `default_provider`, `fast`. `grep -c 'acceptance_role\|output_mode\|default_provider\|\bfast\b' discovery/types.rs` inside the
+> `AgentOverrideConfig` block still returns 0. The severity note this item filed for the `"inherit"`
+> hard-failure case (the sharpest of the ten) no longer applies since that specific case is fixed; the
+> remaining four are the silent-no-op class only, which the item's own text already treats as milder
+> than the `"inherit"` crash. Kept at `high` pending the next pass's judgement — no new observation
+> changes the calculus, only the count of affected fields (10 → 4).
 
 **Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** confirmed
 **Subsystem** discovery / merge (settings overrides)
@@ -701,7 +865,15 @@ broader gap; land the two together.
 
 ---
 
-## SUBA-083 — `asyncByDefault`'s default is inverted, and the documented `asyncByDefault:false` opt-out is a no-op
+## ~~SUBA-083~~ — ~~high~~ **CLOSED 2026-09-04** — `asyncByDefault`'s default is inverted, and the documented `asyncByDefault:false` opt-out is a no-op
+
+> **CLOSED 2026-09-04, cyrup HEAD `2571969`**, verified by reading the current code.
+> `registration/mod.rs`'s `impl Default for SubagentExtensionConfig` now sets `async_by_default: true`
+> (`:441`), matching upstream's `config.asyncByDefault !== false` semantics (absent key = true). The
+> resolution site (`extension/tool/params.rs:337`,
+> `async_param.unwrap_or(cfg.async_by_default)`) is unchanged in shape — only the default flipped —
+> so a stock install now backgrounds by default and `asyncByDefault: false` is a real opt-out in both
+> directions, closing the item's whole Verify recipe.
 
 **Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed
 **Subsystem** config / launch mode
@@ -816,6 +988,12 @@ message; one with an unknown decision id must fail rather than silently no-op.
 **Relation to corpus** — Discharges one of the seven unowned verbs `SUBA-005` (tracker) explicitly
 owes an owner for. `SUBA-005` proposes no schedulable work by its own reclassification, so this is
 the first schedulable filing of the behaviour and is not a duplicate of a counted row.
+
+> **RE-VERIFIED OPEN 2026-09-04, cyrup HEAD `2571969`.** `grep -rn 'resolve_decision\|ResolveDecision'
+> crates/cyrup-ext-subagents/src/missions/` is still 0 hits; `MissionUpdateInput` (`missions/types.rs:689-717`)
+> still has no `resolve_decision` field (`add_decisions` only); `extension/tool/text.rs`'s advertised
+> `mission.*` verbs are still the same six (`create`/`list`/`show`/`update`/`attach-run`/`close`), no
+> `mission.resolve-decision`. Unchanged, no code found closing it.
 
 ---
 
@@ -1103,6 +1281,82 @@ refuses to read the path for lack of a trusted root, then shows
 
 *Relation:* new. Same file as `SUBA-080` (refuted) but a different defect — argument value, not
 missing sanitization. The fix is one call-site change reusing `status.rs:389`'s existing resolver.
+
+---
+
+## SUBA-092 — Agent `excludeTools:`/`allowNestedSubagents:` (frontmatter and settings-override) are unported: a declared tool exclusion has no effect, and nested-subagent authorization can only ever come from an explicit `tools:` allowlist
+
+**Kind** not-ported · **Severity** high · **Effort** M · **Confidence** confirmed
+**Subsystem** discovery / agent definition schema (new since this file's own v0.57.0 scope)
+**Window** v0.57.0..v0.62.0 (`b26da18e feat: add per-agent tool exclusions (#1778)`, 2026-08-31 —
+first tag containing it is v0.62.0; absent at v0.57.0 by `git cat-file -e`). Filed 2026-09-04 during
+the area-09/09a re-audit, from the diff-stat skim `git -C tmp/pi-subagents diff --stat v0.57.0..v0.64.0`
+this file's own scope note anticipates, per the task brief's "conservative, evidenced new items only."
+
+**upstream** — `git show v0.62.0:src/agents/agents.ts`: `excludeTools?: string[]` added to
+`BuiltinAgentOverrideBase` (`:73`), `BuiltinAgentOverrideConfig` as `string[] | false` (`:103`), and
+`AgentConfig` itself (`:137`) — i.e. it is BOTH a frontmatter key on the agent's own definition and a
+settings-override field, parsed by `parseOverrideStringArrayOrFalse` (`:1093-1094`) and applied at
+`applyBuiltinOverride` (`:1381`) and `applyCustomAgentOverride` (`:1547-1549`).
+`git show v0.62.0:src/agents/agent-serializer.ts:12` adds `"excludeTools"` to `KNOWN_FIELDS` (next to
+the pre-existing `"allowNestedSubagents"`, `:13`, which this crate also has no field for). Consumed at
+`git show v0.62.0:src/runs/shared/pi-args.ts:502-508`:
+```ts
+const excludeTools = [...new Set((input.excludeTools ?? []).map(t => t.trim()).filter(Boolean))];
+const excludedToolSet = new Set(excludeTools);
+const effectiveDeclaredBuiltinTools = declaredBuiltinTools.filter(tool => !excludedToolSet.has(tool));
+const fanoutAuthorized = effectiveDeclaredBuiltinTools.includes("subagent") || (
+	input.allowNestedSubagents === true && !excludedToolSet.has("subagent") &&
+	(!allowedToolSet || allowedToolSet.has("subagent"))
+);
+```
+— `excludeTools` subtracts from the declared builtin set **regardless of whether `tools:` was set at
+all** (it filters `declaredBuiltinTools`, which is the full ambient set on the no-`tools:` arm per
+`SUBA-072`'s own evidence), and `allowNestedSubagents` is an INDEPENDENT grant of `subagent` access
+for an agent that declares no explicit tool allowlist. `preflight.ts` threads both into the launch
+contract (`:114`, `:360`, `:440`, `:491`).
+
+**cyrup** — `grep -rniE 'excludeTools|exclude_tools' crates/cyrup-ext-subagents/src` hits only
+`exec/mcp_direct_tools.rs`, a **different, pre-existing `excludeTools`** scoped to MCP-server tool
+expansion (`McpDirectToolSelection`'s own filter), not the agent-level key this item is about.
+`grep -rniE 'allowNestedSubagents|allow_nested_subagents' crates/cyrup-ext-subagents/src` → **0 hits**
+anywhere in the crate. `discovery/frontmatter.rs`'s `KNOWN_FIELDS` has neither `"excludeTools"` nor
+`"allowNestedSubagents"` (both would fall to `extra_fields` if authored), and
+`discovery/types.rs::AgentDefinition`/`AgentOverrideConfig` (already read in full for `SUBA-081`) have
+no such fields — `AgentOverrideConfig`'s 18 fields (post-`SUBA-081` partial closure) do not include
+either. `exec/spawn_plan.rs`'s tool-allowlist block (already read in full for `SUBA-072`) has no
+subtractive step after `declared_builtin_tools`/`ceiling_allowed_tools` are assembled.
+
+**Impact** — An agent author writing `excludeTools: [bash]` in frontmatter, or an operator writing
+`agentOverrides.<n>.excludeTools: ["bash"]` in settings, expecting an otherwise-unrestricted agent to
+lose `bash` specifically, gets no restriction at all: the field round-trips into `extra_fields` (or is
+silently dropped from a settings override, since the struct has no slot to deserialize it into) and
+the agent keeps the full ambient tool set. This is the SAME shape as `SUBA-072`'s pre-fix defect —
+a declared, negative tool constraint that is accepted and inert — but at the agent-schema layer
+instead of the ceiling layer, and `SUBA-072`'s own closure does not cover it (the ceiling's
+`allowedTools`/`denyExtensions` axes are a session-level bound; `excludeTools` is a per-agent
+declaration with no ceiling involvement at all). Separately, `allowNestedSubagents` has no cyrup
+representation, so there is no way to grant an agent `subagent` access without also declaring a full
+`tools:` allowlist that names it — a narrower capability model than upstream's, not a widening, but a
+real behavioural difference an agent author relying on upstream's docs would hit.
+
+**Fix** — Add `exclude_tools: Option<Vec<String>>` (frontmatter, on `AgentDefinition`) and
+`OverrideField<Vec<String>>` (on `AgentOverrideConfig`), wire both into `KNOWN_FIELDS`, and in
+`exec/spawn_plan.rs` filter `declared_builtin_tools` (and any MCP-selected names) through the
+exclusion set at the same point `ceiling_allowed_tools` is applied, before `explicit_tool_allowlist`
+is decided — mirroring `pi-args.ts:502-508`'s `effectiveDeclaredBuiltinTools`. Add
+`allow_nested_subagents: Option<bool>` similarly and fold it into the `subagent`-tool fanout-grant
+check beside the existing allowlist test.
+
+**Verify** — An agent (frontmatter or override) declaring `excludeTools: [bash]` with no `tools:` must
+spawn without `bash` in its allowlist and with every other builtin tool present; the same agent with
+`tools: [bash, edit]` must lose `bash` and keep `edit`. An agent with no `tools:` and
+`allowNestedSubagents: true` must be able to call `subagent`; the same agent with
+`allowNestedSubagents` unset or false must not.
+
+**Relation to corpus** — New; not covered by `SUBA-072`/`SUBA-073`/`SUBA-081` (checked: none of their
+closure evidence, re-read for this pass, mentions `excludeTools` or `allowNestedSubagents`). Distinct
+from area 09's `SUBA-006`/`SUBA-014`, which are about the *existing* `tools:` allowlist mechanism.
 
 ---
 

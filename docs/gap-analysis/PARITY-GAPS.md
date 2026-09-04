@@ -1,5 +1,27 @@
 # PARITY-GAPS
 
+> **CENSUS REFRESH 2026-09-04, cyrup HEAD `2571969`.** Every area file (01–12, excluding area 13
+> which the MCP team owns, plus the `09a` v0.57-drift supplement and `14-cyrup-flux.md`) was
+> independently re-audited this pass against cyrup HEAD `2571969` (baseline `4fb5e40`, 210 commits)
+> and each upstream's real current tag, personally read on both sides per this ledger's evidence
+> rule — not taken from any commit message. **This refresh regenerates §0's census and §0a's
+> above-medium table from the fourteen files' current `## Open items` tables, mechanically, for the
+> first time with a committed script** (`scripts/count_open_items.py`) — discharging the
+> `README.md` "Work this directory owns" bullet asking for one. **§1–§6's per-item bodies below were
+> NOT re-walked this pass** (§1 already carried this same caveat since the fourth edition, 2026-08-14
+> — see its own blockquote) **except OQ-8, which this pass's closures answer directly.** Read the new
+> blockquotes at the top of §0 and §0a before trusting any number in this file; the two counting
+> pitfalls the script's own header comment documents — a struck severity that is a **re-rating**, not
+> a closure (`~~medium~~ low — **PARTIALLY CLOSED**`, area 08's `SEAM-020`), and area 07's
+> ID-unstruck/title-struck `**FIXED <date>**` convention — both cost a naive `grep -c CLOSED` a wrong
+> answer and are exactly why a script is now committed instead of hand-counted.
+>
+> **Headline: the above-medium set is now EIGHT rows and, for the first time in this file's history,
+> ZERO of them are critical.** `PERM-009`, `EXT-054`, `TUI-027`, `SEAM-112`, `PERM-034`, `TUI-092` —
+> every critical this file has ever carried — are closed. The two reading-pass survivors are
+> `TUI-091` and `SEAM-113`, joined by six rows new to this table because they come from `09a`, a file
+> this document's census has never previously merged in (see §0's new block). Full detail below.
+
 **Regenerated 2026-08-12 (repair pass) from the twelve repaired area files.** Supersedes the earlier
 2026-08-12 edition, whose bookkeeping was exact and whose *content* carried four defects a
 completeness critique found and this pass fixed:
@@ -37,18 +59,119 @@ difference costs behaviour, the entry says so and stays on the list as work.**
 
 | | |
 |---|---|
-| cyrup HEAD | **`e5c6933`** — last code commit as of the third edition, 2026-08-14 (docs HEAD `0097149`, branch `david/cyrup`). *Superseded: `04c1ba2` (docs `a9000b1`) when this file was regenerated; `bdcb0d0` at the second edition.* |
-| `pi` | ported baseline **v0.83.0** → latest **v0.84.1** · delta 627 files, +52 291 / −17 556 |
-| `pi-subagents` | ported baseline **≈v0.43.0** (inferred — the crate records no version string) → latest **v0.47.1** · delta 151 files, +10 254 / −1 333 |
-| `pi-permission-system` | ported baseline **v0.7.1** → latest **v0.8.0** · delta 28 files, +4 023 / −1 851 |
-| `pi-intercom` | ported baseline **v0.9.2** *(prior docs said v0.7.0 — wrong, see §1d)* → ~~latest **v0.10.1**~~ **latest is v0.12.0** (`ef95f19`, 2026-08-22; verified 2026-08-27 against a real clone at `tmp/pi-intercom`, not from citations) · audited drift window `v0.9.2..v0.10.1` = 24 files, +2 495 / −700 · **UNAUDITED window `v0.10.1..v0.12.0` = 8 commits, 15 files, +2 006 / −261 — filed as ICOM-054…ICOM-058 in `11-cyrup-intercom.md`** |
+| cyrup HEAD | **`2571969`** — measured 2026-09-04, branch `claude/gap-analysis-refresh` (off `main`), 210 commits ahead of the `4fb5e40` baseline this pass re-audited against. *Superseded: `e5c6933` at the third edition (2026-08-14, docs `0097149`); `04c1ba2` (docs `a9000b1`) when this file was first regenerated; `bdcb0d0` at the second edition. See `README.md`'s "Baselines measured against" table for the same figures kept current across passes.* |
+| `pi` | ported baseline **v0.83.0** → latest **v0.84.4** (HEAD `6aedd1066`) · delta v0.83.0..v0.84.4 = 775 files, +68 885 / −20 827 |
+| `pi-subagents` | ported baseline **≈v0.43.0** (inferred — the crate records no version string) → latest **v0.64.0** (HEAD `a5f401e8`) · delta v0.43.0..v0.64.0 = 485 files, +92 664 / −18 069 |
+| `pi-permission-system` | ported baseline **v0.7.1** → latest **v0.8.0** (HEAD `9affcc9`) · delta 28 files, +4 023 / −1 851 — **re-checked 2026-09-04, unchanged from every prior edition's figure** |
+| `pi-intercom` | ported baseline **v0.9.2** *(prior docs said v0.7.0 — wrong, see §1d)* → latest **v0.13.0** (HEAD `199279a`, re-measured 2026-09-04, superseding the `v0.12.0` figure recorded 2026-08-27) · true window `v0.9.2..v0.13.0` = 26 files, +4 701 / −976 |
+| `code_puppy_core_plugins` | ported baseline **v0.0.6** *(not recorded in-crate; see `FLUX-007`)* → latest **v0.0.40** (HEAD `8c6f852`) · 139 files, +11 071 / −3 822 across the whole repo, but the *ported* surface (`flux_bootstrap/`) is byte-identical `v0.0.6..v0.0.40` — area 14's own re-derivation this pass |
+| `pi-mcp-adapter` | **out of scope for this file** — area 13, owned by the MCP team; not re-measured here |
 
 Read upstream with `git -C <repo> show <tag>:<path>`, never from a working tree — clone-HEAD line
 numbers and file existence both mislead. §7 says how much of this was first-hand.
 
 ---
 
-## 0. Census — every open item in the twelve area files, by class
+## 0. Census — every open item in the fourteen area files, by class
+
+> **EIGHTH EDITION 2026-09-04, cyrup HEAD `2571969` — RECOUNTED IN FULL, MECHANICALLY, FOR THE FIRST
+> TIME.** Every block below this one is superseded. What changed and why it is more trustworthy than
+> its predecessors:
+>
+> **The denominator changed from twelve files to fourteen, and this is the first count that says so
+> plainly.** This document's title ("every open item in the twelve area files") and its 2026-08-12
+> regeneration note both predate `14-cyrup-flux.md` (opened 2026-08-14, and even the fourth edition's
+> own count of it was informal) and `09a-cyrup-ext-subagents-v0.57-drift.md` (a same-tier supplement
+> to area 09, per `README.md`'s Contents table, that this file's census has **never** merged in before
+> now). Both are walked below as their own rows, matching how the area files themselves are already
+> organised — `09a` is not folded into area 09's own row, because its own file says its ids are not
+> covered by area 09's table and both must be read.
+>
+> **The count is produced by a committed script, not by hand, for the first time**:
+> `scripts/count_open_items.py`, run from `docs/gap-analysis/`. It parses each file's *current*
+> `## Open items` table only — never the `## Status of every item from prior analyses` /
+> `## Status table` /`## Status since …` table some files also carry, which every file's own
+> convention (and `README.md`'s "Reading the area tables") says is not current — and classifies every
+> row as OPEN, CLOSED, or excluded (`tracker` / the literal `*(partially-closed)*` marker) by the
+> Severity cell's markup. **Getting this right took two false starts, both now documented in the
+> script's own header comment so the next pass does not repeat them**: (1) a struck old severity
+> followed by a bare NEW severity word is a **re-rating**, not a closure — `~~medium~~ low —
+> **PARTIALLY CLOSED 2026-08-14**` (area 08's `SEAM-020`) is an OPEN row at `low`, not a closed one,
+> and a naive "any `~~..~~` in the Severity cell means closed" rule miscounted it; (2) area 07 alone
+> closes a subset of its rows with a bare `**FIXED <date>**` Severity cell and no strike-through at
+> all, striking the Title cell instead — thirteen rows silently vanished from both the open and the
+> closed count before this was found and handled. Two rows (`PROV-053` in area 01, `SEAM-074` in area
+> 08) strike only one of ID/Severity where the repo's stated convention asks for both; the script
+> treats a struck ID as authoritative over an unstruck severity cell for exactly this reason. Three
+> Kind values used in the wild (`product-decision` — `EXT-058`; `*unclassified — lead*` — `PERM-032`;
+> `test-gap` — `ICOM-053`) are not in `README.md`'s `Kind` enum at all and are reported as
+> **Unclassified** rather than forced into one of the six buckets below.
+>
+> **Open set: 132 work items — 0 critical, 8 high, 49 medium, 75 low**, of which 129 sort cleanly
+> into the six Kind-derived classes and 3 do not (`EXT-058`, `PERM-032`, `ICOM-053`, above). Plus
+> **8 `tracker` rows** — `PROV-004` and `DRIFT-022` (this pass's two tracker closures) drop out of
+> the prior 9-tracker figure, while `SEAM-058` (area 08) and `SUBA-005` (area 09) are **not inside
+> any file's `## Open items` table at all** — both live in a standalone `## Trackers` section their
+> own file excludes from the table by construction, so they are counted here by hand, the one place
+> this census is not purely mechanical; `AGENT-028` (02), `SESS-038` (03), `PERM-017` (10),
+> `DRIFT-023`/`DRIFT-032`/`DRIFT-040` (12) are the other six, all inside their tables and all found
+> by the script.
+>
+> | area | open | crit | high | med | low | trackers | closed this pass\* | new this pass\* |
+> |---|---:|---:|---:|---:|---:|---:|---:|---:|
+> | [01 core + provider](01-cyrup-core-and-provider.md) | 4 | 0 | 0 | 2 | 2 | 0 | 2 | 0 |
+> | [02 agent](02-cyrup-agent.md) | 3 | 0 | 0 | 0 | 3 | 1 | 1 | 2 |
+> | [03 session](03-cyrup-session.md) | 4 | 0 | 0 | 1 | 3 | 1 | 2 | 2 |
+> | [04 tools](04-cyrup-tools.md) | 3 | 0 | 0 | 2 | 1 | 0 | 1 | 0 |
+> | [05 config + resources](05-cyrup-config-and-resources.md) | 14 | 0 | 0 | 4 | 10 | 0 | 4 | 2 |
+> | [06 ext host](06-cyrup-ext.md) | 15 | 0 | 0 | 6 | 9 | 0 | 5 | 1 |
+> | [07 tui](07-cyrup-tui.md) | 36 | 0 | 1 | 8 | 27 | 0 | 23 | 0 |
+> | [08 session-svc + modes](08-cyrup-session-svc-and-modes.md) | 8 | 0 | 1 | 4 | 3 | 0† | 0 | 2 |
+> | [09 subagents](09-cyrup-ext-subagents.md) | 12 | 0 | 0 | 4 | 8 | 0† | 0 | 0 |
+> | [09a v0.57 drift](09a-cyrup-ext-subagents-v0.57-drift.md) | 11 | 0 | 6 | 5 | 0 | 0 | 9 | 1 |
+> | [10 permission system](10-cyrup-permission-system.md) | 1 | 0 | 0 | 0 | 1 | 1 | 0 | 0 |
+> | [11 intercom](11-cyrup-intercom.md) | 7 | 0 | 0 | 4 | 3 | 0 | 7 | 2 |
+> | [12 pi core drift](12-upstream-drift-pi-core.md) | 7 | 0 | 0 | 5 | 2 | 3 | 1 | 1 |
+> | [14 flux](14-cyrup-flux.md) | 7 | 0 | 0 | 4 | 3 | 0 | 0 | 0 |
+> | **total** | **132** | **0** | **8** | **49** | **75** | **6 + 2‡** | **55** | **13** |
+>
+> \* Unlike every other column, "closed this pass" / "new this pass" are **not** script-derived — no
+> prior-state snapshot exists to diff against — and are taken from each area's own 2026-09-04 pass
+> summary, spot-checked against the actual struck rows for at least half the files rather than trusted
+> whole. Treat them as approximate. † `SEAM-058` and `SUBA-005` are each area's one tracker but sit
+> outside the `## Open items` table (see above), so they print as 0 in this script-derived column;
+> both are counted in the `total` row's "6 + 2‡" cell. ‡ 6 trackers found inside `## Open items`
+> tables by the script, plus the 2 (`SEAM-058`, `SUBA-005`) that live outside any table.
+>
+> **Gap class (open, non-tracker rows only) — the mechanical grouping this section's title promises:**
+>
+> | class | Kind values it covers | n |
+> |---|---|---:|
+> | **Port bug** | `not-ported` + `parity-bug` + `port-divergence` (+ the `port-bug` typo variant, and `DRIFT-015`/`DRIFT-019`'s in-row reclassification from `upstream-drift` to `not-ported`) | **71** |
+> | **Version lag** | `upstream-drift` (all 11 open `09a` rows count here — see its own file's note on why: the whole file is drift against a later `pi-subagents` tag than the one cyrup ported) | **32** |
+> | **Reverse lag** | `stale-port` | **2** |
+> | **Test defect** | `test-defect` | **5** |
+> | **Invented surface** | `cyrup-original` | **18** |
+> | **Tooling** | `tooling` | **1** |
+> | *(unclassified)* | `product-decision` (`EXT-058`), `*unclassified — lead*` (`PERM-032`), `test-gap` (`ICOM-053`) — no `Kind` enum value in `README.md`'s Item Format covers these three; reported rather than mis-bucketed | **3** |
+> | | | **132** |
+>
+> **Deduplication, re-derived for one area only (area 12), the rest not re-walked this pass**: of
+> area 12's 7 open rows, 4 carry `duplicate-of` (`DRIFT-009`→`PROV-018`, `DRIFT-015`→`EXT-019`,
+> `DRIFT-019`→`PROV-014`, `DRIFT-047`→`VL-P5`) — this pass's own re-derivation, not carried over from
+> the stale "16 of 30" figure two blocks below, which was measured at a much larger prior open set
+> and was never recomputed against the current one. **The wider cross-area dedup census ("Work this
+> directory owns", `README.md`) was not re-run this pass** — every other area's duplication is
+> unmeasured here, so **132 is a floor, not a deduplicated total**, exactly as every prior edition
+> has said.
+>
+> **What this refresh explicitly did NOT do, so it is not silently assumed done**: it did not re-walk
+> §1 (port bugs), §2 (unwired), §3 (version lag), §4 (closure record), or §5 (deletion candidates)
+> line by line — those sections were already marked incomplete-as-of-2026-08-14 by the fourth edition
+> and remain so; **§6 (open questions) got exactly one update, q8**, because this pass's own closures
+> (`CFG-021`, `DRIFT-022`, `TUI-019`) directly answer the question it asks — see the note at q8. It
+> did not re-run the F4 duplicate-defect reduction, the unwired sweep, or any of the "surfaces left to
+> walk" `README.md` lists. Scheduling from this file still means opening the named area file first.
 
 > **CORRECTED 2026-08-19 against cyrup HEAD `4fb5e40`, and NOT recounted — read why.** The
 > `0 critical / 5 high` headline below is false: all five of those rows closed on 2026-08-15, and the
@@ -256,6 +379,51 @@ Where the re-audit moved an item to a different class, the id moves section and 
 
 ## 0a. Everything above medium, in one table
 
+> **SIXTH EDITION 2026-09-04, cyrup HEAD `2571969`. EIGHT ROWS, ZERO CRITICAL — the first time this
+> table has ever been empty of criticals.** Read this block before planning; every row below it,
+> including the fifth edition's, is superseded.
+>
+> **Every fifth-edition row is dispositioned, all six re-verified this pass by re-reading the current
+> code, not by trusting a prior "closed" mark**: `SEAM-112` (area 08) — **CLOSED 2026-08-29**, before
+> this pass, re-confirmed unchanged. `PERM-034` (area 10) — **CLOSED 2026-08-29, REFUTED**, and this
+> pass's area-10 re-audit specifically re-ran its own falsification condition and found nothing that
+> would reopen it. `TUI-092` (area 07) — **CLOSED**, part of area 07's 23 closures this pass; the
+> keybinding claims that had already downgraded it from critical to high (`keymap.rs:655`/`:656`
+> wiring Ctrl+D/Ctrl+C) hold at HEAD. `PROV-068` (area 01) — **CLOSED 2026-09-04 this pass, REFUTED**:
+> re-read at the ported tag `v0.83.0` rather than a later one, `mapped === null` really does mean
+> unsupported on both sides; see area 01's `PROV-068` row for the full citation trail. `SEAM-113`
+> (area 08) and `TUI-091` (area 07) are the two survivors — both re-confirmed still open this pass,
+> with `SEAM-113`'s evidence substantially expanded (below).
+>
+> **The eight-row set below adds six rows from `09a`, which no prior edition of this table has ever
+> drawn from.** `09a-cyrup-ext-subagents-v0.57-drift.md` predates this table's fifth edition, but
+> nobody had folded its own severities into this cross-cutting file before — it is a same-tier
+> supplement to area 09 per `README.md`'s Contents table, not a subsection of it, and its
+> `## Summary — confirmed items` table carries six rows this pass re-confirmed at `high`: three
+> closed-elsewhere-in-the-taxonomy-sense but still open here (`SUBA-074` stage-2 residual, `SUBA-085`,
+> `SUBA-092`, all re-verified unchanged this pass) and three `## Carried — NOT adversarially verified`
+> rows (`SUBA-082`, `SUBA-084`, `SUBA-086`) that this pass re-checked port-side only (every zero-hit
+> grep the file recorded for them still returns zero at HEAD `2571969`) — held to the lower evidence
+> bar `09a`'s own header states for that section, and flagged as such below rather than silently
+> promoted to the same confidence as a fully re-read row.
+>
+> | id | area | sev | one line |
+> |---|---|---|---|
+> | `TUI-091` | 07 | high | Reasoning blocks never render although every layer — provider through the renderer — is wired and correct. Owner report, live use 2026-08-15 (`together`/`Kimi-K3`), re-confirmed absent this pass; **zero live hypotheses remain**, its last named candidate refuted in the area file. |
+> | `SEAM-113` | 08 | high | A model chosen with `/model` does not survive into the next session. **Evidence substantially expanded this pass, not just re-confirmed**: commit `82f40d3` landed pi's later opt-in Ctrl+S persist mechanism, which is a *different* contract than the unconditional persist in `apply_model_change` this ledger settled on 2026-08-19 as the fix — re-read directly (`session/model.rs`, `session/thinking.rs`, `cyrup-tui/src/app/execute_misc.rs`), not inferred from the landing commit's message. The ordinary `/model` path still writes nothing to settings. |
+> | `SUBA-074` | 09a | high | Agent `runner:` frontmatter is ignored entirely, so a sandboxed foreign-CLI profile runs as a full-capability native child. **Stage 1 (the refusal path) closed this pass**; stage 2 (the external-runner adapter protocol itself) is the open residual under this id. |
+> | `SUBA-085` | 09a | high | `mission.resolve-decision` unported: a mission decision is write-once and permanently open, so the goal driver proposes the same next action forever. Re-verified open this pass (`resolve_decision`/`ResolveDecision` — 0 hits). |
+> | `SUBA-092` | 09a | high | **New this pass.** Agent-level `excludeTools:`/`allowNestedSubagents:` (frontmatter and settings-override) are entirely unported — a declared per-agent tool exclusion has no effect, and a nested-subagent grant can only ever come from an explicit `tools:` allowlist. Both sides read at `pi-subagents` v0.62.0, inside the v0.57.0..v0.64.0 window past this file's original scope. |
+> | `SUBA-082` | 09a | high | *(carried, not adversarially verified — port-side zero-hit grep re-confirmed this pass; upstream line numbers not re-read)* |
+> | `SUBA-084` | 09a | high | *(carried, not adversarially verified — port-side zero-hit grep re-confirmed this pass; upstream line numbers not re-read)* |
+> | `SUBA-086` | 09a | high | *(carried, not adversarially verified — port-side zero-hit grep re-confirmed this pass; upstream line numbers not re-read)* |
+>
+> **Six of the eight are effort M or smaller** per their area files; none is blocked on a decision the
+> way several prior above-medium rows were (`PB-7`'s npm channel, `PB-19`'s Windows question). The
+> live-use pair (`TUI-091`, `SEAM-113`) are the two this ledger's own "no `TUI-*`/live item is done
+> until observed" rule holds to the highest evidence bar; the six `09a` rows are static-read findings
+> at a named tag, per that file's own (lower, for the carried three) standard.
+
 > **SUPERSEDED — FIFTH EDITION 2026-08-19, against cyrup HEAD `4fb5e40`. ALL FIVE ROWS OF THE
 > FOURTH EDITION'S ABOVE-MEDIUM SET ARE CLOSED, AND THE SET THAT REPLACED THEM OPENED WITH THREE
 > CRITICALS — a class the fourth edition published as empty.** Read this block before planning; the
@@ -369,6 +537,16 @@ closes: `AGENT-020`+`AGENT-030`, `TUI-042`+`TUI-043`+`TUI-044`, `SEAM-047`+`SEAM
 > `app/run_action.rs:68-82`; **UW-12** (`SESS-040`) closed 2026-08-15. Each entry now carries a dated
 > `CLOSED` bullet, but they were found incidentally and **the rest of §1–§4 was not audited for
 > status**. Check the area file before scheduling any entry here.
+>
+> **STILL TRUE 2026-09-04 — the census refresh (§0/§0a) did not extend to §1–§6's per-item bodies.**
+> This pass re-audited all fourteen area files and regenerated §0's census and §0a's above-medium
+> table mechanically from their current `## Open items` tables (see both sections' new top blocks),
+> but did not walk §1–§5 entry by entry the way the 2026-08-12 regeneration did — that remains a pass
+> of its own. The one exception is §6 q8, which this pass's own closures (`CFG-021`, `DRIFT-022`,
+> `TUI-019`) answer directly and which now carries an **ANSWERED** note. **The rule above still
+> holds and is now doubly true**: an id's presence or absence in §1 says nothing about whether it is
+> open — the owning area file's `## Open items` table is the only authority, and §0's new block names
+> exactly which ids are open today.
 
 **These rank above everything else in this document at equal severity.** They are not version lag:
 the behaviour was available to be ported and was not.
@@ -1067,6 +1245,7 @@ Also in this class: `TOOL-038` (on Windows with no bash, `bash` silently falls b
 6. **The first-run wizard (UW-2).** The standing trap list says it is "deliberately unreachable"; the code says `is_official_distribution()` is **true** for this build and the gate can fire into an empty `if` body. One of the two is wrong — and **as of the 2026-08-13 live run it is the trap list**: the gate was measured firing (the `xp` badge proves `CYRUP_EXPERIMENTAL=1` was read, the empty agent dir proves `settings_path` did not exist) straight into the empty body, on a pty where the sibling selectors rendered fine. Treat this as a product decision awaiting an answer, not as a documentation discrepancy. Decide whether the wizard ships (wire `startup.rs:256`) or does not (delete the predicate and the dead function, and correct the trap list) — it cannot stay in this state, because the current shape is the worst of both. **ANSWERED 2026-08-13 by ADR-0011: it ships.** `startup.rs`'s wizard is wired at pi's call position with pi's full condition, nothing was deleted, and the trap-list entry was struck from `README.md`. See `UW-2` above for the code, the tests, and the live run that is still owed. This question is closed; note for the record that the escalation token in `UW-2` used to read "OQ-6", which is wrong under both namespaces — this is `PARITY-PLAN` §7 **OQ-9** / `PARITY-GAPS` §6 q6.
 7. **pi's agent-harness v2 (VL-P22 / `AGENT-028` / `DRIFT-040` / `SESS-038`).** ~11.4k insertions / ~10.9k deletions in `packages/agent/src/harness/**` in this delta — an `agent-harness.ts` rewrite, a new 667-line `reducer.ts`, a new `session/` subtree with its own JSONL codec/repo/storage/state and a 993-line conformance suite, and a new typed telemetry layer. **No area file owns it and nobody has measured it.** Do we (a) absorb it, (b) track interop only (read harness-v2-written sessions, keep writing the coding-agent format), or (c) declare it out of scope until pi's own `coding-agent` migrates? The torn-tail bug inside VL-P22 is small and should be fixed regardless of the answer. **`AGENT-028` and `SESS-038` are the same question in two files and must be answered together.**
 8. **NEW — the alt-screen/TUI-mode scope decision (VL-P19 / `TUI-019`, filed in area 07 as `OQ-07-1`).** The previous edition held `TUI-019` at *low* "as a deliberate ADR-0001 divergence". That justification is dead twice over: ADR-0001 is **unreadable in this workspace** (§7), and even a real ADR would not hold it down, because a mechanism difference that costs behaviour stays as work. It is now rated on consequence — *medium*, for no fullscreen mode, no mouse scroll, no scrollbar and no jump-to-prompt, four normal-path features — and the underlying question is what needs a human: **does cyrup ship a fullscreen TUI mode at all?** (a) port it (effort **L+**, an application layer on ratatui's native alt-screen/mouse support), (b) support the flag and settings key as accepted no-ops with an explicit not-supported message, or (c) declare it out of scope and say so in the flag's error text. **`SEAM-051` and `CFG-021` must be fixed under every one of those answers and must not wait on it** — today the flag's default value makes the binary refuse to start.
+   **ANSWERED 2026-09-04 by commit `dbcf59a` ("ship the fullscreen (alternate-screen) TUI mode, ADR-0005 B-1..B-14"), independently re-verified this pass, not taken from the commit message: it is (a).** `--tui-mode` is parsed and wired end to end — `crates/cyrup/src/cli/args.rs:184-185` through `App::switch_tui_mode` (`crates/cyrup/src/interactive.rs:207-217`) with flag-then-setting-then-regular precedence — into a real 13-module renderer under `crates/cyrup-tui/src/altscreen/`. `SEAM-051` (the flag rejected with exit 1) and `CFG-021` (`tuiMode`/`fullscreenScrollbar` settings keys) are both closed as a direct consequence, confirmed in their own area files (08, 05) this pass. `TUI-019` itself is closed in area 07. **Residual, stated so the next pass does not treat this as total fidelity**: this pass did not line-for-line diff cyrup's alt-screen renderer against pi's 1378-line `tui-alt-screen.ts`, and area 12's `DRIFT-022` tracker closure explicitly leaves that comparison to `TUI-019`'s own row rather than claiming it. Two settings keys landed too late to be in scope even for this residual (`fullscreenExitOutput`, `fullscreenCopyOnSelect` — pi v0.84.4, filed as area 05's `CFG-078`) and one more surface (`defaultTools`, `CFG-079`) is unrelated to alt-screen but was found in the same version-lag skim.
 9. **NEW — what is `bash` allowed to be? (`TOOL-039` + `TOOL-007`, one decision).** Both are `cyrup-original` behaviour on the same surface and taking them separately produces an incoherent shell: either (i) delete the `CYRUP_SHELL` arm and require the `shellPath` setting — a three-line deletion, pi's shape, **recommended** — or (ii) keep it and do **all four** of stamp a `[CYRUP-DELTA]`, report the resolved interpreter at session start and in bash result details, add `CYRUP_SHELL` to the scrub set (it does not fit the `{CYRUP,PI}_<SUFFIX>` shape, so a second explicitly-named group is needed), and validate the path exists and is executable per `shell.ts:73`. **Half of (ii) is not an option.** The same decision governs whether `TOOL-007`'s protected-path block — on by default, no pi analog, and bypassed by `bash` — stays, is made configurable, or goes.
 
 ---

@@ -165,12 +165,12 @@ a deletion — `SEAM-035`…`SEAM-046` never existed, and area 08 records the ch
 
 | repo | HEAD | cyrup ported baseline | latest tag | delta |
 |---|---|---|---|---|
-| `cyrup/` | **`4fb5e40`** — last full re-audit, branch `david/cyrup`. **Re-measure before trusting any status: the port moves faster than this directory does.** | — | — | 18 crates, ~482k lines of Rust under `crates/` |
-| `pi/` | `581d75a89` = `v0.84.1-117-g581d75a89` | **v0.83.0** | **v0.84.1** | 627 files, +52 291 / −17 556 |
-| `pi-subagents/` | `9e9fd13` | **≈v0.43.0** (inferred — the crate records no version string) | **v0.47.1** | 151 files, +10 254 / −1 333 |
-| `pi-permission-system/` | `9affcc9` | **v0.7.1** | **v0.8.0** | 28 files, +4 023 / −1 851 |
-| `pi-intercom/` | `30dcbdd` | **v0.9.2** — *not v0.7.0; every prior doc had this wrong* | **v0.10.1** | true window `v0.9.2..v0.10.1` = 24 files, +2 495 / −700 |
-| `code_puppy_core_plugins/` | `8de5184` | **v0.0.6** — *not recorded anywhere in `crates/cyrup-flux`; see `FLUX-007`* | **v0.0.6** | Python, not TypeScript. Ported surface is `flux_bootstrap/` — 18 bundled commands, 4 `_docs` files, 3 renderer scripts. cyrup ships 15 templates + 3 native renderers = the same 18 |
+| `cyrup/` | **`2571969`** — last full re-audit, branch `claude/gap-analysis-refresh` (off `main`). **Re-measure before trusting any status: the port moves faster than this directory does.** | — | — | 21 crates, ~714k lines of Rust under `crates/` (`find crates -name '*.rs' \| xargs wc -l \| tail -1` = 714 265; `for d in crates/*/; do [ -f "$d/Cargo.toml" ] && echo "$d"; done \| wc -l` = 21) |
+| `pi/` | `6aedd1066` = `v0.84.3-453-g6aedd1066` | **v0.83.0** | **v0.84.4** | 775 files, +68 885 / −20 827 |
+| `pi-subagents/` | `a5f401e8` | **≈v0.43.0** (inferred — the crate records no version string) | **v0.64.0** | 485 files, +92 664 / −18 069 |
+| `pi-permission-system/` | `9affcc9` — **re-checked this pass, unchanged from the prior record** | **v0.7.1** | **v0.8.0** — **re-checked this pass, unchanged from the prior record** | 28 files, +4 023 / −1 851 (re-measured identical to the prior record) |
+| `pi-intercom/` | `199279a` | **v0.9.2** — *not v0.7.0; every prior doc had this wrong* | **v0.13.0** | true window `v0.9.2..v0.13.0` = 26 files, +4 701 / −976 |
+| `code_puppy_core_plugins/` | `8c6f852` | **v0.0.6** — *not recorded anywhere in `crates/cyrup-flux`; see `FLUX-007`* | **v0.0.40** | 139 files, +11 071 / −3 822 across the whole repo — but the ported surface is unchanged: `git diff --stat v0.0.6..v0.0.40 -- code_puppy_core_plugins/flux_bootstrap/ tests/test_flux_bootstrap.py` is empty, byte-identical across all 34 intervening tags. Ported surface is `flux_bootstrap/` — 18 bundled commands, 4 `_docs` files, 3 renderer scripts. cyrup ships 15 templates + 3 native renderers = the same 18 |
 | `pi-mcp-adapter/` | `14c0e6c` = `v2.25.0-4-g14c0e6c` | **not ported** — area 13 is the plan | **v2.25.0** | 203 paths / 164 `.ts` at the tag, ~24 200 lines; drift to HEAD is 17 files, +543 / −69 |
 
 **Read upstream with `git -C <repo> show <tag>:<path>`, never from a working tree.** Clone-HEAD line

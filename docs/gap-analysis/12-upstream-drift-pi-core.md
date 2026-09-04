@@ -263,6 +263,61 @@ counts**: they propose no work and say so, so they are bookkeeping rather than b
 > not extend to them, and `DRIFT-009`'s own Fix ("the four missing catalogs must be in the
 > generated set") is therefore not executable from a checkout.
 
+> ### AREA-12 PASS — 2026-09-04, cyrup HEAD `2571969` (210 commits past this file's `4fb5e40`
+> baseline), upstream re-measured at `v0.84.4`
+>
+> **One item closed, one filed, six re-verified unchanged.** `git log --oneline 4fb5e40..HEAD` over
+> this area's eleven crates is 87 commits (112 since the 2026-08-15 pass's `68bbd39`); none of the
+> intervening work (the core-loop CLTR_1..8 type refactor, the provider API module decompositions,
+> the tools/grep/find parity sweep, the MCP port) touched the surfaces this file's six remaining
+> `still-open` rows cite, and all six were re-read at HEAD and stand exactly as filed: `DRIFT-041`
+> (`cyrup-session-svc/src/export.rs` is still 131 lines), `DRIFT-004` (`cyrup-modes/src/rpc/mod.rs:1111`
+> still `operations: None`, `HOST_WORLD` still `cyrup:ext@0.8`, no `bash-operations` WIT member),
+> `DRIFT-009`/`DRIFT-019` (`providers/all.rs:38-40,377` still self-documents `qwen-token-plan`,
+> `qwen-token-plan-cn`, `radius` as `NOT REGISTERED`), `DRIFT-015` (`render-options`/`output-pad`
+> still absent from `cyrup-ext/wit/world.wit`; `scoped-models`/`register-markdown-transformer` cited
+> lines drifted to `:776`/`:517` from `:732`/`:476` — citation rot only, not re-fixed this pass),
+> `DRIFT-047` (`TelemetryContext`/`telemetry_context` still zero hits in `crates/`). Two closures
+> re-derived clause-for-clause and still hold after the refactors that touched their files —
+> `DRIFT-001` (`cyrup-ext/src/wrapper.rs::additive_delta`, consumed at
+> `cyrup-agent/src/agent/run/tools/finalized.rs:35` post-CLTR_4) and `DRIFT-048`
+> (`cyrup-provider/src/api/google_generative_ai/convert.rs::assistant_parts` — the file split into a
+> module directory since the 2026-08-15 pass, `include_id` threading is intact at the new paths).
+>
+> **`DRIFT-022` (TUI mode / alternate screen) is CLOSED.** Its own row already recorded the flag half
+> as fixed via `SEAM-051`; the renderer half — what this tracker actually existed to track — landed
+> in `dbcf59a` ("ship the fullscreen (alternate-screen) TUI mode, ADR-0005 B-1..B-14"), driven under
+> a real pty per the commit's own transcript, not merely type-checked. `--tui-mode` → settings → the
+> `Fullscreen` renderer is wired end to end (`crates/cyrup/src/interactive.rs:207-217`), and the
+> `tuiMode`/`fullscreenScrollbar` settings keys this row's Fix asked for are live
+> (`cyrup-config/src/settings/manager.rs:387,395`). Re-confirmed the upstream surface this row
+> tracks is unchanged at `v0.84.4`. **Fine-grained fidelity against pi's 1378-line
+> `tui-alt-screen.ts` was not diffed line-for-line — that residual belongs to `TUI-019` (area 07),
+> which this closure explicitly does not speak for.**
+>
+> **One new item, `DRIFT-053`.** `packages/coding-agent/src/modes/interactive/session-share.ts` is
+> new at `v0.84.3` (absent at `v0.84.1` and `v0.84.2` — confirmed with `git cat-file -e`) and
+> restructures `/share` into a Radius-upload-first flow with the old gist flow demoted to fallback.
+> cyrup's `/share` (`cyrup-tui/src/app/execute_misc.rs::share_session`) already cites the **new**
+> file by line number for its `gh auth status` pre-check (`session-share.ts:59-68`) — meaning a prior
+> pass read the restructured file — but ported only the fallback tail, not the Radius-first attempt
+> that now precedes it. See the row and body below. **Blocked on `DRIFT-019`/`PROV-014`**: cyrup
+> registers no `radius` provider at all, so even a direct port of `tryShareViaRadius` would have
+> nothing to call `getProvider("radius")` against.
+>
+> **Not attempted this pass, and said so rather than left silent:** a full v0.84.2→v0.84.4 diff-stat
+> skim of `packages/ai`, `packages/agent`, `packages/coding-agent`, `packages/tui` was run
+> (248 files, +9822/−2179) and is far too large to read end-to-end inside one pass. Beyond
+> `session-share.ts`, nothing else in that delta was verified confidently enough to file — in
+> particular `packages/coding-agent/src/core/tools/powershell.ts` (new, 67 lines),
+> `.../settings-submenu.ts` (new, 258 lines) and the `openai-completions.ts` / `bedrock-converse-
+> stream.ts` / `github-copilot.ts` wire-API changes (+312/+155/+192 lines respectively) are
+> **unread** and belong to areas 01/04/05/07 if anyone takes them, not filed here as leads to avoid
+> inventing unverified rows. **DRIFT-023 and DRIFT-040 were left exactly as filed** (still
+> `## Leads — not yet evidenced`) — neither side was re-read this pass; the two commands their rows
+> already name are still the cheapest way to settle them, and this pass's budget went to the
+> eleven-crate commit log and the six re-verifications instead.
+
 | ID | Severity | Kind | Effort | Dedup | Title |
 |---|---|---|---|---|---|
 | ~~DRIFT-049~~ | ~~**high**~~ **CLOSED 2026-08-14** | **FIXED 2026-08-13** *(via `SEAM-047`)* | M | duplicate-of: `SEAM-047` | SIGTERM/SIGHUP never disposes the runtime, and in RPC mode is never observed at all — **CLOSED 2026-08-14**: closed pre-sweep (2026-08-13) via SEAM-047 — the row's kind cell already said so while its severity cell still read `high`, which is why two recounts carried a phantom high. Area 12 now has NO open high. |
@@ -293,18 +348,33 @@ counts**: they propose no work and say so, so they are bookkeeping rather than b
 | ~~DRIFT-045~~ | ~~low~~ **CLOSED 2026-08-15** | not-ported | S | — | Ctrl+V with text on the clipboard inserts nothing — **CLOSED 2026-08-15** (area-12 pass). `read_clipboard_text()` added to `crates/cyrup-tui/src/clipboard.rs` beside the existing writer, porting `utils/clipboard.ts:35-69` @v0.84.2 including the Wayland branch pi added this delta (`bfc679d5e`): `clipboard_read_plan(os, env)` is a pure function gated on pi's literal three-way conjunction `platform() === "linux" && isWaylandSession() && WAYLAND_DISPLAY` (`:53`), then `wl-paste --no-newline --type text`, then `arboard`. **The three-state result is preserved and it is the subtle part**: pi's `ClipboardReadResult` (`:35`) distinguishes ok-with-null from failed, and `readClipboardText` returns `result.text` whenever `ok` — so an EMPTY Wayland clipboard must NOT fall through to the X11-oriented native backend, or it would paste a stale selection. Modelled as `Option<Option<String>>`. **TAG CORRECTION, adversarial review 2026-08-15 — only the WAYLAND branch is v0.84.x drift; the text-paste half is not-ported AT THE PORTED TAG, and every in-source citation for it says @v0.84.2.** Re-derived: `readClipboardText` already exists at v0.83.0 (`clipboard.ts:36-47`, native-only), and `handleClipboardPaste` at v0.83.0 is `interactive-mode.ts:2635-2658` — image-first, `return` at `:2647`, `readClipboardText()` at `:2650` — structurally identical to v0.84.2's `:2870-2893`. So cyrup was missing a v0.83.0 behaviour, not lagging a v0.84.x one. This is the **twelfth** row in this file to take the upstream-drift → not-ported correction; the Kind column already reads not-ported, but the citations should be re-tagged when this file is next touched. Minor off-by-ones in the same in-source block, listed so they are not re-derived: pi's `READ_CLIPBOARD_OPTIONS` is `:37-41` (cited `:36-40`), `readWaylandClipboardText` is `:43-50` (cited `:42-48`), the native read is `:65-70` (cited `:64-67`), `text || null` is `:67` (cited `:66`), and the text read/insert is `:2885-2889` (cited `:2884-2888`). `App::paste_from_clipboard` is pi's `handleClipboardPaste` (`interactive-mode.ts:2870-2892`): image first, text second, and the two reads are closures so the LAZINESS is testable — pi returns at `:2882` and never reads text when an image was found. **`[CYRUP-DELTA]`s, both recorded in-file:** the read gate stays pi's literal `"linux"` where the WRITE side's existing delta widened `p !== "linux"` to "macOS or Windows" (a failed read degrades to "no text"; a silently-succeeding write does not, which is what justified widening the other one) — asserted as a test so the two are not "made consistent" later; and the 5 s timeout comes from `recv_timeout` over a helper thread running `Command::output()`, because `output()` drains the pipe (a 50 MB clipboard cannot deadlock, which a `try_wait` poll over a piped stdout would) but has no timeout, and the helper still holds the `Child` so it is reaped. |
 | ~~DRIFT-046~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | duplicate-of: `TOOL-036` | `normalizeWindowsShellPath` unported — Git-Bash/MSYS/Cygwin/WSL drive paths unconverted — **CLOSED 2026-08-14**: sweep 1 + 2 — **REOPENED AND RE-CLOSED, not a plain duplicate.** Sweep 1 closed it on TOOL-036's landing in `cyrup-tools/src/path.rs`, but a SECOND live instance existed in `crates/cyrup-config/src/paths.rs` — which is the 1:1 port of the very function upstream applies the rule inside (`utils/paths.ts` `normalizePath`) and was created AFTER this item was written, by CFG-025/CFG-036 — so cyrup ended sweep 1 with the rule in one copy of the normalizer and not the other. Now ported and applied at paths.ts:83-85's exact position (before the tilde expansion, inside the shared normalizer), with `test/paths.test.ts:133-150` ported verbatim INCLUDING the pass-through list, plus six extra grammar cases pinning where pi's regex backtracks and a hand parse does not. **The item's own Fix sentence — "Port the function into cyrup-resources (wherever `normalize_path` lives)" — names the wrong crate: `normalize_path` lives in cyrup-config, and cyrup-resources depends on it.** |
 | DRIFT-047 | low | upstream-drift | L | duplicate-of: `VL-P5` | `packages/telemetry` and the `pi.ai.request` span contract absent — **2026-08-15, BLOCKED (measured), still open**: area-12 pass, re-derived at `v0.84.2`. Still absent — `grep -rnE 'TelemetryContext\|TelemetrySpan\|telemetry_context' crates --include='*.rs'` → **0**. Upstream sizes re-measured: `packages/telemetry/src` is **935 lines** (`index.ts` 357, `testing/conformance.ts` 315, `memory.ts` 219, `noop.ts` 20, `testing/{index,types}.ts` 24) and `packages/agent/src/harness/telemetry.ts` — where the `pi.ai.request` schema actually lives — is **615**. The threading surface in `packages/ai` is still just two lines (`types.ts:123` declares `telemetryContext?`, `api/simple-options.ts:36` forwards it), so the item's "SDK-surface parity today" note holds at v0.84.2 as well. **Why not attempted here rather than deferred silently:** the item's own refuter note says to resolve it by EXTENDING `PARITY-GAPS` VL-P5, not by opening a second L workstream from this ID, and landing only the trait pair would put a `telemetry_context` field on `StreamOptions` with no emitter and no conformance suite behind it — an invented surface, which is the `PROV-061` failure mode. Needs the VL-P5 owner. |
+| DRIFT-053 | medium | upstream-drift | M | — | `/share` gained a Radius-first upload path in `v0.84.3`; cyrup's `/share` still only knows the old gist-only flow — **new 2026-09-04**, area-12 pass. Uniquely owned here. See row and body below. |
 | ~~DRIFT-050~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | — | `CYRUP_TELEMETRY=` empty is an explicit OFF upstream and a silent no-op here — **CLOSED 2026-08-14**: sweep 2 — `CYRUP_TELEMETRY=` / `PI_TELEMETRY=` (set but empty) is now an explicit OFF that beats the settings opt-in, restoring pi's tri-state (unset / set-empty / set-truthy): the telemetry field no longer goes through the `!v.is_empty()` filter and takes the first key that is SET AT ALL, while the two sibling flags (`offline`, `skip_version_chk`) keep the per-key empty filter, which is indistinguishable from pi for them. **MECHANISM NOTE the item could not anticipate: this could not be tested by mutating the process environment, because `std::env::set_var` is `unsafe` under Rust 2024 and `cyrup-config` is `#![forbid(unsafe_code)]`. `EnvVars::from_lookup(get)` was added as a pure seam and `from_process` reduced to `from_lookup(\|k\| std::env::var(k).ok())`; `first_env` no longer exists. Any area file citing `cyrup-config/src/env.rs:50-53 first_env` is now stale, and any future env-tier parity item in that crate needs the same seam.** |
 | ~~DRIFT-051~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | — | `process.title`'s role suffix never set — RPC / runner / broker children are all bare `cyrup` in `ps` — **CLOSED 2026-08-14**: sweep 1 — duplicate of SEAM-070, fixed in the same sweep. **Sweep 2 carries SEAM-070's own caveat across: on macOS `pthread_setname_np` does not change what `ps -o comm=` prints, so this item's Verify line holds verbatim only on Linux.** |
 | ~~DRIFT-052~~ | ~~medium~~ **FILED AND CLOSED 2026-08-15** | upstream-drift | S | — | Fireworks GLM 5.2 lost pi's `openAICompat` — no session-affinity header and a long cache retention Fireworks does not honour — **FILED AND CLOSED 2026-08-15** (area-12 pass; this is the unrecorded item the pass was asked to give an id). pi `b9497c8c1` ("fix(ai): correct Fireworks GLM prompt caching, closes #7676") replaced the inline `candidate.compat = { supportsStore: false, supportsDeveloperRole: false }` the GLM rows carried at the ported tag (`ai/scripts/generate-models.ts:2151-2155` @v0.83.0) with the shared `openAICompat` constant `processFireworksModels` builds (`:1239-1244` @v0.84.2), adding `sendSessionAffinityHeaders: true` and `supportsLongCacheRetention: false`. **The tag attribution in the hand-off was off by one: it first ships in `v0.84.0`, not `v0.84.1`, and is unchanged at `v0.84.2`.** See the body below. |
 
-| DRIFT-022 | **tracker** | **flag half FIXED 2026-08-13** *(via `SEAM-051`)*; renderer half still tracking | L | duplicate-of: `SEAM-051` | TUI mode (`--tui-mode`, alternate screen) not ported |
+| ~~DRIFT-022~~ | ~~tracker~~ **CLOSED 2026-09-04** | **FIXED** *(via `SEAM-051`, `TUI-019`, `CFG-021`)* | L | duplicate-of: `SEAM-051` | TUI mode (`--tui-mode`, alternate screen) not ported — **CLOSED 2026-09-04**: area-12 re-audit at cyrup HEAD `2571969`. The renderer half this row was tracking has landed: `dbcf59a` ("ship the fullscreen (alternate-screen) TUI mode, ADR-0005 B-1..B-14") wires `--tui-mode` (`crates/cyrup/src/cli/args.rs:184-185`) through to `App::switch_tui_mode` at `crates/cyrup/src/interactive.rs:207-217`, precedence flag-then-setting-then-`regular` exactly as this row's Fix specified; the `tuiMode`/`fullscreenScrollbar` settings keys are live at `crates/cyrup-config/src/settings/manager.rs:387,395` and `effective.rs:461`. The commit records the binary driven under a real pty (alt-screen enter/leave escapes, wheel-report handling, tmux-aware mouse-capture divergence observed and matched) — an `observed`, not merely static, closure. Re-confirmed upstream still ships the surface unchanged at `v0.84.4` (`packages/coding-agent/src/cli/args.ts:203-209`, `--tui-mode`; `packages/tui/src/tui-alt-screen.ts`, 1378 lines at that tag). **Not re-verified**: line-for-line fidelity against pi's full 1378-line `tui-alt-screen.ts` was not diffed — any residual fine-grained parity gap in the renderer itself is `TUI-019`'s (area 07) to find, not this tracker's. |
 | DRIFT-023 | **tracker** · *lead* | tracking | L | duplicate-of: `CFG-020` | Model registry → `ModelRuntime` refactor not absorbed — **evidence unverified** |
 | DRIFT-032 | **tracker** | **not-ported** *(was upstream-drift)* | L | duplicate-of: `EXT-027` | llama.cpp router integration and Hugging Face model search entirely unported |
 | DRIFT-040 | **tracker** · *lead* | tracking | L | duplicate-of: `VL-P22` | pi's agent-harness v2 rearchitecture entirely unabsorbed — **evidence unverified** |
 
-**Count:** 34 IDs = **30 severity-bearing (0 critical, 1 high, 11 medium, 18 low)** + 4 trackers.
+**Count, re-derived 2026-09-04 (area-12 pass, cyrup HEAD `2571969`):** 36 IDs in this table (35
+DRIFT-NNN rows + the new `DRIFT-053`) = **26 closed** + **10 open** — **7 severity-bearing (0
+critical, 0 high, 5 medium, 2 low)** + **3 trackers** (`DRIFT-023`, `DRIFT-032`, `DRIFT-040`; the
+fourth, `DRIFT-022`, closed this pass). The stale `34 IDs / 4 trackers` figure below predates the
+2026-08-15 pass's eight REFUTED-AT-HEAD closures and this pass's `DRIFT-022` closure and `DRIFT-053`
+filing; it is struck rather than deleted per the no-renumbering rule, and superseded by this line.
+**Deduplicated, this area uniquely owns 15 IDs (the original 14 plus `DRIFT-053`) — 0 high, 9
+medium, 6 low, of which 3 are still open:** medium `DRIFT-004` (open), `DRIFT-013`\*, `DRIFT-014`\*,
+`DRIFT-028`\*, `DRIFT-029`\*, `DRIFT-033`\*, `DRIFT-041` (open), `DRIFT-048`\*, `DRIFT-053` (open,
+new); low `DRIFT-010`\*, `DRIFT-036`\*, `DRIFT-042`\*, `DRIFT-045`\*, `DRIFT-050`\*, `DRIFT-051`\*
+(\* = closed, kept for the ID census). **This area's entire open-and-uniquely-owned set is three
+mediums — `DRIFT-004`, `DRIFT-041`, `DRIFT-053` — everything else open here (`DRIFT-009`,
+`DRIFT-015`, `DRIFT-019`, `DRIFT-047`, and the three trackers) is scheduled in its owning area and
+this file is read only for the extra evidence it carries.** ~~**Count:** 34 IDs =
+**30 severity-bearing (0 critical, 1 high, 11 medium, 18 low)** + 4 trackers.
 **Deduplicated: 14 IDs this area uniquely owns — 0 high, 8 medium, 6 low.** The single high is a
-duplicate and is scheduled in area 08, so **this area contributes no high to a deduplicated plan.**
+duplicate and is scheduled in area 08, so **this area contributes no high to a deduplicated plan.**~~
 
 ## Leads — not yet evidenced (outside the item count)
 
@@ -735,9 +805,25 @@ Missing four catalogs: `baseten`, `qwen-token-plan`, `qwen-token-plan-cn`, `qwen
 
 **Verify** — Catalog entries carrying `sessionAffinityFormat` resolve all three values; a legacy `sendSessionIdHeader: false` still suppresses the header.
 
-## DRIFT-022 — TUI mode (`--tui-mode`, alternate screen) not ported
+## ~~DRIFT-022~~ — TUI mode (`--tui-mode`, alternate screen) not ported — **CLOSED 2026-09-04**
 
-**Kind** tracking · **Severity** **tracker** *(excluded from the severity count, repair pass — was low)* · **Effort** L · **Confidence** high · **duplicate-of: `SEAM-051`**
+**Kind** tracking · **Severity** ~~**tracker**~~ **CLOSED 2026-09-04** · **Effort** L · **Confidence** high · **duplicate-of: `SEAM-051`**
+
+> **CLOSED 2026-09-04 (area-12 pass, cyrup HEAD `2571969`).** The renderer half this tracker was
+> tracking — everything below this line was still true as of the 2026-08-15 pass — has landed:
+> `dbcf59a` ("ship the fullscreen (alternate-screen) TUI mode, ADR-0005 B-1..B-14") wires
+> `--tui-mode` (`crates/cyrup/src/cli/args.rs:184-185`, replacing the `crates/cyrup/src/cli.rs` this
+> body cites — the CLI moved into a `cli/` module tree) through `App::switch_tui_mode` at
+> `crates/cyrup/src/interactive.rs:207-217`, with the precedence this row's own Fix specified
+> (flag → `tuiMode` setting → `regular`). The `tuiMode`/`fullscreenScrollbar` settings keys land at
+> `cyrup-config/src/settings/manager.rs:387,395`. The commit's own log records the binary driven
+> under a real pty — alt-screen enter/leave escapes, SGR wheel reports, tmux-aware mouse-capture
+> divergence observed and matched against upstream — so this is an `observed`, not merely static,
+> closure. Upstream re-confirmed unchanged in shape at `v0.84.4`. **Not verified this pass: line-for-
+> line fidelity against pi's now-1378-line `tui-alt-screen.ts`** (grown further since the `v0.84.1`
+> figure below) — any residual fine-grained gap in the renderer's *behaviour* is `TUI-019`'s to find,
+> not this tracker's; this closure speaks only to "the surface this row tracked now exists and is
+> wired end to end", which is all a tracker of this shape ever asked.
 
 > **Flag half FIXED 2026-08-13 via `SEAM-051`**; the RENDERER half is still tracking, so this row
 > stays open. `--tui-mode regular|fullscreen` now parses (`crates/cyrup/src/cli.rs`), `regular` is a
@@ -1039,6 +1125,72 @@ Missing four catalogs: `baseten`, `qwen-token-plan`, `qwen-token-plan-cn`, `qwen
 **Fix** — Set the per-process **name** (not the environment) after mode resolution in `crates/cyrup/src/main.rs::run`: `prctl(PR_SET_NAME)` on Linux and the macOS equivalent — a two-platform `cfg` block or a small crate such as `proctitle`. Use `cyrup` for interactive, `cyrup-rpc` when `--mode rpc` resolves (mirroring `rpc-entry.ts:6`), and distinct names in `subagent_runner_cmd::dispatch` and `intercom_broker_cmd::dispatch`. **Correct the comment at `main.rs:53-57` in the same change:** its `unsafe`/edition-2024 rationale covers only the `std::env::set_var` half — process naming is a syscall against the current process, not a mutation of the shared environment, so it does not carry that hazard, and the comment currently reads as if the whole block were unimplementable. The `PI_CODING_AGENT` / `AI_AGENT` half of that same comment is **already filed** as `TOOL-031` (`04-cyrup-tools.md:416-430`) and `PARITY-GAPS` **PB-5** — do not re-file it here; PB-5 is where the "add to the per-child env vector rather than `unsafe set_var`" placement decision gets made.
 
 **Verify** — `cyrup --mode rpc`, then `ps -o comm= -p <pid>` returns `cyrup-rpc`; an interactive session returns `cyrup`; a live `__subagent-runner` child returns its own name. All three return `cyrup` today.
+
+## DRIFT-053 — `/share` gained a Radius-upload-first path in `v0.84.3`; cyrup still only knows the old gist-only flow
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** high
+
+*(Filed 2026-09-04, area-12 pass, from the v0.84.2→v0.84.4 diff-stat skim. New relative to this
+file's own baseline: `packages/coding-agent/src/modes/interactive/session-share.ts` does not exist
+at `v0.84.1` or `v0.84.2` — `git -C tmp/pi cat-file -e <tag>:packages/coding-agent/src/modes/
+interactive/session-share.ts` fails at both — and first appears at `v0.84.3`, introduced by pi
+`460191cfc` "feat(coding-agent): include context in Radius session shares". Present unchanged at
+`v0.84.4`.)*
+
+**cyrup** — `crates/cyrup-tui/src/app/execute_misc.rs::share_session` (`:898`) ports exactly the
+**pre-`v0.84.3`** `/share`: render the session to HTML (`crate::export::session_jsonl_to_html`),
+write it to a temp file, gate on `gh auth status` before mounting a loader
+(`crates/cyrup-tui/src/app/execute_misc.rs`, citing `session-share.ts:59-68` in its own comment —
+which is evidence a prior pass *did* open the new file, since that citation only makes sense against
+the post-restructure line numbers), then shell `gh gist create --public=false <file>` and surface
+the URL via `apply_share_outcome` (`:1016`) and `crate::app::share` (`ENV_SHARE_VIEWER_URL`,
+`crates/cyrup-tui/src/app/share.rs:7`). There is no Radius attempt anywhere in the path:
+`grep -rn '"radius"' crates/cyrup-tui/src --include='*.rs'` → 0, and cyrup has no `radius` provider
+registered at all (`DRIFT-019`/`PROV-014`), so there is nothing for a ported `tryShareViaRadius` to
+call `get_provider("radius")` against yet regardless.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/session-share.ts` @`v0.84.4`.
+`shareSession` (`:46-70`) now tries Radius **first**: `exportSessionForShare` writes a JSONL
+augmented with a `pi.share`-typed trailing entry carrying the system prompt and tool list
+(`:25-44`), then `tryShareViaRadius` (`:72-101`) resolves the `radius` provider off
+`session.modelRuntime.getProvider("radius")`, fetches an OAuth credential
+(`getAuthCredential(...modelRuntime.getAuth("radius", …))`), and on success `POST`s the JSONL as
+`application/x-ndjson` to `${DEFAULT_RADIUS_GATEWAY}/v1/artifacts?visibility=organization` — landing
+the share as an **organization-visibility Radius artifact**, not a public link, and returning early
+(`:70`, `return true` whether it succeeded or the upload failed — the caller does not fall through on
+a failed Radius attempt with credentials present, only on "no provider" / "no credential"). Only when
+`tryShareViaRadius` returns `false` (no radius provider or no stored credential) does `shareSession`
+fall to the old `gh auth status` → `session.exportToHtml` → `shareViaGist` chain (`:56-58`,
+`:103-140` for `shareViaGist`), unchanged from `v0.84.1`'s `handleShareCommand`.
+
+**Impact** — Two distinct gaps, gated by whether radius auth exists. (1) **Structural, true today**:
+cyrup's `/share` can never take the Radius path even in principle — it isn't threaded through the
+command at all — so the code path pi added for exactly this feature has no analogue to fall short of
+yet; this is closer to `not-ported` in spirit but the *trigger* (the restructuring) is genuine
+post-baseline drift, which is why it is filed `upstream-drift` here rather than folded into
+`DRIFT-019`. (2) **Behavioural, once `DRIFT-019`/`PROV-014` lands radius**: even after radius is
+registered, cyrup's `/share` would still go straight to the gist fallback unless this item's own fix
+also lands, meaning a user who deliberately configured Radius so their sessions stay inside their
+organization would instead get every `/share` published as a GitHub gist — a materially different,
+more-exposed sharing destination than the one they configured, and silently so (no error, no
+indication the intended path was skipped).
+
+**Fix** — Port `tryShareViaRadius` into `share_session` (or a sibling `try_share_via_radius`) ahead
+of the existing gist path: resolve the `radius` provider and credential through the same
+`AgentSession`/`ModelRuntime`-equivalent surface cyrup's other auth flows use, `POST` the JSONL
+export (already available via `session.export_to_jsonl`) to `{gateway}/v1/artifacts?visibility=
+organization` as `application/x-ndjson`, and only fall through to the existing `gh`/gist chain when
+no radius provider or credential is present — matching `session-share.ts:56-58`'s early-return
+shape. `exportSessionForShare`'s `pi.share`-typed trailing entry (system prompt + tool list) is a
+small addition to `session_jsonl_to_html`'s existing serializer if the Radius viewer needs it
+parsed; **do not attempt this before `DRIFT-019`/`PROV-014` registers a `radius` provider** — there
+is nothing to resolve a credential against otherwise.
+
+**Verify** — With a radius credential present, `/share` POSTs to the artifacts endpoint and surfaces
+the returned `canonical_url`, never invoking `gh`. With no radius provider/credential, behaviour is
+byte-identical to today (gist path, unchanged). A failed Radius upload (non-2xx or network error)
+surfaces an error and does **not** fall through to gist — matching pi's `return true` on failure,
+which this item's Fix must not silently "improve" into a fallback pi itself does not take.
 
 ---
 
