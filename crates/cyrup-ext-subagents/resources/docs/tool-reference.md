@@ -38,6 +38,7 @@ With an `action`, the tool is in **management** or **control** mode.
 | `mission.list` | management | List missions in scope |
 | `mission.show` | management | Show one mission and its attached runs |
 | `mission.update` | management | Change a mission's fields |
+| `mission.resolve-decision` | management | Resolve one open mission decision |
 | `mission.attach-run` | management | Bind a run to a mission |
 | `mission.close` | management | Close a mission |
 | `watchdog.status` | management | Report the effective watchdog config |
@@ -90,6 +91,7 @@ deliberately stricter rule, so a loose typo is never nudged toward a destructive
 | `scope`, `target`, `thinking` | `watchdog.configure` | Watchdog scope and target |
 | `missionId`, `mission`, `missionUpdate`, `missionStatus`, `missionScope` | `mission.*` | Mission payloads |
 | `runMode`, `runStatus`, `summary` | `mission.attach-run` | Run binding fields |
+| `id`, `summary` | `mission.resolve-decision` | Decision id and its resolution text |
 | `config` | management | Extension config fragment for the call |
 
 ### Structured output

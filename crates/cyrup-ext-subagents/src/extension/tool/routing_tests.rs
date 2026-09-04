@@ -930,9 +930,89 @@ async fn a_mission_action_validation_failure_is_a_tool_error_with_upstreams_text
     assert_eq!(err.to_string(), "missionScope must be \"project\" or \"global\"");
 }
 
-/// T6 child-safe restriction (pi `subagent-executor.ts:4379-4386`, over the four mission
-/// actions in `MUTATING_MANAGEMENT_ACTIONS` at `:151`): a fanout child may LIST and SHOW
-/// missions but may not create/update/attach/close one.
+/// SUBA-085 — `mission.resolve-decision` dispatches end to end through the tool
+/// (pi `actions.ts:391-397` @v0.64.0): a decision recorded by `mission.update` is closed by id
+/// with the resolution taken from `summary`, the receipt is upstream's `Resolved decision …`
+/// line over the re-rendered mission, and an empty summary is refused with upstream's text.
+/// Pre-fix `mission.resolve-decision` landed on the unknown-action arm.
+#[tokio::test]
+async fn mission_resolve_decision_dispatches_and_closes_the_decision() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    let created = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "mission.create", "mission": { "title": "Decide" } }),
+    )
+    .await
+    .expect("mission.create must dispatch");
+    let mission_id = created.details.as_ref().expect("details")["missionId"]
+        .as_str()
+        .expect("missionId")
+        .to_string();
+    let updated = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "action": "mission.update",
+            "missionId": mission_id,
+            "missionUpdate": { "decisions": [{ "title": "Ship?" }] },
+        }),
+    )
+    .await
+    .expect("mission.update must dispatch");
+    let decision_id = updated.details.as_ref().expect("details")["mission"]["decisions"][0]["id"]
+        .as_str()
+        .expect("decision id")
+        .to_string();
+
+    let err = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "action": "mission.resolve-decision",
+            "missionId": mission_id,
+            "id": decision_id,
+            "summary": "   ",
+        }),
+    )
+    .await
+    .expect_err("an empty summary must refuse");
+    assert_eq!(
+        err.to_string(),
+        "mission.resolve-decision requires a non-empty summary"
+    );
+
+    let resolved = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "action": "mission.resolve-decision",
+            "missionId": mission_id,
+            "id": decision_id,
+            "summary": "yes, ship it",
+        }),
+    )
+    .await
+    .expect("mission.resolve-decision must dispatch");
+    let text = tool_text(&resolved);
+    assert!(
+        text.starts_with(&format!(
+            "Resolved decision {decision_id} for mission {mission_id}.\n\n"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "  {decision_id}: resolved — Ship?; resolution: yes, ship it"
+        )),
+        "{text}"
+    );
+    let decision = &resolved.details.as_ref().expect("details")["mission"]["decisions"][0];
+    assert_eq!(decision["status"], "resolved");
+    assert_eq!(decision["resolution"], "yes, ship it");
+    assert!(decision["resolvedAt"].is_string());
+}
+
+/// T6 child-safe restriction (pi `subagent-executor.ts:4379-4386`, over the five mission
+/// actions in `MUTATING_MANAGEMENT_ACTIONS` at `:197` @v0.64.0): a fanout child may LIST and
+/// SHOW missions but may not create/update/resolve/attach/close one.
 #[tokio::test]
 async fn child_safe_mission_gating_matches_upstreams_mutating_set() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -940,7 +1020,13 @@ async fn child_safe_mission_gating_matches_upstreams_mutating_set() {
         Arc::new(SubagentExecutor::new()),
         dir.path().to_path_buf(),
     );
-    for action in ["mission.create", "mission.update", "mission.attach-run", "mission.close"] {
+    for action in [
+        "mission.create",
+        "mission.update",
+        "mission.resolve-decision",
+        "mission.attach-run",
+        "mission.close",
+    ] {
         let err = dispatch_tool(
             &child,
             serde_json::json!({ "action": action, "missionId": "m", "runId": "r",

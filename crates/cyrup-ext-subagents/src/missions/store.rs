@@ -942,22 +942,26 @@ pub fn list_missions(location: &MissionStoreLocation) -> MissionListResult {
     MissionListResult { records, warnings }
 }
 
-/// pi `updateMission` (`store.ts:406-475`) — the merge core of the whole subsystem.
+/// pi `updateMission` (`store.ts:439-547` @v0.64.0; `:406-475` @v0.43.0) — the merge core of the
+/// whole subsystem.
 ///
 /// The four `add*` lists are UPSERTS, each with its own identity:
 /// * runs on `(runId, childIndex)`, merged field-by-field over the existing link;
 /// * artifacts on `(kind, resolved path)`, likewise merged;
 /// * receipts on `(kind, url)`, replaced but KEEPING the original `createdAt`;
-/// * decisions are always appended as NEW, open decisions with fresh ids.
+/// * decisions are always appended as NEW, open decisions with fresh ids — and then
+///   `resolve_decision` (SUBA-085) flips exactly one existing open decision to `resolved`.
 ///
 /// Usage is RECOMPUTED from `runs[].usage` unless explicitly supplied, and goal status then
-/// transitions to `budget-exhausted` (or back to `active`) against the budget.
+/// transitions to `budget-exhausted` (or back to `active`) against the budget. The mission status
+/// is gated on open decisions (`store.ts:521-529` @v0.64.0): see the inline note at the gate.
 ///
 /// # Errors
 ///
 /// [`MissionError::NotFound`] when the record is missing, [`MissionError::Invalid`] for any
-/// failed validation (including "budget is required when enabling a goal mission"), or
-/// [`MissionError::Io`] when the merged record cannot be persisted.
+/// failed validation (including "budget is required when enabling a goal mission", an unknown
+/// or already-resolved decision id), or [`MissionError::Io`] when the merged record cannot be
+/// persisted.
 pub fn update_mission(
     location: &MissionStoreLocation,
     mission_id: &str,
@@ -1084,6 +1088,37 @@ pub fn update_mission(
         });
     }
 
+    // ---- resolve ONE open decision (SUBA-085, `store.ts:497-508` @v0.64.0) --------------------
+    // Runs AFTER the append loop, over the merged list, exactly as upstream does. Both refusals
+    // are upstream's verbatim text; the resolution is validated as a non-empty string and stored
+    // trimmed, and `resolvedAt` is the same `createdAt` stamp the rest of this update carries.
+    if let Some(resolve) = &update.resolve_decision {
+        let decision_id =
+            validate_mission_id_str(&resolve.id, "mission.update.resolveDecision.id")?;
+        let Some(decision) = decisions
+            .iter_mut()
+            .find(|decision| decision.id == decision_id)
+        else {
+            return Err(MissionError::invalid(format!(
+                "Decision '{decision_id}' was not found in mission '{mission_id}'"
+            )));
+        };
+        if decision.status == MissionDecisionStatus::Resolved {
+            return Err(MissionError::invalid(format!(
+                "Decision '{decision_id}' is already resolved"
+            )));
+        }
+        let resolution = required_string(
+            Some(&Value::String(resolve.resolution.clone())),
+            "mission.update.resolveDecision.resolution",
+        )?
+        .trim()
+        .to_string();
+        decision.status = MissionDecisionStatus::Resolved;
+        decision.resolved_at = Some(created_at.clone());
+        decision.resolution = Some(resolution);
+    }
+
     // ---- budget / usage / goal ----------------------------------------------------------------
     let budget = match &update.budget {
         Some(b) => Some(parse_budget(
@@ -1124,6 +1159,41 @@ pub fn update_mission(
         });
     }
 
+    // ---- status: the decision gate (SUBA-085, `store.ts:521-529` @v0.64.0) -------------------
+    // Entered at v0.47.1 with `resolveDecision` (`1dec33dd`); v0.43.0 wrote
+    // `update.status ?? current.status` and nothing else. An explicit `status` is always the
+    // candidate. Otherwise appending a decision to an ACTIVE mission gates it as `needs_decision`,
+    // and resolving the LAST open decision of a `needs_decision` mission returns it to `active`
+    // (a `planned`/`waiting` mission keeps its lifecycle status either way). Then, whatever the
+    // candidate, an `active`/`completed` mission that still has an open decision is held at
+    // `needs_decision` — which is also why `mission.close` cannot complete a mission over an
+    // unresolved decision.
+    let has_open_decisions = decisions
+        .iter()
+        .any(|decision| decision.status == MissionDecisionStatus::Open);
+    let candidate_status = match update.status {
+        Some(requested) => requested,
+        None if !update.add_decisions.is_empty() && current.status == MissionStatus::Active => {
+            MissionStatus::NeedsDecision
+        }
+        None if update.resolve_decision.is_some()
+            && current.status == MissionStatus::NeedsDecision
+            && !has_open_decisions =>
+        {
+            MissionStatus::Active
+        }
+        None => current.status,
+    };
+    let status = if has_open_decisions
+        && matches!(
+            candidate_status,
+            MissionStatus::Active | MissionStatus::Completed
+        ) {
+        MissionStatus::NeedsDecision
+    } else {
+        candidate_status
+    };
+
     // ---- assemble ------------------------------------------------------------------------------
     // pi spreads `...current` first, so every field not named below is carried over verbatim; note
     // `usage` is written ONLY when a goal is live (`...(goal ? { goal, usage } : {})`), and
@@ -1146,7 +1216,7 @@ pub fn update_mission(
         goal,
         budget,
         usage: if goal.is_some() { Some(usage) } else { current.usage },
-        status: update.status.unwrap_or(current.status),
+        status,
         updated_at: created_at,
         runs,
         decisions,
@@ -1311,7 +1381,7 @@ mod tests {
     )]
 
     use super::*;
-    use crate::missions::MissionDecisionInput;
+    use crate::missions::{MissionDecisionInput, MissionDecisionResolution};
 
     fn location(root: &Path) -> MissionStoreLocation {
         MissionStoreLocation {
@@ -1601,6 +1671,188 @@ mod tests {
         assert_eq!(updated.decisions[0].status, MissionDecisionStatus::Open);
         assert_eq!(updated.decisions[0].recommendation.as_deref(), Some("postgres"));
         assert!(validate_mission_id_str(&updated.decisions[0].id, "id").is_ok());
+    }
+
+    fn open_decision(loc: &MissionStoreLocation, mission_id: &str, title: &str) -> MissionRecord {
+        update_mission(
+            loc,
+            mission_id,
+            &MissionUpdateInput {
+                add_decisions: vec![MissionDecisionInput {
+                    title: title.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            1000,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn resolve(
+        loc: &MissionStoreLocation,
+        mission_id: &str,
+        decision_id: &str,
+        text: &str,
+    ) -> MissionResult<MissionRecord> {
+        update_mission(
+            loc,
+            mission_id,
+            &MissionUpdateInput {
+                resolve_decision: Some(MissionDecisionResolution {
+                    id: decision_id.to_string(),
+                    resolution: text.to_string(),
+                }),
+                ..Default::default()
+            },
+            2000,
+            None,
+        )
+    }
+
+    /// SUBA-085 / pi `store.ts:497-508` @v0.64.0: `resolveDecision` flips exactly the named
+    /// decision to `resolved`, stamps `resolvedAt` with this update's `createdAt`, stores the
+    /// resolution TRIMMED, and leaves every other decision alone. Pre-fix
+    /// `MissionUpdateInput` had no such field and `Resolved` was produced only by the parser.
+    #[test]
+    fn resolve_decision_marks_only_the_named_decision_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let record = create(&loc, "m");
+        open_decision(&loc, &record.id, "first");
+        let with_two = open_decision(&loc, &record.id, "second");
+        let target = with_two.decisions[1].id.clone();
+        let resolved = resolve(&loc, &record.id, &target, "  go with B  ").unwrap();
+        assert_eq!(resolved.decisions[0].status, MissionDecisionStatus::Open);
+        assert_eq!(resolved.decisions[0].resolution, None);
+        assert_eq!(
+            resolved.decisions[1].status,
+            MissionDecisionStatus::Resolved
+        );
+        assert_eq!(
+            resolved.decisions[1].resolution.as_deref(),
+            Some("go with B")
+        );
+        assert_eq!(
+            resolved.decisions[1].resolved_at.as_deref(),
+            Some(resolved.updated_at.as_str())
+        );
+        // Read back from disk: the parser's `Resolved` arm is now reached by a real write.
+        let reread = read_mission(&loc, &record.id).unwrap();
+        assert_eq!(reread.decisions[1].status, MissionDecisionStatus::Resolved);
+    }
+
+    /// The store's own refusals (`store.ts:498-501` @v0.64.0), verbatim: a malformed id, an id
+    /// that is not on the mission, an already-resolved decision, and an empty resolution.
+    #[test]
+    fn resolve_decision_refuses_unknown_resolved_and_malformed_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let record = create(&loc, "m");
+        let with_one = open_decision(&loc, &record.id, "only");
+        let target = with_one.decisions[0].id.clone();
+        assert_eq!(
+            resolve(&loc, &record.id, "a..b", "x")
+                .unwrap_err()
+                .to_string(),
+            "mission.update.resolveDecision.id must contain only letters, numbers, '.', '_', or \
+             '-' and cannot contain '..'"
+        );
+        assert_eq!(
+            resolve(&loc, &record.id, "missing", "x")
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "Decision 'missing' was not found in mission '{}'",
+                record.id
+            )
+        );
+        assert_eq!(
+            resolve(&loc, &record.id, &target, "   ")
+                .unwrap_err()
+                .to_string(),
+            "mission.update.resolveDecision.resolution must be a non-empty string"
+        );
+        // A refused update must not have been persisted.
+        assert_eq!(
+            read_mission(&loc, &record.id).unwrap().decisions[0].status,
+            MissionDecisionStatus::Open
+        );
+        resolve(&loc, &record.id, &target, "done").unwrap();
+        assert_eq!(
+            resolve(&loc, &record.id, &target, "again")
+                .unwrap_err()
+                .to_string(),
+            format!("Decision '{target}' is already resolved")
+        );
+    }
+
+    /// The decision gate (`store.ts:521-529` @v0.64.0, entered at v0.47.1 with `1dec33dd`):
+    /// appending a decision to an ACTIVE mission gates it as `needs_decision`; an `active` or
+    /// `completed` status requested while a decision is still open is held at `needs_decision`;
+    /// resolving the LAST open decision of a `needs_decision` mission returns it to `active`.
+    /// Pre-fix the status was `update.status ?? current.status` with no gate at all.
+    #[test]
+    fn open_decisions_gate_the_mission_status_and_resolving_the_last_one_reopens_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let record = create(&loc, "m");
+        let active = update_mission(
+            &loc,
+            &record.id,
+            &MissionUpdateInput {
+                status: Some(MissionStatus::Active),
+                ..Default::default()
+            },
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(active.status, MissionStatus::Active);
+        let gated = open_decision(&loc, &record.id, "first");
+        assert_eq!(gated.status, MissionStatus::NeedsDecision);
+        let gated = open_decision(&loc, &record.id, "second");
+        assert_eq!(gated.status, MissionStatus::NeedsDecision);
+        // An explicit `completed` (what `mission.close` sends) is held while a decision is open.
+        let held = update_mission(
+            &loc,
+            &record.id,
+            &MissionUpdateInput {
+                status: Some(MissionStatus::Completed),
+                ..Default::default()
+            },
+            2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(held.status, MissionStatus::NeedsDecision);
+        // Resolving one of two leaves the mission gated; resolving the last reopens it.
+        let first = gated.decisions[0].id.clone();
+        let second = gated.decisions[1].id.clone();
+        assert_eq!(
+            resolve(&loc, &record.id, &first, "a").unwrap().status,
+            MissionStatus::NeedsDecision
+        );
+        assert_eq!(
+            resolve(&loc, &record.id, &second, "b").unwrap().status,
+            MissionStatus::Active
+        );
+    }
+
+    /// The other half of the gate: a `planned` (or `waiting`) mission keeps its lifecycle
+    /// status when a decision is added and when it is resolved — only `active` is gated, and
+    /// only a `needs_decision` mission is returned to `active` by a resolution.
+    #[test]
+    fn a_planned_mission_keeps_its_status_across_a_decision_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let record = create(&loc, "m");
+        assert_eq!(record.status, MissionStatus::Planned);
+        let with_one = open_decision(&loc, &record.id, "later");
+        assert_eq!(with_one.status, MissionStatus::Planned);
+        let resolved = resolve(&loc, &record.id, &with_one.decisions[0].id, "ok").unwrap();
+        assert_eq!(resolved.status, MissionStatus::Planned);
     }
 
     #[test]

@@ -684,7 +684,21 @@ pub enum MissionGoalUpdate {
     Set(MissionGoal),
 }
 
-/// pi `MissionUpdateInput` (`missions/types.ts:143-157`).
+/// SUBA-085 — pi's inline `resolveDecision?: { id: string; resolution: string }`
+/// (`missions/types.ts:188` @v0.64.0, unchanged since it entered at v0.47.1 with
+/// `1dec33dd feat: add mission dispatch ledger`): the one mutation that can close an open
+/// [`MissionDecision`]. The store validates `id` by the mission-id rule and `resolution` as a
+/// non-empty string (`store.ts:497-508` @v0.64.0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissionDecisionResolution {
+    /// The decision's generated id, as `mission.show` rendered it.
+    pub id: String,
+    /// The chosen answer; stored trimmed.
+    pub resolution: String,
+}
+
+/// pi `MissionUpdateInput` (`missions/types.ts:174-190` @v0.64.0; `:143-157` @v0.43.0 before
+/// `resolveDecision` joined it).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MissionUpdateInput {
     /// Replace the title (trimmed).
@@ -712,6 +726,10 @@ pub struct MissionUpdateInput {
     pub add_artifacts: Vec<MissionArtifact>,
     /// Append decisions (always as NEW, open decisions with fresh ids).
     pub add_decisions: Vec<MissionDecisionInput>,
+    /// SUBA-085 — resolve ONE existing open decision by id (`missions/types.ts:188` @v0.64.0).
+    /// Applied AFTER `add_decisions` (`store.ts:497` @v0.64.0), so a decision appended and
+    /// resolved in the same update is reachable only by an id the caller cannot know yet.
+    pub resolve_decision: Option<MissionDecisionResolution>,
     /// Upsert receipts, keyed on `(kind, url)`; an existing receipt keeps its ORIGINAL
     /// `createdAt` (`store.ts:428`).
     pub add_receipts: Vec<MissionReceiptInput>,
@@ -734,6 +752,7 @@ impl MissionUpdateInput {
             && self.add_runs.is_empty()
             && self.add_artifacts.is_empty()
             && self.add_decisions.is_empty()
+            && self.resolve_decision.is_none()
             && self.add_receipts.is_empty()
     }
 }

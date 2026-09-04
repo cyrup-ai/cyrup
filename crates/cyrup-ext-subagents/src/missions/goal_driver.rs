@@ -867,6 +867,70 @@ mod tests {
         );
     }
 
+    /// SUBA-085 — the goal driver's next ready action is `record.decisions.find(open)`
+    /// (`goal-driver.ts:94-95` @v0.64.0), so resolving the decision through
+    /// `MissionUpdateInput::resolve_decision` (`store.ts:497-508`) is what moves the mission
+    /// past it. Pre-fix nothing could flip the status and the same decision was proposed on
+    /// every evaluation; now the notice falls through to the objective.
+    #[test]
+    fn resolving_the_open_decision_moves_the_next_ready_action_past_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let record = goal_mission(&loc, "Deciding", 1000, "sess-1");
+        let gated = update_mission(
+            &loc,
+            &record.id,
+            &MissionUpdateInput {
+                add_decisions: vec![MissionDecisionInput {
+                    title: "Which storage engine?".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(gated.status, MissionStatus::NeedsDecision);
+        let before = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0)).unwrap();
+        assert!(
+            before[0]
+                .message
+                .contains("Next ready action: Resolve decision: Which storage engine?"),
+            "{}",
+            before[0].message
+        );
+
+        let resolved = update_mission(
+            &loc,
+            &record.id,
+            &MissionUpdateInput {
+                resolve_decision: Some(crate::missions::MissionDecisionResolution {
+                    id: gated.decisions[0].id.clone(),
+                    resolution: "rocksdb".to_string(),
+                }),
+                ..Default::default()
+            },
+            2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved.status, MissionStatus::Active);
+        let after = collect_goal_continuation_notices(&loc, "sess-1", &[], 2, Some(0)).unwrap();
+        assert!(
+            after[0]
+                .message
+                .contains("Next ready action: Continue objective: keep working on Deciding"),
+            "{}",
+            after[0].message
+        );
+        assert!(
+            !after[0].message.contains("Resolve decision"),
+            "{}",
+            after[0].message
+        );
+    }
+
     #[test]
     fn mission_state_outranks_everything_and_is_searched_by_shape() {
         let tmp = tempfile::tempdir().unwrap();

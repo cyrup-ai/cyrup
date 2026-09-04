@@ -1,10 +1,11 @@
-//! The six `mission.*` tool actions — a 1:1 port of `pi-subagents/src/missions/actions.ts`
-//! (410 lines @v0.43.0).
+//! The seven `mission.*` tool actions — a 1:1 port of `pi-subagents/src/missions/actions.ts`
+//! (410 lines @v0.43.0; the seventh verb, `mission.resolve-decision`, is `:391-397` @v0.64.0 and
+//! entered at v0.47.1 — SUBA-085).
 //!
 //! [`MISSION_ACTIONS`] is the dispatch vocabulary
-//! (`mission.create`/`list`/`show`/`update`/`attach-run`/`close`, `actions.ts:32-39`), and
-//! [`handle_mission_action`] is the single entry point upstream's
-//! `runs/foreground/subagent-executor.ts:4406` routes all six through.
+//! (`mission.create`/`list`/`show`/`update`/`resolve-decision`/`attach-run`/`close`,
+//! `actions.ts:32-40` @v0.64.0), and [`handle_mission_action`] is the single entry point
+//! upstream's `runs/foreground/subagent-executor.ts:5723-5732` @v0.64.0 routes all seven through.
 //!
 //! Three groups of code live here:
 //!
@@ -42,29 +43,33 @@ use super::store::{
 use super::workflow_state::mission_state_path;
 use super::{
     MissionArtifact, MissionArtifactKind, MissionCreateInput, MissionDecisionInput,
-    MissionError, MissionGoal, MissionGoalStatus, MissionGoalUpdate, MissionReceiptInput,
-    MissionReceiptKind, MissionReceiptStatus, MissionRecord, MissionResult, MissionRunLink,
-    MissionRunMode, MissionStatus, MissionStoreConfig, MissionStoreLocation, MissionTokenBudget,
-    MissionUpdateInput,
+    MissionDecisionResolution, MissionDecisionStatus, MissionError, MissionGoal,
+    MissionGoalStatus, MissionGoalUpdate,
+    MissionReceiptInput, MissionReceiptKind, MissionReceiptStatus, MissionRecord, MissionResult,
+    MissionRunLink, MissionRunMode, MissionStatus, MissionStoreConfig, MissionStoreLocation,
+    MissionTokenBudget, MissionUpdateInput,
 };
 
-/// pi `MISSION_ACTIONS` (`actions.ts:32-39`) — the exact six-action vocabulary, in upstream's
-/// order.
-pub const MISSION_ACTIONS: [&str; 6] = [
+/// pi `MISSION_ACTIONS` (`actions.ts:32-40` @v0.64.0) — the exact seven-action vocabulary, in
+/// upstream's order. `mission.resolve-decision` (SUBA-085) sits between `update` and
+/// `attach-run`, where upstream declares it.
+pub const MISSION_ACTIONS: [&str; 7] = [
     "mission.create",
     "mission.list",
     "mission.show",
     "mission.update",
+    "mission.resolve-decision",
     "mission.attach-run",
     "mission.close",
 ];
 
-/// The four mission actions that appear in `subagent-executor.ts:151`'s
+/// The five mission actions that appear in `subagent-executor.ts:197` @v0.64.0's
 /// `MUTATING_MANAGEMENT_ACTIONS` set — the ones a child-safe fanout child may not perform.
 /// `mission.list`/`mission.show` are read-only and are NOT in it.
-pub const MUTATING_MISSION_ACTIONS: [&str; 4] = [
+pub const MUTATING_MISSION_ACTIONS: [&str; 5] = [
     "mission.create",
     "mission.update",
+    "mission.resolve-decision",
     "mission.attach-run",
     "mission.close",
 ];
@@ -80,6 +85,8 @@ pub enum MissionAction {
     Show,
     /// `mission.update`
     Update,
+    /// `mission.resolve-decision` (SUBA-085, `actions.ts:391-397` @v0.64.0)
+    ResolveDecision,
     /// `mission.attach-run`
     AttachRun,
     /// `mission.close`
@@ -95,6 +102,7 @@ impl MissionAction {
             Self::List => "mission.list",
             Self::Show => "mission.show",
             Self::Update => "mission.update",
+            Self::ResolveDecision => "mission.resolve-decision",
             Self::AttachRun => "mission.attach-run",
             Self::Close => "mission.close",
         }
@@ -110,6 +118,7 @@ impl MissionAction {
             "mission.list" => Some(Self::List),
             "mission.show" => Some(Self::Show),
             "mission.update" => Some(Self::Update),
+            "mission.resolve-decision" => Some(Self::ResolveDecision),
             "mission.attach-run" => Some(Self::AttachRun),
             "mission.close" => Some(Self::Close),
             _ => None,
@@ -153,7 +162,8 @@ pub struct MissionActionParams {
     pub mission_status: Option<String>,
     /// `missionScope` — `"project"` (default) or `"global"` for `mission.list`.
     pub mission_scope: Option<String>,
-    /// `id` — the `mission.attach-run` run id, when `runId` is absent.
+    /// `id` — the `mission.attach-run` run id, when `runId` is absent; the DECISION id for
+    /// `mission.resolve-decision` (`actions.ts:393` @v0.64.0).
     pub id: Option<String>,
     /// `runId` — the `mission.attach-run` run id (preferred over `id`).
     pub run_id: Option<String>,
@@ -165,7 +175,8 @@ pub struct MissionActionParams {
     pub run_status: Option<String>,
     /// `agent` — the attached run's agent.
     pub agent: Option<String>,
-    /// `summary` — the `mission.close` summary.
+    /// `summary` — the `mission.close` summary; the RESOLUTION text for
+    /// `mission.resolve-decision` (`actions.ts:394-395` @v0.64.0).
     pub summary: Option<String>,
 }
 
@@ -733,11 +744,20 @@ pub fn format_mission(record: &MissionRecord) -> String {
     if !record.decisions.is_empty() {
         lines.push("Decisions:".to_string());
         for decision in &record.decisions {
+            // SUBA-085 / `actions.ts:314` @v0.64.0 (entered at v0.47.1; v0.43.0's `:303` had no
+            // suffix): a resolved decision renders its resolution after the title, guarded on
+            // TRUTHINESS, so an absent resolution adds nothing.
             lines.push(format!(
-                "  {}: {} — {}",
+                "  {}: {} — {}{}",
                 decision.id,
                 decision.status.as_str(),
-                decision.title
+                decision.title,
+                decision
+                    .resolution
+                    .as_deref()
+                    .filter(|resolution| !resolution.is_empty())
+                    .map(|resolution| format!("; resolution: {resolution}"))
+                    .unwrap_or_default()
             ));
         }
     }
@@ -833,8 +853,23 @@ pub fn handle_mission_action(
                             .records
                             .iter()
                             .map(|record| {
+                                // SUBA-085 / `actions.ts:361-366` @v0.64.0 (entered at v0.47.1):
+                                // a record with any decisions carries an open/resolved tally.
+                                let open = record
+                                    .decisions
+                                    .iter()
+                                    .filter(|d| d.status == MissionDecisionStatus::Open)
+                                    .count();
+                                let tally = if record.decisions.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "  decisions: {open} open, {} resolved",
+                                        record.decisions.len() - open
+                                    )
+                                };
                                 format!(
-                                    "{}  {}  {}  {}",
+                                    "{}  {}  {}  {}{tally}",
                                     record.id,
                                     record.status.as_str(),
                                     record.title,
@@ -933,6 +968,50 @@ pub fn handle_mission_action(
             Ok(MissionActionOutcome {
                 text: format!(
                     "Updated mission {}.\n\n{}",
+                    record.id,
+                    format_mission(&record)
+                ),
+                details: mission_details(&record, &path),
+            })
+        }
+        MissionAction::ResolveDecision => {
+            // SUBA-085 / pi `actions.ts:391-397` @v0.64.0, in upstream's check order: mission id,
+            // then the decision id through `validateMissionId(params.id, "id")` (so a missing
+            // `id` is "id must be a non-empty string" and a malformed one gets the id-pattern
+            // text), then the summary guard with upstream's verbatim message. The store then
+            // refuses an unknown or already-resolved id rather than silently no-op'ing.
+            let mission_id = require_mission_id(params)?;
+            let decision_id = match params.id.as_deref() {
+                Some(id) => validate_mission_id_str(id, "id")?,
+                None => return Err(MissionError::invalid("id must be a non-empty string")),
+            };
+            let Some(summary) = params
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err(MissionError::invalid(
+                    "mission.resolve-decision requires a non-empty summary",
+                ));
+            };
+            let record = update_mission(
+                &location,
+                &mission_id,
+                &MissionUpdateInput {
+                    resolve_decision: Some(MissionDecisionResolution {
+                        id: decision_id.clone(),
+                        resolution: summary.to_string(),
+                    }),
+                    ..Default::default()
+                },
+                crate::time::now_epoch_millis(),
+                None,
+            )?;
+            let path = mission_record_path(&location, &record.id)?;
+            Ok(MissionActionOutcome {
+                text: format!(
+                    "Resolved decision {decision_id} for mission {}.\n\n{}",
                     record.id,
                     format_mission(&record)
                 ),
@@ -1056,6 +1135,8 @@ mod tests {
         outcome.details["missionId"].as_str().unwrap().to_string()
     }
 
+    /// pi `MISSION_ACTIONS` (`actions.ts:32-40` @v0.64.0), seven verbs in upstream's order. Pre
+    /// SUBA-085 the array had six and `mission.resolve-decision` parsed as `None`.
     #[test]
     fn mission_action_vocabulary_matches_upstream_exactly() {
         assert_eq!(
@@ -1065,10 +1146,16 @@ mod tests {
                 "mission.list",
                 "mission.show",
                 "mission.update",
+                "mission.resolve-decision",
                 "mission.attach-run",
                 "mission.close",
             ]
         );
+        assert_eq!(
+            MissionAction::from_wire("mission.resolve-decision"),
+            Some(MissionAction::ResolveDecision)
+        );
+        assert!(MissionAction::ResolveDecision.is_mutating());
         for name in MISSION_ACTIONS {
             let action = MissionAction::from_wire(name).unwrap();
             assert_eq!(action.as_str(), name);
@@ -1076,6 +1163,155 @@ mod tests {
         }
         assert!(MissionAction::from_wire("mission.nope").is_none());
         assert!(MissionAction::from_wire("list").is_none());
+    }
+
+    /// Record one decision through `mission.update`, then close it through
+    /// `mission.resolve-decision` (pi `actions.ts:391-397` @v0.64.0). The receipt is upstream's
+    /// `Resolved decision <id> for mission <id>.` line over the re-rendered mission, and the
+    /// record now carries `resolved`, the trimmed resolution, and a `resolvedAt` stamp.
+    #[test]
+    fn resolve_decision_closes_an_open_decision_and_renders_the_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = mission_id_of(&create(tmp.path(), "Deciding"));
+        let updated = handle_mission_action(
+            MissionAction::Update,
+            &MissionActionParams {
+                mission_id: Some(id.clone()),
+                mission_update: Some(serde_json::json!({
+                    "decisions": [{"title": "Which database?", "recommendation": "postgres"}],
+                })),
+                ..Default::default()
+            },
+            &ctx(tmp.path()),
+        )
+        .unwrap();
+        let decision_id = updated.details["mission"]["decisions"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resolved = handle_mission_action(
+            MissionAction::ResolveDecision,
+            &MissionActionParams {
+                mission_id: Some(id.clone()),
+                id: Some(decision_id.clone()),
+                summary: Some("  postgres, with pgvector  ".to_string()),
+                ..Default::default()
+            },
+            &ctx(tmp.path()),
+        )
+        .unwrap();
+        assert!(
+            resolved.text.starts_with(&format!(
+                "Resolved decision {decision_id} for mission {id}.\n\n"
+            )),
+            "{}",
+            resolved.text
+        );
+        assert!(
+            resolved.text.contains(&format!(
+                "  {decision_id}: resolved — Which database?; resolution: postgres, with pgvector"
+            )),
+            "{}",
+            resolved.text
+        );
+        let decision = &resolved.details["mission"]["decisions"][0];
+        assert_eq!(decision["status"], "resolved");
+        assert_eq!(decision["resolution"], "postgres, with pgvector");
+        assert!(decision["resolvedAt"].is_string());
+        assert_eq!(resolved.details["missionId"], id);
+
+        // `mission.list` carries the open/resolved tally (`actions.ts:361-366` @v0.64.0).
+        let listed = handle_mission_action(
+            MissionAction::List,
+            &MissionActionParams::default(),
+            &ctx(tmp.path()),
+        )
+        .unwrap();
+        assert!(
+            listed.text.ends_with("  decisions: 0 open, 1 resolved"),
+            "{}",
+            listed.text
+        );
+    }
+
+    /// `mission.resolve-decision`'s refusals, each with upstream's verbatim text and in
+    /// upstream's check order (`actions.ts:392-394` @v0.64.0, then `store.ts:498-501`): the
+    /// mission id first, then the decision id through `validateMissionId(params.id, "id")`, then
+    /// the summary guard, then the store's unknown-id and already-resolved refusals. None of
+    /// them silently no-op.
+    #[test]
+    fn resolve_decision_reports_the_exact_upstream_refusals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = mission_id_of(&create(tmp.path(), "Deciding"));
+        let resolve = |mission_id: Option<&str>, decision: Option<&str>, summary: Option<&str>| {
+            handle_mission_action(
+                MissionAction::ResolveDecision,
+                &MissionActionParams {
+                    mission_id: mission_id.map(str::to_string),
+                    id: decision.map(str::to_string),
+                    summary: summary.map(str::to_string),
+                    ..Default::default()
+                },
+                &ctx(tmp.path()),
+            )
+        };
+        assert_eq!(
+            resolve(None, Some("d1"), Some("s"))
+                .unwrap_err()
+                .to_string(),
+            "missionId must be a non-empty string"
+        );
+        assert_eq!(
+            resolve(Some(&id), None, Some("s")).unwrap_err().to_string(),
+            "id must be a non-empty string"
+        );
+        assert_eq!(
+            resolve(Some(&id), Some("../d1"), Some("s"))
+                .unwrap_err()
+                .to_string(),
+            "id must contain only letters, numbers, '.', '_', or '-' and cannot contain '..'"
+        );
+        assert_eq!(
+            resolve(Some(&id), Some("d1"), None)
+                .unwrap_err()
+                .to_string(),
+            "mission.resolve-decision requires a non-empty summary"
+        );
+        assert_eq!(
+            resolve(Some(&id), Some("d1"), Some("   "))
+                .unwrap_err()
+                .to_string(),
+            "mission.resolve-decision requires a non-empty summary"
+        );
+        assert_eq!(
+            resolve(Some(&id), Some("d1"), Some("s"))
+                .unwrap_err()
+                .to_string(),
+            format!("Decision 'd1' was not found in mission '{id}'")
+        );
+
+        let updated = handle_mission_action(
+            MissionAction::Update,
+            &MissionActionParams {
+                mission_id: Some(id.clone()),
+                mission_update: Some(serde_json::json!({ "decisions": [{"title": "Ship?"}] })),
+                ..Default::default()
+            },
+            &ctx(tmp.path()),
+        )
+        .unwrap();
+        let decision_id = updated.details["mission"]["decisions"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        resolve(Some(&id), Some(&decision_id), Some("yes")).unwrap();
+        assert_eq!(
+            resolve(Some(&id), Some(&decision_id), Some("no"))
+                .unwrap_err()
+                .to_string(),
+            format!("Decision '{decision_id}' is already resolved")
+        );
     }
 
     #[test]

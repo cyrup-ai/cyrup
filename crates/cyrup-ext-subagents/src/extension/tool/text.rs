@@ -221,6 +221,10 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     "mission.list",
     "mission.show",
     "mission.update",
+    // SUBA-085 — pi's own position for this verb (`shared/types.ts:2715` @v0.64.0: `…
+    // "mission.update", "mission.resolve-decision", "mission.attach-run", …`). Dispatched by the
+    // `mission.*` arm through `MissionAction::ResolveDecision`.
+    "mission.resolve-decision",
     "mission.attach-run",
     "mission.close",
     "watchdog.status",

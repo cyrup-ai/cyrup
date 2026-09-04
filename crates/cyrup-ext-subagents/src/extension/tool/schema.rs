@@ -710,8 +710,8 @@ mod tests {
                 "list", "get", "models", "guide", "create", "update", "delete", "eject", "disable",
                 "enable", "reset", "status", "grant-spawn-budget", "interrupt", "resume", "steer",
                 "stop", "dismiss", "append-step", "doctor", "mission.create", "mission.list",
-                "mission.show", "mission.update", "mission.attach-run", "mission.close",
-                "watchdog.status", "watchdog.check", "watchdog.configure",
+                "mission.show", "mission.update", "mission.resolve-decision", "mission.attach-run",
+                "mission.close", "watchdog.status", "watchdog.check", "watchdog.configure",
                 "watchdog.recommend-model"
             ],
             "the action enum must be pi's SUBAGENT_ACTIONS in pi's own order, for the verbs cyrup \

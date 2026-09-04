@@ -883,11 +883,12 @@ impl SubagentTool {
             {
                 self.route_watchdog_action(watchdog_action, p, cwd)
             }
-            // The six `mission.*` actions (pi `subagent-executor.ts:4397-4407` @v0.43.0), in the
-            // dispatch position upstream gives them: after the management/control arms, before the
-            // authority-policy arm. `MUTATING_MANAGEMENT_ACTIONS` (`:151`) lists four of the six —
-            // `mission.list`/`mission.show` are read-only — so a child-safe fanout tool refuses
-            // exactly those four, with upstream's own child-safe text (`:4381`).
+            // The seven `mission.*` actions (pi `subagent-executor.ts:5723-5732` @v0.64.0;
+            // `:4397-4407` @v0.43.0 before SUBA-085's `mission.resolve-decision`), in the dispatch
+            // position upstream gives them: after the management/control arms, before the
+            // authority-policy arm. `MUTATING_MANAGEMENT_ACTIONS` (`:197` @v0.64.0) lists five of
+            // the seven — `mission.list`/`mission.show` are read-only — so a child-safe fanout
+            // tool refuses exactly those five, with upstream's own child-safe text.
             mission_action if crate::missions::MissionAction::from_wire(mission_action).is_some() => {
                 let Some(mission_action) = crate::missions::MissionAction::from_wire(mission_action)
                 else {
