@@ -754,14 +754,23 @@ pub fn stop_request_path(run_dir: &Path) -> PathBuf {
     control_inbox_dir(run_dir).join("stop.json")
 }
 
-/// pi `stopRequestFileName` (`control-channel.ts:190-192`): `<ts zero-padded to 13>-<uuid>.json`
-/// — the padding makes a plain name sort a time sort, the uuid keeps two requests written in the
-/// same millisecond (by two parents, or one parent twice) from colliding.
+/// pi `stopRequestFileName` (`control-channel.ts:190-192` @v0.64.0): `<ts zero-padded to
+/// 13>-<uuid>.json` — the padding makes a plain name sort a time sort, the uuid keeps two requests
+/// written in the same millisecond (by two parents, or one parent twice) from colliding.
+///
+/// `[CYRUP-DELTA]` in the uuid version only: pi draws `randomUUID()` (v4), so two requests whose
+/// `ts` ties drain in RANDOM order (`consumeStopRequestPayloads`'s name sort then stable `ts` sort,
+/// `:597`/`:612`). cyrup draws a v7 uuid from the crate's shared monotonic context — same
+/// collision-freedom, but the hex string of a v7 id is time-then-counter ordered, so a name tie on
+/// `ts` resolves to WRITE order within one process instead of a coin toss. Two parents in two
+/// processes still tie arbitrarily, exactly as upstream. (SUBA-087 review fix: the review
+/// reproduced the coin toss as an intermittent order-assertion failure in this module's and
+/// `runner_main`'s stop-request tests.)
 fn stop_request_file_name(request: &StopRequest) -> String {
     format!(
         "{:013}-{}.json",
         request.ts.max(0),
-        uuid::Uuid::new_v4().as_hyphenated()
+        uuid::Uuid::now_v7().as_hyphenated()
     )
 }
 
@@ -3351,6 +3360,37 @@ mod tests {
     /// its own file under `control/stop-requests/`, the legacy `control/stop.json` is still read,
     /// and the drain returns them oldest-`ts`-first; child-scoped and whole-run requests are
     /// consumed by their own consumers and left alone by the other.
+    /// Two (or twenty-four) requests written within the same millisecond tie on the name's
+    /// `ts` prefix, so what decides their drain order is the uuid half of the file name. With a
+    /// random uuid (pi's `randomUUID()`, and this crate's own v4 before the SUBA-087 review fix)
+    /// that order is a coin toss; with a v7 uuid from the crate's monotonic shared context it is
+    /// the write order. This pins the latter: 24 same-`ts` requests drain exactly as written
+    /// (a v4 name passes this with probability 1/24!).
+    #[tokio::test]
+    async fn same_millisecond_stop_requests_drain_in_write_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        const N: usize = 24;
+        for index in 0..N {
+            let mut request =
+                StopRequest::for_child("stop-action", index, Some(format!("step:{index}")));
+            request.ts = 1_700_000_000_000;
+            request_async_stop(&run_dir, request)
+                .await
+                .expect("write child");
+        }
+        let drained = consume_child_stop_requests(&run_dir).await;
+        assert_eq!(
+            drained
+                .iter()
+                .map(|request| request.target_index)
+                .collect::<Vec<_>>(),
+            (0..N).map(Some).collect::<Vec<_>>(),
+            "same-ts requests must drain in the order they were written"
+        );
+        assert!(pending_stop_request_paths(&run_dir).await.is_empty());
+    }
+
     #[tokio::test]
     async fn stop_requests_are_queued_per_file_drained_oldest_first_and_split_by_scope() {
         let dir = tempfile::tempdir().expect("tempdir");

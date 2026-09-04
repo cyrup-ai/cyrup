@@ -4023,7 +4023,18 @@ async fn route_child_stop_requests(
                         requested_at: now,
                     },
                 );
-                let _ = write_shared_status(run_paths, shared).await;
+                // Best effort, as pi's `writeStatusPayload` is (`subagent-runner.ts:2988`): the
+                // in-memory status and the registry already carry the request, and the next
+                // status write republishes it — but a silent miss here would make a `stopping`
+                // that the parent never sees in `status.json` unexplainable, so say so.
+                if let Err(error) = write_shared_status(run_paths, shared).await {
+                    tracing::warn!(
+                        step_index = index,
+                        child_id = %child_id,
+                        %error,
+                        "child-scoped stop accepted but status.json could not be written"
+                    );
+                }
                 append_event(
                     events,
                     "subagent.step.stop_requested",
