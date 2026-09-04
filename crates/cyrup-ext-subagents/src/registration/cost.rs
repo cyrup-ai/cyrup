@@ -1232,6 +1232,9 @@ mod tests {
             nested_run_ids: Vec::new(),
             started_at: Some(0),
             ended_at: Some(1),
+            stop_requested: false,
+            stop_requested_at: None,
+            stopped: false,
             telemetry: crate::background::StepTelemetry::default(),
         }
     }

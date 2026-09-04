@@ -1078,7 +1078,7 @@ mod tests {
             );
         }
         let err = executor
-            .control_stop(dir.path(), Some("fgstop0001"), None)
+            .control_stop(dir.path(), Some("fgstop0001"), None, None)
             .await
             .expect_err("a foreground run is not stoppable");
         assert_eq!(

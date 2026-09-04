@@ -258,7 +258,12 @@ async fn run_fleet_action(
             let fallback = format!("Failed to stop async run {}.", target.run_id);
             super::fleet::action_result_from_control(
                 executor
-                    .control_stop(cwd, Some(target.run_id.as_str()), target.async_dir.to_str())
+                    .control_stop(
+                        cwd,
+                        Some(target.run_id.as_str()),
+                        target.async_dir.to_str(),
+                        None,
+                    )
                     .await,
                 &fallback,
             )

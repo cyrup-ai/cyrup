@@ -450,8 +450,6 @@ async fn a_delivered_stop_request_stops_the_run_and_cascades_to_descendants() {
     let harness = build_run(dir.path(), &roots, "cascadestp1", "childstp1").await;
 
     // Planted through the REAL parent-side primitive, so this covers the writer too.
-    let stop_path =
-        cyrup_ext_subagents::background::control::stop_request_path(&harness.run_paths.run_dir);
     cyrup_ext_subagents::background::control::deliver_stop_request(
         &harness.run_paths.run_dir,
         "stop-action",
@@ -473,7 +471,10 @@ async fn a_delivered_stop_request_stops_the_run_and_cascades_to_descendants() {
 
     // 1. Consumed at most once.
     assert!(
-        !stop_path.exists(),
+        !cyrup_ext_subagents::background::control::has_pending_stop_request(
+            &harness.run_paths.run_dir
+        )
+        .await,
         "the stop request was never consumed — it is still sitting in the inbox"
     );
 

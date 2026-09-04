@@ -89,6 +89,11 @@ use crate::spawn::parallel::GlobalConcurrencyLimit;
 
 use super::atomic::write_atomic_json;
 use super::cascade;
+use super::child_identity::{async_status_child_identity, positional_child_identity};
+use super::child_stop::{
+    ChildStatusWord, ChildStopMarking, ChildStopRecord, ChildStopRegistry, child_status_event,
+    mark_child_stop_requested, mark_child_stopped,
+};
 use super::control::{self, ChainAppendRequest};
 use super::{
     ParallelGroupStatus, ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus, StepState,
@@ -936,6 +941,7 @@ async fn init_control_flags(run_paths: &RunPaths) -> (ControlFlags, cyrup_core::
         interrupted: Arc::clone(&interrupted),
         timed_out: Arc::clone(&timed_out),
         stopped: Arc::clone(&stopped),
+        child_stops: ChildStopRegistry::new(),
     };
     (control_flags, interrupt_cancel)
 }
@@ -1267,6 +1273,13 @@ struct ControlFlags {
     /// `if (stopped || timedOut || interrupted || state !== "running") return` mutual exclusion
     /// (`subagent-runner.ts:2955-2986`).
     stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// SUBA-087 — the CHILD-SCOPED stop registry (pi `childStopRequests` + `activeChildStops`,
+    /// `subagent-runner.ts:2595-2596` @v0.64.0), shared by the watcher task that receives a
+    /// targeted `control/stop-requests/*.json`, the executor that registers each dispatched step's
+    /// stop handle, and the step loop that skips a step whose stop was queued before it started.
+    /// Unlike the three flags it is not a verdict on the RUN: a child-scoped stop leaves the run
+    /// `Running`.
+    child_stops: ChildStopRegistry,
 }
 
 // =================================================================================================
@@ -1450,9 +1463,30 @@ async fn run_inner(
             SubagentError::Spawn(std::io::Error::other("step cursor out of range"))
         })?;
 
+        // SUBA-087 — pi `if (childStopRequests.has(flatIndex)) { results.push(childStopResult(…));
+        // flatIndex++; continue; }` (`subagent-runner.ts:4937-4941` @v0.64.0): a child-scoped stop
+        // that landed while this step was still `pending` (`subagent.step.stop_queued`) is applied
+        // HERE, before dispatch — the step is marked `stopped` without ever spawning a child, and
+        // the loop moves on to the next step. The run itself stays alive.
+        if let Some(record) = io.flags.child_stops.recorded(cursor) {
+            skip_child_stopped_step(&mut io, &steps, cursor, &step, &record, &mut results).await?;
+            cursor += 1;
+            continue;
+        }
+
         // Publish the current flat index BEFORE dispatch so the live-telemetry sink tags this
         // step's child NDJSON lines with the right index (pi `statusPayload.currentStep = flatIndex`).
         current_flat_index.store(cursor, std::sync::atomic::Ordering::SeqCst);
+
+        // SUBA-087 — pi `registerStepStop(flatIndex, stop)` (`subagent-runner.ts:3048-3055`): this
+        // step's OWN stop handle, a child token of the run-wide interrupt token, registered BEFORE
+        // the step is marked `Running` so a child-scoped stop arriving against a `Running` step
+        // always finds a handle to fire. A run-wide interrupt/timeout/stop still cancels it through
+        // the parent; a child-scoped stop cancels it alone. The executor reads it back through
+        // `current_flat_index` when it builds the child's `RunOptions::interrupt`.
+        io.flags
+            .child_stops
+            .register_active(cursor, interrupt_cancel.child_token());
 
         {
             let mut guard = lock_status(status);
@@ -1497,8 +1531,12 @@ async fn run_inner(
         // fan-out inline here). `ChainGraph` is a plain `Vec<RunnerStep>` type alias, so the
         // one-element "graph" is just a fresh one-element `Vec`.
         let one_step: Vec<RunnerStep> = vec![step.clone()];
-        let (step_results, group_results) =
-            walk_chain(&one_step, &mut registry, &executor, &ctx).await?;
+        let walked = walk_chain(&one_step, &mut registry, &executor, &ctx).await;
+        // pi `registerStepStop(flatIndex, undefined)` (`:1102,1162`): the child is gone, whatever
+        // the outcome, so a late child-scoped stop against this index is `stop_failed`, not a
+        // cancel of a token nothing is listening to.
+        io.flags.child_stops.clear_active(cursor);
+        let (step_results, group_results) = walked?;
 
         let step_result = step_results.into_iter().next().ok_or_else(|| {
             SubagentError::Spawn(std::io::Error::other(
@@ -1610,6 +1648,7 @@ fn build_chain_context(
         depth,
         interrupted: Arc::clone(&flags.interrupted),
         interrupt_cancel: interrupt_cancel.clone(),
+        child_stops: Some(flags.child_stops.clone()),
         current_flat_index: Arc::clone(current_flat_index),
         telemetry: Some(telemetry),
         resolved_agents,
@@ -1730,16 +1769,48 @@ async fn check_stop_flag(
                 .reason
                 .clone()
                 .unwrap_or_else(|| control::STOP_MESSAGE.to_string());
-            {
+            let recorded_child_stops = io.flags.child_stops.recorded_indexes();
+            let stopped_children: Vec<(usize, String, String)> = {
                 let mut guard = lock_status(status);
                 let s = &mut *guard;
                 mark_remaining_stopped(s, cursor, steps.len(), &message);
                 refresh_workflow_graph(s, steps);
                 s.touch();
-            }
+                recorded_child_stops
+                    .into_iter()
+                    .map(|(index, record)| {
+                        let agent = s
+                            .steps
+                            .get(index)
+                            .map(|step| step.agent.clone())
+                            .unwrap_or_default();
+                        (index, record.child_id, agent)
+                    })
+                    .collect()
+            };
             write_shared_status(run_paths, status)
                 .await
                 .map_err(SubagentError::Spawn)?;
+            // SUBA-087 — pi `appendTerminalChildStatusEvent` (`subagent-runner.ts:2975-2978`,
+            // called at `:4340` under `stopped || childStopped`): a child whose OWN stop was
+            // recorded gets its terminal `subagent.child-status` `stopped` even when the whole
+            // run stopped first.
+            let now = crate::time::now_epoch_millis();
+            for (index, child_id, agent) in stopped_children {
+                append_event(
+                    events,
+                    "subagent.child-status",
+                    Some(child_status_event(
+                        config.run_id.as_str(),
+                        index,
+                        &child_id,
+                        &agent,
+                        ChildStatusWord::Stopped,
+                        now,
+                    )),
+                )
+                .await;
+            }
             // pi `stopNestedAsyncDescendants()` (`subagent-runner.ts:2984`) — stop the whole
             // subtree, not just this run, or every background run this one spawned keeps going
             // detached and unreachable after the user asked for it to stop.
@@ -1998,10 +2069,32 @@ async fn run_import_async_root(
     Ok(())
 }
 
+/// Which control verb tore a step's child down mid-flight, in pi's precedence
+/// (`subagent-runner.ts:4219-4222,4336` @v0.64.0: `stopped` → `timedOut` → `childStopRequests.has`
+/// → `interrupted`). cyrup drives every verb off one interrupt token (a run-wide verb cancels the
+/// parent, a child-scoped stop cancels the step's child token), so `step_result.interrupted` alone
+/// cannot say which fired; the pending-request files and the child-stop registry can.
+enum MidFlightVerb {
+    /// A whole-run `control/stop-requests/*` is pending — the loop-top stop branch owns the record.
+    RunStop,
+    /// A `control/timeout.json` is pending — the loop-top timeout branch owns the record.
+    RunTimeout,
+    /// SUBA-087 — a child-scoped stop was recorded against THIS step: it ends `Stopped` and the
+    /// run continues (pi `childStopped`, `:4285-4342`).
+    ChildStop(ChildStopRecord),
+    /// A plain interrupt — the run pauses.
+    Interrupt,
+}
+
 /// R-SA-084 mid-flight interrupt (`subagent-runner.ts:1583-1609`): a step whose child was
 /// signalled and torn down mid-flight (the shared `interrupt_cancel` token this run threaded
 /// into `RunOptions::interrupt` fired) is the pause point — the run ends `Paused`, never
 /// `Complete`, even though an interrupted `run_sync` reports a paused-success (exit 0).
+///
+/// SUBA-087: unless the token that fired was this step's OWN child-scoped stop handle, in which
+/// case the step ends [`StepState::Stopped`] with pi's stop message, `subagent.step.stopped` +
+/// `subagent.child-status` are emitted, and the loop ADVANCES exactly as it does past a failed
+/// step (pi `childStopped`, `subagent-runner.ts:4336-4342` @v0.64.0).
 async fn settle_step_result(
     io: &mut TurnLoopIo<'_>,
     steps: &[RunnerStep],
@@ -2014,26 +2107,71 @@ async fn settle_step_result(
     let config = io.config;
     let run_paths = io.run_paths;
     let status = io.status;
-    let events = &mut *io.events;
     let interrupted_mid_flight = step_result.interrupted;
+    // Disambiguate WHICH verb tore this child down, in pi's precedence. Both run-wide verbs are
+    // checked against their FILE rather than their flag so a stale flag can never spin this
+    // loop: only the loop-top branches' own consumption removes those files.
+    //
+    // G77: the STOP inbox is probed before the timeout inbox, for the identical reason and in
+    // pi's identical order (`runs/background/control-channel.ts:653-655`). Returning `Interrupted`
+    // for either would end an explicitly-stopped or timed-out run as a resumable `Paused`.
+    let mid_flight = if interrupted_mid_flight {
+        if control::check_stop_inbox_now(run_paths).await?.is_some() {
+            Some(MidFlightVerb::RunStop)
+        } else if control::check_timeout_inbox_now(run_paths).await?.is_some() {
+            Some(MidFlightVerb::RunTimeout)
+        } else if let Some(record) = io.flags.child_stops.recorded(cursor) {
+            Some(MidFlightVerb::ChildStop(record))
+        } else {
+            Some(MidFlightVerb::Interrupt)
+        }
+    } else {
+        None
+    };
     let step_duration_ms;
+    let mut child_stopped: Option<super::child_stop::ChildStoppedSummary> = None;
     {
         let mut guard = lock_status(status);
         let s = &mut *guard;
         record_step_outcome(s, cursor, &step, &step_result, group_results.first());
-        if interrupted_mid_flight {
-            // `record_step_outcome` marked this step `Complete` (paused-success exits 0);
-            // override it (and every not-yet-run later step) to `Paused` per R-SA-084.
-            if let Some(entry) = s.steps.get_mut(cursor) {
-                entry.status = StepState::Paused;
-                entry.error = None;
+        match &mid_flight {
+            Some(MidFlightVerb::ChildStop(record)) => {
+                // pi `markChildStopped` (`subagent-runner.ts:2992-3010`): `record_step_outcome`
+                // marked this step `Complete` (paused-success exits 0); it is `Stopped`.
+                child_stopped =
+                    mark_child_stopped(s, cursor, Some(record), crate::time::now_epoch_millis());
             }
-            mark_remaining_paused(s, cursor + 1, steps.len());
+            Some(_) => {
+                // `record_step_outcome` marked this step `Complete` (paused-success exits 0);
+                // override it (and every not-yet-run later step) to `Paused` per R-SA-084.
+                if let Some(entry) = s.steps.get_mut(cursor) {
+                    entry.status = StepState::Paused;
+                    entry.error = None;
+                }
+                mark_remaining_paused(s, cursor + 1, steps.len());
+            }
+            None => {}
         }
         step_duration_ms = step_elapsed_ms(s, cursor);
         refresh_workflow_graph(s, steps);
         s.touch();
     }
+    if let Some(summary) = &child_stopped {
+        // pi `subagent-runner.ts:4335-4340`: `subagent.step.stopped` with `exitCode: 1`, then
+        // `appendTerminalChildStatusEvent` → `subagent.child-status` `stopped`.
+        append_child_stopped_events(io.events, config, cursor, summary).await;
+        let mut single = step_result_to_single_result(&step, &step_result);
+        promote_interrupted_results_to_stopped(
+            std::slice::from_mut(&mut single),
+            control::STOP_MESSAGE,
+        );
+        results.push(single);
+        write_shared_status(run_paths, status)
+            .await
+            .map_err(SubagentError::Spawn)?;
+        return Ok(StepDisposition::Advance);
+    }
+    let events = &mut *io.events;
     let event_type = if interrupted_mid_flight {
         "subagent.step.paused"
     } else if step_result.success {
@@ -2059,38 +2197,23 @@ async fn settle_step_result(
         .await
         .map_err(SubagentError::Spawn)?;
 
-    if interrupted_mid_flight {
-        // Disambiguate WHICH verb tore this child down. Both share one cancellation token, so
-        // `step_result.interrupted` is true for a timeout too — and returning `Interrupted`
-        // here would end a timed-out run as a resumable `Paused`, silently swallowing the
-        // deadline. A still-pending `control/timeout.json` means it was the timeout: fall
-        // through to the top of the loop WITHOUT advancing the cursor and let the timeout
-        // branch there produce the terminal record (it re-marks this same step `Failed`,
-        // overwriting the `Paused` marking just applied, since `Paused` is not terminal).
-        // Checked against the file rather than the flag so a stale flag can never spin this
-        // loop: only this branch's own consumption removes the file.
-        //
-        // G77: the STOP inbox is probed before the timeout inbox, for the identical reason and
-        // in pi's identical order (`runs/background/control-channel.ts:653-655`). All THREE verbs share the one
-        // cancellation token, so `step_result.interrupted` is equally true for a stop — and
-        // returning `Interrupted` here would end an explicitly-stopped run as a resumable
-        // `Paused`, which is exactly the bug this gap is about. Falling through without
-        // advancing the cursor lets the loop-top stop branch produce the terminal record; it
-        // re-marks this same step `Stopped`, overwriting the `Paused` marking just applied,
-        // because `Paused` is not terminal.
-        if control::check_stop_inbox_now(run_paths).await?.is_some() {
+    match mid_flight {
+        // Fall through to the top of the loop WITHOUT advancing the cursor and let the stop /
+        // timeout branch there produce the terminal record (it re-marks this same step, since
+        // `Paused` is not terminal).
+        Some(MidFlightVerb::RunStop | MidFlightVerb::RunTimeout) => {
             return Ok(StepDisposition::Requeue);
         }
-        if control::check_timeout_inbox_now(run_paths).await?.is_some() {
-            return Ok(StepDisposition::Requeue);
+        Some(MidFlightVerb::Interrupt) => {
+            // Consume the interrupt request file (idempotent) so it is not left dangling on the
+            // run dir, then end the run `Paused` — the child was already torn down mid-flight.
+            let _ = control::consume_interrupt_request(run_paths).await;
+            cascade_to_descendants(io.roots, config, events, cascade::CascadeVerb::Interrupt).await;
+            return Ok(StepDisposition::Finish(LoopOutcome::Interrupted {
+                results: std::mem::take(results),
+            }));
         }
-        // Consume the interrupt request file (idempotent) so it is not left dangling on the run
-        // dir, then end the run `Paused` — the child was already torn down mid-flight.
-        let _ = control::consume_interrupt_request(run_paths).await;
-        cascade_to_descendants(io.roots, config, events, cascade::CascadeVerb::Interrupt).await;
-        return Ok(StepDisposition::Finish(LoopOutcome::Interrupted {
-            results: std::mem::take(results),
-        }));
+        Some(MidFlightVerb::ChildStop(_)) | None => {}
     }
 
     // A step whose child was killed by the wall clock means the RUN-WIDE deadline
@@ -2245,6 +2368,8 @@ fn mark_remaining_stopped(status: &mut RunStatus, from_index: usize, total: usiz
         {
             step.status = StepState::Stopped;
             step.error = Some(message.to_string());
+            // SUBA-087 — pi `step.stopped = true` (`subagent-runner.ts:3842` @v0.64.0).
+            step.stopped = true;
             step.ended_at.get_or_insert(now);
         }
     }
@@ -2255,12 +2380,108 @@ fn mark_remaining_stopped(status: &mut RunStatus, from_index: usize, total: usiz
                     if !child.status.is_terminal() {
                         child.status = StepState::Stopped;
                         child.error = Some(message.to_string());
+                        child.stopped = true;
                         child.ended_at.get_or_insert(now);
                     }
                 }
             }
         }
     }
+}
+
+/// SUBA-087 — pi's sequential-branch `childStopResult` (`subagent-runner.ts:3011-3014,4937-4941`
+/// @v0.64.0): the step at `cursor` had a child-scoped stop queued against it before it was
+/// dispatched, so it is marked `stopped` WITHOUT spawning a child, its stopped result is recorded
+/// (`stoppedStepResult`, `:3182-3190`: output/error = the stop message, `exitCode: 1`, `stopped`),
+/// and the events are appended.
+async fn skip_child_stopped_step(
+    io: &mut TurnLoopIo<'_>,
+    steps: &[RunnerStep],
+    cursor: usize,
+    step: &RunnerStep,
+    record: &ChildStopRecord,
+    results: &mut Vec<SingleResult>,
+) -> Result<(), SubagentError> {
+    let config = io.config;
+    let run_paths = io.run_paths;
+    let status = io.status;
+    let summary = {
+        let mut guard = lock_status(status);
+        let s = &mut *guard;
+        let summary = mark_child_stopped(s, cursor, Some(record), crate::time::now_epoch_millis());
+        refresh_workflow_graph(s, steps);
+        s.touch();
+        summary
+    };
+    write_shared_status(run_paths, status)
+        .await
+        .map_err(SubagentError::Spawn)?;
+    if let Some(summary) = &summary {
+        append_child_stopped_events(io.events, config, cursor, summary).await;
+    }
+    results.push(stopped_single_result(step));
+    Ok(())
+}
+
+/// pi `stoppedStepResult` (`subagent-runner.ts:3182-3190`) as a [`SingleResult`]: the stop message
+/// as both output and error, `exitCode: 1`, `stopped: true`, nothing interrupted or timed out.
+fn stopped_single_result(step: &RunnerStep) -> SingleResult {
+    let message = control::STOP_MESSAGE.to_string();
+    let mut single = step_result_to_single_result(
+        step,
+        &StepResult {
+            success: false,
+            structured_output: None,
+            final_output: Some(message.clone()),
+            error: Some(message),
+            interrupted: false,
+            control_events: Vec::new(),
+            exit_code: Some(1),
+            timed_out: false,
+            saved_output_path: None,
+            artifact_paths: None,
+        },
+    );
+    single.exit_code = 1;
+    single.stopped = true;
+    single
+}
+
+/// The two lines pi appends when a child-stopped step settles — `subagent.step.stopped`
+/// (`subagent-runner.ts:3008`/`:4335-4339`: `exitCode: 1`, `durationMs`) and the terminal
+/// `subagent.child-status` `stopped` (`appendTerminalChildStatusEvent`, `:2975-2978`).
+async fn append_child_stopped_events(
+    events: &mut Option<BoundedJsonlWriter>,
+    config: &RunnerConfig,
+    index: usize,
+    summary: &super::child_stop::ChildStoppedSummary,
+) {
+    append_event(
+        events,
+        "subagent.step.stopped",
+        Some(serde_json::json!({
+            "runId": config.run_id.as_str(),
+            "stepIndex": index,
+            "childId": summary.child_id,
+            "agent": summary.agent,
+            "exitCode": 1,
+            "durationMs": summary.duration_ms,
+        })),
+    )
+    .await;
+    append_event(
+        events,
+        "subagent.child-status",
+        Some(child_status_event(
+            config.run_id.as_str(),
+            index,
+            &summary.child_id,
+            &summary.agent,
+            ChildStatusWord::Stopped,
+            crate::time::now_epoch_millis(),
+        )),
+    )
+    .await;
 }
 
 /// Deliver `verb` to every live nested async descendant of this run, logging each failed delivery
@@ -2525,6 +2746,11 @@ pub(crate) struct ExecSingleStepExecutor {
     /// down mid-flight via `exec::run_sync`'s own `opts.interrupt` race, not merely noticed between
     /// steps. For a foreground executor (no control-inbox watcher) this token is never cancelled.
     pub(crate) interrupt_cancel: cyrup_core::CancelToken,
+    /// SUBA-087 — the run's child-scoped stop registry (`ControlFlags::child_stops`), through which
+    /// each dispatched step's OWN stop handle (registered by `run_inner` under the step's flat
+    /// index) is read back as that child's `RunOptions::interrupt`. `None` for a foreground
+    /// executor, which has no control inbox and no child-scoped stops.
+    pub(crate) child_stops: Option<ChildStopRegistry>,
     /// In-process binary override applied to every step this executor dispatches, mirroring
     /// [`RunOptions::spawn_command`]. `Some` only on the FOREGROUND chain/parallel walk, which is
     /// constructed where the extension config is in hand; `None` on the background and detached
@@ -2714,6 +2940,8 @@ impl ExecSingleStepExecutor {
             // A foreground executor has no control-inbox watcher, so this token is never cancelled;
             // foreground cancellation flows through `ChainRunContext::cancel`/`RunOptions::cancel`.
             interrupt_cancel: cyrup_core::CancelToken::new(),
+            // SUBA-087: no control inbox → no child-scoped stops on the foreground walk.
+            child_stops: None,
             current_flat_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             telemetry: None,
             orchestrator_intercom_target,
@@ -2975,7 +3203,22 @@ impl ExecSingleStepExecutor {
         // `run_sync`'s `opts.interrupt` race — not merely gets noticed between steps. Previously a
         // fresh per-step token was cancelled only if an interrupt had ALREADY landed at dispatch
         // time, so interrupting a single-step run was a total no-op (the child ran to completion).
-        let interrupt_token = self.interrupt_cancel.clone();
+        //
+        // SUBA-087: when `run_inner` registered a per-step stop handle for the step being
+        // dispatched (a child token of that same run-wide token), THAT is the child's interrupt
+        // token, so a child-scoped stop cancels this child alone while every run-wide verb still
+        // reaches it through the parent (pi hands `runSubagentProcess` both `stopSignal` and
+        // `registerStop`, `subagent-runner.ts:4268-4270`).
+        let interrupt_token = self
+            .child_stops
+            .as_ref()
+            .and_then(|registry| {
+                registry.active_token(
+                    self.current_flat_index
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                )
+            })
+            .unwrap_or_else(|| self.interrupt_cancel.clone());
         if self.interrupted.load(std::sync::atomic::Ordering::SeqCst) {
             interrupt_token.cancel();
         }
@@ -3446,6 +3689,7 @@ fn spawn_control_watcher(
         interrupted,
         timed_out,
         stopped,
+        child_stops,
     } = flags;
     let handle = tokio::spawn(async move {
         // G90: the steer queue's own `events.jsonl` writer. A second `BoundedJsonlWriter` on the
@@ -3498,6 +3742,9 @@ fn spawn_control_watcher(
             // keep running, so it must be handed over before an interrupt landing in the same tick
             // tears that child down.
             route_steer_requests(&run_paths, &shared_status, &mut events, &mut pending).await;
+            // SUBA-087: child-scoped stops are routed here too — they tear ONE child down and
+            // must never flip the run-wide `stopped` flag probed just below.
+            route_child_stop_requests(&run_paths, &shared_status, &mut events, &child_stops).await;
             // The control inbox now holds TWO distinct request files (`interrupt.json` and
             // `timeout.json`), so a notification is no longer self-describing: this task must ask
             // WHICH one is pending rather than blindly assuming "interrupt". Blindly setting
@@ -3696,6 +3943,117 @@ async fn route_steer_requests(
 
     if status_dirty {
         let _ = write_shared_status(run_paths, shared).await;
+    }
+}
+
+/// SUBA-087 — the runner's child-scoped stop router, pi `stopChildStep` as `watchAsyncControlInbox`'s
+/// `onStop` (`subagent-runner.ts:3015-3031,3900` @v0.64.0; drained at
+/// `runs/background/control-channel.ts:690`).
+///
+/// One tick: consume every `control/stop-requests/*.json` that carries a `targetIndex` (whole-run
+/// requests are left for the loop-top stop branch), oldest first, and for each:
+///
+/// * `childId` defaults to the step's own identity (`request.childId ??
+///   childStopTargetId(request.targetIndex)`, `:3020`);
+/// * `markChildStopRequested` gates on pending/running (`:2979-2991`) — a refusal is
+///   `subagent.step.stop_failed` with `Child is not pending or running.` (`:3023`);
+/// * an accepted request is recorded, the step's `stopRequested`/`stopRequestedAt` written, and
+///   `subagent.step.stop_requested` + `subagent.child-status` `stopping` appended (`:2988-2989`);
+/// * the live child's stop handle fires if there is one, else a still-`pending` step gets
+///   `subagent.step.stop_queued` (`:3026-3030`) and the loop applies it at dispatch.
+async fn route_child_stop_requests(
+    run_paths: &RunPaths,
+    shared: &SharedStatus,
+    events: &mut Option<BoundedJsonlWriter>,
+    registry: &ChildStopRegistry,
+) {
+    let requests = control::consume_child_stop_requests(&run_paths.run_dir).await;
+    if requests.is_empty() {
+        return;
+    }
+    let run_id = run_id_from_paths(run_paths);
+    for request in requests {
+        let Some(index) = request.target_index else {
+            continue;
+        };
+        let now = crate::time::now_epoch_millis();
+        let (child_id, marking) = {
+            let mut status = lock_status(shared);
+            let child_id = request.child_id.clone().unwrap_or_else(|| {
+                status
+                    .steps
+                    .get(index)
+                    .map(|step| async_status_child_identity(step, index))
+                    .unwrap_or_else(|| positional_child_identity(index))
+            });
+            let marking = mark_child_stop_requested(&mut status, index, &child_id, now);
+            (child_id, marking)
+        };
+        match marking {
+            ChildStopMarking::NotStoppable => {
+                append_event(
+                    events,
+                    "subagent.step.stop_failed",
+                    Some(serde_json::json!({
+                        "runId": run_id.as_str(),
+                        "stepIndex": index,
+                        "childId": child_id,
+                        "message": "Child is not pending or running.",
+                    })),
+                )
+                .await;
+            }
+            ChildStopMarking::Requested {
+                child_id,
+                agent,
+                was_pending,
+            } => {
+                registry.record(
+                    index,
+                    ChildStopRecord {
+                        child_id: child_id.clone(),
+                        requested_at: now,
+                    },
+                );
+                let _ = write_shared_status(run_paths, shared).await;
+                append_event(
+                    events,
+                    "subagent.step.stop_requested",
+                    Some(serde_json::json!({
+                        "runId": run_id.as_str(),
+                        "stepIndex": index,
+                        "childId": child_id,
+                        "agent": agent,
+                    })),
+                )
+                .await;
+                append_event(
+                    events,
+                    "subagent.child-status",
+                    Some(child_status_event(
+                        run_id.as_str(),
+                        index,
+                        &child_id,
+                        &agent,
+                        ChildStatusWord::Stopping,
+                        now,
+                    )),
+                )
+                .await;
+                if !registry.cancel_active(index) && was_pending {
+                    append_event(
+                        events,
+                        "subagent.step.stop_queued",
+                        Some(serde_json::json!({
+                            "runId": run_id.as_str(),
+                            "stepIndex": index,
+                            "childId": child_id,
+                        })),
+                    )
+                    .await;
+                }
+            }
+        }
     }
 }
 
@@ -4020,6 +4378,119 @@ mod tests {
         (paths, Arc::new(std::sync::Mutex::new(status)))
     }
 
+    /// SUBA-087 — pi `stopChildStep` (`subagent-runner.ts:3015-3031` @v0.64.0) driven as the full
+    /// lifecycle: parent writes a targeted request → router gates and records → status stamps +
+    /// `events.jsonl` + the live child's handle fires; a `pending` target is queued and its handle
+    /// fires at registration; a terminal target is `stop_failed`. The run-wide `stopped` flag is
+    /// never involved.
+    ///
+    /// Fails at the parent commit by construction (`StopRequest` had no `target_index`).
+    #[tokio::test]
+    async fn child_scoped_stop_requests_are_routed_to_one_step_and_never_the_whole_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a", "b", "c"], &[1]);
+        {
+            let mut status = lock_status(&shared);
+            status.steps[0].status = StepState::Complete;
+        }
+        let registry = ChildStopRegistry::new();
+        let live = cyrup_core::CancelToken::new();
+        registry.register_active(1, live.clone());
+
+        // Three parent-side writes: a terminal target, the running target, and a pending target.
+        for index in [0usize, 1, 2] {
+            control::deliver_child_stop_request(&paths.run_dir, "stop-action", index, None)
+                .await
+                .expect("parent write");
+        }
+
+        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        route_child_stop_requests(&paths, &shared, &mut events, &registry).await;
+        drop(events);
+
+        // The running child's handle fired; the run itself was not asked to stop.
+        assert!(live.is_cancelled(), "the targeted live child is torn down");
+        assert!(
+            control::check_stop_inbox_now(&paths)
+                .await
+                .expect("probe")
+                .is_none(),
+            "no whole-run request exists or was left behind"
+        );
+        assert!(
+            !control::has_pending_stop_request(&paths.run_dir).await,
+            "every child-scoped request was consumed"
+        );
+
+        // Status: step 1 and step 2 carry the request stamps; step 0 is untouched.
+        {
+            let status = lock_status(&shared);
+            assert!(!status.steps[0].stop_requested);
+            assert!(status.steps[1].stop_requested);
+            assert!(status.steps[1].stop_requested_at.is_some());
+            assert_eq!(
+                status.steps[1].status,
+                StepState::Running,
+                "not yet settled"
+            );
+            assert!(status.steps[2].stop_requested);
+            assert_eq!(status.state, RunState::Running, "the run stays alive");
+        }
+        // Registry: 1 and 2 recorded with their positional identities; 0 refused.
+        assert!(!registry.is_requested(0));
+        assert_eq!(
+            registry.recorded(1).map(|r| r.child_id),
+            Some("step:1".to_string())
+        );
+        assert!(registry.is_requested(2));
+        // A handle registered for the QUEUED step fires immediately (pi `registerStepStop`).
+        let late = cyrup_core::CancelToken::new();
+        registry.register_active(2, late.clone());
+        assert!(late.is_cancelled());
+
+        // events.jsonl carries pi's event types with the step index and child id.
+        let text = tokio::fs::read_to_string(&paths.events)
+            .await
+            .expect("events.jsonl");
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let of = |kind: &str| -> Vec<&serde_json::Value> {
+            events.iter().filter(|e| e["type"] == kind).collect()
+        };
+        let failed = of("subagent.step.stop_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["stepIndex"], 0);
+        assert_eq!(failed[0]["childId"], "step:0");
+        assert_eq!(failed[0]["message"], "Child is not pending or running.");
+        let requested = of("subagent.step.stop_requested");
+        assert_eq!(
+            requested
+                .iter()
+                .map(|e| (
+                    e["stepIndex"].as_u64(),
+                    e["childId"].as_str(),
+                    e["agent"].as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(1), Some("step:1"), Some("b")),
+                (Some(2), Some("step:2"), Some("c"))
+            ]
+        );
+        let stopping = of("subagent.child-status");
+        assert_eq!(stopping.len(), 2);
+        assert_eq!(stopping[0]["status"], "stopping");
+        assert_eq!(stopping[0]["version"], 1);
+        assert_eq!(stopping[0]["source"], "async");
+        assert_eq!(stopping[0]["reason"], "user");
+        let queued = of("subagent.step.stop_queued");
+        assert_eq!(queued.len(), 1, "only the PENDING target is queued");
+        assert_eq!(queued[0]["stepIndex"], 2);
+        assert!(of("subagent.run.stopped").is_empty());
+    }
+
     /// G90, the runner's two halves must address the SAME directory.
     ///
     /// `route_steer_requests` writes an accepted request into
@@ -4059,6 +4530,7 @@ mod tests {
             },
             interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             interrupt_cancel: cyrup_core::CancelToken::new(),
+            child_stops: None,
             current_flat_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             telemetry: None,
             share: None,
@@ -4349,6 +4821,7 @@ mod tests {
             },
             interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             interrupt_cancel: cyrup_core::CancelToken::new(),
+            child_stops: None,
             current_flat_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             telemetry: None,
             share: None,

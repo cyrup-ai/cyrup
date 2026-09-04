@@ -634,10 +634,24 @@ pub struct StopRequest {
     pub source: String,
     /// Optional human-readable reason.
     pub reason: Option<String>,
+    /// SUBA-087 — pi `targetIndex?: number` (`runs/background/control-channel.ts:59` @v0.64.0):
+    /// when present, this is a CHILD-SCOPED stop addressed at `steps[targetIndex]` only, and the
+    /// runner keeps the run alive (`stopChildStep`, `subagent-runner.ts:3015-3031`); when absent
+    /// the request stops the whole run (`stopRunner`). Bounded to `0..=1_000_000` on both the
+    /// write (`assertChildIndex`, `:175-177`) and the read (`parseStopRequest`, `:557`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_index: Option<usize>,
+    /// SUBA-087 — pi `childId?: string` (`control-channel.ts:60`): the stable child identity the
+    /// caller named (see [`crate::background::child_identity`]), echoed by the runner on every
+    /// event about that child. Validated by [`validate_stop_child_id`] on write and dropped on
+    /// read when invalid (`:558`); the runner derives one from `target_index` when absent
+    /// (`:3020`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_id: Option<String>,
 }
 
 impl StopRequest {
-    /// Constructs a fresh stop request stamped with the current wall-clock time.
+    /// Constructs a fresh WHOLE-RUN stop request stamped with the current wall-clock time.
     #[must_use]
     pub fn new(source: impl Into<String>, reason: Option<String>) -> Self {
         Self {
@@ -645,48 +659,169 @@ impl StopRequest {
             ts: crate::time::now_epoch_millis(),
             source: source.into(),
             reason,
+            target_index: None,
+            child_id: None,
         }
+    }
+
+    /// SUBA-087 — a CHILD-SCOPED stop request for `steps[target_index]`, carrying the identity
+    /// the caller named (pi `deliverStopRequest({targetIndex: child?.index, childId: child?.id ??
+    /// childId})`, `async-stop-action.ts:68`).
+    #[must_use]
+    pub fn for_child(
+        source: impl Into<String>,
+        target_index: usize,
+        child_id: Option<String>,
+    ) -> Self {
+        Self {
+            target_index: Some(target_index),
+            child_id,
+            ..Self::new(source, None)
+        }
+    }
+
+    /// `true` when this request names one child rather than the whole run (pi
+    /// `request.targetIndex !== undefined`, `subagent-runner.ts:3016`).
+    #[must_use]
+    pub fn is_child_scoped(&self) -> bool {
+        self.target_index.is_some()
     }
 }
 
-/// `<run_dir>/control/stop.json` (pi `stopRequestPath`, `runs/background/control-channel.ts:123-125` @v0.43.0).
+/// SUBA-087 — pi `MAX` on `assertChildIndex` (`control-channel.ts:176`): the largest
+/// `targetIndex` a stop request may carry.
+pub const MAX_STOP_TARGET_INDEX: usize = 1_000_000;
+
+/// SUBA-087 — the longest `childId` a stop request may carry (`validStopChildId`,
+/// `control-channel.ts:182`; the schema's `maxLength: 256`, `extension/schemas.ts:306`).
+pub const MAX_STOP_CHILD_ID_LENGTH: usize = 256;
+
+/// pi `validStopChildId` (`runs/background/control-channel.ts:179-184` @v0.64.0): a non-blank
+/// string of at most [`MAX_STOP_CHILD_ID_LENGTH`] characters containing no CR/LF.
+#[must_use]
+pub fn is_valid_stop_child_id(child_id: &str) -> bool {
+    !child_id.trim().is_empty()
+        && child_id.chars().count() <= MAX_STOP_CHILD_ID_LENGTH
+        && !child_id.contains(['\r', '\n'])
+}
+
+/// [`is_valid_stop_child_id`] as a guard, refusing with upstream's exact sentence
+/// (`requestAsyncStop`, `control-channel.ts:303-305`).
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Management`] with `stop childId must be a non-empty string without
+/// newlines and at most 256 characters.` when the id is invalid.
+pub fn validate_stop_child_id(child_id: &str) -> Result<(), SubagentError> {
+    if is_valid_stop_child_id(child_id) {
+        Ok(())
+    } else {
+        Err(SubagentError::Management(
+            "stop childId must be a non-empty string without newlines and at most 256 characters."
+                .to_string(),
+        ))
+    }
+}
+
+/// pi `assertChildIndex` (`control-channel.ts:175-177`) for the half of its guard `usize` cannot
+/// rule out by type: the upper bound.
+fn validate_stop_target_index(index: usize) -> Result<(), SubagentError> {
+    if index <= MAX_STOP_TARGET_INDEX {
+        Ok(())
+    } else {
+        Err(SubagentError::Management(
+            "child index must be a non-negative integer.".to_string(),
+        ))
+    }
+}
+
+/// SUBA-087 — `<run_dir>/control/stop-requests/` (pi `stopRequestsDir`, `STOP_REQUESTS_DIR =
+/// "stop-requests"`, `runs/background/control-channel.ts:98` @v0.64.0): the directory every stop
+/// request is written into as its own file, so several child-scoped stops can be in flight at once
+/// without overwriting each other — the same queue-not-flag shape [`steer_requests_dir`] has, and
+/// for the same reason. Before v0.57.0 the whole channel was the single [`stop_request_path`] file.
+#[must_use]
+pub fn stop_requests_dir(run_dir: &Path) -> PathBuf {
+    control_inbox_dir(run_dir).join("stop-requests")
+}
+
+/// `<run_dir>/control/stop.json` — the LEGACY single-file stop request (pi `stopRequestPath`,
+/// `runs/background/control-channel.ts:123-125` @v0.43.0). Nothing writes here any more; it is
+/// still READ by every drain (pi `consumeStopRequestPayloads`'s `legacyPath` branch,
+/// `control-channel.ts:607-611` @v0.64.0) so a request planted by an older parent is honoured.
 #[must_use]
 pub fn stop_request_path(run_dir: &Path) -> PathBuf {
     control_inbox_dir(run_dir).join("stop.json")
 }
 
+/// pi `stopRequestFileName` (`control-channel.ts:190-192`): `<ts zero-padded to 13>-<uuid>.json`
+/// — the padding makes a plain name sort a time sort, the uuid keeps two requests written in the
+/// same millisecond (by two parents, or one parent twice) from colliding.
+fn stop_request_file_name(request: &StopRequest) -> String {
+    format!(
+        "{:013}-{}.json",
+        request.ts.max(0),
+        uuid::Uuid::new_v4().as_hyphenated()
+    )
+}
+
 /// The observable outcome of one [`stop`] call — pi `stopAsyncRun`
-/// (`runs/foreground/async-stop-action.ts:23-64` @v0.43.0) returns an `AgentToolResult` whose
-/// `isError` flag and text encode exactly these three cases; this enum is that trichotomy, with the
-/// user-facing prose left to the caller so the tool-result shaping stays in `extension.rs`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// (`runs/foreground/async-stop-action.ts:24-86` @v0.64.0) returns an `AgentToolResult` whose
+/// `isError` flag and text encode exactly these cases; this enum is that set, with the
+/// user-facing prose left to the caller so the tool-result shaping stays in the executor.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopOutcome {
-    /// A [`StopRequest`] file was written into the target's control inbox (pi's `"Stop requested
-    /// for async run {id}."` success result, `async-stop-action.ts:53-56`).
+    /// A whole-run [`StopRequest`] was written into the target's control inbox (pi's `"Stop
+    /// requested for async run {id}."` success result, `async-stop-action.ts:75`).
     Requested,
+    /// SUBA-087 — a child-scoped [`StopRequest`] was written (pi's `"Stop requested for child
+    /// {child.id} in async run {id}."`, `:75`). Carries the RESOLVED identity, which is what the
+    /// receipt names (`child.id`, not the caller's spelling).
+    ChildRequested {
+        /// The resolved child's canonical identity.
+        child_id: String,
+    },
     /// The reconciled status is neither `Running` nor `Queued` — pi's
     /// `if (!status || (status.state !== "running" && status.state !== "queued"))` guard
     /// (`async-stop-action.ts:41`), whose message is `"No running or queued async run was found for
     /// '{id}'."` and whose `isError` is `true`. Note this makes a stop of an already-`Paused` run an
     /// ERROR upstream, not a silent no-op the way a duplicate `interrupt` is.
     NotStoppable,
+    /// SUBA-087 — `childId` named no child, or more than one (pi `if (!resolution.ok) return {
+    /// text: resolution.message, isError: true }`, `:51-57`). Carries the resolver's own sentence.
+    ChildUnresolved(String),
+    /// SUBA-087 — the child resolved but is not `pending`/`running` (pi
+    /// `!isStoppableAsyncStatusStep(child.step)`, `:59-65`). The caller renders `Child '{childId}'
+    /// in async run '{runId}' is {status}; stop only supports pending or running children.` from
+    /// the two facts carried here plus the caller's own spelling of the id.
+    ChildNotStoppable {
+        /// The run id the status carries (pi `status.runId`).
+        run_id: String,
+        /// The child's step state, rendered with `run_status::step_state_label`.
+        state: StepState,
+    },
 }
 
-/// Delivers a stop request against the run identified by `run_id_token` (G77; pi `stopAsyncRun`,
-/// `runs/foreground/async-stop-action.ts:23-64` @v0.43.0).
+/// Delivers a stop request against the run identified by `run_id_token` (G77 / SUBA-087; pi
+/// `stopAsyncRun`, `runs/foreground/async-stop-action.ts:24-86` @v0.64.0).
 ///
 /// Runs the same R-SA-079 reconciliation gate every other control op runs (upstream's own first act
-/// is `reconcileAsyncRun(target.asyncDir, { kill }).status`, `:39`), then applies upstream's
+/// is `reconcileAsyncRun(target.asyncDir, { kill }).status`, `:33`), then applies upstream's
 /// actionability guard verbatim: only a `Running` or `Queued` run may be stopped. Unlike
-/// [`interrupt`] there is no already-pending short-circuit — upstream writes the request
-/// unconditionally via `writeAtomicJson` (`runs/background/control-channel.ts:287-288`), which is idempotent by
-/// construction because the request is a single well-known path whose mere existence is the state.
+/// [`interrupt`] there is no already-pending short-circuit — upstream writes a fresh request file
+/// unconditionally via `writeAtomicJson` (`runs/background/control-channel.ts:306-308`).
+///
+/// With `child_id` (SUBA-087, `:48-66`), the child is resolved against the reconciled status
+/// ([`crate::background::child_identity::resolve_async_status_child`]) and gated on
+/// pending/running BEFORE anything is written; the request then carries the resolved index and
+/// identity (`deliverStopRequest({targetIndex: child?.index, childId: child?.id ?? childId})`,
+/// `:68`).
 ///
 /// # Errors
 ///
 /// Returns [`SubagentError::UnsafePathToken`] if `run_id_token` is unsafe, or an I/O error
 /// (wrapped in [`SubagentError::Spawn`]) if the reconciliation read or the request write fails —
-/// upstream's own `catch` around `deliverStopRequest` (`:58-63`) surfaces the same class of failure
+/// upstream's own `catch` around `deliverStopRequest` (`:78-84`) surfaces the same class of failure
 /// as `"Failed to stop async run {id}: {message}"`.
 pub async fn stop(
     async_root: &Path,
@@ -694,6 +829,7 @@ pub async fn stop(
     run_id_token: &str,
     source: impl Into<String>,
     reason: Option<String>,
+    child_id: Option<&str>,
 ) -> Result<StopOutcome, SubagentError> {
     let paths = resolve_run_paths(async_root, results_dir, run_id_token)?;
     let status = match reconcile_before_control_op(&paths).await {
@@ -713,8 +849,29 @@ pub async fn stop(
         return Ok(StopOutcome::NotStoppable);
     }
 
-    deliver_stop_request(&paths.run_dir, source, reason).await?;
-    Ok(StopOutcome::Requested)
+    let Some(child_id) = child_id else {
+        deliver_stop_request(&paths.run_dir, source, reason).await?;
+        return Ok(StopOutcome::Requested);
+    };
+
+    use super::child_identity::{AsyncStatusChildResolution, resolve_async_status_child};
+    let child = match resolve_async_status_child(&status, child_id) {
+        AsyncStatusChildResolution::Resolved(child) => child,
+        AsyncStatusChildResolution::NotFound(message)
+        | AsyncStatusChildResolution::Ambiguous(message) => {
+            return Ok(StopOutcome::ChildUnresolved(message));
+        }
+    };
+    if !super::child_identity::is_stoppable_step_state(child.state) {
+        return Ok(StopOutcome::ChildNotStoppable {
+            run_id: status.run_id.as_str().to_string(),
+            state: child.state,
+        });
+    }
+    let mut request = StopRequest::for_child(source, child.index, Some(child.id.clone()));
+    request.reason = reason;
+    request_async_stop(&paths.run_dir, request).await?;
+    Ok(StopOutcome::ChildRequested { child_id: child.id })
 }
 
 /// Parent side, addressed by run DIRECTORY: atomically write an [`InterruptRequest`] into
@@ -765,27 +922,69 @@ pub async fn deliver_timeout_request(
     Ok(path)
 }
 
-/// Parent side, addressed by run DIRECTORY: atomically write a [`StopRequest`] into `run_dir`'s
-/// control inbox (G77; pi `deliverStopRequest` → `requestAsyncStop`, `runs/background/control-channel.ts:281-290,
-/// 593-601` @v0.43.0).
+/// Parent side, addressed by run DIRECTORY: atomically write a WHOLE-RUN [`StopRequest`] into
+/// `run_dir`'s stop-request queue (G77; pi `deliverStopRequest` → `requestAsyncStop`,
+/// `runs/background/control-channel.ts:297-310,642-653` @v0.64.0).
 ///
 /// Like [`deliver_timeout_request`] and unlike [`deliver_interrupt_request`], this sends **no**
 /// wake-up signal — upstream's `deliverStopRequest` accepts a `pid`/`kill` pair in its input shape
-/// but its whole body is `requestAsyncStop(input.asyncDir, …)` (`runs/background/control-channel.ts:600`); the file
-/// inbox is the entire channel. The runner's own poll/watch tick picks it up and `stopRunner`
-/// aborts the live children from inside.
+/// but its whole body is `requestAsyncStop(input.asyncDir, …)` (`:652`); the file inbox is the
+/// entire channel. The runner's own poll/watch tick picks it up and `stopRunner` aborts the live
+/// children from inside.
 ///
 /// # Errors
 ///
-/// Returns [`SubagentError::Spawn`] if the control directory cannot be created or the request
-/// cannot be written.
+/// Returns [`SubagentError::Spawn`] if the directory cannot be created or the request cannot be
+/// written.
 pub async fn deliver_stop_request(
     run_dir: &Path,
     source: impl Into<String>,
     reason: Option<String>,
 ) -> Result<PathBuf, SubagentError> {
-    let path = stop_request_path(run_dir);
-    write_control_request(&path, &StopRequest::new(source, reason)).await?;
+    request_async_stop(run_dir, StopRequest::new(source, reason)).await
+}
+
+/// SUBA-087 — [`deliver_stop_request`]'s CHILD-SCOPED sibling: one request addressed at
+/// `steps[target_index]`, carrying the caller's identity when it has one (pi `deliverStopRequest`
+/// with `targetIndex`/`childId`, `control-channel.ts:642-653`). The stop gate and identity
+/// resolution are [`stop`]'s job; this is the raw writer the runner tests and the cascade use.
+///
+/// # Errors
+///
+/// As [`request_async_stop`].
+pub async fn deliver_child_stop_request(
+    run_dir: &Path,
+    source: impl Into<String>,
+    target_index: usize,
+    child_id: Option<String>,
+) -> Result<PathBuf, SubagentError> {
+    request_async_stop(
+        run_dir,
+        StopRequest::for_child(source, target_index, child_id),
+    )
+    .await
+}
+
+/// pi `requestAsyncStop` (`runs/background/control-channel.ts:297-310` @v0.64.0): validate the
+/// targeting (`assertChildIndex`, `validStopChildId`), then write the request as its OWN file
+/// under [`stop_requests_dir`] named by [`stop_request_file_name`].
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Management`] with upstream's sentence for an out-of-range
+/// `target_index` or an invalid `child_id`, or [`SubagentError::Spawn`] for an I/O failure.
+pub async fn request_async_stop(
+    run_dir: &Path,
+    request: StopRequest,
+) -> Result<PathBuf, SubagentError> {
+    if let Some(index) = request.target_index {
+        validate_stop_target_index(index)?;
+    }
+    if let Some(child_id) = request.child_id.as_deref() {
+        validate_stop_child_id(child_id)?;
+    }
+    let path = stop_requests_dir(run_dir).join(stop_request_file_name(&request));
+    write_control_request(&path, &request).await?;
     Ok(path)
 }
 
@@ -1500,36 +1699,174 @@ pub async fn consume_timeout_request(
     }
 }
 
-/// Non-consuming read of a pending [`StopRequest`] (G77) — [`check_control_inbox_now`]'s and
-/// [`check_timeout_inbox_now`]'s sibling, with the identical "the file's existence IS the state,
-/// reading never deletes" contract.
-///
-/// # Errors
-///
-/// Returns [`SubagentError::Spawn`] if the file exists but cannot be read or parsed.
-pub async fn check_stop_inbox_now(paths: &RunPaths) -> Result<Option<StopRequest>, SubagentError> {
-    read_control_request(&stop_request_path(&paths.run_dir)).await
+/// SUBA-087 — pi `parseStopRequest` (`runs/background/control-channel.ts:553-567` @v0.64.0): a
+/// request file whose `type` is not `"stop"`, whose `targetIndex` is out of range, or whose
+/// `childId` fails [`is_valid_stop_child_id`] is NOT a request (it is consumed and dropped, never
+/// acted on), so a corrupted or forged file cannot stop the wrong child.
+fn parse_stop_request(bytes: &[u8]) -> Option<StopRequest> {
+    let request: StopRequest = serde_json::from_slice(bytes).ok()?;
+    if request.kind != "stop" {
+        return None;
+    }
+    if request
+        .target_index
+        .is_some_and(|index| index > MAX_STOP_TARGET_INDEX)
+    {
+        return None;
+    }
+    if request
+        .child_id
+        .as_deref()
+        .is_some_and(|id| !is_valid_stop_child_id(id))
+    {
+        return None;
+    }
+    Some(request)
 }
 
-/// Idempotent, at-most-once consumption of a pending [`StopRequest`] (G77) — pi
-/// `consumeStopRequest` (`runs/background/control-channel.ts:519-530` @v0.43.0), and the exact
-/// read-then-unconditionally-delete discipline [`consume_interrupt_request`] documents at length. A
-/// missing file is `Ok(None)`, never an error; losing the delete race against a concurrent consumer
-/// still returns the contents this caller observed (upstream's own comment on that branch reads
-/// "Already removed by a concurrent check — still counts as consumed").
+/// Every stop-request FILE currently on disk for `run_dir`, oldest name first: the
+/// [`stop_requests_dir`] entries (`*.json`, name-sorted — pi `readdirSync(dir).filter(…).sort()`,
+/// `control-channel.ts:597`) followed by the legacy [`stop_request_path`] when present (`:607-611`).
+async fn pending_stop_request_files(run_dir: &Path) -> Vec<PathBuf> {
+    let dir = stop_requests_dir(run_dir);
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".json") {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    let mut files: Vec<PathBuf> = names.into_iter().map(|name| dir.join(name)).collect();
+    let legacy = stop_request_path(run_dir);
+    if tokio::fs::metadata(&legacy).await.is_ok() {
+        files.push(legacy);
+    }
+    files
+}
+
+/// SUBA-087 — the paths of every pending stop request for `run_dir` (queue files, then the legacy
+/// file), for callers that need to observe the inbox without draining it.
+pub async fn pending_stop_request_paths(run_dir: &Path) -> Vec<PathBuf> {
+    pending_stop_request_files(run_dir).await
+}
+
+/// SUBA-087 — whether ANY stop request (whole-run or child-scoped) is pending for `run_dir`.
+pub async fn has_pending_stop_request(run_dir: &Path) -> bool {
+    !pending_stop_request_files(run_dir).await.is_empty()
+}
+
+/// Non-consuming read of every pending, VALID [`StopRequest`] for `run_dir`, sorted by `ts`
+/// (oldest first, pi `control-channel.ts:612`). Reading never deletes.
 ///
 /// # Errors
 ///
-/// Returns [`SubagentError::Spawn`] for a genuine I/O failure other than "file does not exist".
-pub async fn consume_stop_request(paths: &RunPaths) -> Result<Option<StopRequest>, SubagentError> {
-    let path = stop_request_path(&paths.run_dir);
-    let request = match read_control_request::<StopRequest>(&path).await? {
-        Some(request) => request,
-        None => return Ok(None),
-    };
-    match tokio::fs::remove_file(&path).await {
-        Ok(()) | Err(_) => Ok(Some(request)),
+/// Returns [`SubagentError::Spawn`] if a request file exists but cannot be read.
+pub async fn peek_stop_requests(run_dir: &Path) -> Result<Vec<StopRequest>, SubagentError> {
+    let mut out: Vec<StopRequest> = Vec::new();
+    for path in pending_stop_request_files(run_dir).await {
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => {
+                if let Some(request) = parse_stop_request(&bytes) {
+                    out.push(request);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(SubagentError::Spawn(e)),
+        }
     }
+    out.sort_by_key(|request| request.ts);
+    Ok(out)
+}
+
+/// Non-consuming read of a pending WHOLE-RUN [`StopRequest`] (G77) — [`check_control_inbox_now`]'s
+/// and [`check_timeout_inbox_now`]'s sibling, with the identical "the file's existence IS the
+/// state, reading never deletes" contract. Returns the oldest one.
+///
+/// SUBA-087: a CHILD-SCOPED request is deliberately invisible here — it must never flip the
+/// run-wide `stopped` flag. Child-scoped requests are drained by
+/// [`consume_child_stop_requests`] from the runner's control-inbox watcher.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if a request file exists but cannot be read.
+pub async fn check_stop_inbox_now(paths: &RunPaths) -> Result<Option<StopRequest>, SubagentError> {
+    Ok(peek_stop_requests(&paths.run_dir)
+        .await?
+        .into_iter()
+        .find(|request| !request.is_child_scoped()))
+}
+
+/// Read-then-unconditionally-delete one stop-request file (pi `consumeStopRequestFile`,
+/// `control-channel.ts:569-586`): losing the delete race to a concurrent consumer means THAT
+/// consumer owns the request, so this one reports nothing rather than acting on it twice.
+async fn consume_stop_request_file(path: &Path) -> Option<StopRequest> {
+    let parsed = tokio::fs::read(path)
+        .await
+        .ok()
+        .and_then(|bytes| parse_stop_request(&bytes));
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => parsed,
+        Err(_) => None,
+    }
+}
+
+/// Drain every pending stop-request file whose parsed request satisfies `keep` — reading each,
+/// deleting it, and returning the survivors sorted by `ts` (pi `consumeStopRequestPayloads`,
+/// `control-channel.ts:588-613`). Files `keep` rejects are left on disk for their own consumer.
+async fn drain_stop_requests(
+    run_dir: &Path,
+    keep: impl Fn(&StopRequest) -> bool,
+) -> Vec<StopRequest> {
+    let mut out: Vec<StopRequest> = Vec::new();
+    for path in pending_stop_request_files(run_dir).await {
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        let parsed = parse_stop_request(&bytes);
+        // A file that is not a valid request is consumed regardless (it would otherwise be
+        // re-read on every tick forever); a valid one is consumed only by its own consumer.
+        if parsed.as_ref().is_some_and(|request| !keep(request)) {
+            continue;
+        }
+        if let Some(request) = consume_stop_request_file(&path).await {
+            out.push(request);
+        }
+    }
+    out.sort_by_key(|request| request.ts);
+    out
+}
+
+/// Idempotent, at-most-once consumption of the pending WHOLE-RUN [`StopRequest`]s (G77) — pi
+/// `consumeStopRequestPayload` (`control-channel.ts:615-620` @v0.64.0), and the exact
+/// read-then-unconditionally-delete discipline [`consume_interrupt_request`] documents at length.
+/// Every whole-run request on disk is consumed (a run stops once; the rest are moot) and the
+/// OLDEST is returned. Nothing pending is `Ok(None)`, never an error.
+///
+/// SUBA-087: child-scoped requests are left in place for [`consume_child_stop_requests`].
+///
+/// # Errors
+///
+/// Never fails today; the `Result` is kept so a genuine I/O failure can be surfaced without a
+/// signature change.
+pub async fn consume_stop_request(paths: &RunPaths) -> Result<Option<StopRequest>, SubagentError> {
+    let mut drained =
+        drain_stop_requests(&paths.run_dir, |request| !request.is_child_scoped()).await;
+    if drained.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(drained.remove(0)))
+    }
+}
+
+/// SUBA-087 — idempotent, at-most-once consumption of every pending CHILD-SCOPED
+/// [`StopRequest`], oldest first (pi `consumeStopRequestPayloads` as drained by
+/// `watchAsyncControlInbox`, `control-channel.ts:690`, each routed to `onStop` = `stopChildStep`).
+/// Whole-run requests are left in place for [`consume_stop_request`].
+pub async fn consume_child_stop_requests(run_dir: &Path) -> Vec<StopRequest> {
+    drain_stop_requests(run_dir, StopRequest::is_child_scoped).await
 }
 
 async fn read_control_request<T: serde::de::DeserializeOwned>(
@@ -2905,8 +3242,9 @@ mod tests {
     // G77 — the `stop` control verb (pi `stopAsyncRun` / `StopRequest` / `consumeStopRequest`)
     // ---------------------------------------------------------------------------------------
 
-    /// `stop` writes a real `control/stop.json` for a `Running` run, and `consume_stop_request`
-    /// reads-then-deletes it exactly once (pi `consumeStopRequest`, `runs/background/control-channel.ts:519-530`).
+    /// `stop` writes a real request file under `control/stop-requests/` for a `Running` run, and
+    /// `consume_stop_request` reads-then-deletes it exactly once (pi `requestAsyncStop` /
+    /// `consumeStopRequestPayload`, `runs/background/control-channel.ts:297-310,615-620` @v0.64.0).
     #[tokio::test]
     async fn stop_writes_a_real_stop_request_that_is_consumed_exactly_once() {
         let (_dir, async_root, results_dir) = temp_roots();
@@ -2920,6 +3258,7 @@ mod tests {
                 &results_dir,
                 run_id.as_str(),
                 "stop-action",
+                None,
                 None
             )
             .await
@@ -2927,14 +3266,28 @@ mod tests {
             StopOutcome::Requested
         );
 
-        // The file lands at pi's own path, with pi's own discriminant and source.
-        let path = stop_request_path(&paths.run_dir);
-        assert_eq!(path, paths.run_dir.join("control").join("stop.json"));
+        // The file lands in pi's own directory, with pi's own discriminant and source, and no
+        // targeting fields on the wire for a whole-run request (upstream's conditional spreads).
+        let pending = pending_stop_request_paths(&paths.run_dir).await;
+        assert_eq!(pending.len(), 1);
+        let path = pending[0].clone();
+        assert_eq!(
+            path.parent(),
+            Some(
+                paths
+                    .run_dir
+                    .join("control")
+                    .join("stop-requests")
+                    .as_path()
+            )
+        );
         let raw: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&path).await.expect("stop.json exists"))
+            serde_json::from_slice(&tokio::fs::read(&path).await.expect("request exists"))
                 .expect("valid json");
         assert_eq!(raw["type"], serde_json::json!("stop"));
         assert_eq!(raw["source"], serde_json::json!("stop-action"));
+        assert!(raw.get("targetIndex").is_none());
+        assert!(raw.get("childId").is_none());
 
         // Non-consuming read leaves it in place…
         assert!(check_stop_inbox_now(&paths).await.expect("read").is_some());
@@ -2945,13 +3298,247 @@ mod tests {
             .expect("consume")
             .expect("was pending");
         assert_eq!(consumed.kind, "stop");
+        assert!(!consumed.is_child_scoped());
         assert!(!path.exists());
+        assert!(!has_pending_stop_request(&paths.run_dir).await);
         assert!(
             consume_stop_request(&paths)
                 .await
                 .expect("second consume")
                 .is_none()
         );
+    }
+
+    /// SUBA-087 — pi `requestAsyncStop`'s two guards (`runs/background/control-channel.ts:302-305`
+    /// @v0.64.0): `assertChildIndex` and `validStopChildId`, each with its own sentence, and
+    /// nothing written when either refuses.
+    #[tokio::test]
+    async fn stop_child_id_is_validated_with_upstreams_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        let expected = "stop childId must be a non-empty string without newlines and at most 256 \
+                        characters.";
+        for bad in [
+            String::new(),
+            "   ".to_string(),
+            "a\nb".to_string(),
+            "a\rb".to_string(),
+            "x".repeat(257),
+        ] {
+            let err =
+                request_async_stop(&run_dir, StopRequest::for_child("t", 0, Some(bad.clone())))
+                    .await
+                    .expect_err("invalid childId must be refused");
+            assert_eq!(err.to_string(), expected, "childId {bad:?}");
+            assert!(!is_valid_stop_child_id(&bad));
+        }
+        assert!(is_valid_stop_child_id(&"x".repeat(256)));
+        assert!(is_valid_stop_child_id("step:0"));
+        let err = request_async_stop(
+            &run_dir,
+            StopRequest::for_child("t", MAX_STOP_TARGET_INDEX + 1, None),
+        )
+        .await
+        .expect_err("an index past the cap must be refused");
+        assert_eq!(
+            err.to_string(),
+            "child index must be a non-negative integer."
+        );
+        assert!(!has_pending_stop_request(&run_dir).await);
+    }
+
+    /// SUBA-087 — pi `consumeStopRequestPayloads` (`control-channel.ts:588-613`): every request is
+    /// its own file under `control/stop-requests/`, the legacy `control/stop.json` is still read,
+    /// and the drain returns them oldest-`ts`-first; child-scoped and whole-run requests are
+    /// consumed by their own consumers and left alone by the other.
+    #[tokio::test]
+    async fn stop_requests_are_queued_per_file_drained_oldest_first_and_split_by_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("run");
+        let paths = RunPaths::for_run(&run_dir, &run_dir, &RunId::from_token("queue0000001"));
+        // The paths type only needs `run_dir` here; make it the same directory.
+        let paths = RunPaths {
+            run_dir: run_dir.clone(),
+            ..paths
+        };
+
+        // Three requests, written out of time order so the sort is what the test proves: a
+        // child-scoped one (ts 30), a whole-run one (ts 10), and a LEGACY single-file one (ts 20).
+        let mut child = StopRequest::for_child("stop-action", 1, Some("step:1".to_string()));
+        child.ts = 30;
+        request_async_stop(&run_dir, child.clone())
+            .await
+            .expect("write child");
+        let mut whole = StopRequest::new("stop-action", Some("bye".to_string()));
+        whole.ts = 10;
+        request_async_stop(&run_dir, whole.clone())
+            .await
+            .expect("write whole");
+        let mut legacy = StopRequest::new("ancestor-stop", None);
+        legacy.ts = 20;
+        write_control_request(&stop_request_path(&run_dir), &legacy)
+            .await
+            .expect("write legacy");
+        // Plus one forged file that must be dropped, never acted on (`parseStopRequest`).
+        tokio::fs::write(
+            stop_requests_dir(&run_dir).join("0000000000005-forged.json"),
+            br#"{"type":"stop","ts":5,"source":"x","targetIndex":1,"childId":"bad\nid"}"#,
+        )
+        .await
+        .expect("write forged");
+
+        assert_eq!(pending_stop_request_paths(&run_dir).await.len(), 4);
+        let peeked = peek_stop_requests(&run_dir).await.expect("peek");
+        assert_eq!(
+            peeked.iter().map(|r| r.ts).collect::<Vec<_>>(),
+            vec![10, 20, 30],
+            "sorted by ts, forged file invisible"
+        );
+
+        // The whole-run probe sees the OLDEST whole-run request and never the child-scoped one.
+        let probe = check_stop_inbox_now(&paths)
+            .await
+            .expect("probe")
+            .expect("a whole-run request is pending");
+        assert_eq!(probe.ts, 10);
+        assert!(!probe.is_child_scoped());
+
+        // Child-scoped drain: exactly the targeted request, with its targeting intact; the two
+        // whole-run files are still there.
+        let children = consume_child_stop_requests(&run_dir).await;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].target_index, Some(1));
+        assert_eq!(children[0].child_id.as_deref(), Some("step:1"));
+        assert_eq!(children[0].ts, 30);
+        assert_eq!(
+            pending_stop_request_paths(&run_dir).await.len(),
+            2,
+            "the forged file was consumed with the child drain; the whole-run files remain"
+        );
+
+        // Whole-run drain: returns the oldest, consumes both (queue file AND legacy file).
+        let consumed = consume_stop_request(&paths)
+            .await
+            .expect("consume")
+            .expect("pending");
+        assert_eq!(consumed.ts, 10);
+        assert_eq!(consumed.reason.as_deref(), Some("bye"));
+        assert!(!has_pending_stop_request(&run_dir).await);
+        assert!(
+            !stop_request_path(&run_dir).exists(),
+            "legacy file consumed too"
+        );
+        assert!(check_stop_inbox_now(&paths).await.expect("probe").is_none());
+    }
+
+    /// SUBA-087 — `stop(…, childId)` (pi `stopAsyncRun`, `async-stop-action.ts:48-68` @v0.64.0):
+    /// the child is resolved against the reconciled status and gated on pending/running BEFORE
+    /// anything is written; the written request carries the resolved index and identity.
+    #[tokio::test]
+    async fn stop_with_a_child_id_resolves_gates_and_targets_the_request() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("childstop001");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let mut done = super::super::StepStatus::pending("done-agent");
+        done.status = StepState::Complete;
+        let mut live = super::super::StepStatus::pending("live-agent");
+        live.status = StepState::Running;
+        let queued = super::super::StepStatus::pending("queued-agent");
+        write_running_status(
+            &paths,
+            &run_id,
+            RunMode::Chain,
+            Some(std::process::id()),
+            vec![done, live, queued],
+        )
+        .await;
+
+        // Unknown child → the resolver's not-found sentence, nothing written.
+        assert_eq!(
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                Some("step:9")
+            )
+            .await
+            .expect("stop resolves"),
+            StopOutcome::ChildUnresolved(
+                "Child 'step:9' was not found under async run 'childstop001'.".to_string()
+            )
+        );
+        // Completed child → not stoppable, with the facts the refusal is rendered from.
+        assert_eq!(
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                Some("step:0")
+            )
+            .await
+            .expect("stop resolves"),
+            StopOutcome::ChildNotStoppable {
+                run_id: "childstop001".to_string(),
+                state: StepState::Complete,
+            }
+        );
+        assert!(!has_pending_stop_request(&paths.run_dir).await);
+
+        // Running child → a targeted request lands, carrying index + resolved id.
+        assert_eq!(
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                Some("step:1")
+            )
+            .await
+            .expect("stop resolves"),
+            StopOutcome::ChildRequested {
+                child_id: "step:1".to_string()
+            }
+        );
+        // Pending child → likewise stoppable (pi `isStoppableAsyncStatusStep`).
+        assert!(matches!(
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                Some("step:2")
+            )
+            .await
+            .expect("stop resolves"),
+            StopOutcome::ChildRequested { .. }
+        ));
+        let requests = consume_child_stop_requests(&paths.run_dir).await;
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| (r.target_index, r.child_id.clone(), r.source.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Some(1),
+                    Some("step:1".to_string()),
+                    "stop-action".to_string()
+                ),
+                (
+                    Some(2),
+                    Some("step:2".to_string()),
+                    "stop-action".to_string()
+                ),
+            ]
+        );
+        // …and no whole-run request was written by any of the child-scoped calls.
+        assert!(check_stop_inbox_now(&paths).await.expect("probe").is_none());
     }
 
     /// pi `stopAsyncRun`'s actionability guard (`async-stop-action.ts:41`): only `running` or
@@ -2979,6 +3566,7 @@ mod tests {
                 &results_dir,
                 queued_id.as_str(),
                 "stop-action",
+                None,
                 None
             )
             .await
@@ -3009,6 +3597,7 @@ mod tests {
                 &results_dir,
                 paused_id.as_str(),
                 "stop-action",
+                None,
                 None
             )
             .await

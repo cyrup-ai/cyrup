@@ -90,6 +90,16 @@ pub(crate) struct SubagentToolParams {
     pub(crate) run_id: Option<String>,
     pub(crate) dir: Option<String>,
     pub(crate) index: Option<u64>,
+    /// SUBA-087 / pi `params.childId` (`extension/schemas.ts:306` @v0.64.0: `Type.Optional(
+    /// Type.String({minLength: 1, maxLength: 256}))`, *"Stable child identity for child-scoped stop
+    /// requests."*) — the child of an async run `action='stop'` is scoped to
+    /// (`subagent-executor.ts:6163,6184`). Carried as a raw string: its resolution and its length
+    /// gate both answer with upstream's own sentences from
+    /// [`crate::background::child_identity`] / [`crate::background::control::validate_stop_child_id`],
+    /// which a model can act on, rather than a serde rejection it cannot. Before this field
+    /// existed an upstream-shaped `childId` was silently dropped (no `deny_unknown_fields`) and
+    /// the stop proceeded against the WHOLE run.
+    pub(crate) child_id: Option<String>,
     /// G92 (pi `extension/schemas.ts:233-236` @v0.34.0): the optional `status` VIEW selector —
     /// `"fleet"` for the read-only in-flight fleet surface, `"transcript"` to tail one run's (or one
     /// child's) transcript. Anything else is rejected with pi's own

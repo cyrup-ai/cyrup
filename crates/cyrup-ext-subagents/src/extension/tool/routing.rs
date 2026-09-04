@@ -1388,10 +1388,13 @@ impl SubagentTool {
             // advertise-vs-dispatch invariant — both land in this same change). pi reads
             // `targetRunId = params.runId ?? params.id` (`subagent-executor.ts:4772`), the SAME
             // `runId`-first precedence `interrupt` uses, and also accepts `dir` (`:4779-4787`).
+            // SUBA-087: `childId` (`subagent-executor.ts:6163,6184` @v0.64.0) rides along on both
+            // the `dir` and the id forms, so a child-scoped stop reaches `control_stop`'s resolver
+            // instead of being silently dropped by serde.
             "stop" => {
                 let target = p.run_id.as_deref().or(p.id.as_deref());
                 self.executor
-                    .control_stop(cwd, target, p.dir.as_deref())
+                    .control_stop(cwd, target, p.dir.as_deref(), p.child_id.as_deref())
                     .await
             }
             // SUBA-057: the `dismiss` dispatch arm the schema enum value is advertised against

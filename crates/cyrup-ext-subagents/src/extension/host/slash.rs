@@ -459,7 +459,7 @@ impl SubagentsExtension {
                 .map_err(SubagentError::Management)
         } else {
             self.executor
-                .control_stop(cwd, Some(id), None)
+                .control_stop(cwd, Some(id), None, None)
                 .await
                 .map_err(SubagentError::Management)
         }
@@ -1093,7 +1093,7 @@ mod tests {
             .expect("/subagents-stop must dispatch");
         assert_eq!(rendered, "Stop requested for async run stopslash001.");
         assert!(
-            crate::background::control::stop_request_path(&paths.run_dir).exists(),
+            crate::background::control::has_pending_stop_request(&paths.run_dir).await,
             "the slash command must write the same real stop request the tool action does"
         );
     }

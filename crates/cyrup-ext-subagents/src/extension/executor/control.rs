@@ -111,6 +111,17 @@ impl SubagentExecutor {
     /// | `Workflow {id} is not controlled by this extension runtime; reload recovery cannot stop it safely.` (`:4801`) | **unported subsystem** |
     /// | `Async run '{id}' was not found in the active session.` (`async-stop-action.ts:34`) | **unported subsystem** |
     ///
+    /// SUBA-087 — `childId` (pi `async-stop-action.ts:48-66,68,75` @v0.64.0, threaded from
+    /// `subagent-executor.ts:6163,6184`): when given, the child is resolved against the reconciled
+    /// status ([`crate::background::child_identity::resolve_async_status_child`]) and gated on
+    /// pending/running BEFORE anything is written — a failed resolution answers with the
+    /// resolver's own sentence, a non-stoppable child with `Child '{childId}' in async run
+    /// '{runId}' is {status}; stop only supports pending or running children.`, and success with
+    /// `Stop requested for child {child.id} in async run {id}.` naming the RESOLVED identity. The
+    /// written request then carries `targetIndex`/`childId`, and the runner stops that one step
+    /// while the run stays alive. The `workflowControllers` child-stop branch
+    /// (`subagent-executor.ts:6122-6155`) is the unported workflow subsystem, as below.
+    ///
     /// The two `Workflow …` strings are the `workflowControllers` fast path and the `mode ===
     /// "workflow"` reload-recovery refusal. Both are gated on upstream's fourth run mode
     /// (`SubagentRunMode = "single" | "parallel" | "chain" | "workflow"`, `shared/types.ts:231`) and
@@ -131,6 +142,7 @@ impl SubagentExecutor {
         cwd: &Path,
         target: Option<&str>,
         dir: Option<&str>,
+        child_id: Option<&str>,
     ) -> Result<String, String> {
         if target.is_none() && dir.is_none() {
             return Err("action='stop' requires id or dir.".to_string());
@@ -194,12 +206,39 @@ impl SubagentExecutor {
             None => resolved_async_id.unwrap_or_else(|| target.unwrap_or_default().to_string()),
         };
 
-        match control::stop(&async_root, &results_dir, &run_id, "stop-action", None).await {
+        match control::stop(
+            &async_root,
+            &results_dir,
+            &run_id,
+            "stop-action",
+            None,
+            child_id,
+        )
+        .await
+        {
             Ok(control::StopOutcome::Requested) => {
                 Ok(format!("Stop requested for async run {run_id}."))
             }
+            // SUBA-087 — `async-stop-action.ts:75`: the receipt names the RESOLVED child id.
+            Ok(control::StopOutcome::ChildRequested { child_id }) => Ok(format!(
+                "Stop requested for child {child_id} in async run {run_id}."
+            )),
             Ok(control::StopOutcome::NotStoppable) => Err(format!(
                 "No running or queued async run was found for '{run_id}'."
+            )),
+            // SUBA-087 — `async-stop-action.ts:51-57`: the resolver's own not-found/ambiguous
+            // sentence, verbatim.
+            Ok(control::StopOutcome::ChildUnresolved(message)) => Err(message),
+            // SUBA-087 — `async-stop-action.ts:59-65`: the caller's own spelling of the id and
+            // the status record's run id, with pi's lowercase step-status word.
+            Ok(control::StopOutcome::ChildNotStoppable {
+                run_id: status_run_id,
+                state,
+            }) => Err(format!(
+                "Child '{}' in async run '{status_run_id}' is {}; stop only supports pending or \
+                 running children.",
+                child_id.unwrap_or_default(),
+                run_status::step_state_label(state)
             )),
             Err(e) => Err(format!("Failed to stop async run {run_id}: {e}")),
         }

@@ -355,6 +355,9 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     props.insert("runId".to_string(), serde_json::json!({ "type": "string", "description": "Target run ID for action='interrupt', action='stop', action='resume', action='steer', or action='append-step'. Defaults to the most recently active controllable run for interrupt. Prefer id for new calls." }));
     props.insert("dir".to_string(), serde_json::json!({ "type": "string", "description": "Async run directory for action='status', action='stop', action='resume', or action='steer'." }));
     props.insert("index".to_string(), serde_json::json!({ "type": "integer", "minimum": 0, "description": "Zero-based child index for actions that target a specific child or transcript." }));
+    // SUBA-087 — pi `extension/schemas.ts:306` @v0.64.0, description VERBATIM. Advertised because
+    // the `stop` dispatch arm threads it into `control_stop`'s resolver in this same change.
+    props.insert("childId".to_string(), serde_json::json!({ "type": "string", "minLength": 1, "maxLength": 256, "description": "Stable child identity for child-scoped stop requests." }));
     // G92: `view` + `lines` (pi `extension/schemas.ts:233-237` @v0.34.0, descriptions VERBATIM).
     // Both are read by `route_control_action`'s `status` arm — `view` selects
     // `background::fleet_view::format_fleet` / `format_async_run_transcript`, `lines` is the
@@ -609,6 +612,7 @@ mod tests {
             "runId",
             "dir",
             "index",
+            "childId",
             "message",
             "chainName",
             "config",
@@ -826,6 +830,9 @@ mod tests {
         assert_eq!(props["timeoutMs"]["minimum"], serde_json::json!(1));
         assert_eq!(props["maxRuntimeMs"]["minimum"], serde_json::json!(1));
         assert_eq!(props["index"]["minimum"], serde_json::json!(0));
+        // SUBA-087 — `schemas.ts:306` @v0.64.0.
+        assert_eq!(props["childId"]["minLength"], serde_json::json!(1));
+        assert_eq!(props["childId"]["maxLength"], serde_json::json!(256));
 
         // tasks[] per-task fields the description advertises (output/outputMode/reads/progress),
         // plus count's minimum.

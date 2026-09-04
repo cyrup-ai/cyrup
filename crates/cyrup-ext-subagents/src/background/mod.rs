@@ -33,6 +33,8 @@
 
 pub mod atomic;
 pub mod cascade;
+pub mod child_identity;
+pub mod child_stop;
 pub mod control;
 pub mod parent_anchor;
 pub mod reconcile;
@@ -751,6 +753,24 @@ pub struct StepStatus {
     /// Wall-clock end time (epoch milliseconds) once this step reached a terminal or paused
     /// state.
     pub ended_at: Option<i64>,
+    /// SUBA-087 — pi `step.stopRequested?: boolean` (`shared/types.ts:1882` @v0.64.0): a
+    /// child-scoped stop (`subagent({action:"stop", childId})`) has been recorded against THIS step
+    /// by the runner (`markChildStopRequested`, `subagent-runner.ts:2979-2991`). Set before the
+    /// child is torn down and kept once it is, so a reader can tell a step that was asked to stop
+    /// from one that stopped for any other reason.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_requested: bool,
+    /// SUBA-087 — pi `step.stopRequestedAt?: number` (`shared/types.ts:1883`): epoch milliseconds
+    /// of the request above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_requested_at: Option<i64>,
+    /// SUBA-087 — pi `step.stopped?: boolean` (`shared/types.ts:1904`): this step ended
+    /// [`StepState::Stopped`] because a stop — run-wide (`stopRunner`, `subagent-runner.ts:3842`)
+    /// or child-scoped (`markChildStopped`, `:2998`) — terminated it. Distinct from the state so a
+    /// status reader that only knows the older `status` word still sees the flag pi's readers key
+    /// on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
     /// Live activity telemetry folded from this step's child events (pi
     /// `subagent-runner.ts:2706-2861`) — flattened so its members serialize at the same top level
     /// of the `status.json` step object pi writes them at (`shared/types.ts:598-632`).
@@ -773,6 +793,9 @@ impl StepStatus {
             nested_run_ids: Vec::new(),
             started_at: None,
             ended_at: None,
+            stop_requested: false,
+            stop_requested_at: None,
+            stopped: false,
             telemetry: StepTelemetry::default(),
         }
     }

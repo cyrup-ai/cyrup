@@ -1300,16 +1300,21 @@ async fn the_stop_action_dispatches_and_writes_a_real_stop_request() {
         "Stop requested for async run stoptool0001."
     );
 
-    let request = crate::background::control::stop_request_path(&paths.run_dir);
-    assert!(
-        request.exists(),
-        "a real stop request must land at {}",
-        request.display()
+    let pending = crate::background::control::pending_stop_request_paths(&paths.run_dir).await;
+    assert_eq!(
+        pending.len(),
+        1,
+        "a real stop request must land under {}",
+        crate::background::control::stop_requests_dir(&paths.run_dir).display()
     );
     let raw: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&request).expect("read")).expect("valid json");
+        serde_json::from_slice(&std::fs::read(&pending[0]).expect("read")).expect("valid json");
     assert_eq!(raw["type"], serde_json::json!("stop"));
     assert_eq!(raw["source"], serde_json::json!("stop-action"));
+    assert!(
+        raw.get("targetIndex").is_none(),
+        "a plain stop is whole-run"
+    );
 }
 
 /// G77 — a unique run-id PREFIX stops the run it names, and the confirmation cites the run's
@@ -1339,7 +1344,7 @@ async fn a_run_id_prefix_stops_the_run_it_names_and_the_confirmation_uses_the_fu
         "the confirmation names the RESOLVED run, never the abbreviation the caller typed"
     );
     assert!(
-        crate::background::control::stop_request_path(&paths.run_dir).exists(),
+        crate::background::control::has_pending_stop_request(&paths.run_dir).await,
         "and the request lands in the resolved run's own control inbox"
     );
 }
@@ -1373,7 +1378,7 @@ async fn child_safe_mode_still_dispatches_the_unadvertised_stop_action() {
         "Stop requested for async run childsafestop."
     );
     assert!(
-        crate::background::control::stop_request_path(&paths.run_dir).exists(),
+        crate::background::control::has_pending_stop_request(&paths.run_dir).await,
         "the child-safe dispatch must write the SAME real control request the root one does"
     );
 
@@ -1614,4 +1619,103 @@ async fn dispatch_refuses_an_agent_whose_outranking_definition_is_malformed() {
         tasks.contains("Agent 'ghost' has invalid configuration:") && tasks.contains("(task 2)"),
         "got: {tasks}"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// SUBA-087 — child-scoped stop (`childId`), pi `async-stop-action.ts:48-77` @v0.64.0 dispatched
+// from `subagent-executor.ts:6163,6184`, schema `extension/schemas.ts:306`.
+// -------------------------------------------------------------------------------------------
+
+/// A `childId` reaches `control_stop`'s resolver and writes a TARGETED request — not a whole-run
+/// one — and the receipt names the resolved child (`async-stop-action.ts:68,75`).
+///
+/// Before this change `SubagentToolParams` had no `child_id` field and no `deny_unknown_fields`,
+/// so this exact call silently stopped the WHOLE run and answered with the whole-run receipt.
+#[tokio::test]
+async fn stop_with_child_id_reaches_control_stop_and_writes_a_targeted_request() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = seed_running_run(dir.path(), "childstoptool", &["scout", "reviewer"]);
+    let tool = scoped_tool(dir.path()).await;
+
+    let out = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "stop", "id": "childstoptool", "childId": "step:1" }),
+    )
+    .await
+    .expect("a child-scoped stop must dispatch");
+    assert_eq!(
+        tool_text(&out),
+        "Stop requested for child step:1 in async run childstoptool."
+    );
+
+    let requests = crate::background::control::consume_child_stop_requests(&paths.run_dir).await;
+    assert_eq!(requests.len(), 1, "exactly one TARGETED request lands");
+    assert_eq!(requests[0].target_index, Some(1));
+    assert_eq!(requests[0].child_id.as_deref(), Some("step:1"));
+    assert_eq!(requests[0].source, "stop-action");
+    assert!(
+        crate::background::control::check_stop_inbox_now(&paths)
+            .await
+            .expect("probe")
+            .is_none(),
+        "no whole-run stop request may be written by a child-scoped stop"
+    );
+}
+
+/// pi `async-stop-action.ts:59-65`: a child that is not `pending`/`running` is refused with the
+/// exact sentence, and nothing is written.
+#[tokio::test]
+async fn stop_refuses_a_child_that_is_not_pending_or_running_with_upstreams_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = seed_running_run(dir.path(), "childstopdone", &["scout", "reviewer"]);
+    // Settle step 0 as complete in the seeded status.
+    let mut status: crate::background::RunStatus =
+        serde_json::from_slice(&std::fs::read(&paths.status).expect("read status"))
+            .expect("parse status");
+    status.steps[0].status = crate::background::StepState::Complete;
+    status.steps[1].status = crate::background::StepState::Running;
+    status.current_step = Some(1);
+    std::fs::write(
+        &paths.status,
+        serde_json::to_string(&status).expect("serialize"),
+    )
+    .expect("write status");
+    let tool = scoped_tool(dir.path()).await;
+
+    let err = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "stop", "id": "childstopdone", "childId": "step:0" }),
+    )
+    .await
+    .expect_err("a completed child cannot be stopped");
+    assert_eq!(
+        err.to_string(),
+        "Child 'step:0' in async run 'childstopdone' is complete; stop only supports pending or \
+         running children."
+    );
+    assert!(
+        !crate::background::control::has_pending_stop_request(&paths.run_dir).await,
+        "a refused child stop writes nothing"
+    );
+}
+
+/// pi `child-identity.ts:46` via `async-stop-action.ts:51-57`: an unknown child answers with the
+/// resolver's own not-found sentence — never the whole-run receipt.
+#[tokio::test]
+async fn stop_reports_an_unknown_child_with_upstreams_not_found_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = seed_running_run(dir.path(), "childstopnone", &["scout"]);
+    let tool = scoped_tool(dir.path()).await;
+
+    let err = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "stop", "id": "childstopnone", "childId": "step:7" }),
+    )
+    .await
+    .expect_err("an unknown child is an error");
+    assert_eq!(
+        err.to_string(),
+        "Child 'step:7' was not found under async run 'childstopnone'."
+    );
+    assert!(!crate::background::control::has_pending_stop_request(&paths.run_dir).await);
 }
