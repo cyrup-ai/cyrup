@@ -324,7 +324,7 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-043 | **FIXED 2026-08-13** | Was: word motion and Ctrl+W were not paste-marker atomic — one Ctrl+W deleted the single `]`. Now: `word_left_target`/`word_right_target` are a statement-for-statement port of `findWordBackward`/`findWordForward` (`word-navigation.ts:22-114`) over a marker-merging segmenter (`segmentWithMarkers`, `editor.ts:37-90`), including the `isAtomic` branches at `:44-46`/`:97-99`; `prev_grapheme`/`next_grapheme` route through the same merge, so **cursor motion** is marker-atomic too (pi's `moveCursor`, `editor.ts:1808-1830`) and the caret can no longer be parked inside a marker. `marker_covering` is deleted — upstream has no such predicate. Per `editor.ts:1607-1630`, `deleteWordBackwards` does **not** drop the registry entry, so cyrup no longer does either (see the correction below). RED→GREEN: `::ctrl_w_at_a_marker_end_deletes_the_whole_marker` (RED output: `left: "[paste #1 1500 chars"`), `::alt_d_at_a_marker_start_deletes_the_whole_marker`, `::word_motion_treats_a_paste_marker_as_one_unit`, `::arrow_keys_step_over_a_paste_marker_as_one_grapheme`. |
 | TUI-044 | **FIXED 2026-08-13** | `undo()` restores `snap.col` and calls `reset_preferred_col()` (`editor.ts:2019-2022`); `exit_history()` moved ahead of the pop to match `:2017`. RED→GREEN: `::undo_restores_the_snapshot_cursor_column` — the item's own live scenario, asserting `(0, 5)` and that the next keystroke yields `helloZ` rather than `heZllo`. |
 | TUI-045 | ~~**new (repair pass)** — open, **raised to high 2026-08-13**~~ **CLOSED 2026-08-14** | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — crossterm emits a spurious `Escape` plus the tail as typed text. `stray_reply.rs` documents observing this exact split and rescues only OSC 11. Escape is not inert: it aborts the turn. **Reproduced live, idle and mid-stream — a 60 ms gap between two writes on a LOCAL pty is enough; the "exposure is over SSH/mosh/tmux" hedge was too conservative.** |
-| TUI-046 | **new (repair pass)** — open (medium) | cyrup pushes Kitty flag 1; pi pushes 7 — and neither stdin-buffer guard flag 7 requires exists, so the obvious one-token "fix" would double every composed character and leak CSI-u text on WezTerm. Filed as one change with the two guards for exactly that reason. Also corrects `drain.rs:11-16`'s unfounded release-report premise. |
+| TUI-046 | ~~**new (repair pass)** — open (medium)~~ **PARTIALLY FIXED 2026-09-04 at `8bb0d22f` — still open (low)** | The flag set is decided and single-sourced: `crate::keyboard_protocol::DESIRED_FLAGS` = `DISAMBIGUATE_ESCAPE_CODES \| REPORT_ALTERNATE_KEYS` (`\x1b[>5u`), written by the one `push_flags()` all three sites call. `REPORT_EVENT_TYPES` is a reasoned `[CYRUP-DELTA]`, not the old silent gap, and withholding it makes the WezTerm hazard **unreachable** rather than merely unguarded. `drain.rs:11-16`'s release-report premise is corrected. **Residual:** pi's `pendingKittyPrintableCodepoint` dedup is still unported and is not portable at cyrup's post-crossterm seam. |
 | TUI-047 | **new (repair pass)** — open (low) | A late or unsolicited DCS/APC frame is shredded into ~20 typed characters; `stray_reply.rs` recognises only OSC 11. Reachability is narrow (tmux passthrough), blast radius is not. |
 | TUI-048 | **PARTIALLY FIXED 2026-08-13 — still open** | The character-class run is gone: word motion now goes through `unicode-segmentation`'s UAX#29 word iterator plus pi's `PUNCTUATION_REGEX` sub-boundaries (`utils.ts:821`) in pi's three-branch shape. CJK no longer jumps the whole run (`::cjk_word_motion_no_longer_swallows_the_whole_run`, RED at HEAD). **Not parity**: ICU's `Intl.Segmenter` adds a dictionary/LSTM pass, so pi lands at col 2 in `你好世界` where UAX#29 lands at 3. Closing it needs an ICU-class segmenter (`icu_segmenter` + CJK/Thai data) — a new workspace dependency, deliberately not taken here. CYRUP-DELTA recorded on `InputEditor::word_segments`. |
 | TUI-049 | **FIXED 2026-08-13** | `marker_at` now matches `PASTE_MARKER_SINGLE` exactly (`editor.ts:24`): id, then either an immediate `]` or one space and exactly one of `+<digits> lines` / `<digits> chars`. RED→GREEN: `::a_hand_typed_marker_shaped_string_is_not_expanded`, which also pins that the bare `[paste #N]` form pi's regex allows still expands. |
@@ -517,7 +517,7 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | ~~TUI-034~~ | ~~medium~~ **CLOSED 2026-09-04** | upstream-drift | L | ~~No markdown-transformer hook — extension transformers and pi's Mermaid renderer both absent~~ — `App::apply_markdown_transformers` (`crates/cyrup-tui/src/app/events.rs:102-140`) calls `ExtensionHost::transform_markdown` from three real sites (`session_bind.rs:214`, `events.rs:75,102`), and a real Mermaid renderer (the `mermaid-text` crate) ships in `markdown/mermaid.rs`, live while streaming, gated by the `markdown.mermaid` setting. |
 | ~~TUI-037~~ | ~~medium~~ **CLOSED 2026-09-04** | not-ported | S | ~~`/reload` never persists an implicitly-granted project trust~~ — landed in `0e8c62fa`. `App::maybe_save_implicit_project_trust` (`crates/cyrup-tui/src/app/reload_trust.rs:126`) is the shell of pi's `maybeSaveImplicitProjectTrustAfterReload` (`interactive-mode.ts:4921-4941` @v0.84.4) over the pure `implicit_trust_after_reload` (`:85-102`, outcomes `ImplicitTrustReload::{Keep,Disarm,Persist}` `:64`); the `/reload` arm calls it (`app/execute_session.rs:279`) and selects pi's `; saved project trust` status variant (`:299`, `interactive-mode.ts:6000-6003`); the host arms `autoTrustOnReloadCwd` at the composition root (`crates/cyrup/src/main.rs:672-677`, pi `main.ts:701-704`) → `run_interactive` → `App::set_auto_trust_on_reload_cwd` (`interactive.rs:346`); the store failure is pi's `Warning: Could not save project trust after reload: …`, carried post-swap by `LifecycleEffects::warning` (`app/outcome.rs:104`, `app/channels.rs:181`). **[CYRUP-DELTA]** the write runs BEFORE the rebuild is dispatched, not after as pi's does: cyrup's `/reload` rebuilds the session through the factory and re-decides trust from the store, where pi's `AgentSession.reload` preserves `SettingsManager.projectTrusted` (`resource-loader.ts:404`); the inputs are the same, the store ends the same, and the rebuilt session reads the saved `true` back — the one difference is a reload that then FAILS has already written the entry. Tests: `src/app/reload_trust.rs` (4 decision-table cases) and `src/tests/reload_implicit_trust.rs` (5 App tests through the real runtime + `trust.json` store; `reload_persists_an_implicitly_granted_project_trust`, `…_disarms_without_writing` and `a_store_failure_warns_and_keeps_the_plain_status` were RED against the unwired arm). Closes `TUI-025`'s last residual (the `; saved project trust` variant). |
 | TUI-044 | **FIXED 2026-08-13** | parity-bug | S | ~~`undo()` discards the snapshot's cursor column — `Snapshot::col` is written and never read~~ |
-| TUI-046 | medium | parity-bug | M | cyrup pushes Kitty keyboard flag 1, pi pushes 7 — and neither guard flag 7 requires exists, so raising it alone would duplicate characters and leak CSI-u text — **re-verified 2026-09-04, unchanged: `keyboard_protocol.rs`'s module doc grew a fuller explanation of pi's `CSI > 7 u` push, but all three actual push call sites (`app/crossterm.rs:55,133,223`) still construct `KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES` alone (flag 1). Do not mistake the expanded documentation for a fix.** |
+| TUI-046 | ~~medium~~ **low** | parity-bug | M | ~~cyrup pushes Kitty keyboard flag 1, pi pushes 7 — and neither guard flag 7 requires exists, so raising it alone would duplicate characters and leak CSI-u text~~ — **PARTIALLY FIXED 2026-09-04 at `8bb0d22f`.** The three push sites are now one: `crate::keyboard_protocol::push_flags()` writing `DESIRED_FLAGS` = `DISAMBIGUATE_ESCAPE_CODES \| REPORT_ALTERNATE_KEYS` (`\x1b[>5u`, pi's `\x1b[>7u` minus bit 2). Alternate keys was the half with a user-visible effect (a shifted key on a non-US layout now resolves to the character that layout produces, `crossterm-0.29.0/src/event/sys/unix/parse.rs:597-606`). `REPORT_EVENT_TYPES` is withheld as an argued `[CYRUP-DELTA]` (`keyboard_protocol.rs` module docs): it buys cyrup nothing — `map_event_on` discards every `Release` — and both guards it requires filter RAW BYTES, which cyrup's seam is below. `drain.rs:11-16` corrected. **Stays open (low) for one residual only: the `pendingKittyPrintableCodepoint` dedup, unportable while cyrup filters crossterm events rather than bytes.** |
 | ~~TUI-051~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `/reload` never re-reads `keybindings.json`, while the command's help text and its in-source comment both claim it does — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-058 | **FIXED 2026-08-13** | parity-bug | S | ~~Deleting a paste marker does not renumber the pastes that follow it — ids diverge from pi's for the life of the session~~ — **new, found 2026-08-13** |
 | TUI-059 | **FIXED 2026-08-13** | parity-bug | S | ~~Only Left/Right clear `lastAction`, so a kill survives every other motion and the next kill accumulates into the same ring entry~~ — **new, found 2026-08-13** |
@@ -1193,7 +1193,90 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 
 ## TUI-046 — cyrup pushes Kitty keyboard flag 1; pi pushes 7 — and neither guard flag 7 requires exists
 
-**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** confirmed
+**Kind** parity-bug · ~~**Severity** medium~~ **Severity low** · **Effort** M · **Confidence** confirmed
+
+> **PARTIALLY FIXED 2026-09-04 at `8bb0d22f` — still open (low). The flags decision is made and
+> single-sourced; one residual remains and it is not portable at cyrup's seam.**
+>
+> **What landed.** `crate::keyboard_protocol::DESIRED_FLAGS` is now the only place the flag set is
+> written — `DISAMBIGUATE_ESCAPE_CODES | REPORT_ALTERNATE_KEYS`, wire form `\x1b[>5u` — and
+> `keyboard_protocol::push_flags()` is the only function that writes it. The three literals at
+> `app/crossterm.rs` (startup `:55`, `App::suspend` `:133`, external editor `:223` as filed) are one
+> call each, so a re-entry push can no longer disagree with the set startup negotiated. Fix parts (1)
+> and (4) of the item are done; part (2) is the residual below; part (3) is now unreachable rather
+> than unported.
+>
+> **`REPORT_ALTERNATE_KEYS` is the half with a user-visible effect, and it is the half that was
+> missing.** crossterm substitutes a CSI-u's alternate (shifted) codepoint for the base keycode and
+> clears `SHIFT` (`crossterm-0.29.0/src/event/sys/unix/parse.rs:597-606`), so a shifted key on a
+> non-US layout now reports the character that layout produces — which is what a keybinding is
+> matched against. The decoder cyrup owns for split sequences already handled the
+> `unicode:shifted:base` shape (`escape_reassembly.rs::decode_csi_u_encoded_key_code`); the flag is
+> what makes that shape reachable input, and a test now pins it.
+>
+> **`REPORT_EVENT_TYPES` (bit 2) is deliberately withheld — an argued `[CYRUP-DELTA]` in
+> `keyboard_protocol.rs`'s module docs, which the item's own Fix (1) authorises.** Two reasons, both
+> checked at both ends:
+>
+> 1. It buys cyrup nothing. Its only effect in crossterm terms is `Repeat`/`Release` reports
+>    (`crossterm-0.29.0/src/event.rs:296-299`) and `map_event_on`
+>    (`crates/cyrup-tui/src/app/input_reader.rs`) discards every `KeyEventKind::Release`, so no cyrup
+>    code path consumes one.
+> 2. Both guards pi needs *because of* it filter **raw bytes** ahead of pi's own key parser, and
+>    cyrup's seam is one layer lower — after crossterm has already decoded. That is not a
+>    "not-ported-yet"; there is no discriminator to port against:
+>    * `pendingKittyPrintableCodepoint` (`stdin-buffer.ts:186-192`, `:399-408` @v0.84.4; pi
+>      `bdb416cbc`, issue #3780) drops a raw character duplicating the Kitty CSI-u for the same
+>      codepoint. crossterm decodes `\x1b[224u` (`parse.rs:540-568`) and a bare `à`
+>      (`parse.rs:118-135`) into **byte-identical** `KeyEvent { Char('à'), NONE, Press, NONE }`
+>      values. At the event level the guard degenerates to "drop the second of two identical
+>      printable presses", which eats the second `l` of `hello`. The item's Fix (2) — "remember the
+>      codepoint … and drop the next event that is exactly that bare character" — is therefore
+>      **wrong as written for cyrup**, and that correction is this pass's finding.
+>    * the WezTerm `\x1b\x1b`+CSI split (`stdin-buffer.ts:207-232`, test `:258-265`) keys off the
+>      Kitty release report WezTerm sends for Escape, which exists only when event types are
+>      requested; and crossterm collapses `\x1b\x1b` into one `Esc` event (`parse.rs:77`) before
+>      `escape_reassembly` — TUI-045's machine, which operates on events by its own recorded
+>      `[CYRUP-DELTA]` — can see it. Not asking for bit 2 makes that hazard **unreachable**: WezTerm
+>      sends a plain `\x1b` for Escape and the existing path handles it.
+>
+> **The item's Impact paragraph was stale in one respect** and is corrected here: it predicted
+> "Escape emits `Esc` followed by the literal text `[27;129:3u`" on WezTerm. Since TUI-045 landed
+> (2026-08-14) that is not what would happen — `escape_reassembly` would hold the `Esc`, rebuild
+> `\x1b[27;129:3u`, decode it to an Esc **release**, and `map_event_on` would drop it, so Escape
+> would do *nothing at all*. Either way the conclusion stands and is now moot under the delta.
+>
+> **`drain.rs:11-16` corrected** (Fix part 4). It asserted that `DISAMBIGUATE_ESCAPE_CODES` makes the
+> quit chord generate a *release* report; release reports need `REPORT_EVENT_TYPES`, which cyrup does
+> not push. The drain's justification is unchanged — the CSI-u **press** report for `Ctrl+D`/`Ctrl+C`
+> leaks into the shell the same way — and pi's protocol-disable-first ordering
+> (`terminal.ts:370-377`, `:441-445`) is still what the module ports.
+>
+> **Design decision (no new type).** The invariant worth encoding is "every push site asks for the
+> flag set startup negotiated", which one `const` plus one writer captures; `push_flags` is the seam
+> the wire form is asserted at. A newtype over `KeyboardEnhancementFlags` would re-wrap a `bitflags`
+> type that already rejects invalid bits; a typestate over push→query→pop would encode an ordering
+> the module docs own and that has exactly one production caller. Migration cost: three call sites,
+> two removed imports, two added `pub use` names; no serde, no behavioural API change.
+>
+> **Tests.** `keyboard_protocol.rs::cyrup_asks_for_disambiguate_and_alternate_keys_and_withholds_event_types`
+> and `::push_flags_writes_the_csi_push_all_three_sites_share` were RED with `DESIRED_FLAGS` reverted
+> to HEAD's `DISAMBIGUATE_ESCAPE_CODES` alone (`left: "\x1b[>1u"`, `right: "\x1b[>5u"`), green after;
+> `::a_terminal_echoing_the_flags_cyrup_pushed_is_read_as_kitty` closes the push/read-back loop;
+> `escape_reassembly.rs::a_split_kitty_alternate_key_sequence_resolves_the_layout_character` guards
+> the newly reachable `unicode:shifted:base` shape (it passes with the flags reverted too, so it is a
+> guard, not a red test). `cargo nextest run -p cyrup-tui` 1387 passed; clippy `-D warnings` and
+> `RUSTDOCFLAGS='-D warnings' cargo doc` clean.
+>
+> **Residual — why this stays open at `low`.** The `pendingKittyPrintableCodepoint` dedup is
+> unported and, per the byte-identity above, unportable while cyrup filters crossterm events instead
+> of the bytes behind them. Its hazard is a terminal/layout quirk (pi observed it on Italian layouts
+> at flags 7) rather than a flag-gated one, so withholding bit 2 does not prove it unreachable — only
+> unobserved on cyrup. Closing it needs the same thing the item's Fix (3) needed and TUI-045
+> deliberately did not build: a byte-level pre-parser owned by cyrup between `read(2)` and
+> crossterm. **No live terminal run was performed this pass** (no kitty/ghostty/WezTerm available in
+> this environment), so the item's `## Verify` live-run requirement is unmet and is the other reason
+> the row is not struck.
 
 **cyrup** — all three push sites push a single flag: `crates/cyrup-tui/src/app/crossterm.rs:55`, `:133`, `:223` — `PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)` (value 1). `rg 'KeyboardEnhancementFlags::' crates/cyrup-tui/src/` returns only those three lines: `REPORT_EVENT_TYPES` (2) and `REPORT_ALTERNATE_KEYS` (4) are pushed nowhere. `keyboard_protocol.rs:8-19` transcribes pi's composite query as `ESC [ > 7 u` and calls the push "the caller's (`PushKeyboardEnhancementFlags`, `crate::App::into_stdout`)" — but the caller pushes 1, so cyrup queries with `CSI ? u` after asking for a different flag set than its own module doc describes. `drain.rs:11-16` compounds it by asserting "With `DISAMBIGUATE_ESCAPE_CODES` pushed, the final Ctrl+D / Ctrl+C … also generates a release report" — release reports require `REPORT_EVENT_TYPES`, which cyrup never pushes. Separately, neither stdin-buffer behaviour that flag 7 makes load-bearing is ported: `rg` across `crates/` finds no equivalent of `pendingKittyPrintableCodepoint`, and crossterm collapses `\x1b\x1b` into a single `Esc` at `crossterm-0.29.0/src/event/sys/unix/parse.rs:76`, clearing the buffer so a following `[27;…u` is decoded character by character as literal text.
 
