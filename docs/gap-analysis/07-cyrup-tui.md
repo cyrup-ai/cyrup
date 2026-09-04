@@ -505,7 +505,7 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | ~~TUI-032~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | `/settings` is missing the `Warnings` and `Thinking level` submenus — **CLOSED 2026-08-14**: sweep 1. |
 | ~~TUI-033~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | `ui.setHeader` / `ui.setFooter` are delivered to the TUI and dropped into fields nothing renders — **CLOSED 2026-08-14**: sweep 1 — CYRUP-DELTA recorded: pi restores the built-in when the FACTORY is `undefined`; cyrup's WIT signature is `set-header(content: string)` with no `undefined`, so the empty string carries "restore the built-in". |
 | ~~TUI-034~~ | ~~medium~~ **CLOSED 2026-09-04** | upstream-drift | L | ~~No markdown-transformer hook — extension transformers and pi's Mermaid renderer both absent~~ — `App::apply_markdown_transformers` (`crates/cyrup-tui/src/app/events.rs:102-140`) calls `ExtensionHost::transform_markdown` from three real sites (`session_bind.rs:214`, `events.rs:75,102`), and a real Mermaid renderer (the `mermaid-text` crate) ships in `markdown/mermaid.rs`, live while streaming, gated by the `markdown.mermaid` setting. |
-| TUI-037 | medium | not-ported | S | `/reload` never persists an implicitly-granted project trust — **re-verified 2026-09-04, unchanged: `app/execute_session.rs:255`'s own comment still says the `; saved project trust` variant "needs the implicit-trust write, which lives in `crates/cyrup`", and no such write was found there.** |
+| ~~TUI-037~~ | ~~medium~~ **CLOSED 2026-09-04** | not-ported | S | ~~`/reload` never persists an implicitly-granted project trust~~ — landed in `0e8c62fa`. `App::maybe_save_implicit_project_trust` (`crates/cyrup-tui/src/app/reload_trust.rs:126`) is the shell of pi's `maybeSaveImplicitProjectTrustAfterReload` (`interactive-mode.ts:4921-4941` @v0.84.4) over the pure `implicit_trust_after_reload` (`:85-102`, outcomes `ImplicitTrustReload::{Keep,Disarm,Persist}` `:64`); the `/reload` arm calls it (`app/execute_session.rs:279`) and selects pi's `; saved project trust` status variant (`:299`, `interactive-mode.ts:6000-6003`); the host arms `autoTrustOnReloadCwd` at the composition root (`crates/cyrup/src/main.rs:672-677`, pi `main.ts:701-704`) → `run_interactive` → `App::set_auto_trust_on_reload_cwd` (`interactive.rs:346`); the store failure is pi's `Warning: Could not save project trust after reload: …`, carried post-swap by `LifecycleEffects::warning` (`app/outcome.rs:104`, `app/channels.rs:181`). **[CYRUP-DELTA]** the write runs BEFORE the rebuild is dispatched, not after as pi's does: cyrup's `/reload` rebuilds the session through the factory and re-decides trust from the store, where pi's `AgentSession.reload` preserves `SettingsManager.projectTrusted` (`resource-loader.ts:404`); the inputs are the same, the store ends the same, and the rebuilt session reads the saved `true` back — the one difference is a reload that then FAILS has already written the entry. Tests: `src/app/reload_trust.rs` (4 decision-table cases) and `src/tests/reload_implicit_trust.rs` (5 App tests through the real runtime + `trust.json` store; `reload_persists_an_implicitly_granted_project_trust`, `…_disarms_without_writing` and `a_store_failure_warns_and_keeps_the_plain_status` were RED against the unwired arm). Closes `TUI-025`'s last residual (the `; saved project trust` variant). |
 | TUI-044 | **FIXED 2026-08-13** | parity-bug | S | ~~`undo()` discards the snapshot's cursor column — `Snapshot::col` is written and never read~~ |
 | TUI-046 | medium | parity-bug | M | cyrup pushes Kitty keyboard flag 1, pi pushes 7 — and neither guard flag 7 requires exists, so raising it alone would duplicate characters and leak CSI-u text — **re-verified 2026-09-04, unchanged: `keyboard_protocol.rs`'s module doc grew a fuller explanation of pi's `CSI > 7 u` push, but all three actual push call sites (`app/crossterm.rs:55,133,223`) still construct `KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES` alone (flag 1). Do not mistake the expanded documentation for a fix.** |
 | ~~TUI-051~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `/reload` never re-reads `keybindings.json`, while the command's help text and its in-source comment both claim it does — **CLOSED 2026-08-14**: sweep 1. |
@@ -1022,9 +1022,70 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 
 **Verify** Markdown unit test: a ` ```mermaid ` fence renders box-drawing output with `mermaidRendering=final` and a plain code block with `off`; a registered transformer that uppercases its input changes the rendered assistant text and does not change tool output.
 
-## TUI-037 — `/reload` never persists an implicitly-granted project trust
+## ~~TUI-037~~ — ~~`/reload` never persists an implicitly-granted project trust~~ **CLOSED 2026-09-04**
 
-**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+> ## CLOSED 2026-09-04 — `0e8c62fa` — `crates/cyrup-tui/src/app/reload_trust.rs`
+>
+> **What landed.** `App::maybe_save_implicit_project_trust` (`reload_trust.rs:126`) is the shell of pi's
+> `maybeSaveImplicitProjectTrustAfterReload` (`interactive-mode.ts:4921-4941` @v0.84.4, upstream commit
+> `38f18be44`): it reads the current session's `cwd`/`home`/`project_trusted`, runs
+> `cyrup_config::trust::has_trust_requiring_resources`, and takes the pure decision
+> `implicit_trust_after_reload(armed, cwd, project_trusted, has_resources, already_saved)`
+> (`:85-102`) → `ImplicitTrustReload::{Keep, Disarm, Persist}` (`:64`) — pi's three exits, named by what the
+> shell does (`Keep` = pi's two early `return false` with the arm kept, `Disarm` = an entry already exists,
+> `Persist` = `trustStore.set(cwd, true)`). The store is opened only after the cheap guards, as pi's is
+> (`:4923-4930`); `Persist` writes through `AgentSession::write_project_trust` — the same seam `/trust`
+> uses — and disarms. The `/reload` arm (`app/execute_session.rs:279-303`) calls it and sets pi's status
+> variant `Reloaded …; saved project trust` (`interactive-mode.ts:6000-6003`), which was `TUI-025`'s last
+> residual. A store failure is pi's `catch` (`:4938-4940`): `Warning: Could not save project trust after
+> reload: {e}` (framed as `showWarning` frames it, `:4264-4266`), the plain status, the arm kept — carried
+> by the new `LifecycleEffects::warning` (`app/outcome.rs:104`) and pushed by `apply_lifecycle_outcome`
+> (`app/channels.rs:181`) AFTER the swap, because `rebind_session` resets the transcript.
+>
+> **Arming.** pi's `autoTrustOnReloadCwd` (`main.ts:701-704`: no `--approve`/`--no-approve` AND no
+> trust-requiring resources at boot → the session cwd) is computed at cyrup's composition root
+> (`crates/cyrup/src/main.rs:672-677`, off the built session's own `cwd`/`home`), threaded through
+> `run_interactive` (`crates/cyrup/src/interactive.rs:210`) to `App::set_auto_trust_on_reload_cwd`
+> (`:346`), and held in `AppState::auto_trust_on_reload_cwd` (`app/state.rs:228`).
+>
+> **[CYRUP-DELTA] — ordering, recorded in the module doc.** pi runs the save AFTER `session.reload()`
+> (`interactive-mode.ts:5995`) and can, because `AgentSession.reload` (`agent-session.ts:2811-2826`)
+> calls `resourceLoader.reload()` with no trust options and that "preserves
+> SettingsManager.projectTrusted" (`resource-loader.ts:404`). cyrup's `/reload` REBUILDS the session
+> (`runtime.rs` `reload` → `factory.build` → `SessionBuilder::build`), which re-runs `decide_trust` from
+> the store — with resources now present and nothing saved, the rebuilt session would fall to the prompt
+> or to untrusted, and a post-rebuild `!isProjectTrusted()` guard would never save. So cyrup decides and
+> writes BEFORE dispatching the rebuild: the inputs are identical (pi's post-reload `isProjectTrusted()`
+> IS the pre-reload value; the resource scan and the store read are filesystem state the reload does not
+> change), the store ends in the same state, and the rebuilt session reads the saved `true` back — the
+> nearest cyrup can come to pi's carried in-memory trust. One observable difference: a reload that then
+> FAILS has already written the entry, where pi would not have. **Design (DESIGN-GUIDANCE, FC/IS +
+> domain enum):** the decision is a pure function over five explicit inputs, the I/O is the shell;
+> `Result<bool, SessionServiceError>` keeps pi's boolean (business outcome) apart from the store failure
+> (technical, → warning). Rejected: a post-rebuild call (dead in cyrup, above); a `SwapCaption::Deferred`
+> caption resolved by the outcome arm (needed only for a post-rebuild call); pushing the warning from the
+> `/reload` arm (wiped by the swap's transcript reset).
+>
+> **Tests.** `src/app/reload_trust.rs` — four decision-table cases. `src/tests/reload_implicit_trust.rs`
+> — five App tests driving `AppCommand::Reload` against a real `AgentSessionRuntime` whose factory carries
+> the `trust.json` store (the production `build_factory` shape), then reading back with `TrustStore`, the
+> rebuilt session's `project_trusted`, and the committed scrollback: the item's own Verify clause
+> (`reload_persists_an_implicitly_granted_project_trust`: store `cwd → Trusted`, status carries
+> `; saved project trust`, rebuilt session trusted, arm dropped), no grant → store untouched, no
+> resources → arm kept, a saved ancestor decision → file byte-identical + disarmed, and a `trust.json`
+> directory → pi's warning + plain status + arm kept. **RED→GREEN established by running the App tests
+> with `execute_session.rs` at HEAD (everything else in place):** 3 failed — `trust.json holds cwd → true:
+> left: None, right: Some(Trusted)`, `pi's warning is missing`, `the arm is dropped once a decision is
+> found` — and the two absence tests passed; all 9 pass after.
+>
+> **Residuals (none blocking).** (1) The pre-rebuild write on a reload that subsequently fails (above,
+> low). (2) Whether cyrup's `/reload` should PRESERVE the in-memory trust decision like pi's
+> `resourceLoader.reload()` — it re-decides through the builder, and for a project that gains resources
+> with no saved decision and the interactive `trust_prompt` wired that could raise the pre-launch
+> `TrustSelector` mid-session; not this row's mechanism, not filed here (session-svc/modes territory,
+> low). (3) `TUI-025`'s row still names this residual as open; its text is the ledger agent's to strike.
+
+**Kind** not-ported · **Severity** ~~medium~~ closed · **Effort** S · **Confidence** confirmed · **CLOSED 2026-09-04**
 
 **cyrup** — `rg 'implicit_project_trust|implicit_trust|save_implicit' crates/ -g '*.rs'` → **zero hits**, and the `session_swapped` arm (`crates/cyrup-tui/src/app/run_arms.rs:138-288`) touches no trust state at all. `C::Reload` (`app/execute_session.rs:241-264`) only sets `pending_swap_status`.
 
