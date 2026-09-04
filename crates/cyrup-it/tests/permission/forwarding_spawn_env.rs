@@ -151,6 +151,7 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         default_acceptance: None,
         name: CHILD_AGENT_NAME.to_string(),
         model: Some(ModelId::from("m1")),
+        model_provider: None,
         fallback_models: Vec::new(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,

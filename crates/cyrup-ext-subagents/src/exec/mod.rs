@@ -568,12 +568,21 @@ fn depth_guard_failure(agent: &AgentConfig, task: &str) -> Option<SingleResult> 
 /// warns (never filters) for out-of-scope FALLBACK candidates. The ladder returned is identical
 /// either way — an out-of-scope fallback is still attempted, exactly as upstream, because
 /// dropping it would silently change which model ran.
+///
+/// SUBA-088: the provider rung is pi's `agent.modelProvider ?? options.preferredModelProvider`
+/// (`runs/foreground/execution.ts:1885` @v0.64.0) — the agent's own `subagents.defaultProvider`
+/// stamp, else the parent session's provider — under which a bare candidate id is qualified to
+/// `provider/id` before it reaches `--model`.
 fn resolve_model_candidates(agent: &AgentConfig, opts: &RunOptions) -> Vec<ModelId> {
     let (candidates, _scope_warnings) = crate::exec::fallback::build_model_candidates_scoped(
         &opts.model_override,
         agent.model.as_ref(),
         &agent.fallback_models,
         &opts.available_models,
+        agent
+            .model_provider
+            .as_ref()
+            .or(opts.preferred_provider.as_ref()),
         opts.model_scope.as_ref(),
     );
     candidates
@@ -1473,6 +1482,7 @@ pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinitio
         extra_fields: std::collections::BTreeMap::new(),
         override_info: None,
         model_source: None,
+        model_provider: None,
     }
 }
 
@@ -1545,6 +1555,65 @@ mod tests {
     use crate::exec::acceptance::AcceptanceStatus;
     use crate::exec::testsupport::{base_opts, sample_agent_config};
     use crate::spawn::depth::DepthEnvelope;
+
+    // ---- SUBA-088: a bare model id is qualified by the provider preference before spawn ----
+
+    /// The launch chain `run_sync` drives — `resolve_model_candidates` (pi `buildModelCandidates`
+    /// with `agent.modelProvider ?? options.preferredModelProvider`, `execution.ts:1885`
+    /// @v0.64.0) into `build_attempt_spawn_plan` — must put `openai-codex/gpt-5` on the child's
+    /// `--model` for a persona whose `model: gpt-5` is bare and whose provider comes from
+    /// `subagents.defaultProvider` (stamped as `model_provider`). Before SUBA-088 the ladder had
+    /// no provider input and the argv carried bare `gpt-5`, leaving the child's own default
+    /// provider to decide.
+    #[test]
+    fn a_bare_persona_model_spawns_qualified_by_the_agents_provider_then_the_parents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        // (a) `subagents.defaultProvider` stamp on the agent wins over the parent's provider.
+        let mut agent = sample_agent_config("gpt-5", &["gpt-5-mini"]);
+        agent.model_provider = Some(cyrup_core::ProviderId::from("openai-codex"));
+        let mut opts = base_opts(dir.path(), &["gpt-5", "gpt-5-mini"]);
+        opts.preferred_provider = Some(cyrup_core::ProviderId::from("anthropic"));
+        let candidates = resolve_model_candidates(&agent, &opts);
+        assert_eq!(
+            candidates,
+            vec![
+                ModelId::from("openai-codex/gpt-5"),
+                ModelId::from("openai-codex/gpt-5-mini")
+            ],
+            "agent.modelProvider is the first rung; every bare rung is qualified by it"
+        );
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &candidates[0],
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let idx = argv
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model present");
+        assert_eq!(argv[idx + 1], "openai-codex/gpt-5");
+
+        // (b) with no agent provider, the PARENT session's provider (pi `currentProvider`) applies.
+        let agent = sample_agent_config("gpt-5", &[]);
+        let candidates = resolve_model_candidates(&agent, &opts);
+        assert_eq!(candidates, vec![ModelId::from("anthropic/gpt-5")]);
+
+        // (c) with neither, the id ships exactly as written — the pre-SUBA-088 argv.
+        opts.preferred_provider = None;
+        let candidates = resolve_model_candidates(&agent, &opts);
+        assert_eq!(candidates, vec![ModelId::from("gpt-5")]);
+    }
 
     // ---- SUBA-075: the progress snapshot reports the model the child REALLY launched with ----
 

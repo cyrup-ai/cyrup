@@ -57,6 +57,7 @@ pub(crate) fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefi
         extra_fields: BTreeMap::new(),
         override_info: None,
         model_source: None,
+        model_provider: None,
     }
 }
 

@@ -801,7 +801,9 @@ pub fn parse_subagent_settings(
     // fails the whole struct with `invalid type: integer \`7\`, expected a string`, which names no
     // field and is useless for finding the offending line in a settings file.
     validate_default_thinking(value)?;
+    validate_default_provider(value)?;
     validate_default_extensions(value)?;
+    validate_override_default_providers(value)?;
     let mut settings: SubagentSettings = serde_json::from_value(value.clone())
         .map_err(|e| SubagentError::MalformedSettings(e.to_string()))?;
     // pi `readSubagentSettings` (`agents.ts:874-881`): `defaultModel` must be a NON-EMPTY string;
@@ -824,6 +826,22 @@ pub fn parse_subagent_settings(
         let trimmed = dt.trim();
         if trimmed.len() != dt.len() {
             settings.default_thinking = Some(trimmed.to_string());
+        }
+    }
+    // SUBA-088 / pi `agents.ts:1150` @v0.64.0: `defaultProvider` is likewise stored trimmed, and
+    // so is each per-agent override's `defaultProvider` (`agents.ts:1088`).
+    if let Some(dp) = settings.default_provider.as_ref() {
+        let trimmed = dp.trim();
+        if trimmed.len() != dp.len() {
+            settings.default_provider = Some(trimmed.to_string());
+        }
+    }
+    for delta in settings.overrides.values_mut() {
+        if let OverrideField::Value(provider) = &delta.default_provider {
+            let trimmed = provider.trim();
+            if trimmed.len() != provider.len() {
+                delta.default_provider = OverrideField::Value(trimmed.to_string());
+            }
         }
     }
     if let Some(de) = settings.default_extensions.as_ref() {
@@ -935,6 +953,65 @@ fn validate_default_thinking(subagents: &serde_json::Value) -> Result<(), Subage
     ))
 }
 
+/// SUBA-088 / pi `readSubagentSettings`'s `defaultProvider` gate (`agents.ts:1147-1153` @v0.64.0),
+/// the same shape as [`validate_default_thinking`]:
+///
+/// ```text
+/// if ("defaultProvider" in subagentsObject) {
+///   if (typeof ... === "string" && ....trim()) defaultProvider = ....trim();
+///   else throw new Error(`... have invalid 'defaultProvider'; expected a non-empty string.`);
+/// }
+/// ```
+///
+/// Presence-gated: `null`, a number, `false` and `"   "` all throw; only an absent key is silent.
+/// Before this gate existed the key deserialized into nothing and was dropped without a word.
+fn validate_default_provider(subagents: &serde_json::Value) -> Result<(), SubagentError> {
+    let Some(value) = subagents.get("defaultProvider") else {
+        return Ok(());
+    };
+    if value.as_str().is_some_and(|s| !s.trim().is_empty()) {
+        return Ok(());
+    }
+    Err(SubagentError::MalformedSettings(
+        "invalid 'defaultProvider'; expected a non-empty string".to_string(),
+    ))
+}
+
+/// SUBA-088 / pi `parseBuiltinOverride`'s `defaultProvider` arm (`agents.ts:1086-1089` @v0.64.0):
+///
+/// ```text
+/// if ("defaultProvider" in input) {
+///   if (input.defaultProvider === false) override.defaultProvider = false;
+///   else if (typeof input.defaultProvider === "string" && input.defaultProvider.trim()) override.defaultProvider = input.defaultProvider.trim();
+///   else throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'defaultProvider'; expected a non-empty string or false.`);
+/// }
+/// ```
+///
+/// Runs against the RAW object because serde's untagged [`OverrideField<String>`] would accept
+/// `""` as a `Value` and a `true` as an `ExplicitClear`, neither of which upstream admits. The file
+/// path upstream interpolates is not in scope here (this function takes only the raw `subagents`
+/// value), so it is dropped exactly as [`validate_default_thinking`] drops it; the agent name is
+/// kept so the offending entry is findable.
+fn validate_override_default_providers(subagents: &serde_json::Value) -> Result<(), SubagentError> {
+    let Some(entries) = subagents.get("agentOverrides").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (name, entry) in entries {
+        let Some(raw) = entry.get("defaultProvider") else {
+            continue;
+        };
+        let valid = raw == &serde_json::Value::Bool(false)
+            || raw.as_str().is_some_and(|s| !s.trim().is_empty());
+        if !valid {
+            return Err(SubagentError::MalformedSettings(format!(
+                "Builtin override '{name}' has invalid 'defaultProvider'; expected a non-empty \
+                 string or false."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// pi `readSubagentSettings`'s `defaultExtensions` gate (`agents.ts:890-897`): the value must be an
 /// ARRAY whose every entry is a non-empty string. An EMPTY array is legal — pi's `.some(...)` guard
 /// passes vacuously — and means "no extensions", which is distinct from an absent key.
@@ -1009,7 +1086,7 @@ pub fn read_subagent_settings_file(path: &Path) -> Result<SubagentSettings, Suba
 /// `716-728`). Resolution (R-SA-012/R-SA-133):
 /// - per-agent `agentOverrides.<name>`: the **project** entry wins over a same-named **user** entry
 ///   (only one is ever applied to a given agent name);
-/// - `defaultModel` / `disableBuiltins` / `disableThinking`: the **project** value wins when
+/// - `defaultModel` / `defaultProvider` / `disableBuiltins` / `disableThinking`: the **project** value wins when
 ///   present, else the **user** value — so a project `disableBuiltins: false` re-enables what a user
 ///   `disableBuiltins: true` disabled, and a project `defaultModel` overrides a user one.
 ///
@@ -1069,6 +1146,9 @@ fn resolve_layered_subagent_settings(
     SubagentSettings {
         overrides,
         default_model: project.default_model.or(user.default_model),
+        // SUBA-088 / pi `resolveSubagentDefaultProvider` (`agents.ts:1242-1249` @v0.64.0) —
+        // project-wins-outright, exactly like `defaultModel`.
+        default_provider: project.default_provider.or(user.default_provider),
         // pi `resolveSubagentDefaultThinking`/`resolveSubagentDefaultExtensions`
         // (`agents.ts:946-973`) — project-wins-outright, exactly like `defaultModel`.
         default_thinking: project.default_thinking.or(user.default_thinking),
@@ -2273,6 +2353,67 @@ mod tests {
         assert!(
             matches!(result, Err(SubagentError::MalformedSettings(msg)) if msg.contains("defaultModel"))
         );
+    }
+
+    /// SUBA-088 / pi `readSubagentSettings` (`agents.ts:1147-1153` @v0.64.0): `defaultProvider`
+    /// is presence-gated and must be a NON-EMPTY string; the stored value is trimmed.
+    #[test]
+    fn parse_subagent_settings_reads_and_trims_default_provider() {
+        let raw = serde_json::json!({ "defaultProvider": "  openai-codex " });
+        let settings = parse_subagent_settings(Some(&raw)).expect("valid settings parse");
+        assert_eq!(settings.default_provider.as_deref(), Some("openai-codex"));
+    }
+
+    /// SUBA-088 / pi `agents.ts:1152` @v0.64.0: a present-but-invalid `defaultProvider` (blank,
+    /// `null`, a number) ABORTS the read with upstream's message rather than being dropped.
+    #[test]
+    fn parse_subagent_settings_rejects_invalid_default_provider_with_upstreams_message() {
+        for raw in [
+            serde_json::json!({ "defaultProvider": "   " }),
+            serde_json::json!({ "defaultProvider": null }),
+            serde_json::json!({ "defaultProvider": 7 }),
+        ] {
+            let result = parse_subagent_settings(Some(&raw));
+            assert!(
+                matches!(&result, Err(SubagentError::MalformedSettings(msg))
+                    if msg == "invalid 'defaultProvider'; expected a non-empty string"),
+                "expected upstream's defaultProvider diagnostic for {raw}, got {result:?}"
+            );
+        }
+    }
+
+    /// SUBA-088 / pi `parseBuiltinOverride` (`agents.ts:1086-1089` @v0.64.0): a per-agent
+    /// `defaultProvider` override is a non-empty string (trimmed) or the literal `false`; anything
+    /// else aborts the read with upstream's message, which names the offending agent.
+    #[test]
+    fn parse_subagent_settings_validates_override_default_provider() {
+        let ok = serde_json::json!({
+            "agentOverrides": {
+                "worker": { "defaultProvider": " openai-codex " },
+                "reviewer": { "defaultProvider": false }
+            }
+        });
+        let settings = parse_subagent_settings(Some(&ok)).expect("valid override parse");
+        assert_eq!(
+            settings.overrides["worker"].default_provider,
+            OverrideField::Value("openai-codex".to_string())
+        );
+        assert_eq!(
+            settings.overrides["reviewer"].default_provider,
+            OverrideField::ExplicitClear
+        );
+        for bad in [
+            serde_json::json!({ "agentOverrides": { "worker": { "defaultProvider": "" } } }),
+            serde_json::json!({ "agentOverrides": { "worker": { "defaultProvider": true } } }),
+            serde_json::json!({ "agentOverrides": { "worker": { "defaultProvider": 3 } } }),
+        ] {
+            let result = parse_subagent_settings(Some(&bad));
+            assert!(
+                matches!(&result, Err(SubagentError::MalformedSettings(msg))
+                    if msg == "Builtin override 'worker' has invalid 'defaultProvider'; expected a non-empty string or false."),
+                "expected upstream's override diagnostic for {bad}, got {result:?}"
+            );
+        }
     }
 
     #[test]

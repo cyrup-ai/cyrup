@@ -21,6 +21,7 @@ pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig
     AgentConfig {
         name: "worker".to_string(),
         model: Some(ModelId::from(model)),
+        model_provider: None,
         fallback_models: fallback.iter().map(|m| ModelId::from(*m)).collect(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,

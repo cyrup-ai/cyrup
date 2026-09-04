@@ -305,6 +305,7 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
         subagents: cyrup_ext_subagents::discovery::types::SubagentSettings {
             overrides,
             default_model: None,
+            default_provider: None,
             // G101 added these two; a profile declares neither.
             default_thinking: None,
             default_extensions: None,
@@ -337,6 +338,7 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
         subagents: cyrup_ext_subagents::discovery::types::SubagentSettings {
             overrides: bogus_overrides,
             default_model: None,
+            default_provider: None,
             // G101 added these two; a profile declares neither.
             default_thinking: None,
             default_extensions: None,

@@ -2,12 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{CancelToken, ModelId, ToolUpdateSink};
+use cyrup_core::{CancelToken, ModelId, ProviderId, ToolUpdateSink};
 
 use crate::background::RunId;
 use crate::discovery::types::{AgentDefinition, AgentReadScope, OutputMode};
 use crate::error::SubagentError;
-use crate::exec::fallback::resolve_model_inheritance;
+use crate::exec::fallback::{provider_of, resolve_model_inheritance};
 use crate::exec::{AgentConfig, RunOptions, SingleResult};
 use crate::extension::EXTENSION_ID;
 use crate::extension::executor::SubagentExecutor;
@@ -62,6 +62,11 @@ struct ResolvedRunAgent {
     available_models: Vec<ModelId>,
     /// The model override that survived the fail-closed `modelScope` gate.
     effective_override: crate::exec::fallback::ModelOverride,
+    /// SUBA-088 — pi `currentProvider = parentModel?.provider` (`subagent-executor.ts:3648`
+    /// @v0.64.0): the REMEMBERED parent model's provider, handed to `run_sync` as
+    /// [`RunOptions::preferred_provider`] (pi's `preferredModelProvider: currentProvider`,
+    /// `:3825`) — the second rung under the agent's own `model_provider`.
+    preferred_provider: Option<ProviderId>,
 }
 
 /// The run-scoped identity, sinks and directories [`SubagentExecutor::resolve_run_channels`]
@@ -118,6 +123,7 @@ struct ForegroundRunOptionsInput<'a> {
     max_thinking: Option<String>,
     available_models: Vec<ModelId>,
     effective_override: crate::exec::fallback::ModelOverride,
+    preferred_provider: Option<ProviderId>,
     fork_context: ForkContext,
     deadline_at: Option<std::time::Instant>,
     /// Borrowed: the same id the caller registers, tears down and returns.
@@ -256,6 +262,7 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            preferred_provider,
         } = self.resolve_run_agent(&req, &cfg, depth).await?;
         let ForegroundRunRequest {
             overrides,
@@ -291,6 +298,7 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            preferred_provider,
             fork_context,
             deadline_at,
             run_id: &run_id,
@@ -406,11 +414,12 @@ impl SubagentExecutor {
         // The `!= Fork` arm is a short-circuit, not a claim: a `Fresh` request returns from
         // `resolve` before the flag is ever read, so there is no reason to walk the registry for
         // an answer nothing will look at.
+        let parent_model = self.remembered_parent_model();
         let force_thinking_off = effective_context != ContextMode::Fork
             || fork_requires_thinking_off(
                 &agent,
                 req.model_override.as_ref(),
-                self.remembered_parent_model().as_ref(),
+                parent_model.as_ref(),
             );
         let fork_context = self
             .resolve_context(req.cwd, effective_context, force_thinking_off)
@@ -504,11 +513,14 @@ impl SubagentExecutor {
         let effective_override = resolve_model_inheritance(
             req.model_override.as_ref(),
             agent_config.model.as_ref(),
-            self.remembered_parent_model().as_ref(),
+            parent_model.as_ref(),
             &mut available_models,
             model_scope.as_ref(),
         )
         .map_err(|violation| SubagentError::ModelOutOfScope(violation.message))?;
+        // SUBA-088 / pi `const currentProvider = parentModel?.provider` (`subagent-executor.ts:3648`
+        // @v0.64.0), from the same remembered parent model the inheritance above used.
+        let preferred_provider = parent_model.as_ref().and_then(provider_of);
 
         Ok(ResolvedRunAgent {
             agent,
@@ -521,6 +533,7 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            preferred_provider,
         })
     }
 
@@ -669,6 +682,7 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            preferred_provider,
             fork_context,
             deadline_at,
             run_id,
@@ -723,7 +737,10 @@ impl SubagentExecutor {
             // process itself inherited via the env, so the bound can only tighten as the tree
             // deepens.
             thinking_ceiling: max_thinking,
-            preferred_provider: None,
+            // SUBA-088: the remembered parent session's provider (pi `preferredModelProvider:
+            // currentProvider`, `subagent-executor.ts:3825` @v0.64.0). `run_sync` consults it only
+            // when the agent carries no `model_provider` of its own.
+            preferred_provider,
             available_models,
             // pi `execute(id, params, signal, ...)` threads the host's own `AbortSignal` into the
             // executor for every mode (`extension/index.ts:498-500` ->
@@ -950,13 +967,16 @@ fn fork_requires_thinking_off(
     ) {
         return true;
     }
-    // pi `agentConfig?.modelProvider ?? parentModel?.provider`. `AgentDefinition` declares no
-    // `modelProvider`, so only the parent rung survives: the provider half of a `provider/id`
-    // parent model, used solely to break a tie when a bare candidate id is offered by more than
-    // one provider.
-    let preferred_provider = parent_model
-        .and_then(|model| model.as_str().split_once('/'))
-        .map(|(provider, _)| provider);
+    // pi `agentConfig?.modelProvider ?? parentModel?.provider` (`subagent-executor.ts:6390`
+    // @v0.64.0): the agent's own `subagents.defaultProvider` stamp (SUBA-088) first, else the
+    // provider half of a `provider/id` parent model — used solely to break a tie when a bare
+    // candidate id is offered by more than one provider.
+    let parent_provider = parent_model.and_then(provider_of);
+    let preferred_provider = agent
+        .model_provider
+        .as_ref()
+        .or(parent_provider.as_ref())
+        .map(ProviderId::as_str);
     // pi resolves the `inherit` sentinel through `resolveEffectiveSubagentModel` BEFORE building
     // candidates (`subagent-executor.ts:5864-5879` @v0.57.0), so it never reaches the predicate
     // upstream. Here it would: discovery hands `model: inherit` straight through as a `ModelId`
@@ -1077,6 +1097,7 @@ mod tests {
             extra_fields: std::collections::BTreeMap::new(),
             override_info: None,
             model_source: None,
+            model_provider: None,
         }
     }
 

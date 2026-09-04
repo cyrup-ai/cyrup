@@ -3317,7 +3317,15 @@ impl ExecSingleStepExecutor {
             // `CYRUP_SUBAGENT_THINKING_CEILING` env var hop 1 wrote, and `run_sync` folds that
             // inherited value in. `None` here is "nothing beyond what the environment says".
             thinking_ceiling: None,
-            preferred_provider: None,
+            // SUBA-088 / pi `currentModelProvider: parentModel?.provider`
+            // (`subagent-executor.ts:1297` @v0.64.0, consumed at `async-execution.ts:930` as
+            // `a.modelProvider ?? ctx.currentModelProvider`): the parent session's provider, split
+            // off the SAME `inherited_session_model` the inheritance rung above used, so a step whose
+            // persona names a bare model id is qualified against it before spawn.
+            preferred_provider: self
+                .inherited_session_model
+                .as_ref()
+                .and_then(crate::exec::fallback::provider_of),
             available_models,
             cancel: ctx.cancel.clone(),
             interrupt: interrupt_token,

@@ -486,6 +486,7 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         default_acceptance: None,
         name: name.to_string(),
         model: Some(ModelId::from("fixture-model")),
+        model_provider: None,
         fallback_models: Vec::new(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,

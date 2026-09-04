@@ -2239,6 +2239,7 @@ mod tests {
             extra_fields: std::collections::BTreeMap::new(),
             override_info: None,
             model_source: None,
+            model_provider: None,
         }
     }
 

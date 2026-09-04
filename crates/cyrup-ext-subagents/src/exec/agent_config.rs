@@ -31,6 +31,12 @@ pub struct AgentConfig {
     /// `agent` classification input and [`crate::exec::acceptance::AcceptanceContract::heuristic_default`].
     pub name: String,
     pub model: Option<ModelId>,
+    /// SUBA-088 — pi `AgentConfig.modelProvider` (`agents.ts:144` @v0.64.0), copied off
+    /// [`AgentDefinition::model_provider`]: the provider this agent's BARE model ids resolve
+    /// against, consumed by `run_sync`'s ladder as `agent.modelProvider ??
+    /// options.preferredModelProvider` (`runs/foreground/execution.ts:1885`) — see
+    /// [`RunOptions::preferred_provider`] for the second rung.
+    pub model_provider: Option<ProviderId>,
     pub fallback_models: Vec<ModelId>,
     /// The agent's frontmatter reasoning level (func-SA §4.1 `AgentDefinition::thinking`) as pi's
     /// OPEN string, applied to the child's `--model` argument as a `:<value>` suffix at spawn time via
@@ -132,6 +138,7 @@ impl AgentConfig {
         Self {
             name: agent.local_name.clone(),
             model: agent.model.clone(),
+            model_provider: agent.model_provider.clone(),
             fallback_models: agent.fallback_models.clone(),
             thinking: agent.thinking.clone(),
             system_prompt_mode: agent.system_prompt_mode,
@@ -187,6 +194,12 @@ pub struct ResolvedAgentPersona {
     /// The agent's local (unqualified) name — exactly [`AgentConfig::name`].
     pub name: String,
     pub model: Option<ModelId>,
+    /// SUBA-088 — the persona's `modelProvider` (see [`AgentConfig::model_provider`]), carried
+    /// across the runner-config hand-off so a background/chain step qualifies its bare ids the
+    /// same way the single-run path does. `#[serde(default)]` keeps an older on-disk config
+    /// deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<ProviderId>,
     pub fallback_models: Vec<ModelId>,
     /// The agent's own frontmatter reasoning level (pi's OPEN string), carried on the resolved persona
     /// so a chain/parallel/background step applies the SAME `:<value>` `--model` suffix the single-run
@@ -292,6 +305,7 @@ impl ResolvedAgentPersona {
         Self {
             name: agent.local_name.clone(),
             model: agent.model.clone(),
+            model_provider: agent.model_provider.clone(),
             fallback_models: agent.fallback_models.clone(),
             thinking: agent.thinking.clone(),
             system_prompt_mode: agent.system_prompt_mode,
@@ -325,6 +339,7 @@ impl ResolvedAgentPersona {
         AgentConfig {
             name: self.name.clone(),
             model: self.model.clone(),
+            model_provider: self.model_provider.clone(),
             fallback_models: self.fallback_models.clone(),
             thinking: self.thinking.clone(),
             system_prompt_mode: self.system_prompt_mode,
@@ -414,6 +429,14 @@ pub struct RunOptions {
     /// cross-session default inside [`crate::exec::run_sync`]; a caller wanting that global-default behavior
     /// resolves it explicitly before constructing this struct.
     pub model_override: ModelOverride,
+    /// SUBA-088 — pi `preferredModelProvider: currentProvider` (`subagent-executor.ts:3825`
+    /// @v0.64.0, `currentProvider = parentModel?.provider` at `:3648`; the async runner's
+    /// `ctx.currentModelProvider`, `:1297`): the PARENT session's provider, the second rung of
+    /// `agent.modelProvider ?? options.preferredModelProvider` (`execution.ts:1885`) under which
+    /// `run_sync` qualifies a BARE candidate id before spawn
+    /// ([`crate::exec::fallback::build_model_candidates`]). Derived from the remembered parent
+    /// model with [`crate::exec::fallback::provider_of`]; `None` (headless / no live session)
+    /// leaves a bare id for the child to resolve, exactly as before this field was consumed.
     pub preferred_provider: Option<ProviderId>,
     pub available_models: Vec<ModelId>,
     /// Hard-abort cancellation, raced independently of `interrupt` (arch-SA §5.1).
@@ -766,6 +789,7 @@ mod tests {
         let persona = ResolvedAgentPersona {
             name: "reviewer".to_string(),
             model: Some(ModelId::from("reviewer-model")),
+            model_provider: None,
             fallback_models: vec![ModelId::from("backup-model")],
             thinking: Some("high".to_string()),
             system_prompt_mode: SystemPromptMode::Append,
@@ -809,6 +833,7 @@ mod tests {
         let persona = ResolvedAgentPersona {
             name: "reviewer".to_string(),
             model: Some(ModelId::from("reviewer-model")),
+            model_provider: None,
             fallback_models: vec![ModelId::from("backup-model")],
             thinking: Some("high".to_string()),
             system_prompt_mode: SystemPromptMode::Append,

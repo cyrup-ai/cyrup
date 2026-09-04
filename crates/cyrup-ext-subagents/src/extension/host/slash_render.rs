@@ -475,6 +475,7 @@ mod tests {
         ResolvedAgentPersona {
             name: name.to_string(),
             model: None,
+            model_provider: None,
             fallback_models: Vec::new(),
             thinking: None,
             system_prompt_mode: crate::discovery::types::SystemPromptMode::Replace,

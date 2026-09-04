@@ -303,6 +303,7 @@ fn build_definition(
         extra_fields: BTreeMap::new(),
         override_info: None,
         model_source: None,
+        model_provider: None,
     }
 }
 
@@ -407,6 +408,7 @@ fn merge_fields(
         extra_fields: existing.extra_fields.clone(),
         override_info: existing.override_info.clone(),
         model_source: existing.model_source,
+        model_provider: existing.model_provider.clone(),
     }
 }
 

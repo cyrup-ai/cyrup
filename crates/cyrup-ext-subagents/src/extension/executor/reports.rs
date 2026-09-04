@@ -185,9 +185,21 @@ impl SubagentExecutor {
         // pi `ctx.model?.provider` (agent-management.ts:810) / the `ParentModel` a `model: undefined`
         // (or the `"inherit"` sentinel) resolves to (`resolveSubagentModelOverride`,
         // model-fallback.ts:196-220): both split off the SAME live `provider/id` string.
-        let preferred_provider = current_model
+        //
+        // SUBA-088: this is only the SECOND rung — every resolution below passes
+        // `agent.modelProvider ?? preferredProvider` (`agent-management.ts:1012,1025,1050`
+        // @v0.64.0), so an agent stamped by `subagents.defaultProvider` resolves its bare id
+        // against that provider rather than the session's.
+        let session_provider = current_model
             .and_then(|m| m.split_once('/'))
             .map(|(provider, _)| provider);
+        let provider_for = |agent: &AgentDefinition| -> Option<String> {
+            agent
+                .model_provider
+                .as_ref()
+                .map(|provider| provider.as_str().to_string())
+                .or_else(|| session_provider.map(str::to_string))
+        };
         let parent_model = current_model.and_then(|m| m.split_once('/'));
         let available_models = registry_available_models();
 
@@ -239,11 +251,12 @@ impl SubagentExecutor {
             };
 
             let requested_model_str = agent.model.as_ref().map(ModelId::as_str);
+            let preferred_provider = provider_for(agent);
             let resolved_model = resolve_subagent_model_override(
                 requested_model_str,
                 parent_model,
                 &available_models,
-                preferred_provider,
+                preferred_provider.as_deref(),
             );
             let mut lines = vec![
                 "Builtin subagent model".to_string(),
@@ -308,11 +321,12 @@ impl SubagentExecutor {
                 continue;
             };
             let requested_model_str = agent.model.as_ref().map(ModelId::as_str);
+            let preferred_provider = provider_for(agent);
             let resolved_model = resolve_subagent_model_override(
                 requested_model_str,
                 parent_model,
                 &available_models,
-                preferred_provider,
+                preferred_provider.as_deref(),
             );
             let disabled_suffix = if agent.disabled == Some(true) {
                 "; disabled"

@@ -15,7 +15,7 @@
 //! pi-subagents instances in one process never see each other's agents and `clearRuntimeAgentsForPi`
 //! (`:400-402`) drops exactly one owner's records. cyrup has no `globalThis`; the same "per owning
 //! runtime" scope is one [`RuntimeAgentRegistry`] value owned by each
-//! [`crate::extension::executor::SubagentExecutor`] (`[CYRUP-DELTA]` in mechanism only —
+//! [`crate::extension::SubagentExecutor`] (`[CYRUP-DELTA]` in mechanism only —
 //! the partition, the caps and every check are upstream's). [`RUNTIME_AGENT_REGISTRY_KEY`] is
 //! kept as a documented constant for traceability; nothing is keyed on it.
 //!
@@ -1047,6 +1047,7 @@ fn to_agent_definition(
         extra_fields: BTreeMap::new(),
         override_info: None,
         model_source: None,
+        model_provider: None,
     };
     assert_no_identity_collisions(
         std::slice::from_ref(&agent),

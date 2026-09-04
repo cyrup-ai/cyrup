@@ -40,7 +40,7 @@
 //! `MessageEnd` event), and per-attempt errors are plain `String`s (the orchestrator's own
 //! classification of a failed attempt, not a re-typed provider error).
 
-use cyrup_core::{ModelId, Usage};
+use cyrup_core::{ModelId, ProviderId, Usage};
 
 use crate::exec::model_scope::{
     ModelScopeConfig, ModelScopeSeverity, ModelScopeViolation, ModelSource, check_model_scope,
@@ -119,6 +119,22 @@ impl ModelOverride {
 /// provider catalog, which is not this function's concern; `available_models` here is assumed to
 /// already be the caller's fully resolved, non-empty-when-meaningful allowlist).
 ///
+/// **`preferred_provider` (SUBA-088)** — pi `buildModelCandidates`'s 4th parameter
+/// (`runs/shared/model-fallback.ts:412-418` @v0.64.0), which every caller passes as
+/// `agent.modelProvider ?? options.preferredModelProvider` (`runs/foreground/execution.ts:1885`,
+/// `runs/background/async-execution.ts:930`) — the agent's own `subagents.defaultProvider` stamp
+/// first, else the PARENT session's provider. Upstream threads it into
+/// `resolveSubagentModelCandidate` (`:207-218`), where a BARE id (no `provider/` prefix) that
+/// several registry providers offer resolves to the preferred provider's `fullId`. This crate's
+/// launch path holds no registry here — `available_models` is the persona's own list, and the
+/// bare id is forwarded verbatim as `--model <id>` for the CHILD to resolve — so the preference is
+/// applied the only way it can reach the child: each surviving bare candidate is QUALIFIED to
+/// `{provider}/{id}` by [`qualify_model_candidate`] before it is deduplicated. A candidate that
+/// already names a provider is never rewritten (upstream's "never switches providers for a
+/// qualified query"), and `None` leaves every id exactly as it was. The allowlist is consulted on
+/// BOTH spellings so a persona-derived list (bare) and an inherited parent model (qualified) each
+/// keep matching.
+///
 /// This function never fails and never panics: an empty result (e.g. no override, no agent model,
 /// empty fallback list, or every candidate filtered out by `available_models`) is a legitimate,
 /// representable outcome — [`run_fallback_ladder`]'s caller is responsible for treating an empty
@@ -129,6 +145,7 @@ pub fn build_model_candidates(
     agent_primary_model: Option<&ModelId>,
     agent_fallback_models: &[ModelId],
     available_models: &[ModelId],
+    preferred_provider: Option<&ProviderId>,
 ) -> Vec<ModelId> {
     let mut candidates: Vec<ModelId> = Vec::new();
 
@@ -142,15 +159,56 @@ pub fn build_model_candidates(
 
     let mut seen: Vec<ModelId> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        if seen.contains(&candidate) {
+        let qualified = qualify_model_candidate(&candidate, preferred_provider);
+        if seen.contains(&qualified) {
             continue;
         }
-        if !available_models.contains(&candidate) {
+        if !available_models.contains(&candidate) && !available_models.contains(&qualified) {
             continue;
         }
-        seen.push(candidate);
+        seen.push(qualified);
     }
     seen
+}
+
+/// SUBA-088: the provider half of a `provider/id` model id, or `None` for a bare id (or one whose
+/// halves are not both non-empty — pi `normalizeParentModel`'s rule, `model-fallback.ts:33-39`,
+/// under which `""`, `"anthropic"`, `"/sonnet"` and `"anthropic/"` all yield no parent model).
+/// This is how the PARENT session's provider is derived for `preferredModelProvider` (pi
+/// `currentProvider = parentModel?.provider`, `subagent-executor.ts:3648,3825` @v0.64.0): cyrup's
+/// [`ModelId`] carries the joined `"{provider}/{id}"`, so the provider is split back off it.
+#[must_use]
+pub fn provider_of(model: &ModelId) -> Option<ProviderId> {
+    model
+        .as_str()
+        .split_once('/')
+        .filter(|(provider, id)| !provider.is_empty() && !id.is_empty())
+        .map(|(provider, _)| ProviderId::from(provider))
+}
+
+/// SUBA-088: qualify a BARE model id with `preferred_provider` — `gpt-5` under `openai-codex`
+/// becomes `openai-codex/gpt-5`; `gpt-5:high` keeps its thinking suffix
+/// (`openai-codex/gpt-5:high`). An id that already carries a `/` is returned unchanged (upstream
+/// treats a qualified query as pinned to its provider and never rewrites it), and so is every id
+/// when no provider is preferred. A pure decision over its two inputs; the launch shell applies it.
+///
+/// Documented inference, not upstream text: pi only treats a `/` prefix as a provider when that
+/// prefix is a REGISTERED provider (`splitQualifiedModelQuery`, `model-fallback.ts:95-113`), so a
+/// Hugging Face `owner/name` id with no registered `owner` would still be a bare id there. With no
+/// registry in hand this function treats any `/` as a provider prefix — the same convention the
+/// fork-thinking predicate and the `models` report already use for the parent model.
+#[must_use]
+pub fn qualify_model_candidate(
+    model: &ModelId,
+    preferred_provider: Option<&ProviderId>,
+) -> ModelId {
+    let raw = model.as_str();
+    match preferred_provider {
+        Some(provider) if !raw.contains('/') && !raw.trim().is_empty() => {
+            ModelId::from(format!("{}/{raw}", provider.as_str()))
+        }
+        _ => model.clone(),
+    }
 }
 
 /// [`build_model_candidates`] plus `subagents.modelScope` enforcement over the ladder's
@@ -176,6 +234,7 @@ pub fn build_model_candidates_scoped(
     agent_primary_model: Option<&ModelId>,
     agent_fallback_models: &[ModelId],
     available_models: &[ModelId],
+    preferred_provider: Option<&ProviderId>,
     scope: Option<&ModelScopeConfig>,
 ) -> (Vec<ModelId>, Vec<ModelScopeViolation>) {
     let candidates = build_model_candidates(
@@ -183,6 +242,7 @@ pub fn build_model_candidates_scoped(
         agent_primary_model,
         agent_fallback_models,
         available_models,
+        preferred_provider,
     );
     let mut violations = Vec::new();
     if scope.is_some_and(ModelScopeConfig::is_armed) {
@@ -1336,6 +1396,7 @@ mod tests {
             Some(&model("a")),
             &[model("b")],
             &available,
+            None,
         );
         assert_eq!(
             candidates,
@@ -1352,6 +1413,7 @@ mod tests {
             Some(&model("a")),
             &[model("b")],
             &available,
+            None,
         );
         assert_eq!(candidates, vec![model("a"), model("b")]);
     }
@@ -1366,6 +1428,7 @@ mod tests {
             Some(&model("b")),
             &[model("a"), model("b")],
             &available,
+            None,
         );
         assert_eq!(
             candidates,
@@ -1382,6 +1445,7 @@ mod tests {
             Some(&model("a")),
             &[model("a"), model("b"), model("a"), model("c")],
             &available,
+            None,
         );
         assert_eq!(candidates, vec![model("a"), model("b"), model("c")]);
     }
@@ -1394,6 +1458,7 @@ mod tests {
             Some(&model("b")),
             &[model("c")],
             &available,
+            None,
         );
         assert_eq!(
             candidates,
@@ -1409,14 +1474,126 @@ mod tests {
             Some(&model("b")),
             &[model("c")],
             &[], // nothing available
+            None,
         );
         assert!(candidates.is_empty());
     }
 
     #[test]
     fn candidate_ladder_with_no_override_and_no_agent_model_is_empty() {
-        let candidates = build_model_candidates(&ModelOverride::Inherit, None, &[], &[model("a")]);
+        let candidates =
+            build_model_candidates(&ModelOverride::Inherit, None, &[], &[model("a")], None);
         assert!(candidates.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-088: preferred provider qualifies BARE candidates (pi `buildModelCandidates`'s 4th
+    // parameter -> `resolveSubagentModelCandidate(model, available, preferredProvider)`)
+    // ---------------------------------------------------------------------------------------
+
+    /// pi `execution.ts:1885` `agent.modelProvider ?? options.preferredModelProvider`: the agent's
+    /// own provider is what the caller passes, and a bare id lands on the child as
+    /// `provider/id`. Fails before SUBA-088: the ladder had no provider input and forwarded `gpt-5`
+    /// verbatim.
+    #[test]
+    fn bare_candidate_is_qualified_by_the_preferred_provider() {
+        let available = vec![model("gpt-5"), model("gpt-5-mini:high")];
+        let provider = ProviderId::from("openai-codex");
+        let candidates = build_model_candidates(
+            &ModelOverride::Inherit,
+            Some(&model("gpt-5")),
+            &[model("gpt-5-mini:high")],
+            &available,
+            Some(&provider),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                model("openai-codex/gpt-5"),
+                model("openai-codex/gpt-5-mini:high")
+            ],
+            "every bare id is qualified; a thinking suffix rides along"
+        );
+    }
+
+    /// A qualified id is pinned to its provider (upstream never switches providers for a qualified
+    /// query), and with no preference nothing is rewritten — the pre-SUBA-088 ladder byte for byte.
+    #[test]
+    fn qualified_candidates_and_no_preference_are_left_untouched() {
+        let available = vec![model("anthropic/claude-opus-4-6"), model("gpt-5")];
+        let provider = ProviderId::from("openai-codex");
+        let candidates = build_model_candidates(
+            &ModelOverride::Inherit,
+            Some(&model("anthropic/claude-opus-4-6")),
+            &[model("gpt-5")],
+            &available,
+            Some(&provider),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                model("anthropic/claude-opus-4-6"),
+                model("openai-codex/gpt-5")
+            ]
+        );
+        let untouched = build_model_candidates(
+            &ModelOverride::Inherit,
+            Some(&model("anthropic/claude-opus-4-6")),
+            &[model("gpt-5")],
+            &available,
+            None,
+        );
+        assert_eq!(
+            untouched,
+            vec![model("anthropic/claude-opus-4-6"), model("gpt-5")]
+        );
+    }
+
+    /// Dedup runs on the QUALIFIED spelling (pi's `seen` set holds the normalized id), so an
+    /// explicit `openai-codex/gpt-5` override and the persona's bare `gpt-5` are one rung; and the
+    /// allowlist accepts either spelling so an inherited (qualified) parent model still passes.
+    #[test]
+    fn qualification_dedups_against_the_qualified_spelling_and_keeps_qualified_allowlist_entries() {
+        let provider = ProviderId::from("openai-codex");
+        let available = vec![model("gpt-5"), model("openai-codex/gpt-5")];
+        let candidates = build_model_candidates(
+            &ModelOverride::Explicit(model("openai-codex/gpt-5")),
+            Some(&model("gpt-5")),
+            &[],
+            &available,
+            Some(&provider),
+        );
+        assert_eq!(candidates, vec![model("openai-codex/gpt-5")]);
+    }
+
+    /// `provider_of` is pi `normalizeParentModel`'s two-non-empty-halves rule applied to the joined
+    /// `provider/id` form; `qualify_model_candidate` never touches a blank or qualified id.
+    #[test]
+    fn provider_of_and_qualify_follow_the_parent_model_rules() {
+        assert_eq!(
+            provider_of(&model("anthropic/claude-opus-4-6")),
+            Some(ProviderId::from("anthropic"))
+        );
+        assert_eq!(provider_of(&model("gpt-5")), None);
+        assert_eq!(provider_of(&model("/sonnet")), None);
+        assert_eq!(provider_of(&model("anthropic/")), None);
+        let provider = ProviderId::from("groq");
+        assert_eq!(
+            qualify_model_candidate(&model("llama-4"), Some(&provider)),
+            model("groq/llama-4")
+        );
+        assert_eq!(
+            qualify_model_candidate(&model("groq/llama-4"), Some(&provider)),
+            model("groq/llama-4")
+        );
+        assert_eq!(
+            qualify_model_candidate(&model(""), Some(&provider)),
+            model("")
+        );
+        assert_eq!(
+            qualify_model_candidate(&model("llama-4"), None),
+            model("llama-4")
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1455,8 +1632,13 @@ mod tests {
             available_models.contains(&inherited),
             "the inherited model must be added to available_models so the allowlist filter keeps it"
         );
-        let candidates =
-            build_model_candidates(&ov, persona_model, &persona_fallbacks, &available_models);
+        let candidates = build_model_candidates(
+            &ov,
+            persona_model,
+            &persona_fallbacks,
+            &available_models,
+            None,
+        );
         assert_eq!(
             candidates,
             vec![inherited],
@@ -1474,7 +1656,7 @@ mod tests {
         let ov =
             resolve_model_inheritance(None, None, Some(&inherited), &mut available_models, None)
                 .expect("no scope configured");
-        let candidates = build_model_candidates(&ov, None, &[], &available_models);
+        let candidates = build_model_candidates(&ov, None, &[], &available_models, None);
         assert!(!candidates.is_empty());
         assert_eq!(candidates, vec![inherited]);
     }
@@ -1494,7 +1676,7 @@ mod tests {
         )
         .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Explicit(per_call.clone()));
-        let candidates = build_model_candidates(&ov, None, &[], &available_models);
+        let candidates = build_model_candidates(&ov, None, &[], &available_models, None);
         assert_eq!(
             candidates.first(),
             Some(&per_call),
@@ -1522,7 +1704,7 @@ mod tests {
         )
         .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Inherit);
-        let candidates = build_model_candidates(&ov, Some(&persona), &[], &available_models);
+        let candidates = build_model_candidates(&ov, Some(&persona), &[], &available_models, None);
         assert_eq!(
             candidates.first(),
             Some(&persona),
@@ -1547,7 +1729,7 @@ mod tests {
             available_models, fallbacks,
             "no inherited model may be added when there is no host"
         );
-        let candidates = build_model_candidates(&ov, None, &fallbacks, &available_models);
+        let candidates = build_model_candidates(&ov, None, &fallbacks, &available_models, None);
         assert_eq!(
             candidates, fallbacks,
             "the ladder is exactly the persona fallback list"
@@ -1559,7 +1741,7 @@ mod tests {
         let ov = resolve_model_inheritance(None, None, None, &mut empty_avail, None)
             .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Inherit);
-        assert!(build_model_candidates(&ov, None, &[], &empty_avail).is_empty());
+        assert!(build_model_candidates(&ov, None, &[], &empty_avail, None).is_empty());
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1594,12 +1776,14 @@ mod tests {
             Some(&primary),
             &fallbacks,
             &available,
+            None,
         );
         let (policed, violations) = build_model_candidates_scoped(
             &ModelOverride::Inherit,
             Some(&primary),
             &fallbacks,
             &available,
+            None,
             Some(&scope),
         );
 
@@ -1631,6 +1815,7 @@ mod tests {
             Some(&primary),
             &[],
             &available,
+            None,
             Some(&armed_scope(&["anthropic/*"])),
         );
         assert_eq!(candidates, vec![primary]);
@@ -2101,7 +2286,7 @@ mod tests {
             "the sentinel is a request, never an allowlisted model"
         );
         assert_eq!(
-            build_model_candidates(&resolved, Some(&persona), &[], &available),
+            build_model_candidates(&resolved, Some(&persona), &[], &available, None),
             vec![persona],
             "the child is spawned with `--model <the agent's model>`, never `--model inherit`"
         );
@@ -2126,7 +2311,7 @@ mod tests {
 
         assert_eq!(resolved, ModelOverride::Explicit(parent.clone()));
         assert_eq!(
-            build_model_candidates(&resolved, Some(&persona), &[], &available),
+            build_model_candidates(&resolved, Some(&persona), &[], &available, None),
             vec![parent, persona],
             "the parent model leads; the agent's own model stays as the next rung"
         );
@@ -2150,7 +2335,7 @@ mod tests {
 
         assert_eq!(resolved, ModelOverride::Explicit(persona.clone()));
         assert_eq!(
-            build_model_candidates(&resolved, Some(&persona), &[], &available),
+            build_model_candidates(&resolved, Some(&persona), &[], &available, None),
             vec![persona]
         );
     }
@@ -2180,6 +2365,7 @@ mod tests {
             Some(&sentinel),
             std::slice::from_ref(&fallback),
             &available,
+            None,
         );
         assert_eq!(ladder, vec![parent, fallback]);
         assert!(

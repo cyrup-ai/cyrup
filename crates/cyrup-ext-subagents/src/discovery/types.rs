@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-use cyrup_core::ModelId;
+use cyrup_core::{ModelId, ProviderId};
 
 use crate::fork_context::ContextMode;
 
@@ -557,18 +557,17 @@ pub struct AgentOverrideInfo {
 /// (`agents.ts:80-103`), under the same JSON key.
 ///
 /// **This is NOT the complete set.** pi declares 22 override keys at v0.43.0; the fields below model
-/// 18 of them, plus the two keys pi added in v0.62.0 (`excludeTools`/`allowNestedSubagents`,
-/// SUBA-092), and 4 are unmodeled. An earlier revision of this doc claimed field-for-field
+/// 19 of them, plus the two keys pi added in v0.62.0 (`excludeTools`/`allowNestedSubagents`,
+/// SUBA-092), and 3 are unmodeled. An earlier revision of this doc claimed field-for-field
 /// completeness — it was wrong, and the claim is retracted rather than softened, because "pi has no
 /// others" is exactly the sentence that stops a reader from checking. Keep the arithmetic here
-/// honest: a wrong census misleads in the same way the completeness claim did.
+/// honest: a wrong census misleads in the same way the completeness claim did. (`defaultProvider`
+/// left this list with SUBA-088 — see [`Self::default_provider`].)
 ///
-/// THREE of the four are unmodeled because this crate's [`AgentDefinition`] has no field for them to
+/// TWO of the three are unmodeled because this crate's [`AgentDefinition`] has no field for them to
 /// land in, and modeling them anyway would produce a settings key that parses and is then silently
 /// dropped — which, for an override delta, is indistinguishable from the setting not working at all:
 ///
-/// - `defaultProvider?: string | false` — pi `AgentConfig.modelProvider`; no counterpart here
-///   (this crate resolves a provider from the [`cyrup_core::ModelId`] itself).
 /// - `fast?: boolean` — pi `AgentConfig.fast`; no counterpart here.
 /// - `acceptanceRole?: AcceptanceRole | false` — pi `AgentConfig.acceptanceRole`. The definition
 ///   DOES carry it now ([`AgentDefinition::acceptance_role`], SUBA-082's frontmatter half), but
@@ -577,7 +576,7 @@ pub struct AgentOverrideInfo {
 ///   (`applyAgentOverride`, `agents.ts` @v0.64.0), and that three-state (`unset`/`role`/`false`)
 ///   needs its own field.
 ///
-/// The FOURTH, `outputMode?: OutputMode`, is a different case: it IS representable — this crate
+/// The THIRD, `outputMode?: OutputMode`, is a different case: it IS representable — this crate
 /// merges pi's independent `output` (a path string) and `outputMode` fields into a single
 /// [`OutputSpec`], so its target is [`OutputSpec::mode`] — and is unmodeled only because it fell
 /// outside the scope that added the other five. Note the consequence for [`Self::output`], which is
@@ -639,6 +638,15 @@ pub struct AgentOverrideConfig {
     pub model: OverrideField<String>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub fallback_models: OverrideField<Vec<String>>,
+    /// SUBA-088 — pi `defaultProvider?: string | false` (`agents.ts:90` @v0.64.0), parsed at
+    /// `agents.ts:1086-1089` (a non-empty string, trimmed, or the literal `false`; anything else
+    /// aborts the read — that gate lives in [`crate::discovery::parse_subagent_settings`], since
+    /// serde's derive would silently accept `""`). Applied at `agents.ts:1387-1390`: a string SETS
+    /// [`AgentDefinition::model_provider`], a `false` DELETES it — including one stamped by
+    /// `subagents.defaultProvider`, which runs first. Note the key asymmetry: the settings key is
+    /// `defaultProvider`, the definition field it lands in is pi's `modelProvider`.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub default_provider: OverrideField<String>,
     /// pi's `subagents.overrides.<name>.thinking` (`agents.ts:64,596,1011` @v0.43.0) is a `string | false`:
     /// an OPEN reasoning-level string (`"off"`, `"high"`, or any future/provider-specific value),
     /// or the literal `false` (explicit-clear). Modeled as `OverrideField<String>` — NOT a closed
@@ -730,6 +738,7 @@ impl AgentOverrideConfig {
             || self.default_reads.is_present()
             || self.model.is_present()
             || self.fallback_models.is_present()
+            || self.default_provider.is_present()
             || self.thinking.is_present()
             || self.system_prompt_mode.is_present()
             || self.inherit_project_context.is_present()
@@ -762,6 +771,15 @@ pub struct SubagentSettings {
     pub overrides: BTreeMap<String, AgentOverrideConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// SUBA-088 — pi's `subagents.defaultProvider` (`agents.ts:192` @v0.64.0): the provider a
+    /// subagent's BARE model id (one with no `provider/` prefix) is resolved against, stamped as
+    /// [`AgentDefinition::model_provider`] onto every agent that has not pinned its own
+    /// (`applySubagentDefaultModel`, `agents.ts:1266-1279` — including agents that DO pin a
+    /// `model`). Project scope wins outright over user scope (`resolveSubagentDefaultProvider`,
+    /// `agents.ts:1242-1249`). Validated as a NON-EMPTY string and stored trimmed
+    /// (`agents.ts:1147-1153`); a malformed value MUST abort discovery (R-SA-009).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
     /// pi's `subagents.defaultThinking` (`agents.ts:164`) — a crate-wide reasoning-level default
     /// filled into every agent whose own `thinking` is unset (`applySubagentDefaultThinking`,
     /// `agents.ts:955-964`). Validated as a NON-EMPTY string and stored trimmed
@@ -1045,6 +1063,17 @@ pub struct AgentDefinition {
     /// orchestrator itself.
     pub subagent_only_extensions: Vec<String>,
     pub model: Option<ModelId>,
+    /// SUBA-088 — pi `AgentConfig.modelProvider?: string` (`agents.ts:144` @v0.64.0): the provider
+    /// this agent's BARE model ids (`model`/`fallbackModels` entries with no `provider/` prefix,
+    /// and a bare per-call override) resolve against. NOT a frontmatter key — pi's agent-file
+    /// parser never reads it; it arrives only from `subagents.defaultProvider`
+    /// (`applySubagentDefaultModel`, `agents.ts:1266-1279`, which stamps it even onto an agent that
+    /// pins its own `model`) or a per-agent `agentOverrides.<name>.defaultProvider` (`:1387-1390`,
+    /// where `false` clears it). Consumed as `agent.modelProvider ?? options.preferredModelProvider`
+    /// at the ladder (`runs/foreground/execution.ts:1885`) — see
+    /// [`crate::exec::fallback::build_model_candidates`] — and by the `models` report
+    /// (`agent-management.ts:1012`). `None` defers to the parent session's provider.
+    pub model_provider: Option<ProviderId>,
     pub fallback_models: Vec<ModelId>,
     /// The agent's own frontmatter `thinking` value, held as pi's OPEN reasoning-level string
     /// (`AgentConfig.thinking?: string`, `agents.ts:64,86,126` @v0.43.0) rather than a closed
@@ -1506,6 +1535,7 @@ mod tests {
             extra_fields: BTreeMap::new(),
             override_info: None,
             model_source: None,
+            model_provider: None,
         }
     }
 

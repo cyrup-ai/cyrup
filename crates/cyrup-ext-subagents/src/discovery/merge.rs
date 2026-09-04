@@ -154,8 +154,9 @@ pub fn discover_and_merge(
 /// read, running them here over the already-merged winner (dispatched by `agent.source`) is
 /// observably identical — and the surviving winner is the only agent whose provenance is visible:
 ///
-/// - `applySubagentDefaultModel` (`agents.ts:935-944`): fill every model-less agent from the
-///   resolved (project-over-user) `defaultModel`.
+/// - `applySubagentDefaultModel` (`agents.ts:935-944`; `:1266-1279` @v0.64.0): fill every
+///   model-less agent from the resolved (project-over-user) `defaultModel`, and (SUBA-088) stamp
+///   the resolved `defaultProvider` as `model_provider` onto every agent that has not pinned one.
 /// - `applyBuiltinOverrides` (`agents.ts:1039-1092`): for each [`AgentSource::Builtin`] agent, in
 ///   pi's exact branch order — project override ▷ project bulk-disable ▷ user override ▷ user
 ///   bulk-disable ▷ none — then the `disableThinking` clear (BUILTINS ONLY, skipped when the
@@ -171,7 +172,11 @@ pub fn apply_overrides(
     // applySubagentDefaultModel: resolve the winning defaultModel (project scope wins when the
     // project scope exists and declares one), then fill every model-less agent BEFORE per-agent
     // overrides run so an explicit `agentOverrides.<name>.model` still wins by overwriting it.
-    apply_default_model(merged, resolve_default_model(settings).as_deref());
+    apply_default_model(
+        merged,
+        resolve_default_model(settings).as_deref(),
+        resolve_default_provider(settings).as_deref(),
+    );
     // applySubagentDefaults (agents.ts:986-996) runs model -> thinking -> extensions, all three
     // BEFORE per-agent overrides, and all three fill-only-if-unset.
     apply_default_thinking(merged, resolve_default_thinking(settings).as_deref());
@@ -232,20 +237,53 @@ fn resolve_default_model(settings: &LayeredOverrideSettings) -> Option<String> {
     settings.user.default_model.clone()
 }
 
-/// pi `applySubagentDefaultModel` (`agents.ts:935-944`): fill every agent that has no resolved
-/// `model` from the (already project-over-user resolved) `defaultModel`, stamping
-/// [`AgentModelSourceInfo::SettingsDefault`] provenance so management/`/subagents-doctor` surfaces
-/// can report *why* the model resolved that way. Runs before per-agent overrides so an explicit
-/// `agentOverrides.<name>.model` still wins by overwriting the filled default. A `None` default is
-/// a no-op, leaving a frontmatter-model agent's `model_source` untouched.
-fn apply_default_model(merged: &mut HashMap<String, AgentDefinition>, default_model: Option<&str>) {
-    let Some(dm) = default_model else {
+/// SUBA-088 / pi `resolveSubagentDefaultProvider` (`agents.ts:1242-1249` @v0.64.0): the
+/// project-scope `defaultProvider` wins when the project scope exists and declares one, else the
+/// user-scope value (or `None`) — the same shape as [`resolve_default_model`].
+fn resolve_default_provider(settings: &LayeredOverrideSettings) -> Option<String> {
+    if settings.project_settings_path.is_some()
+        && let Some(dp) = settings.project.default_provider.as_ref()
+    {
+        return Some(dp.clone());
+    }
+    settings.user.default_provider.clone()
+}
+
+/// pi `applySubagentDefaultModel` (`agents.ts:935-944`; `:1266-1279` @v0.64.0): fill every agent
+/// that has no resolved `model` from the (already project-over-user resolved) `defaultModel`,
+/// stamping [`AgentModelSourceInfo::SettingsDefault`] provenance so management/`/subagents-doctor`
+/// surfaces can report *why* the model resolved that way. Runs before per-agent overrides so an
+/// explicit `agentOverrides.<name>.model` still wins by overwriting the filled default. A `None`
+/// default is a no-op, leaving a frontmatter-model agent's `model_source` untouched.
+///
+/// SUBA-088: the same pass stamps `default_provider` as [`AgentDefinition::model_provider`].
+/// Upstream's guard is
+/// `if (agent.model !== undefined && (agent.modelProvider !== undefined || !defaultProvider)) return agent;`
+/// (`:1269`) — so an agent that pins its own `model` but no provider STILL receives the default
+/// provider (its bare `model` id is exactly what the provider disambiguates), and only an agent
+/// that already carries a `modelProvider` is left alone. Because discovery never sets
+/// `model_provider` before this pass (it is not a frontmatter key), the "already carries one"
+/// arm is reachable only for runtime-registered agents, which never enter this map (SUBA-084).
+fn apply_default_model(
+    merged: &mut HashMap<String, AgentDefinition>,
+    default_model: Option<&str>,
+    default_provider: Option<&str>,
+) {
+    if default_model.is_none() && default_provider.is_none() {
         return;
-    };
+    }
     for agent in merged.values_mut() {
-        if agent.model.is_none() {
+        if agent.model.is_some() && (agent.model_provider.is_some() || default_provider.is_none()) {
+            continue;
+        }
+        if agent.model.is_none()
+            && let Some(dm) = default_model
+        {
             agent.model = Some(cyrup_core::ModelId::from(dm.to_string()));
             agent.model_source = Some(AgentModelSourceInfo::SettingsDefault);
+        }
+        if let Some(dp) = default_provider {
+            agent.model_provider = Some(cyrup_core::ProviderId::from(dp));
         }
     }
 }
@@ -436,6 +474,15 @@ fn apply_builtin_override(
         OverrideField::ExplicitClear => agent.model_source = None,
         OverrideField::Unset => {}
     }
+    // SUBA-088 / pi `agents.ts:1387-1390` @v0.64.0: `defaultProvider: false` -> `delete
+    // next.modelProvider` (`None`, clearing even a `subagents.defaultProvider` stamp), a string
+    // -> `next.modelProvider = override.defaultProvider`.
+    apply_field_full_replace(
+        &mut agent.model_provider,
+        &delta.default_provider,
+        None,
+        |v| Some(cyrup_core::ProviderId::from(v.as_str())),
+    );
     apply_field_full_replace(
         &mut agent.fallback_models,
         &delta.fallback_models,
@@ -706,6 +753,18 @@ fn apply_custom_override(
         Vec::new(),
         |v| v.iter().cloned().map(cyrup_core::ModelId::from).collect(),
     );
+    // SUBA-088: `modelProvider` has NO frontmatter key (pi's agent-file parser never reads one),
+    // so the fill-unset gate is vacuously open and this is the same set/clear pi's
+    // `applyCustomAgentOverride` performs by delegating to `applyBuiltinOverride`
+    // (`agents.ts:1481,1387-1390` @v0.64.0).
+    applied_any |= apply_field_fill_unset(
+        &mut agent.model_provider,
+        &[],
+        &agent.present_fields,
+        &delta.default_provider,
+        None,
+        |v| Some(cyrup_core::ProviderId::from(v.as_str())),
+    );
     applied_any |= apply_field_fill_unset(
         &mut agent.thinking,
         &["thinking"],
@@ -975,6 +1034,7 @@ mod tests {
             extra_fields: Default::default(),
             override_info: None,
             model_source: None,
+            model_provider: None,
         }
     }
 
@@ -1584,6 +1644,7 @@ mod tests {
             "reviewer",
             AgentOverrideConfig {
                 model: OverrideField::Value("openai/gpt-5".to_string()),
+                default_provider: OverrideField::Value("openai".to_string()),
                 fallback_models: OverrideField::Value(vec![
                     "anthropic/claude-sonnet-4".to_string(),
                 ]),
@@ -2135,6 +2196,126 @@ mod tests {
         let k = merged.get("k").expect("present");
         assert_eq!(k.model, Some("google/gemini-3-pro".into()));
         assert_eq!(k.model_source, None);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-088: subagents.defaultProvider -> AgentDefinition::model_provider
+    // -----------------------------------------------------------------------------------------
+
+    /// pi `applySubagentDefaultModel` (`agents.ts:1266-1279` @v0.64.0): the guard is
+    /// `agent.model !== undefined && (agent.modelProvider !== undefined || !defaultProvider)`, so an
+    /// agent that pins a MODEL but no provider still gets the default provider, while the
+    /// model-less agent gets both the default model and the provider.
+    #[test]
+    fn default_provider_stamps_agents_that_pin_a_model_but_no_provider() {
+        let mut merged = HashMap::new();
+        merged.insert("b".to_string(), agent("b", AgentSource::Builtin, "/b/b.md"));
+        let mut pinned = agent("k", AgentSource::User, "/u/k.md");
+        pinned.model = Some("gpt-5".into());
+        merged.insert("k".to_string(), pinned);
+
+        let settings = user_scope(SubagentSettings {
+            default_model: Some("deepseek-v4-flash".to_string()),
+            default_provider: Some("openai-codex".to_string()),
+            ..Default::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+
+        let b = merged.get("b").expect("present");
+        assert_eq!(b.model, Some("deepseek-v4-flash".into()));
+        assert_eq!(b.model_source, Some(AgentModelSourceInfo::SettingsDefault));
+        assert_eq!(b.model_provider, Some("openai-codex".into()));
+        let k = merged.get("k").expect("present");
+        assert_eq!(k.model, Some("gpt-5".into()), "own model kept");
+        assert_eq!(k.model_source, None, "own model is not a settings default");
+        assert_eq!(
+            k.model_provider,
+            Some("openai-codex".into()),
+            "a pinned model without a provider still receives the default provider"
+        );
+    }
+
+    /// pi `resolveSubagentDefaultProvider` (`agents.ts:1242-1249` @v0.64.0): project beats user
+    /// outright when the project scope exists and declares one; with no project scope the user
+    /// value stands.
+    #[test]
+    fn default_provider_project_wins_over_user() {
+        let mut merged = HashMap::new();
+        merged.insert("b".to_string(), agent("b", AgentSource::Builtin, "/b/b.md"));
+        let settings = two_scope(
+            SubagentSettings {
+                default_provider: Some("anthropic".to_string()),
+                ..Default::default()
+            },
+            SubagentSettings {
+                default_provider: Some("openai-codex".to_string()),
+                ..Default::default()
+            },
+        );
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged.get("b").expect("present").model_provider,
+            Some("openai-codex".into())
+        );
+
+        let mut merged = HashMap::new();
+        merged.insert("b".to_string(), agent("b", AgentSource::Builtin, "/b/b.md"));
+        let mut no_project = two_scope(
+            SubagentSettings {
+                default_provider: Some("anthropic".to_string()),
+                ..Default::default()
+            },
+            SubagentSettings {
+                default_provider: Some("openai-codex".to_string()),
+                ..Default::default()
+            },
+        );
+        no_project.project_settings_path = None;
+        apply_overrides(&mut merged, &no_project).expect("apply succeeds");
+        assert_eq!(
+            merged.get("b").expect("present").model_provider,
+            Some("anthropic".into()),
+            "without a project scope the project value is not consulted"
+        );
+    }
+
+    /// pi `applyBuiltinOverride` (`agents.ts:1387-1390` @v0.64.0): an override's `defaultProvider`
+    /// string SETS `modelProvider` and `false` DELETES it — including one stamped by
+    /// `subagents.defaultProvider`, which ran first. Both the builtin (full-replace) and custom
+    /// paths behave the same for this key.
+    #[test]
+    fn override_default_provider_sets_and_false_clears_model_provider() {
+        for source in [AgentSource::Builtin, AgentSource::Project] {
+            let mut merged = HashMap::new();
+            merged.insert("w".to_string(), agent("w", source, "/x/w.md"));
+            merged.insert("c".to_string(), agent("c", source, "/x/c.md"));
+            let mut settings = user_scope(settings_with_override(
+                "w",
+                AgentOverrideConfig {
+                    default_provider: OverrideField::Value("groq".to_string()),
+                    ..Default::default()
+                },
+            ));
+            settings.user.default_provider = Some("openai-codex".to_string());
+            settings.user.overrides.insert(
+                "c".to_string(),
+                AgentOverrideConfig {
+                    default_provider: OverrideField::ExplicitClear,
+                    ..Default::default()
+                },
+            );
+            apply_overrides(&mut merged, &settings).expect("apply succeeds");
+            assert_eq!(
+                merged.get("w").expect("present").model_provider,
+                Some("groq".into()),
+                "{source:?}: override string replaces the settings default"
+            );
+            assert_eq!(
+                merged.get("c").expect("present").model_provider,
+                None,
+                "{source:?}: override false clears even the settings default"
+            );
+        }
     }
 
     #[test]

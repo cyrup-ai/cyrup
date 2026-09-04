@@ -99,6 +99,7 @@ fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
         name: "worker".to_string(),
         model: Some(ModelId::from(model)),
+        model_provider: None,
         fallback_models: Vec::new(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,

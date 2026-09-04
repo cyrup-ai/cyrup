@@ -75,6 +75,7 @@ fn reporter_persona() -> ResolvedAgentPersona {
     ResolvedAgentPersona {
         name: "reporter".to_string(),
         model: Some(ModelId::from("fixture-model")),
+        model_provider: None,
         fallback_models: Vec::new(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,

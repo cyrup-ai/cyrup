@@ -1348,6 +1348,7 @@ pub fn parse_agent_file_checked(
         extra_fields,
         override_info: None,
         model_source: None,
+        model_provider: None,
     }))
 }
 

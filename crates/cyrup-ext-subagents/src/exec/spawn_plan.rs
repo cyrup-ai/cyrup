@@ -5210,6 +5210,7 @@ mod tests {
             agent.model.as_ref(),
             &agent.fallback_models,
             &available_models,
+            None,
         );
         assert_eq!(
             candidates,
