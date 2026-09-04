@@ -117,7 +117,7 @@ in areas 07 and 08.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| FLUX-001 | **medium** | cyrup-original | S | The bundled prompt/skill tree is resolved through a build-machine `CARGO_MANIFEST_DIR` path, so a binary without an intact source tree loses all 15 `/flux/*` templates and the skill — silently, while the three native commands, `ctrl+f` and `ask_user_question` still register |
+| ~~FLUX-001~~ | ~~medium~~ **CLOSED 2026-09-04** | cyrup-original | S | The bundled prompt/skill tree is resolved through a build-machine `CARGO_MANIFEST_DIR` path, so a binary without an intact source tree loses all 15 `/flux/*` templates and the skill — silently, while the three native commands, `ctrl+f` and `ask_user_question` still register. **CLOSED 2026-09-04, cyrup `03f3add0`.** Landed as the row's **Fix (a)** with **(b)** on top: `crates/cyrup-flux/build.rs` embeds `resources/**` as a generated `include_bytes!` table (`src/bundle.rs` `bundled_files`/`bundled_file`/`bundle_fingerprint`); `src/install.rs` is the port of upstream's `installer.py` (`decide` → `FileAction`, `install_pass`, `ensure_installed` → `InstallOutcome::{UpToDate, Installed, SkippedLocked}`, SHA-256 manifest `.flux_bootstrap_manifest.json`, marker `.flux_bootstrap_version`, unique `.bak`/`.bak.N`, atomic tmp+rename, `fs4` non-blocking flock on `.flux_bootstrap.lock`); `src/resources.rs` replaces `bundled_dir()` with `BundledRoot::{Vendored(CYRUP_FLUX_RESOURCES_DIR), Managed(<agent_dir>/flux/resources)}` resolved once at construction (`resolve_from`, `managed_root`), and the `CARGO_MANIFEST_DIR` fallback is gone; `src/extension.rs::materialise_bundle` runs on every `ResourcesDiscover` before the contribution (upstream `register_callbacks.py:47-68`, notice wording kept) and a miss on either root is now a `notify` Warning naming the path instead of `HookOutcome::Noop`; `lib.rs` `flux_extension(agent_dir)` / `flux_extension_for_env(agent_dir)` / `flux_extension_with_root`, wired at `crates/cyrup/src/session_launch.rs:138` with the same `agent_dir` MCP and the permission system receive. Upstream re-read at **v0.0.40** (`flux_bootstrap/` byte-identical to v0.0.6): `installer.py:9-20` (goals), `:47`, `:113-127`, `:139-149`, `:152-167`, `:170-222`, `:225-256`; `register_callbacks.py:47-71`. **Tests (red before / green after):** `crates/cyrup-flux/tests/flux_001_embedded_bundle.rs`, 12 tests — a probe of `resources_discover_contributes_the_managed_root_not_the_build_tree` against the pre-change crate failed with `contributed the build-machine source tree: /home/user/cyrup/crates/cyrup-flux/resources/prompts`; `cargo nextest run -p cyrup-flux` 18/18 after (FLUX-002's 6 re-pointed at the embedded bundle, assertions unchanged). **Residual (medium, unfiled here):** the three sibling `CARGO_MANIFEST_DIR` resolvers this row names in `cyrup-ext-subagents` (`registration/resources.rs:46`, `extension/…builtin_agents_dir`) and `cyrup-intercom` (`resources.rs:41`) are NOT touched — other tracks own those crates this batch; the mechanism is reusable as-is. **Residual (low):** the row's full Verify (release binary moved off-tree, `/flux/new` resolves, `/skill:flux` loads) was not executed live; the unit-level Verify it names is `a_fresh_install_materialises_every_file_then_is_a_no_op`. Labelled inference: the marker is `<crate version>+<bundle sha256>`, not the version alone as upstream (`register_callbacks.py:38-44`), so a same-version rebuild with an edited template re-installs. |
 | ~~FLUX-002~~ | ~~medium~~ **CLOSED 2026-09-04** | parity-bug | S | Four templates instruct the model to call the `subagent` tool, which is default-OFF, while Flux itself is default-ON — the rename `invoke_agent` → `subagent` ported the name and dropped the availability. **CLOSED 2026-09-04, cyrup `c7d21bbb`.** Landed as the row's prescribed template fix, not the rejected gate-arming: each of the four multi-task branches now opens with an availability pre-condition — check the tool list for `subagent` BEFORE calling it; if absent, do NOT call it or substitute another tool, tell the user ONCE (naming the `CYRUP_SUBAGENTS=1` / `subagents/config.json` opt-in) and take the sequential single-task path — at `resources/prompts/flux/exec.md:48-49` (dispatch `ELSE:`) + `:181` (MULTI-TASK MODE), `aug.md:50-51` + `:158`, `qa.md:48-49` + `:163`, and `review.md:109` (STEP 6, degrade = review each group in-line, extended to STEP 7's second launch at `:192`); the skill's `N` row (`resources/skills/flux/SKILL.md:56`), `docs/guide/extensions/flux.md:52-55` and `spec/flux.md` §0.3 (next to the rename map, as the row required) record the same. The armed path is unchanged (one `subagent` call, `tasks:[]`, `concurrency: $ARGUMENTS`). The gate itself is untouched: `crates/cyrup-ext-subagents/src/extension/host/registration.rs:99-129` `is_installed`/`is_installed_with`, tool name at `extension/mod.rs:104`; flux still attaches unconditionally at `crates/cyrup/src/session_launch.rs:136` (the `main.rs:726/930/1060` seams this row cited have since moved there). Upstream re-read at **v0.0.40** (ADR-0006; `flux_bootstrap/` is byte-identical to v0.0.6): `bundled/commands/flux/exec.md:181`, `aug.md:158`, `qa.md:163`, `review.md:110` name `invoke_agent` unconditionally, which is correct there because it is a core `TOOL_REGISTRY` tool. **Tests (red before / green after):** `crates/cyrup-flux/tests/flux_002_subagent_fallback.rs` — 4 of 6 failed against the unedited templates (`every_multi_task_template_checks_tool_availability_before_calling_subagent`, `the_three_n_argument_templates_route_a_missing_tool_to_the_sequential_path_in_dispatch`, `review_degrades_in_line_and_covers_its_second_subagent_launch_in_step_7`, `the_skill_tells_the_model_the_n_mode_needs_the_subagent_tool`), 6/6 after; the two that held both times pin the armed path and the four-template census. **Residual (low):** the row's Verify is a live-model observation (`/flux/exec 3` on a three-todo fixture with the gate off completing sequentially with one notice) and was NOT executed — what is pinned is the prompt contract, and whether a given model honours a tool-list check is not testable here; the harness has no template-time signal of tool availability (prompt templates are static files contributed via `ResourcesDiscover`), so a wiring-level degrade would need a new seam and is not filed. |
 | FLUX-003 | **medium** | test-defect | M | The crate has zero tests at 1,513 lines — a state parser, three renderers, an overlay and a tool with no red-before evidence for anything, and no pin on the cross-harness state contract the port calls a requirement |
 | FLUX-004 | **medium** | cyrup-original | S | `ctrl+f` silently takes the editor's `tui.editor.cursorRight` away from the user, with no diagnostic and no rebind path — the first LIVE instance of `EXT-039`'s open residual |
@@ -127,9 +127,87 @@ in areas 07 and 08.
 
 ---
 
-## FLUX-001 — The bundled prompt/skill tree resolves through a build-machine path, so a distributed binary silently ships half a feature
+## ~~FLUX-001~~ — The bundled prompt/skill tree resolves through a build-machine path, so a distributed binary silently ships half a feature — **CLOSED 2026-09-04**
 
-**Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** confirmed
+**Kind** cyrup-original · **Severity** ~~medium~~ · **Effort** S · **Confidence** confirmed
+**CLOSED 2026-09-04, cyrup `03f3add0`** (`fix(flux): FLUX-001 embed the bundled prompt/skill tree and materialise it under the agent dir`).
+Landed as **Fix (a)** below — embed, then materialise on first `ResourcesDiscover` — with **(b)** layered on
+top rather than instead, exactly as the row prescribes. **Embed:** `crates/cyrup-flux/build.rs` walks
+`resources/` at build time (no hand-maintained list; `rerun-if-changed` on the directory and every file)
+and generates `$OUT_DIR/bundled.rs`, which `src/bundle.rs` includes as `BUNDLED_FILES: &[BundledFile
+{rel, bytes}]`, sorted; `bundled_files()`, `bundled_file(rel)`, `sha256_hex`, `bundle_fingerprint()`
+(sha256 over every rel+payload, once per process). **Materialise:** `src/install.rs` is the port of
+`code_puppy_core_plugins/flux_bootstrap/installer.py` @v0.0.40 that `spec/flux.md` §0 had recorded as
+"deleted, replaced by `cyrup install`" — `decide(current, recorded, payload) -> FileAction {Install,
+Unchanged, PreserveForeign, Overwrite, BackupThenOverwrite}` is the pure per-file table of `:186-218`;
+`install_pass(root, files, marker)` is `_install_pass` (`:170-222`) with tmp+rename atomic writes
+(`:83-91`, `:94-110`), `unique_backup_path` (`:113-127`), manifest `.flux_bootstrap_manifest.json`
+(`:139-149`) and marker `.flux_bootstrap_version` (`:152-167`) written last; `ensure_installed(root)
+-> InstallOutcome {UpToDate, Installed(InstallReport), SkippedLocked}` is `install_bundled_commands`
+(`:225-256`) plus the `needs_install` gate its caller applies, with an `fs4` non-blocking flock on
+`.flux_bootstrap.lock` (`:244-256`); `InstallReport::summary()` keeps `:68-72`'s wording. **Resolve
+once:** `src/resources.rs` replaces `bundled_dir()` / `bundled_prompts_dir()` / `bundled_skill_md()`
+with `BundledRoot::{Vendored(PathBuf), Managed(PathBuf)}` decided at construction by `resolve_from(agent_dir,
+env)` — `CYRUP_FLUX_RESOURCES_DIR` (non-blank) names a vendored tree read as-is and never written;
+otherwise `managed_root(agent_dir) = <agent_dir>/flux/resources`, an extension-owned sibling of
+`<agent_dir>/intercom` and `<agent_dir>/subagents`, deliberately NOT the scanned `<agent_dir>/prompts`
++ `skills` (upstream's literal config-dir-root layout) because cyrup's user-scope loader already walks
+those and every template would register twice. The `CARGO_MANIFEST_DIR` fallback no longer exists in
+this crate. **Loud miss:** `src/extension.rs` `on_event(ResourcesDiscover)` now calls
+`materialise_bundle()` first (`register_callbacks.py:47-68` `_install_flux_commands`, notices
+"Flux commands installed -> …" Info / "Backed up locally-modified Flux files (see *.bak): …" Warning /
+"Flux bootstrap skipped (install failed): …" Warning, minus the command-cache rescan `:64-66` which has
+no cyrup counterpart), then contributes the prompt DIRECTORY and skill FILE as before — and when either
+is missing it emits a Warning naming the path tried (`flux: bundled prompt templates not found at …`,
+`flux: bundled skill not found at …`) instead of the silent `Noop` cited below. **Seam:** `lib.rs`
+`flux_extension(agent_dir)`, `flux_extension_for_env(agent_dir)`, `flux_extension_with_root(root)`;
+`crates/cyrup/src/session_launch.rs:138` passes `dirs.agent_dir` — the same value `cyrup_mcp` and
+`cyrup_permission_system` receive at `:128`/`:132` — so no second home/agent-dir ladder was added.
+**Upstream** re-read at **v0.0.40** (ADR-0006; `git -C tmp/code_puppy_core_plugins diff --stat v0.0.6
+v0.0.40 -- code_puppy_core_plugins/flux_bootstrap/` is empty, so every `installer.py` citation below
+holds at both tags). **Design decisions** (recorded in the commit body): invariant = the contributed
+directory comes from exactly one of two rules whose inputs are known at construction → `BundledRoot`
+enum at the boundary; per-file decision as a pure domain enum (FC/IS); `InstallOutcome` names what
+upstream encodes as an early return and an empty report. Rejected: (b) alone; installing into the
+scanned `prompts/`/`skills/` roots; a hand-listed `include_str!` table; a typestate over on-disk
+state; a runtime `include_dir` dependency. **Labelled inference, not an upstream rule:** the marker is
+`<CARGO_PKG_VERSION>+<bundle sha256>` rather than the version string alone
+(`register_callbacks.py:38-44`) — same steady-state cost, and a same-version rebuild with an edited
+template (every from-source development build) re-installs. Mode-bit preservation (`:94-110`) has no
+counterpart (markdown only, embedded bytes carry no mode). **Tests, red before / green after:**
+`crates/cyrup-flux/tests/flux_001_embedded_bundle.rs` (12) —
+`the_embedded_bundle_is_exactly_the_on_disk_resources_tree` (byte-equal to `resources/**`, sorted; the
+one place a test still reads `CARGO_MANIFEST_DIR`, as the reference not the runtime),
+`the_embedded_bundle_holds_fifteen_templates_and_the_skill`,
+`the_root_is_managed_under_the_agent_dir_unless_a_vendored_tree_is_named` (incl. blank override, vendored
+never written), `the_per_file_decision_matches_installer_py`,
+`a_fresh_install_materialises_every_file_then_is_a_no_op` (the row's cheaper Verify: 15 `.md` under
+`prompts/flux/` + `skills/flux/SKILL.md` resolved with no reference to the build tree; manifest + marker;
+`UpToDate` on the second run; idempotent forced pass),
+`a_hand_edited_managed_file_is_backed_up_and_a_foreign_file_is_preserved` (`.bak` then `.bak.1`; foreign
+file never claimed), `a_changed_bundle_overwrites_untouched_managed_files_without_backups`,
+`a_held_install_lock_skips_the_pass_instead_of_racing`,
+`resources_discover_contributes_the_managed_root_not_the_build_tree` (one Info notice, then steady-state
+with none), `a_missing_vendored_tree_is_reported_not_silently_dropped` (Noop + two Warnings naming the
+path), `an_unwritable_managed_root_is_reported_and_the_session_survives`,
+`a_subagent_child_still_gets_no_flux_extension`. Red before: a probe of the seam test against the
+pre-change crate (old `flux_extension()`, same event, same assertion) failed with `contributed the
+build-machine source tree: /home/user/cyrup/crates/cyrup-flux/resources/prompts`; the rest name types
+that did not exist. Green after: `cargo nextest run -p cyrup-flux` **18/18** (12 new + FLUX-002's 6,
+whose helpers now read `bundle::bundled_file` — assertions unchanged). `cargo fmt --all -- --check`,
+`cargo clippy -p cyrup-flux --all-targets -- -D warnings`, `cargo clippy -p cyrup --no-deps
+--all-targets -- -D warnings` and `RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-flux --no-deps` all
+clean (the full-deps `cyrup` clippy fails only on a concurrent track's
+`crates/cyrup-tui/src/app/input_reader.rs:443`, untouched here). `spec/flux.md` (the `bundled_dir()`
+note and the installer row of the rename map) and `docs/guide/extensions/flux.md` record the change.
+**Residual (medium — the WORKSPACE-WIDE CLASS below, still unfiled elsewhere):** the three sibling
+resolvers in `cyrup-ext-subagents` and `cyrup-intercom` are untouched — other tracks own those crates
+this batch; the build.rs table + `install.rs` shape is reusable for them as-is, so "one mechanism
+closes all four" remains available but is not claimed. **Residual (low):** the row's full **Verify**
+(release binary moved off-tree, `/flux/new` resolves, `/skill:flux` loads) was not executed live; what
+is pinned is the extension seam's contributed path plus the materialised tree's content. Note the
+`CYRUP_FLUX_RESOURCES_DIR` census below is now stale by design: `resources.rs` still declares it, and
+it is now the `Vendored` arm.
 **cyrup** — `crates/cyrup-flux/src/resources.rs:19-23` — `bundled_dir()` reads
 `CYRUP_FLUX_RESOURCES_DIR` (`:14`) and otherwise falls back to
 `PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")`, i.e. **the absolute path of the source
