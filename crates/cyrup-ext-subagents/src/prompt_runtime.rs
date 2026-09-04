@@ -2138,26 +2138,35 @@ impl NativeExtension for SubagentPromptRuntime {
 /// is deliberately not a hard failure: the parent already validated it, so an unreadable file
 /// child-side means the private temp dir is gone, and failing the child over it would turn a
 /// recoverable "structured output missing" into an unexplained startup crash.
-#[must_use]
-pub fn prompt_runtime_extension_for_env() -> Option<Arc<dyn NativeExtension>> {
+///
+/// # Errors
+/// CFG-080: a [`crate::exec::tool_budget::TOOL_BUDGET_ENV`] payload that fails to decode is
+/// refused rather than dropped — see [`prompt_runtime_from_env`].
+pub fn prompt_runtime_extension_for_env() -> Result<Option<Arc<dyn NativeExtension>>, String> {
     prompt_runtime_extension_from(&|key| std::env::var(key).ok())
 }
 
 /// The env-injected form of [`prompt_runtime_extension_for_env`] — the whole decision as a pure
 /// function of a lookup, so it is testable without mutating process-global environment state.
-#[must_use]
+///
+/// # Errors
+/// As [`prompt_runtime_extension_for_env`].
 pub fn prompt_runtime_extension_from(
     get: &dyn Fn(&str) -> Option<String>,
-) -> Option<Arc<dyn NativeExtension>> {
-    prompt_runtime_from_env(get).map(|runtime| Arc::new(runtime) as Arc<dyn NativeExtension>)
+) -> Result<Option<Arc<dyn NativeExtension>>, String> {
+    Ok(prompt_runtime_from_env(get)?.map(|runtime| Arc::new(runtime) as Arc<dyn NativeExtension>))
 }
 
 /// [`prompt_runtime_extension_from`] before the trait object is erased — the same decision, typed,
 /// so a caller (and a test) can inspect which halves actually armed.
-#[must_use]
+///
+/// # Errors
+/// CFG-080: pi's `decodeToolBudgetEnv` THROWS out of the registration function
+/// (`subagent-prompt-runtime.ts:693`, `tool-budget.ts:74-80` @v0.64.0), so an undecodable tool
+/// budget is a construction failure here too — the message is pi's own, and no runtime is built.
 pub fn prompt_runtime_from_env(
     get: &dyn Fn(&str) -> Option<String>,
-) -> Option<SubagentPromptRuntime> {
+) -> Result<Option<SubagentPromptRuntime>, String> {
     let non_empty = |key: &str| get(key).filter(|value| !value.trim().is_empty());
 
     let capture = non_empty(STRUCTURED_OUTPUT_CAPTURE_ENV);
@@ -2218,21 +2227,27 @@ pub fn prompt_runtime_from_env(
     // pi `:693` @v0.64.0: `registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV],
     // { allowZero: process.env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" }))` — CFG-067: the zero-budget
     // authorisation is read from the same env the budget arrives in, so a `hard: 0` payload is
-    // honoured only when the parent said so and rejected (below) otherwise.
-    // A malformed payload is dropped rather than propagated: pi lets `decodeToolBudgetEnv` throw out
-    // of module init, which here would take down a child whose budget the parent already validated.
-    // The parent is the only writer of this var, so a malformed value means the environment was
-    // tampered with mid-flight — running unbudgeted beats an unexplained child crash.
-    let tool_budget = match crate::exec::tool_budget::decode_tool_budget_env(
+    // honoured only when the parent said so and rejected otherwise.
+    //
+    // CFG-080: the rejection PROPAGATES. `decodeToolBudgetEnv` throws (`tool-budget.ts:74-80`
+    // @v0.64.0) out of `registerSubagentPromptRuntime`, and pi's loader catches that throw,
+    // `load.discard()`s every registration the factory had already made and records
+    // `Failed to load extension: …` (`pi/packages/coding-agent/src/core/extensions/loader.ts:545-587`
+    // @v0.84.4) — so the one payload the `hard: 0` authorisation exists to gate can never reach a
+    // running child. Dropping it with a `tracing::warn!` (this crate until CFG-080) inverted that:
+    // an UNAUTHORISED `{"hard":0}` was exactly such a decode error, and it disabled the budget
+    // entirely instead of enforcing it.
+    //
+    // **[CYRUP-DELTA] on blast radius, in the safe direction.** pi loses only this extension and
+    // the child keeps running; cyrup has no per-extension quarantine at its native-extension
+    // attach point, so the error travels out of the launch path and the child exits before its
+    // first turn (`crates/cyrup/src/session_launch.rs`). Both refuse to run a budgeted child with
+    // its budget silently removed; cyrup additionally refuses to run it with the rest of the
+    // subagent runtime missing, which for this crate's children is not a survivable state anyway.
+    let tool_budget = crate::exec::tool_budget::decode_tool_budget_env(
         get(crate::exec::tool_budget::TOOL_BUDGET_ENV).as_deref(),
         crate::exec::tool_budget::HardMinimum::from_env(get),
-    ) {
-        Ok(budget) => budget,
-        Err(message) => {
-            tracing::warn!("{message} — running this child with no tool budget");
-            None
-        }
-    };
+    )?;
 
     // G90 / pi `:194-195`: `const steerInbox = process.env[SUBAGENT_STEER_INBOX_ENV]?.trim(); if
     // (!steerInbox) return;`. A blank value is the same as unset, which is what makes the trim
@@ -2314,9 +2329,9 @@ pub fn prompt_runtime_from_env(
         .with_tool_diagnostic(get);
 
     if runtime.is_inert() {
-        return None;
+        return Ok(None);
     }
-    Some(runtime)
+    Ok(Some(runtime))
 }
 
 /// `createMainWatchdogReview(() => currentContext, { getThinkingLevel: () => pi.getThinkingLevel()
@@ -2428,6 +2443,7 @@ mod tool_budget_runtime_tests {
                 None
             }
         })
+        .expect("a valid budget decodes")
         .expect("a budget alone is enough to build the child runtime");
 
         let ctx = ctx();
@@ -2503,25 +2519,23 @@ mod tool_budget_runtime_tests {
     /// allowZero: env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" })`. THE USER ACTION end to end: the
     /// parent ships `{"hard": 0}` — "this child may make no browsing calls at all" — and the
     /// authorisation flag; the child's very first `read` is refused. Without the flag the same
-    /// payload is the malformed-budget case and the child runs unbudgeted (upstream's decode
-    /// throws; this crate's documented policy drops the budget instead). Before this port the
-    /// flag was not read anywhere, so the authorised branch could not be reached.
+    /// payload is a decode error, and since CFG-080 that error REFUSES the runtime instead of
+    /// dropping the budget — the unauthorised half is pinned by
+    /// [`an_unauthorised_zero_budget_refuses_the_runtime_instead_of_running_unbudgeted`].
     #[tokio::test]
     async fn a_zero_budget_is_honoured_only_with_the_parents_authorisation() {
         let encoded = "{\"hard\":0}".to_string();
-        let authorised = {
-            let encoded = encoded.clone();
-            prompt_runtime_extension_from(&move |key| {
-                if key == crate::exec::tool_budget::TOOL_BUDGET_ENV {
-                    Some(encoded.clone())
-                } else if key == crate::exec::tool_budget::TOOL_BUDGET_ZERO_AUTH_ENV {
-                    Some("1".to_string())
-                } else {
-                    None
-                }
-            })
-            .expect("an authorised zero budget builds the child runtime")
-        };
+        let authorised = prompt_runtime_extension_from(&move |key| {
+            if key == crate::exec::tool_budget::TOOL_BUDGET_ENV {
+                Some(encoded.clone())
+            } else if key == crate::exec::tool_budget::TOOL_BUDGET_ZERO_AUTH_ENV {
+                Some("1".to_string())
+            } else {
+                None
+            }
+        })
+        .expect("an authorised zero budget decodes")
+        .expect("an authorised zero budget builds the child runtime");
         let ctx = ctx();
         match authorised.on_event(&call(1, "read"), &ctx).await {
             HookOutcome::Block { reason, .. } => assert!(
@@ -2531,19 +2545,61 @@ mod tool_budget_runtime_tests {
             ),
             other => panic!("the first browsing call must be refused under hard 0: {other:?}"),
         }
+    }
 
-        let unauthorised = prompt_runtime_extension_from(&move |key| {
-            (key == crate::exec::tool_budget::TOOL_BUDGET_ENV).then(|| encoded.clone())
-        });
-        if let Some(ext) = unauthorised {
+    /// CFG-080 — THE USER ACTION: a `{"hard":0}` budget reaches the child WITHOUT the parent's
+    /// `CYRUP_SUBAGENT_TOOL_BUDGET_ZERO_AUTH=1`, i.e. the exact payload that authorisation exists
+    /// to gate. pi's `decodeToolBudgetEnv` throws that validation message out of
+    /// `registerSubagentPromptRuntime` (`subagent-prompt-runtime.ts:693`, `tool-budget.ts:74-80`
+    /// @v0.64.0) and its loader discards every registration the factory made
+    /// (`pi/packages/coding-agent/src/core/extensions/loader.ts:545-587` @v0.84.4), so the child
+    /// can never run with the budget silently removed. Before CFG-080 this resolver logged a
+    /// `tracing::warn!` and returned a runtime with `tool_budget: None` — the child ran with
+    /// UNLIMITED tool calls, the fail-OPEN inverse of upstream. Every decode failure is refused
+    /// the same way, matching upstream's single `throw`.
+    #[test]
+    fn an_unauthorised_zero_budget_refuses_the_runtime_instead_of_running_unbudgeted() {
+        let refused = |payload: &str, expected: &str| {
+            let value = payload.to_string();
+            let Err(error) = prompt_runtime_from_env(&move |key| {
+                (key == crate::exec::tool_budget::TOOL_BUDGET_ENV).then(|| value.clone())
+            }) else {
+                panic!("an undecodable tool budget must refuse the runtime: {payload:?}");
+            };
             assert!(
-                matches!(
-                    ext.on_event(&call(1, "read"), &ctx).await,
-                    HookOutcome::Noop
-                ),
-                "an unauthorised zero budget is dropped, never enforced"
+                error.contains(expected),
+                "expected {expected:?} in {error:?}"
             );
-        }
+        };
+
+        // pi's own message, with `minimumHard` at its default 1 because the authorisation is
+        // absent (`tool-budget.ts:20-24`).
+        refused(
+            "{\"hard\":0}",
+            "CYRUP_SUBAGENT_TOOL_BUDGET.hard must be an integer >= 1.",
+        );
+        // The same refusal for a payload that is not even JSON — pi's `JSON.parse` throws from
+        // the same call.
+        refused("not json", "is not valid JSON");
+        // And for a semantically invalid one.
+        refused(
+            "{\"hard\":2,\"soft\":5}",
+            "CYRUP_SUBAGENT_TOOL_BUDGET.soft must be <= CYRUP_SUBAGENT_TOOL_BUDGET.hard.",
+        );
+
+        // The authorised payload is NOT refused — the gate is what separates them.
+        assert!(
+            prompt_runtime_from_env(&|key| match key {
+                k if k == crate::exec::tool_budget::TOOL_BUDGET_ENV =>
+                    Some("{\"hard\":0}".to_string()),
+                k if k == crate::exec::tool_budget::TOOL_BUDGET_ZERO_AUTH_ENV =>
+                    Some("1".to_string()),
+                _ => None,
+            })
+            .expect("an authorised zero budget decodes")
+            .is_some_and(|runtime| !runtime.is_inert()),
+            "the authorised zero budget still builds an armed child runtime"
+        );
     }
 
     /// No budget in the env => no `tool_call` subscription and no interference at all.
@@ -2557,7 +2613,11 @@ mod tool_budget_runtime_tests {
                 HookOutcome::Noop
             ));
         }
-        assert!(prompt_runtime_extension_from(&|_| None).is_none());
+        assert!(
+            prompt_runtime_extension_from(&|_| None)
+                .expect("no tool budget in this env, so the runtime always builds")
+                .is_none()
+        );
     }
 }
 
@@ -2598,6 +2658,7 @@ mod permission_gate_tests {
             PERMISSION_AUDIT_PATH_ENV => audit.clone(),
             _ => None,
         })
+        .expect("no tool budget in this env, so the runtime always builds")
         .expect("a policy alone arms the child runtime")
     }
 
@@ -2702,7 +2763,11 @@ mod permission_gate_tests {
     /// no extension at all, exactly as `registerPermissionGate`'s early return (`:286`).
     #[tokio::test]
     async fn a_child_with_no_policy_installs_no_gate() {
-        assert!(prompt_runtime_extension_from(&|_| None).is_none());
+        assert!(
+            prompt_runtime_extension_from(&|_| None)
+                .expect("no tool budget in this env, so the runtime always builds")
+                .is_none()
+        );
         let runtime = SubagentPromptRuntime::from_parts(None, None, false).with_permission_gate(
             None,
             None,
@@ -3305,7 +3370,9 @@ mod tests {
     #[test]
     fn a_non_child_process_builds_no_runtime_at_all() {
         assert!(
-            prompt_runtime_extension_from(&|_| None).is_none(),
+            prompt_runtime_extension_from(&|_| None)
+                .expect("no tool budget in this env, so the runtime always builds")
+                .is_none(),
             "an empty environment must not attach the child runtime"
         );
     }
@@ -3321,7 +3388,9 @@ mod tests {
             _ => None,
         };
         assert!(
-            prompt_runtime_extension_from(&env).is_some(),
+            prompt_runtime_extension_from(&env)
+                .expect("no tool budget in this env, so the runtime always builds")
+                .is_some(),
             "a child with inherit flags but no schema still needs the prompt/context runtime"
         );
     }
