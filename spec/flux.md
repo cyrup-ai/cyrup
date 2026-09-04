@@ -128,6 +128,17 @@ not a tool). The `subagent` tool (foreground/background/parallel fan-out, chains
 `review.md` also carries `run_in_background: false` wording for `invoke_agent` — port as
 "foreground `subagent` calls" (see §3.3 rule 4).
 
+**The `invoke_agent` → `subagent` row renames onto a tool with a DIFFERENT availability** (gap-analysis
+`FLUX-002`): `invoke_agent` is a core code-puppy tool (`code_puppy/tools/__init__.py` `TOOL_REGISTRY`),
+always present, whereas `subagent` is registered only behind `cyrup-ext-subagents`' opt-in
+`is_installed` gate (`CYRUP_SUBAGENTS` truthy, or a `subagents/config.json` at user/project scope) —
+and this crate is default-on (§2.4). The four renamed templates therefore carry an availability
+pre-condition upstream never needed: check the tool list for `subagent` BEFORE calling it and, when it
+is absent, tell the user once and take the sequential single-task path (`exec`/`aug`/`qa`) or review the
+groups in-line (`review`). Arming subagents from flux was rejected: it would have a default-on extension
+silently flip the gate on an OS-process-spawning subsystem. Pinned by
+`crates/cyrup-flux/tests/flux_002_subagent_fallback.rs`.
+
 ### 0.4 Extension surfaces (verified)
 
 - **Native extensions**: [`NativeExtension`](../crates/cyrup-ext/src/native.rs) —

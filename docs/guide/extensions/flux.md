@@ -49,7 +49,10 @@ new -> ask -> split -> aug -> exec -> qa -> tests -> commit -> create-pr
 `aug`, `exec` and `qa` share one argument grammar: a filename processes that one task, a bare
 integer `N` fans the work out across `N` parallel subagents over every file in `todo/`, `1` or
 `all` processes every task file sequentially, and no argument at all lists `todo/*.md` and asks
-which to run.
+which to run. The `N` form needs the `subagent` tool, which only the opt-in
+[subagents](subagents.md) extension provides (`CYRUP_SUBAGENTS=1` or a `subagents/config.json`);
+Flux itself is always on, so without that opt-in `N` tells you once that subagents are not
+available and runs the tasks sequentially instead.
 
 Three more pipelines exist alongside the core one:
 
