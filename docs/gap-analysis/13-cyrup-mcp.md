@@ -54,6 +54,21 @@ exists.
 
 ---
 
+## Retarget — v2.26.1 → v2.32.1 (pointer)
+
+**Dated 2026-09-04.** The clone moved again, to **v2.32.1** (`10a4536`). The delta is **147 files /
++16,014 / −1,001 across 79 commits**, and it is triaged — file by file, against the four cuts and
+against this plan's units — in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*The upstream
+delta, triaged*, which also files **40 new units, `MCP-500`–`MCP-539`**, for the surfaces this plan
+has no unit for. Nothing in this document's body was rewritten, for the reason Rule 1 below gives.
+
+Three counts this document carries are superseded and are recorded here rather than edited in place:
+`ServerEntry` is **30** fields at v2.32.1 (`bearerTokenStore`), `McpSettings` is **26** keys
+(`strictDirectToolArguments`, `directToolResultDetails`), and `URL_BOUND_AUTH_FIELDS` is **five**
+entries — `bearerTokenStore` joined it (`v2.32.1:config.ts:525`). That last one is the same
+credential-leak shape the v2.26.1 retarget caught for `requestHeadersCommand` and is filed as the
+`critical` `MCP-500`. `computeServerHash`'s identity key set is **unchanged at 15**.
+
 ## Retarget — v2.25.0 → v2.26.1
 
 **Dated 2026-08-20.** Upstream tagged v2.26.0 and then v2.26.1 after this plan was written. The port

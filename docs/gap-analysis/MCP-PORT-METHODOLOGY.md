@@ -139,9 +139,18 @@ nine section files and agree with it row for row.
 Three fields per upstream, moving on three different triggers — the shape ADR-0006 mandates, because
 conflating them is what produced both of the workspace's earlier baseline errors.
 
+> **Updated 2026-09-04.** The comparison tag moved twice since this table was written — to v2.26.1
+> (2026-08-20 retarget, recorded in `13-cyrup-mcp.md` §*Retarget*) and now to **v2.32.1**
+> (`10a4536`), the clone's tag under ADR-0006's latest-tag rule. The v2.26.1 → v2.32.1 delta is
+> **147 files / +16,014 / −1,001 across 79 commits**, triaged in
+> `13-cyrup-mcp-STATUS.md` §*The upstream delta, triaged*, which also files the 40 units it needs.
+> Rule 1 of the 2026-08-20 retarget still binds: a `file:line` in this document or in `13a`–`13i`
+> resolves against **v2.25.0**, and a version-string search-and-replace would silently invalidate
+> every one of them. Read the old citation at its own tag, then diff that file forward.
+
 | | ported baseline | comparison tag | HEAD | citable? |
 |---|---|---|---|---|
-| **`pi-mcp-adapter`** | v2.25.0 (nothing landed yet; moves as port units close) | **v2.25.0** | **17 files / +543 / −69** past v2.25.0 | baseline and comparison tag: yes. HEAD: **no** |
+| **`pi-mcp-adapter`** | v2.25.0 for the plan's citations; **v2.26.1** for the units filed by the 2026-08-20 retarget (moves as port units close) | **v2.32.1** (`10a4536`), was v2.25.0 then v2.26.1 | at the tag as of 2026-09-04 | baseline and comparison tag: yes. HEAD: **no** |
 | **`rmcp`** | — | **3.1.2** (`rmcp-v3.1.2-7-gf713ebd`) | 7 commits past the tag | comparison tag only |
 | **cyrup** | — | **branch `david/cyrup`** | moves continuously | **nothing about cyrup is pinned — by rule** |
 
@@ -167,7 +176,7 @@ Follow ADR-0006's procedure verbatim, with `pi-mcp-adapter` as a fifth upstream:
 
 1. **Watch** at the top of every phase that names an upstream file, and weekly regardless:
    `git -C <pi-mcp-adapter> fetch --tags && git describe --tags --abbrev=0` plus
-   `git rev-list --count v2.25.0..<latest>`.
+   `git rev-list --count v2.32.1..<latest>` (was `v2.25.0..` when this was written).
 2. **Trigger is a new tag. Only that.** A non-zero commit count is *information*; a tag is the
    *event*. The 17-file / +543 / −69 window past v2.25.0 is **deliberately unanalysed** — an untagged
    commit cannot answer "which side of the ported tag did this land on", so items in it are unfileable
@@ -1611,7 +1620,7 @@ refutation as a success.
 
 | trigger | what to re-run |
 |---|---|
-| **`pi-mcp-adapter` cuts a new tag** | ADR-0006's six-step procedure, scoped by `git diff --name-only v2.25.0..<new>` intersected with the paths this document and the seam map cite. File only what the diff shows; move the **comparison** tag; move the **ported** baseline only as units close |
+| **`pi-mcp-adapter` cuts a new tag** | ADR-0006's six-step procedure, scoped by `git diff --name-only v2.32.1..<new>` intersected with the paths this document and the seam map cite. File only what the diff shows; move the **comparison** tag; move the **ported** baseline only as units close |
 | **`rmcp` cuts a MINOR** | re-read the changed modules in the checkout; re-run the manifest-policy test; check nothing moved from unconditional to feature-gated. Normally additive under rmcp's `VERSIONING.md` |
 | **`rmcp` cuts a MAJOR** | **stop and take the bump as its own unit.** Do not chase it inside a phase. Read the API diff from the checkout, not the changelog |
 | **every phase boundary** | re-check rmcp's latest version; publish the phase's three censuses (§10.1 defence 1); publish what the phase excluded and its negative results |
