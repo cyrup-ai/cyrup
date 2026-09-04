@@ -1,4 +1,5 @@
-//! The `ctrl+f` interactive status overlay — the cyrup-native restoration of Wibey's
+//! The interactive status overlay behind [`crate::extension::STATUS_OVERLAY_SHORTCUT`]
+//! (`ctrl+alt+f`; FLUX-004 retired `ctrl+f`) — the cyrup-native restoration of Wibey's
 //! `ui-mode: flux-status` panel (port doc §3.4.3). `/flux/status` ([`crate::render_status`],
 //! FLUX_07) owns the plain-text channel; this module owns real COLOUR, which can only exist
 //! inside an overlay because the TUI strips ANSI from externally supplied text
@@ -74,7 +75,7 @@ impl Snapshot {
     }
 }
 
-/// The `ctrl+f` overlay: [`InteractiveOverlay`] over the same `~/.flux/<flattened-cwd>/` model
+/// The [`crate::extension::STATUS_OVERLAY_SHORTCUT`] overlay: [`InteractiveOverlay`] over the same `~/.flux/<flattened-cwd>/` model
 /// [`crate::render_status`] renders as plain text.
 pub struct FluxStatusOverlay {
     base: PathBuf,
@@ -376,7 +377,8 @@ impl InteractiveOverlay for FluxStatusOverlay {
     }
 }
 
-/// Open the `ctrl+f` overlay, or fall back to the plain-text table when no interactive surface is
+/// Open the status overlay ([`crate::extension::STATUS_OVERLAY_SHORTCUT`]), or fall back to the
+/// plain-text table when no interactive surface is
 /// attached. `host_services` is the `OnceLock` slot [`crate::extension::FluxExtension`] binds
 /// through `set_host_services` (`native.rs:683`).
 pub fn open_status_overlay(host_services: &Arc<OnceLock<Arc<dyn HostServices>>>) {

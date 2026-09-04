@@ -14,6 +14,40 @@ use cyrup_ext::{
     EventKind, ExtError, HandledValue, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
 };
 
+/// The chord that opens the status overlay ([`crate::overlay`]), registered through
+/// [`InitApi::register_shortcut`] and matched again in [`NativeExtension::execute_shortcut`] —
+/// ONE constant so the two sites cannot drift.
+///
+/// FLUX-004. The original chord was `ctrl+f`, chosen for "flux" — and it is pi's default for
+/// `tui.editor.cursorRight` (`packages/tui/src/keybindings.ts:86-89` @v0.84.4, `defaultKeys:
+/// ["right", "ctrl+f"]`), ported verbatim at `crates/cyrup-tui/src/keymap.rs` (`impl Default for
+/// EditorKeymap`, `ctrl('f') => CursorRight`). The extension-shortcut tier fires BEFORE the editor
+/// (`crates/cyrup-tui/src/app/input.rs`, "before the editor (so the key never leaks in as text)"),
+/// so every emacs-motion user lost forward-char to this overlay on a default install, with no
+/// diagnostic (the host never calls `ExtensionRegistry::resolve_shortcuts` — EXT-039's residual)
+/// and no rebind path (an extension shortcut is not a `Keybinding`). This extension has no
+/// upstream chord to port: `flux_bootstrap/` @v0.0.40 registers no keybinding at all (the overlay
+/// is a cyrup-native surface), so the chord is a cyrup design choice and must stay clear of every
+/// default keymap.
+///
+/// `ctrl+alt+f` keeps the mnemonic and is bound by NO default keymap on either side:
+/// * cyrup binds no `ctrl+alt+<letter>` chord in any of its default tables
+///   (`Keymap`, `EditorKeymap`, `SelectKeymap`, `AutocompleteKeymap`, `ModelsKeymap`,
+///   `SessionKeymap`, `TreeKeymap`, `AltScreenKeymap`) — pinned by
+///   `tests/flux_004_status_shortcut.rs` against the real tables, not a copied list;
+/// * pi v0.84.4's only `ctrl+alt` default is `ctrl+alt+]` (`tui.editor.jumpBack`,
+///   `packages/tui/src/keybindings.ts:110-112`), so a later port of a pi default cannot collide
+///   either. `ctrl+shift+f` was rejected for exactly that reason: it is pi's
+///   `tui.altScreen.search` (`:192-195`; `core/keybindings.ts:88-91`, where the Windows profile
+///   makes it plain `ctrl+f`), unported today and the next collision tomorrow;
+/// * a legacy terminal delivers it as `ESC 0x06`, which crossterm decodes as CONTROL|ALT + `f` —
+///   the same path the `alt+b`/`alt+f` word motions already rely on — so it reaches the TUI without
+///   the kitty keyboard protocol (a `ctrl+shift+f` chord does not).
+pub const STATUS_OVERLAY_SHORTCUT: &str = "ctrl+alt+f";
+
+/// The `/hotkeys` label registered next to [`STATUS_OVERLAY_SHORTCUT`] (EXT-040).
+pub const STATUS_OVERLAY_SHORTCUT_DESCRIPTION: &str = "Flux status overlay";
+
 /// The Flux native extension.
 pub struct FluxExtension {
     pub(crate) id: ExtensionId,
@@ -56,7 +90,10 @@ impl NativeExtension for FluxExtension {
                 completions: vec![],
             },
         );
-        api.register_shortcut("ctrl+f", Some("Flux status overlay".into()));
+        api.register_shortcut(
+            STATUS_OVERLAY_SHORTCUT,
+            Some(STATUS_OVERLAY_SHORTCUT_DESCRIPTION.into()),
+        );
         api.register_tool(Arc::new(crate::ask_tool::AskUserQuestionTool::new(
             Arc::clone(&self.host_services),
         )));
@@ -120,12 +157,12 @@ impl NativeExtension for FluxExtension {
         }
     }
 
-    /// Route the `ctrl+f` shortcut this task registers (port doc §3.4.3). `ctx` is COMMAND tier
-    /// like any command handler; this overlay needs none of the session-replacing ops that tier
-    /// permits.
+    /// Route the [`STATUS_OVERLAY_SHORTCUT`] chord this task registers (port doc §3.4.3). `ctx`
+    /// is COMMAND tier like any command handler; this overlay needs none of the session-replacing
+    /// ops that tier permits.
     async fn execute_shortcut(&self, key: &str, ctx: &HostCtx) -> Result<(), ExtError> {
         ctx.require_command_tier()?;
-        if key == "ctrl+f" {
+        if key == STATUS_OVERLAY_SHORTCUT {
             crate::overlay::open_status_overlay(&self.host_services);
         }
         Ok(())

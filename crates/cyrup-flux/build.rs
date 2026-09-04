@@ -3,7 +3,7 @@
 //! `env!("CARGO_MANIFEST_DIR")` is the absolute source path of whatever machine compiled the
 //! binary; a release artifact, a container image or a `cargo install` from a source dir that is
 //! later cleaned has no tree there, and the fifteen `/flux/*` templates plus the skill silently
-//! vanished while the three native renderers, `ctrl+f` and `ask_user_question` stayed registered.
+//! vanished while the three native renderers, the status shortcut and `ask_user_question` stayed registered.
 //! Upstream never had this problem: `flux_bootstrap/installer.py` @v0.0.40 ships `bundled/` as
 //! package data and copies it into `~/.code_puppy` at startup. This script is the "package data"
 //! half of that port — it walks `resources/` and emits `$OUT_DIR/bundled.rs`, a sorted

@@ -41,3 +41,9 @@ fs4 = "1.1.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# FLUX-004 — `tests/flux_004_status_shortcut.rs` runs the status-overlay chord through the TUI's
+# REAL default keymaps (`Keymap`, `EditorKeymap`, …) rather than a copied key list, so a chord that
+# collides with a built-in binding fails here instead of silently stealing the key at run time.
+# Test-side only: the production crate never depends on a terminal owner (the same crate-boundary
+# rule `cyrup-ext-subagents/Cargo.toml` states for its `ratatui` dependency).
+cyrup-tui = { workspace = true }

@@ -18,8 +18,9 @@ focused task doesn't inherit fifteen pipeline commands and a skill for a workflo
   command list, plus a bundled skill that explains the pipeline to the model.
 - **Three native commands** that render deterministically with no model call:
   `/flux/status`, `/flux/cheatsheet`, `/flux/about`.
-- **A `ctrl+f` overlay** — the same status panel as `/flux/status`, drawn with real colour inside
-  the TUI instead of plain text.
+- **A `ctrl+alt+f` overlay** — the same status panel as `/flux/status`, drawn with real colour
+  inside the TUI instead of plain text. (The chord is `ctrl+alt+f`, not `ctrl+f`: `ctrl+f` is the
+  editor's forward-char motion, and an extension shortcut would take it away from you.)
 - **A structured `ask_user_question` tool** the pipeline templates use to ask you clarifying
   questions one at a time mid-task, with single- or multi-select options.
 
@@ -89,7 +90,7 @@ if you don't plan to use `/flux/tests` yet — every other stage works without i
 /flux/status done review  # any combination of todo / done / review
 ```
 
-Or press `ctrl+f` for the same information as a colour overlay without leaving your current view.
+Or press `ctrl+alt+f` for the same information as a colour overlay without leaving your current view.
 
 `/flux/cheatsheet` prints the full command table shown above (optionally filtered to one pipeline
 with `/flux/cheatsheet A`, `B`, `C` or `D`), and `/flux/about` prints a short description of the
