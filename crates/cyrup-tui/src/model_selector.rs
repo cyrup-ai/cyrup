@@ -719,6 +719,83 @@ mod tests {
         assert!(sel.current().unwrap().current);
     }
 
+    /// TUI-089 guard — the `/model` picker sorts the composed catalog by PROVIDER ONLY, with a stable
+    /// sort, exactly like Pi `sortModels` (`model-selector.ts:225-239` @v0.84.4:
+    /// `sorted.sort((a, b) => … a.provider.localeCompare(b.provider))`, and JS `Array.prototype.sort`
+    /// is stable). Nothing on either side sorts by model id, so the catalog's ASSEMBLY order inside a
+    /// provider is what the user sees — and that order is Pi `applyModelsJson`'s
+    /// (`provider-composer.ts:167-199` @v0.84.4): built-ins first, a `models.json` model with a NEW id
+    /// `push`ed at the END of its provider's block (`:196`), a wholly-new provider appended after every
+    /// built-in (`model-runtime.ts:236-243` `providerIds()` insertion order). cyrup's
+    /// `ModelFile::compose` / `apply_models_json` (`cyrup-config/src/model/compose.rs`) produce the
+    /// same shape, so this test feeds that shape in and pins that the picker keeps every provider
+    /// block contiguous and the appended model adjacent to its siblings — never at the bottom of the
+    /// whole list, which is what the row reported. Both sort sites are checked: `new` and the
+    /// `with_default_model` re-sort.
+    #[test]
+    fn models_json_appended_model_stays_inside_its_provider_block() {
+        // `compose` order: `together` is cyrup's first registered built-in (`providers/all.rs:355`),
+        // the custom `moonshotai/Kimi-K9` is pushed after `together`'s last built-in, and `mycorp`
+        // (declared only in models.json) trails every built-in provider.
+        let composed = vec![
+            entry("Qwen/Qwen3.7-Max", "together", false, false),
+            entry("moonshotai/Kimi-K2.6", "together", false, false),
+            entry("openai/gpt-oss-20b", "together", false, false),
+            entry("moonshotai/Kimi-K9", "together", false, false),
+            entry("claude-opus-4-6", "anthropic", true, false),
+            entry("claude-sonnet-4-6", "anthropic", false, false),
+            entry("gpt-5.1", "openai", false, false),
+            entry("mycorp-large", "mycorp", false, false),
+        ];
+        let expected = vec![
+            ("anthropic", "claude-opus-4-6"), // current first (`:229-231`)
+            ("anthropic", "claude-sonnet-4-6"),
+            ("mycorp", "mycorp-large"),
+            ("openai", "gpt-5.1"),
+            ("together", "Qwen/Qwen3.7-Max"),
+            ("together", "moonshotai/Kimi-K2.6"),
+            ("together", "openai/gpt-oss-20b"),
+            ("together", "moonshotai/Kimi-K9"), // adjacent to its block, in assembly order
+        ];
+        let order = |sel: &ModelSelector| -> Vec<(String, String)> {
+            sel.models
+                .iter()
+                .map(|m| (m.provider.clone(), m.id.clone()))
+                .collect()
+        };
+        let owned = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(p, i)| ((*p).to_string(), (*i).to_string()))
+                .collect()
+        };
+
+        let sel = ModelSelector::new(composed.clone());
+        assert_eq!(order(&sel), owned(&expected), "`new` sort");
+
+        // The default tier (`:232-235`) re-sorts through `sort_models`; with the default equal to
+        // the current model the order must be identical.
+        let sel = ModelSelector::new(composed).with_default_model("anthropic", "claude-opus-4-6");
+        assert_eq!(
+            order(&sel),
+            owned(&expected),
+            "`with_default_model` re-sort"
+        );
+
+        // Every provider block is contiguous after both sorts.
+        let providers: Vec<&str> = sel.models.iter().map(|m| m.provider.as_str()).collect();
+        let mut seen: Vec<&str> = Vec::new();
+        for (i, p) in providers.iter().enumerate() {
+            let starts_new_block = i == 0 || providers[i - 1] != *p;
+            if starts_new_block {
+                assert!(
+                    !seen.contains(p),
+                    "provider {p} split into two blocks: {providers:?}"
+                );
+                seen.push(p);
+            }
+        }
+    }
+
     #[test]
     fn typing_fuzzy_filters() {
         let mut sel = ModelSelector::new(catalog());
